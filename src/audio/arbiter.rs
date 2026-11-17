@@ -117,12 +117,6 @@ pub const VOLUME_BUCKETS: usize = 10;
 /// base and bucket 10 of row `p` is bucket 0 of row `p + 1`.
 pub const BUCKET_DIVISOR: i32 = 1638;
 
-/// Age gap two equal-priority channels need before the older one is taken.
-/// `DSoundChannel::FindAvailable @ 0x004035F0`, `0x0040366B..0x00403675`:
-/// `MOV EBX,ESI ; SUB EBX,EDX ; CMP EBX,0x666 ; JC skip` — the candidate is
-/// only replaced when `bestStamp - stamp >= 0x666`.
-pub const EQUAL_PRIORITY_AGE_GAP: u32 = 0x666;
-
 /// Milliseconds the native ramp takes to cross the whole `0..0x4000` range.
 ///
 /// `InterpGroup::Init @ 0x00401000` seeds every group with
@@ -297,6 +291,13 @@ impl VolumeInterp {
     pub fn target_value(&self) -> i32 {
         (self.target >> 16) as i32
     }
+
+    /// Whether the value is still gliding toward its target: the
+    /// `current != target` test of `Audio__IsStreamPlayerVolumeInterpolating
+    /// @ 0x004080D0` (`0x004080D9..0x004080DF`) and `0x00408410`.
+    pub fn moving(&self) -> bool {
+        self.current != self.target
+    }
 }
 
 /// Identifier of one live `SoundEvent`. VERA-internal: native uses the record
@@ -353,6 +354,14 @@ pub trait PlaybackService {
     /// later admission draws and sample loading. Cancel retained sources at
     /// that boundary; collected Stop actions still retire their payloads.
     fn stop_playout(&mut self, event: EventId);
+    /// `[ch+0xDC] >> 16` of the channel playing `event`: the current value of
+    /// its combined volume group `ch+0xD8`, which `DSoundBuffer::
+    /// CombineInterps @ 0x00402220` builds from the buffer, event, user,
+    /// many-sounds and master groups at start (`0x0040274F`) and the device
+    /// service `0x00402F60` rebuilds whenever one changes. Its device groups
+    /// add nothing: `+0x68` stays full (`0x00402D3F`) and `+0xE8` is null
+    /// (`0x004022AD`).
+    fn channel_volume(&self, event: EventId) -> i32;
 }
 
 /// The 16-byte `{ SoundEvent*, serial, VocClass*, &g_AudioIndex }` an owner
@@ -388,6 +397,9 @@ pub struct EntryFacts {
     /// The entry holds samples (`+0x134` non-zero, `+0x0C` set). Without
     /// them `UpdateState` state 0 kills its events before they take a channel.
     pub samples_ok: bool,
+    /// `+0x0C` alone: every `Sounds=` name resolved (`AddSample @
+    /// 0x004064A0`). Without it the entry never gets an event at all.
+    pub samples_resolved: bool,
 }
 
 impl EntryFacts {
@@ -437,17 +449,12 @@ pub enum ArbiterAction {
 
 /// Per-channel state. Native fields: `+0x0C` kind, `+0xA0` priority,
 /// `+0xA4` busy flags (`& 0x15` in use, `& 1` actively playing), `+0xC0` the
-/// event that owns it, `+0xDC` the start stamp.
+/// event that owns it. The combined volume `+0xDC` belongs to the output
+/// ([`PlaybackService::channel_volume`]).
 #[derive(Debug, Clone, Copy, Default)]
 struct ChannelRec {
     event: Option<EventId>,
     priority: i32,
-    /// Native `ch+0xDC`. Its writer was not located; its role as a
-    /// monotonically increasing start stamp is inferred from the
-    /// `(bestStamp - stamp) >= 0x666` comparison in `FindAvailable`, and the
-    /// unit of `0x666` is UNCHECKED. VERA uses a monotonic allocation counter,
-    /// so the gap compares allocation age rather than milliseconds.
-    stamp: u32,
     /// `ch+0xA4 & 0x15` — holds an event at all.
     busy: bool,
     /// `ch+0xA4 & 1` — the buffer is actually running.
@@ -537,7 +544,6 @@ pub struct SoundArbiter {
     many_sounds: VolumeInterp,
     /// The owner-held loop handles (`SoundEvent::SetLoopHandle @ 0x004060F0`).
     handles: BTreeMap<HandleOwner, VocHandle>,
-    stamp: u32,
 }
 
 impl SoundArbiter {
@@ -555,7 +561,6 @@ impl SoundArbiter {
             buckets: vec![Vec::new(); PRIORITY_ROWS * VOLUME_BUCKETS],
             many_sounds: VolumeInterp::new(VOLUME_SCALE, now_ms),
             handles: BTreeMap::new(),
-            stamp: 0,
         }
     }
 
@@ -599,6 +604,11 @@ impl SoundArbiter {
     /// its dead events and retries once, then gives up and the cue simply
     /// never plays.
     pub fn submit(&mut self, request: &PlayRequest, now_ms: u64) -> Option<EventId> {
+        // `0x004051B6 CMP [EBX+0xC],EBP; JZ 0x004052CB`: an entry with an
+        // unresolved sample name returns NULL before any pool work.
+        if !request.facts.samples_resolved {
+            return None;
+        }
         let entry = self.entry_index(&request.key);
         self.entries[entry as usize].facts = Some(request.facts);
 
@@ -732,6 +742,18 @@ impl SoundArbiter {
     /// Drop an owner's handle entirely (the owner object is gone).
     pub fn clear_loop_handle(&mut self, owner: HandleOwner) {
         self.handles.remove(&owner);
+    }
+
+    /// A deploy conversion's handle copy: `UnitClass::Deploy @
+    /// 0x00739971..0x007399A4` and `BuildingClass::Mission_Selling @
+    /// 0x0044A0D4..0x0044A107` copy the five handle dwords over the new
+    /// object's, then `SetEvent(old, 0, 0)` leaves the old handle naming
+    /// nothing. The event's own back-pointer (`+0x278`) is not rewritten.
+    pub fn move_loop_handle(&mut self, from: HandleOwner, to: HandleOwner) {
+        match self.handles.remove(&from) {
+            Some(handle) => self.handles.insert(to, handle),
+            None => self.handles.remove(&to),
+        };
     }
 
     /// Owners to re-drive: those whose handle names a live event, and those
@@ -1130,6 +1152,7 @@ impl SoundArbiter {
                 delay_ms: (0, 0),
                 entry_volume_linear: 0,
                 samples_ok: true,
+                samples_resolved: true,
             })
     }
 
@@ -1144,16 +1167,19 @@ impl SoundArbiter {
     ///    `0x00403637`).
     /// 2. Otherwise two candidates are tracked: the lowest-priority channel
     ///    that is *not* actively playing, and the lowest-priority one that
-    ///    is. Among actively-playing channels of **equal** priority the older
-    ///    stamp wins, but only when the gap is at least
-    ///    [`EQUAL_PRIORITY_AGE_GAP`].
+    ///    is. Among actively-playing channels of **equal** priority the
+    ///    quieter combined volume wins (`0x00403661..0x00403675`: `CMP
+    ///    EDX,ESI ; JNC skip ; SUB EBX,EDX ; CMP EBX,0x666 ; JC skip` on the
+    ///    16.16 values, whose whole-number steps of `0x10000` always clear the
+    ///    `0x666` gap); an exact tie keeps the earlier channel.
     /// 3. The non-playing candidate wins unless the playing candidate has a
     ///    strictly lower priority (`CMP [ESP+0x10],EDI ; JLE` at
     ///    `0x004036AA`).
-    fn find_available_channel(&self) -> Option<usize> {
+    fn find_available_channel(&self, playback: &impl PlaybackService) -> Option<usize> {
         let mut best_playing: Option<usize> = None;
         let mut best_playing_priority = 0x7f;
-        let mut best_playing_stamp = u32::MAX;
+        // `OR ESI,0xFFFFFFFF` at `0x00403620`.
+        let mut best_playing_volume = i32::MAX;
         let mut best_idle: Option<usize> = None;
         let mut best_idle_priority = 0x7f;
 
@@ -1162,18 +1188,19 @@ impl SoundArbiter {
                 return Some(index);
             }
             if channel.playing {
+                let volume = channel
+                    .event
+                    .map_or(0, |event| playback.channel_volume(event));
                 if channel.priority < best_playing_priority {
                     best_playing_priority = channel.priority;
-                    best_playing_stamp = channel.stamp;
+                    best_playing_volume = volume;
                     best_playing = Some(index);
-                } else if channel.priority == best_playing_priority
-                    && channel.stamp < best_playing_stamp
-                    && best_playing_stamp - channel.stamp >= EQUAL_PRIORITY_AGE_GAP
+                } else if channel.priority == best_playing_priority && volume < best_playing_volume
                 {
                     // `0x00403677: MOV EDI,ECX ; MOV EBP,EAX ; MOV ESI,EDX` —
                     // all three candidate registers move together.
                     best_playing_priority = channel.priority;
-                    best_playing_stamp = channel.stamp;
+                    best_playing_volume = volume;
                     best_playing = Some(index);
                 }
             } else if channel.priority < best_idle_priority {
@@ -1199,7 +1226,7 @@ impl SoundArbiter {
         priority: i32,
         playback: &mut impl PlaybackService,
     ) -> Option<usize> {
-        let index = self.find_available_channel()?;
+        let index = self.find_available_channel(&*playback)?;
         if self.channels[index].busy && priority < self.channels[index].priority {
             return None;
         }
@@ -1215,11 +1242,9 @@ impl SoundArbiter {
         // channel no longer names it is killed on the spot. That is how a
         // additional equal-priority cue in a full pass silences a cue that
         // took a channel earlier in the same pass.
-        self.stamp = self.stamp.wrapping_add(1);
         self.channels[index] = ChannelRec {
             event: Some(id),
             priority,
-            stamp: self.stamp,
             busy: true,
             playing: false,
         };
@@ -1777,6 +1802,8 @@ impl SoundArbiter {
 #[derive(Default)]
 pub(crate) struct TestPlayback {
     predelay_ms: i32,
+    /// Combined channel volumes; unlisted events read as silent.
+    volumes: BTreeMap<EventId, i32>,
 }
 
 #[cfg(test)]
@@ -1796,17 +1823,21 @@ impl PlaybackService for TestPlayback {
     }
 
     fn stop_playout(&mut self, _: EventId) {}
+
+    fn channel_volume(&self, event: EventId) -> i32 {
+        self.volumes.get(&event).copied().unwrap_or(0)
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
 #[path = "arbiter_move_sound_tests.rs"]
 mod move_sound_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
 #[path = "arbiter_coordinate_tests.rs"]
 pub(super) mod coordinate_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
 mod tests {
     use super::*;
 
@@ -1819,6 +1850,7 @@ mod tests {
             delay_ms: (0, 0),
             entry_volume_linear: VOLUME_SCALE,
             samples_ok: true,
+            samples_resolved: true,
         }
     }
 
@@ -1851,6 +1883,39 @@ mod tests {
             .collect()
     }
 
+    /// `FindAvailable @ 0x004035F0` gives a newcomer the quietest of the
+    /// equal-priority playing channels (`[ch+0xDC]`,
+    /// `0x00403661..0x00403675`); an exact tie keeps the first channel.
+    #[test]
+    fn a_full_pool_evicts_the_quietest_equal_priority_channel() {
+        for (quiet, evicted) in [(Some(5), 5), (None, 0)] {
+            let mut arbiter = SoundArbiter::new(0);
+            let mut playback = TestPlayback::default();
+            let old: Vec<_> = (0..MAX_CHANNELS)
+                .map(|index| {
+                    arbiter
+                        .submit(
+                            &request(&format!("OLD{index}"), facts(2, 0), VOLUME_SCALE),
+                            0,
+                        )
+                        .unwrap()
+                })
+                .collect();
+            let actions = arbiter.update_tick(100, &mut playback);
+            assert_eq!(started(&actions).len(), MAX_CHANNELS);
+            for (index, &event) in old.iter().enumerate() {
+                let volume = if Some(index) == quiet { 0x1000 } else { 0x3000 };
+                playback.volumes.insert(event, volume);
+            }
+            let next = arbiter
+                .submit(&request("NEW", facts(2, 0), VOLUME_SCALE), 110)
+                .unwrap();
+            let actions = arbiter.update_tick(150, &mut playback);
+            assert_eq!(stopped(&actions), [old[evicted]]);
+            assert_eq!(started(&actions), [next]);
+        }
+    }
+
     #[test]
     fn channel_reuse_and_limit_stop_old_playout_before_next_admission() {
         struct BoundaryProbe(Vec<(&'static str, EventId)>);
@@ -1870,6 +1935,9 @@ mod tests {
             }
             fn stop_playout(&mut self, event: EventId) {
                 self.0.push(("stop", event));
+            }
+            fn channel_volume(&self, _: EventId) -> i32 {
+                0
             }
         }
 
@@ -2084,34 +2152,6 @@ mod tests {
         assert_eq!(victims, vec![first]);
     }
 
-    /// Two equal-priority channels: the older one only loses its channel when
-    /// the age gap reaches `0x666` (`CMP EBX,0x666 ; JC skip` at
-    /// `0x0040366F`). Below that gap `FindAvailable` keeps the first
-    /// candidate it saw.
-    #[test]
-    fn equal_priority_channels_need_a_1638_stamp_gap_before_the_older_one_loses() {
-        let mut arbiter = SoundArbiter::new(0);
-        // Fill and start the pool so every channel is `playing`.
-        let mut ids = Vec::new();
-        for index in 0..MAX_CHANNELS {
-            ids.push(
-                arbiter
-                    .submit(&request(&format!("C{index}"), facts(2, 0), VOLUME_SCALE), 0)
-                    .expect("pool slot"),
-            );
-        }
-        arbiter.update_tick(100, &mut TestPlayback::default());
-        // These consecutive stamps are never0x666 apart: the first
-        // candidate (channel 0, the oldest) is kept and it is the one the
-        // newcomer takes.
-        let newcomer = arbiter
-            .submit(&request("NEW", facts(2, 0), VOLUME_SCALE), 200)
-            .expect("pool slot");
-        let actions = arbiter.update_tick(200, &mut TestPlayback::default());
-        assert!(started(&actions).contains(&newcomer));
-        assert_eq!(stopped(&actions), vec![ids[0]]);
-    }
-
     /// `Limit=0` is unlimited (`if (Voc+0x48 != 0 && ...)`).
     #[test]
     fn limit_zero_is_unlimited() {
@@ -2274,7 +2314,14 @@ mod tests {
 
         let event = arbiter.submit(&held, 0).expect("pool slot");
         assert!(
-            started(&arbiter.update_tick(40, &mut TestPlayback { predelay_ms: 300 })).is_empty()
+            started(&arbiter.update_tick(
+                40,
+                &mut TestPlayback {
+                    predelay_ms: 300,
+                    ..Default::default()
+                }
+            ))
+            .is_empty()
         );
         assert!(started(&arbiter.update_tick(200, &mut TestPlayback::default())).is_empty());
         assert!(started(&arbiter.update_tick(400, &mut TestPlayback::default())).contains(&event));
@@ -2288,7 +2335,8 @@ mod tests {
             started(&arbiter.update_tick(
                 40,
                 &mut TestPlayback {
-                    predelay_ms: PREDELAY_FLOOR_MS - 1
+                    predelay_ms: PREDELAY_FLOOR_MS - 1,
+                    ..Default::default()
                 }
             ))
             .contains(&event)
@@ -2301,8 +2349,14 @@ mod tests {
 
         let event = arbiter.submit(&plain, 0).expect("pool slot");
         assert!(
-            started(&arbiter.update_tick(40, &mut TestPlayback { predelay_ms: 300 }))
-                .contains(&event)
+            started(&arbiter.update_tick(
+                40,
+                &mut TestPlayback {
+                    predelay_ms: 300,
+                    ..Default::default()
+                }
+            ))
+            .contains(&event)
         );
     }
 
@@ -2317,7 +2371,13 @@ mod tests {
         let held = request("CUE", delayed, VOLUME_SCALE);
 
         let event = arbiter.submit(&held, 0).expect("pool slot");
-        arbiter.update_tick(10, &mut TestPlayback { predelay_ms: 100 });
+        arbiter.update_tick(
+            10,
+            &mut TestPlayback {
+                predelay_ms: 100,
+                ..Default::default()
+            },
+        );
         arbiter.suspend_all(50);
         // 10 seconds of paused passes: nothing starts, and the service keeps
         // running throughout.
@@ -2647,6 +2707,9 @@ mod tests {
                 true
             }
             fn stop_playout(&mut self, _: EventId) {}
+            fn channel_volume(&self, _: EventId) -> i32 {
+                0
+            }
         }
         let mut arbiter = SoundArbiter::new(0);
         let mut empty = facts(3, 0);

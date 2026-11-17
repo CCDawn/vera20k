@@ -187,7 +187,10 @@ fn computer_crusher_charges_a_crushable_attacker() {
     );
     assert!(!charge(10, &|sim, _, gi| {
         let owner = sim.interner.get("Russians").unwrap();
-        sim.houses.get_mut(&owner).unwrap().is_human = true;
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .set_is_human_for_test(true);
         gi
     }));
     assert!(!charge(10, &|sim, rhino, gi| {
@@ -198,7 +201,7 @@ fn computer_crusher_charges_a_crushable_attacker() {
         gi
     }));
     assert!(!charge(10, &|sim, _, gi| {
-        sim.house_alliances = crate::map::houses::HouseAllianceMap::from([(
+        *sim.house_alliances_mut_for_test() = crate::map::houses::HouseAllianceMap::from([(
             "RUSSIANS".to_string(),
             std::collections::BTreeSet::from(["AMERICANS".to_string()]),
         )]);
@@ -212,12 +215,18 @@ fn computer_crusher_charges_a_crushable_attacker() {
     }));
     assert!(!charge(10, &|sim, _, gi| {
         let owner = sim.interner.get("Russians").unwrap();
-        sim.houses.get_mut(&owner).unwrap().difficulty = HouseDifficulty::Easy;
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .set_difficulty_for_test(HouseDifficulty::Easy);
         gi
     }));
     assert!(!charge(10, &|sim, _, gi| {
         let owner = sim.interner.get("Russians").unwrap();
-        sim.houses.get_mut(&owner).unwrap().current_iq = 1;
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .set_current_iq_for_test(1);
         gi
     }));
     assert!(!charge(10, &|sim, rhino, gi| {
@@ -316,6 +325,7 @@ fn damaged_computer_miner_heads_for_its_refinery() {
         entity.health.set_for_test(health);
         entity.miner.as_mut().unwrap().set_cargo_for_test(vec![
             CargoBale {
+                tiberium_type: crate::rules::tiberium_type::TiberiumTypeId(0),
                 resource_type: ResourceType::Ore,
                 value: 25,
             };
@@ -385,6 +395,7 @@ fn damaged_miner_retreat_consumes_original_signed_storage_fill() {
                 .set_for_test(rules.object("HARV").unwrap().strength / 2);
             entity.miner.as_mut().unwrap().set_cargo_for_test(vec![
                 CargoBale {
+                    tiberium_type: crate::rules::tiberium_type::TiberiumTypeId(0),
                     resource_type: ResourceType::Ore,
                     value: 25
                 };
@@ -463,7 +474,7 @@ fn damage_starts_the_radar_combat_flash() {
         let mut sim = arena(&rules);
         let rhino = spawn(&mut sim, &rules, "HTNK", "Russians", (10, 10));
         let gi = spawn(&mut sim, &rules, "E1", "Americans", (11, 10));
-        let frame = sim.session.binary_frame as i32;
+        let frame = sim.session.binary_frame() as i32;
         hit(&mut sim, &rules, rhino, gi, damage);
         sim.substrate
             .entities

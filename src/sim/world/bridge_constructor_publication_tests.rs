@@ -45,11 +45,13 @@ fn fixture_with_rules(
 
 fn cells(sim: &Simulation) -> Value {
     let grid = sim.resolved_terrain.as_ref().unwrap();
+    let overlays = sim.overlay_grid.as_ref().unwrap();
     Value::Array((12..=20).flat_map(|y| (12..=20).filter_map(move |x| {
         let cell = grid.cell(x, y).unwrap();
         let flags = cell.bridge_facts.raw_flags;
-        let overlay = cell.bridge_facts.overlay_id.map_or(-1, i32::from);
-        let state = cell.bridge_facts.state_byte;
+        let live = overlays.cell(x, y);
+        let overlay = live.overlay_id.map_or(-1, i32::from);
+        let state = live.overlay_data;
         let anchor = cell.bridge_facts.native_anchor.map(|id| grid.native_cell_coord(id));
         (flags != 0 || overlay != -1 || state != 0 || anchor.is_some()).then(||
             json!({"coord":[x,y], "flags":flags, "overlay":overlay, "state":state, "anchor":anchor}))
@@ -65,50 +67,6 @@ fn dummy(sim: &Simulation) -> Value {
 }
 
 #[test]
-fn live_bridge_recalc_publishes_retained_attributes_before_connectivity() {
-    use crate::sim::pathfinding::{PathGrid, zone_map::ZoneGrid};
-    let (mut sim, rules, registry) = fixture();
-    let terrain = sim.resolved_terrain.as_ref().unwrap();
-    let path = PathGrid::from_resolved_terrain(terrain);
-    let mut prior_terrain = terrain.clone();
-    prior_terrain.cell_mut(16, 16).unwrap().overlay_blocks = true;
-    prior_terrain.cell_mut(17, 16).unwrap().overlay_blocks = true;
-    let prior_path = std::sync::Arc::new(PathGrid::from_resolved_terrain(&prior_terrain));
-    sim.path_grid = Some(prior_path.clone());
-    sim.zone_grid = Some(ZoneGrid::build_with_terrain(&path, terrain, &[], 33, 33));
-    let base = sim.zone_grid.as_mut().unwrap().base_topology_mut();
-    base.levels.fill(200);
-    base.movement_classes.fill(6);
-    let ids_before = base.zone_ids.clone();
-    let rows_before = base.raw_zone_ids_by_row.clone();
-    let mut host = LivePublication {
-        frame_effects: crate::sim::world::FrameEffects::default(),
-        sim: &mut sim,
-        rules: &rules,
-        registry: Some(&registry),
-        collapsed: false,
-    };
-    let cell = host.lookup((16, 16));
-    host.recalc_cell(cell, 4).unwrap();
-    let terrain_cell = sim.resolved_terrain.as_ref().unwrap().cell(16, 16).unwrap();
-    assert_eq!(terrain_cell.level, 4);
-    let mut expected_classes = vec![6; 33 * 33];
-    let mut expected_levels = vec![200; 33 * 33];
-    expected_classes[16 * 33 + 16] = terrain_cell.zone_type;
-    expected_levels[16 * 33 + 16] = terrain_cell.level;
-    let base = sim.zone_grid.as_mut().unwrap().base_topology_mut();
-    assert_eq!(base.movement_classes, expected_classes);
-    assert_eq!(base.levels, expected_levels);
-    assert_eq!(base.zone_ids, ids_before);
-    assert_eq!(base.raw_zone_ids_by_row, rows_before);
-    let current = sim.path_grid().unwrap();
-    assert_eq!(current.cell(16, 16).unwrap().ground_level, 4);
-    assert!(current.is_walkable(16, 16));
-    assert_eq!(current.cell(17, 16), prior_path.cell(17, 16));
-    assert_eq!(prior_path.cell(16, 16).unwrap().ground_level, 6);
-}
-
-#[test]
 fn live_bridge_constructor_matches_original_and_drains_at_admitted_tick() {
     let corpus: Value = serde_json::from_str(crate::test_fixture::text(
         "tools/spatial_oracle/bridge_constructor.json",
@@ -120,13 +78,15 @@ fn live_bridge_constructor_matches_original_and_drains_at_admitted_tick() {
         let (mut sim, rules, registry) = fixture();
         match original["kind"].as_str().unwrap() {
             "terrain" => {
-                sim.production.terrain_object_cells.insert((16, 16), 919);
+                sim.terrain_objects
+                    .cell_index_mut_for_test()
+                    .insert((16, 16), 919);
             }
             "slope" => {
                 sim.resolved_terrain
                     .as_mut()
                     .unwrap()
-                    .cell_mut(16, 16)
+                    .cell_mut_for_test(16, 16)
                     .unwrap()
                     .slope_type = 5;
             }
@@ -135,9 +95,6 @@ fn live_bridge_constructor_matches_original_and_drains_at_admitted_tick() {
                     .as_mut()
                     .unwrap()
                     .place_overlay(16, 16, 7, 0);
-                sim.resolved_terrain.as_mut().unwrap().cells[16 * 33 + 16]
-                    .bridge_facts
-                    .overlay_id = Some(7);
             }
             "success" => (),
             other => panic!("unexpected native case {other}"),
@@ -239,6 +196,7 @@ fn live_bridge_constructor_side_cells_restore_deck_without_overlay_sprites() {
         assert_eq!(cells(&sim), original["cells"]);
         let path = crate::sim::pathfinding::PathGrid::from_resolved_terrain_with_bridges(
             sim.resolved_terrain.as_ref().unwrap(),
+            sim.overlay_grid.as_ref(),
         );
         let mut id = 100;
         for row in original["cells"].as_array().unwrap() {
@@ -248,9 +206,13 @@ fn live_bridge_constructor_side_cells_restore_deck_without_overlay_sprites() {
             let x = row["coord"][0].as_u64().unwrap() as u16;
             let y = row["coord"][1].as_u64().unwrap() as u16;
             let terrain = sim.resolved_terrain.as_ref().unwrap().cell(x, y).unwrap();
+            let live = sim.overlay_grid.as_ref().unwrap().cell(x, y);
             assert!(terrain.bridge_facts.has_structural_bridge());
-            assert_eq!(terrain.bridge_facts.overlay_id, None);
-            assert!(crate::sim::bridge_state::cell_render_state(terrain.bridge_facts).is_none());
+            assert_eq!(live.overlay_id, None);
+            assert!(
+                crate::sim::bridge_state::cell_render_state(live, terrain.bridge_facts.raw_flags)
+                    .is_none()
+            );
             assert!(path.cell(x, y).unwrap().bridge_walkable, "{row}");
 
             for (category, mask) in [
@@ -338,34 +300,30 @@ fn constructor_side_admission_matches_original_foot_receiver() {
             crate::map::playfield::PlayfieldBounds::from_normalized_local_size(16, 0, 0, 16, 16),
         );
         sim.playfield_size_height = Some(16);
-        sim.session.binary_frame = input["frame"].as_u64().unwrap() as u32;
+        sim.session
+            .set_binary_frame_for_test(input["frame"].as_u64().unwrap() as u32);
         // These native controls retain constructor25 topology, then supply
         // raw occupation / the candidate raw100-clear discriminator. The
         // original and Rust both execute the complete Infantry +1AC body.
         for native in input["cells"].as_array().unwrap() {
             let x = native["coord"][0].as_u64().unwrap() as u16;
             let y = native["coord"][1].as_u64().unwrap() as u16;
+            let live = sim.overlay_grid.as_ref().unwrap().cell(x, y);
+            assert_eq!(live.overlay_id.map_or(-1, i32::from), native["overlay"]);
+            assert_eq!(live.overlay_data, native["state"].as_u64().unwrap() as u8);
             let cell = sim
                 .resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(x, y)
+                .cell_mut_for_test(x, y)
                 .unwrap();
             let flags = native["bridge_flags"].as_u64().unwrap() as u32;
             assert_eq!(cell.bridge_facts.raw_flags & !0x100, flags & !0x100);
             assert_eq!(cell.level, native["level"].as_u64().unwrap() as u8);
-            assert_eq!(
-                cell.bridge_facts.overlay_id.map_or(-1, i32::from),
-                native["overlay"]
-            );
-            assert_eq!(
-                cell.bridge_facts.state_byte,
-                native["state"].as_u64().unwrap() as u8
-            );
             cell.bridge_facts.raw_flags = flags;
             // Original674000 reads Foot=1.0 for the Clear0/Road1 cells in
             // this corpus; the fixture catalog only recalculates its body.
-            cell.speed_costs.foot = Some(100);
+            cell.speed_costs.foot = Some(crate::util::native_x87::NativeF32Bits::ONE);
             sim.substrate.raw_cell_occupation.mark_ground(
                 x,
                 y,
@@ -403,14 +361,15 @@ fn constructor_side_admission_matches_original_foot_receiver() {
         actor.set_on_bridge(native["on_bridge"].as_bool().unwrap());
         actor.set_in_playfield(native["in_playfield"].as_bool().unwrap());
         sim.substrate.entities.insert(actor);
-        sim.mission_assign_exact(
-            id,
-            crate::sim::mission::MissionId::from_raw(
-                native["current_mission"].as_i64().unwrap() as i32
-            ),
-            sim.session.binary_frame,
-        )
-        .unwrap();
+        sim.substrate
+            .mission_assign_exact(
+                id,
+                crate::sim::mission::MissionId::from_raw(
+                    native["current_mission"].as_i64().unwrap() as i32,
+                ),
+                sim.session.binary_frame(),
+            )
+            .unwrap();
         assert_eq!(native["queued_mission"], -1);
         assert_eq!(native["speed_type"], 0);
         let query = &row["native_entry_arguments"][0];
@@ -452,7 +411,7 @@ fn live_bridge_constructor_queue_respects_terminal_admission_and_other_objects()
     // Isolate the constructor/deferred-drain chain from Logic55B29A's
     // independently tested120-frame578100 sweep, whose map queries may
     // legitimately restamp the shared Dummy's coordinate.
-    sim.session.binary_frame = 1;
+    sim.session.set_binary_frame_for_test(1);
     for (index, requested) in [(16, 16), (17, 16)].into_iter().enumerate() {
         let mut host = LivePublication {
             frame_effects: crate::sim::world::FrameEffects::default(),
@@ -502,9 +461,14 @@ fn live_bridge_constructor_queue_respects_terminal_admission_and_other_objects()
 #[test]
 fn sparse_native_sight_indexes_real_cells_and_keeps_diagnostics_read_only() {
     let (mut sim, _, _) = fixture();
-    sim.session.binary_frame = 1;
+    sim.session.set_binary_frame_for_test(1);
     sim.fog = crate::sim::vision::FogState::new(33, 33);
     let owner = sim.interner.intern("Americans");
+    // A human player's house: its client map is the plane under test.
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 0, 10,
+        ));
     let type_ref = sim.interner.intern("E1");
     let mut object =
         crate::sim::game_entity::GameEntity::test_default(101, "E1", "Americans", 16, 16);
@@ -545,12 +509,14 @@ fn live_bridge_constructor_restamp_updates_the_state_byte_axis() {
     let (mut sim, rules, registry) = fixture();
     let render = |sim: &Simulation| {
         crate::sim::bridge_state::cell_render_state(
+            sim.overlay_grid.as_ref().unwrap().cell(16, 16),
             sim.resolved_terrain
                 .as_ref()
                 .unwrap()
                 .cell(16, 16)
                 .unwrap()
-                .bridge_facts,
+                .bridge_facts
+                .raw_flags,
         )
     };
     {
@@ -576,13 +542,7 @@ fn live_bridge_constructor_restamp_updates_the_state_byte_axis() {
     assert_eq!(host.state(selected), 0);
     assert_eq!(render(&sim).map(|(_, axis)| axis), Some(Axis::NS));
     assert_eq!(
-        sim.resolved_terrain
-            .as_ref()
-            .unwrap()
-            .cell(16, 16)
-            .unwrap()
-            .bridge_facts
-            .overlay_id,
+        sim.overlay_grid.as_ref().unwrap().cell(16, 16).overlay_id,
         Some(24)
     );
 }

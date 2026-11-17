@@ -1,13 +1,12 @@
 //! Action4/7 Team creation, with the existing VM, Techno constructor, class
-//! Unlimbo, admission and destructor owners. Original YR1.001 SHA256
-//! 1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c:
+//! Unlimbo, admission and destructor owners. Original YR1.001:
 //! CreateTeam6F09C0, SpawnReinforcements65D8E0, CreateMembers65DD30 and
 //! PlaceMembers65E010. Executable controls: tools/spatial_oracle/team_creation.
 //!
 //! Normal TaskForce and Full hover-transport chains share construction,
 //! membership, cargo, placement and scalar cleanup owners. Droppod uses the
-//! existing paradrop carrier/flight/departure owners; Full storage fill remains
-//! a separate mechanism and refuses explicitly. Team
+//! existing paradrop carrier/flight/departure owners. Full mineral storage uses
+//! the existing miner hold; other four-slot float storage refuses explicitly. Team
 //! retention of an off-map Dummy Cell identity remains a TeamTarget residual.
 
 use super::{TeamScriptAction, TeamTarget, TeamTypeHouse};
@@ -15,25 +14,75 @@ use crate::map::entities::EntityCategory;
 use crate::rules::locomotor_type::MovementZone;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
+use crate::rules::tiberium_type::TiberiumTypeId;
 use crate::sim::components::DriveCoord;
 use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
 use crate::sim::intern::InternedId;
+use crate::sim::miner::CargoBale;
 use crate::sim::mission::MissionType;
 use crate::sim::movement::infantry_entry::{EntryQueryMode, InfantryEntryArgs};
 use crate::sim::movement::teleport_movement::ChronoWarp;
+use crate::sim::tiberium::resource_type_for_tiberium_slot;
 use crate::sim::world::{FrameEffects, PlacementEvidence, Simulation, UninitContext};
 
 impl Simulation {
     /// GetHouse6F2070: fixed Country attachment, otherwise the native
-    /// Scenario1180 start-slot mapping used by Player@A..H510ED0. Country
+    /// Scenario1180 start-slot mapping used by Player@A..H510ED0 (VERA
+    /// extends this to A..AD). Country
     /// resolution uses House array order502D30, never sorted owner names.
-    fn team_type_house(&self, team_type: InternedId, rules: &RuleSet) -> Option<InternedId> {
+    /// Sole owner of the TeamType -> House projection; shared read-only with
+    /// the defeat gate's armed-reinforcement scan
+    /// (`Simulation::house_has_armed_future_reinforcements`).
+    pub(crate) fn team_type_house(
+        &self,
+        team_type: InternedId,
+        rules: &RuleSet,
+    ) -> Option<InternedId> {
         match self.team_script_vm.team_type_ini.get(&team_type)?.house? {
             TeamTypeHouse::Country(country) => self.house_by_country_index(country, rules),
-            TeamTypeHouse::PlayerAt(slot) => {
-                self.house_by_trigger_selector(0x117B + i32::from(slot), rules)
-            }
+            TeamTypeHouse::PlayerAt(slot) => self.house_by_trigger_selector(
+                crate::rules::native_processing::HOUSE_TYPE_PLAYER_AT_SELECTORS.start
+                    + i32::from(slot),
+                rules,
+            ),
         }
+    }
+
+    /// Whether the TeamType's `House=` is a lobby-selector name — the
+    /// `PlayerAt` arm of the projection above, minted only from
+    /// `house_type_player_at` tokens whose slots sit inside
+    /// `HOUSE_TYPE_PLAYER_AT_SELECTORS` (0x117B..+8), never from a country
+    /// name. Shared read-only with the defense-map classification's
+    /// environmental-wave exclusion.
+    pub(crate) fn team_type_house_is_selector(&self, team_type: InternedId) -> bool {
+        matches!(
+            self.team_script_vm
+                .team_type_ini
+                .get(&team_type)
+                .and_then(|metadata| metadata.house),
+            Some(TeamTypeHouse::PlayerAt(_))
+        )
+    }
+
+    /// Ares 3.0 TeamTypeClass_ValidateHouse (1005D170, hooks 0x65D8FB and
+    /// 0x65EC4A), at the entry of both reinforcement owners: the TeamType's
+    /// House (GetHouse) must exist, and unless the TeamType names a Country
+    /// (`+0xC4`) or this is a campaign, must not be defeated.
+    fn ares_reinforcement_house_valid(&self, team_type: InternedId, rules: &RuleSet) -> bool {
+        let Some(house) = self.team_type_house(team_type, rules) else {
+            return false;
+        };
+        let country = self
+            .team_script_vm
+            .team_type_ini
+            .get(&team_type)
+            .is_some_and(|metadata| matches!(metadata.house, Some(TeamTypeHouse::Country(_))));
+        country
+            || !self.session.game_mode_nonzero()
+            || !self
+                .houses
+                .get(&house)
+                .is_some_and(|state| state.is_defeated())
     }
 
     fn team_initial_zone(&self, team_type: InternedId) -> Option<TeamTarget> {
@@ -54,14 +103,23 @@ impl Simulation {
         explicit_owner: Option<InternedId>,
         rules: &RuleSet,
     ) -> Option<u64> {
-        let owner = explicit_owner.or_else(|| self.team_type_house(team_type, rules))?;
+        let owner = match explicit_owner.or_else(|| self.team_type_house(team_type, rules)) {
+            Some(owner) => owner,
+            None => {
+                self.note_trigger_failure(format!(
+                    "team {}: owner not resolvable (lobby slot house missing?)",
+                    self.interner.resolve(team_type)
+                ));
+                return None;
+            }
+        };
         let zone = self.team_initial_zone(team_type);
         let placement_scope_active = self.object_placement_scope_active();
         let id = self.team_script_vm.construct_team(
             team_type,
             owner,
-            self.session.game_mode_nonzero,
-            self.session.binary_frame as i32,
+            self.session.game_mode_nonzero(),
+            self.session.binary_frame() as i32,
             placement_scope_active,
             zone,
         )?;
@@ -69,6 +127,25 @@ impl Simulation {
         // TagType ordinal; never re-find it through a copied raw name.
         self.attach_team_trigger_tag(id, team_type);
         Some(id)
+    }
+
+    /// `TeamClass::TeamClass @ 0x006E8A90` called directly, with no `Max=`
+    /// gate: Reinforcement65DD30 and team script action 18 (`0x006E96E4`).
+    /// The constructor takes the TeamType's initial waypoint and its own Tag.
+    pub(crate) fn construct_team_unlimited(
+        &mut self,
+        team_type: InternedId,
+        owner: InternedId,
+    ) -> Option<u64> {
+        let zone = self.team_initial_zone(team_type);
+        let team = self.team_script_vm.construct_team_instance(
+            team_type,
+            owner,
+            self.session.binary_frame() as i32,
+            zone,
+        )?;
+        self.attach_team_trigger_tag(team, team_type);
+        Some(team)
     }
 
     /// Trigger4 original6DEB6B brackets CreateTeam with A8E7AC. Recruiting
@@ -95,6 +172,9 @@ impl Simulation {
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> (bool, Option<(i16, i16)>) {
+        if rules.ares_form() && !self.ares_reinforcement_house_valid(team_type, rules) {
+            return (false, None);
+        }
         let Some(definition) = self.team_script_vm.team_types.get(&team_type).copied() else {
             return (false, None);
         };
@@ -130,6 +210,10 @@ impl Simulation {
             return (false, None);
         };
         let Some(owner) = self.team_type_house(team_type, rules) else {
+            self.note_trigger_failure(format!(
+                "team {}: owner not resolvable (lobby slot house missing?)",
+                self.interner.resolve(team_type)
+            ));
             return (false, None);
         };
         let waypoint = if waypoint_override == -1 {
@@ -138,10 +222,90 @@ impl Simulation {
             waypoint_override
         };
         let origin = self.session.waypoint_cell(waypoint).unwrap_or((0, 0));
+        //65D9E6..65DB20: before ordinary placement, an all-Infantry chain
+        //with a nonzero origin can leave through a nearby building. This is
+        //the live-game47C520 query; keep its ground-list and last-match order.
+        let receiver = if !metadata.droppod
+            && origin != (0, 0)
+            && members.iter().all(|&id| {
+                self.substrate
+                    .entities
+                    .get(id)
+                    .is_some_and(|member| member.category() == EntityCategory::Infantry)
+            }) {
+            self.resolved_terrain.as_ref().and_then(|terrain| {
+                use crate::map::resolved_terrain::NativeCellQuery;
+                use crate::sim::movement::locomotor::MovementLayer;
+
+                let cells = NativeCellQuery::canonical(terrain);
+                let origin_cell = cells.lookup(origin);
+                let mut receiver = None;
+                for direction in std::iter::once(None).chain((0..8).map(Some)) {
+                    let cell = if let Some(direction) = direction {
+                        //Adjacent_Cell rereads the retained origin CellClass;
+                        //a miss may have restamped its shared-dummy coordinate.
+                        let base = cells.coord(origin_cell);
+                        let (dx, dy) = crate::util::direction::DIRECTION_DELTAS[direction];
+                        cells.lookup((
+                            base.0.wrapping_add(dx as i16),
+                            base.1.wrapping_add(dy as i16),
+                        ))
+                    } else {
+                        origin_cell
+                    };
+                    let at = cells.coord(cell);
+                    let Some(building) = self.substrate.occupancy.first_building_on_layer(
+                        at.0 as u16,
+                        at.1 as u16,
+                        MovementLayer::Ground,
+                    ) else {
+                        continue;
+                    };
+                    if self
+                        .substrate
+                        .entities
+                        .get(building)
+                        .is_some_and(|building| building.health.current() > 0)
+                        && crate::sim::docking::building_dock::building_has_clear_foundation_exit(
+                            self, building, rules,
+                        )
+                    {
+                        receiver = Some(building);
+                    }
+                }
+                receiver
+            })
+        } else {
+            None
+        };
+        if let Some(receiver) = receiver {
+            let mut placed_any = false;
+            for member in members {
+                if crate::sim::production::exit_produced_object(
+                    self, rules, receiver, member, origin, registry, effects,
+                ) == crate::sim::ai_base_building::BuildingExit::Placed
+                {
+                    let _ = crate::sim::radio::transmit_to_contact(
+                        self,
+                        receiver,
+                        crate::sim::radio::RadioMessage::Break,
+                        rules,
+                        effects,
+                    );
+                    placed_any = true;
+                } else {
+                    //65DB07 invokes the scalar destructor, not UnInit or
+                    //ReceiveDamage: no loss bookkeeping for a refused member.
+                    self.discard_constructed_limbo(member, rules, effects);
+                }
+            }
+            //This early return bypasses both65E010 and the review-cell ring.
+            return (placed_any, None);
+        }
         let nearby = waypoint_override != -1
             && crate::sim::cell_rect::cell_is_in_playfield_height_aware(
                 (i32::from(origin.0), i32::from(origin.1)),
-                self.playfield_bounds,
+                self.playfield_bounds(),
                 self.resolved_terrain.as_ref(),
             );
         let placed = if metadata.droppod {
@@ -161,11 +325,9 @@ impl Simulation {
             .current_house()
             .filter(|&current| {
                 placed
-                    && crate::map::houses::is_allied_with(
-                        &self.house_alliances,
-                        self.interner.resolve(owner),
-                        self.interner.resolve(current),
-                    )
+                    && self
+                        .house_alliances
+                        .is_allied(&self.interner, owner, current)
             })
             .map(|_| origin);
         //65DB9C returns true regardless of PlaceMembers' result. Ordinary
@@ -175,7 +337,7 @@ impl Simulation {
     }
 
     /// Chrono reinforcement65EC30, called by Action107. Original active-YR
-    /// Steam3e81a617..08600; executable controls are maintained by
+    /// Steam gamemd; executable controls are maintained by
     /// tools.spatial_oracle.trigger_action_values --chrono-reinforcement.
     /// This shares65DD30's
     /// member constructor and the existing placement, ammo, COM/piggyback and
@@ -196,6 +358,9 @@ impl Simulation {
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> (bool, Option<(i16, i16)>) {
+        if rules.ares_form() && !self.ares_reinforcement_house_valid(team_type, rules) {
+            return (false, None);
+        }
         let Some(definition) = self.team_script_vm.team_types.get(&team_type).copied() else {
             return (false, None);
         };
@@ -240,7 +405,7 @@ impl Simulation {
             waypoint_override
         };
         let origin = self.session.waypoint_cell(waypoint).unwrap_or((0, 0));
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         let mut successes = Vec::with_capacity(members.len());
         for member in members {
             let actor = self
@@ -316,11 +481,19 @@ impl Simulation {
                     .expect("native FNPC Cell coordinates");
                 cell = (center.x / 256, center.y / 256);
                 landing = if !unit && !aircraft {
-                    self.place_infantry_spot_in_cell(rules, identity, center)
-                        .unwrap_or_else(|error| {
-                            log::warn!("Chrono reinforcement subcell: {error}");
-                            None
-                        })
+                    Self::place_infantry_spot_in_cell(
+                        &self.interner,
+                        &mut self.scenario_rng,
+                        &self.substrate,
+                        &self.resolved_terrain,
+                        rules,
+                        identity,
+                        center,
+                    )
+                    .unwrap_or_else(|error| {
+                        log::warn!("Chrono reinforcement subcell: {error}");
+                        None
+                    })
                 } else {
                     Some(center)
                 };
@@ -335,7 +508,7 @@ impl Simulation {
                     member,
                     coord,
                     0,
-                    PlacementEvidence::UnitEntryAdmitted,
+                    PlacementEvidence::FootEntryAdmitted,
                     rules,
                     registry,
                     effects,
@@ -344,7 +517,7 @@ impl Simulation {
             });
             if !placed {
                 //65F016 decrements A8E7AC before the scalar deleting destructor.
-                self.discard_constructed_limbo(member, Some(rules), effects);
+                self.discard_constructed_limbo(member, rules, effects);
                 continue;
             }
             let locomotor = self
@@ -381,7 +554,7 @@ impl Simulation {
             return (false, None);
         }
         for member in successes.into_iter().rev() {
-            self.foot_mark_remove(member, Some(rules), registry, effects);
+            self.foot_mark_remove(member, rules, registry, effects);
             //65F29F publishes pending3 after Mark0 and before Commence5B3570.
             //The same warp payload carries that pending value until state7.
             self.substrate
@@ -396,17 +569,14 @@ impl Simulation {
                 .chrono_mut()
                 .unwrap()
                 .set_pending_state(3);
-            let _ = self.mission_commence_exact(member, frame);
+            let _ = self.substrate.mission_commence_exact(member, frame);
         }
         let review = self.team_type_house(team_type, rules).and_then(|owner| {
             self.session
                 .current_house()
                 .filter(|&current| {
-                    crate::map::houses::is_allied_with(
-                        &self.house_alliances,
-                        self.interner.resolve(owner),
-                        self.interner.resolve(current),
-                    )
+                    self.house_alliances
+                        .is_allied(&self.interner, owner, current)
                 })
                 .map(|_| origin)
         });
@@ -418,7 +588,7 @@ impl Simulation {
     /// not replace their locomotors or manufacture another set of infantry.
     /// Constructor then edge pick then mission/target then scoped Unlimbo
     /// then whole cargo attach and direct Commence preserve the native order.
-    /// Steam3e81a617..08600, original literals/slots/reader packet in the
+    /// Steam gamemd, original literals/slots/reader packet in the
     /// ALL01 handoff; aircraft/paradrop owners carry the subsequent lifecycle.
     fn place_paradrop_reinforcement_members(
         &mut self,
@@ -436,17 +606,6 @@ impl Simulation {
         let Some(&head) = members.first() else {
             return false;
         };
-        let plane_type = crate::sim::superweapon::paradrop::PDPLANE;
-        if rules
-            .object_in_category(ObjectCategory::Aircraft, plane_type)
-            .is_none()
-        {
-            // Native FindIndex(-1) would dereference before the Aircraft
-            // array. A missing literal type is outside a valid retail rules
-            // closure; retain explicit diagnostics instead of a fake plane.
-            log::warn!("Droppod reinforcement requires native aircraft type {plane_type}");
-            return false;
-        }
         //65DBD0 reads the returned head's live owner, not a copied TeamType
         // Country or current player. The carrier itself never joins the Team.
         let Some(owner) = self
@@ -457,6 +616,21 @@ impl Simulation {
         else {
             return false;
         };
+        // Ares 3.0 TeamTypeClass_CreateInstance_Plane (1003A340, hook
+        // 0x65DBB3): that owner's GetParadropPlane replaces the PDPLANE
+        // literal.
+        let plane_type =
+            crate::sim::superweapon::paradrop::house_paradrop_plane(self, rules, owner);
+        if rules
+            .object_in_category(ObjectCategory::Aircraft, plane_type)
+            .is_none()
+        {
+            // Native FindIndex(-1) would dereference before the Aircraft
+            // array. A missing literal type is outside a valid retail rules
+            // closure; retain explicit diagnostics instead of a fake plane.
+            log::warn!("Droppod reinforcement requires native aircraft type {plane_type}");
+            return false;
+        }
         let owner_name = self.interner.resolve(owner).to_string();
         let plane = self.with_object_placement_scope(|sim| {
             sim.construct_object_limbo_at_height(
@@ -501,16 +675,16 @@ impl Simulation {
                 .get(head)
                 .map(|entity| entity.owner())
             else {
-                self.discard_constructed_limbo(plane, Some(rules), effects);
+                self.discard_constructed_limbo(plane, rules, effects);
                 return false;
             };
             let (authored, waypoint) = self.houses.get(&owner).map_or((-1, 0), |house| {
-                (house.authored_edge(), house.waypoint_edge)
+                (house.authored_edge(), house.waypoint_edge())
             });
             let Some(cell) =
                 self.aircraft_edge_cell(Edge::authored_or_waypoint(authored, waypoint))
             else {
-                self.discard_constructed_limbo(plane, Some(rules), effects);
+                self.discard_constructed_limbo(plane, rules, effects);
                 return false;
             };
             (cell.0 as i16, cell.1 as i16)
@@ -541,7 +715,7 @@ impl Simulation {
         if !placed {
             //65DD08 deletes only the carrier. The already constructed Team
             //members remain held; no additional UnInit/kill is invented.
-            self.discard_constructed_limbo(plane, Some(rules), effects);
+            self.discard_constructed_limbo(plane, rules, effects);
             return false;
         }
         let cargo_members: Vec<_> = members
@@ -563,7 +737,7 @@ impl Simulation {
         let loaded = self.add_cargo_passenger_chain(
             plane,
             &cargo_members,
-            UninitContext::new(Some(rules), registry).with_effects(effects),
+            UninitContext::new(rules, registry).with_effects(effects),
         );
         assert!(
             loaded,
@@ -579,7 +753,9 @@ impl Simulation {
         }
         //65DCF9 invokes Aircraft Commence41B870 directly, with no Ready
         //query, after the entire payload attaches. Use the sole mission owner.
-        let _ = self.mission_commence_exact(plane, self.session.binary_frame);
+        let _ = self
+            .substrate
+            .mission_commence_exact(plane, self.session.binary_frame());
         true
     }
 
@@ -606,12 +782,19 @@ impl Simulation {
             .get(&definition.task_force_id)?
             .entries
             .clone();
-        // Full65DE53..65DE80 fills StorageClass before veterancy and
-        // AddMember. The selected ALL01 types must pass the production
-        // scenario reader's Storage0 boundary; the mineral/bale migration
-        // does not represent
-        // this arbitrary four-slot float fill. Preserve an explicit boundary
-        // instead of inventing a second storage owner for other Full teams.
+        let full_cargo = metadata
+            .full
+            .then(|| {
+                let slot = TiberiumTypeId(0);
+                let ty = rules.tiberium_types.get(slot)?;
+                CargoBale::of_type(slot, resource_type_for_tiberium_slot(ty.id), rules)
+            })
+            .flatten();
+        // CreateMembers65DE53..65DE80 fills literal Storage slot0 of every
+        // member whose Type.Storage > 0 (miners, SLAV, WEEDGUY) before
+        // veterancy/AddMember. The whole-bale hold has no room for a capacity
+        // beyond u16 and no bale without a slot0 descriptor; these refusals
+        // are representation boundaries, not native admission rules.
         if metadata.full
             && entries.iter().any(|entry| {
                 entry.count > 0
@@ -620,24 +803,24 @@ impl Simulation {
                             entry.member_type.category,
                             self.interner.resolve(entry.member_type.id),
                         )
-                        .is_some_and(|object| object.storage > 0)
+                        .is_some_and(|object| {
+                            object.storage > 0
+                                && (u16::try_from(object.storage).is_err() || full_cargo.is_none())
+                        })
             })
         {
+            self.note_trigger_failure(format!(
+                "team {}: Full StorageClass fill is unported",
+                self.interner.resolve(team_type)
+            ));
             log::warn!(
-                "TeamType {} Full StorageClass fill is unported",
+                "TeamType {} Full StorageClass fill exceeds the represented hold",
                 self.interner.resolve(team_type)
             );
             return None;
         }
         let owner = self.team_type_house(team_type, rules)?;
-        let zone = self.team_initial_zone(team_type);
-        let team = self.team_script_vm.construct_team_instance(
-            team_type,
-            owner,
-            self.session.binary_frame as i32,
-            zone,
-        )?;
-        self.attach_team_trigger_tag(team, team_type);
+        let team = self.construct_team_unlimited(team_type, owner)?;
         let state = self
             .team_script_vm
             .teams
@@ -667,10 +850,21 @@ impl Simulation {
         let mut transports = Vec::new();
         for entry in entries {
             let type_name = self.interner.resolve(entry.member_type.id).to_string();
+            let Some(object) = rules.object_in_category(entry.member_type.category, &type_name)
+            else {
+                continue;
+            };
+            let full_storage = if metadata.full {
+                object.storage.max(0)
+            } else {
+                0
+            };
             for _ in 0..entry.count {
+                // CreateMembers65DE36 calls the retained TaskForce Type's
+                // CreateObject virtual, shared with the existing typed ctor.
                 let member = self.with_object_placement_scope(|sim| {
-                    sim.construct_object_limbo_at_height(
-                        &type_name,
+                    sim.construct_resolved_object_limbo_at_height(
+                        object,
                         &owner_name,
                         0,
                         0,
@@ -688,6 +882,16 @@ impl Simulation {
                     .entities
                     .get_mut(member)
                     .expect("constructed member");
+                // CreateMembers65DE7B calls StorageClass::AddAmount6C9690
+                // after the concrete ctor zeroes storage, before veterancy.
+                // Positive u16 capacities are exact in the native f32 slot.
+                if full_storage > 0 {
+                    entity.add_storage_bales(
+                        full_cargo.expect("Full storage preflight resolved slot0"),
+                        u16::try_from(full_storage)
+                            .expect("Full storage preflight bounded capacity"),
+                    );
+                }
                 match metadata.veteran_level {
                     0 => entity.veterancy.set_rookie(),
                     2 => entity.veterancy.set_veteran(),
@@ -748,7 +952,7 @@ impl Simulation {
                 let loaded = self.add_cargo_passenger_chain(
                     transport,
                     &cargo_members,
-                    UninitContext::new(Some(rules), registry).with_effects(effects),
+                    UninitContext::new(rules, registry).with_effects(effects),
                 );
                 assert!(
                     loaded,
@@ -828,7 +1032,18 @@ impl Simulation {
         let mut placed_any = false;
         for &member in members {
             if cell == (0, 0) {
-                self.discard_constructed_limbo(member, Some(rules), effects);
+                // Residual: a member that fails all eight directions, or whose
+                // search returns Cell (0,0) (65E5DC..65E5F4), is deleted at
+                //65E5A4; 65E5AE..65E5D7 moves on to the next member and the
+                //65E611 cleanup deletes only those after it, so native leaves
+                // that next member constructed in limbo and in the Team. VERA
+                // discards it too, and keeps the (0,0) member in limbo. Fresh
+                // members never get there: with A8E7AC raised, Unlimbo
+                // (Object5F4EC0, Foot Mark4D3780 ->5F5850, Infantry51E027
+                // priority spot) cannot refuse a cell-centre coordinate.
+                #[cfg(any(test, feature = "dev-overlays"))]
+                self.trace_placement_refused(cell);
+                self.discard_constructed_limbo(member, rules, effects);
                 continue;
             }
             let aircraft = self
@@ -862,7 +1077,7 @@ impl Simulation {
                             member,
                             coord,
                             facing,
-                            PlacementEvidence::UnitEntryAdmitted,
+                            PlacementEvidence::FootEntryAdmitted,
                             rules,
                             registry,
                             effects,
@@ -903,7 +1118,9 @@ impl Simulation {
                                 .then_some(candidate)
                         });
                     if next.is_none() {
-                        sim.discard_constructed_limbo(member, Some(rules), effects);
+                        #[cfg(any(test, feature = "dev-overlays"))]
+                        sim.trace_placement_refused(cell);
+                        sim.discard_constructed_limbo(member, rules, effects);
                     }
                     (false, next)
                 });

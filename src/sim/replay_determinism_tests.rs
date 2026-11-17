@@ -5,6 +5,8 @@
 //! since F09, so this coverage must live inside the lib test harness.
 
 use crate::map::entities::{EntityCategory, MapEntity};
+use crate::rules::ini_parser::IniFile;
+use crate::rules::ruleset::RuleSet;
 use crate::sim::command::{Command, CommandEnvelope};
 use crate::sim::pathfinding::PathGrid;
 use crate::sim::replay::{ReplayHeader, ReplayLog, ReplayRunner};
@@ -12,9 +14,20 @@ use crate::sim::world::Simulation;
 
 const TICK_MS: u32 = 33;
 
-fn make_test_sim() -> Simulation {
+/// The map tank's type: a tracked Drive vehicle.
+fn replay_rules() -> RuleSet {
+    RuleSet::from_ini(&IniFile::from_str(
+        "[VehicleTypes]\n0=MTNK\n[MTNK]\nStrength=400\nSpeed=6\nSpeedType=Track\n\
+         MovementZone=Normal\nLocomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n",
+    ))
+    .expect("replay fixture rules")
+}
+
+/// The tank on flat ground, and the ground's path grid.
+fn make_test_sim(rules: &RuleSet) -> (Simulation, PathGrid) {
     let mut sim = Simulation::with_seed(123_456);
     sim.hash_state_every(std::num::NonZeroU64::MIN);
+    let grid = crate::sim::arena_fixture::flat_ground(&mut sim, rules);
     let entity = MapEntity {
         owner: "Americans".to_string(),
         type_id: "MTNK".to_string(),
@@ -29,14 +42,16 @@ fn make_test_sim() -> Simulation {
         mission: None,
         recruitable_a: true,
         recruitable_b: true,
-        structure_upgrades: [None, None, None],
+        group: -1,
+        follows: None,
+        structure_columns: Default::default(),
         structure_ai_sellable: false,
         structure_ai_repairable: false,
         structure_online: true,
         trigger_tag: None,
     };
-    sim.spawn_from_map(&[entity], None);
-    sim
+    sim.spawn_from_map(&[entity], Some(rules));
+    (sim, grid)
 }
 
 fn make_move_command() -> CommandEnvelope {
@@ -52,13 +67,13 @@ fn make_move_command() -> CommandEnvelope {
 }
 
 fn run_with_frame_profile(total_ms: u32, frame_ms: u32) -> (u64, Vec<Option<u64>>, ReplayLog) {
-    let mut sim = make_test_sim();
-    let grid = PathGrid::new(32, 32);
+    let rules = replay_rules();
+    let (mut sim, grid) = make_test_sim(&rules);
     let mut pending = vec![make_move_command()];
     let mut acc_ms: u64 = 0;
     let mut hashes: Vec<Option<u64>> = Vec::new();
     let mut replay = ReplayLog::new(ReplayHeader {
-        pixel_conversion_bounds: sim.session.pixel_conversion_bounds,
+        pixel_conversion_bounds: sim.session.pixel_conversion_bounds(),
         version: 1,
         tick_hz: 30,
         seed: 123_456,
@@ -74,7 +89,7 @@ fn run_with_frame_profile(total_ms: u32, frame_ms: u32) -> (u64, Vec<Option<u64>
 
         while acc_ms >= TICK_MS as u64 {
             acc_ms -= TICK_MS as u64;
-            let execute_tick = sim.session.tick + 1;
+            let execute_tick = sim.session.tick() + 1;
             let mut due: Vec<CommandEnvelope> = Vec::new();
             pending.retain(|cmd| {
                 if cmd.execute_tick <= execute_tick {
@@ -85,7 +100,7 @@ fn run_with_frame_profile(total_ms: u32, frame_ms: u32) -> (u64, Vec<Option<u64>
                 }
             });
 
-            let result = sim.advance_tick(&due, None, Some(&grid), None, TICK_MS);
+            let result = sim.advance_tick(&due, Some(&rules), Some(&grid), None, TICK_MS);
             hashes.push(result.state_hash);
             replay.record_tick(result.tick, due, result.state_hash);
         }
@@ -112,11 +127,12 @@ fn determinism_repeatability_same_inputs() {
 fn replay_reapplies_header_seed() {
     use crate::sim::scenario_session::ScenarioDescriptor;
 
-    fn sim_with_unit(desc: &ScenarioDescriptor) -> Simulation {
+    fn sim_with_unit(desc: &ScenarioDescriptor, rules: &RuleSet) -> (Simulation, PathGrid) {
         let mut sim = Simulation::from_descriptor(desc);
         // This synthetic fixture omits the production native Rules prefix.
         sim.native_unique_ids =
             Some(crate::sim::native_identity::NativeUniqueIdCursor::for_synthetic_simulation());
+        let grid = crate::sim::arena_fixture::flat_ground(&mut sim, rules);
         let entity = MapEntity {
             owner: "Americans".to_string(),
             type_id: "MTNK".to_string(),
@@ -131,14 +147,16 @@ fn replay_reapplies_header_seed() {
             mission: None,
             recruitable_a: true,
             recruitable_b: true,
-            structure_upgrades: [None, None, None],
+            group: -1,
+            follows: None,
+            structure_columns: Default::default(),
             structure_ai_sellable: false,
             structure_ai_repairable: false,
             structure_online: true,
             trigger_tag: None,
         };
-        sim.spawn_from_map(&[entity], None);
-        sim
+        sim.spawn_from_map(&[entity], Some(rules));
+        (sim, grid)
     }
 
     // Record under a descriptor seed. The map name is hashed session state,
@@ -153,10 +171,10 @@ fn replay_reapplies_header_seed() {
         },
         ..Default::default()
     };
-    let mut sim = sim_with_unit(&desc);
-    let grid = PathGrid::new(32, 32);
+    let rules = replay_rules();
+    let (mut sim, grid) = sim_with_unit(&desc, &rules);
     let mut replay = ReplayLog::new(ReplayHeader {
-        pixel_conversion_bounds: sim.session.pixel_conversion_bounds,
+        pixel_conversion_bounds: sim.session.pixel_conversion_bounds(),
         version: 1,
         tick_hz: 30,
         // The descriptor seed/map name are what the sim was constructed from;
@@ -168,7 +186,7 @@ fn replay_reapplies_header_seed() {
     let mut live: Vec<Option<u64>> = Vec::new();
     let mut pending = vec![make_move_command()];
     for _ in 0..40 {
-        let execute_tick = sim.session.tick + 1;
+        let execute_tick = sim.session.tick() + 1;
         let mut due: Vec<CommandEnvelope> = Vec::new();
         pending.retain(|cmd| {
             if cmd.execute_tick <= execute_tick {
@@ -178,7 +196,7 @@ fn replay_reapplies_header_seed() {
                 true
             }
         });
-        let r = sim.advance_tick(&due, None, Some(&grid), None, TICK_MS);
+        let r = sim.advance_tick(&due, Some(&rules), Some(&grid), None, TICK_MS);
         replay.record_tick(r.tick, due, r.state_hash);
         live.push(r.state_hash);
     }
@@ -190,8 +208,9 @@ fn replay_reapplies_header_seed() {
         pixel_conversion_bounds: header.pixel_conversion_bounds,
         ..Default::default()
     };
-    let mut playback = sim_with_unit(&descriptor_from_header(&replay.header));
-    let replayed = ReplayRunner::run_fixture(&mut playback, &replay, None, Some(&grid), TICK_MS);
+    let (mut playback, _) = sim_with_unit(&descriptor_from_header(&replay.header), &rules);
+    let replayed =
+        ReplayRunner::run_fixture(&mut playback, &replay, Some(&rules), Some(&grid), TICK_MS);
     assert_eq!(
         live, replayed,
         "playback from header.seed must match the recorded timeline"
@@ -200,8 +219,9 @@ fn replay_reapplies_header_seed() {
     // Corrupt the header: a consistent-but-wrong seed must diverge.
     let mut corrupted = replay.clone();
     corrupted.header.seed ^= 1;
-    let mut wrong = sim_with_unit(&descriptor_from_header(&corrupted.header));
-    let diverged = ReplayRunner::run_fixture(&mut wrong, &corrupted, None, Some(&grid), TICK_MS);
+    let (mut wrong, _) = sim_with_unit(&descriptor_from_header(&corrupted.header), &rules);
+    let diverged =
+        ReplayRunner::run_fixture(&mut wrong, &corrupted, Some(&rules), Some(&grid), TICK_MS);
     assert_ne!(
         live, diverged,
         "a corrupted header seed must not reproduce the timeline"

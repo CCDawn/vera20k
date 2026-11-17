@@ -10,6 +10,7 @@ from unicorn.x86_const import *
 from tools.rules_oracle.bridge_landing_inputs import Landing,WH
 from tools.spatial_oracle.building_body_rules import TYPE,INI,SP,dwords
 from tools.native_oracle import run_checked,RET_MAGIC,finish_vectors,provenance
+from tools.native_oracle import require
 from tools.spatial_oracle.estimated_damage import CLASSES
 RAW='100%,100%,100%,50%,10%,10%,0%,0%,0%,100%,100%'
 def execute(frame=16,cell=(6,5),armor=5,category='unit', *, field=None):
@@ -192,7 +193,7 @@ def concrete_dogs(packets):
   actor=m.alloc(0x1000);m.invoke(0x517A50,actor,(typ,0))
   u.mem_write(actor+0x21C,dwords(q.house));u.mem_write(actor+0x14C,dwords(q.house))
   m.invoke(0x486840,q.resident.ptrs[(86,49)],(q.coord,))
-  assert m.invoke(0x51DFF0,actor,(q.coord,0x80))&255
+  require(m.invoke(0x51DFF0,actor,(q.coord,0x80))&255, 'native 0x51DFF0 returned an unexpected result')
   m.invoke(0x51D6F0,actor,(0,0,0));q.phase='logic'
   damage=m.alloc(4);u.mem_write(damage,dwords(base_damage));seen=[]
   def observe(uc,a,size,data):
@@ -534,9 +535,8 @@ class LightLifecycle:
         from tools.native_oracle import configured_gamemd
         from tools.projectile_oracle.bridge_render_inputs import assets_root
         root = configured_gamemd().parent
-        paths = {'gamemd.exe': configured_gamemd()}
-        paths.update({f'retail/{name}': root / name for name in
-                      ('ra2.mix', 'ra2md.mix', 'multimd.mix', 'expandmd01.mix')})
+        paths = {f'retail/{name}': root / name for name in
+                 ('ra2.mix', 'ra2md.mix', 'multimd.mix', 'expandmd01.mix')}
         # Reader loads this existing extraction eagerly, before physical
         # selected resources replace its cache entries. Guard that readset too.
         paths.update({f'initial_palette_cache/{p.name}': p for p in assets_root().glob('*')})
@@ -1000,7 +1000,6 @@ class LightLifecycle:
 
 
 def generate_light_lifecycle(center=(33, 88), *, snow=False):
-    from tools.native_oracle import image_sha256
     histories = []
     for name, refresh in (('single_lifetime', None), ('same_center_refresh', 45)):
         owner = LightLifecycle(center, snow=snow)
@@ -1013,7 +1012,7 @@ def generate_light_lifecycle(center=(33, 88), *, snow=False):
     assert owner.binary_sources() == before, 'native binary/material kernel input drift'
     alpha = {row['surface_a_value'] for history in histories for row in history['rasters']}
     assert len(alpha) == 1
-    return dict(schema_version=1, native_sha256=image_sha256(), histories=histories,
+    return dict(schema_version=1, histories=histories,
                 tint_integer_controls=tint_controls,
                 light_update_controls=update_controls,
                 surface=dict(width=192, height=160, bytes_per_pixel=2, baseline=32768,

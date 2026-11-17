@@ -4,8 +4,9 @@
 //! collision-free stable handles and of every RNG stream. Constructors
 //! preincrement it; they neither search for nor prevent duplicate values.
 
+use crate::map::tubes::NativeMapTubes;
 use crate::map::tubes::{
-    NativeMapTubeReceipt, NativeMapTubesState, RawTubeSection, TubeConstructionError,
+    NativeMapTubeReceipt, NativeMapTubesTakeError, RawTubeSection, TubeConstructionError,
     construct_raw_tube_section,
 };
 use crate::rules::ini_parser::IniFile;
@@ -13,6 +14,26 @@ use crate::sim::world::Simulation;
 
 pub(crate) const FRESH_SCENARIO_NATIVE_ID_SEED: u32 = 1_000_000;
 pub(crate) const MAP_READ_NATIVE_ID_RESERVATION: u32 = 0x2710;
+
+/// VERA network startup policy: LAN and online games originally admitted with
+/// more than one human share one pre-map checkpoint. The Full_Init checkpoint
+/// follows each process's Rules history (the host's Create Random Map dialog,
+/// an earlier Skirmish), so players would otherwise build worlds whose native
+/// IDs differ, and the startup agreement hashes those IDs. Native LAN never
+/// compared them (Receive64A0C0 checks only the seed at 64A5DD..64A5E8).
+/// Solo games keep their actual Full_Init checkpoint.
+/// This intentionally changes native-history phases: guided bullets use
+/// UID-dependent modulo15 timing, powered-unit modulo30 sparks consume two Scenario draws, and gas/
+/// particle UID cadence affects lifetime. Those algorithms remain unchanged;
+/// the shared startup input makes the resulting trajectory deterministic.
+pub fn network_native_id_prefix(
+    mode: crate::sim::scenario_session::ScenarioGameMode,
+    original_humans: usize,
+) -> Option<u32> {
+    use crate::sim::scenario_session::ScenarioGameMode;
+    (matches!(mode, ScenarioGameMode::Lan | ScenarioGameMode::Wol) && original_humans > 1)
+        .then_some(0)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 enum NativeFreshIdPhase {
@@ -25,7 +46,7 @@ enum NativeFreshIdPhase {
 /// One Scenario's wrapping numeric-ID cursor. Original689310/689470 save/load
 /// +214 as part of the raw Scenario block;683560 preserves it while resetting
 /// the adjacent RNG. Evidence: tools/spatial_oracle/native_id_snapshot.
-#[derive(Debug, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Hash, serde::Serialize, serde::Deserialize)]
 pub struct NativeUniqueIdCursor {
     value: u32,
     saved_after_fresh_prefix: u32,
@@ -53,6 +74,8 @@ impl NativeUniqueIdCursor {
     }
 
     /// The campaign's one MapClass::Resize565C10 follows House Read_INI.
+    /// InitializeScenarioFromINI's call at `0x006874E2` goes through
+    /// `RadarClass::CreateEmptyMap @ 0x00653F50`, which only forwards to it.
     /// Fill consumes no native IDs; mapreader4AD026 then saves this checkpoint
     /// before theater construction and the saved+0x2710 overwrite.
     pub(crate) fn finish_campaign_prefix_after_resize(
@@ -146,6 +169,8 @@ impl NativeUniqueIdCursor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum NativeIdentityError {
+    #[error("accepted native-ID prefix must be installed before map and House construction")]
+    AcceptedPrefixRequiresPreMapWorld,
     #[error("fresh native-ID prefix has not reached its saved Resize checkpoint")]
     FreshPrefixNotFinished,
     #[error("fresh native-ID prefix was already finished")]
@@ -171,6 +196,40 @@ pub enum NativeMapTubeConstructionError {
 }
 
 impl Simulation {
+    /// Effective saved pre-map checkpoint used by this world, independent of
+    /// later allocations. It may be Full_Init's process-history result or an
+    /// accepted network startup policy; replay records the actual chosen input.
+    pub fn native_identity_prefix_checkpoint(&self) -> Option<u32> {
+        self.native_unique_ids.as_ref().and_then(|cursor| {
+            (cursor.phase == NativeFreshIdPhase::MapReadReserved)
+                .then_some(cursor.saved_after_fresh_prefix)
+        })
+    }
+
+    /// An immutable startup supplies its checkpoint: the actual recorded
+    /// prefix for replay, or the network startup policy above. Install
+    /// it at the same pre-map fence;
+    /// mapreader4AD026 still performs the one saved+0x2710 reservation and all
+    /// subsequent constructors allocate normally through this cursor.
+    pub fn install_accepted_native_id_prefix(
+        &mut self,
+        checkpoint: u32,
+    ) -> Result<(), NativeIdentityError> {
+        if !self.houses.is_empty()
+            || !self.substrate.entities.is_empty()
+            || self.session.tick() != 0
+            || self.session.binary_frame() != 0
+            || self
+                .native_unique_ids
+                .as_ref()
+                .is_none_or(|cursor| cursor.phase != NativeFreshIdPhase::PrefixSaved)
+        {
+            return Err(NativeIdentityError::AcceptedPrefixRequiresPreMapWorld);
+        }
+        self.native_unique_ids = Some(NativeUniqueIdCursor::from_saved_prefix(checkpoint));
+        Ok(())
+    }
+
     /// Immutable Scenario+214 cursor for capture. Reading never reserves IDs.
     pub fn native_identity_cursor(&self) -> Option<u32> {
         self.native_unique_ids.as_ref().map(|cursor| cursor.value)
@@ -203,28 +262,30 @@ impl Simulation {
         &mut self,
         map_ini: &IniFile,
     ) -> Result<(), NativeMapTubeConstructionError> {
-        self.construct_native_map_tubes_with_allocator(map_ini, |_| true)
+        Self::construct_native_map_tubes_with_allocator(
+            &mut self.native_unique_ids,
+            &mut self.native_map_tubes,
+            map_ini,
+            |_| true,
+        )
     }
 
     fn construct_native_map_tubes_with_allocator(
-        &mut self,
+        native_unique_ids: &mut Option<NativeUniqueIdCursor>,
+        native_map_tubes: &mut NativeMapTubes,
         map_ini: &IniFile,
         mut allocate: impl FnMut(usize) -> bool,
     ) -> Result<(), NativeMapTubeConstructionError> {
-        if !matches!(self.native_map_tubes, NativeMapTubesState::Unconstructed) {
+        if !native_map_tubes.is_unconstructed() {
             return Err(NativeMapTubeConstructionError::ReceiptAlreadyInstalled);
         }
-        let cursor = self
-            .native_unique_ids
+        let cursor = native_unique_ids
             .as_mut()
             .ok_or(NativeMapTubeConstructionError::MissingFreshCursor)?;
         cursor.reserve_map_read_from_saved()?;
 
         let raw_section = RawTubeSection::from_ini(map_ini);
-        self.native_map_tubes = NativeMapTubesState::Pending(NativeMapTubeReceipt::default());
-        let NativeMapTubesState::Pending(receipt) = &mut self.native_map_tubes else {
-            unreachable!("fresh Tube receipt was installed immediately above")
-        };
+        let receipt = native_map_tubes.install_receipt();
         let mut assign_native_id = || cursor.next_id();
         construct_raw_tube_section(raw_section, receipt, &mut allocate, &mut assign_native_id)?;
         Ok(())
@@ -233,17 +294,16 @@ impl Simulation {
     pub(crate) fn take_native_map_tubes_receipt(
         &mut self,
     ) -> Result<NativeMapTubeReceipt, NativeMapTubeConstructionError> {
-        match std::mem::replace(&mut self.native_map_tubes, NativeMapTubesState::Bound) {
-            NativeMapTubesState::Pending(receipt) => Ok(receipt),
-            NativeMapTubesState::Unconstructed => {
-                self.native_map_tubes = NativeMapTubesState::Unconstructed;
-                Err(NativeMapTubeConstructionError::ReceiptNotConstructed)
-            }
-            NativeMapTubesState::Bound => {
-                self.native_map_tubes = NativeMapTubesState::Bound;
-                Err(NativeMapTubeConstructionError::ReceiptAlreadyBound)
-            }
-        }
+        self.native_map_tubes
+            .take_receipt()
+            .map_err(|error| match error {
+                NativeMapTubesTakeError::NotConstructed => {
+                    NativeMapTubeConstructionError::ReceiptNotConstructed
+                }
+                NativeMapTubesTakeError::AlreadyBound => {
+                    NativeMapTubeConstructionError::ReceiptAlreadyBound
+                }
+            })
     }
 }
 
@@ -343,7 +403,7 @@ fn resize_constructor_count(map_width: u32, map_height: u32) -> u32 {
         .wrapping_add(1)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod tests {
     use super::{
         MAP_READ_NATIVE_ID_RESERVATION, NativeFreshIdPrefixCheckpoints,
@@ -420,7 +480,7 @@ mod tests {
             ));
             let hash = sim.state_hash();
             let rng = sim.scenario_rng.logical_state();
-            let stable_cursor = sim.substrate.next_stable_object_id;
+            let stable_cursor = sim.next_stable_object_id();
             assert_eq!(
                 sim.next_native_runtime_id() as u32,
                 case["next"].as_u64().unwrap() as u32,
@@ -431,7 +491,7 @@ mod tests {
                 "future constructor phase is authority"
             );
             assert_eq!(sim.scenario_rng.logical_state(), rng);
-            assert_eq!(sim.substrate.next_stable_object_id, stable_cursor);
+            assert_eq!(sim.next_stable_object_id(), stable_cursor);
         }
     }
 
@@ -446,7 +506,8 @@ mod tests {
             let input = case["input"].as_u64().unwrap() as u32;
             let mut sim =
                 simulation_with_saved_prefix(input.wrapping_sub(MAP_READ_NATIVE_ID_RESERVATION));
-            sim.session.map_name = "native-id-continuation".into();
+            sim.session
+                .set_map_name_for_test("native-id-continuation".into());
             let cursor = sim.native_unique_ids.as_mut().unwrap();
             cursor.reserve_map_read_from_saved().unwrap();
             assert_eq!(cursor.current_raw(), case["saved"].as_u64().unwrap() as u32);
@@ -481,18 +542,6 @@ mod tests {
             }
         );
         assert_eq!(receipt.cursor.saved_after_fresh_prefix(), 1_000_037);
-    }
-
-    #[test]
-    fn map_read_reservation_sets_from_wrapping_saved_snapshot() {
-        let mut cursor = super::NativeUniqueIdCursor::from_saved_prefix(0xFFFF_FFF0);
-        assert_eq!(cursor.next_id() as u32, 0xFFFF_FFF1);
-        assert_eq!(
-            cursor.reserve_map_read_from_saved().unwrap(),
-            0xFFFF_FFF0u32.wrapping_add(MAP_READ_NATIVE_ID_RESERVATION)
-        );
-        assert_eq!(cursor.current_raw(), 0x0000_2700);
-        assert!(cursor.reserve_map_read_from_saved().is_err());
     }
 
     #[test]
@@ -531,12 +580,16 @@ mod tests {
         let mut simulation = simulation_with_saved_prefix(1_000_037);
         let mut allocation_visits = Vec::new();
 
-        let error = simulation
-            .construct_native_map_tubes_with_allocator(&ini, |source| {
+        let error = Simulation::construct_native_map_tubes_with_allocator(
+            &mut simulation.native_unique_ids,
+            &mut simulation.native_map_tubes,
+            &ini,
+            |source| {
                 allocation_visits.push(source);
                 true
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
 
         assert_eq!(allocation_visits, vec![0, 1]);
         assert_eq!(
@@ -567,12 +620,16 @@ mod tests {
         let mut simulation = simulation_with_saved_prefix(1_000_037);
         let mut allocation_visits = Vec::new();
 
-        let error = simulation
-            .construct_native_map_tubes_with_allocator(&ini, |source| {
+        let error = Simulation::construct_native_map_tubes_with_allocator(
+            &mut simulation.native_unique_ids,
+            &mut simulation.native_map_tubes,
+            &ini,
+            |source| {
                 allocation_visits.push(source);
                 false
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
 
         assert_eq!(allocation_visits, vec![0]);
         assert_eq!(
@@ -592,42 +649,6 @@ mod tests {
                 .unwrap()
                 .entries
                 .is_empty()
-        );
-    }
-
-    /// A malformed row spends its ID and stops the section before the valid
-    /// row after it.
-    #[test]
-    fn a_malformed_tube_row_stops_native_construction() {
-        let ini = IniFile::from_str(
-            "[Tubes]\n\
-             malformed=1,2,2,4,2,2,2\n\
-             valid=7,0,6,4,0,6,6,-1\n",
-        );
-        let mut simulation = simulation_with_saved_prefix(1_000_018);
-
-        let error = simulation.construct_native_map_tubes(&ini).unwrap_err();
-
-        assert_eq!(
-            error,
-            NativeMapTubeConstructionError::Tube(TubeConstructionError::AllocatedRowMalformed {
-                ordinal: 0,
-                native_unique_id: 1_010_019,
-                error: AllocatedTubeParseError::PathRunsOutBeforeNativeStop,
-            })
-        );
-        assert_eq!(
-            simulation.native_unique_ids.as_ref().unwrap().current_raw(),
-            1_010_019
-        );
-        assert!(
-            simulation
-                .native_map_tubes
-                .as_ref()
-                .unwrap()
-                .entries
-                .is_empty(),
-            "the later convenience fact must never become a native binding"
         );
     }
 

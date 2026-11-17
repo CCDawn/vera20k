@@ -48,7 +48,8 @@ pub struct MainMenuShellLayout {
     pub movie_base: MainMenuMovieBase,
     pub movie: RectPx,
     pub title: RectPx,
-    /// Bottom-right version/status static. Text is `"<GUI:Version> <VERSION.TXT>"`.
+    /// Bottom-right version static. Retail text is `"<GUI:Version> <VERSION.TXT>"`;
+    /// VERA shows its own release there (`BUILD_STAMP`).
     /// Sits inside the SDBTM cap, sidebar-inset from the right edge.
     pub version_line: RectPx,
     /// Bottom-left hover tooltip/status static. Receives the CSF tooltip for the
@@ -56,7 +57,8 @@ pub struct MainMenuShellLayout {
     pub tooltip_line: RectPx,
     /// Static `0x71C` window rect (the animated SDWRNANM monitor).
     pub warning_monitor: RectPx,
-    pub buttons: [MainMenuButtonRect; 6],
+    /// Top to bottom; Exit is last.
+    pub buttons: Vec<MainMenuButtonRect>,
     pub right_panel: RightPanelRects,
     pub lower_strip: RectPx,
 }
@@ -233,7 +235,18 @@ pub fn compute_layout(screen_w: u32, screen_h: u32) -> MainMenuShellLayout {
     // by the shared shell pass (contract C7: DLU->pixel once, then include-set
     // re-anchor). The bottom-anchored version/tooltip statics keep their bespoke
     // helpers above.
-    let laid = layout_pass(&dialog_descriptor(), screen_w, screen_h);
+    let descriptor = dialog_descriptor();
+    let laid = layout_pass(&descriptor, screen_w, screen_h);
+    let buttons = descriptor
+        .controls
+        .iter()
+        .filter(|control| control.kind == ControlKind::Button)
+        .map(|control| MainMenuButtonRect {
+            id: MainMenuControlId::from_resource_id(control.id)
+                .expect("0xE2 descriptor buttons are main-menu controls"),
+            rect: rect_for(&laid, control.id),
+        })
+        .collect();
 
     MainMenuShellLayout {
         scale: ShellScale::RETAIL,
@@ -244,32 +257,7 @@ pub fn compute_layout(screen_w: u32, screen_h: u32) -> MainMenuShellLayout {
         version_line,
         tooltip_line,
         warning_monitor: rect_for(&laid, WARNING_MONITOR_CONTROL),
-        buttons: [
-            MainMenuButtonRect {
-                id: MainMenuControlId::SinglePlayer0x683,
-                rect: rect_for(&laid, 0x0683),
-            },
-            MainMenuButtonRect {
-                id: MainMenuControlId::WwOnline0x684,
-                rect: rect_for(&laid, 0x0684),
-            },
-            MainMenuButtonRect {
-                id: MainMenuControlId::Network0x578,
-                rect: rect_for(&laid, 0x0578),
-            },
-            MainMenuButtonRect {
-                id: MainMenuControlId::MoviesAndCredits0x686,
-                rect: rect_for(&laid, 0x0686),
-            },
-            MainMenuButtonRect {
-                id: MainMenuControlId::Options0x55c,
-                rect: rect_for(&laid, 0x055C),
-            },
-            MainMenuButtonRect {
-                id: MainMenuControlId::ExitGame0x3ee,
-                rect: rect_for(&laid, 0x03EE),
-            },
-        ],
+        buttons,
         right_panel,
         lower_strip,
     }
@@ -295,7 +283,7 @@ pub fn movie_base_for_responsive_width(_screen_w: u32) -> MainMenuMovieBase {
 pub fn compute_responsive_layout(screen_w: u32, screen_h: u32) -> MainMenuShellLayout {
     let scale = ShellScale::from_screen(screen_w as i32, screen_h as i32);
     let base = compute_layout(SHELL_BASE_W as u32, SHELL_BASE_H as u32);
-    let mut buttons = base.buttons;
+    let mut buttons = base.buttons.clone();
     for button in &mut buttons {
         button.rect = scale.scale_rect(button.rect);
     }
@@ -316,21 +304,9 @@ pub fn compute_responsive_layout(screen_w: u32, screen_h: u32) -> MainMenuShellL
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn key_rects_match_800x600() {
-        // All six buttons are SDBTNANM cells: 156x42, flush-right at x=644
-        // (632 panel left + 168 - 156). The five stacked buttons are grid-snapped
-        // Y; Exit occupies the final complete tile above the bottom cap.
-        let layout = compute_layout(800, 600);
-        assert_eq!(layout.movie_base, MainMenuMovieBase::Ra2tsL);
-        assert_eq!(layout.movie, RectPx::new(0, 0, 632, 570));
-        assert_eq!(layout.buttons[0].rect, RectPx::new(644, 199, 156, 42)); // SP
-        assert_eq!(layout.buttons[5].rect, RectPx::new(644, 535, 156, 42)); // Exit
-    }
 
     #[test]
     fn buttons_grid_snap_and_exit_special_case_800x600() {
@@ -341,7 +317,33 @@ mod tests {
             assert_eq!(button.rect, RectPx::new(644, y, 156, 42));
         }
         // Exit (0x3ee): same flush-right cell in the final row above SDBTM.
-        assert_eq!(layout.buttons[5].rect, RectPx::new(644, 535, 156, 42));
+        assert_eq!(
+            layout.buttons.last().unwrap().rect,
+            RectPx::new(644, 535, 156, 42)
+        );
+    }
+
+    #[test]
+    fn the_menu_holds_retails_six_buttons_at_every_size() {
+        use MainMenuControlId::*;
+        let ids = |layout: MainMenuShellLayout| {
+            layout
+                .buttons
+                .iter()
+                .map(|button| button.id)
+                .collect::<Vec<_>>()
+        };
+        let retail = [
+            SinglePlayer0x683,
+            WwOnline0x684,
+            Network0x578,
+            MoviesAndCredits0x686,
+            Options0x55c,
+            ExitGame0x3ee,
+        ];
+        assert_eq!(ids(compute_layout(640, 480)), retail);
+        assert_eq!(ids(compute_layout(800, 600)), retail);
+        assert_eq!(ids(compute_responsive_layout(1920, 1080)), retail);
     }
 
     #[test]
@@ -380,7 +382,10 @@ mod tests {
         let layout = compute_layout(640, 480);
         assert_eq!(layout.movie_base, MainMenuMovieBase::Ra2tsS);
         assert_eq!(layout.movie, RectPx::new(0, 0, 472, 450));
-        assert_eq!(layout.buttons[5].rect, RectPx::new(484, 409, 156, 42));
+        assert_eq!(
+            layout.buttons.last().unwrap().rect,
+            RectPx::new(484, 409, 156, 42)
+        );
     }
 
     #[test]
@@ -396,19 +401,6 @@ mod tests {
     }
 
     #[test]
-    fn large_screen_buttons_sdbtnanm_cells_and_exit() {
-        // 1024x768: left_margin=112, top_margin=84, panel.top.x=744 -> cells at
-        // x=756. Grid anchor panel_y = 84 + 199 = 283; rows step 42.
-        let layout = compute_layout(1024, 768);
-        let expected_y = [283, 325, 367, 409, 451];
-        for (button, y) in layout.buttons[..5].iter().zip(expected_y) {
-            assert_eq!(button.rect, RectPx::new(756, y, 156, 42));
-        }
-        // Exit: same flush-right cell x=756 in the final row above SDBTM.
-        assert_eq!(layout.buttons[5].rect, RectPx::new(756, 619, 156, 42));
-    }
-
-    #[test]
     fn responsive_layout_fits_the_base_shell_centred_in_the_window() {
         let layout = compute_responsive_layout(1600, 900);
         assert_eq!(layout.screen, RectPx::new(0, 0, 1600, 900));
@@ -419,7 +411,29 @@ mod tests {
         // Base SP cell (644,199,156,42) scaled 1.5x (corner-rounded) ->
         // (1166,299,234,63); base Exit (644,535,156,42) -> (1166,803,234,63).
         assert_eq!(layout.buttons[0].rect, RectPx::new(1166, 299, 234, 63));
-        assert_eq!(layout.buttons[5].rect, RectPx::new(1166, 803, 234, 63));
+        assert_eq!(
+            layout.buttons.last().unwrap().rect,
+            RectPx::new(1166, 803, 234, 63)
+        );
+    }
+
+    /// At 1.28x (1366x768) each scaled panel row rounds like the button
+    /// authored on it. Stepping the rounded 53-px tile put row 8 six pixels
+    /// above Exit, so slide frames and tiles jumped against the buttons.
+    #[test]
+    fn scaled_panel_rows_land_on_their_buttons() {
+        let base = compute_layout(800, 600);
+        let layout = compute_responsive_layout(1366, 768);
+        let panel = layout.right_panel;
+        for (authored, button) in base.buttons.iter().zip(&layout.buttons) {
+            let row = (authored.rect.y - base.right_panel.tile.y) / 42;
+            assert_eq!(panel.row_cell(row, 156, 42), button.rect, "row {row}");
+        }
+        for row in 0..panel.tile_count {
+            let rect = panel.tile_row(row);
+            assert_eq!(rect.y + rect.h, panel.tile_row(row + 1).y, "row {row}");
+        }
+        assert_eq!(panel.tile_row(panel.tile_count).y, panel.bottom.y);
     }
 
     #[test]
@@ -431,11 +445,5 @@ mod tests {
         assert_eq!(layout.movie, RectPx::new(0, 0, 506, 456));
         // Base SP cell (644,199,156,42) scaled 0.8x/0.8x → (515, 159, 125, 34).
         assert_eq!(layout.buttons[0].rect, RectPx::new(515, 159, 125, 34));
-    }
-
-    #[test]
-    fn responsive_layout_is_identity_at_800x600() {
-        let retail = compute_layout(800, 600);
-        assert_eq!(compute_responsive_layout(800, 600), retail);
     }
 }

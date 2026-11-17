@@ -60,7 +60,10 @@ directly; it does not execute or claim the FireAt/Bullet/LimboLaunch producer.
 Scenario map-lighting/reset and cell relight are also excluded. The initial
 lighting record preserves the actual Scenario current profile, raw fields,
 effect globals and selected Cell scalars. Consumers import that component
-profile: original `629DDE` copies signed Cell `+10A` into the held Anim Z-adjust.
+profile. Snapshot `z_adjust` reads Anim `+100`; the signed Cell `+10A` copy
+at `629DDE`/`629DE5` instead writes Anim `+FC`. This corpus does not record that
+field or pixels. The additive [squid_grapple_light](squid_grapple_light.md)
+control distinguishes the fields under original nonzero Cell relighting.
 The zero prior here is not the ordinary full-map lighting default.
 The initial signed `game_speed` readback similarly preserves the inherited
 GameOptions `A8EB60` input used by original `5FB2E0` to normalize Anim rates.
@@ -89,10 +92,9 @@ separate and unchanged.
 
 `building_death_anims.py --joined` adds four original-executable controls. It
 preserves the existing primitive `building_death_anims.json` and its sidecar.
-The binary is active-retail `gamemd.exe`, SHA-256
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
+The binary is active-retail `gamemd.exe`.
 Unicorn executes the original instructions; executable PE sections are checked
-against the pinned binary before accepting each route. Goldens are not
+against the loaded file before accepting each route. Goldens are not
 produced from Rust.
 
 The main route is one ready, faced, targeted MTNK firing its production-read

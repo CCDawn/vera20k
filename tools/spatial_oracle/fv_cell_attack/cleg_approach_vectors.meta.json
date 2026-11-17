@@ -1,6 +1,5 @@
 {
   "schema_version": 1,
-  "native_sha256": "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600",
   "unicorn_binding": "2.1.4",
   "unicorn_core": [
     2,
@@ -30,5 +29,5 @@
     "map_flags": "0x00565730"
   },
   "replay_command": "python -m tools.spatial_oracle.fv_cell_attack.candidates --cleg-radius",
-  "payload_sha256": "6746c773f2d56cbaf1be36400ff8fadfa72d0578dbb1762d6ca143e9311c8d92"
+  "payload_sha256": "62fde605912bfb15d1c884c12ce648b7b23d50998ee64f2f5d2216ed43890f5b"
 }

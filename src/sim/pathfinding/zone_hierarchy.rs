@@ -8,14 +8,16 @@
 //! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, PoisonError};
 
-use super::native_heap::NativeHeap;
+use crate::util::sync::Mutex;
+
 use super::passability;
 use super::search_table::SearchTable;
 use super::zone_map::{ZONE_INVALID, ZoneId};
 use crate::rules::locomotor_type::MovementZone;
 use crate::util::lookup_hash::LookupMap;
+use crate::util::native_heap::NativeHeap;
 use crate::util::native_x87::{NativeF32Bits, NativeF64Bits, X87Chop53};
 
 /// Retained House+57E4 reader. No Map/GetCell lookup belongs to585F40.
@@ -61,9 +63,9 @@ fn estimate_zone_threat(
         return lookup(target_index);
     }
     let decode = |index: i32| {
-        let remainder = index.wrapping_sub(1) % 130;
+        let remainder = index.wrapping_sub(1) % (i32::from(graph.cell_grid().side()) / 4 + 2);
         let x = remainder.wrapping_mul(4);
-        let y = (index.wrapping_sub(remainder) / 130)
+        let y = (index.wrapping_sub(remainder) / (i32::from(graph.cell_grid().side()) / 4 + 2))
             .wrapping_mul(4)
             .wrapping_sub(4);
         let raw = (x as i16, y as i16);
@@ -75,8 +77,11 @@ fn estimate_zone_threat(
     };
     let (source_raw, source) = decode(index(source)?);
     let (target_raw, target) = decode(target_index);
-    let read =
-        |coord: (i16, i16)| lookup(crate::sim::house_threat::HouseSpatialThreat::index(coord));
+    let read = |coord: (i16, i16)| {
+        lookup(
+            crate::sim::house_threat::HouseSpatialThreat::index_for_grid(graph.cell_grid(), coord),
+        )
+    };
     if source == target {
         let a = read(target_raw)?;
         return Ok(a.wrapping_add(read(source_raw)?) >> 1);
@@ -175,15 +180,20 @@ impl ZoneRecord {
         parent: ZoneId,
         zone_type: u8,
         seed: (i16, i16),
+        grid: crate::map::cell_index::CellGrid,
     ) -> Self {
         let mut record = Self::new(zone_id, parent, zone_type);
         record.native_threat_index =
-            Some(crate::sim::house_threat::HouseSpatialThreat::index(seed));
+            Some(crate::sim::house_threat::HouseSpatialThreat::index_for_grid(grid, seed));
         record
     }
 
+    /// Record 0, the Outside sentinel, has no seed: Original581F90 clears its
+    /// temporary record's +20 (58205F) and copies it (58A59F). Bridge pairs can
+    /// target it, and 42C580 estimates that edge before passability rejects it.
     pub(crate) fn native_threat_index(self) -> Option<i32> {
         self.native_threat_index
+            .or((self.zone_id == ZONE_INVALID).then_some(0))
     }
 }
 
@@ -216,6 +226,9 @@ pub struct ZoneLevelGraph {
 }
 
 impl ZoneLevelGraph {
+    pub(crate) fn cell_grid(&self) -> crate::map::cell_index::CellGrid {
+        crate::map::cell_index::CellGrid::for_extent(self.width, self.height)
+    }
     pub(crate) fn new(zone_count: ZoneId) -> Self {
         Self {
             records: vec![None; zone_count as usize + 1],
@@ -254,7 +267,9 @@ impl ZoneLevelGraph {
         let Ok(expected) = ZoneId::try_from(self.records.len()) else {
             return false;
         };
-        if record.zone_id != expected {
+        if (!self.cell_grid().is_extended() && expected > u32::from(u16::MAX))
+            || record.zone_id != expected
+        {
             return false;
         }
         self.records.push(Some(record));
@@ -556,7 +571,7 @@ pub struct MarkedZones {
 
 impl MarkedZones {
     pub(crate) fn contains(&self, zone: &ZoneId) -> bool {
-        let zone = usize::from(*zone);
+        let zone = *zone as usize;
         self.bits
             .get(zone / 64)
             .is_some_and(|word| word & (1 << (zone % 64)) != 0)
@@ -567,7 +582,7 @@ impl FromIterator<ZoneId> for MarkedZones {
     fn from_iter<I: IntoIterator<Item = ZoneId>>(zones: I) -> Self {
         let mut bits = Vec::new();
         for zone in zones {
-            let zone = usize::from(zone);
+            let zone = zone as usize;
             if bits.len() <= zone / 64 {
                 bits.resize(zone / 64 + 1, 0);
             }
@@ -837,17 +852,28 @@ type ActiveZoneThreat<'a> = (
     &'a dyn Fn(i32) -> Result<i32, String>,
 );
 
+/// The size the PathfinderClass constructor gives the precheck's heap
+/// (`0x2710` at `0x0042A7B2`). A full heap drops the insert, but the record
+/// and the zone's best cost are kept.
+const PRECHECK_HEAP_SIZE: usize = 0x2710;
+
 /// Reusable scratch for `search_precheck_level`: pure scratch, nothing in it
 /// outlives one level search.
-#[derive(Default)]
 struct PrecheckScratch {
     /// The best cost each zone has been reached with in the running search.
     best: SearchTable<NativeF32Bits>,
     nodes: Vec<PrecheckNode>,
-    /// The size the PathfinderClass constructor gives this heap (`0x2710` at
-    /// `0x0042A7B2`). A full heap drops the insert, but the record and the
-    /// zone's best cost are kept.
-    heap: NativeHeap<usize, 0x2710>,
+    heap: NativeHeap<usize>,
+}
+
+impl Default for PrecheckScratch {
+    fn default() -> Self {
+        Self {
+            best: SearchTable::default(),
+            nodes: Vec::new(),
+            heap: NativeHeap::new(PRECHECK_HEAP_SIZE),
+        }
+    }
 }
 
 thread_local! {
@@ -920,7 +946,7 @@ fn search_precheck_level_in(
         cost: NativeF32Bits::from_bits(0),
         depth: 0,
     });
-    best.set(usize::from(start), NativeF32Bits::from_bits(0));
+    best.set(start as usize, NativeF32Bits::from_bits(0));
     heap.push(0, by_cost(nodes));
     #[cfg(any(test, feature = "test-support"))]
     let mut pops = Vec::new();
@@ -965,7 +991,7 @@ fn search_precheck_level_in(
             };
             let new_cost = precheck_edge_cost(cost, base_cost, threat_cost, edge.flag);
             if best
-                .get(usize::from(neighbor))
+                .get(neighbor as usize)
                 .is_some_and(|best| !precheck_cost_less(new_cost, best))
             {
                 continue;
@@ -983,7 +1009,7 @@ fn search_precheck_level_in(
                 continue;
             }
             {
-                best.set(usize::from(neighbor), new_cost);
+                best.set(neighbor as usize, new_cost);
                 let next = nodes.len();
                 nodes.push(PrecheckNode {
                     parent: Some(index),
@@ -1010,11 +1036,11 @@ fn reconstruct_zone_path(nodes: &[PrecheckNode], goal: usize) -> Vec<ZoneId> {
     path
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_pathfinding, tests_sim_movement)))]
 #[path = "zone_cost_native_tests.rs"]
 mod zone_cost_native_tests;
 
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_pathfinding, tests_sim_movement)))]
 mod tests {
     use super::*;
 
@@ -1295,16 +1321,6 @@ mod tests {
     }
 
     #[test]
-    fn zone_level_graph_cell_lookup_returns_invalid_out_of_bounds() {
-        let graph = ZoneLevelGraph::new(2).with_cell_zone_ids(vec![1, 2], 2, 1);
-
-        assert_eq!(graph.zone_at(0, 0), 1);
-        assert_eq!(graph.zone_at(1, 0), 2);
-        assert_eq!(graph.zone_at(2, 0), ZONE_INVALID);
-        assert_eq!(graph.zone_at(0, 1), ZONE_INVALID);
-    }
-
-    #[test]
     fn zone_precheck_manual_exclusion_is_undirected() {
         let mut hierarchy = fixture_hierarchy();
         hierarchy.levels_mut()[0].push_edge(3, ZoneEdgeRecord::new(5, 0));
@@ -1344,12 +1360,6 @@ mod tests {
             .unwrap(),
             ZonePrecheckOutcome::Failed
         );
-    }
-
-    #[test]
-    fn zone_precheck_bridge_edges_are_zero_flagged_fixture_contract() {
-        let edge = ZoneEdgeRecord::new(2, 0);
-        assert_eq!(edge.flag, 0);
     }
 
     /// Every start/goal pair, for movement zones the fixture's type-0 zones

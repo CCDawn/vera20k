@@ -6,9 +6,8 @@
 //! anchor, sorts by 3D distance from that anchor, and probes six cells along
 //! each member's anchor-relative direction.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::util::lepton::lepton_to_cell;
 use crate::util::native_x87::{
     NativeF32Bits, NativeF64Bits, X87Chop53, distance_3d_leptons, sqrt_approx_f32,
 };
@@ -25,6 +24,10 @@ pub struct GroupDestinationMember {
     pub coord: [i32; 3],
     /// Cell returned by the member's source-cell virtual.
     pub source_cell: (i16, i16),
+    /// Cell of the member's navigation coordinate (vt+0x4C at `0x0064D27A`:
+    /// the active locomotor's head, else its Location). Its probe ray starts
+    /// here, which is one cell ahead of `coord` for a member on the move.
+    pub navigation_cell: (i32, i32),
 }
 
 /// Read-only results of the native candidate gates.
@@ -89,10 +92,21 @@ where
 
     let mut sorted_indices = (0..members.len()).collect::<Vec<_>>();
     sorted_indices.sort_unstable_by_key(|&index| {
-        distance_3d_leptons(members[index].coord, anchor_coord)
-            .wrapping_mul(1000)
-            .wrapping_add(index as i32)
+        (
+            distance_3d_leptons(members[index].coord, anchor_coord),
+            index,
+        )
     });
+    // The native 256-entry stage could pack index after distance*1000.
+    // VERA's larger stage keeps the same ordering as a tuple and indexes the
+    // unchanged same-source-cell rule instead of rescanning every later unit.
+    let mut source_members = BTreeMap::<_, Vec<_>>::new();
+    for (index, member) in members.iter().enumerate() {
+        source_members
+            .entry(member.source_cell)
+            .or_default()
+            .push(index);
+    }
 
     let mut destinations = vec![clicked_target; members.len()];
     let mut assigned = vec![false; members.len()];
@@ -108,13 +122,15 @@ where
             continue;
         }
         let member = &members[member_index];
-        let member_cell = (
-            lepton_to_cell(member.coord[0]),
-            lepton_to_cell(member.coord[1]),
-        );
         let direction = (
-            member_cell.0.wrapping_sub(i32::from(anchor_source_cell.0)),
-            member_cell.1.wrapping_sub(i32::from(anchor_source_cell.1)),
+            member
+                .navigation_cell
+                .0
+                .wrapping_sub(i32::from(anchor_source_cell.0)),
+            member
+                .navigation_cell
+                .1
+                .wrapping_sub(i32::from(anchor_source_cell.1)),
         );
         let step = normalized_step(direction);
         let mut candidate_x = cell_center_f32(clicked_target.0);
@@ -168,8 +184,8 @@ where
         // Members whose source-cell virtual returns the same cell receive the
         // same destination. This is the native reason grouped infantry can
         // share a cell; there is no category-based "three infantry" rule here.
-        for &later_index in &sorted_indices[(sorted_position + 1)..] {
-            if !assigned[later_index] && members[later_index].source_cell == member.source_cell {
+        for &later_index in &source_members[&member.source_cell] {
+            if !assigned[later_index] {
                 destinations[later_index] = chosen;
                 assigned[later_index] = true;
             }
@@ -187,14 +203,16 @@ where
 }
 
 fn centroid_3d(members: &[GroupDestinationMember]) -> [i32; 3] {
-    let mut sum = [0i32; 3];
+    let mut sum = [0i64; 3];
     for member in members {
         for (axis, coordinate) in member.coord.into_iter().enumerate() {
-            sum[axis] = sum[axis].wrapping_add(coordinate);
+            sum[axis] += i64::from(coordinate);
         }
     }
-    let count = members.len() as i32;
-    [sum[0] / count, sum[1] / count, sum[2] / count]
+    let count = i64::try_from(members.len()).expect("an allocated group count fits i64");
+    // Division still truncates toward zero. The mean remains in the original
+    // i32 coordinate range even when a 20,000-member sum exceeds it.
+    sum.map(|value| i32::try_from(value / count).expect("coordinate mean fits i32"))
 }
 
 fn normalized_step(direction: (i32, i32)) -> (NativeF32Bits, NativeF32Bits) {
@@ -245,7 +263,7 @@ fn stored_f32_to_i16(value: NativeF32Bits) -> i16 {
     X87Chop53::ftol_i64(value).expect("candidate probe fits a signed integer") as i16
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::*;
 
@@ -259,6 +277,7 @@ mod tests {
                 0,
             ],
             source_cell: cell,
+            navigation_cell: (i32::from(cell.0), i32::from(cell.1)),
         }
     }
 
@@ -268,6 +287,31 @@ mod tests {
         height_band_ok: true,
         can_enter_code: 0,
     };
+
+    #[test]
+    fn large_group_keeps_centroid_and_distance_priority_past_the_native_stage() {
+        let mut members = (0..20_000)
+            .map(|index| GroupDestinationMember {
+                command_index: index,
+                entity_id: index as u64,
+                coord: [115_329, 115_329, 0],
+                source_cell: (450, 450),
+                navigation_cell: (450, 450),
+            })
+            .collect::<Vec<_>>();
+        members.last_mut().unwrap().coord = [115_328, 115_328, 0];
+        assert_eq!(centroid_3d(&members), [115_328, 115_328, 0]);
+        let mut first_probe = None;
+        let assigned = distribute_group_destinations((460, 460), &members, |member, _| {
+            first_probe.get_or_insert(member.command_index);
+            CLEAR
+        });
+        // The final member is the anchor; its index must not outweigh a
+        // smaller distance, as a distance*1000+index key would allow.
+        assert_eq!(first_probe, Some(0));
+        assert_eq!(assigned.len(), members.len());
+        assert!(assigned.iter().all(|entry| entry.destination == (460, 460)));
+    }
 
     #[test]
     fn normal_group_uses_centroid_anchor_distance_order_and_directional_probes() {

@@ -17,11 +17,16 @@
 
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
+use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
+use crate::sim::intern::StringInterner;
 #[cfg(any(test, feature = "test-support"))]
 use crate::sim::mission::MissionType;
 use crate::sim::movement::locomotor::MovementLayer;
+use crate::sim::power_system::PowerStates;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::timer::CdTimer;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
 
 /// `BuildingClass+0x6D0`/`+0x6D8` ProduceCash timer (oil derricks).
@@ -57,9 +62,23 @@ impl ProduceCash {
     }
 }
 
+/// The type's timer (slot 0, `+0x6D0`) or upgrade slot `slot - 1`'s Ares
+/// BuildingExt timer (`AresPart::cash_upgrade_timers`), in the order Ares'
+/// ProduceCash hooks walk them. The upgrade timers sit in the object's Ares
+/// part, so a game without them adds nothing to an object's record.
+fn ares_cash_timer_mut(
+    entity: &mut crate::sim::game_entity::GameEntity,
+    slot: usize,
+) -> &mut CdTimer {
+    match slot {
+        0 => &mut entity.produce_cash.timer,
+        upgrade => &mut entity.ares.cash_upgrade_timers[upgrade - 1],
+    }
+}
+
 /// The Floating Disc drain link pair, `TechnoClass+0x1CC`/`+0x1D0`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Drain {
+pub struct Drain {
     /// `TechnoClass+0x1CC DrainTarget`: the building this object is draining
     /// (Floating Disc). Set by `Fire_At`'s `DrainWeapon` arm
     /// ([`install_drain_link`]), cleared by `UnitClass::AI`'s cell recheck,
@@ -80,13 +99,19 @@ pub(crate) struct Drain {
 
 impl Drain {
     /// The building this object is draining.
-    pub(crate) fn target(&self) -> Option<u64> {
+    pub fn target(&self) -> Option<u64> {
         self.target
     }
 
     /// The object draining this one.
     pub(crate) fn draining_me(&self) -> Option<u64> {
         self.draining_me
+    }
+
+    /// Neither drain step can act: no link either way and no ray
+    /// ([`drain_common_step`], [`drain_unit_ai_step`]).
+    pub(crate) fn is_idle(&self) -> bool {
+        self.target.is_none() && self.draining_me.is_none() && self.anim.is_none()
     }
 
     /// The drainer's DrainAnim.
@@ -107,7 +132,7 @@ impl Drain {
 
 #[cfg(any(test, feature = "test-support"))]
 impl Drain {
-    pub(crate) fn set_target_for_test(&mut self, target: Option<u64>) {
+    pub fn set_target_for_test(&mut self, target: Option<u64>) {
         self.target = target;
     }
 
@@ -129,32 +154,57 @@ fn produce_cash_fires(timer: CdTimer, frame: u32) -> bool {
 
 /// [`Economy::add_credits`](crate::sim::economy::Economy::add_credits) on
 /// `owner`'s wallet (`HouseClass::Add_Credits @ 0x004F9950`).
-pub fn add_credits(sim: &mut Simulation, owner: InternedId, amount: i32) {
-    if let Some(house) = sim.houses.get_mut(&owner) {
-        house.economy.add_credits(amount);
+pub fn add_credits(houses: &mut Houses, owner: InternedId, amount: i32) {
+    if let Some(house) = houses.get_mut(&owner) {
+        house.economy_mut().add_credits(amount);
     }
 }
 
 /// [`Economy::spend_money`](crate::sim::economy::Economy::spend_money) on
 /// `owner`'s wallet (`HouseClass::Spend_Money @ 0x004F9790`).
-pub(crate) fn spend_money(sim: &mut Simulation, owner: InternedId, amount: i32) {
-    if let Some(house) = sim.houses.get_mut(&owner) {
-        house.economy.spend_money(amount);
+pub(crate) fn spend_money(houses: &mut Houses, owner: InternedId, amount: i32) {
+    if let Some(house) = houses.get_mut(&owner) {
+        house.economy_mut().spend_money(amount);
     }
 }
 
 /// [`Economy::available_money`](crate::sim::economy::Economy::available_money)
 /// of `owner`'s wallet (the money interface's slot `+0x18`,
 /// `Available_Money @ 0x004F6990`); 0 for a house that does not exist.
-pub(crate) fn available_money(sim: &Simulation, owner: InternedId) -> i32 {
-    sim.houses
+pub(crate) fn available_money(houses: &Houses, owner: InternedId) -> i32 {
+    houses
         .get(&owner)
-        .map_or(0, |house| house.economy.available_money())
+        .map_or(0, |house| house.economy().available_money())
 }
 
 // ---------------------------------------------------------------------------
 // Oil derrick ProduceCash
 // ---------------------------------------------------------------------------
+
+/// The ProduceCash startup of `BuildingClass::ChangeOwner`: the stock block
+/// ([`stock_produce_cash_on_owner_change`]), or in a game read the Ares way
+/// (`RuleSet::ares_form`) the hook that replaces it
+/// ([`ares_produce_cash_on_owner_change`]).
+pub(crate) fn produce_cash_on_owner_change(
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    substrate: &mut ObjectSubstrate,
+    houses: &mut Houses,
+    stable_id: u64,
+    old_owner: InternedId,
+    new_owner: InternedId,
+    rules: &RuleSet,
+) {
+    if rules.ares_form() {
+        ares_produce_cash_on_owner_change(
+            interner, session, substrate, houses, stable_id, old_owner, new_owner, rules,
+        );
+    } else {
+        stock_produce_cash_on_owner_change(
+            interner, session, substrate, houses, stable_id, old_owner, new_owner, rules,
+        );
+    }
+}
 
 /// `BuildingClass::ChangeOwner @ 0x004482AA..0x004482F9`, run BEFORE the
 /// Techno owner swap while `this->Owner` is still the OLD house: when the old
@@ -165,51 +215,170 @@ pub(crate) fn available_money(sim: &Simulation, owner: InternedId) -> i32 {
 ///
 /// Capture by a non-passive house from a non-passive house (an engineer
 /// retaking a derrick) grants nothing and leaves the timer running as it was.
-pub(crate) fn produce_cash_on_owner_change(
-    sim: &mut Simulation,
+fn stock_produce_cash_on_owner_change(
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    substrate: &mut ObjectSubstrate,
+    houses: &mut Houses,
     stable_id: u64,
     old_owner: InternedId,
     new_owner: InternedId,
     rules: &RuleSet,
 ) {
-    let Some(entity) = sim.substrate.entities.get(stable_id) else {
+    let Some(entity) = substrate.entities.get(stable_id) else {
         return;
     };
     if entity.category() != EntityCategory::Structure {
         return;
     }
-    let Some(obj) = sim.interner.object_type(entity.type_ref(), rules) else {
+    let Some(obj) = interner.object_type(entity.type_ref(), rules) else {
         return;
     };
-    let old_passive = sim
-        .houses
+    let old_passive = houses
         .get(&old_owner)
-        .is_some_and(|house| house.multiplay_passive);
+        .is_some_and(|house| house.multiplay_passive());
     if !old_passive || obj.produce_cash_startup == 0 {
         return;
     }
     let startup = obj.produce_cash_startup;
     let delay = obj.produce_cash_delay;
-    let frame = sim.session.binary_frame;
-    add_credits(sim, new_owner, startup);
-    if let Some(entity) = sim.substrate.entities.get_mut(stable_id) {
+    let frame = session.binary_frame();
+    add_credits(houses, new_owner, startup);
+    if let Some(entity) = substrate.entities.get_mut(stable_id) {
         entity.produce_cash.arm(frame, delay);
     }
 }
 
+/// The building's type and its installed upgrades, in the order Ares'
+/// ProduceCash hooks pair them with their timers (Type with `+0x6D0`, then
+/// `Upgrades[0..3]` with the BuildingExt timers).
+fn ares_cash_types<'r>(
+    interner: &StringInterner,
+    entity: &crate::sim::game_entity::GameEntity,
+    rules: &'r RuleSet,
+) -> [Option<&'r crate::rules::object_type::ObjectType>; 4] {
+    let upgrades = entity.building_upgrades().types();
+    [
+        interner.object_type(entity.type_ref(), rules),
+        upgrades[0].and_then(|id| interner.object_type(id, rules)),
+        upgrades[1].and_then(|id| interner.object_type(id, rules)),
+        upgrades[2].and_then(|id| interner.object_type(id, rules)),
+    ]
+}
+
+/// BuildingExt::ExtData::AddProduceCashDisplay (Ares.dll 100117C0): with
+/// the building type's `ProduceCashDisplay`, `amount` joins the building's
+/// floating money display (TechnoExt BountyDisplayAmount, `sim::bounty`).
+fn add_produce_cash_display(
+    interner: &StringInterner,
+    substrate: &mut ObjectSubstrate,
+    stable_id: u64,
+    amount: i32,
+    rules: &RuleSet,
+) {
+    let Some(entity) = substrate.entities.get_mut(stable_id) else {
+        return;
+    };
+    if interner
+        .object_type(entity.type_ref(), rules)
+        .is_some_and(|object| object.building_type_ext().produce_cash_display())
+    {
+        entity.ares.bounty_display.queue(amount);
+    }
+}
+
+/// Ares 3.0 BuildingClass_ChangeOwnership_ProduceCash (10013D40, hook
+/// 0x4482BD), which replaces the startup payout inside the stock old-owner
+/// `MultiplayPassive` test (`0x004482AA..0x004482BC`, to `0x004482FC`): the
+/// type and each installed upgrade with a `ProduceCashStartup` or a
+/// `ProduceCashAmount` add their startup to a sum and, with a nonzero
+/// `ProduceCashDelay`, restart their timer for `delay + 1` frames. A sum
+/// other than zero goes to a new owner whose HouseType is not
+/// `MultiplayPassive` (GiveMoney, or TakeMoney of its negation), then joins
+/// the money display.
+fn ares_produce_cash_on_owner_change(
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    substrate: &mut ObjectSubstrate,
+    houses: &mut Houses,
+    stable_id: u64,
+    old_owner: InternedId,
+    new_owner: InternedId,
+    rules: &RuleSet,
+) {
+    let Some(entity) = substrate.entities.get(stable_id) else {
+        return;
+    };
+    if entity.category() != EntityCategory::Structure
+        || !houses
+            .get(&old_owner)
+            .is_some_and(|house| house.multiplay_passive())
+    {
+        return;
+    }
+    let types = ares_cash_types(interner, entity, rules);
+    let frame = session.binary_frame() as i32;
+    let mut amount = 0_i32;
+    let Some(entity) = substrate.entities.get_mut(stable_id) else {
+        return;
+    };
+    for (slot, kind) in types.into_iter().enumerate() {
+        let Some(kind) = kind else {
+            continue;
+        };
+        if kind.produce_cash_startup == 0 && kind.produce_cash_amount == 0 {
+            continue;
+        }
+        amount = amount.wrapping_add(kind.produce_cash_startup);
+        if kind.produce_cash_delay != 0 {
+            ares_cash_timer_mut(entity, slot).start(frame, kind.produce_cash_delay.wrapping_add(1));
+        }
+    }
+    if amount == 0
+        || houses
+            .get(&new_owner)
+            .is_none_or(|house| house.multiplay_passive())
+    {
+        return;
+    }
+    if amount > 0 {
+        add_credits(houses, new_owner, amount);
+    } else {
+        spend_money(houses, new_owner, amount.wrapping_neg());
+    }
+    add_produce_cash_display(interner, substrate, stable_id, amount, rules);
+}
+
 ///445FA5..445FC8: every admitted Grand_Opening rearms a nonzero delay,
 /// including the already-placed capture arm. Zero leaves the prior timer.
-pub(crate) fn produce_cash_on_grand_opening(sim: &mut Simulation, id: u64, rules: &RuleSet) {
-    let delay = sim
-        .substrate
+pub(crate) fn produce_cash_on_grand_opening(
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    substrate: &mut ObjectSubstrate,
+    id: u64,
+    rules: &RuleSet,
+) {
+    let delay = substrate
         .entities
         .get(id)
-        .and_then(|entity| sim.object_type(entity.type_ref(), rules))
+        .and_then(|entity| interner.object_type(entity.type_ref(), rules))
         .map_or(0, |object| object.produce_cash_delay);
     if delay != 0
-        && let Some(entity) = sim.substrate.entities.get_mut(id)
+        && let Some(entity) = substrate.entities.get_mut(id)
     {
-        entity.produce_cash.arm(sim.session.binary_frame, delay);
+        entity.produce_cash.arm(session.binary_frame(), delay);
+    }
+}
+
+/// The ProduceCash block of `BuildingClass::Update`: the stock block
+/// ([`stock_produce_cash_step`]), or in a game read the Ares way
+/// (`RuleSet::ares_form`) the hook that replaces it
+/// ([`ares_produce_cash_step`]).
+pub(crate) fn produce_cash_step(sim: &mut Simulation, stable_id: u64, rules: &RuleSet) {
+    if rules.ares_form() {
+        ares_produce_cash_step(sim, stable_id, rules);
+    } else {
+        stock_produce_cash_step(sim, stable_id, rules);
     }
 }
 
@@ -221,18 +390,18 @@ pub(crate) fn produce_cash_on_grand_opening(sim: &mut Simulation, id: u64, rules
 /// else `Spend_Money(-amount)` (`0x0043FDAA..0x0043FDD1`).
 ///
 /// The two warp gates ahead of the block (`IsWarpingOut` `+0x270` at
-/// `0x0043FD0C`, `IsBeingWarped` `+0x271` at `0x0043FD1E`) jump past it; VERA
-/// has no chrono-warp bytes on a building, so the block always runs.
-/// Residual trigger: a captured derrick inside a Chronosphere warp — the
-/// native timer dies on the skipped frame, VERA's keeps paying.
-pub(crate) fn produce_cash_step(sim: &mut Simulation, stable_id: u64, rules: &RuleSet) {
+/// `0x0043FD0C`, `IsBeingWarped` `+0x271` at `0x0043FD1E`) jump past it. In
+/// VERA the object turn's temporal prologue (`temporal_ai_prologue`) returns
+/// for a warped building before this step, so a timer whose expiry frame
+/// falls inside the warp dies as natively.
+fn stock_produce_cash_step(sim: &mut Simulation, stable_id: u64, rules: &RuleSet) {
     let Some(entity) = sim.substrate.entities.get(stable_id) else {
         return;
     };
     if entity.category() != EntityCategory::Structure {
         return;
     }
-    let frame = sim.session.binary_frame;
+    let frame = sim.session.binary_frame();
     if !produce_cash_fires(entity.produce_cash.timer(), frame) {
         return;
     }
@@ -248,7 +417,7 @@ pub(crate) fn produce_cash_step(sim: &mut Simulation, stable_id: u64, rules: &Ru
     if sim
         .houses
         .get(&owner)
-        .is_some_and(|house| house.multiplay_passive)
+        .is_some_and(|house| house.multiplay_passive())
     {
         return;
     }
@@ -256,9 +425,63 @@ pub(crate) fn produce_cash_step(sim: &mut Simulation, stable_id: u64, rules: &Ru
         return;
     }
     if amount > 0 {
-        add_credits(sim, owner, amount);
+        add_credits(&mut sim.houses, owner, amount);
     } else {
-        spend_money(sim, owner, amount.wrapping_neg());
+        spend_money(&mut sim.houses, owner, amount.wrapping_neg());
+    }
+}
+
+/// Ares 3.0 BuildingClass_Update_ProduceCash (100146E0, hook 0x43FD2C),
+/// which replaces the stock block to `0x0043FDD6`: the type (on `+0x6D0`)
+/// and each installed upgrade (on its BuildingExt timer) with a positive
+/// `ProduceCashDelay` whose timer has one frame or none left restart it for
+/// `delay + 1` frames, adding their `ProduceCashAmount` when one was left;
+/// a timer that never ran thus starts without any startup cash. A sum other
+/// than zero goes to an owner whose HouseType is not `MultiplayPassive`
+/// while the building is operational (vt+0x350): it joins the money display,
+/// then GiveMoney, or TakeMoney of its negation. The stock warp gates still
+/// skip the hook, as above.
+fn ares_produce_cash_step(sim: &mut Simulation, stable_id: u64, rules: &RuleSet) {
+    let Some(entity) = sim.substrate.entities.get(stable_id) else {
+        return;
+    };
+    if entity.category() != EntityCategory::Structure {
+        return;
+    }
+    let owner = entity.owner();
+    let types = ares_cash_types(&sim.interner, entity, rules);
+    let frame = sim.session.binary_frame() as i32;
+    let mut amount = 0_i32;
+    let Some(entity) = sim.substrate.entities.get_mut(stable_id) else {
+        return;
+    };
+    for (slot, kind) in types.into_iter().enumerate() {
+        let Some(kind) = kind.filter(|kind| kind.produce_cash_delay > 0) else {
+            continue;
+        };
+        let timer = ares_cash_timer_mut(entity, slot);
+        let left = timer.remaining(frame);
+        if left < 2 {
+            timer.start(frame, kind.produce_cash_delay.wrapping_add(1));
+            if left == 1 {
+                amount = amount.wrapping_add(kind.produce_cash_amount);
+            }
+        }
+    }
+    if amount == 0
+        || sim
+            .houses
+            .get(&owner)
+            .is_none_or(|house| house.multiplay_passive())
+        || sim.building_operational_state(stable_id, rules) != Some(true)
+    {
+        return;
+    }
+    add_produce_cash_display(&sim.interner, &mut sim.substrate, stable_id, amount, rules);
+    if amount > 0 {
+        add_credits(&mut sim.houses, owner, amount);
+    } else {
+        spend_money(&mut sim.houses, owner, amount.wrapping_neg());
     }
 }
 
@@ -278,9 +501,15 @@ pub(crate) fn produce_cash_step(sim: &mut Simulation, stable_id: u64, rules: &Ru
 /// suppresses the drained output.
 ///
 /// Returns whether the link was made.
-pub(crate) fn install_drain_link(sim: &mut Simulation, drainer_id: u64, victim_id: u64) -> bool {
-    let Some((rx, ry)) = sim
-        .substrate
+pub(crate) fn install_drain_link(
+    substrate: &mut ObjectSubstrate,
+    houses: &Houses,
+    power_states: &mut PowerStates,
+    drainer_id: u64,
+    victim_id: u64,
+    ares: bool,
+) -> bool {
+    let Some((rx, ry)) = substrate
         .entities
         .get(drainer_id)
         .map(|entity| (entity.position.rx(), entity.position.ry()))
@@ -288,28 +517,36 @@ pub(crate) fn install_drain_link(sim: &mut Simulation, drainer_id: u64, victim_i
         return false;
     };
     // 70FD8D: first ground Building, before any reciprocal-link writes.
-    if sim
-        .substrate
+    if substrate
         .occupancy
         .first_building_on_layer(rx, ry, MovementLayer::Ground)
         != Some(victim_id)
     {
         return false;
     }
-    if let Some(victim) = sim.substrate.entities.get_mut(victim_id) {
+    // Ares TechnoClass_Drain_PrismForward (10016B90, hook 0x70FD9A): a
+    // building not yet drained by this drainer leaves its Prism network.
+    if ares
+        && substrate
+            .entities
+            .get(victim_id)
+            .is_some_and(|victim| victim.drain.draining_me != Some(drainer_id))
+    {
+        substrate.ares_prism_remove_from_network(victim_id, true);
+    }
+    if let Some(victim) = substrate.entities.get_mut(victim_id) {
         victim.drain.draining_me = Some(drainer_id);
     }
-    if let Some(drainer) = sim.substrate.entities.get_mut(drainer_id) {
+    if let Some(drainer) = substrate.entities.get_mut(drainer_id) {
         drainer.drain.target = Some(victim_id);
     }
-    if let Some(owner) = sim
-        .substrate
+    if let Some(owner) = substrate
         .entities
         .get(victim_id)
         .map(|victim| victim.owner())
     {
         //70FDAC, before capture release/animation/team callbacks.
-        sim.invalidate_house_power(owner, false);
+        Simulation::invalidate_house_power(houses, power_states, owner, false);
     }
     true
 }
@@ -366,7 +603,7 @@ pub(crate) fn attach_drain_anim(sim: &mut Simulation, drainer_id: u64, rules: &R
 
 /// The `+0x1D4` DrainAnim un-init (vt+0xF8) that opens every native break
 /// of a drain link, for `drainer_id`.
-fn remove_drain_anim(sim: &mut Simulation, drainer_id: u64, rules: Option<&RuleSet>) {
+fn remove_drain_anim(sim: &mut Simulation, drainer_id: u64, rules: &RuleSet) {
     if let Some(anim) = sim
         .substrate
         .entities
@@ -381,7 +618,7 @@ fn remove_drain_anim(sim: &mut Simulation, drainer_id: u64, rules: Option<&RuleS
 /// the `DrainAnim`, clear the victim's `DrainingMe`, flag its house's power
 /// recalc, clear the drainer's `DrainTarget`. Also the inline copy in
 /// `TechnoClass::AI_Update @ 0x006FA1DF..0x006FA21E`.
-pub(crate) fn stop_drain(sim: &mut Simulation, drainer_id: u64, rules: Option<&RuleSet>) {
+pub(crate) fn stop_drain(sim: &mut Simulation, drainer_id: u64, rules: &RuleSet) {
     remove_drain_anim(sim, drainer_id, rules);
     let Some(victim_id) = sim
         .substrate
@@ -396,7 +633,7 @@ pub(crate) fn stop_drain(sim: &mut Simulation, drainer_id: u64, rules: Option<&R
     {
         victim.drain.draining_me = None;
         let owner = victim.owner();
-        sim.invalidate_house_power(owner, false); //70FE93 /6FA217
+        Simulation::invalidate_house_power(&sim.houses, &mut sim.power_states, owner, false); //70FE93 /6FA217
     }
     if let Some(drainer) = sim.substrate.entities.get_mut(drainer_id) {
         drainer.drain.target = None;
@@ -408,13 +645,9 @@ pub(crate) fn stop_drain(sim: &mut Simulation, drainer_id: u64, rules: Option<&R
 /// dying object drops both halves of any drain link it is part of, the
 /// drainer's DrainAnim first on each side. The killing hit reaches it through
 /// its Destroy's Detach_All broadcast (`0x005F5280`, the receiver's
-/// `object_destroy_callback`), in the same ReceiveDamage and before any draw
+/// `detach_all`), in the same ReceiveDamage and before any draw
 /// the death arm makes, so a falling wreck no longer drains or shows its ray.
-pub(crate) fn clear_drain_links_on_expiry(
-    sim: &mut Simulation,
-    expired_id: u64,
-    rules: Option<&RuleSet>,
-) {
+pub(crate) fn clear_drain_links_on_expiry(sim: &mut Simulation, expired_id: u64, rules: &RuleSet) {
     let Some((drain_target, draining_me)) = sim
         .substrate
         .entities
@@ -432,7 +665,7 @@ pub(crate) fn clear_drain_links_on_expiry(
     {
         victim.drain.draining_me = None;
         let owner = victim.owner();
-        sim.invalidate_house_power(owner, false); //7020AA /70789F
+        Simulation::invalidate_house_power(&sim.houses, &mut sim.power_states, owner, false); //7020AA /70789F
     }
     if let Some(drainer_id) = draining_me
         && sim
@@ -451,7 +684,7 @@ pub(crate) fn clear_drain_links_on_expiry(
             .get(expired_id)
             .map(|entity| entity.owner());
         if let Some(owner) = owner {
-            sim.invalidate_house_power(owner, false);
+            Simulation::invalidate_house_power(&sim.houses, &mut sim.power_states, owner, false);
         } //7020FB /70791D
     }
     if let Some(entity) = sim.substrate.entities.get_mut(expired_id) {
@@ -477,13 +710,14 @@ pub(crate) fn clear_drain_links_on_expiry(
 ///    refineries `GAREFN`/`NAREFN`/`YAREFN`); a drained `GAPOWR` loses power
 ///    (the `+0x5778` recalc, retained House assessment) but no credits.
 /// 2. Drainer side `0x006FA1C5..0x006FA224`: with `DrainTarget` (`+0x1CC`)
-///    set and `HouseClass::IsAlliedWith(target->Owner, this)` true, stop the
-///    drain inline.
+///    set and the target's house allied with this object's
+///    (`HouseClass::Is_Ally_ByObject @ 0x004F9A90`, asked by the target's
+///    house at `0x006FA1CF`), stop the drain inline.
 pub(crate) fn drain_common_step(sim: &mut Simulation, stable_id: u64, rules: &RuleSet) {
     let Some(entity) = sim.substrate.entities.get(stable_id) else {
         return;
     };
-    let victim_owner = entity.owner();
+    let owner = entity.owner();
     let draining_me = entity.drain.draining_me;
     let drain_target = entity.drain.target;
     let type_ref = entity.type_ref();
@@ -495,9 +729,10 @@ pub(crate) fn drain_common_step(sim: &mut Simulation, stable_id: u64, rules: &Ru
             .is_some_and(|obj| obj.resource_destination)
     {
         let delay = rules.general.drain_money_frame_delay;
-        // Native divides by the raw dword; a zero delay would fault there.
+        // Safety deviation: native IDIV faults on zero and i32::MIN / -1.
+        // Keep invalid overrides non-fatal with a zero skip and wrapping remainder.
         if delay != 0
-            && (sim.session.binary_frame as i32).wrapping_rem(delay) == 0
+            && (sim.session.binary_frame() as i32).wrapping_rem(delay) == 0
             && let Some(drainer_owner) = sim
                 .substrate
                 .entities
@@ -505,12 +740,12 @@ pub(crate) fn drain_common_step(sim: &mut Simulation, stable_id: u64, rules: &Ru
                 .map(|drainer| drainer.owner())
         {
             let mut amount = rules.general.drain_money_amount;
-            let available = available_money(sim, victim_owner);
+            let available = available_money(&sim.houses, owner);
             if available < amount {
                 amount = available;
             }
-            spend_money(sim, victim_owner, amount);
-            add_credits(sim, drainer_owner, amount);
+            spend_money(&mut sim.houses, owner, amount);
+            add_credits(&mut sim.houses, drainer_owner, amount);
         }
     }
 
@@ -520,13 +755,11 @@ pub(crate) fn drain_common_step(sim: &mut Simulation, stable_id: u64, rules: &Ru
             .entities
             .get(victim_id)
             .map(|victim| victim.owner())
-        && crate::map::houses::are_houses_friendly(
-            &sim.house_alliances,
-            sim.interner.resolve(target_owner),
-            sim.interner.resolve(victim_owner),
-        )
+        && sim
+            .house_alliances
+            .is_allied(&sim.interner, target_owner, owner)
     {
-        stop_drain(sim, stable_id, Some(rules));
+        stop_drain(sim, stable_id, rules);
     }
 }
 
@@ -537,7 +770,7 @@ pub(crate) fn drain_common_step(sim: &mut Simulation, stable_id: u64, rules: &Ru
 ///    unit's own cell and stop the drain when it is no longer the target.
 /// 2. `0x007361E9..0x00736204`: a `DrainAnim` (`+0x1D4`) left with no
 ///    `DrainTarget` is removed through Stop_Drain.
-pub(crate) fn drain_unit_ai_step(sim: &mut Simulation, stable_id: u64, rules: Option<&RuleSet>) {
+pub(crate) fn drain_unit_ai_step(sim: &mut Simulation, stable_id: u64, rules: &RuleSet) {
     let Some((target, anim, rx, ry)) = sim.substrate.entities.get(stable_id).map(|entity| {
         (
             entity.drain.target,
@@ -549,7 +782,7 @@ pub(crate) fn drain_unit_ai_step(sim: &mut Simulation, stable_id: u64, rules: Op
         return;
     };
     if let Some(target) = target
-        && (sim.session.binary_frame as i32).wrapping_rem(16) == 2
+        && (sim.session.binary_frame() as i32).wrapping_rem(16) == 2
         && sim
             .substrate
             .occupancy
@@ -569,7 +802,7 @@ pub(crate) fn drain_unit_ai_step(sim: &mut Simulation, stable_id: u64, rules: Op
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -585,19 +818,24 @@ mod tests {
     /// first Attack dispatch drops the target on the fog-visibility retarget
     /// (`combat::resolve_attacker_fire`) before any shot is resolved.
     fn rules() -> RuleSet {
-        rules_with_refinery_foundation("2x2")
+        rules_with_refinery_foundation("2x2", 30, 30)
     }
 
-    fn rules_with_refinery_foundation(foundation: &str) -> RuleSet {
+    fn rules_with_refinery_foundation(
+        foundation: &str,
+        drain_delay: i32,
+        drain_amount: i32,
+    ) -> RuleSet {
         // Retail `[DISKRAY]` art (ARTMD.INI), five frames bound.
         let art_text = format!(
             "[CAOILD]\nFoundation=2x2\n[CAOILDP]\nFoundation=2x2\n[GAPOWR]\nFoundation=2x2\n\
              [NAREFN]\nFoundation={foundation}\n\
              [DISKRAY]\nLoopCount=-1\nRate=200\nLoopStart=0\nLoopEnd=4\n"
         );
-        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&IniFile::from_str(
-            "[General]\nDrainMoneyFrameDelay=30\nDrainMoneyAmount=30\n\n\
-             [CombatDamage]\nDrainAnimationType=DISKRAY\n\n\
+        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&IniFile::from_str(&format!(
+            "[General]\n\
+             [CombatDamage]\nDrainMoneyFrameDelay={drain_delay}\nDrainMoneyAmount={drain_amount}\n\
+             DrainAnimationType=DISKRAY\n\n\
              [InfantryTypes]\n[AircraftTypes]\n\
              [VehicleTypes]\n0=DISK\n\
              [BuildingTypes]\n0=CAOILD\n1=CAOILDP\n2=GAPOWR\n3=NAREFN\n\n\
@@ -609,14 +847,14 @@ mod tests {
              [GAPOWR]\nStrength=750\nArmor=wood\nPower=100\nDrainable=yes\n\n\
              [NAREFN]\nStrength=1000\nArmor=wood\n\
              ResourceDestination=yes\nDrainable=yes\n\n\
-             [DISK]\nLocomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\nStrength=500\nArmor=heavy\nSpeed=6\n\
+             [DISK]\nLocomotor={{4A582741-9839-11d1-B709-00A024DDAFD1}}\nStrength=500\nArmor=heavy\nSpeed=6\n\
              Sight=9\nPrimary=DiskLaser\nSecondary=DiskDrain\n\n\
              [DiskLaser]\nDamage=90\nROF=80\nRange=7\nProjectile=Invisible\nWarhead=DiskWH\n\n\
              [DiskDrain]\nDamage=1\nBurst=1\nROF=50\nRange=1.5\nProjectile=Invisible\nWarhead=AntiB\n\
              DrainWeapon=yes\nOmniFire=yes\n\n\
              [DiskWH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\n\
              [AntiB]\nVerses=0%,0%,0%,0%,0%,0%,100%,100%,100%,100%,100%\n",
-        ), &IniFile::from_str(&art_text))
+        )), &IniFile::from_str(&art_text))
         .expect("credit-income test rules parse");
         let mut art = crate::rules::art_data::ArtRegistry::from_ini(&IniFile::from_str(&art_text));
         art.bind_anim_frame_count_for_test("DISKRAY", 5);
@@ -628,7 +866,7 @@ mod tests {
     /// (or already deleted by a later tick).
     fn anim_uninited(sim: &Simulation, id: crate::sim::anim_class::AnimId) -> bool {
         sim.anim(id).is_none_or(|anim| {
-            !anim.in_logic_vector && sim.substrate.pending_delete.contains_object(&id)
+            !anim.in_logic_vector() && sim.substrate.pending_delete.contains_object(&id)
         })
     }
 
@@ -642,8 +880,8 @@ mod tests {
             .anim
             .expect("drain anim");
         let anim = sim.anim(id).expect("live drain anim");
-        assert_eq!(sim.interner.resolve(anim.type_id), "DISKRAY");
-        assert_eq!(anim.owner_entity, Some(disk));
+        assert_eq!(sim.interner.resolve(anim.type_id()), "DISKRAY");
+        assert_eq!(anim.owner_entity(), Some(disk));
         id
     }
 
@@ -655,8 +893,7 @@ mod tests {
     fn house(sim: &mut Simulation, name: &str, human: bool, credits: i32) -> InternedId {
         let id = sim.interner.intern(name);
         sim.houses
-            .insert(id, HouseState::new(id, 0, None, human, credits, 10));
-        sim.session.house_order.push(id);
+            .register(HouseState::new(id, 0, None, human, credits, 10));
         id
     }
 
@@ -697,7 +934,7 @@ mod tests {
     }
 
     fn credits(sim: &Simulation, owner: InternedId) -> i32 {
-        sim.houses[&owner].economy.credits()
+        sim.houses[&owner].economy().credits()
     }
 
     /// Original 70FD8D/47C520 queries the actual ground list, not the enclosing
@@ -705,7 +942,7 @@ mod tests {
     /// stock GAREFN/NAREFN instead use rectangular 4x3 foundations.
     #[test]
     fn cell_building_query_disc_refuses_an_authored_refinery_foundation_hole() {
-        let rules = rules_with_refinery_foundation("3x3Refinery");
+        let rules = rules_with_refinery_foundation("3x3Refinery", 30, 30);
         let mut sim = Simulation::new();
         let refinery = sim
             .spawn_object("NAREFN", "Americans", 20, 20, 0, &rules)
@@ -713,7 +950,14 @@ mod tests {
         let disc = sim
             .spawn_object("DISK", "YuriCountry", 22, 21, 0, &rules)
             .unwrap();
-        assert!(!install_drain_link(&mut sim, disc, refinery));
+        assert!(!install_drain_link(
+            &mut sim.substrate,
+            &sim.houses,
+            &mut sim.power_states,
+            disc,
+            refinery,
+            rules.ares_form()
+        ));
         assert_eq!(sim.entities().get(disc).unwrap().drain.target(), None);
         assert_eq!(
             sim.entities().get(refinery).unwrap().drain.draining_me(),
@@ -741,11 +985,18 @@ mod tests {
             .death
             .set_dying_for_test(true);
         assert!(
-            install_drain_link(&mut sim, disc, refinery),
+            install_drain_link(
+                &mut sim.substrate,
+                &sim.houses,
+                &mut sim.power_states,
+                disc,
+                refinery,
+                rules.ares_form()
+            ),
             "still on the ground list"
         );
-        sim.session.binary_frame = 2;
-        drain_unit_ai_step(&mut sim, disc, Some(&rules));
+        sim.session.set_binary_frame_for_test(2);
+        drain_unit_ai_step(&mut sim, disc, &rules);
         assert_eq!(
             sim.entities().get(disc).unwrap().drain.target(),
             Some(refinery)
@@ -754,22 +1005,29 @@ mod tests {
             refinery,
             crate::sim::world::UninitContext::with_rules(&rules)
         ));
-        sim.session.binary_frame = 17;
-        drain_unit_ai_step(&mut sim, disc, Some(&rules));
+        sim.session.set_binary_frame_for_test(17);
+        drain_unit_ai_step(&mut sim, disc, &rules);
         assert_eq!(
             sim.entities().get(disc).unwrap().drain.target(),
             Some(refinery),
             "not a recheck frame"
         );
-        sim.session.binary_frame = 18;
-        drain_unit_ai_step(&mut sim, disc, Some(&rules));
+        sim.session.set_binary_frame_for_test(18);
+        drain_unit_ai_step(&mut sim, disc, &rules);
         assert_eq!(sim.entities().get(disc).unwrap().drain.target(), None);
         assert_eq!(
             sim.entities().get(refinery).unwrap().drain.draining_me(),
             None
         );
         assert!(
-            !install_drain_link(&mut sim, disc, refinery),
+            !install_drain_link(
+                &mut sim.substrate,
+                &sim.houses,
+                &mut sim.power_states,
+                disc,
+                refinery,
+                rules.ares_form()
+            ),
             "stored but unlisted"
         );
     }
@@ -779,12 +1037,17 @@ mod tests {
     /// `ProduceCashAmount` every `ProduceCashDelay - 1` frames (the native
     /// `remaining == 1` fire test), and re-capture by another non-passive
     /// house grants nothing.
+    /// Ares replaces both ProduceCash blocks (hooks 0x43FD2C, 0x4482BD;
+    /// `ares_cash_restarts_spent_timers_and_adds_each_upgrade`).
     #[test]
     fn derrick_capture_grant_then_twenty_per_ninety_nine_frames() {
         let rules = rules();
         let mut sim = Simulation::with_seed(0x0011_0901);
         let neutral = house(&mut sim, "Neutral", false, 0);
-        sim.houses.get_mut(&neutral).unwrap().multiplay_passive = true;
+        sim.houses
+            .get_mut(&neutral)
+            .unwrap()
+            .set_multiplay_passive_for_test(true);
         let americans = house(&mut sim, "Americans", true, 5_000);
         let soviets = house(&mut sim, "Soviet", true, 5_000);
         base(&mut sim, &rules, "Americans", 30, 30);
@@ -815,7 +1078,7 @@ mod tests {
         );
         let armed = sim.substrate.entities.get(oil).unwrap().produce_cash.timer;
         assert_eq!(armed.duration(), 100);
-        assert_eq!(armed.start_frame(), sim.session.binary_frame as i32);
+        assert_eq!(armed.start_frame(), sim.session.binary_frame() as i32);
 
         // Arming frame semantics: `change_owner` armed the timer at frame
         // `F = start_frame` with duration `Delay = 100`. `advance_tick` runs
@@ -832,7 +1095,7 @@ mod tests {
             let now = credits(&sim, americans);
             if now != last {
                 assert_eq!(now - last, 20, "one ProduceCashAmount per fire");
-                payments.push((tick, sim.session.binary_frame));
+                payments.push((tick, sim.session.binary_frame()));
                 last = now;
             }
         }
@@ -891,6 +1154,7 @@ mod tests {
             (false, -1, 5, true),
         ] {
             sim.power_states
+                .map_mut_for_test()
                 .entry(owner)
                 .or_default()
                 .start_blackout(0, if outage { 1000 } else { 0 });
@@ -906,7 +1170,7 @@ mod tests {
                 ai_counter: 0,
                 dispatch_timer: MissionDispatchTimer::at_frame(0),
             });
-            sim.session.binary_frame = 99;
+            sim.session.set_binary_frame_for_test(99);
             let before = credits(&sim, owner);
             produce_cash_step(&mut sim, id, &rules);
             assert_eq!(credits(&sim, owner) - before, if pays { 20 } else { 0 });
@@ -922,54 +1186,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn derrick_stops_paying_while_not_operational() {
-        let rules = rules();
-        let mut sim = Simulation::with_seed(0x0011_0902);
-        let neutral = house(&mut sim, "Neutral", false, 0);
-        sim.houses.get_mut(&neutral).unwrap().multiplay_passive = true;
-        let americans = house(&mut sim, "Americans", true, 0);
-        let oil = sim
-            .spawn_object("CAOILDP", "Neutral", 10, 10, 0, &rules)
-            .expect("powered derrick spawns");
-        sim.change_owner_with_rules(
-            oil,
-            americans,
-            &rules,
-            None,
-            crate::sim::world::FrameEffects::default(),
-        );
-        assert_eq!(credits(&sim, americans), 1_000);
-        // No power plant: output 0 < drain 10 → low power → not operational.
-        run_ticks(&mut sim, &rules, 300);
-        assert!(
-            sim.power_states[&americans].is_low_power,
-            "fixture must be in low power"
-        );
-        assert_eq!(
-            credits(&sim, americans),
-            1_000,
-            "no ProduceCashAmount while offline"
-        );
-        // The timer still re-armed on every expiry (the re-arm precedes the gate).
-        let timer = sim.substrate.entities.get(oil).unwrap().produce_cash.timer;
-        assert_eq!(timer.duration(), 100);
-        assert!(
-            (sim.session.binary_frame as i32).wrapping_sub(timer.start_frame()) < 100,
-            "timer keeps cycling while offline"
-        );
-    }
-
     /// §2.17: with the drain link installed on a `ResourceDestination=yes`
     /// victim (a refinery) the victim loses `min(DrainMoneyAmount, Available)`
     /// on every `DrainMoneyFrameDelay`-th frame and the drainer's house gains
     /// the same amount; a poor victim is drained only to zero.
     #[test]
-    fn disc_drain_thirty_per_thirty_frames_capped_at_available() {
-        let rules = rules();
+    fn disc_drain_uses_loaded_cadence_and_amount_capped_at_available() {
+        let rules = rules_with_refinery_foundation("2x2", 17, 13);
         let mut sim = Simulation::with_seed(0x0011_0903);
         let yuri = house(&mut sim, "YuriCountry", false, 500);
-        let americans = house(&mut sim, "Americans", true, 75);
+        let americans = house(&mut sim, "Americans", true, 31);
         base(&mut sim, &rules, "YuriCountry", 40, 40);
         base(&mut sim, &rules, "Americans", 44, 44);
         let refinery = sim
@@ -983,7 +1209,14 @@ mod tests {
                 .first_building_on_layer(21, 21, MovementLayer::Ground),
             Some(refinery)
         );
-        assert!(install_drain_link(&mut sim, disk, refinery));
+        assert!(install_drain_link(
+            &mut sim.substrate,
+            &sim.houses,
+            &mut sim.power_states,
+            disk,
+            refinery,
+            rules.ares_form()
+        ));
         assert_eq!(
             sim.substrate.entities.get(disk).unwrap().drain.target,
             Some(refinery)
@@ -998,30 +1231,69 @@ mod tests {
             Some(disk)
         );
 
-        // 75 available: 30, 30, then 15, then nothing.
-        let mut transfers: Vec<i32> = Vec::new();
-        let mut victim_last = 75;
-        for _ in 0..150 {
+        // The common AI reads the global frame before advance_tick increments it.
+        sim.session.set_binary_frame_for_test(1);
+        // 31 available: 13 at frame17, 13 at34, then5 at51.
+        let mut transfers = Vec::new();
+        let mut victim_last = 31;
+        for _ in 0..68 {
+            let frame = sim.session.binary_frame();
             run_ticks(&mut sim, &rules, 1);
             let now = credits(&sim, americans);
             if now != victim_last {
-                transfers.push(victim_last - now);
+                transfers.push((frame, victim_last - now));
                 victim_last = now;
             }
             assert_eq!(
                 credits(&sim, americans) + credits(&sim, yuri),
-                575,
+                531,
                 "money is moved, never created or destroyed"
             );
         }
-        assert_eq!(transfers, vec![30, 30, 15]);
+        assert_eq!(transfers, vec![(17, 13), (34, 13), (51, 5)]);
         assert_eq!(credits(&sim, americans), 0);
-        assert_eq!(credits(&sim, yuri), 575);
+        assert_eq!(credits(&sim, yuri), 531);
         // The link survives an empty wallet (native keeps calling with 0).
         assert_eq!(
             sim.substrate.entities.get(disk).unwrap().drain.target,
             Some(refinery)
         );
+    }
+
+    /// The drainer side stops the link once the drained building's house is
+    /// allied with the disc's, as the building's house asks it (`0x006FA1CF`,
+    /// `HouseClass::Is_Ally_ByObject @ 0x004F9A90`): the disc's house allying
+    /// the building's alone keeps the link.
+    #[test]
+    fn the_drained_buildings_house_asks_whether_the_drain_stops() {
+        let rules = rules();
+        let linked = |asker: &str, other: &str| {
+            let mut sim = Simulation::with_seed(0x006F_A1CF);
+            house(&mut sim, "YuriCountry", false, 500);
+            house(&mut sim, "Americans", true, 75);
+            let plant = sim
+                .spawn_object("GAPOWR", "Americans", 20, 20, 0, &rules)
+                .expect("power plant spawns");
+            let disk = sim
+                .spawn_object("DISK", "YuriCountry", 21, 21, 0, &rules)
+                .expect("disc spawns");
+            assert!(install_drain_link(
+                &mut sim.substrate,
+                &sim.houses,
+                &mut sim.power_states,
+                disk,
+                plant,
+                rules.ares_form()
+            ));
+            *sim.house_alliances_mut_for_test() = crate::map::houses::HouseAllianceMap::from([(
+                asker.to_ascii_uppercase(),
+                [other.to_ascii_uppercase()].into(),
+            )]);
+            drain_common_step(&mut sim, disk, &rules);
+            sim.substrate.entities.get(disk).unwrap().drain.target == Some(plant)
+        };
+        assert!(linked("YuriCountry", "Americans"));
+        assert!(!linked("Americans", "YuriCountry"));
     }
 
     /// `TechnoClass::AI_Update @ 0x006FA15D` reads `Type+0x5ED` =
@@ -1041,7 +1313,14 @@ mod tests {
         let disk = sim
             .spawn_object("DISK", "YuriCountry", 21, 21, 0, &rules)
             .expect("disc spawns");
-        assert!(install_drain_link(&mut sim, disk, plant));
+        assert!(install_drain_link(
+            &mut sim.substrate,
+            &sim.houses,
+            &mut sim.power_states,
+            disk,
+            plant,
+            rules.ares_form()
+        ));
         run_ticks(&mut sim, &rules, 150);
         assert_eq!(credits(&sim, americans), 75, "no credits leave a GAPOWR");
         assert_eq!(credits(&sim, yuri), 500);
@@ -1160,6 +1439,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retail_disc_attack_binds_and_loops_the_attached_drain_ray() {
+        let Some(battle) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let (_, assets) = crate::rules::retail_ini_fixture::retail_assets().unwrap();
+        let mut rules = battle.rules;
+        // Use the loader's closure instead of this module's manually bound ART.
+        let roots = crate::rules::effect_asset_catalog::tolerant_anim_class_roots(&rules);
+        rules.bind_anim_class_assets(&roots, &assets, "TEM", "TEMPERATE");
+        let name = rules.combat_damage.drain_animation_type.as_deref().unwrap();
+        assert_eq!(name, "DISKRAY");
+        let physical_frames = crate::assets::shp_file::ShpFile::frame_count_from_bytes(
+            assets.get_ref("DISKRAY.SHP").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rules
+                .art()
+                .anim_runtime_config(name)
+                .unwrap()
+                .raw_shp_frame_count,
+            Some(i32::from(physical_frames)),
+            "physical DISKRAY.SHP must bind before the drain shot"
+        );
+
+        let mut sim = Simulation::with_seed(0x70FD70);
+        let grid = crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
+        let yuri = house(&mut sim, "YuriCountry", true, 500);
+        house(&mut sim, "Americans", true, 5_000);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        sim.resolve_rule_animation_lists(&rules);
+        base(&mut sim, &rules, "YuriCountry", 4, 4);
+        let plant = sim
+            .spawn_object("GAPOWR", "Americans", 20, 20, 0, &rules)
+            .unwrap();
+        let disk = sim
+            .spawn_object("DISK", "YuriCountry", 21, 23, 0, &rules)
+            .unwrap();
+        // Start over the target's marked cell; approach timing is unrelated to
+        // the loader regression. The ordinary Attack still creates the link.
+        move_disc(&mut sim, disk, 21, 21);
+        sim.fog_mut_for_test().mark_visible_for_owner(yuri, 20, 20);
+        let order = cmd(
+            &sim,
+            "YuriCountry",
+            1,
+            Command::Attack {
+                attacker_id: disk,
+                target_id: plant,
+            },
+        );
+        let result = sim.advance_tick(&[order], Some(&rules), Some(&grid), None, 67);
+        assert_eq!(result.executed_commands, 1);
+        for _ in 0..120 {
+            run_ticks(&mut sim, &rules, 1);
+            if sim.entities().get(disk).unwrap().drain.target() == Some(plant) {
+                break;
+            }
+        }
+        assert_eq!(
+            sim.entities().get(disk).unwrap().drain.target(),
+            Some(plant)
+        );
+        let ray = assert_drain_anim(&sim, disk);
+        let anim = sim.anim(ray).unwrap();
+        assert_eq!(anim.draw_flags(), 0x600);
+        assert_eq!(
+            anim.world_coord(),
+            crate::sim::anim_class::AnimWorldCoord { x: 0, y: 0, z: 0 }
+        );
+        assert_eq!(sim.anim_absolute_coord(ray), sim.anim_owner_coords(disk));
+        assert!(sim.display_layers().layer_of(ray).is_some());
+        let mut frames = std::collections::BTreeSet::new();
+        for _ in 0..120 {
+            run_ticks(&mut sim, &rules, 1);
+            let anim = sim.anim(ray).expect("the same attached ray keeps looping");
+            frames.insert(anim.runtime().current_frame);
+            assert_eq!(sim.anim_absolute_coord(ray), sim.anim_owner_coords(disk));
+        }
+        // AnimClass::AI4246FC..42470A treats ART LoopEnd as exclusive.
+        assert_eq!(frames, (0..4).collect());
+        move_disc(&mut sim, disk, 16, 16);
+        run_ticks(&mut sim, &rules, 16);
+        assert_eq!(sim.entities().get(disk).unwrap().drain.target(), None);
+        assert!(
+            anim_uninited(&sim, ray),
+            "leaving the building removes the ray"
+        );
+    }
+
+    /// The drain re-check (`0x007361A9..0x00736204`) precedes
+    /// `TemporalClass::Update` (`0x00736204`), so a disc being erased still
+    /// drops a ray left with no link.
+    #[test]
+    fn a_warped_disc_still_drops_a_ray_with_no_link() {
+        let rules = rules();
+        let mut sim = Simulation::with_seed(0x0073_61A9);
+        let _yuri = house(&mut sim, "YuriCountry", false, 500);
+        let _americans = house(&mut sim, "Americans", true, 500);
+        base(&mut sim, &rules, "YuriCountry", 40, 40);
+        base(&mut sim, &rules, "Americans", 4, 4);
+        let disk = sim
+            .spawn_object("DISK", "YuriCountry", 30, 30, 0, &rules)
+            .expect("disc spawns");
+        attach_drain_anim(&mut sim, disk, &rules);
+        let stray = assert_drain_anim(&sim, disk);
+        sim.substrate
+            .entities
+            .get_mut(disk)
+            .unwrap()
+            .set_temporal_for_test(crate::sim::temporal::TemporalState::warped_by_for_test(
+                disk,
+            ));
+        run_ticks(&mut sim, &rules, 1);
+        let disc = sim.entities().get(disk).unwrap();
+        assert!(disc.is_warped_out(), "the fixture keeps the disc warped");
+        assert_eq!(disc.drain.anim, None);
+        assert!(anim_uninited(&sim, stray));
+    }
+
     /// `UnitClass::AI @ 0x007361B3`: every 16th frame the disc re-checks the
     /// building under it and releases the link once it has moved off;
     /// `0x0070FD70` refuses to link a disc that is not over the target.
@@ -1176,14 +1577,28 @@ mod tests {
         let disk = sim
             .spawn_object("DISK", "YuriCountry", 30, 30, 0, &rules)
             .expect("disc spawns");
-        assert!(!install_drain_link(&mut sim, disk, plant));
+        assert!(!install_drain_link(
+            &mut sim.substrate,
+            &sim.houses,
+            &mut sim.power_states,
+            disk,
+            plant,
+            rules.ares_form()
+        ));
         assert_eq!(
             sim.substrate.entities.get(plant).unwrap().drain.draining_me,
             None
         );
 
         move_disc(&mut sim, disk, 20, 21);
-        assert!(install_drain_link(&mut sim, disk, plant));
+        assert!(install_drain_link(
+            &mut sim.substrate,
+            &sim.houses,
+            &mut sim.power_states,
+            disk,
+            plant,
+            rules.ares_form()
+        ));
         attach_drain_anim(&mut sim, disk, &rules);
         let anim = assert_drain_anim(&sim, disk);
         run_ticks(&mut sim, &rules, 40);
@@ -1208,14 +1623,21 @@ mod tests {
         // UnitClass::AI, whatever the frame.
         attach_drain_anim(&mut sim, disk, &rules);
         let stray = assert_drain_anim(&sim, disk);
-        sim.session.binary_frame = 5;
-        drain_unit_ai_step(&mut sim, disk, Some(&rules));
+        sim.session.set_binary_frame_for_test(5);
+        drain_unit_ai_step(&mut sim, disk, &rules);
         assert_eq!(sim.entities().get(disk).unwrap().drain.anim, None);
         assert!(anim_uninited(&sim, stray));
 
         // The victim's expiry drops both halves and the drainer's ray.
         move_disc(&mut sim, disk, 20, 21);
-        assert!(install_drain_link(&mut sim, disk, plant));
+        assert!(install_drain_link(
+            &mut sim.substrate,
+            &sim.houses,
+            &mut sim.power_states,
+            disk,
+            plant,
+            rules.ares_form()
+        ));
         attach_drain_anim(&mut sim, disk, &rules);
         let anim = assert_drain_anim(&sim, disk);
         sim.uninit_with_rules(plant, &rules);
@@ -1227,7 +1649,14 @@ mod tests {
         let plant = sim
             .spawn_object("GAPOWR", "Americans", 20, 20, 0, &rules)
             .expect("power plant spawns");
-        assert!(install_drain_link(&mut sim, disk, plant));
+        assert!(install_drain_link(
+            &mut sim.substrate,
+            &sim.houses,
+            &mut sim.power_states,
+            disk,
+            plant,
+            rules.ares_form()
+        ));
         attach_drain_anim(&mut sim, disk, &rules);
         let anim = assert_drain_anim(&sim, disk);
         sim.uninit_with_rules(disk, &rules);
@@ -1236,22 +1665,6 @@ mod tests {
             None
         );
         assert!(anim_uninited(&sim, anim));
-    }
-
-    #[test]
-    fn produce_cash_timer_fires_once_at_delay_minus_one_then_needs_rearm() {
-        let timer = CdTimer::started(100, 100);
-        for frame in 100..199 {
-            assert!(
-                !produce_cash_fires(timer, frame),
-                "frame {frame} must not fire"
-            );
-        }
-        assert!(produce_cash_fires(timer, 199));
-        // Past its duration the native timer is dead: `elapsed >= duration`
-        // jumps over the block until something re-arms it.
-        assert!(!produce_cash_fires(timer, 200));
-        assert!(!produce_cash_fires(timer, 5_000));
     }
 
     #[test]
@@ -1264,5 +1677,61 @@ mod tests {
         // The `-1` sentinel reads the raw duration; only duration 1 fires.
         assert!(!produce_cash_fires(CdTimer::from_raw(-1, 0), 0));
         assert!(produce_cash_fires(CdTimer::from_raw(-1, 1), 123));
+    }
+
+    /// Ares BuildingClass_Update_ProduceCash (100146E0, hook 0x43FD2C): the
+    /// type's timer with one frame left pays and restarts for Delay+1; the
+    /// installed upgrade's never-run timer starts without paying, then pays
+    /// its own amount on its own cadence; `ProduceCashDisplay` queues each
+    /// payment on the building's money display.
+    #[test]
+    fn ares_cash_restarts_spent_timers_and_adds_each_upgrade() {
+        use crate::sim::mission::state::MissionTestFixture;
+        use crate::sim::mission::{MissionDispatchTimer, MissionId};
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[BuildingTypes]\n0=OIL\n1=PUMP\n\
+             [OIL]\nStrength=100\nProduceCashAmount=20\nProduceCashDelay=100\n\
+             ProduceCashDisplay=yes\n\
+             [PUMP]\nStrength=100\nProduceCashAmount=5\nProduceCashDelay=10\n",
+        ))
+        .unwrap();
+        let mut sim = Simulation::new();
+        let owner = house(&mut sim, "A", true, 0);
+        let id = sim
+            .spawn_object_at_height("OIL", "A", 10, 10, 0, 0, &rules)
+            .unwrap();
+        let pump = sim.interner.intern("PUMP");
+        let entity = sim.substrate.entities.get_mut(id).unwrap();
+        entity.set_building_upgrades_for_test(1, [Some(pump), None, None]);
+        entity.produce_cash.timer = CdTimer::started(0, 100);
+        entity.mission.apply_test_fixture(MissionTestFixture {
+            current: MissionId::from_raw(-1),
+            queued: MissionId::from_raw(5),
+            suspended: MissionId::NONE,
+            movement_bypass_latch: 0,
+            handler_state: 0,
+            mission_start_frame: 0,
+            ai_counter: 0,
+            dispatch_timer: MissionDispatchTimer::at_frame(0),
+        });
+        let step = |sim: &mut Simulation, frame: u32| {
+            sim.session.set_binary_frame_for_test(frame);
+            let before = credits(sim, owner);
+            produce_cash_step(sim, id, &rules);
+            credits(sim, owner) - before
+        };
+        assert_eq!(step(&mut sim, 99), 20);
+        let entity = sim.substrate.entities.get(id).unwrap();
+        assert_eq!(entity.produce_cash.timer, CdTimer::started(99, 101));
+        assert_eq!(entity.ares.cash_upgrade_timers[0], CdTimer::started(99, 11));
+        assert_eq!(step(&mut sim, 108), 0);
+        assert_eq!(step(&mut sim, 109), 5);
+        let entity = sim.substrate.entities.get_mut(id).unwrap();
+        assert_eq!(
+            entity.ares.cash_upgrade_timers[0],
+            CdTimer::started(109, 11)
+        );
+        assert_eq!(entity.ares.bounty_display.take_pending_for_test(), 25);
     }
 }

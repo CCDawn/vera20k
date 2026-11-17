@@ -17,15 +17,19 @@ fn scene() -> (Simulation, RuleSet, OverlayTypeRegistry, [InternedId; 3]) {
          [Warheads]\n2=CONTROL\n[CONTROL]\nMindControl=yes\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
          [SuperWeaponTypes]\n0=REVEAL\n[REVEAL]\nType=PsychicReveal\nRechargeTime=.1\nIsPowered=no\nRevealRadius=1\n",
     );
-    sim.session.game_mode_nonzero = true;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     let houses = std::array::from_fn(|i| {
         let name = sim.interner.intern(&format!("H{i}"));
         let country = sim.interner.intern(&format!("Country{i}"));
-        sim.houses.insert(
+        sim.houses.register(HouseState::new(
             name,
-            HouseState::new(name, i as u8, Some(country), false, 10000, 10),
-        );
-        sim.session.house_order.push(name);
+            i as u8,
+            Some(country),
+            false,
+            10000,
+            10,
+        ));
         name
     });
     super::tests::install_event_ingress_map(
@@ -53,7 +57,7 @@ fn run(
         .unwrap()
         .entries()[0]
         .clone();
-    let action = RuntimeDefinitions::default().resolve_action(entry, None, None);
+    let action = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
     let live_index = live.then(|| sim.trigger_runtime.trigger_order[0]);
     sim.apply_live_trigger_action(
         &action,
@@ -63,7 +67,7 @@ fn run(
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        Some(rules),
+        rules,
         Some(registry),
         FrameEffects::default(),
     )
@@ -173,17 +177,17 @@ fn house_directive_make_ally_runs_both_directions_and_preserves_native_receipt()
         true
     ));
     assert!(crate::map::houses::is_allied_with(
-        &sim.house_alliances,
+        sim.house_alliances.as_map(),
         "H0",
         "H1"
     ));
     assert!(crate::map::houses::is_allied_with(
-        &sim.house_alliances,
+        sim.house_alliances.as_map(),
         "H1",
         "H0"
     ));
     assert!(!crate::map::houses::is_allied_with(
-        &sim.house_alliances,
+        sim.house_alliances.as_map(),
         "H0",
         "H2"
     ));
@@ -200,8 +204,14 @@ fn house_directive_make_ally_runs_both_directions_and_preserves_native_receipt()
     assert_eq!(sim.state_hash(), hash);
     // CanAlly checks the calling House, so defeat both callers to refuse both directions.
     // A valid selection still reports success.
-    sim.houses.get_mut(&houses[0]).unwrap().is_defeated = true;
-    sim.houses.get_mut(&houses[2]).unwrap().is_defeated = true;
+    sim.houses
+        .get_mut(&houses[0])
+        .unwrap()
+        .set_is_defeated_for_test(true);
+    sim.houses
+        .get_mut(&houses[2])
+        .unwrap()
+        .set_is_defeated_for_test(true);
     assert!(run(
         &mut sim,
         &rules,
@@ -212,7 +222,7 @@ fn house_directive_make_ally_runs_both_directions_and_preserves_native_receipt()
         true
     ));
     assert!(!crate::map::houses::is_allied_with(
-        &sim.house_alliances,
+        sim.house_alliances.as_map(),
         "H0",
         "H2"
     ));
@@ -237,12 +247,12 @@ fn house_directive_base_control_and_saved_return_use_reverse_live_lists_and_shar
         true
     ));
     assert_eq!(
-        sim.houses[&houses[0]].base_projection.buildings(),
+        sim.houses[&houses[0]].base_projection().buildings(),
         &[ids[0], ids[2], ids[1]]
     );
     assert!(
         sim.houses[&houses[1]]
-            .base_projection
+            .base_projection()
             .buildings()
             .is_empty()
     );
@@ -285,7 +295,7 @@ fn house_directive_base_control_and_saved_return_use_reverse_live_lists_and_shar
         .unwrap();
     loaded.resolve_type_handles(&rules);
     assert_eq!(
-        loaded.houses[&houses[0]].base_projection.buildings(),
+        loaded.houses[&houses[0]].base_projection().buildings(),
         &[ids[0], ids[2], ids[1]]
     );
     assert_eq!(loaded.techno_original_owner(ids[1]), Some(houses[1]));
@@ -300,11 +310,11 @@ fn house_directive_base_control_and_saved_return_use_reverse_live_lists_and_shar
         true
     ));
     assert_eq!(
-        loaded.houses[&houses[1]].base_projection.buildings(),
+        loaded.houses[&houses[1]].base_projection().buildings(),
         &[ids[1], ids[2]]
     );
     assert_eq!(
-        loaded.houses[&houses[0]].base_projection.buildings(),
+        loaded.houses[&houses[0]].base_projection().buildings(),
         &[ids[0]]
     );
     for id in [ids[1], ids[2]] {
@@ -392,6 +402,56 @@ fn house_directive_ordinary_capture_keeps_controller_but_clears_original_and_res
             .house_controller(),
         None
     );
+}
+
+/// House50D290 retains the pre-transfer owner; Blowup_All4FC70D admits
+/// that owner's buildings without a unit CaptureManager, even under another House.
+#[test]
+fn house_directive_transferred_base_dies_with_original_house() {
+    let (mut sim, rules, registry, houses, ids) = building_scene();
+    assert!(run(
+        &mut sim,
+        &rules,
+        &registry,
+        Some(houses[0]),
+        123,
+        "1",
+        true
+    ));
+    assert_eq!(sim.techno_original_owner(ids[1]), Some(houses[1]));
+    assert_eq!(
+        sim.substrate.entities.get(ids[1]).unwrap().owner(),
+        houses[0]
+    );
+    // An ordinary later capture clears only +2E0; that building no longer
+    // belongs to the old original owner for this sweep.
+    sim.change_owner_with_rules(
+        ids[2],
+        houses[2],
+        &rules,
+        Some(&registry),
+        FrameEffects::default(),
+    );
+    assert_eq!(sim.techno_original_owner(ids[2]), None);
+    assert!(run(
+        &mut sim,
+        &rules,
+        &registry,
+        Some(houses[0]),
+        119,
+        "1",
+        true
+    ));
+    assert!(
+        sim.substrate
+            .entities
+            .get(ids[1])
+            .is_none_or(|entity| entity.health.current() <= 0),
+        "the original house's destruction must kill its transferred building"
+    );
+    assert!(sim.substrate.entities.get(ids[2]).unwrap().health.current() > 0);
+    assert!(sim.substrate.entities.get(ids[0]).unwrap().health.current() > 0);
+    assert!(sim.substrate.entities.get(ids[3]).unwrap().health.current() > 0);
 }
 
 #[test]
@@ -497,7 +557,10 @@ fn house_directive_target_kind_reaches_first_own_team_threat_scan_and_real_super
     let team = sim
         .team_script_vm
         .create_team(houses[0], script, vec![leader], 0);
-    sim.houses.get_mut(&houses[0]).unwrap().enemy_house = Some(houses[1]);
+    sim.houses
+        .get_mut(&houses[0])
+        .unwrap()
+        .set_enemy_house_for_test(Some(houses[1]));
     assert!(run(
         &mut sim,
         &rules,
@@ -516,7 +579,7 @@ fn house_directive_target_kind_reaches_first_own_team_threat_scan_and_real_super
         Some(&registry),
         FrameEffects::default(),
     );
-    assert!(sim.sound_events.iter().any(|e| matches!(e,crate::sim::world::SimSoundEvent::SuperWeaponLaunched { owner,sw_type,rx:17,ry:15 } if *owner==houses[0] && *sw_type==sw)), "the closer third House is excluded by native arg3=true");
+    assert!(sim.sound_events.iter().any(|e| matches!(e,crate::sim::world::SimSoundEvent::SuperWeaponLaunched { owner,sw_type,world } if *owner==houses[0] && *sw_type==sw && world.to_cell_sub_z().0==17 && world.to_cell_sub_z().1==15)), "the closer third House is excluded by native arg3=true");
     assert!(
         !crate::sim::superweapon::superweapon_views_for_owner(&sim, &rules, &houses[0])
             .iter()
@@ -527,7 +590,7 @@ fn house_directive_target_kind_reaches_first_own_team_threat_scan_and_real_super
         houses[1]
     );
     // A scripted cell wins over the quarry and bypasses the ground +2 offset.
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     sim.houses
         .get_mut(&houses[0])
         .unwrap()
@@ -542,14 +605,15 @@ fn house_directive_target_kind_reaches_first_own_team_threat_scan_and_real_super
     );
     assert!(sim.sound_events.iter().any(|e| matches!(
         e,
-        crate::sim::world::SimSoundEvent::SuperWeaponLaunched { rx: 16, ry: 15, .. }
+        crate::sim::world::SimSoundEvent::SuperWeaponLaunched { world, .. }
+            if world.to_cell_sub_z().0 == 16 && world.to_cell_sub_z().1 == 15
     )));
     sim.houses
         .get_mut(&houses[0])
         .unwrap()
         .clear_preferred_super_weapon_target();
     sim.destroy_team(team, &rules, FrameEffects::default());
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     crate::sim::superweapon::chronosphere_tests::charge_super(&mut sim, houses[0], "REVEAL");
     let rng = sim.rng_state();
     crate::sim::superweapon::ai_fire::try_fire(

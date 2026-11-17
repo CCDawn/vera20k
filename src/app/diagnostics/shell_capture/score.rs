@@ -12,9 +12,9 @@ use crate::ui::campaign_score_shell::{
 };
 use crate::ui::score_shell::{ScoreRow, ScoreScreenModel};
 use crate::ui::shell::geom::RectPx;
+use crate::util::time::Instant;
 use image::ImageEncoder;
 use serde_json::{Value, json};
-use std::time::Instant;
 
 /// Frames to present once the target state is reached.
 const SETTLE_FRAMES: u32 = 4;
@@ -125,6 +125,7 @@ fn synthetic_campaign_score_model() -> CampaignScoreScreenModel {
         enemies_destroyed: "17".into(),
         rank: "Captain".into(),
         commendation: "Mission completed ahead of schedule.".into(),
+        ..Default::default()
     }
 }
 
@@ -636,7 +637,7 @@ fn campaign_score_layout(state: &AppState) -> CampaignScoreLayout {
     )
 }
 
-fn click_campaign_continue(state: &mut AppState) -> Result<()> {
+pub(super) fn click_campaign_continue(state: &mut AppState) -> Result<()> {
     let layout = campaign_score_layout(state);
     let button = layout.continue_button;
     state.match_state.input.cursor_x = (button.x + button.w / 2) as f32;
@@ -718,6 +719,8 @@ fn comparison_model(state: &AppState) -> Result<ScoreScreenModel> {
         game_number: 1,
         elapsed_seconds: 79,
         side: 0,
+        theme: None,
+        background: None,
         rows: vec![
             ScoreRow {
                 name: computer,
@@ -740,7 +743,7 @@ fn comparison_model(state: &AppState) -> Result<ScoreScreenModel> {
 }
 
 /// Every kind-1 static of the page has run its reveal to the end.
-fn reveals_settled(state: &AppState) -> bool {
+pub(super) fn reveals_settled(state: &AppState) -> bool {
     state.frontend.shell_page_title.is_terminal()
         && state.frontend.shell_status_line.is_terminal()
         && state

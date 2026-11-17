@@ -13,22 +13,29 @@ fn frames(sim: &Simulation, rules: &RuleSet, carrier: u64, hover: Option<u64>) -
     let entity = sim.entities().get(carrier).expect("Carrier survives");
     let before = (
         sim.state_hash(),
-        sim.main_rng.native_state_hex(),
-        sim.scenario_rng.native_state_hex(),
-        sim.mapgen_rng.native_state_hex(),
+        sim.main_rng().native_state_hex(),
+        sim.scenario_rng().native_state_hex(),
+        sim.mapgen_rng().native_state_hex(),
         entity.spawn_manager.clone(),
     );
-    let result = super::ui_overlays::scale_pip_draws(sim, entity, hover, Some(OWNER), rules)
-        .into_iter()
-        .map(|pip| pip.frame)
-        .collect();
+    let frame = crate::app::presentation::frame::PresentationFrame::of_test(sim, rules);
+    let result = super::ui_overlays::scale_pip_draws(
+        sim,
+        frame.object(carrier).unwrap(),
+        hover,
+        sim.interner().get(OWNER),
+        rules,
+    )
+    .into_iter()
+    .map(|pip| pip.frame)
+    .collect();
     assert_eq!(
         before,
         (
             sim.state_hash(),
-            sim.main_rng.native_state_hex(),
-            sim.scenario_rng.native_state_hex(),
-            sim.mapgen_rng.native_state_hex(),
+            sim.main_rng().native_state_hex(),
+            sim.scenario_rng().native_state_hex(),
+            sim.mapgen_rng().native_state_hex(),
             entity.spawn_manager.clone(),
         ),
         "drawing reads retained nodes without advancing RNG, timers or targets"
@@ -85,8 +92,8 @@ fn stock_carrier_pips_follow_construction_sortie_recall_reload_and_selection() {
     });
     sim.intern_rule_type_ids(rules);
     sim.resolve_type_handles(rules);
-    let owner = sim.interner.get(OWNER).unwrap();
-    sim.fog.reveal_all_for_owner(owner);
+    let owner = sim.interner().get(OWNER).unwrap();
+    sim.fog_mut_for_test().reveal_all_for_owner(owner);
     let carrier = sim
         .spawn_object("CARRIER", OWNER, 20, 20, 64, rules)
         .unwrap();
@@ -126,9 +133,7 @@ fn stock_carrier_pips_follow_construction_sortie_recall_reload_and_selection() {
         },
         Some(rules)
     ));
-    let hornet_bomb = sim
-        .interner
-        .intern(rules.object("HORNET").unwrap().weapon_at(0).unwrap());
+    let hornet_bomb = sim.intern(rules.object("HORNET").unwrap().weapon_at(0).unwrap());
     let mut counts = BTreeSet::from([3]);
     let mut fired = false;
     let mut recalled = false;
@@ -138,7 +143,7 @@ fn stock_carrier_pips_follow_construction_sortie_recall_reload_and_selection() {
         let result = sim
             .advance_app_frame(
                 &[],
-                Some(rules),
+                rules,
                 None,
                 33,
                 crate::sim::world::TickLane::Ordinary,
@@ -224,8 +229,8 @@ fn stock_carrier_spawner_fire_reveals_to_its_human_victim() {
         map,
         &[(LaunchCountry::Russia, AiDifficulty::Easy)],
     );
-    launch.player_name = "VERA-OBSERVER".into();
-    launch.local.country = LaunchCountry::America;
+    launch.local_player_mut().name = "VERA-OBSERVER".into();
+    launch.local_slot_mut().country = LaunchCountry::America;
     launch.options.bases = false;
     launch.options.unit_count = 0;
     launch.options.short_game = false;
@@ -233,13 +238,13 @@ fn stock_carrier_spawner_fire_reveals_to_its_human_victim() {
     launch.options.fog_of_war = false;
     let mut scene =
         crate::headless_scenario::load_session(&retail, map, 0x1234_5678, launch).unwrap();
-    let current = scene.sim().session.current_house.unwrap();
+    let current = scene.sim().session().current_house().unwrap();
     let carrier = scene
         .sim()
         .entities()
         .iter_sorted()
         .find_map(|(id, entity)| {
-            (scene.sim().interner.resolve(entity.type_ref()) == "CARRIER").then_some(id)
+            (scene.sim().interner().resolve(entity.type_ref()) == "CARRIER").then_some(id)
         })
         .expect("authored Carrier admitted through normal Unlimbo");
     let target = scene
@@ -247,7 +252,8 @@ fn stock_carrier_spawner_fire_reveals_to_its_human_victim() {
         .entities()
         .iter_sorted()
         .find_map(|(id, entity)| {
-            (entity.owner() == current && scene.sim().interner.resolve(entity.type_ref()) == "LCRF")
+            (entity.owner() == current
+                && scene.sim().interner().resolve(entity.type_ref()) == "LCRF")
                 .then_some(id)
         })
         .expect("normal local human LCRF");
@@ -260,12 +266,11 @@ fn stock_carrier_spawner_fire_reveals_to_its_human_victim() {
     assert!(
         scene
             .sim()
-            .resolved_terrain
-            .as_ref()
+            .resolved_terrain()
             .unwrap()
             .cell(source.0, source.1)
             .unwrap()
-            .land_type()
+            .land_type
             == crate::rules::terrain_rules::LandType::Water.as_index(),
         "authored source is real loaded Water"
     );
@@ -297,15 +302,18 @@ fn stock_carrier_spawner_fire_reveals_to_its_human_victim() {
     assert!(
         !scene
             .sim()
-            .fog
+            .fog()
             .is_cell_revealed(current, source.0, source.1)
     );
 
     for frame in 0..30 {
         let commands = if frame == 0 {
+            // The local human House sends the computer Carrier's order:
+            // the DoList skips computer Houses' events (0x0064C4FB..0x0064C50D),
+            // and MegaMission never compares sender and actor (0x004C71F6..0x004C721F).
             vec![CommandEnvelope::new(
-                owner,
-                scene.sim().session.tick,
+                current,
+                scene.sim().session().tick(),
                 Command::Attack {
                     attacker_id: carrier,
                     target_id: target,
@@ -353,7 +361,7 @@ fn stock_carrier_spawner_fire_reveals_to_its_human_victim() {
             assert!(
                 scene
                     .sim()
-                    .fog
+                    .fog()
                     .is_cell_revealed(current, source.0, source.1),
                 "original6FDF30 reveals a stock Spawner firer to its human victim"
             );

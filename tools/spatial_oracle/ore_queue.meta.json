@@ -1,6 +1,5 @@
 {
   "schema_version": 1,
-  "native_sha256": "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c",
   "unicorn_binding": "2.1.4",
   "unicorn_core": [
     2,
@@ -60,6 +59,6 @@
     "tiberium_constructor_members": "0x007216CF",
     "tiberium_timer_readers": "0x00721A78"
   },
-  "payload_sha256": "0464a64cfcd07a6efaa5f73f2c949d306ac161491cbf1e07b3d505950905601d",
-  "replay_command": "python -m tools.spatial_oracle.ore_queue"
+  "replay_command": "python -m tools.spatial_oracle.ore_queue",
+  "payload_sha256": "5fa1779e3eb6971219ade8238696c66b28684a57eb15933ec7a6503da2588ddb"
 }

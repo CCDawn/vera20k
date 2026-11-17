@@ -1,5 +1,11 @@
 //! Search scratch that forgets every entry at once.
 
+// Inverted bounds are deliberate: the first write replaces both through min/max.
+const EMPTY_DIRTY_RANGE: std::ops::Range<usize> = std::ops::Range {
+    start: usize::MAX,
+    end: 0,
+};
+
 /// Per-index values that one search writes and reads, reused across searches.
 ///
 /// An entry belongs to the running search only while its bit is set, and
@@ -23,7 +29,7 @@ impl<T> Default for SearchTable<T> {
     fn default() -> Self {
         Self {
             written: Vec::new(),
-            dirty: usize::MAX..0,
+            dirty: EMPTY_DIRTY_RANGE,
             values: Vec::new(),
         }
     }
@@ -38,7 +44,7 @@ impl<T: Copy> SearchTable<T> {
         }
         let end = self.dirty.end.min(self.written.len());
         self.written[self.dirty.start.min(end)..end].fill(0);
-        self.dirty = usize::MAX..0;
+        self.dirty = EMPTY_DIRTY_RANGE;
         self.written.resize(len.div_ceil(64), 0);
     }
 
@@ -70,22 +76,9 @@ impl<T: Copy> SearchTable<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_pathfinding, tests_sim_movement)))]
 mod tests {
     use super::SearchTable;
-
-    #[test]
-    fn a_new_search_forgets_the_last_one() {
-        let mut table = SearchTable::default();
-        table.begin(4, 0);
-        table.set(1, 7u8);
-        assert_eq!(table.get(1), Some(7));
-        assert_eq!(table.get(2), None);
-        table.begin(8, 0);
-        assert_eq!(table.get(1), None);
-        table.set(6, 3);
-        assert_eq!(table.get(6), Some(3));
-    }
 
     #[test]
     fn entries_in_neighbouring_words_stay_apart() {

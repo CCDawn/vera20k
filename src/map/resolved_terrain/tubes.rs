@@ -73,7 +73,7 @@ impl ResolvedTerrainGrid {
     /// Cell484AE0, CanDeploy700D50's tunnel-mouth exclusion. Native
     /// neighbors use packed lookup and then the returned cell's coordinates;
     /// absent neighbors do not become an ordinary edge cell.
-    pub(crate) fn is_tube_deploy_neighborhood(&self, cell: (i16, i16)) -> bool {
+    pub fn is_tube_deploy_neighborhood(&self, cell: (i16, i16)) -> bool {
         let Some(origin) = self.native_fixed_cell_index(cell.0, cell.1) else {
             return false;
         };

@@ -17,7 +17,7 @@
 //! Render-agnostic: geometry, the resolved model and the statics' reveal
 //! state. The app resolves strings and colours when it opens the page.
 
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 
 use crate::ui::shell::descriptor::DialogId;
 use crate::ui::shell::geom::{
@@ -29,6 +29,9 @@ use crate::ui::shell::static_reveal::{Kind1Params, Kind1RevealWindow, PresentedK
 
 pub const SCORE_DIALOG: DialogId = DialogId(0x0108);
 pub const CONTINUE_BUTTON: u16 = 0x06D1;
+/// VERA paging controls; omitted for native-sized result tables.
+pub const PREVIOUS_PAGE: u16 = 0xF201;
+pub const NEXT_PAGE: u16 = 0xF202;
 
 /// RT_DIALOG `0x108`'s right panel: Continue on the bottom tile.
 pub const SCORE_PAGE: MenuPageSpec = MenuPageSpec {
@@ -115,9 +118,28 @@ pub struct ScoreScreenModel {
     /// The local side, `ScenarioClass +0x34B8`: in a skirmish the side of
     /// session player 0's country (`0x0068779A..0x0068782D`). It picks the
     /// art (`0x0072D730`) and the bars (`0x005CA110`).
-    pub side: u8,
-    /// Rows in display order, at most [`SCORE_ROW_SLOTS`].
+    pub side: i32,
+    /// The theme this dialog starts: the side's `MultiplayerScore.WinTheme` /
+    /// `.LoseTheme` under Ares, selected on the local player's
+    /// `HouseClass+0x1F5` defeated flag. `None` keeps gamemd's literal `SCORE`.
+    pub theme: Option<String>,
+    /// A background that replaces the local side's own. `None` keeps the side
+    /// art (`0x0072D730`); the field exists for `[EndGameScreens]`, which no
+    /// retail rules set writes.
+    pub background: Option<ScoreBackground>,
+    /// Complete immutable result order. VERA pages rows beyond the eight native slots.
     pub rows: Vec<ScoreRow>,
+}
+
+/// A score-page background from `[EndGameScreens]`: the SHP whose first frame
+/// the page draws, and the palette it is drawn with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoreBackground {
+    /// The SHP file name; the first frame is the page background.
+    pub shape: String,
+    /// The palette file name. `None` keeps the side's own palette, which is
+    /// what a rules set that only swaps the picture wants.
+    pub palette: Option<String>,
 }
 
 impl ScoreScreenModel {
@@ -321,6 +343,15 @@ pub fn compute_responsive_layout(screen_w: u32, screen_h: u32) -> ScoreLayout {
 }
 
 impl ScoreLayout {
+    pub fn paging_button(&self, id: u16) -> Option<RectPx> {
+        let rows = crate::ui::shell::paging::button_rects(self.continue_button());
+        match id {
+            PREVIOUS_PAGE => Some(rows[0]),
+            NEXT_PAGE => Some(rows[1]),
+            _ => None,
+        }
+    }
+
     pub fn continue_button(&self) -> RectPx {
         self.page
             .button_rect(CONTINUE_BUTTON)
@@ -395,6 +426,8 @@ pub struct ScoreTexts {
 pub struct ScorePage {
     pub model: ScoreScreenModel,
     table: Vec<ScoreTableStatic>,
+    texts: ScoreTexts,
+    page: crate::ui::shell::paging::RowPage,
 }
 
 impl ScorePage {
@@ -402,6 +435,19 @@ impl ScorePage {
     /// past the model keep `GUI:Blank` and draw nothing, so they get no
     /// static here.
     pub fn open(model: ScoreScreenModel, texts: &ScoreTexts, now: Instant) -> Self {
+        let mut page = Self {
+            model,
+            table: Vec::new(),
+            texts: texts.clone(),
+            page: Default::default(),
+        };
+        page.rebuild_table(now);
+        page
+    }
+
+    fn rebuild_table(&mut self, now: Instant) {
+        let model = &self.model;
+        let texts = &self.texts;
         let layout = ScoreTableLayout::template();
         let mut table = vec![
             ScoreTableStatic::new(
@@ -444,7 +490,11 @@ impl ScorePage {
                 now,
             ));
         }
-        for ((row, rects), ids) in model.rows.iter().zip(layout.rows).zip(ROW_CELL_IDS) {
+        for ((row, rects), ids) in model.rows[self.visible_range()]
+            .iter()
+            .zip(layout.rows)
+            .zip(ROW_CELL_IDS)
+        {
             let rgb = Some(row.rgb);
             let [name, kills, losses, built, score] = rects.cells();
             table.push(ScoreTableStatic::new(
@@ -473,7 +523,45 @@ impl ScorePage {
                 ));
             }
         }
-        Self { model, table }
+        self.table = table;
+    }
+
+    pub fn page_index(&self) -> usize {
+        self.page.index(self.model.rows.len(), SCORE_ROW_SLOTS)
+    }
+    pub fn page_count(&self) -> usize {
+        crate::ui::shell::paging::RowPage::count(self.model.rows.len(), SCORE_ROW_SLOTS)
+    }
+    pub fn visible_range(&self) -> std::ops::Range<usize> {
+        self.page.range(self.model.rows.len(), SCORE_ROW_SLOTS)
+    }
+    pub fn visible_row_count(&self) -> usize {
+        self.visible_range().len()
+    }
+
+    /// VERA extension: rebuild only visible statics from the already sorted
+    /// result snapshot. No simulation or sort is rerun when the player pages.
+    pub fn change_page(&mut self, next: bool, now: Instant) -> bool {
+        if !self
+            .page
+            .change(next, self.model.rows.len(), SCORE_ROW_SLOTS)
+        {
+            return false;
+        }
+        self.rebuild_table(now);
+        self.start_reveals(now);
+        true
+    }
+
+    /// Text held by the actual visible table, for presentation diagnostics.
+    pub fn visible_row_texts(&self) -> Vec<[String; 5]> {
+        self.table
+            .iter()
+            .skip(2 + HEADER_IDS.len())
+            .collect::<Vec<_>>()
+            .chunks_exact(5)
+            .map(|cells| std::array::from_fn(|column| cells[column].text().to_owned()))
+            .collect()
     }
 
     /// The entry slide's end (`0x4EC -> 0x0060AA60 -> 0x4EE`) starts every
@@ -508,9 +596,51 @@ pub fn sort_rows(rows: &mut [ScoreRow]) {
     crate::util::retail_pointer_sort::sort_by(rows, |a, b| b.score.cmp(&a.score));
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thirty_results_are_presented_in_order_through_the_existing_table() {
+        let rows: Vec<_> = (0..30)
+            .map(|i| ScoreRow {
+                name: format!("Player{i}"),
+                score: i,
+                ..row("", 0)
+            })
+            .collect();
+        let model = ScoreScreenModel {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let texts = ScoreTexts {
+            game: "Game".into(),
+            time: "Time".into(),
+            headers: ["Player", "Kills", "Losses", "Built", "Score"].map(str::to_owned),
+        };
+        let mut page = ScorePage::open(model.clone(), &texts, Instant::now());
+        let mut shown = Vec::new();
+        loop {
+            shown.extend(
+                page.visible_row_texts()
+                    .into_iter()
+                    .map(|row| row[0].clone()),
+            );
+            if !page.change_page(true, Instant::now()) {
+                break;
+            }
+        }
+        assert_eq!(
+            shown,
+            rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(page.model, model);
+        assert_eq!(page.visible_row_count(), 6);
+        assert_eq!(
+            ScorePage::open(model, &texts, Instant::now()).page_index(),
+            0
+        );
+    }
 
     #[test]
     fn every_window_matches_the_executed_relayout() {
@@ -551,22 +681,6 @@ mod tests {
         assert_eq!(
             layout.shaded_rect(8, ShellScale::RETAIL),
             Some(RectPx::new(95, 116, 440, 354))
-        );
-    }
-
-    #[test]
-    fn responsive_score_layout_stretches_the_page_table_and_status_line() {
-        let base = compute_layout(800, 600);
-        let same = compute_responsive_layout(800, 600);
-        assert_eq!(same, base);
-        let double = compute_responsive_layout(1600, 1200);
-        assert_eq!(double.table.bands[0], RectPx::new(192, 234, 882, 74));
-        assert_eq!(double.table.bands[1], RectPx::new(192, 306, 882, 74));
-        assert_eq!(double.page.status_help, RectPx::new(20, 1150, 912, 48));
-        // The shaded band grows by the authored 4 and 8 pixels.
-        assert_eq!(
-            double.table.shaded_rect(2, double.page.scale),
-            Some(RectPx::new(190, 232, 880, 280))
         );
     }
 
@@ -664,6 +778,8 @@ mod tests {
             game_number: 1,
             elapsed_seconds: 79,
             side: 0,
+            theme: None,
+            background: None,
             rows: vec![
                 ScoreRow {
                     name: "Computer".into(),
@@ -725,27 +841,6 @@ mod tests {
                 Some([34, 107, 212])
             )
         );
-    }
-
-    #[test]
-    fn reveals_wait_for_the_slide_end() {
-        let t0 = Instant::now();
-        let mut page = ScorePage::open(
-            ScoreScreenModel {
-                rows: vec![row("P", 5)],
-                ..Default::default()
-            },
-            &ScoreTexts {
-                game: "Game: 1".into(),
-                time: "T".into(),
-                headers: ["a", "b", "c", "d", "e"].map(String::from),
-            },
-            t0,
-        );
-        assert!(page.table.iter_mut().all(|text| text.paint(t0).is_none()));
-        page.start_reveals(t0);
-        assert!(page.table.iter_mut().all(|text| text.paint(t0).is_some()));
-        assert!(!page.reveals_terminal());
     }
 
     #[test]

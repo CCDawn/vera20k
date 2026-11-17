@@ -47,20 +47,6 @@ pub(crate) fn retail_rules_binding(anims: &[(&str, i32)]) -> Option<RuleSet> {
     Some(rules)
 }
 
-/// [`retail_rules_binding`] with `artmd.ini`'s infantry sequences bound, as
-/// the app binds them: a killed infantryman plays its Die sequence instead of
-/// having a zero-count request refused (`0x0051D70F`) and reviving at
-/// Health 1 on its next visit (`0x0051BC57`).
-pub(crate) fn retail_rules_with_sequences(anims: &[(&str, i32)]) -> Option<RuleSet> {
-    let mut rules = retail_rules_binding(anims)?;
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(
-            &crate::rules::retail_ini_fixture::retail_ini("artmd.ini")?,
-        ),
-    );
-    Some(rules)
-}
-
 /// Retail rules and a flat 64x64 map ([`world_with`]).
 pub fn retail_world() -> Option<(RuleSet, Simulation, InternedId)> {
     Some(world_with(retail_rules()?, 64, &[]))
@@ -100,21 +86,21 @@ fn world_with_cells(
     let russians = sim.interner.intern("Russians");
     for (id, side, human) in [(americans, 0, true), (russians, 1, false)] {
         sim.houses
-            .insert(id, HouseState::new(id, side, None, human, 0, 10));
-        sim.session.house_order.push(id);
+            .register(HouseState::new(id, side, None, human, 0, 10));
         // The native scenario constructs every stock Super for each House
         // before its map objects; provider passes never construct lazily.
         for name in &rules.super_weapon_order {
             let type_id = sim.interner.intern(name);
             sim.super_weapons
+                .map_mut_for_test()
                 .entry(id)
                 .or_default()
                 .insert(type_id, super::SuperWeaponInstance::new(type_id, id, 0));
         }
     }
-    sim.session.game_options.super_weapons = true;
-    sim.session.map_width = size;
-    sim.session.map_height = size;
+    sim.session.game_options_mut_for_test().super_weapons = true;
+    sim.session.set_map_width_for_test(size);
+    sim.session.set_map_height_for_test(size);
     sim.install_resolved_terrain_for_new_map(test_grid(size, size, cell));
     crate::sim::arena_fixture::supply_native_map_keyed(
         &mut sim,
@@ -127,7 +113,8 @@ fn world_with_cells(
 fn retail_water_world() -> Option<(RuleSet, Simulation, InternedId)> {
     use crate::rules::terrain_rules::{LandType, SpeedCostProfile};
     let float = SpeedCostProfile {
-        float: Some(100),
+        float: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
         ..SpeedCostProfile::default()
     };
     let water = LandType::Water.as_index();
@@ -189,7 +176,7 @@ pub(crate) fn place(
             crate::sim::world::FrameEffects::default(),
         )
         .unwrap_or_else(|| panic!("{kind} constructs at {x},{y}"));
-    let frame = sim.session.binary_frame;
+    let frame = sim.session.binary_frame();
     let entity = sim.substrate.entities.get_mut(id).unwrap();
     entity.position.put_location(DriveCoord {
         x: i32::from(x) * 256 + 128,
@@ -199,9 +186,8 @@ pub(crate) fn place(
     entity.position.set_z_for_test(level + deck);
     entity.set_on_bridge(bridge);
     if latch {
-        entity
-            .drop_credit
-            .set_warped_by_house_for_test(Some(entity.owner()));
+        let owner = entity.owner();
+        entity.drop_credit.set_warped_by_house_for_test(Some(owner));
         entity
             .locomotor
             .as_mut()
@@ -232,9 +218,9 @@ pub(crate) fn charge_super(sim: &mut Simulation, owner: InternedId, name: &str) 
     // Sparse launch-only controls still supply a native Super owner House.
     // Do not append it to House AI order: these cases do not test provider
     // grants, Strategy, natural defeat, or an additional House update.
-    sim.houses
-        .entry(owner)
-        .or_insert_with(|| crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10));
+    sim.houses.get_or_register_for_test(owner, || {
+        crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10)
+    });
     sim.houses
         .get_mut(&owner)
         .expect("supplied launcher's House")
@@ -242,11 +228,12 @@ pub(crate) fn charge_super(sim: &mut Simulation, owner: InternedId, name: &str) 
     let sw_type = sim.interner.intern(name);
     let mut instance = SuperWeaponInstance::new(sw_type, owner, 0);
     instance.is_active = true;
-    instance.charge_start_tick = (sim.session.binary_frame) as i32;
+    instance.charge_start_tick = (sim.session.binary_frame()) as i32;
     instance.charge_duration = 6300;
     instance.charge_start_tick -= 6300;
     instance.is_ready = true;
     sim.super_weapons
+        .map_mut_for_test()
         .entry(owner)
         .or_default()
         .insert(sw_type, instance);
@@ -258,7 +245,7 @@ pub fn click(sim: &mut Simulation, rules: &RuleSet, owner: InternedId, name: &st
     let sw_type_id = sim.interner.intern(name);
     sim.queue_command(CommandEnvelope::new(
         owner,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::LaunchSuperWeapon {
             sw_type_id,
             target_rx: at.0,
@@ -309,6 +296,9 @@ fn retail_chrono_rules() {
         (SuperWeaponKind::ChronoSphere, true, false)
     );
     let warp = rules.super_weapon("ChronoWarpSpecial").unwrap();
+    // Ares LoadFromINIFile (10033370's tail) writes -1 for a handled type;
+    // Fire_SW pairs it with the House's last Super (hook 4FAE72).
+    let pre_dependent = if rules.ares() { -1 } else { 3 };
     assert_eq!(
         (
             warp.kind,
@@ -316,7 +306,7 @@ fn retail_chrono_rules() {
             warp.post_click,
             warp.pre_dependent
         ),
-        (SuperWeaponKind::ChronoWarp, false, true, 3)
+        (SuperWeaponKind::ChronoWarp, false, true, pre_dependent)
     );
     assert_eq!(rules.super_weapon_order[3], "ChronoSphereSpecial");
     assert_eq!(
@@ -366,10 +356,15 @@ fn retail_chrono_warp_moves_the_source_block() {
     let placement: Vec<_> = sim.super_placement_anims();
     assert_eq!(placement.len(), 1);
     let anim = sim.substrate.anims.get(placement[0].1).unwrap();
-    assert_eq!(sim.interner.resolve(anim.type_id), "CHRONOAR");
+    assert_eq!(sim.interner.resolve(anim.type_id()), "CHRONOAR");
     // Case 3 lifts the cell 5 leptons and CreateChronoAnim 5 more
-    // (`0x006CC423`, `0x006CB43B`).
-    assert_eq!(anim.world_coord.z, super::deck_coords(&sim, SOURCE)[2] + 10);
+    // (`0x006CC423`, `0x006CB43B`); Ares's Activate (1006ED30) lifts it by
+    // SW.AnimationHeight (Initialize 5) only.
+    let lift = if rules.ares() { 5 } else { 10 };
+    assert_eq!(
+        anim.world_coord().z,
+        super::deck_coords(&sim, SOURCE)[2] + lift
+    );
     step(&mut sim, &rules);
     assert!(sim.super_weapons[&americans][&sphere].is_ready);
 
@@ -435,6 +430,160 @@ fn retail_chrono_warp_moves_the_source_block() {
     assert!(!dead(&sim, tank) && !dead(&sim, legionnaire));
 }
 
+/// Stock Battle rules in an explicit headless skirmish scene. This joins the
+/// provider, two launch commands, warp, sinking and terminal object cleanup;
+/// AircraftClass::AI414DB6..414ED0 supplies the sinking suffix.
+#[test]
+fn retail_skirmish_chrono_warp_sinks_a_landed_harrier_to_terminal_cleanup() {
+    use crate::rules::terrain_rules::{LandType, SpeedCostProfile};
+    use crate::sim::movement::{air_movement, ground_pose::position_world_coord};
+    use crate::sim::scenario_session::ScenarioGameMode;
+    use crate::sim::world::{FrameEffects, TickLane};
+
+    fn frame(sim: &mut Simulation, rules: &RuleSet) {
+        let due = sim.take_due_commands();
+        sim.advance_app_frame(
+            &due,
+            rules,
+            None,
+            67,
+            TickLane::Ordinary,
+            FrameEffects::default(),
+        )
+        .expect("ordinary skirmish frame");
+    }
+
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules_for_map("XMP03T4.MAP")
+    else {
+        return;
+    };
+    let mut rules = retail.rules;
+    // Headless art counts and a supplied land/water scene; physical Battle
+    // rules, provider/power/charge, both commands and object AI are production.
+    for name in ["CHRONOAR", "CHRONOTG", "CHRONOFD", "WARPOUT", "WAKE1"] {
+        rules.bind_anim_frame_count_for_test(name, 20);
+    }
+    let (rules, mut sim, owner) =
+        world_with_cells(rules, 64, ("aircraft sink", Vec::new()), |x, y| {
+            let mut cell = test_terrain_cell(x, y);
+            if (35..=45).contains(&x) && (35..=45).contains(&y) {
+                cell.land_type = LandType::Water.as_index();
+                cell.base_land_type = cell.land_type;
+                cell.speed_costs = SpeedCostProfile {
+                    float: Some(crate::util::native_x87::NativeF32Bits::ONE),
+                    winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
+                    ..Default::default()
+                };
+                cell.base_speed_costs = cell.speed_costs;
+                cell.zone_type = 4;
+                cell.ground_walk_blocked = true;
+                cell.base_ground_walk_blocked = true;
+                cell.base_build_blocked = true;
+            }
+            cell
+        });
+    sim.session.set_game_mode(ScenarioGameMode::Skirmish);
+    sim.session.set_current_house_for_test(Some(owner));
+    sim.set_input_delay_ticks(0);
+    sim.fog = crate::sim::vision::FogState::new(64, 64);
+    sim.fog.reveal_all_for_owner(owner);
+    spawn(&mut sim, &rules, "GACNST", "Americans", (5, 5));
+    spawn(&mut sim, &rules, "NACNST", "Russians", (10, 30));
+    for at in [(5, 10), (8, 10), (11, 10)] {
+        spawn(&mut sim, &rules, "GAPOWR", "Americans", at);
+    }
+    spawn(&mut sim, &rules, "GACSPH", "Americans", (15, 10));
+    for _ in 0..8 {
+        frame(&mut sim, &rules);
+    }
+    let sphere = sim.interner.intern("ChronoSphereSpecial");
+    let instance = &sim.super_weapons[&owner][&sphere];
+    assert!(instance.is_active() && !instance.is_suspended());
+    // Skip idle countdown frames; actual Super AI performs the ready edge.
+    let deadline = instance
+        .charge_start_tick()
+        .wrapping_add(instance.charge_duration())
+        .wrapping_add(1);
+    sim.session.set_binary_frame_for_test(deadline as u32);
+    frame(&mut sim, &rules);
+    assert!(sim.super_weapons[&owner][&sphere].is_ready());
+    let aircraft = spawn(&mut sim, &rules, "ORCA", "Americans", SOURCE);
+    let actor = sim.substrate.entities.get(aircraft).unwrap();
+    assert_eq!(
+        air_movement::current_fly_height(actor, sim.resolved_terrain.as_ref()),
+        0
+    );
+    assert_eq!(locomotors(&sim, aircraft), (LocomotorKind::Fly, None));
+    let losses_before = sim.houses[&owner].stats().units_lost();
+    for (name, target) in [
+        ("ChronoSphereSpecial", SOURCE),
+        ("ChronoWarpSpecial", TARGET),
+    ] {
+        let sw_type_id = sim.interner.intern(name);
+        sim.queue_command(CommandEnvelope::new(
+            owner,
+            sim.session.tick() + 1,
+            Command::LaunchSuperWeapon {
+                sw_type_id,
+                target_rx: target.0,
+                target_ry: target.1,
+            },
+        ));
+        frame(&mut sim, &rules);
+    }
+    assert!(
+        sim.substrate
+            .entities
+            .get(aircraft)
+            .unwrap()
+            .chrono_warp_latch()
+    );
+    let mut observed_sink = false;
+    let mut observed_wake = false;
+    let mut removed = false;
+    for _ in 0..240 {
+        let previous = sim.substrate.entities.get(aircraft).map(|actor| {
+            (
+                actor.sinking.is_active(),
+                position_world_coord(&actor.position).z,
+            )
+        });
+        frame(&mut sim, &rules);
+        observed_wake |= sim
+            .substrate
+            .anims
+            .iter()
+            .any(|(_, anim)| sim.interner.resolve(anim.type_id()) == "WAKE1");
+        let Some(actor) = sim.substrate.entities.get(aircraft) else {
+            removed = true;
+            break;
+        };
+        if actor.sinking.is_active() {
+            if !observed_sink {
+                // PostWarpValidation books the manipulating House's kill;
+                // the later terminal callback remains a separate owner.
+                assert_eq!(sim.houses[&owner].stats().units_lost(), losses_before + 1);
+            }
+            observed_sink = true;
+            assert_eq!(cell(&sim, aircraft), TARGET);
+            if let Some((true, z)) = previous {
+                assert_eq!(position_world_coord(&actor.position).z, z.wrapping_sub(5));
+            }
+        }
+    }
+    assert!(
+        observed_sink && observed_wake && removed,
+        "sink={observed_sink} wake={observed_wake} removed={removed}"
+    );
+    assert!(!sim.logic_order().contains(&aircraft));
+    assert_eq!(sim.houses[&owner].stats().units_lost(), losses_before + 2);
+    assert!(
+        !sim.substrate
+            .occupancy
+            .contains_entity(TARGET.0, TARGET.1, aircraft)
+    );
+}
+
 /// The locomotor chain from the active object down.
 fn chain(sim: &Simulation, id: u64) -> Vec<LocomotorKind> {
     let mut kinds = Vec::new();
@@ -457,6 +606,10 @@ fn chain(sim: &Simulation, id: u64) -> Vec<LocomotorKind> {
 /// Drive's refused own-cell search clears its destination, so the Foot AI
 /// tail ends it at the landing. Its next order drives it, and it ends back
 /// on its Teleport at the stop.
+// Stock Launch case 4's arming (0x006CC91D..0x006CCCA8); installed Ares
+// replaces it with SW_ChronoWarp's lambda 1006F4D0, which forces every Foot's
+// track to its own coordinates and moves those by the cell offset. Ares
+// coverage: `ares_stock_types_tests`.
 #[test]
 fn retail_chrono_warp_carries_a_driving_chrono_miner() {
     use LocomotorKind::{Drive, Teleport};
@@ -473,7 +626,7 @@ fn retail_chrono_warp_carries_a_driving_chrono_miner() {
         assert!(sim.apply_command_with_overlays(
             "Americans",
             &command,
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default()
         ));
@@ -539,6 +692,10 @@ fn retail_chrono_warp_carries_a_driving_chrono_miner() {
 /// refuses (AStar returns no route for a goal in its start cell,
 /// `0x00429BF3..0x00429C0A`): the destination clears, the head stays, and
 /// the ship stays where it landed.
+// Stock Launch case 4's arming (0x006CC91D..0x006CCCA8); installed Ares
+// replaces it with SW_ChronoWarp's lambda 1006F4D0, which forces every Foot's
+// track to its own coordinates and moves those by the cell offset. Ares
+// coverage: `ares_stock_types_tests`.
 #[test]
 fn retail_chrono_warp_forces_a_sailing_ships_track_to_its_landing() {
     use LocomotorKind::{Ship, Teleport};
@@ -554,7 +711,7 @@ fn retail_chrono_warp_forces_a_sailing_ships_track_to_its_landing() {
     assert!(sim.apply_command_with_overlays(
         "Americans",
         &command,
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::default()
     ));
@@ -616,6 +773,102 @@ fn retail_chrono_warp_forces_a_sailing_ships_track_to_its_landing() {
         }
     }
     assert!(ended);
+}
+
+/// Unit::ReceiveDamage737E2A..737E32 checks WarpingIn(+271), not the
+/// ordinary teleport effect. A Chronosphere collision's own C4 receiver
+/// must explode the warping ship, rather than retain a sinking hull.
+#[test]
+fn retail_warping_ship_dies_on_an_iron_curtained_landing_without_sinking() {
+    let Some((rules, mut sim, americans)) = retail_water_world() else {
+        return;
+    };
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+    sim.session.game_options_mut_for_test().short_game = false;
+    let ship = spawn(&mut sim, &rules, "DEST", "Americans", SOURCE);
+    let blocker = spawn(&mut sim, &rules, "DEST", "Americans", TARGET);
+    spawn(&mut sim, &rules, "SUB", "Russians", (6, 6));
+    let initial_health = sim.substrate.entities.get(ship).unwrap().health.current();
+    let blocker_health = sim
+        .substrate
+        .entities
+        .get(blocker)
+        .unwrap()
+        .health
+        .current();
+    assert!(
+        sim.unit_sinks_on_death(&rules, ship),
+        "an ordinary destroyer on water sinks"
+    );
+
+    charge_super(&mut sim, americans, "IronCurtainSpecial");
+    click(&mut sim, &rules, americans, "IronCurtainSpecial", TARGET);
+    assert!(super::invulnerability::is_invulnerable(
+        sim.substrate
+            .entities
+            .get(blocker)
+            .unwrap()
+            .invulnerability
+            .as_ref(),
+        sim.session.binary_frame(),
+    ));
+    charge_chronosphere(&mut sim, americans);
+    click(&mut sim, &rules, americans, "ChronoSphereSpecial", SOURCE);
+    click(&mut sim, &rules, americans, "ChronoWarpSpecial", TARGET);
+    let actor = sim.substrate.entities.get(ship).unwrap();
+    assert!(
+        actor.chrono_warp_latch(),
+        "the real destination event armed the warp"
+    );
+    assert!(
+        actor.teleport_state().is_none(),
+        "ChronoWarp has its own state owner"
+    );
+
+    let mut reached_fatal_collision = false;
+    for _ in 0..100 {
+        let commands = sim.take_due_commands();
+        let output = sim.advance_tick(&commands, Some(&rules), None, None, 33);
+        assert!(output.frame_committed, "the skirmish frame advances");
+        if sim
+            .substrate
+            .entities
+            .get(ship)
+            .is_none_or(|actor| actor.health.current() < initial_health)
+        {
+            reached_fatal_collision = true;
+            assert!(
+                sim.substrate
+                    .entities
+                    .get(ship)
+                    .is_none_or(|actor| !actor.sinking.is_active()),
+                "the collision must not enter the ordinary ship-sinking arm"
+            );
+            assert!(
+                sim.substrate
+                    .entities
+                    .get(ship)
+                    .is_none_or(|actor| !actor.lifecycle.object_alive()),
+                "the warp's fatal receiver uninitializes the ship immediately"
+            );
+            break;
+        }
+    }
+    assert!(
+        reached_fatal_collision,
+        "the Chronosphere reached the occupied landing"
+    );
+    let protected = sim
+        .substrate
+        .entities
+        .get(blocker)
+        .expect("the blocker survives");
+    assert_eq!(protected.health.current(), blocker_health);
+    assert!(super::invulnerability::is_invulnerable(
+        protected.invulnerability.as_ref(),
+        sim.session.binary_frame(),
+    ));
 }
 
 /// A Chrono Miner on its own Teleport warps on a tank's frames. Arming
@@ -758,7 +1011,7 @@ fn retail_chrono_warp_onto_the_iron_curtain_kills_the_warper() {
     };
     let tank = spawn(&mut sim, &rules, "MTNK", "Americans", SOURCE);
     let curtained = spawn(&mut sim, &rules, "HTNK", "Russians", TARGET);
-    let frame = sim.session.binary_frame;
+    let frame = sim.session.binary_frame();
     crate::sim::superweapon::invulnerability::apply_invulnerability(
         sim.substrate.entities.get_mut(curtained).unwrap(),
         frame,
@@ -773,6 +1026,93 @@ fn retail_chrono_warp_onto_the_iron_curtain_kills_the_warper() {
     }
     assert!(dead(&sim, tank));
     assert!(!dead(&sim, curtained));
+}
+
+/// Ares 3.0 TeleportLocomotionClass_Unwarp_PreventSelfCrush (10037BC0, hook
+/// 0x7187DA): a warper that came under the Iron Curtain during its warp is
+/// not crushed by its own curtain on the landing cell.
+#[test]
+fn ares_iron_curtained_warper_survives_its_own_landing() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let Some((rules, mut sim, americans)) = retail_world() else {
+        return;
+    };
+    let tank = spawn(&mut sim, &rules, "MTNK", "Americans", SOURCE);
+    charge_chronosphere(&mut sim, americans);
+    click(&mut sim, &rules, americans, "ChronoSphereSpecial", SOURCE);
+    click(&mut sim, &rules, americans, "ChronoWarpSpecial", TARGET);
+    let frame = sim.session.binary_frame();
+    crate::sim::superweapon::invulnerability::apply_invulnerability(
+        sim.substrate.entities.get_mut(tank).unwrap(),
+        frame,
+        10_000,
+        crate::sim::superweapon::invulnerability::InvulnKind::IronCurtain,
+    );
+    for _ in 0..62 {
+        step(&mut sim, &rules);
+    }
+    assert!(!dead(&sim, tank));
+    assert_eq!(cell(&sim, tank), TARGET);
+}
+
+/// Ares 3.0 TeleportLocomotionClass_Unwarp_SinkJumpJets (10037BE0, hook
+/// 0x7188F2): a Robot Tank offline for want of power does not float on a
+/// water landing, though its AmphibiousDestroyer zone floats it otherwise
+/// (SinkOrSwim, 0x718871).
+#[test]
+fn ares_chrono_warp_sinks_an_offline_robot_tank_on_water() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    use crate::rules::terrain_rules::{LandType, SpeedCostProfile};
+    let Some(rules) = retail_rules() else {
+        return;
+    };
+    // Land at SOURCE, open water around TARGET.
+    let (rules, mut sim, americans) =
+        world_with_cells(rules, 64, ("robot sink", Vec::new()), |x, y| {
+            let mut cell = test_terrain_cell(x, y);
+            if (35..=45).contains(&x) && (35..=45).contains(&y) {
+                cell.land_type = LandType::Water.as_index();
+                cell.base_land_type = cell.land_type;
+                cell.speed_costs = SpeedCostProfile {
+                    float: Some(crate::util::native_x87::NativeF32Bits::ONE),
+                    winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
+                    // Retail `[Water]` admits Hover and Amphibious too.
+                    hover: Some(crate::util::native_x87::NativeF32Bits::ONE),
+                    amphibious: Some(crate::util::native_x87::NativeF32Bits::ONE),
+                    ..Default::default()
+                };
+                cell.base_speed_costs = cell.speed_costs;
+                cell.zone_type = 4;
+                cell.ground_walk_blocked = true;
+                cell.base_ground_walk_blocked = true;
+                cell.base_build_blocked = true;
+            }
+            cell
+        });
+    let robot = spawn(&mut sim, &rules, "ROBO", "Americans", SOURCE);
+    sim.substrate
+        .entities
+        .get_mut(robot)
+        .unwrap()
+        .deactivated
+        .set_for_test(true);
+    charge_chronosphere(&mut sim, americans);
+    click(&mut sim, &rules, americans, "ChronoSphereSpecial", SOURCE);
+    click(&mut sim, &rules, americans, "ChronoWarpSpecial", TARGET);
+    let mut sank = false;
+    for _ in 0..80 {
+        step(&mut sim, &rules);
+        if sim
+            .substrate
+            .entities
+            .get(robot)
+            .is_none_or(|actor| actor.sinking.is_active())
+        {
+            sank = true;
+            break;
+        }
+    }
+    assert!(sank, "the offline Robot Tank sinks on its water landing");
 }
 
 /// A building on the destination blocks it: the warp lands on a nearby
@@ -844,7 +1184,7 @@ fn retail_chrono_warp_frames_match_native_process() {
         charge_chronosphere(&mut sim, americans);
         click(&mut sim, &rules, americans, "ChronoSphereSpecial", SOURCE);
         click(&mut sim, &rules, americans, "ChronoWarpSpecial", TARGET);
-        let origin = sim.session.binary_frame as i64;
+        let origin = sim.session.binary_frame() as i64;
         let frames = row["frames"].as_array().unwrap();
         let landing = frames
             .iter()
@@ -950,8 +1290,8 @@ fn retail_chrono_update_position_matches_native_rows() {
                 let index = terrain
                     .index(int(&cell[0]) as u16, int(&cell[1]) as u16)
                     .unwrap();
-                terrain.cells[index].level = int(&cell[2]) as u8;
-                terrain.cells[index].bridge_facts.raw_flags = int(&cell[3]) as u32;
+                terrain.cells_mut_for_test()[index].level = int(&cell[2]) as u8;
+                terrain.cells_mut_for_test()[index].bridge_facts.raw_flags = int(&cell[3]) as u32;
             }
         }
         sim.zone_grid = None;
@@ -980,7 +1320,7 @@ fn retail_chrono_update_position_matches_native_rows() {
                 );
             }
             if object[5].as_bool().unwrap() {
-                let frame = sim.session.binary_frame;
+                let frame = sim.session.binary_frame();
                 crate::sim::superweapon::invulnerability::apply_invulnerability(
                     sim.substrate.entities.get_mut(id).unwrap(),
                     frame,
@@ -1063,6 +1403,10 @@ fn retail_chrono_update_position_matches_native_rows() {
 /// `chrono_destination` rows: a Grizzly (Unit) or a Chrono Legionnaire in
 /// the source block, on the row's levels and bridge flags, warped from
 /// (21, 21) to (40, 40).
+// Stock Launch case 4's arming (0x006CC91D..0x006CCCA8); installed Ares
+// replaces it with SW_ChronoWarp's lambda 1006F4D0, which forces every Foot's
+// track to its own coordinates and moves those by the cell offset. Ares
+// coverage: `ares_stock_types_tests`.
 #[test]
 fn retail_chrono_warp_destinations_match_native_rows() {
     if retail_rules().is_none() {
@@ -1092,8 +1436,8 @@ fn retail_chrono_warp_destinations_match_native_rows() {
                 let index = terrain
                     .index(int(&cell[0]) as u16, int(&cell[1]) as u16)
                     .unwrap();
-                terrain.cells[index].level = int(&cell[2]) as u8;
-                terrain.cells[index].bridge_facts.raw_flags = int(&cell[3]) as u32;
+                terrain.cells_mut_for_test()[index].level = int(&cell[2]) as u8;
+                terrain.cells_mut_for_test()[index].bridge_facts.raw_flags = int(&cell[3]) as u32;
             }
         }
         sim.zone_grid = None;

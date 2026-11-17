@@ -1,7 +1,7 @@
 //! Jumpjet flight kernel: the per-frame altitude and translation body shared by
 //! every moving Jumpjet state, and the cruise state that steers it.
 //!
-//! gamemd-derived (disassembly read 2026-09-15; YR 1.001, SHA-256 `1cdd1180…4298c`):
+//! gamemd-derived (disassembly read 2026-09-15; YR 1.001):
 //!
 //! - `JumpjetLocomotionClass::Update_Coordinates_And_Altitude @ 0x0054D0F0`,
 //!   called from `Process @ 0x0054AEC0` whenever the locomotor reports moving.
@@ -180,6 +180,24 @@ impl JumpjetFlightParams {
     pub(crate) const fn accel_bits(&self) -> u32 {
         self.accel_bits
     }
+
+    /// See the field.
+    #[cfg(all(feature = "phobos", any(test, feature = "test-support")))]
+    pub(crate) const fn wobbles_bits(&self) -> u32 {
+        self.wobbles_bits
+    }
+
+    /// See the field.
+    #[cfg(all(feature = "phobos", any(test, feature = "test-support")))]
+    pub(crate) const fn deviation(&self) -> i32 {
+        self.deviation
+    }
+
+    /// See the field.
+    #[cfg(all(feature = "phobos", any(test, feature = "test-support")))]
+    pub(crate) const fn no_wobbles(&self) -> bool {
+        self.no_wobbles
+    }
 }
 
 impl Default for JumpjetFlightParams {
@@ -268,8 +286,15 @@ impl JumpjetFlight {
         self.target_height
     }
 
-    /// Store the field.
-    pub(crate) fn set_target_height(&mut self, target_height: i32) {
+    /// Move_To lifts a descent back into the climb at `JumpjetHeight=`
+    /// (`0x0054B455..0x0054B467`).
+    pub(crate) fn lift_to(&mut self, height: i32) {
+        self.target_height = height;
+    }
+
+    /// A fixture's target height.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_target_height_for_test(&mut self, target_height: i32) {
         self.target_height = target_height;
     }
 
@@ -308,6 +333,7 @@ impl Default for JumpjetFlight {
 pub(crate) enum FlightOwnerKind {
     Unit,
     Infantry,
+    Aircraft,
     Other,
 }
 
@@ -317,6 +343,7 @@ impl FlightOwnerKind {
         match category {
             EntityCategory::Unit => Self::Unit,
             EntityCategory::Infantry => Self::Infantry,
+            EntityCategory::Aircraft => Self::Aircraft,
             _ => Self::Other,
         }
     }
@@ -325,11 +352,36 @@ impl FlightOwnerKind {
 /// Everything the flight kernel reads from or writes to the owner and the map.
 /// Coordinates are world leptons.
 pub(crate) trait JumpjetFlightHost {
+    /// VERA `[JumpjetControls] SmoothFacing=`; off is the original.
+    fn smooth_facing(&self) -> bool {
+        false
+    }
+    /// VERA `[JumpjetControls] LandNearby=` in cells; 0 is the original.
+    fn land_nearby_range(&self) -> i32 {
+        0
+    }
+    /// VERA `LandNearby=`: the owner's id, to settle two Jumpjets heading
+    /// for one cell.
+    fn owner_id(&self) -> u64 {
+        0
+    }
+    /// VERA `LandNearby=`: the lowest id among the other airborne Jumpjets
+    /// whose destination is `cell`.
+    fn landing_cell_claimed_by(&self, _cell: (i16, i16)) -> Option<u64> {
+        None
+    }
     fn binary_frame(&self) -> u32;
     fn trig(&self) -> &TrigTable;
     fn owner_kind(&self) -> FlightOwnerKind;
+    /// Whether the owner still has this kind of locomotor after a callback.
+    fn has_installed_jumpjet(&self) -> bool;
     /// Object+90, checked after Update54AF24 before the state dispatch.
     fn is_object_alive(&self) -> bool;
+    /// Process's tail after the state dispatch (`0x0054B07D..0x0054B16C`):
+    /// the owner's deselect over the player's shroud, then its discovery by
+    /// the player over open ground. The callback runs on the published
+    /// instance.
+    fn visibility_tail(&mut self, runtime: &mut JumpjetRuntime);
     fn marked(&self) -> bool;
     /// Save/clear/restore Object+74 without calling Mark or changing lists.
     fn replace_marked_byte(&mut self, marked: bool) -> bool;
@@ -572,8 +624,9 @@ pub(crate) fn update_coordinates_and_altitude(
     // 0x0054D6A6), so its own cell does not list it while the reference height
     // samples the cell top. The hold and the cruise instead clear +0x74 here
     // and restore the saved byte at the end (0x0054D6B4..0x0054D6BD), leaving
-    // the lists alone. Either way SetZ (0x005F6060) finds +0x74 clear and
-    // skips its own Mark pair.
+    // the lists alone (VERA's host still unlinks a link left in the cell the
+    // owner leaves, `CruiseHost::set_location`). Either way SetZ (0x005F6060)
+    // finds +0x74 clear and skips its own Mark pair.
     let lifted = !hold_or_translate;
     let saved_marked = host.marked();
     if lifted {
@@ -730,6 +783,11 @@ pub(crate) fn update_coordinates_and_altitude(
             Some(toward_target) => {
                 flight.facing.snap(toward_target, frame);
             }
+            // VERA `SmoothFacing=` (a deviation from `0x0054D67B`, off by
+            // default): on the ground the body keeps its own heading, so
+            // State 0 hands that heading to the locomotor and the body then
+            // turns with it instead of snapping to a stale one.
+            None if host.smooth_facing() && phase == STATE_GROUND => {}
             None => host.snap_body_facing(flight.facing.current(frame)),
         }
     }
@@ -757,6 +815,10 @@ pub(crate) fn state3_translate(
     let tracker_cell = host.cell_of([location[0], location[1]]);
     if tracker_cell != host.tracker_cell() {
         host.tracker_update(tracker_cell);
+    }
+    // VERA `LandNearby=` (off by default, no native counterpart).
+    if replan_landing_on_approach(runtime, tracker_cell, host) {
+        return STATE_TRANSLATE;
     }
 
     // Desired facing toward the destination (0x0054C081..C0CD).
@@ -793,6 +855,9 @@ pub(crate) fn state3_translate(
         if host.piggyback_active() {
             runtime.flight.target_height = 0;
             host.piggyback_arrival(runtime);
+            if !host.has_installed_jumpjet() {
+                return runtime.phase;
+            }
             state = STATE_DESCEND;
         } else if !has_target && !host.balloon_hover() {
             if unit_owner && host.simple_deployer() && host.type_flag_6ad() {
@@ -807,7 +872,9 @@ pub(crate) fn state3_translate(
                 runtime.flight.target_height = 0;
                 state = STATE_DESCEND;
             }
-            host.arrival_notify();
+            if host.has_installed_jumpjet() {
+                host.arrival_notify();
+            }
         } else if claim_or_scatter(here, runtime, host) {
             let marked = host.marked();
             host.mark(false);
@@ -865,6 +932,9 @@ pub(crate) fn state3_translate(
 
     // Tail 0x0054C4FD..C544: hovering types, water and beach destinations and
     // flagged units keep full height.
+    if !host.has_installed_jumpjet() {
+        return runtime.phase;
+    }
     if host.balloon_hover()
         || matches!(
             host.cell_land_type([runtime.destination.x, runtime.destination.y]),
@@ -877,8 +947,9 @@ pub(crate) fn state3_translate(
     state
 }
 
-/// One `Process @ 0x0054AEC0` frame: the Update gate, the crash latch, then the
-/// state at `+0x50` through the jump table at `0x0054B19C`. Returns the new
+/// One `Process @ 0x0054AEC0` frame: the Update gate, the crash latch, the
+/// state at `+0x50` through the jump table at `0x0054B19C`, then the
+/// visibility tail ([`JumpjetFlightHost::visibility_tail`]). Returns the new
 /// state.
 ///
 /// The gate is the moving byte or `Is_Moving_Now` (`0x0054D0D0`, any state
@@ -886,8 +957,7 @@ pub(crate) fn state3_translate(
 /// Jumpjet is advanced by nothing at all. It comes first, so a crashing owner
 /// idle in the hold never latches and hangs where it is, natively too.
 ///
-/// Not modelled: `0x0053A130`'s constant-false arm and the two visibility
-/// probes in the tail.
+/// Not modelled: `0x0053A130`'s constant-false arm.
 pub(crate) fn process(runtime: &mut JumpjetRuntime, host: &mut impl JumpjetFlightHost) -> i32 {
     let state = runtime.phase;
     if !runtime.moving
@@ -903,7 +973,7 @@ pub(crate) fn process(runtime: &mut JumpjetRuntime, host: &mut impl JumpjetFligh
     ];
     let params = runtime.params;
     update_coordinates_and_altitude(state, destination, &params, &mut runtime.flight, host);
-    if !host.is_object_alive() {
+    if !host.has_installed_jumpjet() || !host.is_object_alive() {
         return runtime.phase;
     }
     runtime.phase = crash_latch(state, runtime, host);
@@ -928,6 +998,9 @@ pub(crate) fn process(runtime: &mut JumpjetRuntime, host: &mut impl JumpjetFligh
         STATE_CRASH => state5_crash(runtime, host),
         other => other,
     };
+    if host.has_installed_jumpjet() {
+        host.visibility_tail(runtime);
+    }
     runtime.phase
 }
 
@@ -1003,6 +1076,89 @@ fn claim_or_scatter(
     }
 }
 
+/// VERA `[JumpjetControls] LandNearby=`: among the cells within the key's
+/// range of `refused`, the one nearest the owner's own cell `here` that the
+/// owner may enter outright (`Can_Enter_Cell` 0), that is neither water nor
+/// beach, has no other object in its air slot and is no other airborne
+/// Jumpjet's destination. Ties go to the lower row, then the lower column.
+fn nearby_landing_cell(
+    refused: (i16, i16),
+    here: (i16, i16),
+    host: &mut impl JumpjetFlightHost,
+) -> Option<(i16, i16)> {
+    let range = host.land_nearby_range();
+    if range <= 0 {
+        return None;
+    }
+    let mut cells: Vec<(i32, i32, i32)> = Vec::new();
+    for dy in -range..=range {
+        for dx in -range..=range {
+            if (dx, dy) != (0, 0) && dx * dx + dy * dy <= range * range {
+                let x = i32::from(refused.0) + dx;
+                let y = i32::from(refused.1) + dy;
+                let (hx, hy) = (x - i32::from(here.0), y - i32::from(here.1));
+                cells.push((hx * hx + hy * hy, y, x));
+            }
+        }
+    }
+    cells.sort_unstable();
+    cells.into_iter().find_map(|(_, y, x)| {
+        let x = i16::try_from(x).ok().filter(|x| *x >= 0)?;
+        let y = i16::try_from(y).ok().filter(|y| *y >= 0)?;
+        let centre = [i32::from(x) * 256 + 128, i32::from(y) * 256 + 128];
+        (host.can_enter_cell((x, y)) == 0
+            && !matches!(host.cell_land_type(centre), 2 | 6)
+            && host.landing_cell_claimed_by((x, y)).is_none()
+            && !host.air_slot_taken_at((x, y)))
+        .then_some((x, y))
+    })
+}
+
+/// VERA `LandNearby=`, on approach: every eighth frame within four cells of
+/// its destination, a Jumpjet on an ordinary move whose landing cell is taken
+/// (`Can_Enter_Cell` 2 or more), or is also the destination of an airborne
+/// Jumpjet with a lower id, picks its landing cell now instead of on arrival.
+/// Answers whether it re-aimed.
+fn replan_landing_on_approach(
+    runtime: &mut JumpjetRuntime,
+    here: (i16, i16),
+    host: &mut impl JumpjetFlightHost,
+) -> bool {
+    if host.land_nearby_range() <= 0
+        || host.binary_frame() % 8 != 0
+        || host.mission_is_seven()
+        || host.has_target()
+    {
+        return false;
+    }
+    let destination = [runtime.destination.x, runtime.destination.y];
+    let dest_cell = host.cell_of(destination);
+    let (dx, dy) = (
+        i32::from(dest_cell.0) - i32::from(here.0),
+        i32::from(dest_cell.1) - i32::from(here.1),
+    );
+    if dest_cell == here
+        || dx * dx + dy * dy > 16
+        || matches!(host.cell_land_type(destination), 2 | 6)
+    {
+        return false;
+    }
+    let taken = host.can_enter_cell(dest_cell) >= 2
+        || host
+            .landing_cell_claimed_by(dest_cell)
+            .is_some_and(|other| other < host.owner_id());
+    if !taken {
+        return false;
+    }
+    match nearby_landing_cell(dest_cell, here, host) {
+        Some(cell) => {
+            host.set_destination_cell(cell, runtime);
+            true
+        }
+        None => false,
+    }
+}
+
 /// `CellClass::GetSubCell @ 0x004810A0`: the infantry sub-cell a coordinate
 /// falls in. Only 0, 2, 3 and 4 are produced — never 1.
 fn sub_cell_of(coord: [i32; 3]) -> i32 {
@@ -1030,7 +1186,14 @@ pub(crate) fn state0_ground(
     }
     let frame = host.binary_frame();
     host.set_speed_fraction(ONE);
-    // Takeoff keeps the body's heading, so the link-time 0x4000 never leaks.
+    // `0x0054B9AA..0x0054B9C1`: the locomotor facing takes the body's
+    // (UpdateFacing). `Process` has already run Update this frame
+    // (`0x0054AEF0`, before this dispatch at `0x0054B046`), and Update copies
+    // the locomotor facing onto the body (`0x0054D67B..0x0054D692`). So the
+    // body first snaps to the locomotor's heading: the link-time `0x4000` on
+    // the first take-off, later the heading of the last flight, whatever
+    // `Do_Turn` (`0x0054B6E0`, body only) wrote on the ground since. VERA's
+    // `SmoothFacing=` skips that copy on the ground (Update, above).
     flight.facing.snap(host.body_facing(), frame);
     flight.current_speed_bits = 0;
     flight.target_speed_bits = 0;
@@ -1082,6 +1245,9 @@ pub(crate) fn state1_ascend(
             // A factory contact hears the lift-off; the barracks releases
             // its tether and the owner may take its rally or scatter again.
             host.factory_contact_notify(runtime);
+            if !host.has_installed_jumpjet() {
+                return runtime.phase;
+            }
             // 0x0054BCB5 re-reads +0x40/+0x44 after that callback.
             let destination = [runtime.destination.x, runtime.destination.y];
             let dest_cell = host.cell_of(destination);
@@ -1100,6 +1266,9 @@ pub(crate) fn state1_ascend(
     // At cruise height the owner claims the cell's air slot, or scatters to a
     // random neighbour when another object already holds it.
     let claimed = claim_or_scatter(here, runtime, host);
+    if !host.has_installed_jumpjet() {
+        return runtime.phase;
+    }
     //54BB3C/54BB62 suffix is after the class callback on both arms.
     let marked = host.marked();
     host.mark(false);
@@ -1197,6 +1366,9 @@ pub(crate) fn state4_descend(
         if matches!(host.cell_land_type([destination[0], destination[1]]), 2 | 6) && !mission_seven
         {
             let claimed = claim_or_scatter(here, runtime, host);
+            if !host.has_installed_jumpjet() {
+                return runtime.phase;
+            }
             let marked = host.marked();
             host.mark(false);
             host.replace_marked_byte(marked);
@@ -1223,6 +1395,24 @@ pub(crate) fn state4_descend(
             let refused =
                 !admitted || (!bridge && (answer > 2 || (answer == 2 && !runtime.landing_latched)));
             if refused {
+                // VERA `LandNearby=` (a deviation from `0x0054CA43`'s stop,
+                // off by default): fly to the nearest clear cell and land
+                // there. No RNG draw; with none in range, the original's stop.
+                if let Some(cell) = nearby_landing_cell(dest_cell, here, host) {
+                    host.set_destination_cell(cell, runtime);
+                    if !host.has_installed_jumpjet() {
+                        return runtime.phase;
+                    }
+                    // It leaves for the cruise as State 4's own re-aim does
+                    // (`0x0054C5F9..0x0054C610`): Mark(UP), then `+0x74`
+                    // restored. Below two levels Update's Mark(DOWN)
+                    // (`0x0054D6A6`) has linked it in this cell's list, and
+                    // the cruise moves it with no Mark pair (`0x0054D134`).
+                    let marked = host.marked();
+                    host.mark(false);
+                    host.replace_marked_byte(marked);
+                    return STATE_TRANSLATE;
+                }
                 return host.stop_moving(runtime);
             }
             if !runtime.landing_latched {
@@ -1286,7 +1476,9 @@ pub(crate) fn state4_descend(
 /// crashes it. Otherwise the cell under its Location is weighed
 /// (`0x0054CDC3..0x0054CE9A`): a cell its `Can_Enter_Cell` admits (and, for a
 /// `JumpJet=` type, Wheel can cross) lands it through State 4 with a null
-/// destination; water it is refused sinks it; anything else crashes it.
+/// destination; water it is refused sinks it; anything else crashes it. An
+/// Aircraft owner also needs Wheel to cross the cell, whatever its type's
+/// `JumpJet=` (`0x0054CE43..0x0054CE65`).
 /// Then a crash, or an owner no Magnetron lifted, above the ground loses
 /// the drop's credit, and a deck crossing after the weighing sets OnBridge
 /// (`0x0054CFBC..0x0054D012`).
@@ -1298,9 +1490,7 @@ pub(crate) fn state4_descend(
 ///
 /// Dead and not ported: the landing's crash for a Foot speed fraction
 /// (`+0x578`) of 5.0 or 7.0 (`0x0054CF3C..0x0054CF75`); its only writer,
-/// `SetSpeedFraction @ 0x004D3710`, clamps it to [0, 1]. The weighing's
-/// Aircraft arm (`0x0054CE43..0x0054CE65`) is unreachable: Jumpjet owners
-/// here are Units and Infantry.
+/// `SetSpeedFraction @ 0x004D3710`, clamps it to [0, 1].
 pub(crate) fn state5_crash(runtime: &mut JumpjetRuntime, host: &mut impl JumpjetFlightHost) -> i32 {
     let frame = host.binary_frame();
     let [x, y, old_z] = host.location();
@@ -1339,6 +1529,9 @@ pub(crate) fn state5_crash(runtime: &mut JumpjetRuntime, host: &mut impl Jumpjet
     let mut crash = false;
     if (host.height_above_ground() <= 0 || crossed_deck) && host.dropped() {
         let evaluated = !host.crush_below(runtime);
+        if !host.has_installed_jumpjet() {
+            return runtime.phase;
+        }
         if evaluated {
             let location = host.location();
             let xy = [location[0], location[1]];
@@ -1346,7 +1539,13 @@ pub(crate) fn state5_crash(runtime: &mut JumpjetRuntime, host: &mut impl Jumpjet
             let land = host.cell_land_type(xy);
             let water = land == LAND_WATER && !crossed_deck;
             let beach = land == LAND_BEACH && !crossed_deck;
-            let answer = host.can_enter_cell(cell);
+            let mut answer = host.can_enter_cell(cell);
+            // Aircraft's own entry query can admit impassable terrain.
+            // State5 asks the Cell's Wheel check separately and replaces
+            // its answer with Move_No (7) on refusal (54CE43..54CE65).
+            if host.owner_kind() == FlightOwnerKind::Aircraft && !host.wheel_clear(cell) {
+                answer = 7;
+            }
             let landable = (!host.jumpjet_type() || host.wheel_clear(cell)) && answer == 0;
             if landable {
                 if host.holds_air_slot_at(cell) {
@@ -1361,6 +1560,9 @@ pub(crate) fn state5_crash(runtime: &mut JumpjetRuntime, host: &mut impl Jumpjet
             }
         } else {
             crash = true;
+        }
+        if !host.has_installed_jumpjet() {
+            return runtime.phase;
         }
         if crossed_deck {
             if evaluated {
@@ -1398,7 +1600,7 @@ pub(crate) fn cell_top_height(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::*;
     use crate::sim::components::DriveCoord;
@@ -1457,6 +1659,10 @@ mod tests {
         fn is_object_alive(&self) -> bool {
             true
         }
+        fn has_installed_jumpjet(&self) -> bool {
+            true
+        }
+        fn visibility_tail(&mut self, _runtime: &mut JumpjetRuntime) {}
         fn marked(&self) -> bool {
             true
         }
@@ -1930,6 +2136,10 @@ mod tests {
         fn is_object_alive(&self) -> bool {
             true
         }
+        fn has_installed_jumpjet(&self) -> bool {
+            true
+        }
+        fn visibility_tail(&mut self, _runtime: &mut JumpjetRuntime) {}
         fn marked(&self) -> bool {
             true
         }

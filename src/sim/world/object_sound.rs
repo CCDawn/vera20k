@@ -52,7 +52,7 @@
 //! RESIDUALS:
 //! - A waypoint index the action reader rejects (native `-1`) reads the slot
 //!   before the waypoint array; VERA plays nothing.
-//! - Anim, Bullet, Wave and Terrain types do not bind AmbientSound
+//! - Anim, Bullet and Wave types do not bind AmbientSound
 //!   (dormant: no retail one sets it).
 
 use super::{FrameEffects, SimSoundEvent, Simulation};
@@ -69,7 +69,7 @@ const AMBIENT_SOUND_TAG: u64 = 1 << 59;
 const CUSTOM_SOUND_TAG: u64 = 1 << 58;
 
 /// The owner of an object's `+0x3C` AmbientSound handle.
-pub(crate) const fn ambient_sound_owner(object: u64) -> u64 {
+pub const fn ambient_sound_owner(object: u64) -> u64 {
     object | AMBIENT_SOUND_TAG
 }
 
@@ -79,7 +79,7 @@ pub(crate) const fn custom_sound_owner(object: u64) -> u64 {
 }
 
 /// The object whose `+0x3C` or `+0x50` handle `owner` names.
-pub(crate) const fn object_sound_object(owner: u64) -> Option<u64> {
+pub const fn object_sound_object(owner: u64) -> Option<u64> {
     if owner & (AMBIENT_SOUND_TAG | CUSTOM_SOUND_TAG) != 0 {
         Some(owner & !(AMBIENT_SOUND_TAG | CUSTOM_SOUND_TAG))
     } else {
@@ -89,15 +89,10 @@ pub(crate) const fn object_sound_object(owner: u64) -> Option<u64> {
 
 impl Simulation {
     /// `ObjectClass::AI`'s sound block for one visit of a Techno or Terrain.
-    pub(crate) fn object_ai_sounds(
-        &mut self,
-        id: u64,
-        rules: Option<&RuleSet>,
-        effects: FrameEffects<'_>,
-    ) {
+    pub(crate) fn object_ai_sounds(&mut self, id: u64, rules: &RuleSet, effects: FrameEffects<'_>) {
         // `+0x1F4` and `+0x64` are read before `Location`, so an object
         // with neither costs no coordinate.
-        let ambient = rules.and_then(|rules| self.object_ambient_sound(id, rules));
+        let ambient = self.object_ambient_sound(id, rules);
         if ambient.is_none() && !self.object_custom_sounds.contains_key(&id) {
             return;
         }
@@ -105,7 +100,7 @@ impl Simulation {
             return;
         };
         if let Some(sound_id) = ambient {
-            self.sound_events.push(SimSoundEvent::AnimationStarted {
+            self.sound_events.emit(SimSoundEvent::AnimationStarted {
                 anim_id: ambient_sound_owner(id),
                 sound_id: sound_id.to_owned(),
                 world,
@@ -113,7 +108,7 @@ impl Simulation {
             effects.flush_sound(self, rules);
         }
         if let Some(sound_id) = self.object_custom_sounds.get(&id).cloned() {
-            self.sound_events.push(SimSoundEvent::AnimationStarted {
+            self.sound_events.emit(SimSoundEvent::AnimationStarted {
                 anim_id: custom_sound_owner(id),
                 sound_id,
                 world,
@@ -129,36 +124,59 @@ impl Simulation {
     pub(crate) fn trigger_play_sound_at_random_waypoint(
         &mut self,
         sound: Option<&str>,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) -> bool {
-        let mut candidates = Vec::new();
-        for index in 0..crate::map::waypoints::WAYPOINT_SLOT_COUNT as i32 {
-            if self.session.waypoint_is_valid(index) {
-                candidates.push(self.session.waypoint_cell(index).expect("valid slot"));
-                if candidates.len() == 400 {
-                    break;
+        // Ares 3.0 TActionClass_PlayAudioAtRandomWP (10039B60, hook 0x6E1780,
+        // #1004906) replaces the scan: every defined slot is a candidate,
+        // without the 400 cap, and no candidate means no draw and no sound.
+        let cell = if rules.ares() {
+            let candidates: Vec<i32> = (0..crate::map::waypoints::WAYPOINT_SLOT_COUNT as i32)
+                .filter(|&index| self.session.waypoint_is_valid(index))
+                .collect();
+            if candidates.is_empty() {
+                return true;
+            }
+            let selected = self
+                .scenario_rng
+                .next_range_i32_inclusive(0, candidates.len() as i32 - 1);
+            let Some(cell) = usize::try_from(selected)
+                .ok()
+                .and_then(|index| candidates.get(index))
+                .and_then(|&index| self.session.waypoint_cell(index))
+            else {
+                return true;
+            };
+            cell
+        } else {
+            let mut candidates = Vec::new();
+            for index in 0..crate::map::waypoints::WAYPOINT_SLOT_COUNT as i32 {
+                if self.session.waypoint_is_valid(index) {
+                    candidates.push(self.session.waypoint_cell(index).expect("valid slot"));
+                    if candidates.len() == 400 {
+                        break;
+                    }
                 }
             }
-        }
-        let selected = self
-            .scenario_rng
-            .next_range_i32_inclusive(0, candidates.len() as i32 - 1);
-        let cell = if candidates.is_empty() && selected == 0 {
-            //4068F0 initializes the original100 CellStruct scratch entries.
-            (0, 0)
-        } else if let Some(cell) = usize::try_from(selected)
-            .ok()
-            .and_then(|index| candidates.get(index))
-        {
-            *cell
-        } else {
-            //RESIDUAL: no-waypoint result-1 reads before native's scratch
-            //array. Keep the real RNG request and Execute's unconditional
-            //AL1 (6DE836), while skipping audio with an undefined coordinate.
-            //A Vec also avoids native stack corruption when its
-            //400-entry admission exceeds that100-entry scratch allocation.
-            return true;
+            let selected = self
+                .scenario_rng
+                .next_range_i32_inclusive(0, candidates.len() as i32 - 1);
+            if candidates.is_empty() && selected == 0 {
+                //4068F0 initializes the original100 CellStruct scratch entries.
+                (0, 0)
+            } else if let Some(cell) = usize::try_from(selected)
+                .ok()
+                .and_then(|index| candidates.get(index))
+            {
+                *cell
+            } else {
+                //RESIDUAL: no-waypoint result-1 reads before native's scratch
+                //array. Keep the real RNG request and Execute's unconditional
+                //AL1 (6DE836), while skipping audio with an undefined coordinate.
+                //A Vec also avoids native stack corruption when its
+                //400-entry admission exceeds that100-entry scratch allocation.
+                return true;
+            }
         };
         let coordinate = crate::sim::cell_kernel::cell_center(
             crate::sim::cell_kernel::CellCoordinate {
@@ -168,7 +186,7 @@ impl Simulation {
             0,
         );
         if let Some(sound_id) = sound {
-            self.sound_events.push(SimSoundEvent::VocAtCoord {
+            self.sound_events.emit(SimSoundEvent::VocAtCoord {
                 sound_id: sound_id.to_owned(),
                 coordinate: DriveCoord {
                     x: coordinate.x,
@@ -188,7 +206,7 @@ impl Simulation {
         &mut self,
         sound: Option<&str>,
         waypoint: Option<u32>,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) -> bool {
         let Some([x, y, z]) =
@@ -205,7 +223,7 @@ impl Simulation {
             return true;
         }
         if let Some(sound_id) = sound {
-            self.sound_events.push(SimSoundEvent::VocAtCoord {
+            self.sound_events.emit(SimSoundEvent::VocAtCoord {
                 sound_id: sound_id.to_owned(),
                 coordinate: DriveCoord { x, y, z },
                 flags: 1,
@@ -222,7 +240,7 @@ impl Simulation {
     pub(crate) fn trigger_stop_sound_at_waypoint(
         &mut self,
         waypoint: Option<u32>,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) -> bool {
         let Some([x, y, z]) =
@@ -236,7 +254,7 @@ impl Simulation {
         {
             self.set_custom_sound(object, None);
         } else {
-            self.sound_events.push(SimSoundEvent::VocStopAtCoord {
+            self.sound_events.emit(SimSoundEvent::VocStopAtCoord {
                 coordinate: DriveCoord { x, y, z },
                 flags: 1,
             });
@@ -247,13 +265,13 @@ impl Simulation {
         true
     }
 
-    /// `ObjectClass::Limbo`'s handle teardown for a Techno
+    /// `ObjectClass::Limbo`'s handle teardown for a Techno or Terrain
     /// (`0x005F4D81`, `0x005F4D89`).
-    pub(crate) fn object_sound_conceal(&mut self, id: u64, rules: Option<&RuleSet>) {
-        if rules.is_some_and(|rules| self.object_ambient_sound(id, rules).is_some())
+    pub(crate) fn object_sound_conceal(&mut self, id: u64, rules: &RuleSet) {
+        if self.object_ambient_sound(id, rules).is_some()
             && let Some(world) = self.object_sound_location(id)
         {
-            self.sound_events.push(SimSoundEvent::AnimationStopped {
+            self.sound_events.emit(SimSoundEvent::AnimationStopped {
                 anim_id: ambient_sound_owner(id),
                 stop_sound_id: None,
                 world,
@@ -266,7 +284,7 @@ impl Simulation {
     /// makes it. Only an assigned sound can have given the handle an event.
     pub(crate) fn detach_custom_sound(&mut self, id: u64) {
         if self.object_custom_sounds.contains_key(&id) {
-            self.sound_events.push(SimSoundEvent::ObjectSoundDetached {
+            self.sound_events.emit(SimSoundEvent::ObjectSoundDetached {
                 owner: custom_sound_owner(id),
             });
         }
@@ -288,6 +306,9 @@ impl Simulation {
 
     /// `ObjectClass::Set_Custom_Sound @ 0x005F6CB0`.
     fn set_custom_sound(&mut self, object: u64, sound: Option<&str>) {
+        // The object's next visit plays the sound (`ObjectClass::AI
+        // @ 0x005F3E70`); a sleeping one must take it (`world::idle_sleep`).
+        self.substrate.entities.wake(object);
         match sound {
             Some(sound_id) => {
                 self.object_custom_sounds
@@ -306,7 +327,7 @@ impl Simulation {
         self.substrate
             .occupancy
             .first_building_on_layer(cell.0, cell.1, MovementLayer::Ground)
-            .or_else(|| self.production.terrain_object_cells.get(&cell).copied())
+            .or_else(|| self.terrain_objects.cell_index().get(&cell).copied())
     }
 
     /// `Location` (`+0x9C`) of a Techno, or of a Terrain object while it is
@@ -318,8 +339,8 @@ impl Simulation {
             return (!entity.lifecycle.in_limbo()).then(|| Self::movement_sound_world(entity));
         }
         let terrain = self
-            .production
             .terrain_objects
+            .objects()
             .get(&id)
             .filter(|terrain| terrain.is_live())?;
         let coord = terrain.world_coord();
@@ -331,13 +352,21 @@ impl Simulation {
     }
 
     fn object_ambient_sound<'r>(&self, id: u64, rules: &'r RuleSet) -> Option<&'r str> {
-        let entity = self.substrate.entities.get(id)?;
-        self.object_type(entity.type_ref(), rules)?
-            .ambient_sound
-            .as_deref()
+        if let Some(entity) = self.substrate.entities.get(id) {
+            return self
+                .object_type(entity.type_ref(), rules)?
+                .ambient_sound
+                .as_deref();
+        }
+        // TerrainAI71C738 calls the same ObjectAI5F3E70; its vt+88
+        // returns TerrainType+1F4, not a same-named Techno type.
+        let terrain = self.terrain_objects.get(id)?;
+        rules
+            .terrain_object_type_case_insensitive(self.interner.resolve(terrain.type_ref()))?
+            .ambient_sound()
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_c_o))]
 #[path = "object_sound_tests.rs"]
 mod tests;

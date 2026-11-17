@@ -18,6 +18,14 @@ pub struct ExplosionEffect {
     /// Exact absolute Z in leptons; the anim is constructed there (its Middle
     /// height gate reads it). `z` is the level byte of the same point.
     pub world_z: i32,
+    /// `AnimClass +0x100` draw Z adjust passed to the constructor. The stock
+    /// combat row uses [`crate::sim::anim_class::COMBAT_EXPLOSION_Z_ADJUST`];
+    /// the Phobos Bullet tail substitutes the warhead's `AnimZAdjust`.
+    pub z_adjust: i32,
+    /// Phobos' `0x469C46` tail assigns the invoker House to every animation it
+    /// constructs (`pAnim->Owner = pInvoker`). `None` keeps the constructor's
+    /// unowned state.
+    pub owner_house: Option<InternedId>,
     /// A death producer's own constructor call (`Death_Explosion`, the
     /// Aircraft death arm, `DestructionEffects`, the infantry InfDeath arms):
     /// `AnimClass(type, coord, delay, 1, 0x600, 0, 0)` at an exact
@@ -50,6 +58,14 @@ pub enum CombatLightRequest {
     },
 }
 
+/// One Bullet detonation's screen-shake writes, in native X-then-Y order.
+/// `None` leaves that axis' prior process-owned value untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenShakeUpdate {
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+}
+
 /// One smudge producer payload. Production commits it synchronously through
 /// the world receiver; phase-level combat fixtures retain it in their result as
 /// a test adapter.
@@ -67,15 +83,16 @@ pub enum SmudgeSpawnRequest {
         rx: u16,
         ry: u16,
         building_z: i32,
-        foundation_w: u8,
-        foundation_h: u8,
+        foundation_w: u16,
+        foundation_h: u16,
     },
     /// One foundation cell's mark, committed by `SpawnSurvivors` after that
     /// cell's survivor roll (never for a building owing no survivor).
     BuildingSurvivor { cell_rx: u16, cell_ry: u16 },
 }
 
-/// Hookless compatibility record for one admitted per-cell tiberium reduction.
+/// One admitted per-cell tiberium reduction: the inline dispatch's request,
+/// and the record the callback-disabled receiver fixture defers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TiberiumReductionRequest {
     pub rx: u16,
@@ -104,6 +121,28 @@ pub struct UnderAttackEvent {
     /// The VICTIM's owner — the player whose radar/EVA should react.
     pub owner: InternedId,
     pub victim_type: InternedId,
+    /// The victim house's own radar/EVA line. Ares
+    /// HouseClass_BuildingUnderAttack_Malicious (10053980, hook 0x4F94A5)
+    /// skips it for a building hit by a `Malicious=no` warhead; the ally
+    /// line and the House Tags still follow.
+    pub own_alert: bool,
+    pub line: UnderAttackLine,
+}
+
+/// Which native call raises an [`UnderAttackEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnderAttackLine {
+    /// `HouseClass::NotifyUnderAttack @ 0x004F93E0` for a building: the
+    /// victim house's own line, which picks the ore-miner cue for a deployed
+    /// miner and the base cue otherwise, and, when `allies`, the line its
+    /// human allies hear. Ares announceAttack (10062150) calls it only after
+    /// testing Owner == PlayerPtr, so on the victim's own client alone, where
+    /// the own branch runs: no ally hears it.
+    House { allies: bool },
+    /// `CreateRadarEvent(4)` and `EVA_OreMinerUnderAttack` called by the
+    /// producer itself (Unit `0x00738530`, Temporal `0x0071B04C`, Ares
+    /// announceAttack 10062150), with no siren, ally line or House Tags.
+    OreMiner,
 }
 
 /// `TechnoClass::Death_Announcement @ 0x004D98C0` input: a non-building
@@ -111,11 +150,29 @@ pub struct UnderAttackEvent {
 /// 0x00416613`, infantry `0x005180F4`, `UnitClass 0x00737DC9/0x00737E39/
 /// 0x00737E68`, all vtable slot `+0x3B8`) and its type is not `Spawned=`.
 /// The world applies the owner-is-human gate and the radar type-7 dedupe.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct UnitLostEvent {
     pub rx: u16,
     pub ry: u16,
     pub owner: InternedId,
+    /// The dead techno's interned type, for the optional detailed EVA text;
+    /// a transient fact, never a state input.
+    pub type_id: InternedId,
+    /// The Ares announcement, when Ares plays; `None` is the stock event.
+    pub ares: Option<AresUnitLost>,
+}
+
+/// What Ares' announcement adds to a [`UnitLostEvent`] (FootClass_Destroyed
+/// 10049080, hook 0x4D98C0; BuildingClass_Destroyed_UnitLost 10013F10, hook
+/// 0x44D760).
+#[derive(Debug, Clone)]
+pub struct AresUnitLost {
+    /// The victim type's `EVA.Lost`, spoken whether or not the client admits
+    /// the radar event.
+    pub eva: String,
+    /// A Foot creates the radar event (FootClass_Destroyed 10049080); a
+    /// building does not (BuildingClass_Destroyed_UnitLost 10013F10).
+    pub radar_event: bool,
 }
 
 /// One ordered accumulator for weapon emission and recursive receiver effects.
@@ -140,8 +197,11 @@ pub(crate) struct DeathEffects {
     pub(crate) wall_mutations: Vec<WallMutation>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) cell_target_detaches: Vec<combat_aoe::CellTargetDetach>,
+    /// The receiver fixture's deferred reductions. Production reduces each
+    /// admitted cell inline, before the cell's damage.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) tiberium_reduction_requests: Vec<TiberiumReductionRequest>,
-    pub(crate) death_sounds: Vec<(String, u16, u16)>,
+    pub(crate) death_sounds: Vec<(String, crate::sim::anim_class::AnimWorldCoord)>,
     pub(crate) smudge_spawn_requests: Vec<SmudgeSpawnRequest>,
     pub(crate) rad_detonations: Vec<crate::sim::radiation::RadDetonation>,
     pub(crate) under_attack_events: Vec<UnderAttackEvent>,
@@ -190,6 +250,7 @@ impl DeathEffects {
         #[cfg(any(test, feature = "test-support"))]
         self.cell_target_detaches
             .append(&mut other.cell_target_detaches);
+        #[cfg(any(test, feature = "test-support"))]
         self.tiberium_reduction_requests
             .append(&mut other.tiberium_reduction_requests);
         self.death_sounds.append(&mut other.death_sounds);

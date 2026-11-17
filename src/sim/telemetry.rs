@@ -24,7 +24,9 @@
 //!   `store_spawned_limbo` resets the CoordStruct to the off-map default —
 //!   so the map view shows them piled at the origin.
 //! - **Measured data only.** No event-history or pathfinding-health counters
-//!   are invented where the current simulation has no observation source.
+//!   are invented where the current simulation has no observation source. The
+//!   `path_batch` block (v24) is the batch's own accounting: it already makes
+//!   those counts to enforce its caps and its budget, so it reports them.
 //! - **Wire stability.** Houses and spots are `Vec`s in store/interned-id
 //!   order — deterministic across peers and runs. New fields arrive as
 //!   `Option` or new sections under a bumped `TELEMETRY_SCHEMA_VERSION`.
@@ -57,7 +59,78 @@ use crate::sim::world::Simulation;
 /// positions).
 /// v22: read-only schema; trainer state is absent and collections are bounded.
 /// v23: optional developer-tools capability and bounded selected-object history.
-pub const TELEMETRY_SCHEMA_VERSION: u32 = 23;
+/// v24: `path_batch` — the path batch pass's own counts and durations.
+/// v25: `history` — 1 Hz match summaries recorded whether or not a dashboard is
+/// attached; sent once, to a client that attached since the last publish.
+/// v26: `report_points` — report-grade samples (5 s) carrying exactly the
+/// fields the dashboard's match report reads, so a past point can render the
+/// full report. Spots, logs, debug and production detail stay out.
+/// v27: `terrain` — the map's elevation grid, sent once per map so the
+/// dashboard builds a real terrain surface instead of a flat plane.
+/// v28: `terrain` gained per-cell land type, ramp slope and bridge deck rise,
+/// so the dashboard can tell water from land, slope a ramp instead of walling
+/// it, and lift a high bridge deck off its ground.
+/// v29: `session` — which match a stream belongs to: map name, `GameMode`, the
+/// game speed the pacer uses, the local player and its accepted result, and the
+/// running binary's version stamp.
+/// v30: `network` — an online relay match's backlog, catch-up state, skipped
+/// draws and relay slowdown.
+/// v31: `render` splits the old catch-all `other_ms` into combat lights, effect
+/// lines, draw calls and handing the frame to the driver; `other_ms` keeps the
+/// remainder.
+/// v32: `profile.phases_ms` splits the object pass into unit AI, pathfinding,
+/// targeting, movement, firing, buildings, bullets and effects, and drops four
+/// slots no step ever filled.
+pub const TELEMETRY_SCHEMA_VERSION: u32 = 32;
+
+/// One house row of a [`ReportPoint`]: just what the report's party table and
+/// pie captions read.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReportHouseRow {
+    pub name: String,
+    pub is_human: bool,
+    pub passive: bool,
+    pub structures: u32,
+    pub credits: i32,
+    pub score: i32,
+}
+
+/// A report-grade sample of a match at one tick.
+///
+/// It carries exactly the readings the dashboard's match report consumes, so
+/// the report renderer can be pointed at a past sample unchanged. `timing`
+/// and `render` are filled by the app (their owners are the render loop).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReportPoint {
+    pub tick: u64,
+    pub entities_total: u32,
+    pub map_width: u16,
+    pub map_height: u16,
+    pub houses: Vec<ReportHouseRow>,
+    pub timing: Option<TimingSample>,
+    pub profile: Option<crate::sim::frame_profile::FrameProfileReport>,
+    pub render: Option<crate::sim::telemetry::RenderTimingReport>,
+    pub path_batch: Option<crate::sim::movement::PathBatchStats>,
+}
+
+/// One 1 Hz summary of a match, recorded by the app for the whole match.
+///
+/// The dashboard draws these as the match-long timeline; a client that
+/// attaches mid-match receives the ring once so the time before it is not a
+/// hole. Render and phase-ledger fields are deliberately absent: those are
+/// measured only while a client is attached.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MatchHistorySample {
+    pub tick: u64,
+    /// Mean and slowest simulation-advance wall time over the sample's ticks.
+    pub tick_ms: f32,
+    pub peak_ms: f32,
+    pub entities: u32,
+    pub houses: u32,
+    /// The path batch's own counts at the sample's last tick; `None` while the
+    /// simulation searches serially.
+    pub path_batch: Option<crate::sim::movement::PathBatchStats>,
+}
 
 /// Spot ceiling per snapshot: the project's headline unit scale. Beyond it
 /// the capture keeps the first N in store order (deterministic) and the
@@ -77,7 +150,7 @@ pub const TELEMETRY_MAX_BASE_PLAN: usize = 32;
 /// Byte limit, shortened only at UTF-8 character boundaries.
 pub const TELEMETRY_MAX_NAME_BYTES: usize = 64;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_t_z))]
 #[path = "telemetry_tests.rs"]
 mod tests;
 
@@ -118,7 +191,7 @@ pub struct HousePopulation {
     /// Rules-owned side index: the position in the loaded `[Sides]` section.
     /// Not a fixed enum — retail order differs from test fixtures, so the app
     /// also sends `side_name`, the authoritative spelling.
-    pub side_index: u8,
+    pub side_index: i32,
     /// The `[Sides]` key this house belongs to ("Allied", "ThirdSide",
     /// "Civilian", "Mutant", …), resolved from the loaded rules. `None` when
     /// no rule set is available.
@@ -129,8 +202,7 @@ pub struct HousePopulation {
     pub is_human: bool,
     /// True for the non-contending houses the engine keeps for map objects:
     /// `Neutral` and `Special` own scenery and civilians but never take part
-    /// in the match, so the dashboard filters them out of any lineup. This is
-    /// the same flag `Simulation::contending_house_count` counts.
+    /// in the match, so the dashboard filters them out of any lineup.
     pub passive: bool,
     pub counts: CategoryCounts,
     /// The house's own team colour, RGB, from the rules `[Colors]` scheme the
@@ -194,6 +266,49 @@ pub struct EntitySpot {
     /// Index into `TelemetrySnapshot::houses`; u16::MAX when the entity's
     /// owner has no house row.
     pub owner_index: u16,
+}
+
+/// The map's elevation grid, sent once per map so the dashboard can displace a
+/// real terrain surface instead of drawing a flat plane. The four per-cell
+/// grids are the same elevation bytes the engine's height map holds, flattened
+/// row-major. App-filled: the simulation owns no map grid, the presentation
+/// layer does, so this stays out of every other publish.
+///
+/// Every grid is lowercase hex with two characters per cell, row-major, so a
+/// cell `(rx, ry)` sits at `(ry * width + rx) * 2`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TerrainGrid {
+    pub width: u16,
+    pub height: u16,
+    /// `width * height` elevation levels: the per-cell ground height the
+    /// terraces stack on. Hex avoids a bulky numeric JSON array for the
+    /// one-per-map payload while needing no extra dependency.
+    pub levels: String,
+    /// `width * height` `CellClass+0xEC` land types (`rules::terrain_rules::
+    /// LandType`, `2` = Water). Lets the dashboard paint water apart from land.
+    pub land_types: String,
+    /// `width * height` TMP slope types: `0` is a flat cell's top, `1..=16` a
+    /// ramp tile whose surface tilts toward its lower neighbour. The dashboard
+    /// slopes those cells instead of dropping a step face.
+    pub slope_types: String,
+    /// `width * height` bridge deck rises: the extra levels a structural
+    /// bridge deck sits above the cell's own ground level (`0` when the cell
+    /// carries no raised deck, which includes low, ground-level bridges). The
+    /// dashboard lifts those cells' tops by this much and draws their sides.
+    pub deck_rises: String,
+}
+
+/// An online relay match's delivery state, measured by the app.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NetworkSample {
+    /// Frames the relay has sealed past the local simulation.
+    pub backlog_frames: u32,
+    /// The playout pacer is running buffered frames to catch up.
+    pub catching_up: bool,
+    /// Draws skipped while catching up, this match.
+    pub skipped_draws: u64,
+    /// The relay seals slower than the match's own rate for a slow player.
+    pub relay_slowed: bool,
 }
 
 /// Frame-timing sample, filled by the app layer (the simulation never
@@ -386,7 +501,15 @@ pub struct RenderTimingReport {
     pub sidebar_ms: f32,
     /// Phase 6 — instance upload to the GPU buffer pool.
     pub upload_ms: f32,
-    /// Prep before phase 1 and everything after phase 6.
+    /// Combat lights and spotlights.
+    pub lights_ms: f32,
+    /// Effect lines and rings, and ion blasts.
+    pub effects_ms: f32,
+    /// Phase 7 — recording the render passes.
+    pub draw_calls_ms: f32,
+    /// Encoding, submitting and presenting the frame.
+    pub handoff_ms: f32,
+    /// Prep before phase 1 and between the lights and the effects.
     pub other_ms: f32,
 }
 
@@ -505,6 +628,27 @@ pub struct CheatReport {
     pub power_forced: bool,
 }
 
+/// Which match a stream belongs to. App-filled like every other non-sim
+/// section: the header needs the session's identity, and the entity wall alone
+/// cannot tell a campaign stage from a skirmish on the same map.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionContext {
+    /// The loaded scenario's map file name, bounded like every other wire name.
+    pub map_name: String,
+    /// `GameMode` (`0x00A8B238`) as the engine's own variant spelling.
+    pub game_mode: String,
+    /// The scenario speed, clamped the way the frame pacer clamps it.
+    pub game_speed: u8,
+    /// The pinned local player's house; `None` when the scenario names none.
+    pub local_owner: Option<String>,
+    /// The local player's accepted result, present once its SavourDelay has
+    /// expired — the same query the app's outcome presentation and simulation
+    /// termination share, so the header never shows a result still in flight.
+    pub local_outcome: Option<crate::sim::house_state::HouseOutcomeKind>,
+    /// The running binary's version stamp, from `CARGO_PKG_VERSION`.
+    pub build_stamp: String,
+}
+
 /// One dashboard sample: the whole wire payload per snapshot.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TelemetrySnapshot {
@@ -516,6 +660,12 @@ pub struct TelemetrySnapshot {
     /// Map dimensions in cells; frames the dashboard's ground plane.
     pub map_width: u16,
     pub map_height: u16,
+    /// App-filled session identity; `None` until the app layer fills it.
+    pub session: Option<SessionContext>,
+    /// The map's elevation grid; app-filled and sent once per map (first
+    /// publish after a client attaches, and again after a map loads), so the
+    /// dashboard can build real terrain. `None` on every other publish.
+    pub terrain: Option<TerrainGrid>,
     /// Every entity stored in the entity store, limbo (cargo, paradrop)
     /// included. The sum of house counts is lower only when an entity names
     /// an owner with no house row — a data anomaly the dashboard should
@@ -534,11 +684,25 @@ pub struct TelemetrySnapshot {
     pub process: Option<ProcessStats>,
     /// Mean cost per simulation tick in the current observation window.
     pub profile: Option<crate::sim::frame_profile::FrameProfileReport>,
+    /// The path batch's own accounting of its latest pass; `None` while the
+    /// simulation searches serially, since then no pass runs.
+    pub path_batch: Option<crate::sim::movement::PathBatchStats>,
+    /// Whole-match 1 Hz summaries; app-filled, and only on the first publish
+    /// after a client attached.
+    pub history: Option<Vec<MatchHistorySample>>,
+    /// Report-grade 5 s samples; app-filled, and only on the first publish
+    /// after a client attached.
+    pub report_points: Option<Vec<ReportPoint>>,
+    /// The newest report-grade sample; app-filled on every snapshot, so a long
+    /// session keeps gaining reportable points after the initial backfill.
+    pub report_point: Option<ReportPoint>,
     /// App-filled per-phase render breakdown; `None` until the app has rendered
     /// a game frame.
     pub render: Option<RenderTimingReport>,
     /// App-filled log records since the previous snapshot.
     pub logs: Option<LogBatch>,
+    /// App-filled online relay match delivery state; `None` otherwise.
+    pub network: Option<NetworkSample>,
     #[cfg(feature = "debug-tools")]
     pub debug_tools: DebugToolsReport,
 }
@@ -594,37 +758,37 @@ impl Simulation {
             Vec::with_capacity(self.houses.len().min(TELEMETRY_MAX_HOUSES));
         for (index, (owner, house)) in self.houses.iter().take(TELEMETRY_MAX_HOUSES).enumerate() {
             owner_index.insert(*owner, index);
-            let difficulty = match house.difficulty {
+            let difficulty = match house.difficulty() {
                 crate::sim::house_state::HouseDifficulty::Hard => "hard",
                 crate::sim::house_state::HouseDifficulty::Normal => "normal",
                 crate::sim::house_state::HouseDifficulty::Easy => "easy",
             };
             houses.push(HousePopulation {
-                name: bounded_name(self.interner.resolve(house.name)),
-                side_index: house.side_index,
+                name: bounded_name(self.interner.resolve(house.name())),
+                side_index: house.side_index(),
                 side_name: None,
                 difficulty: difficulty.to_owned(),
-                is_human: house.is_human,
-                passive: house.multiplay_passive,
+                is_human: house.is_human(),
+                passive: house.multiplay_passive(),
                 counts: CategoryCounts::default(),
                 color: None,
-                credits: house.economy.credits(),
+                credits: house.economy().credits(),
                 power_output: self
                     .power_states
                     .get(owner)
-                    .map_or(0, |power| power.total_output),
+                    .map_or(0, |power| power.total_output()),
                 power_drain: self
                     .power_states
                     .get(owner)
-                    .map_or(0, |power| power.total_drain),
+                    .map_or(0, |power| power.total_drain()),
                 low_power: self
                     .power_states
                     .get(owner)
-                    .is_some_and(|power| power.is_low_power),
-                spent: house.economy.spent_credits(),
-                score: house.economy.score(),
-                defeated: house.is_defeated,
-                base_center: house.base_center,
+                    .is_some_and(|power| power.is_low_power()),
+                spent: house.economy().spent_credits(),
+                score: house.economy().score(),
+                defeated: house.is_defeated(),
+                base_center: house.base_center(),
                 roster: Vec::new(),
                 production: Vec::new(),
                 squads: Vec::new(),
@@ -660,8 +824,8 @@ impl Simulation {
             house.roster = type_counts(counts, &self.interner, TELEMETRY_MAX_ROSTER);
         }
 
-        for factory in self.production.factories.iter_insertion_ordered() {
-            let Some(&index) = owner_index.get(&factory.owner) else {
+        for factory in self.production.factories().iter_insertion_ordered() {
+            let Some(&index) = owner_index.get(&factory.owner()) else {
                 continue;
             };
             let rows = &mut houses[index].production;
@@ -669,21 +833,21 @@ impl Simulation {
                 continue;
             }
             let type_name = |id| bounded_name(self.interner.resolve(id));
-            let (active_type, ready_to_place) = match factory.object.as_ref() {
-                Some(object) if factory.progress >= PRODUCTION_STEPS => {
+            let (active_type, ready_to_place) = match factory.object() {
+                Some(object) if factory.progress() >= PRODUCTION_STEPS => {
                     (None, vec![type_name(object.type_id)])
                 }
                 Some(object) => (Some(type_name(object.type_id)), Vec::new()),
                 None => (None, Vec::new()),
             };
             rows.push(ProductionLine {
-                category: factory.category.label().to_owned(),
+                category: factory.category().label().to_owned(),
                 active_type,
-                progress: factory.progress,
-                on_hold: factory.on_hold,
-                suspended: factory.suspended,
+                progress: factory.progress(),
+                on_hold: factory.on_hold(),
+                suspended: factory.suspended(),
                 queue: factory
-                    .queue
+                    .queue()
                     .iter()
                     .take(TELEMETRY_MAX_QUEUE)
                     .map(|entry| type_name(entry.type_id))
@@ -732,8 +896,8 @@ impl Simulation {
         for (owner, index) in &owner_index {
             let source = &self.houses[owner];
             houses[*index].base_plan = source
-                .base_plan
-                .nodes
+                .base_plan()
+                .nodes()
                 .iter()
                 .filter(|node| node.packed_cell != 0)
                 .take(TELEMETRY_MAX_BASE_PLAN)
@@ -748,10 +912,12 @@ impl Simulation {
 
         TelemetrySnapshot {
             version: TELEMETRY_SCHEMA_VERSION,
-            tick: self.session.tick,
-            binary_frame: self.session.binary_frame,
-            map_width: self.session.map_width,
-            map_height: self.session.map_height,
+            tick: self.session.tick(),
+            binary_frame: self.session.binary_frame(),
+            map_width: self.session.map_width(),
+            map_height: self.session.map_height(),
+            session: None,
+            terrain: None,
             entities_total,
             houses,
             spots,
@@ -759,8 +925,13 @@ impl Simulation {
             debug: None,
             process: None,
             profile: self.frame_profile().report(),
+            path_batch: self.path_batch_stats(),
+            history: None,
+            report_points: None,
+            report_point: None,
             render: None,
             logs: None,
+            network: None,
             #[cfg(feature = "debug-tools")]
             debug_tools: {
                 let flags = self.cheat_flags();
@@ -786,6 +957,53 @@ impl Simulation {
                     }),
                 }
             },
+        }
+    }
+
+    /// Build a report-grade sample of the current state. `timing` and `render`
+    /// stay `None`: the render loop owns those readings, and the app fills them
+    /// where it captures the point.
+    pub fn report_point(&self) -> ReportPoint {
+        let rows: Vec<ReportHouseRow> = self
+            .houses
+            .iter()
+            .take(TELEMETRY_MAX_HOUSES)
+            .map(|(_, house)| ReportHouseRow {
+                name: bounded_name(self.interner.resolve(house.name())),
+                is_human: house.is_human(),
+                passive: house.multiplay_passive(),
+                structures: 0,
+                credits: house.economy().credits(),
+                score: house.economy().score(),
+            })
+            .collect();
+        let index: BTreeMap<InternedId, usize> = self
+            .houses
+            .keys()
+            .take(TELEMETRY_MAX_HOUSES)
+            .enumerate()
+            .map(|(row, owner)| (*owner, row))
+            .collect();
+        let mut rows = rows;
+        let mut entities_total = 0u32;
+        for entity in self.entities().values() {
+            entities_total = entities_total.saturating_add(1);
+            if entity.category() == EntityCategory::Structure
+                && let Some(&row) = index.get(&entity.owner())
+            {
+                rows[row].structures = rows[row].structures.saturating_add(1);
+            }
+        }
+        ReportPoint {
+            tick: self.session.tick(),
+            entities_total,
+            map_width: self.session.map_width(),
+            map_height: self.session.map_height(),
+            houses: rows,
+            timing: None,
+            profile: self.frame_profile().report(),
+            render: None,
+            path_batch: self.path_batch_stats(),
         }
     }
 }

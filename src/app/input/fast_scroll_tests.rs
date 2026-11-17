@@ -46,7 +46,12 @@ fn mouse_for(case: &DragCase) -> TacticalMouseState {
 }
 
 fn check_poll(mouse: &mut TacticalMouseState, case: &DragCase) {
-    let poll = mouse.poll_right_drag(case.cursor.into(), case.drag_metrics.into(), case.band_box);
+    let poll = mouse.poll_right_drag(
+        case.cursor.into(),
+        case.drag_metrics.into(),
+        case.band_box,
+        1.0,
+    );
     let motion = if poll == RightDragPoll::Pan {
         right_drag_pan_step(
             mouse.right_anchor,
@@ -237,14 +242,18 @@ fn a_drag_between_offline_polls_remains_a_cancel_click() {
             menu_open: false,
             session_mode: SessionMode::from_game_mode(mode),
             pacer_timing_admits: false,
+            network_wait: false,
+            network_dialog_open: false,
         });
         assert_eq!(
             usize::from(decision.scroll_input),
             row["expected"]["input_calls"].as_u64().unwrap() as usize
         );
         if decision.scroll_input {
-            mouse.poll_right_drag((500.0, 300.0), (4, 4), false);
+            mouse.poll_right_drag((500.0, 300.0), (4, 4), false, 1.0);
         }
+        // The camera's own scroll steps between polls have nothing to pan.
+        assert!(!mouse.right_pan_active(), "{}", row["name"]);
         // Moving far and releasing during the throttle wait cannot cross a
         // latch which only the native admitted poll is allowed to write.
         assert_eq!(mouse.end_right_press(), Some(true), "{}", row["name"]);
@@ -352,7 +361,12 @@ fn pending_requests_commit_once_and_absolute_views_discard_them() {
                 "drag" => {
                     let cursor: [f32; 2] = serde_json::from_value(step["cursor"].clone()).unwrap();
                     assert_eq!(
-                        mouse.poll_right_drag(cursor.into(), sequence.drag_metrics.into(), false),
+                        mouse.poll_right_drag(
+                            cursor.into(),
+                            sequence.drag_metrics.into(),
+                            false,
+                            1.0
+                        ),
                         RightDragPoll::Pan
                     );
                     let delta = right_drag_pan_step(
@@ -460,13 +474,14 @@ fn cinematic_focus_matches_native_frame_gates_projection_cleanup_and_restored_st
                         1.0,
                     );
                     let mut sim = crate::sim::world::Simulation::new();
-                    sim.session.binary_frame = frame;
+                    sim.session_mut_for_test().set_binary_frame_for_test(frame);
                     let bytes = GameSnapshot::save_validated_with_presentation(
                         &sim,
                         0,
                         0,
                         "native camera lifecycle",
                         0,
+                        &[],
                         &[],
                         None,
                         Some(&saved_view),
@@ -476,7 +491,7 @@ fn cinematic_focus_matches_native_frame_gates_projection_cleanup_and_restored_st
                     let snapshot = GameSnapshot::load(&bytes).unwrap();
                     let restored = snapshot.tactical_view().unwrap();
                     super::validate_saved_tactical_view(restored).unwrap();
-                    assert_eq!(snapshot.sim.session.binary_frame, frame);
+                    assert_eq!(snapshot.sim.session().binary_frame(), frame);
                     if let Some(rect) = step.get("local_size") {
                         let mut geometry = sequence.clone();
                         geometry.local_size = serde_json::from_value(rect.clone()).unwrap();

@@ -14,7 +14,7 @@ use crate::sim::aircraft::attack_mission::{StrikeFacts, StrikeHost, strike_visit
 use crate::sim::aircraft::fire_at::{AircraftShot, FireAtHost};
 use crate::sim::projectile::ProjectileVelocity;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_a_c))]
 #[path = "aircraft_release_tests.rs"]
 mod tests;
 
@@ -49,13 +49,15 @@ fn live_shot<'r>(
             .get(id)
             .map(|target| (target_coords(target), target.type_ref()))
             .or_else(|| {
-                let terrain = world.production.terrain_objects.get(&id)?;
+                let terrain = world.terrain_objects.objects().get(&id)?;
                 Some((
                     resolve_target_coords(&TargetKind::Entity(id), world)?,
-                    terrain.type_ref,
+                    terrain.type_ref(),
                 ))
             }),
-        Some(TargetKind::Cell(rx, ry)) => Some((cell_center_coords(rx, ry), entity.type_ref())),
+        Some(target @ TargetKind::Cell(..)) => {
+            resolve_target_coords(&target, world).map(|coords| (coords, entity.type_ref()))
+        }
         None => None,
     };
     let shot = coordinates.map(|(target_coords, target_type_ref)| AdmittedFire {
@@ -92,7 +94,7 @@ pub(super) fn visit(
     let Some(obj) = world.interner.object_type(entity.type_ref(), rules) else {
         return;
     };
-    let binary_frame = world.session.binary_frame;
+    let binary_frame = world.session.binary_frame();
     let weapon0 = combat_weapon::primary_for_tier(obj, entity.veterancy.rank())
         .and_then(|name| rules.weapon(name));
     let facts = StrikeFacts {
@@ -279,7 +281,7 @@ impl FireAtHost for AircraftFireAt<'_, '_, '_, '_> {
             .world
             .projectiles
             .get(bullet)
-            .map_or(ProjectileVelocity::new(0, 0, 0), |bullet| bullet.velocity);
+            .map_or(ProjectileVelocity::new(0, 0, 0), |bullet| bullet.velocity());
         Some(AircraftShot::new(rot, velocity))
     }
 
@@ -291,7 +293,10 @@ impl FireAtHost for AircraftFireAt<'_, '_, '_, '_> {
             .entity()
             .and_then(|entity| entity.locomotor.as_ref())
             .and_then(|locomotor| locomotor.fly_runtime())
-            .map_or(crate::util::fixed_math::SIM_ZERO, |fly| fly.current_speed());
+            .map_or(
+                crate::util::native_x87::NativeF64Bits::POSITIVE_ZERO,
+                |fly| fly.current_speed(),
+            );
         crate::sim::movement::air_movement::current_fly_speed(
             crate::util::fixed_math::ra2_speed_to_leptons_per_frame(self.strike.obj.speed),
             fraction,
@@ -349,14 +354,13 @@ impl FireAtHost for AircraftFireAt<'_, '_, '_, '_> {
         }
     }
 
-    /// `0x0050B6F0` asks whether the owner is the local player; each human
-    /// house's map takes what its own client would. RESIDUAL: in a campaign
-    /// (GameMode 0) it also admits a `PlayerControl=` house, whose shot then
-    /// asks and maps the player's map (through RevealArea's house gate,
-    /// `0x00567AB0..0x00567B12`); VERA asks and maps that house's own.
-    fn owner_is_player(&mut self) -> bool {
-        self.entity()
-            .is_some_and(|entity| self.strike.world.owner_is_human(entity.owner()))
+    /// [`Simulation::human_player_clients`] of the owner: each human house's
+    /// map takes what its own client would, and in a campaign a
+    /// `PlayerControl=` house's shot asks the player's map too.
+    fn player_clients(&mut self) -> Vec<InternedId> {
+        self.entity().map_or_else(Vec::new, |entity| {
+            self.strike.world.human_player_clients(entity.owner())
+        })
     }
 
     fn location(&mut self) -> ProjectileCoord {
@@ -371,20 +375,17 @@ impl FireAtHost for AircraftFireAt<'_, '_, '_, '_> {
             })
     }
 
-    /// On the owner's map, as [`Self::owner_is_player`] reads it. A world
-    /// without a map (a fixture) has nothing to ask.
-    fn is_shrouded(&mut self, point: ProjectileCoord) -> bool {
+    /// On `client`'s map. A world without a map (a fixture) has nothing to
+    /// ask.
+    fn is_shrouded(&mut self, client: InternedId, point: ProjectileCoord) -> bool {
         let world = &*self.strike.world;
-        let (Some(owner), Some(terrain)) = (
-            self.entity().map(GameEntity::owner),
-            world.resolved_terrain.as_ref(),
-        ) else {
+        let Some(terrain) = world.resolved_terrain.as_ref() else {
             return false;
         };
         crate::sim::vision::point_is_shrouded(
             &world.fog,
             &crate::map::resolved_terrain::NativeCellQuery::canonical(terrain),
-            owner,
+            client,
             crate::sim::components::DriveCoord {
                 x: point.x,
                 y: point.y,
@@ -393,10 +394,13 @@ impl FireAtHost for AircraftFireAt<'_, '_, '_, '_> {
         )
     }
 
-    /// On the owner's map only: the other houses' clients do not run it.
+    /// On `client`'s map, when RevealArea's house gate
+    /// (`0x00567AB0..0x00567B12`, [`crate::sim::vision::reveal_admits`])
+    /// admits the owner there: the owner's own map, or an ally's under
+    /// `AllyReveal=`.
     /// RESIDUAL: a negative `AttackingAircraftSightRange=` indexes before
     /// RevealArea's count table natively; VERA reveals nothing. Retail is 2.
-    fn reveal_area(&mut self, final_pass: bool) {
+    fn reveal_area(&mut self, client: InternedId, final_pass: bool) {
         let strike = &mut *self.strike;
         let world = &mut *strike.world;
         let Some(entity) = world.substrate.entities.get(strike.id) else {
@@ -412,10 +416,19 @@ impl FireAtHost for AircraftFireAt<'_, '_, '_, '_> {
             .general
             .attacking_aircraft_sight_range
             .clamp(0, i32::from(u16::MAX)) as u16;
-        let config = world.sight_reveal_config(Some(strike.rules));
+        let config = world.sight_reveal_config(strike.rules);
+        if !crate::sim::vision::reveal_admits(
+            &world.house_alliances,
+            owner,
+            client,
+            &config,
+            &world.interner,
+        ) {
+            return;
+        }
         let heights = world.sight_height_grid(&config);
         let _ = world.reveal_area(
-            &[owner],
+            &[client],
             (
                 location.x.div_euclid(256) as u16,
                 location.y.div_euclid(256) as u16,
@@ -425,10 +438,10 @@ impl FireAtHost for AircraftFireAt<'_, '_, '_, '_> {
             Some(&heights),
             final_pass,
             &config,
-            crate::sim::world::UninitContext::new(Some(strike.rules), strike.overlay_registry)
+            crate::sim::world::UninitContext::new(strike.rules, strike.overlay_registry)
                 .with_effects(strike.run.effects()),
             crate::sim::vision::MapRevealProjection::Transient,
-            world.session.current_house,
+            world.session.current_house(),
         );
     }
 
@@ -441,7 +454,7 @@ impl FireAtHost for AircraftFireAt<'_, '_, '_, '_> {
         let strike = &mut *self.strike;
         strike.world.uninit_with_context(
             strike.id,
-            crate::sim::world::UninitContext::new(Some(strike.rules), strike.overlay_registry)
+            crate::sim::world::UninitContext::new(strike.rules, strike.overlay_registry)
                 .with_effects(strike.run.effects()),
         );
     }
@@ -471,14 +484,13 @@ impl StrikeHost for CombatStrike<'_, '_, '_> {
         }) else {
             return;
         };
-        let (frame, rot) = (self.binary_frame, self.obj.turret_rot);
+        let frame = self.binary_frame;
         if let Some(entity) = world.substrate.entities.get_mut(id) {
-            let initial = entity.body_facing.current(frame);
+            entity.ensure_fly_secondary_facing();
             entity.body_facing.set(desired, frame);
-            entity
-                .barrel_facing
-                .get_or_insert_with(|| crate::sim::movement::FacingClass::new(initial, rot))
-                .set(desired, frame);
+            if let Some(secondary) = entity.barrel_facing.as_mut() {
+                secondary.set(desired, frame);
+            }
         }
     }
 
@@ -545,12 +557,24 @@ impl StrikeHost for CombatStrike<'_, '_, '_> {
 
     fn uncloak(&mut self) {
         let sound = sound_enabled(self.world);
-        uncloak_to_fire(self.world, self.rules, self.obj, self.id(), sound);
+        let id = self.id();
+        uncloak_to_fire(
+            &self.world.session,
+            &mut self.world.substrate,
+            &mut self.world.sound_events,
+            self.rules,
+            self.obj,
+            id,
+            sound,
+        );
     }
 
     fn epilogue(&mut self) -> i32 {
-        self.world
-            .mission_rate_epilogue(self.rules, crate::sim::mission::MissionType::Attack)
+        crate::sim::mission::authority::rate_epilogue(
+            self.rules,
+            crate::sim::mission::MissionType::Attack,
+            &mut self.world.scenario_rng,
+        )
     }
 
     fn ammo(&mut self) -> i32 {

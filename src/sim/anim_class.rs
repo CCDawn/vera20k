@@ -1,7 +1,7 @@
 //! Scheduler-owned ordinary SHP animation objects.
 //!
 //! `AnimStore` owns animation storage while `world::LogicVector` owns live AI
-//! order. This module implements the verified AnimClass lifecycle:
+//! order. This module implements the native-derived AnimClass lifecycle:
 //! constructor/reveal, first-AI guard, start delay and its `Start` edge,
 //! `Middle`'s scorch and crater, logic-frame timing, loops, reverse/ping-pong,
 //! Next, trailer, sound identity, owner attachment, conceal, deferred
@@ -15,34 +15,17 @@
 //!
 //! ## Residuals
 //!
-//! RESIDUAL (M11b) — **the per-frame damage arm.** `AnimClass::AI
-//! 0x00424507..0x0042464C` accumulates the type's `Damage=` (parsed, see
-//! `AnimTypeRuntimeConfig::damage`) into `AnimClass+0x188`, which the
-//! constructor seeds to `1.0`, and calls `Apply_area_damage` with a
-//! truncating `Math__ftol` whenever the accumulator reaches 1.0, subtracting
-//! the emitted integer back as a double. The warhead is
-//! `[CombatDamage] C4Warhead` when the anim's own section name is `INVISO`
-//! (string at `0x008182F8`, NOT the neighbouring `RING1` at `0x008182F0`) and
-//! `[CombatDamage] FlameDamage2` otherwise; a `TerrainClass` owner
-//! (`What_Am_I` -> `0x24`) multiplies the per-frame value by 5.
-//! - Bouncing anims skip this arm at42452A..424532, including meteors.
-//! - Trigger: the `FIRE3` anims `BuildingClass::DestructionEffects` starts,
-//!   for an `Explodes=` building, in each cardinal neighbour cell whose own
-//!   overlay has `Explodes=yes` (`0x00441A2B..0x00441B2E`; the neighbour's
-//!   `+0x44` overlay tested at `0x00441A90..0x00441AC2`, name loaded at
-//!   `0x00441AEC`).
-//!   No stock overlay has `Explodes=yes`, the `BURN-S/M/L` family is commented
-//!   out of `[Animations]` and `INVISO` has no stock producer, so stock play
-//!   never reaches it.
-//! - Player effect: `[FIRE3] Damage=.003` plus the `1.0` seed means exactly one
-//!   point of `Fire2` area damage on the fire's first ticked frame and then
-//!   none for another ~334 frames.
-//! - Frequency: none in stock; magnitude 1.
-//! - Downstream risk: low — it applies damage through the existing
-//!   `Apply_area_damage` path and consumes no RNG.
-//!   The `TerrainClass` x5 multiplier has no verified stock producer at all:
-//!   its only source of a terrain-owned anim is `TerrainClass::Catch_Fire @
-//!   0x0071C5B0`, which has no code caller in active YR.
+//! Ordinary damage runs after a due stage advance and before Middle/boundary
+//! through the shared area receiver (AnimAI424513..424654). Authored Overlay
+//! CellAnim provides a live FIRE3 producer; its stock ART Damage is .003.
+//! No common unchanged-stock ordinary positive-Damage producer is established.
+//! Terrain never burns in YR, so this needs no fire chain. `TerrainClass::
+//! Catch_Fire @ 0x0071C5B0`, the only IsOnFire writer, sits in vtable slot
+//! +0x178 (0x007F53A4) with no virtual call found. `Take_Damage @ 0x0071B920`
+//! uninits a terrain object on a lethal hit, and `Finish_Fire_Death @
+//! 0x0071C6B0` (from AnimClass 0x00422955/0x00424BB0) returns while IsOnFire is
+//! clear. Ares 3.0 makes trees burn (`sim::terrain_fire`); its fire anims
+//! are owned by the tree (`AnimObject::owner_terrain`).
 
 use crate::sim::world::FrameEffects;
 use std::collections::BTreeMap;
@@ -50,28 +33,61 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::art_data::AnimTypeRuntimeConfig;
 use crate::rules::house_colors::HouseColorIndex;
+use crate::rules::overlay_types::TiberiumImageError;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::bounce::{BounceOutcome, BounceState};
 use crate::sim::components::AnimClassSpawnDescriptor;
 use crate::sim::intern::InternedId;
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::occupancy::{RawCellKey, RawCellOccupationGrid, infantry_raw_occupation_mask};
+use crate::sim::overlay_mark_host::{OverlayRecalc, RuntimeOverlayError};
+use crate::sim::rng::SimRng;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::timer::CdTimer;
 use crate::sim::touch_log::{TouchLogs, Touched};
-use crate::sim::world::{LifecycleOutput, SimSoundEvent, Simulation};
+use crate::sim::world::ObjectSubstrate;
+use crate::sim::world::{SimSoundEvent, Simulation};
 use crate::util::fixed_math::SimFixed;
 use crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS;
+use crate::util::lookup_hash::LookupMap;
 use crate::util::native_x87::{NativeF64Bits, NativeX87Error, X87Chop53};
 
 pub type AnimId = u64;
+
+mod flaming_guy;
+
+#[cfg(all(test, tests_sim_a_b))]
+#[path = "anim_animated_tiberium_tests.rs"]
+mod animated_tiberium_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AnimWorldCoord {
     pub x: i32,
     pub y: i32,
     pub z: i32,
+}
+
+impl From<crate::sim::components::DriveCoord> for AnimWorldCoord {
+    fn from(coord: crate::sim::components::DriveCoord) -> Self {
+        Self {
+            x: coord.x,
+            y: coord.y,
+            z: coord.z,
+        }
+    }
+}
+
+impl From<crate::sim::projectile::ProjectileCoord> for AnimWorldCoord {
+    fn from(coord: crate::sim::projectile::ProjectileCoord) -> Self {
+        Self {
+            x: coord.x,
+            y: coord.y,
+            z: coord.z,
+        }
+    }
 }
 
 impl AnimWorldCoord {
@@ -154,18 +170,6 @@ const LEVEL_HEIGHT_LEPTONS: i32 = crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTO
 const TRAILER_DRAW_FLAGS: u32 = 0x600;
 const DAMAGE_FIRE_SLOT_COUNT: usize = 8;
 
-/// Pure YR `AnimClass_UpdateBouncePhysics` directional-frame projection.
-#[cfg(any(test, feature = "test-support"))]
-pub fn directional_tumble_frame(running_frames: i32, bucket8: i32, global_frame: i32) -> i32 {
-    let running = running_frames.max(1);
-    running * ((-1 - bucket8) & 7) + (global_frame / 3).rem_euclid(running)
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub fn settled_bounce_frame(running_frames: i32) -> i32 {
-    running_frames.wrapping_mul(8).wrapping_add(1)
-}
-
 /// `AnimClass_Update` @ 0x00423f37: landing consumes two inclusive rolls.
 pub(crate) fn bounce_spawn_count(
     has_spawns: bool,
@@ -205,7 +209,10 @@ pub fn anim_draw_detail_visible(input: AnimDrawDetailInput) -> bool {
 pub struct AnimTranslucencyInput {
     pub base_flags: u32,
     pub forced_translucent: bool,
-    pub forced_uses_75: bool,
+    /// Type `+0x368`, art.ini `DoubleThick=` (`AnimTypeClass::ReadINI @
+    /// 0x00427D00`), read only by the `+0x119` arm: `OR EBX,0x6` when set,
+    /// `OR EBX,0x4` when clear.
+    pub double_thick: bool,
     pub translucency_detail_level: i32,
     pub game_detail_level: i32,
     pub translucent_ramp: bool,
@@ -235,9 +242,9 @@ fn translucency_flag(level: i32) -> u32 {
 /// `AnimClass__DrawIt` @ 0x00423061: preserve native 25/50/75 flag values.
 pub fn anim_translucency_selection(input: AnimTranslucencyInput) -> AnimTranslucencyResult {
     let mut flags = input.base_flags;
+    // `0x00423061..0x0042307A` ORs the `+0x119` bits and falls through.
     if input.forced_translucent {
-        flags |= if input.forced_uses_75 { 6 } else { 4 };
-        return AnimTranslucencyResult { draw: true, flags };
+        flags |= if input.double_thick { 6 } else { 4 };
     }
     if input.translucency_detail_level > input.game_detail_level {
         return AnimTranslucencyResult { draw: true, flags };
@@ -246,13 +253,23 @@ pub fn anim_translucency_selection(input: AnimTranslucencyInput) -> AnimTransluc
         if input.instance_ramp >= 15 {
             return AnimTranslucencyResult { draw: false, flags };
         }
-        let frame = i64::from(input.current_frame);
-        let end = i64::from(input.end_frame);
-        flags |= if frame * 5 > end * 3 {
+        // `0x004230A8..0x004230FB`: the stage against End times the doubles
+        // 0.6, 0.4 and 0.2 (`0x007E3558`, `0x007E3550`, `0x007E3548`) on the
+        // x87 in chop-53. 0.6 rounds below three fifths, so with End a
+        // multiple of 5 the stage at three fifths already takes 75%.
+        use crate::util::native_x87::{NativeF64Bits, X87Chop53, X87Ordering};
+        let stage = X87Chop53::load_i32(input.current_frame);
+        let end = X87Chop53::load_i32(input.end_frame);
+        let above = |factor: u64| {
+            X87Chop53::load_f64(NativeF64Bits::from_bits(factor)).is_ok_and(|factor| {
+                X87Chop53::compare(stage, X87Chop53::mul(end, factor)) == X87Ordering::Greater
+            })
+        };
+        flags |= if above(0x3FE3_3333_3333_3333) {
             6
-        } else if frame * 5 > end * 2 {
+        } else if above(0x3FD9_9999_9999_999A) {
             4
-        } else if frame * 5 > end {
+        } else if above(0x3FC9_9999_9999_999A) {
             2
         } else {
             0
@@ -265,11 +282,13 @@ pub fn anim_translucency_selection(input: AnimTranslucencyInput) -> AnimTransluc
             flags: flags | translucency_flag(input.explicit_translucency),
         };
     }
-    if input.instance_ramp > 15 {
-        return AnimTranslucencyResult { draw: false, flags };
-    }
-    if input.instance_ramp > 5 {
-        flags |= 4;
+    // `0x004231C1..0x004231EE`: a ramp of 1-5 draws at 25%, 6-15 at 50%,
+    // and anything above 15 not at all.
+    match input.instance_ramp {
+        16.. => return AnimTranslucencyResult { draw: false, flags },
+        6..=15 => flags |= 4,
+        1..=5 => flags |= 2,
+        _ => {}
     }
     AnimTranslucencyResult { draw: true, flags }
 }
@@ -278,7 +297,9 @@ pub fn anim_translucency_selection(input: AnimTranslucencyInput) -> AnimTransluc
 pub struct AnimRuntime {
     pub current_frame: i32,
     pub frame_step: i32,
-    pub delay_remaining: u16,
+    /// AnimClass +0x184, a signed int: the constructor's delay or a drawn
+    /// `RandomLoopDelay=` pause.
+    pub delay_remaining: i32,
     pub rate_reload: u16,
     pub frame_timer: CdTimer,
     pub loop_remaining: u8,
@@ -291,6 +312,12 @@ pub struct AnimRuntime {
     /// Anim+19E, pause/resume425260/425270. The absolute frame timer keeps running.
     #[serde(default)]
     pub paused: bool,
+    /// Anim+11A: a building's Temporal erase freezes its slot anims
+    /// ([`AnimObject::set_temporal_erase`], [`AnimObject::temporal_pause`]).
+    /// AI stops on it just as on +19E (`0x004244A9`); the frame timer keeps
+    /// running.
+    #[serde(default)]
+    pub temporal_paused: bool,
 }
 
 /// Per-instance `AnimClass::DrawIt` bytes that are independent of the art
@@ -300,22 +327,16 @@ pub struct AnimRuntime {
 pub struct AnimDrawRuntime {
     /// AnimClass `+0x19d`: unconditional draw suppression.
     pub hidden: bool,
-    /// AnimClass `+0x199`: applies only with the unresolved type `+0x374` bit.
+    /// AnimClass `+0x199`, the fogged byte. DrawIt skips the anim when it is
+    /// set and the type's `ShouldFogRemove=` (`+0x374`, `0x004282DC`) is too
+    /// (`0x00423014..0x00423026`). Presentation ports that gate with the fog
+    /// query (`instances::overlays`), so nothing sets this field.
     pub special_hidden: bool,
     /// AnimClass `+0x178`: ramp/age input used by translucency selection.
     pub translucency_ramp: u8,
-    /// AnimClass `+0x119`: force the type-selected 50/75% draw family.
+    /// AnimClass `+0x119`: draw at 50%, or 75% for a `DoubleThick=` type
+    /// (`AnimClass::DrawIt` reads type `+0x368` at `0x0042306B`).
     pub forced_translucent: bool,
-    /// Type `+0x368` = art.ini `DoubleThick=`, consulted only inside the
-    /// `+0x119` forced-translucency arm: `AnimClass::DrawIt` reads
-    /// `0x0042306B MOV CL,[EAX+0x368]` and takes `OR EBX,0x6` when set,
-    /// `OR EBX,0x4` when clear. `AnimTypeClass::ReadINI @ 0x00427D00` stores
-    /// `DoubleThick=` at `param_1[0xda]` (= byte offset `0x368`), which closes
-    /// the art-key mapping this comment previously left open. It stays a
-    /// producer-supplied instance byte rather than a type read because nothing
-    /// in this engine sets `+0x119` yet — the first producer that does should
-    /// feed it from `AnimTypeRuntimeConfig::double_thick`.
-    pub forced_uses_75: bool,
 }
 
 /// Retained Anim instance inputs to Display, independent of vector membership.
@@ -341,51 +362,73 @@ impl AnimDisplayState {
 pub enum AnimRemap {
     ColorScheme(HouseColorIndex),
     House(InternedId),
+    /// Techno705D70's loaded `+0xDF0` group and house colour, frozen when
+    /// the producer assigns the Convert. The palette name survives the
+    /// source building's destruction and distinguishes simultaneous groups.
+    ExtraBuildingScheme {
+        house: InternedId,
+        palette: InternedId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnimObject {
-    pub stable_id: AnimId,
-    pub native_unique_id: i32,
-    pub type_id: InternedId,
+    stable_id: AnimId,
+    native_unique_id: i32,
+    type_id: InternedId,
     /// World leptons — but **owner-relative whenever `owner_entity` is set**,
     /// exactly as `AnimClass::SetOwnerObject @ 0x00424B50` stores it. Read it
     /// through [`Simulation::anim_absolute_coord`] for a world position; read
     /// the field directly only where native reads the stored `ObjectClass`
-    /// coordinate directly, which is the multiplayer sync checksum
-    /// (`Compute_Game_Sync_Checksum @ 0x0064DAB0` folds `+0x9c`/`+0xa0`) and
-    /// the state hash. All three axes are world leptons.
-    pub world_coord: AnimWorldCoord,
-    pub draw_flags: u32,
-    pub z_adjust: i32,
+    /// coordinate directly: the multiplayer sync checksum
+    /// (`Compute_Game_Sync_Checksum @ 0x0064DAB0` folds `+0x9c`/`+0xa0`),
+    /// HideIfNoOre and post-load Tiberium conversion4261D0. All three axes
+    /// are world leptons.
+    world_coord: AnimWorldCoord,
+    draw_flags: u32,
+    z_adjust: i32,
     /// Optional ConvertClass palette selected by a producer after construction
     /// (for example OverlayClass CellAnim over a Tiberium cell).
     #[serde(default)]
     remap: Option<AnimRemap>,
-    pub effective_end: i32,
-    pub effective_loop_end: i32,
-    pub runtime: AnimRuntime,
-    pub draw_runtime: AnimDrawRuntime,
+    effective_end: i32,
+    effective_loop_end: i32,
+    runtime: AnimRuntime,
+    draw_runtime: AnimDrawRuntime,
+    /// Per-viewer snapshots of native Anim+19D, for a producer whose byte
+    /// depends on the native client's PlayerPtr. Every ordinary hidden-byte
+    /// writer replaces this with a uniform value.
+    #[serde(default)]
+    viewer_hidden: Option<AnimViewerHidden>,
     /// AnimClass `+0x196`: use the containing CellClass draw/palette authority.
     #[serde(default)]
-    pub use_cell_drawer: bool,
+    use_cell_drawer: bool,
     /// AnimClass `+0x197`: created from a terrain tile animation descriptor.
     #[serde(default)]
-    pub terrain_attached: bool,
+    terrain_attached: bool,
     /// Anim+198. Constructor421FF1 clears it; TAction416E2368 sets it
     /// only after constructor-time Start. Start424CF1/424D5F, AI423AC6
     /// and UnInit4255DA suppress effects, independently of drawing/Middle.
     #[serde(default)]
     no_effects: bool,
+    /// Anim+188. Normal ctor421FA4/421FC8 seeds1; default ctor4227FD/
+    ///42280F and Next424877/424885 seed0. Load425280 retains saved bytes.
+    /// Binary64 keeps the reader's fractional precision and full accumulator
+    /// range, including a NoEffects backlog, beyond SimFixed's16.16 range.
+    /// Basic IEEE operations are deterministic; NaN stores are canonicalized.
+    /// https://doc.rust-lang.org/std/primitive.f64.html
+    /// Precision residual: round-to-nearest replaces native PC53/chop. Near
+    /// an integer threshold a long-running fire can emit on a different visit.
+    damage_accumulator: NativeF64Bits,
     /// LogicClass membership is reconstructed from the serialized vector.
     /// ObjectClass::Save does not persist its local membership byte.
     #[serde(skip)]
-    pub in_logic_vector: bool,
-    pub owner_entity: Option<u64>,
+    in_logic_vector: bool,
+    owner_entity: Option<u64>,
     /// Derived reverse index of Building+55C's slot reference, rebuilt on load.
     /// Independent of both Anim+118 and the Anim+CC Object-owner attachment.
     #[serde(skip)]
-    pub building_slot: Option<(u64, u8)>,
+    building_slot: Option<(u64, u8)>,
     /// Anim+118: ctor421F44 clears it; Building45199B sets it. It suppresses
     /// independent drawing and admits451B40, even after the slot is cleared.
     #[serde(default)]
@@ -393,19 +436,22 @@ pub struct AnimObject {
     /// Derived reverse index of Building+5C8's damage-fire slot, rebuilt on
     /// load. It survives owner expiry until the Anim's own UnInit broadcast.
     #[serde(skip)]
-    pub(crate) damage_fire_slot: Option<(u64, u8)>,
+    damage_fire_slot: Option<(u64, u8)>,
     /// Anim+179: constructor421FB0 clears it; normal AI completion424B31
     /// sets it before UnInit. Building451B40 distinguishes a completed
     /// retraction from an animation removed for another reason.
     #[serde(default)]
     completed: bool,
-    pub start_sound_active: bool,
-    pub stop_sound_id: Option<InternedId>,
-    pub(crate) display: AnimDisplayState,
-    /// `AnimClass+0x128`: a `Bouncer=` chunk's BounceClass body. Its presence
-    /// is `+0x194` for the ported arm (the `IsMeteor=` arm is not built).
+    start_sound_active: bool,
+    stop_sound_id: Option<InternedId>,
+    display: AnimDisplayState,
+    /// `AnimClass+0x128`: a `Bouncer=` or `IsMeteor=` chunk's BounceClass
+    /// body, both built by [`anim_constructor_draws`]. Its presence is `+0x194`.
     #[serde(default)]
-    pub bounce: Option<BounceState>,
+    bounce: Option<BounceState>,
+    /// Anim+108/+114/+19A and Object falling words for IsFlamingGuy AI.
+    #[serde(default)]
+    flaming_guy: Option<flaming_guy::FlamingGuyState>,
     /// `AnimClass+0x180`, the owning House (`SetOwnerHouse @ 0x00424CA0`).
     /// Its expiry also ends the anim (`0x004251D5`). The PsiWarning
     /// visibility test reads it against the local player (`0x0043B4C0`).
@@ -417,9 +463,266 @@ pub struct AnimObject {
     /// rides its missile this way.
     #[serde(default)]
     attached_bullet: Option<u64>,
+    /// `AnimClass+0xCC` when it names a `TerrainClass`: a tree's fire, which
+    /// only the Ares terrain fire attaches (`sim::terrain_fire`). VERA keeps
+    /// a terrain owner apart from `owner_entity` and its stored coordinate
+    /// absolute: a terrain object never moves, so native's owner-relative
+    /// form adds the same constant back on every read.
+    #[serde(default)]
+    owner_terrain: Option<u64>,
+    /// VERA-only: `Some` for a presentation anim
+    /// ([`AnimConstructorInput::Presentation`]), holding the layer it draws in
+    /// while revealed, where an ordinary anim would hold a Display slot. A
+    /// presentation anim is local, so it is never saved, compared or hashed.
+    #[serde(skip)]
+    presentation: Option<Option<crate::sim::world::display_layers::DisplayLayer>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+struct AnimViewerHidden {
+    viewers: Vec<(InternedId, bool)>,
+    other_hidden: bool,
 }
 
 impl AnimObject {
+    /// Whether this is a presentation anim ([`AnimConstructorInput::Presentation`]).
+    pub fn is_presentation(&self) -> bool {
+        self.presentation.is_some()
+    }
+
+    /// The layer a revealed presentation anim draws in; `None` for an
+    /// ordinary anim, which Display places, or a concealed one.
+    pub fn presentation_layer(&self) -> Option<crate::sim::world::display_layers::DisplayLayer> {
+        self.presentation.flatten()
+    }
+
+    /// Read the same hidden byte for a particular client without making
+    /// simulation state depend on which house this process is displaying.
+    pub fn hidden_for(&self, viewer: Option<InternedId>) -> bool {
+        if let Some(snapshot) = &self.viewer_hidden {
+            return viewer
+                .and_then(|viewer| snapshot.viewers.iter().find(|(id, _)| *id == viewer))
+                .map_or(snapshot.other_hidden, |(_, hidden)| *hidden);
+        }
+        self.draw_runtime.hidden
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn draw_runtime_mut_for_test(&mut self) -> &mut AnimDrawRuntime {
+        &mut self.draw_runtime
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_building_slot_for_test(&mut self, value: Option<(u64, u8)>) {
+        self.building_slot = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_in_logic_vector_for_test(&mut self, value: bool) {
+        self.in_logic_vector = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_start_sound_active_for_test(&mut self, value: bool) {
+        self.start_sound_active = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_terrain_attached_for_test(&mut self, value: bool) {
+        self.terrain_attached = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn runtime_mut_for_test(&mut self) -> &mut AnimRuntime {
+        &mut self.runtime
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn world_coord_mut_for_test(&mut self) -> &mut AnimWorldCoord {
+        &mut self.world_coord
+    }
+
+    /// LogicClass membership: RegisterObject sets it (`0x0055BAC6`),
+    /// UnregisterObject clears it (`0x0055BB27`). Only the logic vector's
+    /// owner writes it, and a load rebuilds it from the saved vector.
+    pub(crate) fn mark_logic_membership(&mut self, member: bool) {
+        self.in_logic_vector = member;
+    }
+
+    /// Building43F738 moves a slot anim to its building's new coordinate;
+    /// it neither reconstructs the anim nor resets its timers.
+    pub(crate) fn move_with_building(&mut self, coord: AnimWorldCoord) {
+        self.world_coord = coord;
+    }
+
+    /// The anim takes slot `slot` of `building` (Building+55C), with the
+    /// slot config's `ZAdjust=`. The reverse index is derived from that slot.
+    pub(crate) fn enter_building_slot(&mut self, building: u64, slot: u8, z_adjust: i32) {
+        self.building_slot = Some((building, slot));
+        self.z_adjust = z_adjust;
+    }
+
+    /// The reverse index of the building slot that holds this anim, rebuilt
+    /// from Building+55C on load.
+    pub(crate) fn index_building_slot(&mut self, building: u64, slot: u8) {
+        self.building_slot = Some((building, slot));
+    }
+
+    /// The building slot leaves the anim: the index is cleared and returned.
+    pub(crate) fn take_building_slot(&mut self) -> Option<(u64, u8)> {
+        self.building_slot.take()
+    }
+
+    /// The reverse index of the Building+5C8 damage-fire slot that holds
+    /// this anim, rebuilt on load.
+    pub(crate) fn index_damage_fire_slot(&mut self, building: u64, slot: u8) {
+        self.damage_fire_slot = Some((building, slot));
+    }
+
+    /// Drop both derived slot indexes before a rebuild, or when the
+    /// building releases the anim.
+    pub(crate) fn clear_slot_indexes(&mut self) {
+        self.building_slot = None;
+        self.damage_fire_slot = None;
+    }
+
+    /// Anim pause (`0x00425260`): only Anim+19E changes; the absolute frame
+    /// timer keeps running.
+    pub(crate) fn pause(&mut self) {
+        self.runtime.paused = true;
+    }
+
+    /// Anim resume (`0x00425270`).
+    pub(crate) fn resume(&mut self) {
+        self.runtime.paused = false;
+    }
+
+    /// A building's Temporal erase on one slot anim: `0x004521C0` freezes it
+    /// (+11A) and draws it translucent (+119); `0x00452210` clears both.
+    ///
+    /// RESIDUAL: the erase also saves the frame (+11C) and the release sets
+    /// +11B, which AI (`0x00423C03..0x00423C1D`) clears once the frame comes
+    /// back round to the saved one. Nothing else reads either, so neither is
+    /// kept.
+    pub(crate) fn set_temporal_erase(&mut self, erased: bool) {
+        self.runtime.temporal_paused = erased;
+        self.draw_runtime.forced_translucent = erased;
+    }
+
+    /// `0x00451B25`: a slot anim created while its building is being erased
+    /// starts frozen (+11A), but opaque.
+    pub(crate) fn temporal_pause(&mut self) {
+        self.runtime.temporal_paused = true;
+    }
+
+    /// A building writes the anim's current frame: a slot successor keeps
+    /// its predecessor's frame, and SiloDamage (`0x00450D81`) shows the
+    /// storage tier.
+    pub(crate) fn jump_to_frame(&mut self, frame: i32) {
+        self.runtime.current_frame = frame;
+    }
+
+    /// A turret building aims its slot-9 anim (`0x004466C5..0x004466CB`,
+    /// `0x00451286..0x0045128C`, `0x0044FE17..0x0044FE1D`): it writes the
+    /// frame (`+0xAC`) and a zero frame step (`+0xC4`), so the stage timer
+    /// keeps running without moving the frame.
+    pub(crate) fn hold_at_frame(&mut self, frame: i32) {
+        self.runtime.current_frame = frame;
+        self.runtime.frame_step = 0;
+    }
+
+    /// Hold the current loop until the owning effect explicitly destroys it.
+    /// Ares attached animation1005872F stores byte255 at Anim+195.
+    pub(crate) fn hold_loops(&mut self) {
+        self.runtime.loop_remaining = u8::MAX;
+    }
+
+    /// No loops remain: the anim ends after its current pass. The
+    /// parachute release and the ChronoPlacement release use it.
+    pub(crate) fn end_loops(&mut self) {
+        self.runtime.loop_remaining = 0;
+    }
+
+    pub const fn stable_id(&self) -> AnimId {
+        self.stable_id
+    }
+
+    pub const fn native_unique_id(&self) -> i32 {
+        self.native_unique_id
+    }
+
+    pub const fn type_id(&self) -> InternedId {
+        self.type_id
+    }
+
+    pub const fn world_coord(&self) -> AnimWorldCoord {
+        self.world_coord
+    }
+
+    pub const fn draw_flags(&self) -> u32 {
+        self.draw_flags
+    }
+
+    pub const fn z_adjust(&self) -> i32 {
+        self.z_adjust
+    }
+
+    pub const fn effective_end(&self) -> i32 {
+        self.effective_end
+    }
+
+    pub const fn effective_loop_end(&self) -> i32 {
+        self.effective_loop_end
+    }
+
+    pub const fn runtime(&self) -> &AnimRuntime {
+        &self.runtime
+    }
+
+    pub const fn draw_runtime(&self) -> AnimDrawRuntime {
+        self.draw_runtime
+    }
+
+    pub const fn use_cell_drawer(&self) -> bool {
+        self.use_cell_drawer
+    }
+
+    pub const fn terrain_attached(&self) -> bool {
+        self.terrain_attached
+    }
+
+    pub const fn in_logic_vector(&self) -> bool {
+        self.in_logic_vector
+    }
+
+    pub const fn owner_entity(&self) -> Option<u64> {
+        self.owner_entity
+    }
+
+    pub const fn building_slot(&self) -> Option<(u64, u8)> {
+        self.building_slot
+    }
+
+    pub const fn damage_fire_slot(&self) -> Option<(u64, u8)> {
+        self.damage_fire_slot
+    }
+
+    pub const fn start_sound_active(&self) -> bool {
+        self.start_sound_active
+    }
+
+    pub const fn stop_sound_id(&self) -> Option<InternedId> {
+        self.stop_sound_id
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) const fn display(&self) -> &AnimDisplayState {
+        &self.display
+    }
+
+    pub const fn bounce(&self) -> Option<BounceState> {
+        self.bounce
+    }
+
     pub fn remap(&self) -> Option<AnimRemap> {
         self.remap
     }
@@ -443,6 +746,14 @@ impl AnimObject {
     pub(crate) fn mark_building_anim(&mut self, y_sort: i32) {
         self.building_anim = true;
         self.display.y_sort_adjust = y_sort;
+    }
+
+    /// Ares `BuildingExt::ExtData::UpdateFirewall @ 10013280` stores its
+    /// own anims in `building`'s `slot` and sets only Anim+0x118: the
+    /// constructor's ZAdjust and YSortAdjust stay.
+    pub(crate) fn enter_ares_firewall_slot(&mut self, building: u64, slot: u8) {
+        self.building_anim = true;
+        self.building_slot = Some((building, slot));
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -473,9 +784,11 @@ impl AnimObject {
             effective_loop_end: 1,
             runtime,
             draw_runtime: AnimDrawRuntime::default(),
+            viewer_hidden: None,
             use_cell_drawer: false,
             terrain_attached: false,
             no_effects: false,
+            damage_accumulator: NativeF64Bits::POSITIVE_ZERO,
             in_logic_vector: false,
             owner_entity: None,
             building_slot: None,
@@ -486,8 +799,11 @@ impl AnimObject {
             stop_sound_id: None,
             display: AnimDisplayState::default(),
             bounce: None,
+            flaming_guy: None,
             owner_house: None,
             attached_bullet: None,
+            owner_terrain: None,
+            presentation: None,
         }
     }
 
@@ -508,7 +824,9 @@ impl AnimObject {
     /// the pointer-expiry listener index (`ExpiryListeners`); a field that
     /// callback compares must be named here too.
     pub(crate) fn expiry_names(&self) -> [Option<u64>; 2] {
-        [self.owner_entity, self.attached_bullet]
+        // An anim names at most one owner at `+0xCC`.
+        let owner = self.owner_entity.or(self.owner_terrain);
+        [owner, self.attached_bullet]
     }
 
     /// Preserve the former field order; the new damage-fire reverse index is
@@ -526,6 +844,10 @@ impl AnimObject {
         self.effective_loop_end.hash(hasher);
         self.runtime.hash(hasher);
         self.draw_runtime.hash(hasher);
+        if let Some(snapshot) = &self.viewer_hidden {
+            "AnimViewerHidden".hash(hasher);
+            snapshot.hash(hasher);
+        }
         self.use_cell_drawer.hash(hasher);
         self.terrain_attached.hash(hasher);
         self.in_logic_vector.hash(hasher);
@@ -541,11 +863,23 @@ impl AnimObject {
             b"anim-no-effects-v1".hash(hasher);
             self.no_effects.hash(hasher);
         }
+        if self.damage_accumulator != NativeF64Bits::ONE {
+            b"anim-damage-accumulator-v1".hash(hasher);
+            self.damage_accumulator.hash(hasher);
+        }
         // Unset links add no bytes, preserving earlier streams.
         if self.owner_house.is_some() || self.attached_bullet.is_some() {
             b"anim-owner-house-bullet-v1".hash(hasher);
             self.owner_house.hash(hasher);
             self.attached_bullet.hash(hasher);
+        }
+        if let Some(state) = &self.flaming_guy {
+            b"anim-flaming-guy-v1".hash(hasher);
+            state.hash(hasher);
+        }
+        if let Some(terrain) = self.owner_terrain {
+            b"anim-owner-terrain-v1".hash(hasher);
+            terrain.hash(hasher);
         }
     }
 }
@@ -620,9 +954,57 @@ pub(crate) fn anim_world_coords(
 /// which notes it in a touch log for each [`AnimTouchReader`].
 pub struct AnimStore {
     anims: BTreeMap<AnimId, AnimObject>,
+    /// VERA-only: how many stored anims name each owner at `+0xCC`
+    /// (`owner_entity`), so [`Self::another_owned_by`] answers the Anim
+    /// array scans without walking it. The anims' owners are the truth:
+    /// [`Self::insert`] and [`Self::remove`] keep it, and
+    /// [`Self::set_owner_entity`] is the owners' one writer. Rebuilt on load,
+    /// never saved, compared or hashed; only looked up.
+    owner_counts: LookupMap<u64, u32>,
     /// Which anims may have changed since each reader last took its log
     /// ([`Self::take_touched`]). Transient: never saved, compared or hashed.
     touched: TouchLogs<{ AnimTouchReader::COUNT }>,
+    /// Which anims may draw differently since the presentation last took the
+    /// log ([`Self::take_looks`]): stored, or given a new colour remap or, by
+    /// [`Self::note_look`], a new type. The simulation never reads it; never
+    /// saved, compared or hashed.
+    looks: TouchLogs<1>,
+    /// The local anims, which only this game runs and draws: a LAN or online
+    /// MoveFlash, which `FootClass::ClickedAction_Cell` moves out of
+    /// AnimClass::Array (`0x00A8E9A8`) into its own list (`0x00A83E00`,
+    /// `0x004D7FD7..0x004D8062`). They take ids from their own range
+    /// ([`is_local_anim_id`]). The by-id reads and writes find them; the
+    /// Anim array's readers ([`Self::iter`], [`Self::len`], [`Self::key_at`],
+    /// [`Self::values_mut`]), comparison, saves and the world hash leave them
+    /// out. They have no owner: the owner writers refuse them.
+    local: BTreeMap<AnimId, AnimObject>,
+    /// The id the next local anim takes.
+    next_local: AnimId,
+    /// Local anims Destroy has retired, which the end-of-frame drain removes
+    /// ([`Self::drain_local_deletes`]): the shared pending-delete queue is
+    /// hashed, so they stay out of it.
+    local_deletes: Vec<AnimId>,
+}
+
+/// How a world makes the effect anims (muzzle flashes, impacts, trailers)
+/// that change nothing but their own picture: in native order, as a new world
+/// does, or as presentation anims ([`AnimConstructorInput::Presentation`])
+/// once [`Simulation::present_effect_anims`] has asked. The choice decides
+/// the unique ids later objects take, so a save carries it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EffectAnims {
+    presentation: bool,
+}
+
+/// The first local anim id ([`AnimStore`]'s `local`). Shared ids count up
+/// from 1 ([`crate::sim::world::ObjectSubstrate::allocate_stable_id`]) and
+/// never reach it, and it sits below the sound-handle owner tags
+/// (`1 << 57` to `1 << 62`), so a local anim's sound owner stays its own.
+const LOCAL_ANIM_ID_BASE: AnimId = 1 << 56;
+
+/// Whether `id` names a local anim, one only this game runs and draws.
+pub(crate) fn is_local_anim_id(id: u64) -> bool {
+    id >= LOCAL_ANIM_ID_BASE
 }
 
 /// A product derived from the anims that re-derives from the touch log.
@@ -641,27 +1023,185 @@ impl AnimTouchReader {
 
 impl AnimStore {
     pub fn get(&self, id: AnimId) -> Option<&AnimObject> {
+        if is_local_anim_id(id) {
+            return self.local.get(&id);
+        }
         self.anims.get(&id)
     }
 
     pub fn get_mut(&mut self, id: AnimId) -> Option<&mut AnimObject> {
         let stored = self.anims.len();
-        let anim = self.anims.get_mut(&id)?;
+        let anim = if is_local_anim_id(id) {
+            self.local.get_mut(&id)?
+        } else {
+            self.anims.get_mut(&id)?
+        };
         self.touched.note(id, stored);
         Some(anim)
     }
 
+    /// A house's colour conversion as the anim's remap (`+0xD4`), frozen at
+    /// the write; later disguise or owner changes must not recolor the anim.
+    /// Unit deploy739C1A/739DFE store the one Techno705D70 returns (its
+    /// custom-palette arm is unported there: no retail deploying Unit sets
+    /// art `Palette=`); InfantryClass::ReceiveDamage's InfDeath 9 arm
+    /// the house's colour scheme's (`0x00518AB5..0x00518AC9`,
+    /// `0x00518AE4..0x00518AF9`).
+    pub fn set_anim_house_remap(&mut self, id: AnimId, house: InternedId) -> bool {
+        self.set_anim_remap(id, AnimRemap::House(house))
+    }
+
+    /// Assign the producer's frozen Convert identity (`Anim+0xD4`). Custom
+    /// groups also retain their resource name, independently of any owner.
+    pub fn set_anim_remap(&mut self, id: AnimId, remap: AnimRemap) -> bool {
+        let Some(anim) = self.get_mut(id) else {
+            return false;
+        };
+        anim.remap = Some(remap);
+        self.looks.note(id, self.anims.len());
+        true
+    }
+
+    /// Drop the anim's Convert (`Anim+0xD4 = 0`): Ares
+    /// InfantryClass_ReceiveDamage_InfantryVirus2 (10025F50, hook 0x51887B).
+    pub(crate) fn clear_anim_remap(&mut self, id: AnimId) -> bool {
+        let Some(anim) = self.get_mut(id) else {
+            return false;
+        };
+        anim.remap = None;
+        true
+    }
+
     pub(crate) fn insert(&mut self, object: AnimObject) -> Option<AnimObject> {
         self.touched.note(object.stable_id, self.anims.len());
-        self.anims.insert(object.stable_id, object)
+        self.looks.note(object.stable_id, self.anims.len());
+        if is_local_anim_id(object.stable_id) {
+            debug_assert!(object.owner_entity.is_none());
+            return self.local.insert(object.stable_id, object);
+        }
+        count_owner(&mut self.owner_counts, object.owner_entity);
+        let replaced = self.anims.insert(object.stable_id, object);
+        if let Some(replaced) = &replaced {
+            uncount_owner(&mut self.owner_counts, replaced.owner_entity);
+        }
+        replaced
     }
 
     pub(crate) fn remove(&mut self, id: AnimId) -> Option<AnimObject> {
+        if is_local_anim_id(id) {
+            let removed = self.local.remove(&id);
+            if removed.is_some() {
+                self.touched.note(id, self.anims.len());
+            }
+            return removed;
+        }
         let removed = self.anims.remove(&id);
-        if removed.is_some() {
+        if let Some(removed) = &removed {
+            uncount_owner(&mut self.owner_counts, removed.owner_entity);
             self.touched.note(id, self.anims.len());
         }
         removed
+    }
+
+    /// Write `id`'s owner (`+0xCC`), returning the one it replaced, or `None`
+    /// when `id` is not stored. The owners' one writer.
+    pub(crate) fn set_owner_entity(
+        &mut self,
+        id: AnimId,
+        owner: Option<u64>,
+    ) -> Option<Option<u64>> {
+        // A presentation anim follows its owner too. No Anim array scan
+        // counts it ([`Self::another_owned_by`]): it raises no owner flag.
+        if is_local_anim_id(id) {
+            let anim = self.local.get_mut(&id)?;
+            debug_assert!(anim.presentation.is_some() || owner.is_none());
+            return Some(std::mem::replace(&mut anim.owner_entity, owner));
+        }
+        let stored = self.anims.len();
+        let anim = self.anims.get_mut(&id)?;
+        self.touched.note(id, stored);
+        let replaced = std::mem::replace(&mut anim.owner_entity, owner);
+        uncount_owner(&mut self.owner_counts, replaced);
+        count_owner(&mut self.owner_counts, owner);
+        Some(replaced)
+    }
+
+    /// Write `id`'s terrain owner (`+0xCC` naming a TerrainClass), returning
+    /// the one it replaced, or `None` when `id` is not stored.
+    pub(crate) fn set_owner_terrain(
+        &mut self,
+        id: AnimId,
+        owner: Option<u64>,
+    ) -> Option<Option<u64>> {
+        let stored = self.anims.len();
+        let anim = self.anims.get_mut(&id)?;
+        self.touched.note(id, stored);
+        Some(std::mem::replace(&mut anim.owner_terrain, owner))
+    }
+
+    /// Whether a stored anim other than `id` names the terrain object
+    /// `owner`: the Anim array scan of SetOwnerObject424B79..424BB6 for a
+    /// terrain owner. Only burning trees own anims, so it walks the store.
+    pub(crate) fn another_owned_by_terrain(&self, id: AnimId, owner: u64) -> bool {
+        self.anims
+            .iter()
+            .any(|(&other, anim)| other != id && anim.owner_terrain == Some(owner))
+    }
+
+    /// Ares terrain fire: the anims a terrain object owns, in array order.
+    pub(crate) fn owned_by_terrain(&self, owner: u64) -> Vec<AnimId> {
+        self.anims
+            .iter()
+            .filter(|(_, anim)| anim.owner_terrain == Some(owner))
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// `AnimClass::ClearLoopsForOwner @ 0x00422B80`: every anim naming
+    /// `owner` at `+0xCC` ends after its current loop (`+0x195 = 0`).
+    pub(crate) fn clear_loops_for_terrain_owner(&mut self, owner: u64) {
+        let stored = self.anims.len();
+        for (&id, anim) in self.anims.iter_mut() {
+            if anim.owner_terrain == Some(owner) {
+                anim.end_loops();
+                self.touched.note(id, stored);
+            }
+        }
+    }
+
+    /// The terrain object an anim is attached to (`+0xCC`).
+    pub(crate) fn owner_terrain(&self, id: AnimId) -> Option<u64> {
+        self.anims.get(&id).and_then(|anim| anim.owner_terrain)
+    }
+
+    /// Install a fixture's owner (`+0xCC`) on a stored anim.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_owner_entity_for_test(&mut self, id: AnimId, owner: Option<u64>) {
+        self.set_owner_entity(id, owner)
+            .expect("the fixture's anim is stored");
+    }
+
+    /// Whether a stored anim other than `id` names `owner` at `+0xCC`: the
+    /// Anim array scan of SetOwnerObject424B79..424BB6 and the destructor
+    ///42291A..42295B, which counts every retained entry (inactive,
+    /// concealed and pending-delete ones too), answered from the owners'
+    /// counts. Debug builds check it against that scan (the live-read check).
+    pub(crate) fn another_owned_by(&self, id: AnimId, owner: u64) -> bool {
+        let own = u32::from(self.get(id).and_then(|anim| anim.owner_entity) == Some(owner));
+        let another = self
+            .owner_counts
+            .get(&owner)
+            .is_some_and(|&count| count > own);
+        debug_assert!(
+            !crate::sim::touch_log::live_read_check_enabled()
+                || another
+                    == self
+                        .anims
+                        .iter()
+                        .any(|(&other, anim)| other != id && anim.owner_entity == Some(owner)),
+            "the Anim owner counts disagree with the Anim array for owner {owner}"
+        );
+        another
     }
 
     /// Store the independently owned attached-Bullet pointer (+0x17C).
@@ -674,9 +1214,71 @@ impl AnimStore {
     }
 
     fn from_anims(anims: BTreeMap<AnimId, AnimObject>) -> Self {
+        let mut owner_counts = LookupMap::default();
+        for anim in anims.values() {
+            count_owner(&mut owner_counts, anim.owner_entity);
+        }
         Self {
             anims,
+            owner_counts,
             touched: TouchLogs::everything(),
+            looks: TouchLogs::everything(),
+            local: BTreeMap::new(),
+            next_local: LOCAL_ANIM_ID_BASE,
+            local_deletes: Vec::new(),
+        }
+    }
+
+    /// The id for a new local anim.
+    pub(crate) fn allocate_local_id(&mut self) -> AnimId {
+        let id = self.next_local;
+        self.next_local += 1;
+        id
+    }
+
+    /// The local anims, in the order they were made (the local list's).
+    pub(crate) fn local_ids(&self) -> Vec<AnimId> {
+        self.local.keys().copied().collect()
+    }
+
+    /// The local anims and their ids, in the local list's order.
+    pub(crate) fn local_iter(&self) -> impl Iterator<Item = (&AnimId, &AnimObject)> {
+        self.local.iter()
+    }
+
+    /// Take presentation anim `id` out of its layer, as Display's remove
+    /// takes an ordinary anim out of its vector.
+    pub(crate) fn conceal_presentation(&mut self, id: AnimId) {
+        if let Some(anim) = self.local.get_mut(&id)
+            && anim.presentation.is_some()
+        {
+            anim.presentation = Some(None);
+        }
+    }
+
+    /// The presentation anims, in the order they were made.
+    pub(crate) fn presentation_iter(&self) -> impl Iterator<Item = (&AnimId, &AnimObject)> {
+        self.local.iter().filter(|(_, anim)| anim.is_presentation())
+    }
+
+    /// Retire the local anim `id` for the end-of-frame drain.
+    pub(crate) fn queue_local_delete(&mut self, id: AnimId) {
+        if !self.local_deletes.contains(&id) {
+            self.local_deletes.push(id);
+        }
+    }
+
+    /// Whether Destroy has retired the local anim `id`.
+    pub(crate) fn local_delete_queued(&self, id: AnimId) -> bool {
+        self.local_deletes.contains(&id)
+    }
+
+    /// Remove the retired local anims. Their Destroy already released the
+    /// sound and left Display; the destructor's `0x00422A69` takes each out
+    /// of the local list.
+    pub(crate) fn drain_local_deletes(&mut self) {
+        for id in std::mem::take(&mut self.local_deletes) {
+            self.remove(id);
         }
     }
 
@@ -686,10 +1288,14 @@ impl AnimStore {
 
     pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut AnimObject> {
         self.touched.note_all();
+        self.looks.note_all();
         self.anims.values_mut()
     }
 
     pub fn contains_key(&self, id: AnimId) -> bool {
+        if is_local_anim_id(id) {
+            return self.local.contains_key(&id);
+        }
         self.anims.contains_key(&id)
     }
 
@@ -705,6 +1311,16 @@ impl AnimStore {
     pub(crate) fn take_touched(&mut self, reader: AnimTouchReader) -> Touched {
         self.touched.take(reader as usize)
     }
+
+    /// Take the look log, leaving it empty.
+    pub(crate) fn take_looks(&mut self) -> Touched {
+        self.looks.take(0)
+    }
+
+    /// Note that an in-place write gave `id` a new type.
+    pub(crate) fn note_look(&mut self, id: AnimId) {
+        self.looks.note(id, self.anims.len());
+    }
 }
 
 impl Default for AnimStore {
@@ -715,12 +1331,19 @@ impl Default for AnimStore {
 
 impl Clone for AnimStore {
     /// A clone starts with an everything-touched log: whatever was derived
-    /// from the original says nothing certain about the copy's future.
+    /// from the original says nothing certain about the copy's future. The
+    /// local anims come along, so the presentation copy draws them.
     fn clone(&self) -> Self {
-        Self::from_anims(self.anims.clone())
+        Self {
+            local: self.local.clone(),
+            next_local: self.next_local,
+            local_deletes: self.local_deletes.clone(),
+            ..Self::from_anims(self.anims.clone())
+        }
     }
 }
 
+/// The local anims are left out, as they are from saves and the hash.
 impl PartialEq for AnimStore {
     fn eq(&self, other: &Self) -> bool {
         self.anims == other.anims
@@ -735,7 +1358,8 @@ impl std::fmt::Debug for AnimStore {
     }
 }
 
-/// The saved form is the former newtype `AnimStore(map)`; the log is not saved.
+/// The saved form is the former newtype `AnimStore(map)`; the log and the
+/// local anims are not saved.
 impl Serialize for AnimStore {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_newtype_struct("AnimStore", &self.anims)
@@ -752,8 +1376,29 @@ impl<'de> Deserialize<'de> for AnimStore {
     }
 }
 
+/// Count one more stored anim naming `owner`.
+fn count_owner(counts: &mut LookupMap<u64, u32>, owner: Option<u64>) {
+    if let Some(owner) = owner {
+        *counts.entry(owner).or_default() += 1;
+    }
+}
+
+/// Count one fewer stored anim naming `owner`, forgetting an owner none names.
+fn uncount_owner(counts: &mut LookupMap<u64, u32>, owner: Option<u64>) {
+    if let Some(owner) = owner
+        && let std::collections::hash_map::Entry::Occupied(mut count) = counts.entry(owner)
+    {
+        *count.get_mut() -= 1;
+        if *count.get() == 0 {
+            count.remove();
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AnimSpawnError {
+    #[error(transparent)]
+    Tiberium(#[from] TiberiumImageError),
     #[error("animation type id {0} does not resolve to bound runtime metadata")]
     MissingType(InternedId),
     #[error("animation type [{0}] has no bound SHP frame count")]
@@ -842,6 +1487,46 @@ impl DamageFires {
     }
 }
 
+/// An object that never lit a fire keeps no slots (`GameEntity::damage_fires`).
+impl crate::util::sparse::SparseDefault for DamageFires {
+    fn sparse_default() -> &'static Self {
+        static DEFAULT: std::sync::LazyLock<DamageFires> =
+            std::sync::LazyLock::new(DamageFires::default);
+        &DEFAULT
+    }
+}
+
+/// The fields `Simulation::visit_anim`'s prefix and gates read, copied in one
+/// lookup of the anim.
+#[derive(Clone, Copy)]
+struct AnimGates {
+    /// The stored Location (`+0x9C`), owner-relative on an attached anim.
+    location: AnimWorldCoord,
+    bouncing: bool,
+    inactive: bool,
+    first_ai_guard: bool,
+    delay_remaining: i32,
+    /// Paused (`+0x19E`) or Temporal-paused (`+0x11A`).
+    paused: bool,
+    rate_reload: u16,
+    frame_timer: CdTimer,
+}
+
+impl AnimGates {
+    fn of(anim: &AnimObject) -> Self {
+        Self {
+            location: anim.world_coord,
+            bouncing: anim.bounce.is_some(),
+            inactive: anim.runtime.inactive,
+            first_ai_guard: anim.runtime.first_ai_guard,
+            delay_remaining: anim.runtime.delay_remaining,
+            paused: anim.runtime.paused || anim.runtime.temporal_paused,
+            rate_reload: anim.runtime.rate_reload,
+            frame_timer: anim.runtime.frame_timer,
+        }
+    }
+}
+
 impl Simulation {
     pub fn anim(&self, id: AnimId) -> Option<&AnimObject> {
         self.substrate.anims.get(id)
@@ -867,17 +1552,22 @@ impl Simulation {
         Some((anim.runtime.current_frame, frames))
     }
 
-    fn anim_mut_by_id(&mut self, id: AnimId) -> Option<&mut AnimObject> {
-        self.substrate.anims.get_mut(id)
-    }
-
     /// `AnimClass::MarkCellOccupancy` (vt+0xF0 = `0x00426270`) at the anim's
     /// stored Location, called directly: InfantryClass::ReceiveDamage's
     /// InfDeath 9 arm marks its new InfantryMutate anim (`0x00518B26`),
     /// whatever the anim's `MakeInfantry=`.
-    pub(crate) fn anim_mark_cell_occupancy(&mut self, id: AnimId) {
-        if let Some(location) = self.anim(id).map(|anim| anim.world_coord) {
-            self.apply_make_infantry_raw_occupation(location, AnimOccupationOperation::Mark);
+    pub(crate) fn anim_mark_cell_occupancy(
+        substrate: &mut ObjectSubstrate,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        id: AnimId,
+    ) {
+        if let Some(location) = substrate.anims.get(id).map(|anim| anim.world_coord) {
+            Self::apply_make_infantry_raw_occupation(
+                substrate,
+                resolved_terrain,
+                location,
+                AnimOccupationOperation::Mark,
+            );
         }
     }
 
@@ -886,7 +1576,8 @@ impl Simulation {
     /// (`0x004810A0`), the cell through Map[coord] (`0x00565730`), whose miss
     /// is the shared dummy cell, and the floor there (`0x00578080`).
     fn apply_make_infantry_raw_occupation(
-        &mut self,
+        substrate: &mut ObjectSubstrate,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
         location: AnimWorldCoord,
         operation: AnimOccupationOperation,
     ) {
@@ -894,7 +1585,7 @@ impl Simulation {
             SimFixed::from_num(location.x & 0xff),
             SimFixed::from_num(location.y & 0xff),
         );
-        let (key, ground_z, live_structural_bridge) = match self.resolved_terrain.as_ref() {
+        let (key, ground_z, live_structural_bridge) = match resolved_terrain.as_ref() {
             Some(terrain) => {
                 let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
                 let cell = cells.lookup_world(location.x, location.y);
@@ -917,14 +1608,15 @@ impl Simulation {
                 )
             }
             None => {
-                let Some((rx, ry)) = self.map_coord_cell(location.x, location.y) else {
+                let Some((rx, ry)) = Self::map_coord_cell(resolved_terrain, location.x, location.y)
+                else {
                     return;
                 };
                 (RawCellKey::Real(rx, ry), 0, false)
             }
         };
         apply_anim_raw_occupation(
-            &mut self.substrate.raw_cell_occupation,
+            &mut substrate.raw_cell_occupation,
             key,
             mask,
             location.z,
@@ -969,10 +1661,10 @@ impl Simulation {
     /// is played, from the single `AnimTypeClass+0x2F8` slot. So an explosion's
     /// sound is a constructor-time effect, not a first-tick one.
     ///
-    /// Returns `None` when the art type never bound (no art section or no SHP,
-    /// see `ArtRegistry::bind_anim_class_assets`); native mints a
-    /// default `AnimTypeClass` in that case whose `End` stays 0, so the anim
-    /// retains its first-AI guard, expires on a later visit, and draws nothing.
+    /// Returns `None` if the type or its required runtime bounds never bound
+    /// (see `ArtRegistry::bind_anim_class_assets`). A missing SHP is a bound
+    /// native null image: its zero-frame animation still constructs and runs
+    /// Start/Middle effects, then retires through the existing AI lifecycle.
     ///
     /// The anim is constructed at the producer's exact impact Z (`world_z`);
     /// `z` is only the level byte of the descriptor.
@@ -987,11 +1679,47 @@ impl Simulation {
         z: u8,
         world_z: i32,
     ) -> Option<AnimId> {
+        self.spawn_combat_explosion_anim_with_z_adjust(
+            rules,
+            type_name,
+            rx,
+            ry,
+            sub_x,
+            sub_y,
+            z,
+            world_z,
+            COMBAT_EXPLOSION_Z_ADJUST,
+            None,
+            true,
+        )
+    }
+
+    /// [`Self::spawn_combat_explosion_anim`] with the Phobos warhead
+    /// `AnimZAdjust` substituted for the stock combat row's -15 and the
+    /// tail's invoker House installed after construction. Unless the caller
+    /// `keeps` the anim, a picture-only type runs as a presentation anim
+    /// ([`Self::effect_anim_constructor`]); [`Self::spawn_combat_explosion_anim`]
+    /// returns an anim its callers may keep (the nuke and Ares' PreImpactAnim
+    /// await theirs), so it always makes an ordinary one.
+    pub(crate) fn spawn_combat_explosion_anim_with_z_adjust(
+        &mut self,
+        rules: &RuleSet,
+        type_name: InternedId,
+        rx: u16,
+        ry: u16,
+        sub_x: crate::util::fixed_math::SimFixed,
+        sub_y: crate::util::fixed_math::SimFixed,
+        z: u8,
+        world_z: i32,
+        z_adjust: i32,
+        owner_house: Option<InternedId>,
+        keeps: bool,
+    ) -> Option<AnimId> {
         let descriptor = AnimClassSpawnDescriptor {
             delay: 0,
             loop_count: 1,
             draw_flags: COMBAT_EXPLOSION_DRAW_FLAGS,
-            z_adjust: COMBAT_EXPLOSION_Z_ADJUST,
+            z_adjust,
             reverse: false,
             ..AnimClassSpawnDescriptor::new(type_name, rx, ry, sub_x, sub_y, z)
         };
@@ -999,8 +1727,51 @@ impl Simulation {
             z: world_z,
             ..AnimWorldCoord::from_cell_sub_z(rx, ry, sub_x, sub_y, z)
         };
-        match self.spawn_anim_at_world(rules, descriptor, world_coord) {
-            Ok(id) => Some(id),
+        let constructor = if keeps {
+            AnimConstructorInput::Runtime
+        } else {
+            self.effect_anim_constructor(rules, type_name)
+        };
+        match self.spawn_anim_at_world_with_constructor(
+            rules,
+            descriptor,
+            world_coord,
+            constructor,
+            FrameEffects::default(),
+        ) {
+            Ok(id) => {
+                if let Some(house) = owner_house {
+                    self.substrate.set_anim_owner_house(id, house);
+                    // `SetAnimOwnerHouseKind` updates LightConvert only for a
+                    // `MakeInfantry=` type or a `CreateUnit=` type with
+                    // `CreateUnit.RemapAnim=`, and not for a defeated House.
+                    #[cfg(feature = "phobos")]
+                    {
+                        let (make_infantry, create_unit) = {
+                            let name = self.interner.resolve(type_name);
+                            rules
+                                .art()
+                                .anim_runtime_config(name)
+                                .map_or((false, None), |config| {
+                                    (config.make_infantry > -1, config.phobos_create_unit)
+                                })
+                        };
+                        let remaps = make_infantry || create_unit.is_some_and(|(_, remap)| remap);
+                        let defeated = self
+                            .houses
+                            .get(&house)
+                            .is_some_and(|state| state.is_defeated());
+                        if remaps && !defeated {
+                            self.substrate.anims.set_anim_house_remap(id, house);
+                        }
+                    }
+                }
+                Some(id)
+            }
+            Err(AnimSpawnError::Tiberium(error)) => {
+                log::warn!("combat explosion refused an invalid Tiberium Image start: {error}");
+                None
+            }
             Err(error) => {
                 log::debug!(
                     "combat explosion [{}] did not construct: {error}",
@@ -1008,6 +1779,42 @@ impl Simulation {
                 );
                 None
             }
+        }
+    }
+
+    /// Run the effect anims that change nothing but their picture as
+    /// presentation anims from now on ([`AnimConstructorInput::Presentation`]).
+    /// Simulations start without, in native order, so a comparison with
+    /// gamemd's unique ids, Logic order and anim rows holds; real matches,
+    /// replays of them and sim-bench turn it on.
+    pub fn present_effect_anims(&mut self) {
+        self.effect_anims.presentation = true;
+    }
+
+    /// Whether picture-only effect anims run as presentation anims
+    /// ([`Self::present_effect_anims`]).
+    pub(crate) fn effect_anims_presented(&self) -> bool {
+        self.effect_anims.presentation
+    }
+
+    /// The constructor a muzzle flash, an impact or a trailer of type
+    /// `type_id` takes: a presentation anim when the match runs them
+    /// ([`Self::present_effect_anims`]) and the type changes nothing but
+    /// its picture ([`crate::rules::art_data::ArtRegistry::anim_presentation_only`]),
+    /// else an ordinary one. Only producers that keep no hold on the anim ask.
+    pub(crate) fn effect_anim_constructor(
+        &self,
+        rules: &RuleSet,
+        type_id: InternedId,
+    ) -> AnimConstructorInput {
+        if self.effect_anims_presented()
+            && rules
+                .art()
+                .anim_presentation_only(self.interner.resolve(type_id))
+        {
+            AnimConstructorInput::Presentation
+        } else {
+            AnimConstructorInput::Runtime
         }
     }
 
@@ -1022,6 +1829,7 @@ impl Simulation {
             descriptor,
             world_coord,
             AnimConstructorInput::Runtime,
+            FrameEffects::default(),
         )
     }
 
@@ -1031,33 +1839,150 @@ impl Simulation {
     /// sets+198 after the constructor returns, so its first Start effects
     /// remain admitted. Invalid Rust input safely fails instead of taking
     /// the original unchecked pointer access; stock operands are valid.
+    ///
+    /// Ares 3.0 ActionClass_PlayAnimAt 10025C20 (hook 0x6E232E) gives a
+    /// `MakeInfantry=` type SetMakeInfOwner with the action's House as
+    /// invoker, victim and killer.
     pub(crate) fn trigger_play_anim_at_waypoint(
         &mut self,
         rules: &RuleSet,
         anim_type_index: i32,
         waypoint: i32,
+        house: Option<InternedId>,
+        frame_effects: FrameEffects<'_>,
     ) -> bool {
-        let Some(type_name) = rules.anim_type_name_by_index(anim_type_index) else {
+        let Some(type_name) = rules.anim_type_runtime_key_by_index(anim_type_index) else {
             return false;
         };
         let Some([x, y, z]) = self.trigger_waypoint_coord(waypoint) else {
             return false;
         };
         let world_coord = AnimWorldCoord { x, y, z };
-        let type_id = self.interner.intern(type_name);
+        let type_id = self.interner.intern(&type_name);
         let (rx, ry, sub_x, sub_y, level) = world_coord.to_cell_sub_z();
         let descriptor = AnimClassSpawnDescriptor {
             draw_flags: 0x600,
             ..AnimClassSpawnDescriptor::new(type_id, rx, ry, sub_x, sub_y, level)
         };
-        let Ok(id) = self.spawn_anim_at_world(rules, descriptor, world_coord) else {
-            return false;
+        let id = match self.spawn_anim_at_world_with_constructor(
+            rules,
+            descriptor,
+            world_coord,
+            AnimConstructorInput::Runtime,
+            frame_effects,
+        ) {
+            Ok(id) => id,
+            Err(AnimSpawnError::Tiberium(error)) => {
+                log::warn!("waypoint animation refused an invalid Tiberium Image start: {error}");
+                return false;
+            }
+            Err(_) => return false,
         };
-        self.set_anim_no_effects(id, true);
+        if rules.ares_form()
+            && rules
+                .art()
+                .anim_runtime_config(&type_name)
+                .is_some_and(|config| config.make_infantry > -1)
+        {
+            self.ares_set_make_inf_owner(id, type_id, house, house, house, rules);
+        }
+        self.substrate.set_anim_no_effects(id, true);
         true
     }
 
-    /// Execute58 MeteorShower6E2C40..6E2E12 (Steam3e81a617). Literal types
+    /// The MoveFlash of `FootClass::ClickedAction_Cell`'s Move arm
+    /// (`0x004D7EB5..0x004D7F98`): `AnimClass(Rules+0xBB4, coord, 0, 1,
+    /// 0x600, 0, false)` at the clicked Cell's centre, on the ground
+    /// (`0x00578080`) and raised by the bridge deck when the Cell at that
+    /// coordinate (`0x00565730`) has flag 0x100. Campaign and skirmish
+    /// (GameMode 0 and 5) keep it an ordinary anim. LAN and online games make
+    /// it a local anim instead (`0x004D7F28..0x004D7F57`,
+    /// `0x004D7FA6..0x004D8062`), which only the clicking game runs and
+    /// draws. False when nothing is constructed.
+    ///
+    /// RESIDUAL: a local anim runs the whole AnimClass::AI, as gamemd's does.
+    /// A MoveFlash type that damages, leaves a scorch or crater, spawns
+    /// particles, a `TrailerAnim=` or a `Next=` anim, marks `MakeInfantry=`
+    /// cells or sits in `Layer=Ground` (whose sorted order is shared state)
+    /// would change the clicking game alone, as in gamemd. Retail RING does
+    /// none of these.
+    pub(crate) fn spawn_move_flash(&mut self, rules: &RuleSet, cell: (u16, u16)) -> bool {
+        if rules.general.move_flash.name.is_empty() {
+            return false;
+        }
+        let Some(terrain) = self.resolved_terrain.as_ref() else {
+            return false;
+        };
+        let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+        // 0x004D7EC2..0x004D7EED: the signed Cell words, times 0x100, plus 0x80.
+        let centre = crate::sim::cell_kernel::cell_center(
+            crate::sim::cell_kernel::CellCoordinate {
+                x: i32::from(cell.0 as i16),
+                y: i32::from(cell.1 as i16),
+            },
+            0,
+        );
+        let Ok(mut z) = crate::sim::movement::ground_pose::query_ground_height(
+            &cells,
+            crate::sim::components::DriveCoord {
+                x: centre.x,
+                y: centre.y,
+                z: 0,
+            },
+        ) else {
+            return false;
+        };
+        if cells.flags(cells.lookup_world(centre.x, centre.y)) & 0x100 != 0 {
+            z = z.wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
+        }
+        let world_coord = AnimWorldCoord {
+            x: centre.x,
+            y: centre.y,
+            z,
+        };
+        let local = !self.session.game_mode().is_single_player();
+        let name = &rules.general.move_flash.name;
+        // `resolve_type_handles` interned it; a local flash never adds a
+        // name, which the other games would lack.
+        let type_id = if local {
+            let Some(type_id) = self.interner.get(name) else {
+                log::debug!("MoveFlash [{name}] was not interned with the type handles");
+                return false;
+            };
+            type_id
+        } else {
+            self.interner.intern(name)
+        };
+        let (rx, ry, sub_x, sub_y, level) = world_coord.to_cell_sub_z();
+        let descriptor = AnimClassSpawnDescriptor {
+            draw_flags: 0x600,
+            ..AnimClassSpawnDescriptor::new(type_id, rx, ry, sub_x, sub_y, level)
+        };
+        let constructor = if local {
+            AnimConstructorInput::Local
+        } else {
+            AnimConstructorInput::Runtime
+        };
+        match self.spawn_anim_at_world_with_constructor(
+            rules,
+            descriptor,
+            world_coord,
+            constructor,
+            FrameEffects::default(),
+        ) {
+            Ok(_) => true,
+            Err(AnimSpawnError::Tiberium(error)) => {
+                log::warn!("MoveFlash refused an invalid Tiberium Image start: {error}");
+                false
+            }
+            Err(error) => {
+                log::debug!("MoveFlash did not construct: {error}");
+                false
+            }
+        }
+    }
+
+    /// Execute58 MeteorShower6E2C40..6E2E12 (Steam gamemd). Literal types
     /// are find-only; raw signed XY remainders precede each constructor, whose
     /// launch/Start draws are visible to the following selection. 842AFC holds
     /// [1,5,9,15]. No House, SuperWeapon, no-effects flag or per-piece delay.
@@ -1129,20 +2054,25 @@ impl Simulation {
             draw_flags: 0x600,
             ..AnimClassSpawnDescriptor::new(type_id, rx, ry, sub_x, sub_y, level)
         };
-        let Ok(id) = self.spawn_anim_at_world(rules, descriptor, world_coord) else {
-            return false;
+        let id = match self.spawn_anim_at_world(rules, descriptor, world_coord) {
+            Ok(id) => id,
+            Err(AnimSpawnError::Tiberium(error)) => {
+                log::warn!("DropZone flare refused an invalid Tiberium Image start: {error}");
+                return false;
+            }
+            Err(_) => return false,
         };
-        self.set_anim_no_effects(id, true);
+        self.substrate.set_anim_no_effects(id, true);
         true
     }
 
     /// Anim ctor42264D..4226BF: the bound DropZone type reveals twice for
     ///the current House. Rules+14BC is converted from leptons by signed /256;
     ///the existing Map5678E0 owner handles height, allies and notifications.
+    /// Every native client reveals for its own PlayerPtr, so a network game
+    /// reveals for each human House ([`Self::represented_player_maps`]).
     fn reveal_drop_zone_from_anim(&mut self, rules: &RuleSet, world: AnimWorldCoord) {
-        let Some(owner) = self.session.current_house else {
-            return;
-        };
+        let owners = self.represented_player_maps();
         // Preserve large positive inputs through the narrower Rust parameter;
         // Map567A3E/the shared reveal owner still applies the native cap10.
         let radius = (rules.general.drop_zone_radius / 256).min(i32::from(u16::MAX));
@@ -1156,34 +2086,30 @@ impl Simulation {
             y: world.y,
             z: world.z,
         });
-        let config = self.sight_reveal_config(Some(rules));
-        let viewers = self.reveal_viewers.direct(
-            &self.fog,
-            &self.house_alliances,
-            owner,
-            &config,
-            &self.interner,
-        );
-        for final_pass in [false, true] {
-            let _ = self.reveal_area(
-                &viewers,
-                (x as u16, y as u16),
-                world.z,
-                radius,
-                None,
-                final_pass,
+        let config = self.sight_reveal_config(rules);
+        for owner in owners {
+            let clients = self.fog_viewers();
+            let viewers = self.reveal_viewers.direct(
+                self.house_alliances.as_map(),
+                owner,
                 &config,
-                crate::sim::world::UninitContext::with_rules(rules),
-                crate::sim::vision::MapRevealProjection::Transient,
-                self.session.current_house,
+                &self.interner,
+                &clients,
             );
-        }
-    }
-
-    /// Mutation of the retained Anim+198 byte belongs to its instance owner.
-    pub(crate) fn set_anim_no_effects(&mut self, id: AnimId, no_effects: bool) {
-        if let Some(anim) = self.anim_mut_by_id(id) {
-            anim.no_effects = no_effects;
+            for final_pass in [false, true] {
+                let _ = self.reveal_area(
+                    &viewers,
+                    (x as u16, y as u16),
+                    world.z,
+                    radius,
+                    None,
+                    final_pass,
+                    &config,
+                    crate::sim::world::UninitContext::with_rules(rules),
+                    crate::sim::vision::MapRevealProjection::Transient,
+                    self.session.current_house(),
+                );
+            }
         }
     }
 
@@ -1196,6 +2122,7 @@ impl Simulation {
         descriptor: AnimClassSpawnDescriptor,
         world_coord: AnimWorldCoord,
         constructor: AnimConstructorInput,
+        frame_effects: FrameEffects<'_>,
     ) -> Result<AnimId, AnimSpawnError> {
         // Anim42203D assigns before registry insertion and RandomRate4221F5.
         // Death debris may already have constructed at its pick/draw boundary.
@@ -1205,23 +2132,48 @@ impl Simulation {
                 .native_unique_id
                 .unwrap_or_else(|| self.next_native_runtime_id()),
             AnimConstructorInput::Runtime => self.next_native_runtime_id(),
+            // ClickedAction_Cell sets Scenario+0x214 to -3 around the
+            // constructor (0x004D7F42) and restores it after (0x004D7FCB), so
+            // NextUniqueID's pre-increment (0x0068BCB0) gives the flash -2,
+            // the id the sync checksum skips, and the counter stays put.
+            AnimConstructorInput::Local | AnimConstructorInput::Presentation => {
+                crate::sim::multiplayer_checksum::SYNC_EXEMPT_ANIM_ID
+            }
         };
+        let presentation = matches!(constructor, AnimConstructorInput::Presentation);
+        let local = presentation || matches!(constructor, AnimConstructorInput::Local);
+        // The MoveFlash alone runs in the clicking game only; a presentation
+        // anim runs in every game alike, so it may name what it plays.
+        let private = local && !presentation;
         let type_name = self
             .interner
             .resolve(descriptor.type_name)
             .to_ascii_uppercase();
+        // Borrowed from the rules, which outlive the spawn: the record is
+        // only read.
         let config = rules
             .art()
             .anim_runtime_config(&type_name)
-            .cloned()
             .ok_or(AnimSpawnError::MissingType(descriptor.type_name))?;
-        let (effective_end, effective_loop_end) = effective_bounds(&type_name, &config)?;
+        let (effective_end, effective_loop_end) = effective_bounds(&type_name, config)?;
         let reverse = descriptor.reverse || config.reverse;
-        let stop_sound_id = config
-            .stop_sound
-            .as_deref()
-            .map(|sound| self.interner.intern(sound));
-        let stable_id = self.allocate_stable_id();
+        // VERA-only: a local anim never adds a name to the interner, which the
+        // other games would lack; a StopSound name not yet interned is left out.
+        let stop_sound_id = config.stop_sound.as_deref().and_then(|sound| {
+            if private {
+                self.interner.get(sound)
+            } else {
+                Some(self.interner.intern(sound))
+            }
+        });
+        if presentation {
+            self.intern_presentation_chain(rules, config);
+        }
+        let stable_id = if local {
+            self.substrate.anims.allocate_local_id()
+        } else {
+            self.substrate.allocate_stable_id()
+        };
         if self.substrate.anims.contains_key(stable_id)
             || self.substrate.entities.contains(stable_id)
         {
@@ -1250,7 +2202,7 @@ impl Simulation {
                     0
                 },
                 frame_step: if reverse { -1 } else { 1 },
-                delay_remaining: descriptor.delay,
+                delay_remaining: i32::from(descriptor.delay),
                 rate_reload: 0,
                 frame_timer: CdTimer::default(),
                 loop_remaining: native_loop_remaining(config.loop_count, descriptor.loop_count),
@@ -1258,11 +2210,14 @@ impl Simulation {
                 constructor_reverse: descriptor.reverse,
                 inactive: false,
                 paused: false,
+                temporal_paused: false,
             },
             draw_runtime: descriptor.draw_runtime,
+            viewer_hidden: None,
             use_cell_drawer: descriptor.use_cell_drawer,
             terrain_attached: descriptor.terrain_attached,
             no_effects: false,
+            damage_accumulator: NativeF64Bits::ONE,
             in_logic_vector: false,
             owner_entity: None,
             building_slot: None,
@@ -1273,11 +2228,19 @@ impl Simulation {
             stop_sound_id,
             display: AnimDisplayState {
                 marked_on_map: false,
-                y_sort_adjust: config.y_sort_adjust,
+                // 0x004D7F57 writes -5000 to the MoveFlash type's YSortAdjust
+                // (+0x340) before a local flash's constructor. RESIDUAL: gamemd
+                // keeps that write on the type, so later anims of the type
+                // sort with it too; VERA gives it to the flash alone. Retail
+                // MoveFlash is RING, which nothing else makes, in Air.
+                y_sort_adjust: if private { -5000 } else { config.y_sort_adjust },
             },
             bounce: None,
+            flaming_guy: None,
             owner_house: None,
             attached_bullet: None,
+            owner_terrain: None,
+            presentation: presentation.then_some(None),
         };
         // The insert must run in every build profile: wrapped in
         // `debug_assert!` it was compiled out of release binaries and no
@@ -1286,8 +2249,21 @@ impl Simulation {
         debug_assert!(previous.is_none());
         let draws = match constructor {
             AnimConstructorInput::Preconsumed(draws) => draws,
-            AnimConstructorInput::Runtime | AnimConstructorInput::AssignedIdentity(_) => {
-                match anim_constructor_draws(&config, world_coord, &mut self.scenario_rng) {
+            AnimConstructorInput::Runtime
+            | AnimConstructorInput::AssignedIdentity(_)
+            | AnimConstructorInput::Local
+            | AnimConstructorInput::Presentation => {
+                // VERA-only: a local anim draws from a copy, so the other
+                // games' Scenario RNG stays in step. gamemd draws from the
+                // shared one; retail RING has no draw (no `RandomRate=`).
+                let mut copy;
+                let rng = if local {
+                    copy = self.scenario_rng.clone();
+                    &mut copy
+                } else {
+                    &mut self.scenario_rng
+                };
+                match anim_constructor_draws(config, world_coord, rng) {
                     Ok(draws) => draws,
                     Err(error) => {
                         // VERA's explicit unsupported-arithmetic failure precedes
@@ -1298,9 +2274,9 @@ impl Simulation {
                 }
             }
         };
-        let rate_reload = self.anim_rate(&config, draws.random_rate);
+        let rate_reload = Self::anim_rate(&self.session, config, draws.random_rate);
         let frame_timer =
-            CdTimer::started(self.session.binary_frame as i32, i32::from(rate_reload));
+            CdTimer::started(self.session.binary_frame() as i32, i32::from(rate_reload));
         let registered = self
             .substrate
             .anims
@@ -1327,17 +2303,18 @@ impl Simulation {
         // delay-zero constructor-time Start call. A producer's attach then
         // removes the Anim from Display and submits it to Ground again, so
         // Reveal's own submit is left out when nothing before the attach can
-        // read or change Display: Start reaches it only through Middle's
-        // smudge construction.
+        // read or change Display. Start's mineral tail can construct children
+        // and dispatch damage before the producer attaches its receiver.
         let start_reaches_display = descriptor.delay == 0
-            && middle_frame(&config).is_none()
-            && (config.scorch
-                || config.crater
-                || (config.spawns_particle.is_some() && config.num_particles > 0));
+            && (config.tiberium_chain_reaction
+                || (middle_frame(config).is_none()
+                    && (config.scorch
+                        || config.crater
+                        || (config.spawns_particle.is_some() && config.num_particles > 0))));
         let attaches = descriptor
             .owner
             .is_some_and(|owner| self.anim_owner_coords(owner).is_some());
-        self.reveal_anim(stable_id, Some(rules), !attaches || start_reaches_display);
+        self.reveal_anim(stable_id, rules, !attaches || start_reaches_display);
         //42264D..4226BF reveals DropZone before the constructor-time Start.
         if rules
             .general
@@ -1348,7 +2325,7 @@ impl Simulation {
             self.reveal_drop_zone_from_anim(rules, initial_world_coord);
         }
         if descriptor.delay == 0 {
-            self.anim_start(stable_id, &config, rules, None);
+            self.anim_start(stable_id, config, rules, None, frame_effects)?;
         }
         if let Some(owner) = descriptor.owner {
             self.set_anim_owner_object(stable_id, Some(owner), rules);
@@ -1372,39 +2349,17 @@ impl Simulation {
                 index += 1;
                 continue;
             }
-            let start_sound_active = self
-                .substrate
-                .anims
-                .get(id)
-                .is_some_and(|anim| anim.start_sound_active);
-            self.notify_anim_pointer_expired(id);
-            self.clear_damage_fire_anim_reference(id);
-            self.release_anim_owner_reference(id);
-            if start_sound_active {
-                // `MapClass::InitCellAttributes @ 0x00568BB0` reaches the
-                // scalar destructor4228E0: Release406060, no StopSound.
-                self.sound_events
-                    .push(SimSoundEvent::ObjectSoundReleased { owner: id });
-            }
-            self.conceal_anim(id);
-            self.substrate.pending_delete.remove_object(id);
-            let removed_anim = self.substrate.anims.remove(id);
-            debug_assert!(removed_anim.is_some());
+            // MapClass::InitCellAttributes568BB0 uses the same scalar
+            // destructor4228E0: Release406060, without StopSound.
+            self.scalar_delete_anim(id);
             removed += 1;
         }
         removed
     }
 
-    /// `CellClass::Get_Tiberium_Value @ 0x00485020` of the anim's cell. Native
-    /// finds it from the raw Location through Object vtable `+0x1BC`
-    /// (`0x005F6960`): two Map[coord] lookups (`0x00565730`), whose miss is the
-    /// shared dummy cell.
-    fn anim_cell_tiberium_value(
-        &self,
-        location: AnimWorldCoord,
-        rules: &RuleSet,
-        overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
-    ) -> i32 {
+    /// One Map565730 lookup and Cell+44/+11E read. Live IsAnimatedTiberium
+    /// AI424402 and post-load426224 use this same real/dummy field owner.
+    fn anim_cell_overlay_fields(&self, location: AnimWorldCoord) -> (Option<u8>, u8) {
         let grid_fields = |(rx, ry): (u16, u16)| {
             self.overlay_grid
                 .as_ref()
@@ -1414,15 +2369,10 @@ impl Simulation {
                     (cell.overlay_id, cell.overlay_data)
                 })
         };
-        let (overlay_id, overlay_data) = match self.resolved_terrain.as_ref() {
+        match self.resolved_terrain.as_ref() {
             Some(terrain) => {
                 let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
-                let point = crate::sim::components::DriveCoord {
-                    x: location.x,
-                    y: location.y,
-                    z: location.z,
-                };
-                match crate::sim::movement::ground_pose::query_object_cell(&cells, point) {
+                match cells.lookup_world(location.x, location.y) {
                     cell @ crate::map::cell_index::NativeCellIdentity::Real(_) => {
                         let (rx, ry) = cells.coord(cell);
                         grid_fields((rx as u16, ry as u16)).unwrap_or((None, 0))
@@ -1432,11 +2382,25 @@ impl Simulation {
                     }
                 }
             }
-            None => self
-                .map_coord_cell(location.x, location.y)
+            None => Self::map_coord_cell(&self.resolved_terrain, location.x, location.y)
                 .and_then(grid_fields)
                 .unwrap_or_else(|| self.effective_shared_cell_dummy().overlay_fields()),
-        };
+        }
+    }
+
+    /// Cell485020 value from raw Location via Object5F6960: two Map565730
+    /// lookups. Keep its first lookup separate from the shared field read.
+    fn anim_cell_tiberium_value(
+        &self,
+        location: AnimWorldCoord,
+        rules: &RuleSet,
+        overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    ) -> Result<i32, TiberiumImageError> {
+        if let Some(terrain) = self.resolved_terrain.as_ref() {
+            let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+            let _ = cells.lookup_world(location.x, location.y);
+        }
+        let (overlay_id, overlay_data) = self.anim_cell_overlay_fields(location);
         crate::map::tiberium_cell::tiberium_value(
             overlay_id,
             overlay_data,
@@ -1445,31 +2409,88 @@ impl Simulation {
         )
     }
 
+    /// Anims_Refresh_Tiberium_LightConverts4261D0, after user-load lighting:
+    /// all flagged stored Anims sample raw Location, including inactive and
+    /// attached entries. Non-resource cells keep the prior Convert. This is not
+    /// the live AI's virtual coordinate minus384, and does not alter timers,
+    /// intensity, depth, attachment or RNG.
+    pub fn refresh_animated_tiberium_after_load(
+        &mut self,
+        rules: &RuleSet,
+        overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    ) -> Result<(), TiberiumImageError> {
+        // Remap writes have no callbacks. Snapshot the selected coordinates
+        // in storage order so the shared setter retains touch invalidation.
+        let candidates: Vec<_> = self
+            .anims()
+            .filter(|(_, anim)| {
+                rules
+                    .art()
+                    .anim_runtime_config(self.interner.resolve(anim.type_id))
+                    .is_some_and(|config| config.is_animated_tiberium)
+            })
+            .map(|(&id, anim)| (id, anim.world_coord))
+            .collect();
+        for (id, location) in candidates {
+            let (Some(overlay), _) = self.anim_cell_overlay_fields(location) else {
+                continue;
+            };
+            let Some(kind) =
+                overlay_registry.tiberium_type_for_overlay(&rules.tiberium_types, overlay)?
+            else {
+                continue;
+            };
+            let tiberium = rules
+                .tiberium_types
+                .get(kind)
+                .ok_or(TiberiumImageError::MissingType(kind))?;
+            if let Ok(index) = u8::try_from(tiberium.color_scheme() / 2) {
+                assert!(self.substrate.anims.set_anim_remap(
+                    id,
+                    AnimRemap::ColorScheme(crate::rules::house_colors::HouseColorIndex(index)),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn visit_anim(
         &mut self,
         id: AnimId,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
-    ) -> bool {
+    ) -> Result<bool, RuntimeOverlayError> {
+        // One read serves the visit's prefix and gates: most visits end at a
+        // gate, and each step that may write the anim re-reads it (VERA-only,
+        // results unchanged).
+        let Some(anim) = self.anim(id) else {
+            return Ok(false);
+        };
+        let type_id = anim.type_id;
+        let mut gates = AnimGates::of(anim);
+        // Borrowed from the rules, not the world: the visit below mutates the
+        // world while it reads the type.
+        let Some(config) = rules
+            .art()
+            .anim_runtime_config(self.interner.resolve(type_id))
+        else {
+            self.destroy_anim(id, rules);
+            return Ok(false);
+        };
+
+        //423B17/423B1E precede the ordinary first-AI, delay and timer gates.
+        if config.is_flaming_guy {
+            self.anim_flaming_guy_ai(id, &config, rules, overlay_registry);
+            let Some(reread) = self.anim(id).map(AnimGates::of) else {
+                return Ok(false);
+            };
+            gates = reread;
+        }
         // HideIfNoOre and the MakeInfantry mark read the stored Location
         // (`+0x9C`, `0x00423BD6..0x00423BFD`), not GetCoords: an owner-attached
         // anim stores an owner-relative delta there.
-        let Some((type_id, first_guard, inactive, location)) = self.anim(id).map(|anim| {
-            (
-                anim.type_id,
-                anim.runtime.first_ai_guard,
-                anim.runtime.inactive,
-                anim.world_coord,
-            )
-        }) else {
-            return false;
-        };
-        let type_name = self.interner.resolve(type_id).to_ascii_uppercase();
-        let Some(config) = rules.art().anim_runtime_config(&type_name).cloned() else {
-            self.destroy_anim(id, rules);
-            return false;
-        };
+        let location = gates.location;
 
         // `AnimClass::AI @ 0x00423AC0`, before the MakeInfantry `vtable+0xF0`
         // call, the bounce-landing block, and the trailer block: with
@@ -1481,43 +2502,59 @@ impl Simulation {
         if config.hide_if_no_ore
             && let Some(overlay_registry) = overlay_registry
         {
-            let hidden = self.anim_cell_tiberium_value(location, rules, overlay_registry) == 0;
-            if let Some(anim) = self.anim_mut_by_id(id) {
-                anim.draw_runtime.hidden = hidden;
-            }
+            let value = self.anim_cell_tiberium_value(location, rules, overlay_registry)?;
+            // Phobos' `AnimClass_AI_Early @ 0x423B95` replacement keeps the same
+            // gate and compares instead: `GetContainedTiberiumValue() <=
+            // abs(HideIfNoOre.Threshold)`. `wrapping_abs` keeps the native
+            // two's-complement result for INT_MIN, where C++'s `abs` overflows.
+            #[cfg(feature = "phobos")]
+            let hidden = value <= config.hide_if_no_ore_threshold.wrapping_abs();
+            #[cfg(not(feature = "phobos"))]
+            let hidden = value == 0;
+            self.substrate.set_anim_hidden(id, hidden);
         }
 
         // AnimClass::AI performs this before its first-AI, inactive, delay,
         // visibility, and frame-timer gates. Repeated visits OR the same raw
         // bit; there is deliberately no contributor count.
         if config.make_infantry != -1 {
-            self.apply_make_infantry_raw_occupation(location, AnimOccupationOperation::Mark);
+            Self::apply_make_infantry_raw_occupation(
+                &mut self.substrate,
+                &self.resolved_terrain,
+                location,
+                AnimOccupationOperation::Mark,
+            );
         }
-        if inactive {
-            self.destroy_anim(id, rules);
-            return false;
-        }
-
         // `AnimClass::AI 0x00423C24`: a bouncing chunk flies its body before
         // the trailer and the first-AI guard; touching down ends it.
-        if self.anim(id).is_some_and(|anim| anim.bounce.is_some())
-            && let Some(bridge_state_changed) =
-                self.anim_bounce_step(id, &config, rules, overlay_registry, frame_effects)
-        {
-            return bridge_state_changed;
+        if gates.bouncing {
+            if let Some(bridge_state_changed) =
+                self.anim_bounce_step(id, &config, rules, overlay_registry, frame_effects)?
+            {
+                return Ok(bridge_state_changed);
+            }
+            let Some(reread) = self.anim(id).map(AnimGates::of) else {
+                return Ok(false);
+            };
+            gates = reread;
         }
-        // The trailer spawns at GetCoords after the body moved the anim.
-        let Some(world_coord) = self.anim_absolute_coord(id) else {
-            return false;
-        };
 
+        // AnimAI4242A6/4242B0 gates only this producer on ObjectAlive and
+        // inactive. Bounce above still runs before the retirement gate.
         if let Some(trailer_name) = config.trailer_anim.as_deref()
+            && !gates.inactive
+            && !self.substrate.pending_delete.contains_object(&id)
             && trailer_cadence_matches(
-                u64::from(self.session.binary_frame),
+                u64::from(self.session.binary_frame()),
                 config.trailer_seperation,
+                rules.ares(),
             )
             && rules.art().anim_runtime_config(trailer_name).is_some()
         {
+            // The trailer spawns at GetCoords after the body moved the anim.
+            let Some(world_coord) = self.anim_absolute_coord(id) else {
+                return Ok(false);
+            };
             let trailer_type = self.interner.intern(trailer_name);
             let descriptor = AnimClassSpawnDescriptor {
                 type_name: trailer_type,
@@ -1536,14 +2573,29 @@ impl Simulation {
                 draw_runtime: AnimDrawRuntime::default(),
                 owner: None,
             };
-            // RESIDUAL: this unwrap relies on the binder having bound the
-            // parent's whole `TrailerAnim=` closure. The strict binder
-            // guarantees it; the tolerant one ends a chain at the first
-            // type with no sprite, so a tolerantly bound parent with an
-            // unbindable trailer would panic here. Trigger: modded art
-            // only; no retail trailer chain starts from a tolerant root.
-            self.spawn_anim_at_world(rules, descriptor, world_coord)
-                .expect("validated trailer closure must remain spawnable");
+            // The strict binder binds the parent's whole `TrailerAnim=`
+            // closure; the tolerant one stops on a malformed image header, so
+            // a mod's trailer can be unbindable here. It is then not spawned.
+            let constructor = self.effect_anim_constructor(rules, trailer_type);
+            match self.spawn_anim_at_world_with_constructor(
+                rules,
+                descriptor,
+                world_coord,
+                constructor,
+                FrameEffects::default(),
+            ) {
+                Ok(_) => {}
+                Err(AnimSpawnError::Tiberium(error)) => {
+                    log::warn!(
+                        "trailer animation refused an invalid Tiberium Image start: {error}"
+                    );
+                }
+                Err(error) => log::warn!("trailer animation not spawned: {error}"),
+            }
+            let Some(reread) = self.anim(id).map(AnimGates::of) else {
+                return Ok(false);
+            };
+            gates = reread;
         }
 
         //AnimAI424322..42435F: a DropZone marker ends over the first ground
@@ -1553,9 +2605,9 @@ impl Simulation {
             .general
             .drop_zone_anim
             .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case(&type_name))
+            .is_some_and(|name| name.eq_ignore_ascii_case(self.interner.resolve(type_id)))
             && self.anim_absolute_coord(id).is_some_and(|world| {
-                self.map_coord_cell(world.x, world.y)
+                Self::map_coord_cell(&self.resolved_terrain, world.x, world.y)
                     .and_then(|(x, y)| {
                         self.substrate.occupancy.first_building_on_layer(
                             x,
@@ -1566,54 +2618,84 @@ impl Simulation {
                     .is_some()
             })
         {
-            if let Some(anim) = self.anim_mut_by_id(id) {
+            if let Some(anim) = self.substrate.anims.get_mut(id) {
                 anim.runtime.inactive = true; //424358 writes+19B before UnInit.
+                gates.inactive = true;
             }
-            self.destroy_anim(id, rules);
-            return false;
         }
 
-        if first_guard {
-            if let Some(anim) = self.anim_mut_by_id(id) {
+        // AnimAI42435F rereads after prefix callbacks. All inactive writers
+        // share this retirement; a Bouncer may already have landed/retired.
+        if gates.inactive {
+            self.destroy_anim(id, rules);
+            return Ok(false);
+        }
+        if gates.first_ai_guard {
+            if let Some(anim) = self.substrate.anims.get_mut(id) {
                 anim.runtime.first_ai_guard = false;
             }
-            return false;
+            return Ok(false);
         }
 
         // `AnimClass::AI @ 0x00423AC0` delay countdown: the visit that takes it
         // to zero calls `AnimClass::Start @ 0x00424CE0` (call site `0x004243A1`)
         // and returns. The field also holds the `RandomLoopDelay=` pause, so a
         // looping anim restarts, and replays its start sound, after each pause.
-        {
-            let Some(anim) = self.anim_mut_by_id(id) else {
-                return false;
+        // `0x00424386..0x00424399` tests `!= 0` and decrements, so a negative
+        // pause counts on down and holds the anim.
+        if gates.delay_remaining != 0 {
+            let Some(anim) = self.substrate.anims.get_mut(id) else {
+                return Ok(false);
             };
-            if anim.runtime.delay_remaining > 0 {
-                anim.runtime.delay_remaining -= 1;
-                if anim.runtime.delay_remaining == 0 {
-                    self.anim_start(id, &config, rules, overlay_registry);
-                }
-                return false;
+            anim.runtime.delay_remaining = anim.runtime.delay_remaining.wrapping_sub(1);
+            if anim.runtime.delay_remaining == 0 {
+                self.anim_start(id, &config, rules, overlay_registry, frame_effects)?;
             }
+            return Ok(false);
         }
 
+        // AnimAI4243AE..4243B6 checks Object+90 after first-AI/delay.
+        // FlamingGuyAI can retire this receiver before the ordinary tail.
+        if self.substrate.pending_delete.contains_object(&id) {
+            return Ok(false);
+        }
+        // AnimAI4243BC..424427: compare the exact CellAnim type at virtual
+        // GetCoords minus384 in XY. A mismatch writes inactive but falls
+        // through this visit's frame/damage work; retirement is next visit.
+        if config.is_animated_tiberium {
+            let Some(mut location) = self.anim_absolute_coord(id) else {
+                return Ok(false);
+            };
+            location.x = location.x.wrapping_sub(384);
+            location.y = location.y.wrapping_sub(384);
+            let (overlay, _) = self.anim_cell_overlay_fields(location);
+            let matches = if let Some(overlay) = overlay {
+                let registry = overlay_registry.unwrap_or_else(|| rules.overlay_registry());
+                registry
+                    .flags(overlay)
+                    .ok_or(TiberiumImageError::MissingOverlay(i32::from(overlay)))?
+                    .cell_anim
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(self.interner.resolve(type_id)))
+            } else {
+                false
+            };
+            if !matches && let Some(anim) = self.substrate.anims.get_mut(id) {
+                anim.runtime.inactive = true;
+            }
+        }
         let mut action = VisitAction::None;
         let mut random_loop_delay = None;
-        let current_frame = self.session.binary_frame as i32;
-        let (middle, boundary) = {
-            let Some(anim) = self.anim_mut_by_id(id) else {
-                return false;
+        let current_frame = self.session.binary_frame() as i32;
+        //42449B: power pause follows first-AI/delay gates and precedes timer advance;
+        //4244A9: the Temporal erase pause (+11A) right after it.
+        if gates.paused || gates.rate_reload == 0 || !gates.frame_timer.expired(current_frame) {
+            return Ok(false);
+        }
+        {
+            let Some(anim) = self.substrate.anims.get_mut(id) else {
+                return Ok(false);
             };
-            //42449B: power pause follows first-AI/delay gates and precedes timer advance.
-            if anim.runtime.paused {
-                return false;
-            }
-            if anim.runtime.rate_reload == 0 {
-                return false;
-            }
-            if !anim.runtime.frame_timer.expired(current_frame) {
-                return false;
-            }
             anim.runtime
                 .frame_timer
                 .start(current_frame, i32::from(anim.runtime.rate_reload));
@@ -1621,21 +2703,34 @@ impl Simulation {
                 .runtime
                 .current_frame
                 .wrapping_add(anim.runtime.frame_step);
+        }
+        let bridge_state_changed =
+            self.anim_frame_damage(id, &config, rules, overlay_registry, frame_effects);
+        // AnimAI42464C checks only ObjectAlive after receiver callbacks.
+        // Ordinary Anim retirement queues retained storage; scalar deletion
+        // removes it. Owner expiry's inactive byte is a later-visit gate.
+        if self.anim(id).is_none() || self.substrate.pending_delete.contains_object(&id) {
+            return Ok(bridge_state_changed);
+        }
+        let middle = self.anim(id).is_some_and(|anim| {
             // `0x0042465D..0x00424687`: the committed stage reaching the
             // type's middle frame (`+0x298`, zero meaning Start already ran
             // Middle) calls Middle unless the anim is bouncing (`+0x194`, the
             // constructor's byte, which a `Next=` switch keeps), before the boundary
             // tail.
-            let middle = middle_frame(&config).is_some_and(|middle| {
+            middle_frame(&config).is_some_and(|middle| {
                 config.start.wrapping_add(anim.runtime.current_frame) == middle
-            }) && !(anim.bounce.is_some() || config.is_meteor);
-            (middle, advance_anim_boundary(anim, &config))
-        };
+            }) && anim.bounce.is_none()
+        });
         if middle {
             self.anim_middle(id, &config, rules, overlay_registry);
         }
+        let Some(anim) = self.substrate.anims.get_mut(id) else {
+            return Ok(bridge_state_changed);
+        };
+        let boundary = advance_anim_boundary(anim, &config);
         match boundary {
-            AnimBoundary::Continue | AnimBoundary::Bounce => return false,
+            AnimBoundary::Continue | AnimBoundary::Bounce => return Ok(bridge_state_changed),
             AnimBoundary::Loop => {
                 random_loop_delay = config.random_loop_delay;
             }
@@ -1650,19 +2745,19 @@ impl Simulation {
             }
         }
 
+        // `0x004247B1..0x004247E5`: unless both bounds are 0, Random_Ranged
+        // (`0x0065C7E0`) on the Scenario stream draws the signed pause; equal
+        // bounds draw nothing.
         if let Some((low, high)) = random_loop_delay {
-            let delay = self
-                .scenario_rng
-                .next_range_u32_inclusive(u32::from(low), u32::from(high))
-                as u16;
-            if let Some(anim) = self.anim_mut_by_id(id) {
+            let delay = self.scenario_rng.next_range_i32_inclusive(low, high);
+            if let Some(anim) = self.substrate.anims.get_mut(id) {
                 anim.runtime.delay_remaining = delay;
             }
         }
         match action {
             VisitAction::None => {}
             VisitAction::Destroy => {
-                if let Some(anim) = self.anim_mut_by_id(id) {
+                if let Some(anim) = self.substrate.anims.get_mut(id) {
                     anim.completed = true;
                 }
                 self.destroy_anim(id, rules);
@@ -1675,15 +2770,230 @@ impl Simulation {
                     overlay_registry,
                     frame_effects,
                 ) {
-                    if let Some(anim) = self.anim_mut_by_id(id) {
+                    if let Some(anim) = self.substrate.anims.get_mut(id) {
                         anim.completed = true;
                     }
                     self.destroy_anim(id, rules);
                 }
             }
-            VisitAction::Next(next) => self.switch_anim_type(id, &next, rules, overlay_registry),
+            VisitAction::Next(next) => {
+                self.switch_anim_type(id, &next, rules, overlay_registry, frame_effects)?;
+            }
         }
-        false
+        Ok(bridge_state_changed)
+    }
+
+    /// AnimClass::AI424513..424647, after the stage/timer commit. Debit the
+    /// retained fraction before GetCoords/AreaDamage can retire this emitter.
+    /// The body adds no RNG request; receiver consequences keep their owners.
+    fn anim_frame_damage(
+        &mut self,
+        id: AnimId,
+        config: &AnimTypeRuntimeConfig,
+        rules: &RuleSet,
+        overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        effects: FrameEffects<'_>,
+    ) -> bool {
+        let ares = rules.ares_form();
+        let Some(anim) = self.anim(id) else {
+            return false;
+        };
+        let damage = f64::from_bits(config.damage.bits());
+        //424513..424532 rejects zero/negative/unordered, then instance+194.
+        if !(damage > 0.0) || anim.bounce.is_some() {
+            return false;
+        }
+        // 0x00424538..0x0042455E: an owner whose WhatAmI is Terrain (0x24)
+        // scales Damage by 5.0 (0x007E3568). A tree owner is kept in
+        // `owner_terrain`, never in `owner_entity`.
+        let terrain_owner = anim.owner_terrain.is_some();
+        // Ares AnimClass_Update_DamageDelay1000B1AF..1000B1E7 passes the
+        // animation's House, falling back to an attached Techno's owner.
+        // Neither owner is an attacking object; keep RAD_NO_ATTACKER below.
+        let source_house = if ares {
+            anim.owner_house.or_else(|| {
+                anim.owner_entity
+                    .and_then(|owner| self.substrate.entities.get(owner))
+                    .map(|owner| owner.owner())
+            })
+        } else {
+            None
+        };
+        let no_effects = anim.no_effects;
+        let type_id = anim.type_id;
+        let accumulator = f64::from_bits(anim.damage_accumulator.bits());
+        // Rust does not specify arithmetic NaN payloads across platforms.
+        let store = |sim: &mut Self, value: f64| {
+            let bits = if value.is_nan() {
+                0x7ff8_0000_0000_0000
+            } else {
+                value.to_bits()
+            };
+            sim.substrate.anims.get_mut(id).unwrap().damage_accumulator =
+                NativeF64Bits::from_bits(bits);
+        };
+        // Ares 3.0 AnimClass_Update_DamageDelay (1000AFE0, hook 0x424538,
+        // resuming at 0x42464C or 0x42465D): with `Damage.Delay=` above zero
+        // and `Damage=` at least 1, +0x188 counts frames and the whole Damage
+        // (truncated, times 5 on a terrain owner) lands once the count reaches
+        // the delay, which then restarts from zero. Otherwise the original
+        // fraction accumulates. Its conversion (100772B0) truncates and gives
+        // the integer indefinite out of range; a result below 1 or a
+        // no-effects anim delivers nothing and keeps the count.
+        let whole = if ares {
+            let multiplier = if terrain_owner { 5 } else { 1 };
+            let delay = config.ares_damage_delay;
+            let delayed = delay >= 1 && !(damage < 1.0);
+            let counted = if delayed {
+                accumulator + 1.0
+            } else {
+                f64::from(multiplier) * damage + accumulator
+            };
+            store(self, counted);
+            let short = if delayed {
+                counted < f64::from(delay)
+            } else {
+                counted < 1.0
+            };
+            if short {
+                return false;
+            }
+            let whole = if delayed {
+                ares_truncate(damage).wrapping_mul(multiplier)
+            } else {
+                ares_truncate(counted)
+            };
+            if whole < 1 || no_effects {
+                return false;
+            }
+            store(
+                self,
+                if delayed {
+                    0.0
+                } else {
+                    counted - f64::from(whole)
+                },
+            );
+            // Weapon= detonates a bullet of that weapon instead (0x42464C).
+            if let Some(weapon) = config
+                .ares_weapon
+                .as_deref()
+                .and_then(|name| rules.weapon(name))
+            {
+                return self.ares_anim_weapon_detonation(
+                    id,
+                    weapon,
+                    whole,
+                    rules,
+                    overlay_registry,
+                    effects,
+                );
+            }
+            whole
+        } else {
+            let increment = if terrain_owner { damage * 5.0 } else { damage };
+            let accumulated = accumulator + increment;
+            store(self, accumulated);
+            if !(accumulated >= 1.0) || no_effects {
+                return false;
+            }
+            //4245AC..4245D5 consumes Math7C5F00's low signed32 result, including
+            // masked conversion/overflow, and subtracts that signed integer.
+            let whole = X87Chop53::ftol_f64_low_masked(accumulated);
+            store(self, accumulated - f64::from(whole));
+            whole
+        };
+        //4245C3..424630 compares the own stored ID exactly, not Image.
+        let warhead_name = if self.interner.resolve(type_id) == "INVISO" {
+            Some(rules.bridge_warheads.c4_name.as_str())
+        } else {
+            rules.combat_damage.flame_damage2()
+        };
+        // Ares1000B179 first reads AnimType+330 (the existing art Warhead
+        // reader); only a null pointer uses the stock INVISO/FlameDamage2
+        // fallback.
+        let warhead_name = if ares {
+            config.warhead.as_deref().or(warhead_name)
+        } else {
+            warhead_name
+        };
+        let Some((name, warhead)) =
+            warhead_name.and_then(|name| rules.warhead(name).map(|warhead| (name, warhead)))
+        else {
+            return false;
+        };
+        let Some(coord) = self.anim_absolute_coord(id) else {
+            return false;
+        };
+        let warhead_ref = self.interner.intern(name);
+        crate::sim::combat::world_receiver::apply_area_damage(
+            self,
+            rules,
+            overlay_registry,
+            crate::sim::projectile::ProjectileCoord::new(coord.x, coord.y, coord.z),
+            whole,
+            warhead,
+            true,
+            (
+                crate::sim::combat::RAD_NO_ATTACKER,
+                source_house,
+                warhead_ref,
+            ),
+            effects,
+        )
+        .bridge_state_changed
+    }
+
+    /// Ares AnimClass_Update_DamageDelay's `Weapon=` arm (1000B116..
+    /// 1000B169): BulletTypeExt::CreateBullet of the weapon's Projectile at
+    /// the anim's cell, no owner, the computed damage, the weapon's Warhead
+    /// and Bright, given the weapon, Removed, detonated at the anim's
+    /// GetCoords and Released. That is the bare `DetonateAtCoord`
+    /// Fire_Death_Weapon makes (`ProjectileDetonationReason::DeathWeapon`).
+    /// Returns whether a bridge changed.
+    fn ares_anim_weapon_detonation(
+        &mut self,
+        id: AnimId,
+        weapon: &crate::rules::weapon_type::WeaponType,
+        damage: i32,
+        rules: &RuleSet,
+        overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        effects: FrameEffects<'_>,
+    ) -> bool {
+        let (Some(warhead), Some(coord)) =
+            (weapon.warhead.as_deref(), self.anim_absolute_coord(id))
+        else {
+            return false;
+        };
+        let impact = crate::sim::projectile::ProjectileCoord::new(coord.x, coord.y, coord.z);
+        let (rx, ry) = (coord.x.div_euclid(256), coord.y.div_euclid(256));
+        let target = match (u16::try_from(rx), u16::try_from(ry)) {
+            (Ok(rx), Ok(ry)) => crate::sim::projectile::ProjectileTarget::looked_up_cell(
+                self.resolved_terrain.as_ref(),
+                rx,
+                ry,
+            ),
+            _ => crate::sim::projectile::ProjectileTarget::DummyCell,
+        };
+        let payload = crate::sim::projectile::ProjectilePayload::new(
+            damage,
+            self.interner.intern(warhead),
+            weapon
+                .projectile
+                .as_deref()
+                .map(|id| self.interner.intern(id)),
+            weapon.bright,
+        )
+        .with_installed_weapon(Some(self.interner.intern(&weapon.id)));
+        let detonation = crate::sim::projectile::ProjectileDetonation {
+            projectile_id: id,
+            source_id: crate::sim::combat::RAD_NO_ATTACKER,
+            target,
+            impact,
+            payload,
+            reason: crate::sim::projectile::ProjectileDetonationReason::DeathWeapon,
+        };
+        self.commit_logic_projectile_detonations(rules, overlay_registry, &[detonation], effects)
     }
 
     /// The end of a `MakeInfantry=` anim's last loop with no `Next=`
@@ -1702,6 +3012,7 @@ impl Simulation {
     /// 5. A refused Unlimbo steps the stage (`+0xAC`) back one and keeps the
     ///    anim (`0x00424B23`): its next completed frame tries again with a
     ///    new object. The refused one stays in limbo, as it does natively.
+    ///    With Ares the refused one is UnInit and the anim ends (below).
     /// 6. Placed where the anim's cell (GetCoords, `0x005657A0`) carries the
     ///    bridge flag (`+0x140 & 0x100`) and the Location is above the cell's
     ///    GetCoords Z (`0x00486840`), it moves onto the deck: Mark(UP),
@@ -1733,7 +3044,12 @@ impl Simulation {
         else {
             return true;
         };
-        self.apply_make_infantry_raw_occupation(location, AnimOccupationOperation::Clear);
+        Self::apply_make_infantry_raw_occupation(
+            &mut self.substrate,
+            &self.resolved_terrain,
+            location,
+            AnimOccupationOperation::Clear,
+        );
         let kinds = &rules.general.anim_to_infantry;
         if i64::from(make_infantry) > kinds.len() as i64 {
             return true;
@@ -1747,12 +3063,12 @@ impl Simulation {
         let defeated = |sim: &Self, house: InternedId| {
             sim.houses
                 .get(&house)
-                .is_some_and(|state| state.is_defeated)
+                .is_some_and(|state| state.is_defeated())
         };
         let owner = if owner.is_none_or(|house| defeated(self, house)) {
             match self.civilian_side_house(rules) {
                 Some(civilian) => {
-                    self.set_anim_owner_house(id, civilian);
+                    self.substrate.set_anim_owner_house(id, civilian);
                     Some(civilian)
                 }
                 None => owner,
@@ -1765,8 +3081,15 @@ impl Simulation {
         };
         let owner_name = self.interner.resolve(owner).to_string();
         let (rx, ry, _, _, _) = location.to_cell_sub_z();
-        let Some(infantry) = self.construct_object_limbo_at_height(
-            kind,
+        // Rules6707DC/67BB10 retains an InfantryType pointer; AnimAI4249F9
+        // calls that type's creator, independent of other name registries.
+        let Some(object) =
+            rules.object_in_category(crate::rules::object_type::ObjectCategory::Infantry, kind)
+        else {
+            return true;
+        };
+        let Some(infantry) = self.construct_resolved_object_limbo_at_height(
+            object,
             &owner_name,
             rx,
             ry,
@@ -1792,7 +3115,18 @@ impl Simulation {
             frame_effects,
         );
         if placed.is_none() {
-            if let Some(anim) = self.anim_mut_by_id(id) {
+            // Ares 3.0 AnimClass_Update (1005C3E0, hook 0x424B23): the
+            // refused infantryman is UnInit and the anim ends (TimeToDie,
+            // UnInit) instead of trying again.
+            if rules.ares_form() {
+                self.uninit_with_context(
+                    infantry,
+                    crate::sim::world::UninitContext::new(rules, overlay_registry)
+                        .with_effects(frame_effects),
+                );
+                return true;
+            }
+            if let Some(anim) = self.substrate.anims.get_mut(id) {
                 anim.runtime.current_frame = anim.runtime.current_frame.wrapping_sub(1);
             }
             return false;
@@ -1815,13 +3149,16 @@ impl Simulation {
                     .z
         });
         if lift {
-            self.foot_mark_remove(infantry, Some(rules), overlay_registry, frame_effects);
+            self.foot_mark_remove(infantry, rules, overlay_registry, frame_effects);
             if let Some(entity) = self.substrate.entities.get_mut(infantry) {
                 entity.on_bridge.store(true);
             }
-            self.foot_mark_put(infantry, Some(rules), overlay_registry, frame_effects);
+            self.foot_mark_put(infantry, rules, overlay_registry, frame_effects);
         }
-        let human = self.houses.get(&owner).is_some_and(|house| house.is_human);
+        let human = self
+            .houses
+            .get(&owner)
+            .is_some_and(|house| house.is_human());
         if !human && let Some(entity) = self.substrate.entities.get_mut(infantry) {
             crate::sim::mission::authority::queue_entity_mission_deferred(
                 entity,
@@ -1832,11 +3169,13 @@ impl Simulation {
     }
 
     pub(crate) fn destroy_anim(&mut self, id: AnimId, rules: &RuleSet) {
-        self.destroy_anim_with_context(id, Some(rules));
+        self.destroy_anim_with_context(id, rules);
     }
 
-    pub(crate) fn destroy_anim_with_context(&mut self, id: AnimId, rules: Option<&RuleSet>) {
-        if self.substrate.pending_delete.contains_object(&id) {
+    pub(crate) fn destroy_anim_with_context(&mut self, id: AnimId, rules: &RuleSet) {
+        if self.substrate.pending_delete.contains_object(&id)
+            || self.substrate.anims.local_delete_queued(id)
+        {
             return;
         }
         // `AnimClass::GetCoords @ 0x00422BE0` — the sound plays at the anim's
@@ -1850,31 +3189,11 @@ impl Simulation {
         else {
             return;
         };
-        if let Some(building_slot) = self
-            .anim(id)
-            .and_then(|anim| anim.owner_entity.map(|_| anim.building_slot.is_some()))
-        {
-            match rules {
-                // A Building slot Anim's expiry below can construct its
-                // successor, which reads and changes Display.
-                Some(rules) if building_slot => {
-                    self.detach_anim_from_owner(id, rules);
-                }
-                _ => {
-                    // SetOwner(NULL)'s resolved coordinates and pointer
-                    // callback, without its temporary Display resubmission:
-                    // until this operation's conceal below, nothing reads or
-                    // changes Display (the expiry reaches Bullets and
-                    // damage-fire slots only), so it is unobservable. An
-                    // imminent physical owner retirement may have no Rules.
-                    self.release_anim_owner_reference(id);
-                    self.anim_mut_by_id(id)
-                        .expect("the retiring animation still exists")
-                        .world_coord = world;
-                }
-            }
-        }
-        if let Some(anim) = self.anim_mut_by_id(id) {
+        // UnInit4255C3 calls owner+60 before SetOwner(NULL)4255CA. Keep
+        // the shared attachment flag and every matching owner link in that
+        // operation, including the ordinary non-Building path.
+        self.detach_anim_from_owner(id, rules);
+        if let Some(anim) = self.substrate.anims.get_mut(id) {
             anim.start_sound_active = false;
         }
         // Original4255B0..425628 never writes19B; ObjectUnInit5F6625 clears
@@ -1887,12 +3206,12 @@ impl Simulation {
         // playing; StopAndClear405D40 would cut it off. Original execution:
         // tools/rules_oracle/bridge_child_sound.{py,json,md}.
         self.sound_events
-            .push(SimSoundEvent::ObjectSoundReleased { owner: id });
+            .emit(SimSoundEvent::ObjectSoundReleased { owner: id });
         if let Some(stop_sound_id) = stop_sound {
             // Native425618 plays StopSound after releasing the Report. The
             // preceding release removes this owner's handle, so the existing
             // stop/play consumer cannot interrupt the released Report.
-            self.sound_events.push(SimSoundEvent::AnimationStopped {
+            self.sound_events.emit(SimSoundEvent::AnimationStopped {
                 anim_id: id,
                 stop_sound_id: Some(stop_sound_id),
                 world,
@@ -1902,7 +3221,7 @@ impl Simulation {
         // Building44EA1A..44EA4F clears its matching damage-fire slot or
         // runs the building-slot transition before this Anim leaves Logic.
         self.notify_anim_pointer_expired(id);
-        self.clear_damage_fire_anim_reference(id);
+        self.substrate.clear_damage_fire_anim_reference(id);
         self.building_anim_pointer_expired(id, rules);
         // Limbo5F4D30→DetachAll5F4D61 announces again. The first callback
         // normally removed the reverse index; preserve the second visit for
@@ -1911,7 +3230,13 @@ impl Simulation {
         self.notify_anim_pointer_expired(id);
         self.building_anim_pointer_expired(id, rules);
         self.conceal_anim(id);
-        self.substrate.pending_delete.queue_object(id);
+        // VERA-only: a local anim waits for the drain outside the shared,
+        // hashed queue gamemd puts it in.
+        if is_local_anim_id(id) {
+            self.substrate.anims.queue_local_delete(id);
+        } else {
+            self.substrate.pending_delete.queue_object(id);
+        }
     }
 
     /// Building451A2C, ClearAnimSlot451E40 and Infantry5185C3 use scalar
@@ -1923,35 +3248,27 @@ impl Simulation {
         // cleared by the caller before these synchronous destructor effects.
         let sound_active = self.anim(id).is_some_and(|anim| anim.start_sound_active);
         self.notify_anim_pointer_expired(id);
-        self.clear_damage_fire_anim_reference(id);
-        self.release_anim_owner_reference(id);
-        self.clear_building_anim_reference(id);
+        self.substrate.clear_damage_fire_anim_reference(id);
+        self.substrate.release_last_anim_owner_flag(id);
+        self.substrate.release_anim_owner_reference(id);
+        self.substrate.clear_building_anim_reference(id);
         if sound_active {
             self.sound_events
-                .push(SimSoundEvent::ObjectSoundReleased { owner: id });
+                .emit(SimSoundEvent::ObjectSoundReleased { owner: id });
         }
         self.conceal_anim(id);
         self.substrate.pending_delete.remove_object(id);
+        // Scalar slot deletion451A2C ends its inherited FoggedOut199 flag;
+        // the immutable FoggedObject record does not retain this Anim pointer.
+        self.fog.forget_fogged_live_object(id);
         self.substrate.anims.remove(id);
-    }
-
-    pub(crate) fn clear_damage_fire_anim_reference(&mut self, id: AnimId) {
-        let link = self
-            .anim_mut_by_id(id)
-            .and_then(|anim| anim.damage_fire_slot.take());
-        if let Some((owner, slot)) = link
-            && let Some(entity) = self.substrate.entities.get_mut(owner)
-            && entity.damage_fires.anim_ids[usize::from(slot)] == Some(id)
-        {
-            entity.damage_fires.anim_ids[usize::from(slot)] = None;
-        }
     }
 
     /// AnimClass::SetOwnerObject424B50. Normal detach preserves absolute
     /// coordinates and gates Remove/Submit on the entry Object+74 mark. Attach
     /// always removes, stores owner-relative coordinates, then submits Ground.
-    /// The owner+17C callback is a bare RET for all currently supported Techno
-    /// owners; Object+84's shared-owner flag has no consumer here.
+    /// The owner+17C callback is a bare RET5F43C0 for supported Techno owners.
+    /// Last detach clears Object+84; every attach sets it before publishing CC.
     pub(crate) fn set_anim_owner_object(
         &mut self,
         id: AnimId,
@@ -1962,40 +3279,94 @@ impl Simulation {
             return false;
         };
         let marked = anim.display.marked_on_map;
+        // A terrain owner (Ares terrain fire): the same detach, whose
+        // last-anim callback is TerrainClass vt+0x17C, Finish_Fire_Death
+        // (`0x00424BB0`). Its stored coordinate is already absolute.
+        let owner_terrain = anim.owner_terrain;
+        if let Some(terrain) = owner_terrain {
+            if marked {
+                self.substrate.display.remove(id);
+            }
+            let last = !self.substrate.anims.another_owned_by_terrain(id, terrain);
+            if last {
+                self.terrain_finish_fire_death(terrain);
+            }
+            self.substrate.anims.set_owner_terrain(id, None);
+            if marked {
+                self.submit_anim_display(id, rules);
+            }
+        }
+        let Some(anim) = self.anim(id) else {
+            return false;
+        };
         if anim.owner_entity.is_some() {
             if marked {
                 self.substrate.display.remove(id);
             }
+            self.substrate.release_last_anim_owner_flag(id);
             let absolute = self.anim_absolute_coord(id).expect("live Anim");
-            let anim = self.anim_mut_by_id(id).expect("live Anim");
-            anim.owner_entity = None;
+            self.substrate.anims.set_owner_entity(id, None);
+            let anim = self.substrate.anims.get_mut(id).expect("live Anim");
             anim.world_coord = absolute;
             if marked {
-                self.submit_anim_display(id, Some(rules));
+                self.submit_anim_display(id, rules);
             }
         }
         if let Some(owner_id) = new_owner {
             let Some(owner_coord) = self.anim_owner_coords(owner_id) else {
                 return false;
             };
+            if !self.substrate.entities.contains(owner_id) {
+                // A terrain owner: attach without the coordinate conversion
+                // (see `AnimObject::owner_terrain`) or the Object+84 flag,
+                // which no terrain reader asks.
+                self.substrate.display.remove(id);
+                self.substrate.anims.set_owner_terrain(id, Some(owner_id));
+                self.submit_anim_display(id, rules);
+                return true;
+            }
             self.substrate.display.remove(id);
-            let anim = self.anim_mut_by_id(id).expect("live Anim");
+            // A presentation anim leaves the owner's flag alone
+            // (`AnimConstructorInput::Presentation`).
+            if !self.anim(id).is_some_and(AnimObject::is_presentation) {
+                self.substrate
+                    .entities
+                    .get_mut(owner_id)
+                    .expect("the resolved Anim owner remains stored")
+                    .set_attached_anim_flag(true);
+            }
+            let anim = self.substrate.anims.get_mut(id).expect("live Anim");
             anim.world_coord = AnimWorldCoord {
                 x: anim.world_coord.x.wrapping_sub(owner_coord.x),
                 y: anim.world_coord.y.wrapping_sub(owner_coord.y),
                 z: anim.world_coord.z.wrapping_sub(owner_coord.z),
             };
-            anim.owner_entity = Some(owner_id);
-            self.submit_anim_display(id, Some(rules));
+            self.substrate.anims.set_owner_entity(id, Some(owner_id));
+            self.submit_anim_display(id, rules);
         }
         true
     }
 
     /// Anim GetLayer424CB0: attached -> Ground; missing type -> Air; otherwise
     /// the current type's layer.
-    pub(crate) fn submit_anim_display(&mut self, id: AnimId, rules: Option<&RuleSet>) {
+    pub(crate) fn submit_anim_display(&mut self, id: AnimId, rules: &RuleSet) {
+        // A presentation anim keeps the layer it draws in instead of a slot.
+        if self.anim(id).is_some_and(AnimObject::is_presentation) {
+            let layer = self.anim_display_layer(id, rules);
+            if let Some(anim) = self.substrate.anims.get_mut(id) {
+                anim.presentation = Some(layer);
+            }
+            return;
+        }
         if let Some(layer) = self.anim_display_layer(id, rules) {
-            self.submit_object_display(id, layer, rules);
+            Self::submit_object_display(
+                &self.interner,
+                &self.terrain_objects,
+                &mut self.substrate,
+                id,
+                layer,
+                rules,
+            );
         } else {
             self.substrate.display.remove(id);
         }
@@ -2004,19 +3375,18 @@ impl Simulation {
     pub(crate) fn anim_display_layer(
         &self,
         id: AnimId,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
     ) -> Option<crate::sim::world::display_layers::DisplayLayer> {
         use crate::rules::art_data::AnimLayer;
         use crate::sim::world::display_layers::DisplayLayer;
         let anim = self.substrate.anims.get(id)?;
-        if anim.owner_entity.is_some() {
+        let attached = anim.owner_entity.is_some() || anim.owner_terrain.is_some();
+        if attached {
             return Some(DisplayLayer::GROUND);
         }
-        let config = rules.and_then(|rules| {
-            rules
-                .art()
-                .anim_runtime_config(self.interner.resolve(anim.type_id))
-        });
+        let config = rules
+            .art()
+            .anim_runtime_config(self.interner.resolve(anim.type_id));
         match config.map(|config| config.layer) {
             None => Some(DisplayLayer::AIR),
             Some(AnimLayer::Ground) => Some(DisplayLayer::GROUND),
@@ -2024,12 +3394,6 @@ impl Simulation {
             Some(AnimLayer::Other(index)) => {
                 u8::try_from(index).ok().and_then(DisplayLayer::from_index)
             }
-        }
-    }
-
-    pub(crate) fn mark_anim_display(&mut self, id: AnimId, marked: bool) {
-        if let Some(anim) = self.anim_mut_by_id(id) {
-            anim.display.marked_on_map = marked;
         }
     }
 
@@ -2059,7 +3423,93 @@ impl Simulation {
         ))
     }
 
+    /// Intern now every name a presentation anim of type `config` may intern
+    /// on a later visit: the types it can become or make (`Next=`,
+    /// `TrailerAnim=`, `ExpireAnim=`, `BounceAnim=`) and their StopSounds.
+    /// A game loaded or rejoined while the anim lives lacks the anim, so the
+    /// interner must not wait for its visits to learn them.
+    fn intern_presentation_chain(&mut self, rules: &RuleSet, config: &AnimTypeRuntimeConfig) {
+        let children = |config: &AnimTypeRuntimeConfig| {
+            [
+                config.next.clone(),
+                config.trailer_anim.clone(),
+                config.expire_anim.clone(),
+                config.bounce_anim.clone(),
+            ]
+            .into_iter()
+            .flatten()
+        };
+        let mut pending: Vec<String> = children(config).collect();
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(name) = pending.pop() {
+            if seen.contains(&name) {
+                continue;
+            }
+            self.interner.intern(&name);
+            if let Some(child) = rules.art().anim_runtime_config(&name) {
+                if let Some(sound) = child.stop_sound.as_deref() {
+                    self.interner.intern(sound);
+                }
+                pending.extend(children(child));
+            }
+            seen.push(name);
+        }
+    }
+
+    /// Whether presentation anim `id` rides an owner its UnInit has ended.
+    pub(crate) fn presentation_anim_orphaned(&self, id: AnimId) -> bool {
+        self.anim(id)
+            .filter(|anim| anim.is_presentation())
+            .and_then(|anim| anim.owner_entity)
+            .is_some_and(|owner| {
+                self.substrate
+                    .entities
+                    .get(owner)
+                    .is_none_or(|entity| !entity.lifecycle.object_alive())
+            })
+    }
+
+    /// The presentation anims ([`AnimConstructorInput::Presentation`]) that
+    /// draw this frame, each with its layer, in the order they were made. The
+    /// presentation draws each at the end of its layer, after the Display
+    /// members: depth, not the vector's order, hides what stands in front.
+    pub fn presentation_anims(
+        &self,
+    ) -> impl Iterator<Item = (AnimId, crate::sim::world::display_layers::DisplayLayer)> + '_ {
+        self.substrate
+            .anims
+            .presentation_iter()
+            .filter(|(id, _)| !self.substrate.anims.local_delete_queued(**id))
+            .filter_map(|(&id, anim)| Some((id, anim.presentation_layer()?)))
+    }
+
+    /// Every Anim's [`Self::anim_absolute_coord`], in one walk of the store,
+    /// the local anims last: the presentation places what it draws by these.
+    pub fn anim_absolute_coords(&self) -> impl Iterator<Item = (AnimId, AnimWorldCoord)> + '_ {
+        let terrain = self.resolved_terrain.as_ref();
+        let anims = &self.substrate.anims;
+        anims
+            .iter()
+            .chain(anims.local_iter())
+            .map(move |(&id, anim)| {
+                (
+                    id,
+                    anim_world_coords(anim, &self.substrate.entities, terrain),
+                )
+            })
+    }
+
     pub(crate) fn anim_owner_coords(&self, owner_id: u64) -> Option<AnimWorldCoord> {
+        // A terrain owner's centre is its GetCoords (Terrain VT+48 ->
+        // Object5F65A0), for the Ares terrain fire.
+        if !self.substrate.entities.contains(owner_id) {
+            let centre = self.terrain_objects.get(owner_id)?.world_coord();
+            return Some(AnimWorldCoord {
+                x: centre.x,
+                y: centre.y,
+                z: centre.z,
+            });
+        }
         Some(anim_owner_world_coords(
             self.substrate.entities.get(owner_id)?,
             self.resolved_terrain.as_ref(),
@@ -2070,27 +3520,16 @@ impl Simulation {
     /// other owner references, not Building damage-fire slots. Those clear
     /// only when this Anim broadcasts its own pointer expiry (44EA45).
     pub(crate) fn detach_anim_from_owner(&mut self, id: AnimId, rules: &RuleSet) -> Option<u64> {
+        // A terrain owner's +60 is the Object base, which keeps no anim.
+        if let Some(terrain) = self.substrate.anims.owner_terrain(id) {
+            self.set_anim_owner_object(id, None, rules);
+            return Some(terrain);
+        }
         let owner = self.anim(id)?.owner_entity?;
         if let Some(entity) = self.substrate.entities.get_mut(owner) {
-            // TechnoClass::Detach710415/71042F/710443 clear the matching
-            // Techno+0x12C, +0x1D4 and +0x130.
-            entity.expire_behind_anim(id);
-            entity.drain.expire_anim(id);
-            entity.expire_deploy_anim(id);
+            entity.attached_anim_expired(id);
         }
         self.set_anim_owner_object(id, None, rules);
-        Some(owner)
-    }
-
-    /// Destruction/expiry clear the reference without SetOwner's coordinate
-    /// conversion or intermediate display submission (422961 / 425190).
-    pub(crate) fn release_anim_owner_reference(&mut self, id: AnimId) -> Option<u64> {
-        let owner = self.anim_mut_by_id(id)?.owner_entity.take()?;
-        if let Some(entity) = self.substrate.entities.get_mut(owner) {
-            entity.expire_behind_anim(id);
-            entity.drain.expire_anim(id);
-            entity.expire_deploy_anim(id);
-        }
         Some(owner)
     }
 
@@ -2100,26 +3539,27 @@ impl Simulation {
     /// Its independent attached-Bullet arm clears +17C before UnInit (4251AD).
     /// Native comparisons: tools/spatial_oracle/display_anim_owner.json.
     ///
-    /// Residual: native AI checks +19B at42435F after looping-sound, bounce and
-    /// visibility work; `visit_anim` currently checks it earlier, after ore
-    /// visibility/occupation.
-    /// Owner expiry during combat therefore still needs that prefix audit when
-    /// its missing effects land. Occupied-cell424358 and animated-tiberium424427
-    /// writers of +19B remain unported. No claim of complete Anim AI parity.
+    /// AI checks +19B at42435F after its bounce/trailer/DropZone prefix. The
+    /// same gate serves owner expiry, occupied-cell424358 and the later
+    /// IsAnimatedTiberium424427 writer; the latter finishes its current visit.
     pub(crate) fn anim_pointer_expired(
         &mut self,
         id: AnimId,
         expired_id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
     ) -> bool {
         let mut changed = false;
-        if self.anim(id).and_then(|anim| anim.owner_entity) == Some(expired_id) {
-            self.lifecycle_outputs
-                .push(LifecycleOutput::DisplayRemove { stable_id: id });
+        let owner = self
+            .anim(id)
+            .and_then(|anim| anim.owner_entity.or(anim.owner_terrain));
+        if owner == Some(expired_id) {
             self.substrate.display.remove(id);
-            self.release_anim_owner_reference(id);
-            self.mark_anim_display(id, false);
-            if let Some(anim) = self.anim_mut_by_id(id) {
+            if let Some(entity) = self.substrate.entities.get_mut(expired_id) {
+                entity.attached_anim_expired(id);
+            }
+            self.substrate.release_anim_owner_reference(id);
+            self.substrate.mark_anim_display(id, false);
+            if let Some(anim) = self.substrate.anims.get_mut(id) {
                 anim.runtime.inactive = true;
             }
             changed = true;
@@ -2140,103 +3580,19 @@ impl Simulation {
     /// Manual frame writer62979A..6297D7: restart the owned stage timer,
     /// write its reload rate (+C0 at6297B7), then set the requested frame.
     /// The animation remains in Logic and must retain this rate on expiry.
-    pub(crate) fn set_anim_manual_frame(&mut self, id: AnimId, frame: i32, duration: u16) {
-        let current = self.session.binary_frame as i32;
-        if let Some(anim) = self.anim_mut_by_id(id) {
+    pub(crate) fn set_anim_manual_frame(
+        session: &ScenarioSession,
+        substrate: &mut ObjectSubstrate,
+        id: AnimId,
+        frame: i32,
+        duration: u16,
+    ) {
+        let current = session.binary_frame() as i32;
+        if let Some(anim) = substrate.anims.get_mut(id) {
             anim.runtime.frame_timer = CdTimer::started(current, i32::from(duration));
             anim.runtime.rate_reload = duration;
             anim.runtime.current_frame = frame;
         }
-    }
-
-    pub(crate) fn set_anim_frame_and_z_adjust(&mut self, id: AnimId, frame: i32, z_adjust: i32) {
-        if let Some(anim) = self.anim_mut_by_id(id) {
-            anim.runtime.current_frame = frame;
-            anim.z_adjust = z_adjust;
-        }
-    }
-
-    /// Apply OverlayClass's post-constructor CellAnim writes: `+0xD4` selects
-    /// the Tiberium ConvertClass when present and `+0xFC` receives CellClass's
-    /// current ground Z-adjust (`+0x10A`).
-    pub fn set_cell_anim_draw_authority(
-        &mut self,
-        id: AnimId,
-        remap_color: Option<HouseColorIndex>,
-        z_adjust: i32,
-    ) -> bool {
-        let Some(anim) = self.anim_mut_by_id(id) else {
-            return false;
-        };
-        anim.remap = remap_color.map(AnimRemap::ColorScheme);
-        anim.z_adjust = z_adjust;
-        true
-    }
-
-    /// A house's colour conversion as the anim's remap (`+0xD4`), frozen at
-    /// the write; later disguise or owner changes must not recolor the anim.
-    /// Unit deploy739C1A/739DFE store the one Techno705D70 returns
-    /// (CustomPalette is not yet represented by this owner; stock SCHP uses
-    /// the house conversion); InfantryClass::ReceiveDamage's InfDeath 9 arm
-    /// the house's colour scheme's (`0x00518AB5..0x00518AC9`,
-    /// `0x00518AE4..0x00518AF9`).
-    pub fn set_anim_house_remap(&mut self, id: AnimId, house: InternedId) -> bool {
-        let Some(anim) = self.anim_mut_by_id(id) else {
-            return false;
-        };
-        anim.remap = Some(AnimRemap::House(house));
-        true
-    }
-
-    /// Apply CellClass's producer-owned `AnimClass +0x100` write after the
-    /// delay-zero constructor has already run `Middle`.
-    pub(crate) fn set_terrain_anim_z_adjust_after_construction(
-        &mut self,
-        id: AnimId,
-        z_adjust: i32,
-    ) -> bool {
-        let Some(anim) = self.anim_mut_by_id(id) else {
-            return false;
-        };
-        if !anim.terrain_attached || anim.z_adjust != 0 {
-            return false;
-        }
-        anim.z_adjust = z_adjust;
-        true
-    }
-
-    /// A producer's plain post-construction `AnimClass +0x100` (ZAdjust)
-    /// write, such as CaptureUnit's building ring (`0x00471F66`).
-    pub(crate) fn set_anim_z_adjust(&mut self, id: AnimId, z_adjust: i32) -> bool {
-        let Some(anim) = self.anim_mut_by_id(id) else {
-            return false;
-        };
-        anim.z_adjust = z_adjust;
-        true
-    }
-
-    /// A producer's plain Anim+19D store. Mirage's attached-ring tail
-    /// `746A9C..746B19` changes drawing without suspending the Anim AI.
-    pub(crate) fn set_anim_hidden(&mut self, id: AnimId, hidden: bool) -> bool {
-        let Some(anim) = self.anim_mut_by_id(id) else {
-            return false;
-        };
-        anim.draw_runtime.hidden = hidden;
-        true
-    }
-
-    /// `AnimClass::SetOwnerHouse @ 0x00424CA0`: store `+0x180`.
-    pub(crate) fn set_anim_owner_house(&mut self, id: AnimId, house: InternedId) -> bool {
-        let Some(anim) = self.anim_mut_by_id(id) else {
-            return false;
-        };
-        anim.owner_house = Some(house);
-        true
-    }
-
-    /// `0x00424C90`: store `+0x17C`, the bullet whose expiry ends the anim.
-    pub(crate) fn set_anim_attached_bullet(&mut self, id: AnimId, bullet: Option<u64>) -> bool {
-        self.substrate.anims.set_attached_bullet(id, bullet)
     }
 
     /// Original43B5E0: caller supplies the target's GetCoords and the name;
@@ -2256,10 +3612,17 @@ impl Simulation {
             draw_flags: 0x600,
             ..AnimClassSpawnDescriptor::new(type_name, rx, ry, sub_x, sub_y, z)
         };
-        let id = self.spawn_anim_at_world(rules, descriptor, world).ok()?;
-        self.set_anim_attached_bullet(id, Some(bullet));
-        self.set_anim_owner_house(id, house);
-        self.set_anim_hidden(id, true);
+        let id = match self.spawn_anim_at_world(rules, descriptor, world) {
+            Ok(id) => id,
+            Err(AnimSpawnError::Tiberium(error)) => {
+                log::warn!("bullet warning refused an invalid Tiberium Image start: {error}");
+                return None;
+            }
+            Err(_) => return None,
+        };
+        self.substrate.set_anim_attached_bullet(id, Some(bullet));
+        self.substrate.set_anim_owner_house(id, house);
+        self.substrate.set_anim_hidden(id, true);
         Some(id)
     }
 
@@ -2296,11 +3659,16 @@ impl Simulation {
         }
         let terrain = self.resolved_terrain.as_ref();
         let at = anim_world_coords(anim, &self.substrate.entities, terrain);
-        let cell = crate::sim::projectile::cell_ground_coord(
-            terrain,
-            (at.x / 256) as u16,
-            (at.y / 256) as u16,
-        );
+        // The lookup stamps the fallback CellClass on a miss, as native's
+        // does. The presentation asks this, so the stamp stays private to
+        // the query: drawing must not change the simulation.
+        let cell = self.effective_shared_cell_dummy().detached(|| {
+            crate::sim::projectile::cell_ground_coord(
+                terrain,
+                (at.x / 256) as u16,
+                (at.y / 256) as u16,
+            )
+        });
         self.psychic_detection_sites(viewer, rules)
             .any(|(site, radius)| {
                 crate::util::native_x87::distance_3d_leptons(
@@ -2332,8 +3700,10 @@ impl Simulation {
         };
         let maximum = object_type.strength;
         let can_be_occupied = object_type.can_be_occupied;
-        let image = object_type.image.clone();
-        let foundation = object_type.foundation.clone();
+        // Borrowed from the rules, which outlive this visit: the image and
+        // foundation are read only when the fires start.
+        let image = &object_type.image;
+        let foundation = &object_type.foundation;
         let ratio = if can_be_occupied {
             rules.general.condition_red
         } else {
@@ -2347,7 +3717,7 @@ impl Simulation {
             return;
         }
         if !active {
-            self.clear_building_damage_fire_slots(building_id, Some(rules));
+            self.clear_building_damage_fire_slots(building_id, rules);
         } else if !rules.general.damage_fire_types.is_empty() {
             let type_count = rules.general.damage_fire_types.len();
             let mut type_index = self
@@ -2356,11 +3726,10 @@ impl Simulation {
                 as usize;
             let offsets = rules
                 .art()
-                .get(&image)
+                .get(image)
                 .map(|entry| entry.damage_fire_offsets.clone())
                 .unwrap_or_default();
-            let (foundation_w, foundation_h) =
-                crate::rules::foundation::foundation_dimensions(&foundation);
+            let (foundation_w, foundation_h) = foundation.dimensions();
             let foundation_sum = i32::from(foundation_w).wrapping_add(i32::from(foundation_h));
             let location = crate::sim::movement::ground_pose::object_location(
                 self.substrate.entities.get(building_id).unwrap(),
@@ -2382,6 +3751,12 @@ impl Simulation {
                 let Some(offset) = offsets.get(slot).copied() else {
                     break;
                 };
+                // 43C124..43C137: an offset equal to the zero Point2D at
+                // 89C848 (never written) ends the fires, as the reader's end
+                // marker does; an explicit `DamageFireOffsetN=0,0` stops here.
+                if offset.pixel_x == 0 && offset.pixel_y == 0 {
+                    break;
+                }
                 let fire_name = &rules.general.damage_fire_types[type_index].name;
                 let fire_type = self.interner.intern(fire_name);
                 let descriptor = AnimClassSpawnDescriptor {
@@ -2406,13 +3781,29 @@ impl Simulation {
                     y: base.y.wrapping_add(offset.world_dy),
                     z: base.z,
                 };
-                let anim_id = self
-                    .spawn_anim_at_world(rules, descriptor, world)
-                    .expect("validated stock damage-fire animation must spawn");
+                let anim_id = match self.spawn_anim_at_world(rules, descriptor, world) {
+                    Ok(id) => id,
+                    Err(AnimSpawnError::Tiberium(error)) => {
+                        log::warn!(
+                            "damage-fire animation refused an invalid Tiberium Image start: {error}"
+                        );
+                        break;
+                    }
+                    // A map or mod can list a `DamageFireTypes=` entry with
+                    // no bound art. Nothing is written for this slot before
+                    // the spawn, so the building keeps its earlier fires and
+                    // gets no more this pass, as for the trailer above.
+                    Err(error) => {
+                        log::warn!("damage-fire animation not spawned: {error}");
+                        break;
+                    }
+                };
                 // Original43C0D0/43C1EB retains only the Building5C8 slot.
                 // The constructor leaves Anim+CC null: absolute coordinates
                 // and the expiry listener do not require Object attachment.
-                self.anim_mut_by_id(anim_id)
+                self.substrate
+                    .anims
+                    .get_mut(anim_id)
                     .expect("new damage fire")
                     .damage_fire_slot = Some((building_id, slot as u8));
                 if let Some(entity) = self.substrate.entities.get_mut(building_id) {
@@ -2436,7 +3827,8 @@ impl Simulation {
                 } else {
                     0
                 };
-                self.set_anim_frame_and_z_adjust(anim_id, frame, z_adjust);
+                self.substrate
+                    .set_anim_frame_and_z_adjust(anim_id, frame, z_adjust);
                 type_index += 1;
                 if type_index == type_count {
                     type_index = 0;
@@ -2451,14 +3843,12 @@ impl Simulation {
         }
     }
 
-    /// Recovery43FCA4 and destructor43BDE0 call Anim Destroy, not scalar delete.
+    /// Recovery43FCA4, destructor43BDE0 and Building Limbo 4458E4..445903
+    /// call Anim UnInit4255B0 (deferred), not scalar delete, on each of the
+    /// eight slots and null it; none of them writes5E8 here.
     /// The destructor follows owner expiry, so its Anims no longer need Rules
     /// for SetOwner's intermediate display resubmission.
-    pub(crate) fn clear_building_damage_fire_slots(
-        &mut self,
-        building_id: u64,
-        rules: Option<&RuleSet>,
-    ) {
+    pub(crate) fn clear_building_damage_fire_slots(&mut self, building_id: u64, rules: &RuleSet) {
         if !self.substrate.entities.contains(building_id) {
             return;
         }
@@ -2478,17 +3868,25 @@ impl Simulation {
         }
     }
 
-    fn choose_anim_rate(&mut self, config: &AnimTypeRuntimeConfig) -> u16 {
-        let drawn = anim_random_rate(config, &mut self.scenario_rng);
-        self.anim_rate(config, drawn)
+    fn choose_anim_rate(
+        session: &ScenarioSession,
+        scenario_rng: &mut SimRng,
+        config: &AnimTypeRuntimeConfig,
+    ) -> u16 {
+        let drawn = anim_random_rate(config, scenario_rng);
+        Self::anim_rate(session, config, drawn)
     }
 
     /// The frame delay from `Rate=` or a drawn `RandomRate=` pick, normalized
     /// to the game speed for `Normalized=` types.
-    fn anim_rate(&self, config: &AnimTypeRuntimeConfig, random_rate: Option<u16>) -> u16 {
+    fn anim_rate(
+        session: &ScenarioSession,
+        config: &AnimTypeRuntimeConfig,
+        random_rate: Option<u16>,
+    ) -> u16 {
         let delay = random_rate.unwrap_or(config.rate_logic_frames);
         if config.normalized {
-            self.session.game_options.normalized_anim_delay(delay)
+            session.game_options().normalized_anim_delay(delay)
         } else {
             delay
         }
@@ -2519,18 +3917,20 @@ impl Simulation {
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
-    ) -> Option<bool> {
-        let mut body = self.anim(id).and_then(|anim| anim.bounce)?;
+    ) -> Result<Option<bool>, RuntimeOverlayError> {
+        let Some(mut body) = self.anim(id).and_then(|anim| anim.bounce) else {
+            return Ok(None);
+        };
         let outcome = self.anim_bounce_update(&mut body, rules);
         if config.is_meteor
             && let Err(error) = body.compensate_meteor_gravity()
         {
             log::warn!("meteor anim left the verified x87 domain: {error}");
             self.destroy_anim(id, rules);
-            return Some(false);
+            return Ok(Some(false));
         }
         let position = body.position_leptons();
-        if let Some(anim) = self.anim_mut_by_id(id) {
+        if let Some(anim) = self.substrate.anims.get_mut(id) {
             anim.bounce = Some(body);
         }
         let mut bridge_state_changed = false;
@@ -2548,7 +3948,7 @@ impl Simulation {
             }
             BounceOutcome::Stopped => self.destroy_anim(id, rules),
         }
-        if let Some(anim) = self.anim_mut_by_id(id) {
+        if let Some(anim) = self.substrate.anims.get_mut(id) {
             anim.world_coord = AnimWorldCoord {
                 x: position.x,
                 y: position.y,
@@ -2556,12 +3956,12 @@ impl Simulation {
             };
         }
         if outcome == BounceOutcome::Falling {
-            return None;
+            return Ok(None);
         }
         bridge_state_changed |=
-            self.anim_bounce_landing(config, rules, overlay_registry, position, frame_effects);
+            self.anim_bounce_landing(config, rules, overlay_registry, position, frame_effects)?;
         self.destroy_anim(id, rules);
-        Some(bridge_state_changed)
+        Ok(Some(bridge_state_changed))
     }
 
     /// The Bounced arm of `AnimClass::ProcessBounceResult` (`0x00423981..
@@ -2574,7 +3974,7 @@ impl Simulation {
         id: AnimId,
         config: &AnimTypeRuntimeConfig,
         rules: &RuleSet,
-        overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        _overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         position: glam::IVec3,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
@@ -2583,92 +3983,27 @@ impl Simulation {
         {
             self.spawn_named_anim(rules, bounce_anim, coord, 0, BOUNCE_CONTACT_DRAW_FLAGS, 0);
         }
-        // Map[coord] (`0x004239E5`); VERA keeps no objects on the dummy cell.
-        let (Some(warhead_name), Some((rx, ry))) = (
-            config.warhead.as_deref(),
-            self.map_coord_cell(position.x, position.y),
-        ) else {
+        let Some(warhead_name) = config.warhead.as_deref() else {
             return false;
         };
         let damage = match X87Chop53::load_f64(config.damage).and_then(X87Chop53::ftol_i64) {
             Ok(damage) => damage as i32,
             Err(_) => return false,
         };
-        let warhead_ref = self.interner.intern(warhead_name);
-        use crate::sim::combat::combat_aoe::AreaDamageReceiver;
-        use crate::sim::occupancy::CellObjectMember;
-        let ground = MovementLayer::Ground;
-        let mut current = self.cell_objects((rx, ry), ground).next();
-        let mut bridge_state_changed = false;
-        while let Some(target) = current {
-            let center = match target {
-                CellObjectMember::Entity(id) => self.substrate.entities.get(id).map(|entity| {
-                    let [x, y] = crate::sim::movement::ground_pose::object_center_xy(entity);
-                    (x, y)
-                }),
-                // Loaded Terrain objects retain their map-cell center. This
-                // contact gate uses XY only (GetCoords5F65A0); it does not
-                // substitute ground/deck height for the object's location.
-                CellObjectMember::Terrain(id) => {
-                    self.production.terrain_objects.get(&id).map(|tree| {
-                        let coord = tree.world_coord();
-                        (coord.x, coord.y)
-                    })
-                }
-            };
-            if let Some((x, y)) = center {
-                let distance = position
-                    .x
-                    .wrapping_sub(x)
-                    .wrapping_abs()
-                    .wrapping_add(position.y.wrapping_sub(y).wrapping_abs());
-                if distance <= config.damage_radius {
-                    let distance_leptons = crate::util::native_x87::adjust_for_z_standard(distance);
-                    let receiver = match target {
-                        CellObjectMember::Entity(id) => AreaDamageReceiver::Entity(
-                            crate::sim::combat::EntityDamageEvent::direct_receiver(
-                                id,
-                                damage,
-                                distance_leptons,
-                                crate::sim::combat::RAD_NO_ATTACKER,
-                                None,
-                                warhead_ref,
-                                crate::sim::combat::ReceiverCallFlags {
-                                    ignore_defenses: false,
-                                    arg6: false,
-                                },
-                            ),
-                        ),
-                        CellObjectMember::Terrain(id) => {
-                            let tree = &self.production.terrain_objects[&id];
-                            AreaDamageReceiver::Terrain(crate::sim::combat::TerrainDamageEvent {
-                                stable_id: id,
-                                rx: tree.rx,
-                                ry: tree.ry,
-                                damage,
-                                distance_leptons,
-                                warhead_ref,
-                                near_center_ic_isolation_eligible: false,
-                            })
-                        }
-                    };
-                    bridge_state_changed |= self
-                        .commit_noncombat_aoe_receivers(
-                            rules,
-                            overlay_registry,
-                            &[receiver],
-                            frame_effects,
-                        )
-                        .bridge_state_changed;
-                }
-            }
-            // 423A83 reads Object+30 AFTER ReceiveDamage. The native Terrain
-            // lethal tail unlinks synchronously and clears that successor;
-            // collecting a vector up front would incorrectly hit later objects.
-            // Evidence: tools/spatial_oracle/terrain_debris_receiver.json.
-            current = self.next_cell_object(target);
+        // Ares 3.0 AnimClass_UpdateBounce_Damage (1005C410, hook 0x4239F0):
+        // a negative DamageRadius or a Damage of zero damages nothing.
+        if rules.ares() && (config.damage_radius < 0 || damage == 0) {
+            return false;
         }
-        bridge_state_changed
+        let warhead_ref = self.interner.intern(warhead_name);
+        self.apply_bounce_contact_damage(
+            position,
+            config.damage_radius,
+            crate::sim::world::BounceContactDamage::Anim(damage),
+            warhead_ref,
+            rules,
+            frame_effects,
+        )
     }
 
     /// The landing arm proper (`0x00423C4A..0x00423EF8`); see
@@ -2680,7 +4015,7 @@ impl Simulation {
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         position: glam::IVec3,
         frame_effects: FrameEffects<'_>,
-    ) -> bool {
+    ) -> Result<bool, RuntimeOverlayError> {
         let location = AnimWorldCoord {
             x: position.x,
             y: position.y,
@@ -2710,7 +4045,7 @@ impl Simulation {
                 };
                 self.spawn_named_anim(rules, splash, splash_coord, 0, BOUNCE_CONTACT_DRAW_FLAGS, 0);
             }
-            return false;
+            return Ok(false);
         }
         //423C4A..423EFD: only the explosion prefix requires ExpireAnim.
         //The Spawns/IsTiberium continuation still runs without it or a Warhead.
@@ -2741,11 +4076,13 @@ impl Simulation {
                     impact,
                     damage,
                     warhead,
+                    true,
                     (crate::sim::combat::RAD_NO_ATTACKER, None, warhead_ref),
                     frame_effects,
-                );
+                )
+                .bridge_state_changed;
                 self.combat_light_requests
-                    .push(crate::sim::combat::CombatLightRequest::Impact {
+                    .emit(crate::sim::combat::CombatLightRequest::Impact {
                         target_id: None,
                         damage,
                         warhead_ref,
@@ -2770,9 +4107,9 @@ impl Simulation {
             }
         }
         if config.is_tiberium && !above_deck {
-            self.anim_landing_tiberium(config, rules, overlay_registry, position);
+            self.anim_landing_tiberium(config, rules, overlay_registry, position, frame_effects)?;
         }
-        bridge_state_changed
+        Ok(bridge_state_changed)
     }
 
     /// AnimAI423FD0..424269. The radius gates a squared-distance loop, but
@@ -2784,21 +4121,17 @@ impl Simulation {
         rules: &RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         position: glam::IVec3,
-    ) {
+        frame_effects: FrameEffects<'_>,
+    ) -> Result<(), RuntimeOverlayError> {
         use crate::sim::tiberium::{NewTiberiumAdmission, TiberiumPlacementObjectContext};
         let Some(registry) = registry else {
-            return;
+            return Ok(());
         };
         let radius = config.tiberium_spread_radius;
         let first = radius.wrapping_neg();
         if first > radius {
-            return;
+            return Ok(());
         }
-        let lighting = self
-            .session
-            .lighting
-            .profile(crate::sim::scenario_session::ScenarioLightingProfile::Normal)
-            .into();
         for x in first..=radius {
             for y in first..=radius {
                 if crate::util::native_x87::sqrt_approx_length([x, y]) > radius {
@@ -2813,7 +4146,7 @@ impl Simulation {
                     let (Some(terrain), Some(grid)) =
                         (self.resolved_terrain.as_ref(), self.overlay_grid.as_ref())
                     else {
-                        return;
+                        return Ok(());
                     };
                     let objects = TiberiumPlacementObjectContext::new(
                         &self.substrate.entities,
@@ -2821,11 +4154,11 @@ impl Simulation {
                         &self.substrate.raw_cell_occupation,
                         rules,
                         &self.interner,
-                        &self.production.terrain_object_cells,
+                        self.terrain_objects.cell_index(),
                     );
                     crate::sim::tiberium::admit_new_tiberium_target(
                         grid,
-                        &self.production.tiberium_spawning_terrain_cells,
+                        self.terrain_objects.spawning_cells(),
                         NewTiberiumAdmission::runtime(terrain, objects),
                         cell,
                     )
@@ -2845,32 +4178,34 @@ impl Simulation {
                     crate::sim::crates::construct_runtime_overlay(
                         self,
                         &rules.crate_rules,
-                        Some(rules),
+                        rules,
                         registry,
                         cell,
                         selected,
-                        lighting,
-                    );
+                        OverlayRecalc::Immediate,
+                        frame_effects,
+                    )?;
                 }
                 //424140 executes even when Overlay Unlimbo refused the cell.
                 let density = self.scenario_rng.next_range_i32_inclusive(0, 2) as u8;
                 if let Some(grid) = self.overlay_grid.as_mut() {
                     //424155: like Place487190's post-constructor store, a
                     //literal Cell+11E write even when no overlay was installed.
-                    grid.write_cell_data(self.resolved_terrain.as_mut(), cell.0, cell.1, density);
+                    grid.write_cell_data(cell.0, cell.1, density);
                 }
-                if !self.tactical_dirty_cells.contains(&cell) {
-                    self.tactical_dirty_cells.push(cell);
-                }
+                self.dirty_cells.mark_tactical_once(cell);
                 //Anim's ore arm does not call AddToGrowthQueue or radar6551C0.
             }
         }
+        Ok(())
     }
 
     /// `new AnimClass(AnimTypes[FindIndex(name)], &coord, delay, 1, flags,
     /// zAdjust, 0)`: a landing chunk's follow-up anims and the rocket puffs of
     /// Rocket Process and the spawn manager's Boomer launch. A type that never
-    /// bound constructs nothing.
+    /// bound constructs nothing. This optional-effect boundary also reports
+    /// and refuses an invalid Tiberium Image reached during the child's Start;
+    /// the core constructor and the live Anim visitor return that error.
     pub(crate) fn spawn_named_anim(
         &mut self,
         rules: &RuleSet,
@@ -2892,6 +4227,12 @@ impl Simulation {
         };
         match self.spawn_anim_at_world(rules, descriptor, coord) {
             Ok(_) => true,
+            Err(AnimSpawnError::Tiberium(error)) => {
+                log::warn!(
+                    "optional animation [{type_name}] refused an invalid Tiberium Image start: {error}"
+                );
+                false
+            }
             Err(error) => {
                 log::debug!("anim [{type_name}] did not construct: {error}");
                 false
@@ -2912,8 +4253,8 @@ impl Simulation {
     /// over (`0x00424925`).
     ///
     /// `AnimType+0x2F8` is one slot: `AnimTypeClass::ReadINI @ 0x00427D00`
-    /// reads `Report=` into it only when `StartSound=` resolved to `-1`, which
-    /// is what `start_sound.or(report)` reproduces.
+    /// reads `Report=` into it only when `StartSound=` resolved to `-1`
+    /// (`0x00428344..0x004283BC`); `config.start_sound` holds that slot.
     ///
     /// Constructor-time starts pass no overlay registry; no retail marking
     /// anim has fewer than two frames, so none marks from there.
@@ -2923,25 +4264,21 @@ impl Simulation {
         config: &AnimTypeRuntimeConfig,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-    ) {
+        frame_effects: FrameEffects<'_>,
+    ) -> Result<(), AnimSpawnError> {
+        let ares = rules.ares_form();
         let sound_name = self.anim(id).and_then(|anim| {
             (!anim.no_effects())
-                .then(|| {
-                    config
-                        .start_sound
-                        .as_ref()
-                        .or(config.report.as_ref())
-                        .cloned()
-                })
+                .then(|| config.start_sound.clone())
                 .flatten()
         });
         if let Some(sound_name) = sound_name
             && let Some(world) = self.anim_absolute_coord(id)
         {
-            if let Some(anim) = self.anim_mut_by_id(id) {
+            if let Some(anim) = self.substrate.anims.get_mut(id) {
                 anim.start_sound_active = true;
             }
-            self.sound_events.push(SimSoundEvent::AnimationStarted {
+            self.sound_events.emit(SimSoundEvent::AnimationStarted {
                 anim_id: id,
                 sound_id: sound_name,
                 world,
@@ -2951,19 +4288,213 @@ impl Simulation {
             // set or the new type has no StartSound. A late TAction41 flag
             // never cancels the constructor's sound before this later Start.
             if let Some(world) = self.anim_absolute_coord(id) {
-                self.sound_events.push(SimSoundEvent::AnimationStopped {
+                self.sound_events.emit(SimSoundEvent::AnimationStopped {
                     anim_id: id,
                     stop_sound_id: None,
                     world,
                 });
             }
-            self.anim_mut_by_id(id)
+            self.substrate
+                .anims
+                .get_mut(id)
                 .expect("restarting animation remains present")
                 .start_sound_active = false;
         }
         if middle_frame(config).is_none() {
             self.anim_middle(id, config, rules, overlay_registry);
         }
+
+        // AnimClass::Start424D5F..424EF3, original gamemd instructions:
+        // the constructor reaches this before TAction41's late NoEffects.
+        // Middle may run callbacks, so read the live instance/type again.
+        let Some(type_id) = self
+            .anim(id)
+            .filter(|anim| !anim.no_effects())
+            .map(|anim| anim.type_id())
+        else {
+            return Ok(());
+        };
+        if !rules
+            .art()
+            .anim_runtime_config(self.interner.resolve(type_id))
+            .is_some_and(|config| config.tiberium_chain_reaction)
+        {
+            return Ok(());
+        }
+        let Some(coord) = self.anim_absolute_coord(id) else {
+            return Ok(());
+        };
+        let registry = rules.overlay_registry();
+        let cell = {
+            let Some(terrain) = self.resolved_terrain.as_ref() else {
+                return Ok(());
+            };
+            let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+            match crate::sim::movement::ground_pose::query_object_cell(
+                &cells,
+                crate::sim::components::DriveCoord {
+                    x: coord.x,
+                    y: coord.y,
+                    z: coord.z,
+                },
+            ) {
+                receiver @ crate::map::cell_index::NativeCellIdentity::Real(_) => {
+                    let (x, y) = cells.coord(receiver);
+                    (x as u16, y as u16)
+                }
+                crate::map::cell_index::NativeCellIdentity::Dummy => {
+                    if cells.dummy().overlay_fields().0.is_some_and(|overlay| {
+                        registry.flags(overlay).is_some_and(|flags| flags.tiberium)
+                    }) {
+                        log::warn!(
+                            "Anim.Start mineral-bearing shared Dummy mutation is unsupported"
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+        };
+        let resource = self
+            .overlay_grid
+            .as_ref()
+            .filter(|grid| cell.0 < grid.width() && cell.1 < grid.height())
+            .map(|grid| {
+                crate::sim::tiberium::tiberium_cell_view(
+                    grid,
+                    registry,
+                    &rules.tiberium_types,
+                    cell,
+                )
+            })
+            .transpose()?
+            .flatten();
+        let Some(resource) = resource else {
+            return Ok(());
+        };
+        // Retain the selected class across removal; the cleared overlay no
+        // longer identifies its Debris or Color (424DAA..424DC0).
+        let mineral = rules
+            .tiberium_types
+            .get(resource.tiberium_type)
+            .expect("resolved mineral type");
+        Self::reduce_tiberium_at_with_native_context(
+            &self.terrain_objects,
+            &self.ore_growth_config,
+            &mut self.ore_growth_state,
+            &self.session,
+            &mut self.scenario_rng,
+            &self.substrate,
+            &mut self.resolved_terrain,
+            &mut self.overlay_grid,
+            &mut self.dirty_cells,
+            cell,
+            i32::from(resource.overlay_data) + 1,
+            rules,
+            Some(registry),
+        )?;
+        // Reduce480A80 publishes Recalc's caches before the child constructor.
+        // No zone repair belongs to that first Recalc.
+        self.publish_recalculated_cells(rules, &[cell]);
+        let debris = mineral.debris();
+        let throw_debris = if ares {
+            // Ares 3.0 10050D50 (hook 0x424DD3), after the Debris count test:
+            // RandomRanged(0, 99) < Debris.Chance replaces the one-in-three draw.
+            !debris.is_empty()
+                && self.scenario_rng.next_range_i32_inclusive(0, 99)
+                    < mineral.ares().debris_chance()
+        } else {
+            // 424DDF..424DF3 uses one signed raw draw. Only zero is consumed:
+            // abs(raw % 3)==0 also matches wrapped abs(raw)%3==0 at INT_MIN.
+            !debris.is_empty() && self.scenario_rng.next_raw_abs_modulo(3) == 0
+        };
+        if throw_debris {
+            if let Some(mut child_coord) = self.anim_absolute_coord(id) {
+                child_coord.z = child_coord.z.wrapping_add(10);
+                let selected = self
+                    .scenario_rng
+                    .next_range_u32_inclusive(0, (debris.len() - 1) as u32)
+                    as usize;
+                let (rx, ry, sub_x, sub_y, level) = child_coord.to_cell_sub_z();
+                let type_name = self.interner.intern(&debris[selected]);
+                let descriptor = AnimClassSpawnDescriptor {
+                    draw_flags: 0x600,
+                    ..AnimClassSpawnDescriptor::new(type_name, rx, ry, sub_x, sub_y, level)
+                };
+                match self.spawn_anim_at_world_with_constructor(
+                    rules,
+                    descriptor,
+                    child_coord,
+                    AnimConstructorInput::Runtime,
+                    frame_effects,
+                ) {
+                    Ok(child) => {
+                        // 424E72..424E95 assigns Convert and retained Cell
+                        // light AFTER all child constructor/Start callbacks.
+                        if let Ok(entry) = u8::try_from(mineral.color_scheme() / 2) {
+                            self.substrate.anims.set_anim_remap(
+                                child,
+                                AnimRemap::ColorScheme(
+                                    crate::rules::house_colors::HouseColorIndex(entry),
+                                ),
+                            );
+                        }
+                        self.retain_anim_cell_light(child, Some(cell));
+                    }
+                    Err(error @ AnimSpawnError::Tiberium(_)) => return Err(error),
+                    Err(error) => {
+                        log::warn!("Anim.Start mineral Debris failed to construct: {error}")
+                    }
+                }
+            }
+        }
+        // The damage centre is raw Object.Location, whereas the retained Cell
+        // and child above use GetCoords. Zero damage still leaves the suffix.
+        // RESIDUAL: Start returns nothing, so the bridge-change flag is dropped
+        // and a bridge hit here skips that frame's bridge art refresh; only a
+        // TiberiumExplosionDamage above retail's 0 reaches it.
+        // Ares 3.0 10050DA0 (hook 0x424EC5): the mineral's ExplosionWarhead
+        // and ExplosionDamage, else C4Warhead and TiberiumExplosionDamage.
+        let (warhead_name, damage) = if ares {
+            (
+                mineral
+                    .ares()
+                    .explosion_warhead(Some(rules.bridge_warheads.c4_name.as_str())),
+                mineral
+                    .ares()
+                    .explosion_damage(rules.combat_damage.tiberium_explosion_damage),
+            )
+        } else {
+            (
+                Some(rules.bridge_warheads.c4_name.as_str()),
+                rules.combat_damage.tiberium_explosion_damage,
+            )
+        };
+        if let Some(raw) = self.anim(id).map(|anim| anim.world_coord)
+            && let Some(warhead_name) = warhead_name
+            && let Some(warhead) = rules.warhead(warhead_name)
+        {
+            let warhead_ref = self.interner.intern(warhead_name);
+            crate::sim::combat::world_receiver::apply_area_damage(
+                self,
+                rules,
+                Some(registry),
+                crate::sim::projectile::ProjectileCoord::new(raw.x, raw.y, raw.z),
+                damage,
+                warhead,
+                false,
+                (crate::sim::combat::RAD_NO_ATTACKER, None, warhead_ref),
+                frame_effects,
+            );
+        }
+        // Start424EDA/424EE8/424EF3 is a distinct, unconditional second
+        // Recalc -> AssignOrphaned -> hierarchy update, never a second Reduce.
+        if let (Some(grid), Some(terrain)) =
+            (self.overlay_grid.as_mut(), self.resolved_terrain.as_mut())
+        {
+            grid.recalculate_runtime_cell(terrain, registry, cell);
+        }
+        self.publish_cell_and_assign_orphaned_zone(rules, cell, None);
+        Ok(())
     }
 
     /// `AnimClass::Middle @ 0x00424F00`: marks the ground under the anim.
@@ -2989,8 +4520,17 @@ impl Simulation {
             .and_then(|name| rules.p_type_id_by_name(name))
             && let Some(coord) = self.anim(id).map(|anim| anim.world_coord)
         {
-            for _ in 0..config.num_particles {
-                self.spawn_gas_particle(kind, glam::IVec3::new(coord.x, coord.y, coord.z), rules);
+            let spread = rules.ares_form() && config.ares_spawns_particle_range != [0, 0];
+            if spread {
+                self.ares_spawn_particles_around(id, kind, config, rules);
+            } else {
+                for _ in 0..config.num_particles {
+                    self.spawn_gas_particle(
+                        kind,
+                        glam::IVec3::new(coord.x, coord.y, coord.z),
+                        rules,
+                    );
+                }
             }
         }
         if !(config.scorch || config.crater) {
@@ -3039,44 +4579,104 @@ impl Simulation {
         );
     }
 
+    /// Ares 3.0 AnimClass_Expired_SpawnsParticle (1000AE40, hook 0x425002,
+    /// resuming at 0x42504D): each of the NumParticles particles lands at
+    /// `|RandomRanged(min, max)|` leptons from the anim's GetCoords, at an
+    /// angle drawn within its share of the circle (`RandomRanged(1,
+    /// 0x7FFFFFFF)` times 1/0x7FFFFFFF), keeping the anim's height above the
+    /// floor (`0x00578080`). The arithmetic is the DLL's x87 code; its CRT
+    /// cos/sin are libm's.
+    fn ares_spawn_particles_around(
+        &mut self,
+        id: AnimId,
+        kind: crate::rules::particle_type::ParticleTypeId,
+        config: &AnimTypeRuntimeConfig,
+        rules: &RuleSet,
+    ) {
+        use crate::util::native_x87::NativeF64Bits as Bits;
+        let Some(coord) = self.anim_absolute_coord(id) else {
+            return;
+        };
+        let floor = |sim: &Self, x: i32, y: i32, z: i32| {
+            crate::sim::projectile::projectile_ground_z(
+                sim.resolved_terrain.as_ref(),
+                &sim.effective_shared_cell_dummy(),
+                crate::sim::projectile::ProjectileCoord::new(x, y, z),
+            )
+        };
+        let height = coord.z.wrapping_sub(floor(self, coord.x, coord.y, coord.z));
+        let load = |value: f64| {
+            X87Chop53::load_f64(Bits::from_bits(value.to_bits())).expect("finite constant")
+        };
+        let store = |value| f64::from_bits(X87Chop53::store_f64(value).map_or(0, Bits::bits));
+        let count = config.num_particles;
+        let step =
+            X87Chop53::div(load(6.283185307179586), X87Chop53::load_i32(count)).map_or(0.0, store);
+        let [minimum, maximum] = config.ares_spawns_particle_range;
+        let mut angle = 0.0;
+        for _ in 0..count {
+            let distance = self
+                .scenario_rng
+                .next_range_i32_inclusive(minimum, maximum)
+                .wrapping_abs();
+            let value = self.scenario_rng.next_range_i32_inclusive(1, 0x7FFF_FFFF);
+            let radians = store(X87Chop53::add(
+                X87Chop53::mul(
+                    X87Chop53::mul(X87Chop53::load_i32(value), load(4.656612873077393e-10)),
+                    load(step),
+                ),
+                load(angle),
+            ));
+            let (cos, sin) = (libm::cos(radians), libm::sin(radians));
+            let along = |trig: f64| {
+                ares_truncate_x87(X87Chop53::mul(X87Chop53::load_i32(distance), load(trig)))
+            };
+            let x = along(cos).wrapping_add(coord.x);
+            let y = coord.y.wrapping_sub(along(sin));
+            let z = floor(self, x, y, coord.z).wrapping_add(height);
+            self.spawn_gas_particle(kind, glam::IVec3::new(x, y, z), rules);
+            angle = store(X87Chop53::add(load(angle), load(step)));
+        }
+    }
+
     fn switch_anim_type(
         &mut self,
         id: AnimId,
         next: &str,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-    ) {
-        let Some(config) = rules.art().anim_runtime_config(next).cloned() else {
+        frame_effects: FrameEffects<'_>,
+    ) -> Result<(), AnimSpawnError> {
+        let Some(config) = rules.art().anim_runtime_config(next) else {
             self.destroy_anim(id, rules);
-            return;
+            return Ok(());
         };
-        let Ok((effective_end, effective_loop_end)) = effective_bounds(next, &config) else {
+        let Ok((effective_end, effective_loop_end)) = effective_bounds(next, config) else {
             self.destroy_anim(id, rules);
-            return;
+            return Ok(());
         };
         let type_id = self.interner.intern(next);
-        let rate_reload = self.choose_anim_rate(&config);
+        let rate_reload = Self::choose_anim_rate(&self.session, &mut self.scenario_rng, config);
         let frame_timer =
-            CdTimer::started(self.session.binary_frame as i32, i32::from(rate_reload));
+            CdTimer::started(self.session.binary_frame() as i32, i32::from(rate_reload));
         let stop_sound_id = config
             .stop_sound
             .as_deref()
             .map(|sound| self.interner.intern(sound));
-        let constructor_reverse = self
-            .anim(id)
-            .is_some_and(|anim| anim.runtime.constructor_reverse);
-        let reverse = constructor_reverse || config.reverse;
-        if let Some(anim) = self.anim_mut_by_id(id) {
+        // A remapped anim's new type is a new atlas key.
+        self.substrate.anims.note_look(id);
+        if let Some(anim) = self.substrate.anims.get_mut(id) {
             anim.type_id = type_id;
+            anim.damage_accumulator = NativeF64Bits::POSITIVE_ZERO;
             anim.effective_end = effective_end;
             anim.effective_loop_end = effective_loop_end;
             anim.stop_sound_id = stop_sound_id;
-            anim.runtime.current_frame = if reverse {
-                effective_loop_end.wrapping_sub(1)
-            } else {
-                0
-            };
-            anim.runtime.frame_step = if reverse { -1 } else { 1 };
+            // 0x00424913..0x0042491F: Value (+0xAC) takes Next's Start as
+            // written, though it is otherwise relative to Start, so the first
+            // drawn frame is twice Start; the step (+0xC4) keeps the old
+            // type's direction. Retail Next targets all have Start=0 and no
+            // Reverse=, where this equals a fresh start.
+            anim.runtime.current_frame = config.start;
             anim.runtime.delay_remaining = 0;
             anim.runtime.rate_reload = rate_reload;
             anim.runtime.frame_timer = frame_timer;
@@ -3084,7 +4684,139 @@ impl Simulation {
             anim.runtime.first_ai_guard = false;
             anim.runtime.inactive = false;
         }
-        self.anim_start(id, &config, rules, overlay_registry);
+        self.anim_start(id, config, rules, overlay_registry, frame_effects)
+    }
+}
+
+impl crate::sim::world::ObjectSubstrate {
+    /// Mutation of the retained Anim+198 byte belongs to its instance owner.
+    pub(crate) fn set_anim_no_effects(&mut self, id: AnimId, no_effects: bool) {
+        if let Some(anim) = self.anims.get_mut(id) {
+            anim.no_effects = no_effects;
+        }
+    }
+    pub(crate) fn clear_damage_fire_anim_reference(&mut self, id: AnimId) {
+        let link = self
+            .anims
+            .get_mut(id)
+            .and_then(|anim| anim.damage_fire_slot.take());
+        if let Some((owner, slot)) = link
+            && let Some(entity) = self.entities.get_mut(owner)
+            && entity.damage_fires.anim_ids[usize::from(slot)] == Some(id)
+        {
+            entity.damage_fires.anim_ids[usize::from(slot)] = None;
+        }
+    }
+    pub(crate) fn mark_anim_display(&mut self, id: AnimId, marked: bool) {
+        if let Some(anim) = self.anims.get_mut(id) {
+            anim.display.marked_on_map = marked;
+        }
+    }
+    /// Retail gamemd.exe SetOwnerObject424B79..424BB6 and active-scenario
+    /// destructor42291A..42295B clear Object+84 only for the last attached
+    /// Anim. Scan the whole retained array, excluding only this Anim: inactive,
+    /// concealed and pending-delete entries still count while CC names owner.
+    /// Owner+17C is bare RET5F43C0 for supported Techno owners. Rust world
+    /// disposal drops the stores; it does not simulate native gate0 exit teardown.
+    pub(crate) fn release_last_anim_owner_flag(&mut self, id: AnimId) {
+        // A presentation anim never raised the flag, and the scan below does
+        // not count it.
+        let Some(owner) = self
+            .anims
+            .get(id)
+            .filter(|anim| !anim.is_presentation())
+            .and_then(|anim| anim.owner_entity)
+        else {
+            return;
+        };
+        if !self.anims.another_owned_by(id, owner)
+            && let Some(entity) = self.entities.get_mut(owner)
+        {
+            entity.set_attached_anim_flag(false);
+        }
+    }
+
+    /// Clear only CC, without SetOwner's coordinate conversion or display
+    /// submission (422961 / 425190). Callers own the distinct +60 and +84
+    /// effects: PointerExpired clears CC without releasing the retained flag.
+    pub(crate) fn release_anim_owner_reference(&mut self, id: AnimId) -> Option<u64> {
+        // Runs in every game: only the Ares terrain fire gives an anim a
+        // terrain owner, and without one this falls through to the stock clear.
+        if let Some(Some(terrain)) = self.anims.set_owner_terrain(id, None) {
+            return Some(terrain);
+        }
+        self.anims.set_owner_entity(id, None)?
+    }
+    pub(crate) fn set_anim_frame_and_z_adjust(&mut self, id: AnimId, frame: i32, z_adjust: i32) {
+        if let Some(anim) = self.anims.get_mut(id) {
+            anim.runtime.current_frame = frame;
+            anim.z_adjust = z_adjust;
+        }
+    }
+    /// Apply CellClass's producer-owned `AnimClass +0x100` write after the
+    /// delay-zero constructor has already run `Middle`.
+    pub(crate) fn set_terrain_anim_z_adjust_after_construction(
+        &mut self,
+        id: AnimId,
+        z_adjust: i32,
+    ) -> bool {
+        let Some(anim) = self.anims.get_mut(id) else {
+            return false;
+        };
+        if !anim.terrain_attached || anim.z_adjust != 0 {
+            return false;
+        }
+        anim.z_adjust = z_adjust;
+        true
+    }
+    /// A producer's plain post-construction `AnimClass +0x100` (ZAdjust)
+    /// write, such as CaptureUnit's building ring (`0x00471F66`).
+    pub(crate) fn set_anim_z_adjust(&mut self, id: AnimId, z_adjust: i32) -> bool {
+        let Some(anim) = self.anims.get_mut(id) else {
+            return false;
+        };
+        anim.z_adjust = z_adjust;
+        true
+    }
+    /// A producer's plain Anim+19D store. Mirage's attached-ring tail
+    /// `746A9C..746B19` changes drawing without suspending the Anim AI.
+    pub(crate) fn set_anim_hidden(&mut self, id: AnimId, hidden: bool) -> bool {
+        let Some(anim) = self.anims.get_mut(id) else {
+            return false;
+        };
+        anim.draw_runtime.hidden = hidden;
+        anim.viewer_hidden = None;
+        true
+    }
+
+    /// Anim+19D per viewer: `viewers` holds named houses' bytes and
+    /// `other_hidden` every other viewer's. Ares common Launch100330DC writes
+    /// it once, from the alliance relation at construction rather than a live
+    /// visibility query; the disguised ring tail writes it every frame.
+    pub(crate) fn set_anim_viewer_hidden(
+        &mut self,
+        id: AnimId,
+        viewers: Vec<(InternedId, bool)>,
+        other_hidden: bool,
+    ) {
+        if let Some(anim) = self.anims.get_mut(id) {
+            anim.viewer_hidden = Some(AnimViewerHidden {
+                viewers,
+                other_hidden,
+            });
+        }
+    }
+    /// `AnimClass::SetOwnerHouse @ 0x00424CA0`: store `+0x180`.
+    pub(crate) fn set_anim_owner_house(&mut self, id: AnimId, house: InternedId) -> bool {
+        let Some(anim) = self.anims.get_mut(id) else {
+            return false;
+        };
+        anim.owner_house = Some(house);
+        true
+    }
+    /// `0x00424C90`: store `+0x17C`, the bullet whose expiry ends the anim.
+    pub(crate) fn set_anim_attached_bullet(&mut self, id: AnimId, bullet: Option<u64>) -> bool {
+        self.anims.set_attached_bullet(id, bullet)
     }
 }
 
@@ -3152,6 +4884,30 @@ pub(crate) enum AnimConstructorInput {
     Runtime,
     AssignedIdentity(i32),
     Preconsumed(AnimConstructorDraws),
+    /// A local anim ([`AnimStore`]'s `local`): the LAN and online MoveFlash
+    /// of [`Simulation::spawn_move_flash`].
+    Local,
+    /// A presentation anim: a local anim of a type that changes nothing but
+    /// its own picture ([`crate::rules::art_data::ArtRegistry::anim_presentation_only`]),
+    /// which every game makes alike. It takes no Display slot, no Logic slot,
+    /// no unique id and no Scenario draw, and nothing in the simulation holds
+    /// it; the presentation draws it at the end of its layer
+    /// ([`Simulation::presentation_anims`]).
+    ///
+    /// VERA-only sim-scale deviation, on in real matches
+    /// ([`Simulation::present_effect_anims`]): gamemd keeps every muzzle flash and
+    /// impact anim in Display (Ground's sorted vector) and Logic and gives each
+    /// a unique id. Leaving them out changes the unique ids and the Ground order
+    /// later objects take, and the state hash and sync checksum with them; a
+    /// player sees the same picture. RESIDUAL: such an anim does not raise its
+    /// owner's attached-Anim flag (Object+84, `SetOwnerObject @ 0x00424B50`),
+    /// whose only reader caps the fall rate (`ObjectFall`); trigger: a Techno
+    /// that starts falling within a few frames of firing; effect: it falls at
+    /// the ordinary rate; frequency: rare (a bridge collapsing under a firing
+    /// unit). It ends with its owner's UnInit, where gamemd detaches it in
+    /// place; an owner that enters Limbo (a transport, a garrison) keeps it
+    /// drawing until its own end, a few frames.
+    Presentation,
 }
 
 /// Take the constructor's draws for an anim of `config` at `coord`.
@@ -3168,6 +4924,8 @@ pub(crate) fn anim_constructor_draws(
     let bounce = if config.is_meteor {
         let launch = crate::sim::bounce::meteor_launch(
             glam::IVec3::new(coord.x, coord.y, coord.z),
+            // 4223D8: a literal lifetime that only places the start.
+            70,
             config.min_z_vel,
             config.max_xy_vel,
             rng,
@@ -3265,9 +5023,14 @@ pub(crate) const ANIM_MIDDLE_MAX_HEIGHT: i32 = 30;
 /// halved (`AnimTypeClass::Load_Image @ 0x00427B50`). None when it is zero,
 /// where Start runs Middle instead.
 fn middle_frame(config: &AnimTypeRuntimeConfig) -> Option<i32> {
+    // AnimTypeLoad428855 calls generic LoadSHP, not bounds resolver427B50;
+    // an unread type's newly resident header must not replace ctor Middle0.
+    if !config.art_body_read {
+        return None;
+    }
     config
-        .raw_shp_frame_count
-        .map(|raw| raw / 2)
+        .middle_frame
+        .or_else(|| config.raw_shp_frame_count.map(|raw| raw / 2))
         .filter(|&middle| middle != 0)
 }
 
@@ -3283,8 +5046,32 @@ fn native_loop_remaining(loop_count: i32, constructor_loop: i32) -> u8 {
     (loop_count as u8).wrapping_mul(constructor_factor).max(1)
 }
 
-fn trailer_cadence_matches(binary_frame: u64, separation: i32) -> bool {
-    separation == 1 || (separation > 1 && (binary_frame as i32) % separation == 0)
+/// Ares.dll's float-to-int conversion (100772B0): toward zero, and the
+/// integer indefinite (`i32::MIN`) for NaN or a value out of range.
+fn ares_truncate(value: f64) -> i32 {
+    X87Chop53::load_f64(NativeF64Bits::from_bits(value.to_bits()))
+        .map_or(i32::MIN, ares_truncate_x87)
+}
+
+fn ares_truncate_x87(value: crate::util::native_x87::X87Value) -> i32 {
+    X87Chop53::ftol_i64(value)
+        .ok()
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(i32::MIN)
+}
+
+/// `0x004242CA..0x004242DF`: a separation of 1, else the signed frame count
+/// modulo the separation (IDIV), so a negative separation also spawns.
+/// Ares hooks 0x004242CA (`AnimClass_Update_FixIE_TrailerSeperation`,
+/// Ares.dll `1000B210`): a separation below 1 jumps to 0x00424322 and spawns
+/// none; 1 and above take the IDIV.
+/// RESIDUAL: gamemd faults dividing by a zero `TrailerSeperation=`; VERA
+/// spawns no trailer there.
+fn trailer_cadence_matches(binary_frame: u64, separation: i32, ares: bool) -> bool {
+    if ares && separation < 1 {
+        return false;
+    }
+    separation == 1 || (separation != 0 && (binary_frame as i32).wrapping_rem(separation) == 0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3346,38 +5133,97 @@ fn advance_anim_boundary(anim: &mut AnimObject, config: &AnimTypeRuntimeConfig) 
     AnimBoundary::Loop
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 mod long_tail_contract_tests {
     use super::*;
 
-    #[test]
-    fn yr_long_tail_vectors() {
-        assert_eq!(directional_tumble_frame(5, 0, 9), 38);
-        assert_eq!(directional_tumble_frame(5, 7, 14), 4);
-        assert_eq!(settled_bounce_frame(5), 41);
-        assert_eq!(bounce_spawn_count(true, 4, 2, 3), 5);
-        assert_eq!(
-            anim_translucency_selection(AnimTranslucencyInput {
-                base_flags: 0,
-                forced_translucent: false,
-                forced_uses_75: false,
-                translucency_detail_level: 1,
-                game_detail_level: 2,
-                translucent_ramp: true,
-                current_frame: 7,
-                end_frame: 10,
-                explicit_translucency: 0,
-                instance_ramp: 0,
-            }),
-            AnimTranslucencyResult {
-                draw: true,
-                flags: 6
-            }
-        );
-    }
-
     /// `0x0042319A..0x004231BC`: only an exact `Translucency=` 25, 50 or 75
     /// selects a stage; any other value draws without one.
+    /// `0x0042306B`: the `+0x119` arm ORs 75% for a `DoubleThick=` type,
+    /// else 50%, and falls through to the type's own arms (`0x0042307D`).
+    #[test]
+    fn forced_translucency_reads_double_thick_and_falls_through() {
+        let input = |double_thick, explicit_translucency, instance_ramp| AnimTranslucencyInput {
+            base_flags: 0,
+            forced_translucent: true,
+            double_thick,
+            translucency_detail_level: 0,
+            game_detail_level: 2,
+            translucent_ramp: false,
+            current_frame: 0,
+            end_frame: 10,
+            explicit_translucency,
+            instance_ramp,
+        };
+        for (double_thick, explicit, ramp, expected) in [
+            (false, 0, 0, (true, 4)),
+            (true, 0, 0, (true, 6)),
+            (false, 25, 0, (true, 6)),
+            (false, 0, 16, (false, 4)),
+        ] {
+            let result = anim_translucency_selection(input(double_thick, explicit, ramp));
+            assert_eq!((result.draw, result.flags), expected);
+        }
+    }
+
+    /// `0x004231C1..0x004231EE`: the `+0x178` bands a fading building
+    /// writes into its slot anims.
+    #[test]
+    fn instance_ramp_bands_draw_at_25_then_50_then_not_at_all() {
+        for (instance_ramp, expected) in [
+            (0, (true, 0)),
+            (1, (true, 2)),
+            (5, (true, 2)),
+            (6, (true, 4)),
+            (15, (true, 4)),
+            (16, (false, 0)),
+        ] {
+            let result = anim_translucency_selection(AnimTranslucencyInput {
+                base_flags: 0,
+                forced_translucent: false,
+                double_thick: false,
+                translucency_detail_level: 0,
+                game_detail_level: 2,
+                translucent_ramp: false,
+                current_frame: 0,
+                end_frame: 10,
+                explicit_translucency: 0,
+                instance_ramp,
+            });
+            assert_eq!(
+                (result.draw, result.flags),
+                expected,
+                "ramp {instance_ramp}"
+            );
+        }
+    }
+
+    /// `0x004230A8..0x004230FB`: End 15 (EXPLOMED, WAKE1, RING) reaches 75%
+    /// at stage 9, because 15 times the 0.6 double chops below 9, while the
+    /// 0.4 and 0.2 doubles sit above their fifths.
+    #[test]
+    fn translucent_ramp_takes_75_percent_at_three_fifths() {
+        for (current_frame, flags) in [(3, 0), (4, 2), (6, 2), (7, 4), (9, 6)] {
+            let result = anim_translucency_selection(AnimTranslucencyInput {
+                base_flags: 0,
+                forced_translucent: false,
+                double_thick: false,
+                translucency_detail_level: 0,
+                game_detail_level: 2,
+                translucent_ramp: true,
+                current_frame,
+                end_frame: 15,
+                explicit_translucency: 0,
+                instance_ramp: 0,
+            });
+            assert_eq!(
+                (result.draw, result.flags),
+                (true, flags),
+                "stage {current_frame}"
+            );
+        }
+    }
+
     #[test]
     fn only_exact_fixed_translucency_values_select_a_stage() {
         for (explicit_translucency, flags) in [
@@ -3394,7 +5240,7 @@ mod long_tail_contract_tests {
                 anim_translucency_selection(AnimTranslucencyInput {
                     base_flags: 0,
                     forced_translucent: false,
-                    forced_uses_75: false,
+                    double_thick: false,
                     translucency_detail_level: 0,
                     game_detail_level: 2,
                     translucent_ramp: false,
@@ -3410,15 +5256,19 @@ mod long_tail_contract_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "anim_debris_tests.rs"]
 mod debris_tests;
 
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_a_b, tests_sim_c_g)))]
 #[path = "anim_trigger_tests.rs"]
 pub(in crate::sim) mod trigger_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
+#[path = "anim_mineral_start_tests.rs"]
+mod mineral_start_tests;
+
+#[cfg(all(test, tests_sim_a_b))]
 mod tests {
     use super::*;
     use crate::map::entities::EntityCategory;
@@ -3426,6 +5276,69 @@ mod tests {
     use crate::rules::ini_parser::IniFile;
     use crate::sim::combat::Health;
     use crate::sim::game_entity::GameEntity;
+
+    /// Phobos' `AnimClass_AI_Early @ 0x423B95` replacement of the stock
+    /// `HideIfNoOre` test: the anim's cell `Get_Tiberium_Value @ 0x00485020`
+    /// hides it at or below `abs(HideIfNoOre.Threshold=)`, not only at zero.
+    #[test]
+    #[cfg(feature = "phobos")]
+    fn hide_if_no_ore_threshold_moves_the_value_cut_off() {
+        use crate::sim::overlay_grid::OverlayGrid;
+        use crate::sim::world::Simulation;
+
+        let ini = IniFile::from_str(&format!(
+            "[InfantryTypes]\n[VehicleTypes]\n[AircraftTypes]\n[BuildingTypes]\n{}",
+            crate::sim::tiberium::test_support::tiberium_rules_text(),
+        ));
+        let mut rules = RuleSet::from_ini(&ini).expect("twinkle rules");
+        let mut art = ArtRegistry::from_ini(&IniFile::from_str(
+            "[TWNK1]\nLoopCount=-1\nDetailLevel=2\nHideIfNoOre=true\n\
+             HideIfNoOre.Threshold=-60\nRate=450\n",
+        ));
+        art.bind_anim_frame_count_for_test("TWNK1", 8);
+        rules.replace_art_registry_for_test(art);
+        let overlays = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(&ini, None);
+
+        let hidden_over = |density: u8| {
+            let mut sim = Simulation::new();
+            sim.session.set_map_width_for_test(16);
+            sim.session.set_map_height_for_test(16);
+            let mut grid = OverlayGrid::new(16, 16);
+            grid.place_overlay(8, 8, overlays.id_for_name("TIB01").unwrap(), density);
+            sim.install_overlay_grid_for_load(grid);
+            let type_id = sim.interner.intern("TWNK1");
+            let id = sim
+                .spawn_anim_at_world(
+                    &rules,
+                    AnimClassSpawnDescriptor {
+                        loop_count: -1,
+                        ..runtime_descriptor(type_id, 0)
+                    },
+                    AnimWorldCoord {
+                        x: 8 * 256 + 128,
+                        y: 8 * 256 + 128,
+                        z: 0,
+                    },
+                )
+                .expect("the twinkle constructs");
+            sim.visit_anim(
+                id,
+                &rules,
+                Some(&overlays),
+                crate::sim::world::FrameEffects::default(),
+            )
+            .unwrap();
+            sim.anim(id)
+                .expect("the looping twinkle survives its visit")
+                .draw_runtime
+                .hidden
+        };
+
+        // `TiberiumClass::Value` times `OverlayData + 1`, so 50 against the
+        // threshold's 60 and 125 over it.
+        assert!(hidden_over(1), "50 <= abs(-60) hides the twinkle");
+        assert!(!hidden_over(4), "125 > 60 leaves it drawing");
+    }
 
     #[test]
     fn damage_fire_references_follow_original_owner_then_anim_expiry() {
@@ -3457,7 +5370,8 @@ mod tests {
                 .unwrap()
                 .damage_fires
                 .anim_ids[slot] = Some(id);
-            sim.anim_mut_by_id(id).unwrap().damage_fire_slot = Some((building_id, slot as u8));
+            sim.substrate.anims.get_mut(id).unwrap().damage_fire_slot =
+                Some((building_id, slot as u8));
             sim.detach_all_pointer_expired(
                 building_id,
                 &rules,
@@ -3498,7 +5412,7 @@ mod tests {
     }
 
     #[test]
-    fn building_uninit_expires_attached_fires_before_destructor_destroy_and_survives_save() {
+    fn building_uninit_expires_attached_fires_then_limbo_uninits_them_and_survives_save() {
         let (mut sim, rules, building_id) = damage_fire_fixture(false);
         sim.substrate
             .entities
@@ -3523,33 +5437,36 @@ mod tests {
             .flatten()
             .map(|id| (*id, sim.anim(*id).unwrap().world_coord))
             .collect();
-        sim.sound_events.clear();
+        sim.sound_events.clear_for_test();
         sim.uninit_with_rules(building_id, &rules);
-        // TechnoLimbo6F6C6B reaches Release even on its empty4A4 handle.
-        // Attached-owner expiry still must not destroy any Anim sound.
+        // ObjectUnInit5F6616 expires the owner first (Anim425150: owner
+        // cleared, +19B set), then its Limbo call reaches Building Limbo
+        // 4458E4, which UnInits each fire (Release4255D5) and nulls its slot
+        // before TechnoLimbo6F6C6B releases the empty4A4 handle.
+        assert!(matches!(
+            sim.sound_events.as_slice().last(),
+            Some(SimSoundEvent::GattlingLoopRelease { owner })
+                if *owner == crate::sim::combat::gattling::gattling_sound_owner(building_id)
+        ));
         assert!(
-            matches!(
-                sim.sound_events.as_slice(),
-                [SimSoundEvent::GattlingLoopRelease { owner }]
-                    if *owner == crate::sim::combat::gattling::gattling_sound_owner(building_id)
-            ),
-            "owner expiry does not call Anim Destroy"
-        );
-        assert_eq!(
             sim.entities()
                 .get(building_id)
                 .unwrap()
                 .damage_fires
-                .anim_ids,
-            ids
+                .anim_ids
+                .iter()
+                .all(Option::is_none)
         );
         for (id, coord) in &coords {
             let anim = sim.anim(*id).unwrap();
             assert_eq!(anim.world_coord, *coord);
             assert_eq!(anim.owner_entity, None);
             assert!(anim.runtime.inactive);
-            assert!(!sim.substrate.pending_delete.contains_object(id));
+            assert_eq!(anim.damage_fire_slot, None);
+            assert!(sim.substrate.pending_delete.contains_object(id));
             assert_eq!(sim.substrate.display.layer_of(*id), None);
+            assert!(sim.sound_events.iter().any(|event| matches!(event,
+                SimSoundEvent::ObjectSoundReleased { owner } if *owner == *id)));
         }
         sim.scenario_rng = crate::sim::rng::SimRng::new(0);
         let hash = sim.state_hash();
@@ -3559,21 +5476,39 @@ mod tests {
             .sim;
         sim.restore_after_snapshot_load().unwrap();
         assert_eq!(sim.state_hash(), hash);
-        for (slot, id) in ids.iter().enumerate() {
-            if let Some(id) = id {
-                assert_eq!(
-                    sim.anim(*id).unwrap().damage_fire_slot,
-                    Some((building_id, slot as u8))
-                );
-            }
-        }
         sim.process_pending_delete();
         assert!(sim.entities().get(building_id).is_none());
         for (id, _) in coords {
             assert!(sim.anim(id).is_none());
-            assert!(sim.sound_events.iter().any(|event| matches!(event,
-                SimSoundEvent::ObjectSoundReleased { owner } if *owner == id)));
         }
+    }
+
+    /// AnimClass::AI's Next= switch (`0x004247F3..0x00424925`) sets Value to
+    /// the new type's Start (`0x0042491F`) and leaves the step as it was.
+    #[test]
+    fn next_takes_the_new_start_as_its_value_and_keeps_the_step() {
+        let rules = runtime_rules(
+            "[A]\nReverse=yes\nNext=A_NEXT\n[A_NEXT]\nStart=3\n",
+            &[("A", 10), ("A_NEXT", 10)],
+        );
+        let mut sim = Simulation::with_seed(0);
+        let type_id = sim.interner.intern("A");
+        let id = sim
+            .spawn_anim_at_world(
+                &rules,
+                runtime_descriptor(type_id, 0),
+                AnimWorldCoord {
+                    x: 2816,
+                    y: 2944,
+                    z: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(sim.anim(id).unwrap().runtime.frame_step, -1);
+        sim.switch_anim_type(id, "A_NEXT", &rules, None, FrameEffects::default())
+            .unwrap();
+        let runtime = &sim.anim(id).unwrap().runtime;
+        assert_eq!((runtime.current_frame, runtime.frame_step), (3, -1));
     }
 
     #[test]
@@ -3604,7 +5539,7 @@ mod tests {
                 &[("A", 10), ("A_NEXT", 10)],
             );
             let mut sim = Simulation::with_seed(0);
-            let owner_id = sim.allocate_stable_id();
+            let owner_id = sim.substrate.allocate_stable_id();
             let owner_name = sim.interner.intern("HOUSE");
             let type_ref = sim.interner.intern("UNIT");
             let mut owner = GameEntity::new_at_frame_zero_for_test(
@@ -3639,15 +5574,17 @@ mod tests {
                 .unwrap();
             // Native corpus deliberately has type+340=999 and a different
             // retained instance+104. Exercise the real Next type transition.
-            sim.switch_anim_type(id, "A_NEXT", &rules, None);
+            sim.switch_anim_type(id, "A_NEXT", &rules, None, FrameEffects::default())
+                .unwrap();
             assert_eq!(
                 sim.anim(id).unwrap().display.y_sort_adjust,
                 input["adjust"].as_i64().unwrap() as i32
             );
-            sim.mark_anim_display(id, input["marked"].as_bool().unwrap());
+            sim.substrate
+                .mark_anim_display(id, input["marked"].as_bool().unwrap());
             for observation in row["observations"].as_array().unwrap() {
                 match observation["op"].as_str().unwrap() {
-                    "submit" => sim.submit_anim_display(id, Some(&rules)),
+                    "submit" => sim.submit_anim_display(id, &rules),
                     "attach" => {
                         assert!(sim.set_anim_owner_object(id, Some(owner_id), &rules));
                     }
@@ -3667,7 +5604,11 @@ mod tests {
                         owner.position.set_exact_z_leptons_for_test(Some(700));
                     }
                     "expire" => {
-                        assert!(sim.anim_pointer_expired(id, owner_id, None));
+                        assert!(sim.anim_pointer_expired(
+                            id,
+                            owner_id,
+                            crate::rules::ruleset::RuleSet::empty_for_test()
+                        ));
                     }
                     other => panic!("unexpected {other}"),
                 }
@@ -3705,7 +5646,7 @@ mod tests {
                 let queried = u8::try_from(queried)
                     .ok()
                     .and_then(DisplayLayer::from_index);
-                assert_eq!(sim.anim_display_layer(id, Some(&rules)), queried);
+                assert_eq!(sim.anim_display_layer(id, &rules), queried);
                 for layer in 0..5 {
                     let expected_ids = if expected["layers"][layer] == 0 {
                         vec![]
@@ -3749,11 +5690,16 @@ mod tests {
     }
 
     #[test]
-    fn trailer_zero_separation_never_divides_or_spawns() {
-        assert!(!trailer_cadence_matches(0, 0));
-        assert!(trailer_cadence_matches(7, 1));
-        assert!(trailer_cadence_matches(6, 3));
-        assert!(!trailer_cadence_matches(7, 3));
+    fn trailer_separation_spawns_on_signed_multiples_and_never_divides_by_zero() {
+        assert!(!trailer_cadence_matches(0, 0, false));
+        assert!(trailer_cadence_matches(7, 1, false));
+        assert!(trailer_cadence_matches(6, 3, false));
+        assert!(!trailer_cadence_matches(7, 3, false));
+        assert!(trailer_cadence_matches(6, -3, false));
+        assert!(!trailer_cadence_matches(7, -3, false));
+        // Ares spawns no trailer below a separation of 1.
+        assert!(!trailer_cadence_matches(6, -3, true));
+        assert!(trailer_cadence_matches(6, 3, true));
     }
 
     fn damage_fire_fixture(can_be_occupied: bool) -> (Simulation, RuleSet, u64) {
@@ -3764,6 +5710,19 @@ mod tests {
         can_be_occupied: bool,
         strength: i32,
     ) -> (Simulation, RuleSet, u64) {
+        damage_fire_fixture_with_offsets(
+            can_be_occupied,
+            strength,
+            "DamageFireOffset0=-24,-1\nDamageFireOffset1=64,36\n",
+        )
+    }
+
+    /// `offsets` are TESTART's `DamageFireOffsetN=` lines.
+    fn damage_fire_fixture_with_offsets(
+        can_be_occupied: bool,
+        strength: i32,
+        offsets: &str,
+    ) -> (Simulation, RuleSet, u64) {
         let rules_ini = IniFile::from_str(&format!(
             "[BuildingTypes]\n0=TESTBLD\n\n\
              [TESTBLD]\nStrength={strength}\nImage=TESTART\nCanBeOccupied={}\n\n\
@@ -3771,12 +5730,12 @@ mod tests {
              [AudioVisual]\nConditionYellow=50%\nConditionRed=25%\n",
             if can_be_occupied { "yes" } else { "no" },
         ));
-        let art_ini = IniFile::from_str(
-            "[TESTART]\nFoundation=4x4\nDamageFireOffset0=-24,-1\nDamageFireOffset1=64,36\n\n\
+        let art_ini = IniFile::from_str(&format!(
+            "[TESTART]\nFoundation=4x4\n{offsets}\n\
              [FIRE01]\nRate=450\nLoopCount=-1\nStartSound=BuildingFireBig\n\n\
              [FIRE02]\nRate=450\nLoopCount=-1\nStartSound=BuildingFireMed\n\n\
              [FIRE03]\nRate=450\nLoopCount=-1\nStartSound=BuildingFireSmall\n",
-        );
+        ));
         let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&rules_ini, &art_ini)
             .expect("damage-fire rules and ART");
         let mut art = ArtRegistry::from_ini(&art_ini);
@@ -3791,7 +5750,7 @@ mod tests {
         for name in ["FIRE01", "FIRE02", "FIRE03"] {
             sim.interner.intern(name);
         }
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         let mut building = GameEntity::new_at_frame_zero_for_test(
             id,
             10,
@@ -3808,7 +5767,7 @@ mod tests {
         );
         building
             .type_facts
-            .set_foundation_for_test("4x4".to_string());
+            .set_foundation_for_test("4x4".to_string().into());
         sim.substrate.entities.insert(building);
         sim.reveal(id);
         (sim, rules, id)
@@ -3848,6 +5807,31 @@ mod tests {
         }
     }
 
+    /// 43C124..43C137: an authored (0,0) offset ends the fires, as the
+    /// reader's end marker does, so later offsets get none.
+    #[test]
+    fn a_zero_damage_fire_offset_ends_the_fires() {
+        let (mut sim, rules, id) = damage_fire_fixture_with_offsets(
+            false,
+            100,
+            "DamageFireOffset0=-24,-1\nDamageFireOffset1=0,0\nDamageFireOffset2=64,36\n",
+        );
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .health
+            .set_for_test(10);
+        sim.update_building_damage_fire(id, &rules);
+        let fires = &sim.substrate.entities.get(id).unwrap().damage_fires;
+        assert!(fires.active);
+        let slots: Vec<bool> = fires.anim_ids.iter().map(Option::is_some).collect();
+        assert_eq!(
+            slots,
+            [true, false, false, false, false, false, false, false]
+        );
+    }
+
     /// Each `art_text` section is an AnimType, so the ordered Rules processor
     /// reads its fixed-ART Type references (`Next=`, `TrailerAnim=`, ...) as
     /// in production.
@@ -3859,12 +5843,23 @@ mod tests {
             .enumerate()
             .map(|(index, name)| format!("{index}={name}\n"))
             .collect();
-        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+        // SOUNDMD knows every sound the art names.
+        let sounds: Vec<&str> = art_ini
+            .section_names()
+            .iter()
+            .filter_map(|name| art_ini.section(name))
+            .flat_map(|section| {
+                ["StartSound", "Report", "StopSound"].map(|key| section.get_for_test(key))
+            })
+            .flatten()
+            .collect();
+        let mut rules = RuleSet::from_ini_with_fixed_art_and_sounds_for_test(
             &IniFile::from_str(&format!(
                 "[General]\nDamageFireTypes=\n\n[AudioVisual]\nConditionYellow=50%\nConditionRed=25%\n\n\
                  [Animations]\n{animations}"
             )),
             &art_ini,
+            &sounds,
         )
         .unwrap();
         let mut art = ArtRegistry::from_ini(&art_ini);
@@ -3896,9 +5891,8 @@ mod tests {
     }
 
     /// A producer's `owner` attaches inside the constructor without Reveal's
-    /// own Display submit, and Destroy conceals the attached Anim without
-    /// SetOwner(NULL)'s temporary resubmission: Display ends as the native
-    /// constructor, SetOwnerObject, detach and conceal sequence leaves it.
+    /// own Display submit. Destroy follows the shared SetOwner(NULL) detach
+    /// and conceal sequence, leaving Display as those native calls do.
     #[test]
     fn an_owned_anim_leaves_display_as_construct_then_attach_does() {
         let rules = runtime_rules("[A]\nLayer=Ground\n", &[("A", 10)]);
@@ -3914,7 +5908,7 @@ mod tests {
             let ids: Vec<u64> = [(10, 10), (14, 3), (6, 9), (12, 12), (8, 15)]
                 .into_iter()
                 .map(|(rx, ry)| {
-                    let id = sim.allocate_stable_id();
+                    let id = sim.substrate.allocate_stable_id();
                     sim.substrate
                         .entities
                         .insert(GameEntity::new_at_frame_zero_for_test(
@@ -4023,12 +6017,11 @@ mod tests {
                 .unwrap()
                 .retain_deploy_anim(retained);
             for (id, expected) in [(other, Some(retained)), (retained, None)] {
-                let cleared = if detach_with_coords {
-                    sim.detach_anim_from_owner(id, &rules)
+                if detach_with_coords {
+                    assert_eq!(sim.detach_anim_from_owner(id, &rules), Some(owner_id));
                 } else {
-                    sim.release_anim_owner_reference(id)
-                };
-                assert_eq!(cleared, Some(owner_id));
+                    assert!(sim.anim_pointer_expired(id, owner_id, &rules));
+                }
                 assert_eq!(sim.anim(id).unwrap().owner_entity, None);
                 let entity = sim.substrate.entities.get(owner_id).unwrap();
                 assert_eq!(entity.deploy_anim(), expected);
@@ -4036,6 +6029,141 @@ mod tests {
                 assert!(!entity.is_fully_deployed());
             }
         }
+    }
+
+    /// SetOwnerObject424B50, destructor4228E0 and PointerExpired425150 have
+    /// distinct effects on the retained Object+84 byte and owner+60 links.
+    #[test]
+    fn attached_animation_transfer_and_expiry_preserve_shared_owner_state() {
+        let rules = runtime_rules("[A]\nEnd=3\n", &[("A", 3)]);
+        let mut sim = Simulation::new();
+        sim.interner = crate::sim::intern::test_interner();
+        for owner in [100, 101] {
+            sim.substrate.entities.insert(GameEntity::test_default(
+                owner,
+                "UNIT",
+                "Americans",
+                10,
+                10,
+            ));
+        }
+        let type_id = sim.interner.intern("A");
+        let first = sim
+            .spawn_anim_object(&rules, runtime_descriptor(type_id, 0))
+            .unwrap();
+        let second = sim
+            .spawn_anim_object(&rules, runtime_descriptor(type_id, 0))
+            .unwrap();
+        for anim in [first, second] {
+            assert!(sim.set_anim_owner_object(anim, Some(100), &rules));
+        }
+        // The native scan includes an inactive Anim while its CC still names
+        // this owner; filtering to Logic/Display/live entries clears too early.
+        sim.substrate
+            .anims
+            .get_mut(second)
+            .unwrap()
+            .runtime
+            .inactive = true;
+        assert!(sim.set_anim_owner_object(first, Some(101), &rules));
+        assert!(sim.substrate.entities.get(100).unwrap().is_parachuted());
+        assert!(sim.substrate.entities.get(101).unwrap().is_parachuted());
+
+        sim.scalar_delete_anim(second);
+        assert!(sim.anim(second).is_none());
+        assert!(!sim.substrate.entities.get(100).unwrap().is_parachuted());
+        sim.substrate
+            .entities
+            .write_held_anim(101, |owner, authority| {
+                owner.hold_parachute_animation(first, authority)
+            })
+            .unwrap();
+        assert!(sim.anim_pointer_expired(first, 101, &rules));
+        assert_eq!(sim.anim(first).unwrap().owner_entity, None);
+        let owner = sim.substrate.entities.get(101).unwrap();
+        assert_eq!(
+            owner.parachute_animation(),
+            None,
+            "owner+60 ran before unlink"
+        );
+        assert!(owner.is_parachuted(), "PointerExpired retains Object+84");
+        sim.scalar_delete_anim(first);
+        assert!(sim.anim(first).is_none());
+        assert!(
+            sim.substrate.entities.get(101).unwrap().is_parachuted(),
+            "a later destructor cannot reconstruct the already-cleared owner"
+        );
+
+        // GameEntity serde is the production snapshot payload. Preserve the
+        // orphaned raw flag, then let ObjectAI consume it in a subsequent fall.
+        let cap = rules.general.parachute_max_fall_rate;
+        let owner = sim.substrate.entities.get_mut(101).unwrap();
+        owner.set_fall_rate_for_test(cap);
+        let bytes = serde_json::to_vec(owner).unwrap();
+        let mut restored: GameEntity = serde_json::from_slice(&bytes).unwrap();
+        restored.lifecycle.set_in_limbo_for_test(false);
+        restored.lifecycle.set_cell_marked_for_test(false);
+        restored.position.put_z(512);
+        restored.begin_bomb_fall();
+        *sim.substrate.entities.get_mut(101).unwrap() = restored;
+        sim.object_ai_fall(101, &rules, None, FrameEffects::default())
+            .unwrap();
+        let owner = sim.substrate.entities.get(101).unwrap();
+        assert!(owner.is_parachuted());
+        assert_eq!(owner.parachute_animation(), None);
+        assert_eq!(
+            owner.fall_rate(),
+            cap,
+            "restored raw flag still selects canopy cap"
+        );
+    }
+
+    /// The owners' counts answer SetOwnerObject424B79's and the destructor
+    /// 42291A's Anim array scan through each owner write, a load, and a
+    /// removal of an Anim that still names its owner.
+    #[test]
+    fn the_last_anim_naming_an_owner_releases_it_through_writes_loads_and_removals() {
+        let rules = runtime_rules("[A]\nEnd=3\n", &[("A", 3)]);
+        let mut sim = Simulation::new();
+        sim.interner = crate::sim::intern::test_interner();
+        for owner in [100, 101] {
+            sim.substrate.entities.insert(GameEntity::test_default(
+                owner,
+                "UNIT",
+                "Americans",
+                10,
+                10,
+            ));
+        }
+        let type_id = sim.interner.intern("A");
+        let [a, b, c] = [0; 3].map(|_| {
+            sim.spawn_anim_object(&rules, runtime_descriptor(type_id, 0))
+                .unwrap()
+        });
+        for (anim, owner) in [(a, 100), (b, 100), (c, 101)] {
+            assert!(sim.set_anim_owner_object(anim, Some(owner), &rules));
+        }
+        let parachuted =
+            |sim: &Simulation, owner| sim.substrate.entities.get(owner).unwrap().is_parachuted();
+        sim.substrate.anims = crate::util::save_codec::deserialize(
+            &crate::util::save_codec::serialize(&sim.substrate.anims).unwrap(),
+        )
+        .unwrap();
+        assert!(sim.set_anim_owner_object(a, Some(101), &rules));
+        assert!(parachuted(&sim, 100), "the loaded b still names 100");
+        // PointerExpired's bare CC clear leaves b no longer naming 100.
+        assert_eq!(sim.substrate.release_anim_owner_reference(b), Some(100));
+        assert!(sim.set_anim_owner_object(c, Some(100), &rules));
+        assert!(parachuted(&sim, 101), "a still names 101");
+        assert!(sim.set_anim_owner_object(c, None, &rules));
+        assert!(!parachuted(&sim, 100), "c was the last Anim naming 100");
+        assert!(sim.set_anim_owner_object(b, Some(101), &rules));
+        assert!(sim.substrate.anims.remove(b).is_some());
+        sim.scalar_delete_anim(a);
+        assert!(
+            !parachuted(&sim, 101),
+            "a was the last stored Anim naming 101"
+        );
     }
 
     #[test]
@@ -4058,7 +6186,7 @@ mod tests {
         let absolute = sim.anim_absolute_coord(id).unwrap();
         assert_ne!(sim.anim(id).unwrap().world_coord, absolute);
 
-        sim.destroy_anim_with_context(id, None);
+        sim.destroy_anim_with_context(id, crate::rules::ruleset::RuleSet::empty_for_test());
 
         let anim = sim.anim(id).unwrap();
         assert_eq!(anim.world_coord, absolute);
@@ -4154,7 +6282,8 @@ mod tests {
             // Native load resets Scenario RNG to seed zero. Keep this fixture
             // on that stream so endpoint continuation is comparable across load.
             let mut sim = Simulation::with_seed(0);
-            sim.session.map_name = "anim-boundary".to_string();
+            sim.session
+                .set_map_name_for_test("anim-boundary".to_string());
             let explosion_type = sim.interner.intern("TWLT036");
             let neighbor_type = sim.interner.intern("NEIGHBOR");
             let explosion = sim
@@ -4187,11 +6316,11 @@ mod tests {
             resources.rules = rules;
             let mut runtime = SimRuntime {
                 simulation: sim,
-                resources,
+                resources: std::sync::Arc::new(resources),
             };
             let mut hashes = Vec::new();
             for frame in 0..=17 {
-                assert_eq!(runtime.simulation.session.binary_frame, frame);
+                assert_eq!(runtime.simulation.session.binary_frame(), frame);
                 if restore && frame == 8 {
                     assert_eq!(
                         runtime.simulation.rng_state().scenario,
@@ -4297,6 +6426,35 @@ mod tests {
         );
     }
 
+    /// `AnimClass::AI @ 0x00423AC0`: the loop boundary stores the signed
+    /// `RandomLoopDelay=` draw (`0x004247B1..0x004247E5`) and the countdown
+    /// tests `!= 0` (`0x00424386`), so a negative pause holds the anim.
+    #[test]
+    fn a_negative_random_loop_delay_holds_the_anim() {
+        let rules = runtime_rules(
+            "[LOOPER]\nRate=900\nEnd=2\nLoopCount=-1\nRandomLoopDelay=-3,-3\n",
+            &[("LOOPER", 2)],
+        );
+        let mut sim = Simulation::new();
+        let type_name = sim.interner.intern("LOOPER");
+        let id = sim
+            .spawn_anim_object(
+                &rules,
+                AnimClassSpawnDescriptor {
+                    loop_count: -1,
+                    ..runtime_descriptor(type_name, 0)
+                },
+            )
+            .expect("bound art constructs");
+        for frame in 1..40 {
+            sim.session.set_binary_frame_for_test(frame);
+            sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+                .unwrap();
+        }
+        let delay = sim.anim(id).unwrap().runtime.delay_remaining;
+        assert!(delay < -3, "the pause counts on down, got {delay}");
+    }
+
     /// The whole point of routing combat explosions through `AnimStore`: the
     /// verified constructor row from `BulletClass::DetonateAtCoord 0x00469C93`,
     /// and the `Report=` that only `AnimClass::Start @ 0x00424CE0` can play.
@@ -4342,12 +6500,15 @@ mod tests {
         assert!(!sim.anim(id).unwrap().start_sound_active);
 
         // The first AI visit only clears the first-AI guard.
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap();
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap();
         assert_eq!(sim.anim(id).unwrap().runtime.delay_remaining, 1);
         assert_eq!(starts(&sim), 0);
 
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap();
         assert_eq!(sim.anim(id).unwrap().runtime.delay_remaining, 0);
         assert_eq!(starts(&sim), 1, "the expiring visit runs Start");
         assert_eq!(
@@ -4356,13 +6517,46 @@ mod tests {
             "and returns before advancing a frame"
         );
 
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap();
         assert_eq!(starts(&sim), 1, "Start runs once per delay");
+    }
+
+    /// The impact packet keeps nothing, so a picture-only impact is a
+    /// presentation anim; `spawn_combat_explosion_anim`'s callers may keep
+    /// theirs (the nuke awaits its NUKEBALL), so it makes an ordinary one.
+    #[test]
+    fn only_an_unkept_picture_only_impact_is_a_presentation_anim() {
+        let rules = runtime_rules("[PUFF]\nEnd=8\n", &[("PUFF", 8)]);
+        let point = crate::sim::projectile::ProjectileCoord::new(1000, 1000, 0);
+        // A new world makes it in native order: in the Anim array.
+        let mut native = Simulation::new();
+        let type_id = native.interner.intern("PUFF");
+        let packet = crate::sim::combat::detonation_anim::placed_effect(type_id, point);
+        crate::sim::world::damage_consequences::admit_explosion_effect(&mut native, &rules, packet);
+        assert_eq!(native.anims().count(), 1, "in the Anim array, as gamemd's");
+        assert_eq!(native.presentation_anims().count(), 0);
+
+        let mut sim = Simulation::new();
+        sim.present_effect_anims();
+        let type_id = sim.interner.intern("PUFF");
+        let packet = crate::sim::combat::detonation_anim::placed_effect(type_id, point);
+        crate::sim::world::damage_consequences::admit_explosion_effect(&mut sim, &rules, packet);
+        assert_eq!(sim.anims().count(), 0, "not in the Anim array");
+        assert_eq!(sim.presentation_anims().count(), 1);
+
+        let zero = crate::util::fixed_math::SIM_ZERO;
+        let kept = sim
+            .spawn_combat_explosion_anim(&rules, type_id, 3, 3, zero, zero, 0, 0)
+            .unwrap();
+        assert!(!sim.anim(kept).unwrap().is_presentation());
+        assert_eq!(sim.anims().count(), 1);
     }
 
     #[test]
     fn signed_impact_packet_keeps_exact_xy_through_explosion_admission() {
-        let rules = runtime_rules("[TWLT036]\nEnd=8\n", &[("TWLT036", 8)]);
+        // Sticky= keeps it an ordinary anim (`ArtRegistry::anim_presentation_only`).
+        let rules = runtime_rules("[TWLT036]\nEnd=8\nSticky=yes\n", &[("TWLT036", 8)]);
         for (x, y) in [(-257, -511), (-1, 1811), (-128_128, 5248), (2694, 5253)] {
             let mut sim = Simulation::new();
             let type_id = sim.interner.intern("TWLT036");
@@ -4383,6 +6577,32 @@ mod tests {
             let (rx, ry, sub_x, sub_y, _) = coord.to_cell_sub_z();
             assert_eq!((rx, ry, sub_x, sub_y), packed);
         }
+    }
+
+    #[test]
+    fn combat_explosion_z_adjust_and_owner_reach_the_anim() {
+        let rules = runtime_rules("[TWLT036]\nEnd=8\n", &[("TWLT036", 8)]);
+        let mut sim = Simulation::new();
+        let type_id = sim.interner.intern("TWLT036");
+        let house = sim.interner.intern("Americans");
+        let id = sim
+            .spawn_combat_explosion_anim_with_z_adjust(
+                &rules,
+                type_id,
+                1,
+                1,
+                crate::util::fixed_math::SIM_ZERO,
+                crate::util::fixed_math::SIM_ZERO,
+                0,
+                0,
+                7,
+                Some(house),
+                true,
+            )
+            .unwrap();
+        let anim = sim.anim(id).unwrap();
+        assert_eq!(anim.z_adjust, 7);
+        assert_eq!(anim.owner_house(), Some(house));
     }
 
     #[test]
@@ -4485,7 +6705,6 @@ mod tests {
             special_hidden: true,
             translucency_ramp: 6,
             forced_translucent: true,
-            forced_uses_75: true,
         };
         descriptor.use_cell_drawer = true;
         descriptor.terrain_attached = true;
@@ -4500,7 +6719,7 @@ mod tests {
         assert!(restored.get(id).unwrap().terrain_attached);
 
         let before = sim.state_hash();
-        sim.anim_mut_by_id(id).unwrap().terrain_attached = false;
+        sim.substrate.anims.get_mut(id).unwrap().terrain_attached = false;
         assert_ne!(sim.state_hash(), before);
     }
 
@@ -4604,6 +6823,7 @@ mod tests {
                 descriptor,
                 coord,
                 AnimConstructorInput::Preconsumed(draws),
+                crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         assert_eq!(sim.anim(id).unwrap().native_unique_id, native_unique_id);
@@ -4638,6 +6858,7 @@ mod tests {
                 first,
                 world,
                 AnimConstructorInput::AssignedIdentity(1_010_001),
+                crate::sim::world::FrameEffects::default(),
             )
             .expect("first authored load Anim");
         let keep_id = sim
@@ -4652,6 +6873,7 @@ mod tests {
                 second,
                 world,
                 AnimConstructorInput::AssignedIdentity(1_010_002),
+                crate::sim::world::FrameEffects::default(),
             )
             .expect("second authored load Anim");
 
@@ -4689,7 +6911,8 @@ mod tests {
         let id = sim.spawn_anim_object(&rules, descriptor).unwrap();
 
         assert_eq!(sim.substrate.raw_cell_occupation.ground_bits(3, 4), 0);
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap();
         assert_eq!(
             sim.substrate.raw_cell_occupation.ground_bits(3, 4),
             0x04,
@@ -4697,8 +6920,9 @@ mod tests {
         );
         assert_eq!(sim.anim(id).unwrap().runtime.current_frame, 0);
 
-        sim.session.binary_frame = 1;
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+        sim.session.set_binary_frame_for_test(1);
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap();
 
         assert_eq!(sim.substrate.raw_cell_occupation.ground_bits(3, 4), 0);
         assert!(sim.substrate.pending_delete.contains_object(&id));
@@ -4721,10 +6945,12 @@ mod tests {
         descriptor.sub_y = SimFixed::from_num(192);
         let id = sim.spawn_anim_object(&rules, descriptor).unwrap();
 
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap();
         assert_eq!(sim.substrate.raw_cell_occupation.ground_bits(5, 6), 0x08);
-        sim.session.binary_frame = 1;
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+        sim.session.set_binary_frame_for_test(1);
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap();
 
         assert_eq!(sim.anim(id).unwrap().type_id, plain);
         assert_eq!(
@@ -4814,10 +7040,13 @@ mod tests {
             let cell = terrain.native_cell_identity((x as i16, y as i16));
             let flags = native["flags"].as_u64().unwrap() as u32;
             terrain.write_native_cell_flags(cell, flags);
-            terrain.write_native_cell_state(cell, native["state"].as_u64().unwrap() as u8);
-            assert_eq!(terrain.cell(x, y).unwrap().bridge_facts.overlay_id, None);
+            // Native -1 identity with the corpus state byte.
+            let mut overlays =
+                crate::sim::overlay_grid::OverlayGrid::new(terrain.width(), terrain.height());
+            overlays.cell_mut_for_test(x, y).overlay_data = native["state"].as_u64().unwrap() as u8;
             let mut sim = Simulation::new();
             sim.resolved_terrain = Some(terrain);
+            sim.overlay_grid = Some(overlays);
             assert!(sim.bridge_state.is_none());
             let world = AnimWorldCoord {
                 x: i32::from(x) * 256 + 128,
@@ -4826,7 +7055,12 @@ mod tests {
             };
             // Original Infantry5217C0's center (128,128) occupies slot0:
             // walk_head_occupation.json raw[94]/[98], deck8 -> deck9.
-            sim.apply_make_infantry_raw_occupation(world, AnimOccupationOperation::Mark);
+            Simulation::apply_make_infantry_raw_occupation(
+                &mut sim.substrate,
+                &sim.resolved_terrain,
+                world,
+                AnimOccupationOperation::Mark,
+            );
             assert_eq!(sim.substrate.raw_cell_occupation.ground_bits(x, y), 0);
             assert_eq!(sim.substrate.raw_cell_occupation.deck_bits(x, y), 0x01);
 
@@ -4834,9 +7068,19 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .write_native_cell_flags(cell, flags & !0x100);
-            sim.apply_make_infantry_raw_occupation(world, AnimOccupationOperation::Clear);
+            Simulation::apply_make_infantry_raw_occupation(
+                &mut sim.substrate,
+                &sim.resolved_terrain,
+                world,
+                AnimOccupationOperation::Clear,
+            );
             assert_eq!(sim.substrate.raw_cell_occupation.deck_bits(x, y), 0);
-            sim.apply_make_infantry_raw_occupation(world, AnimOccupationOperation::Mark);
+            Simulation::apply_make_infantry_raw_occupation(
+                &mut sim.substrate,
+                &sim.resolved_terrain,
+                world,
+                AnimOccupationOperation::Mark,
+            );
             assert_eq!(sim.substrate.raw_cell_occupation.ground_bits(x, y), 0x01);
             assert_eq!(sim.substrate.raw_cell_occupation.deck_bits(x, y), 0);
         }
@@ -4867,13 +7111,29 @@ mod tests {
             y: 5 * 256 + 128,
             z: 0,
         };
-        sim.apply_make_infantry_raw_occupation(world, AnimOccupationOperation::Mark);
+        Simulation::apply_make_infantry_raw_occupation(
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            world,
+            AnimOccupationOperation::Mark,
+        );
         assert_eq!(sim.substrate.raw_cell_occupation.ground_bits(0, 5), 0x01);
-        sim.apply_make_infantry_raw_occupation(world, AnimOccupationOperation::Clear);
+        Simulation::apply_make_infantry_raw_occupation(
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            world,
+            AnimOccupationOperation::Clear,
+        );
         assert_eq!(sim.substrate.raw_cell_occupation.ground_bits(0, 5), 0);
 
-        assert_eq!(sim.map_coord_cell(-128 - 256, world.y), None);
-        assert_eq!(sim.map_coord_cell(512 * 256 + 128, world.y), Some((0, 6)));
+        assert_eq!(
+            Simulation::map_coord_cell(&sim.resolved_terrain, -128 - 256, world.y),
+            None
+        );
+        assert_eq!(
+            Simulation::map_coord_cell(&sim.resolved_terrain, 512 * 256 + 128, world.y),
+            Some((0, 6))
+        );
     }
 
     /// `AnimClass::MarkCellOccupancy` (`0x00426270`) stores the anim's owner
@@ -4907,11 +7167,21 @@ mod tests {
             y: 3 * 256 + 128,
             z: 0,
         };
-        sim.apply_make_infantry_raw_occupation(on_map, AnimOccupationOperation::Mark);
+        Simulation::apply_make_infantry_raw_occupation(
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            on_map,
+            AnimOccupationOperation::Mark,
+        );
         let raw = &sim.substrate.raw_cell_occupation;
         assert_eq!(raw.ground_bits(3, 3), 0x05);
         assert_eq!(raw.occupant_at(RawCellKey::Real(3, 3), ground).1, None);
-        sim.apply_make_infantry_raw_occupation(on_map, AnimOccupationOperation::Clear);
+        Simulation::apply_make_infantry_raw_occupation(
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            on_map,
+            AnimOccupationOperation::Clear,
+        );
         let raw = &sim.substrate.raw_cell_occupation;
         assert_eq!(raw.ground_bits(3, 3), 0x04);
         assert_eq!(raw.occupant_at(RawCellKey::Real(3, 3), ground).1, None);
@@ -4930,11 +7200,21 @@ mod tests {
             y: 3 * 256 + 128,
             z: 0,
         };
-        sim.apply_make_infantry_raw_occupation(off_map, AnimOccupationOperation::Mark);
+        Simulation::apply_make_infantry_raw_occupation(
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            off_map,
+            AnimOccupationOperation::Mark,
+        );
         let raw = &sim.substrate.raw_cell_occupation;
         assert_eq!(raw.bits_at(RawCellKey::Dummy, ground), 0x09);
         assert_eq!(raw.occupant_at(RawCellKey::Dummy, ground).1, None);
-        sim.apply_make_infantry_raw_occupation(off_map, AnimOccupationOperation::Clear);
+        Simulation::apply_make_infantry_raw_occupation(
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            off_map,
+            AnimOccupationOperation::Clear,
+        );
         let raw = &sim.substrate.raw_cell_occupation;
         assert_eq!(raw.bits_at(RawCellKey::Dummy, ground), 0x08);
         assert_eq!(raw.occupant_at(RawCellKey::Dummy, ground).1, None);
@@ -5006,28 +7286,28 @@ mod tests {
             let bits = |key: &str, i: usize| native[key][i].as_u64().unwrap() as u32;
             for axis in 0..3 {
                 assert_eq!(
-                    body.position[axis].bits(),
+                    body.position()[axis].bits(),
                     bits("position_bits", axis),
                     "{input}"
                 );
                 assert_eq!(
-                    body.velocity[axis].bits(),
+                    body.velocity()[axis].bits(),
                     bits("velocity_bits", axis),
                     "{input}"
                 );
             }
             assert_eq!(
-                body.elasticity.bits(),
+                body.elasticity().bits(),
                 native["elasticity_bits"].as_u64().unwrap(),
                 "{input}"
             );
             assert_eq!(
-                body.gravity.bits(),
+                body.gravity().bits(),
                 native["gravity_bits"].as_u64().unwrap(),
                 "{input}"
             );
             assert_eq!(
-                body.angular_velocity_magnitude.bits(),
+                body.angular_velocity_magnitude().bits(),
                 native["clamp_bits"].as_u64().unwrap(),
                 "{input}"
             );
@@ -5061,6 +7341,7 @@ mod tests {
                             z: at(2),
                         },
                         AnimConstructorInput::AssignedIdentity(native_id),
+                        crate::sim::world::FrameEffects::default(),
                     )
                     .unwrap();
                 assert_eq!(
@@ -5126,6 +7407,7 @@ mod tests {
                         z: at(2),
                     },
                     AnimConstructorInput::AssignedIdentity(native_id),
+                    crate::sim::world::FrameEffects::default(),
                 )
                 .unwrap()
             });
@@ -5202,13 +7484,13 @@ mod tests {
             // Every stored field, including both quaternions, is compared to
             // the whole original constructor rather than a second launch port.
             let actual = serde_json::json!({
-                "elasticity_bits": body.elasticity.bits(),
-                "gravity_bits": body.gravity.bits(),
-                "clamp_bits": body.angular_velocity_magnitude.bits(),
-                "position_bits": body.position.map(|v| v.bits()),
-                "velocity_bits": body.velocity.map(|v| v.bits()),
-                "orientation_bits": body.orientation.map(|v| v.bits()),
-                "rotation_bits": body.rotation.map(|v| v.bits()),
+                "elasticity_bits": body.elasticity().bits(),
+                "gravity_bits": body.gravity().bits(),
+                "clamp_bits": body.angular_velocity_magnitude().bits(),
+                "position_bits": body.position().map(|v| v.bits()),
+                "velocity_bits": body.velocity().map(|v| v.bits()),
+                "orientation_bits": body.orientation().map(|v| v.bits()),
+                "rotation_bits": body.rotation().map(|v| v.bits()),
             });
             assert_eq!(actual, row["bounce"], "{input}: whole native Bounce state");
         }
@@ -5250,11 +7532,10 @@ mod tests {
         rules.install_art_fixture(art);
         let mut sim = Simulation::with_seed(3);
         let americans = sim.interner.intern("Americans");
-        sim.houses.insert(
-            americans,
-            crate::sim::house_state::HouseState::new(americans, 0, None, true, 0, 10),
-        );
-        sim.session.house_order.push(americans);
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                americans, 0, None, true, 0, 10,
+            ));
         crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
         let tank = sim
             .spawn_object_at_height("TANK", "Americans", 8, 8, 0, 0, &rules)
@@ -5292,13 +7573,14 @@ mod tests {
 
         let mut landed_at = None;
         for frame in 1..200 {
-            sim.session.binary_frame = frame;
+            sim.session.set_binary_frame_for_test(frame);
             sim.visit_anim(
                 chunk,
                 &rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
-            );
+            )
+            .unwrap();
             let anim = sim.anim(chunk).unwrap();
             let body = anim.bounce.unwrap().position_leptons();
             assert_eq!(
@@ -5342,7 +7624,7 @@ mod tests {
         let mut terrain = crate::map::resolved_terrain::test_flat_ground_grid(8);
         for ry in 0..8 {
             for rx in 0..8 {
-                terrain.cell_mut(rx, ry).unwrap().accepts_smudge = true;
+                terrain.cell_mut_for_test(rx, ry).unwrap().accepts_smudge = true;
             }
         }
         sim.resolved_terrain = Some(terrain);
@@ -5376,8 +7658,9 @@ mod tests {
         );
         let mut saw_middle = false;
         for frame in 1..40 {
-            sim.session.binary_frame = frame;
-            sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+            sim.session.set_binary_frame_for_test(frame);
+            sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+                .unwrap();
             let Some(anim) = sim.anim(id) else {
                 break;
             };
@@ -5401,8 +7684,9 @@ mod tests {
             let (rules, mut sim) = middle_world("[MARK]\nRate=900\nScorch=yes\n", 13);
             let id = spawn_mark(&mut sim, &rules, world_z);
             for frame in 1..40 {
-                sim.session.binary_frame = frame;
-                sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+                sim.session.set_binary_frame_for_test(frame);
+                sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+                    .unwrap();
             }
             assert_eq!(marks_placed(&sim), expected, "z {world_z}");
         }
@@ -5431,43 +7715,49 @@ mod tests {
             .spawn_anim_object(&rules, runtime_descriptor(type_id, 1))
             .unwrap();
 
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default()); // constructor first-AI guard at frame 0
-        sim.session.binary_frame = 1;
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default()); // delay 1 -> 0
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap(); // constructor first-AI guard at frame 0
+        sim.session.set_binary_frame_for_test(1);
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap(); // delay 1 -> 0
         assert_eq!(sim.anim(id).unwrap().runtime.current_frame, 0);
-        sim.session.binary_frame = 2;
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default()); // constructor-anchored timer is already due
+        sim.session.set_binary_frame_for_test(2);
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap(); // constructor-anchored timer is already due
 
         assert_eq!(sim.anim(id).unwrap().runtime.current_frame, 1);
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default()); // a second visit in the same frame cannot advance again
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap(); // a second visit in the same frame cannot advance again
         assert_eq!(sim.anim(id).unwrap().runtime.current_frame, 1);
         assert_eq!(sim.scenario_rng.logical_state(), rng_before);
     }
 
+    /// An anim waiting on its frame timer ends its visit at the gates without
+    /// being handed out, so nothing re-derives from it; the visit that
+    /// advances its frame hands it out.
     #[test]
-    fn normalized_rate_uses_live_speed_after_random_rate_selection() {
-        let rules = runtime_rules(
-            "[TEST]\nRate=900\nRandomRate=180,225\nNormalized=yes\nEnd=3\nLoopCount=1\n",
-            &[("TEST", 3)],
-        );
+    fn a_waiting_anims_visit_hands_it_out_to_no_one() {
+        let rules = runtime_rules("[TEST]\nRate=450\nEnd=3\nLoopCount=1\n", &[("TEST", 3)]);
         let mut sim = Simulation::new();
-        sim.session.game_options.game_speed = 1;
         let type_id = sim.interner.intern("TEST");
-        let expected_rng = sim.scenario_rng.clone();
-        let expected_rate = sim.session.game_options.normalized_anim_delay(4);
-
         let id = sim
-            .spawn_anim_object(&rules, runtime_descriptor(type_id, 0))
+            .spawn_anim_object(&rules, runtime_descriptor(type_id, 1))
             .unwrap();
-        let runtime = &sim.anim(id).unwrap().runtime;
-
-        assert_eq!(runtime.rate_reload, expected_rate);
-        assert_eq!(runtime.frame_timer.start_frame(), 0);
-        assert_eq!(runtime.frame_timer.duration(), i32::from(expected_rate));
-        assert_eq!(
-            sim.scenario_rng.logical_state(),
-            expected_rng.logical_state()
-        );
+        let visit = |sim: &mut Simulation, frame: u32| {
+            sim.session.set_binary_frame_for_test(frame);
+            sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+                .unwrap();
+            sim.substrate
+                .anims
+                .take_touched(AnimTouchReader::GroundKeys)
+        };
+        visit(&mut sim, 0); // constructor first-AI guard
+        visit(&mut sim, 1); // delay 1 -> 0
+        assert_eq!(visit(&mut sim, 2), Touched::Ids(vec![id]));
+        assert_eq!(sim.anim(id).unwrap().runtime.current_frame, 1);
+        // The timer the last visit restarted is not due in the same frame.
+        assert_eq!(visit(&mut sim, 2), Touched::Ids(Vec::new()));
+        assert_eq!(sim.anim(id).unwrap().runtime.current_frame, 1);
     }
 
     #[test]
@@ -5477,19 +7767,22 @@ mod tests {
             &[("NAWEAP_A", 12)],
         );
         let mut sim = Simulation::new();
-        sim.session.game_options.game_speed = 1;
+        sim.session.game_options_mut_for_test().game_speed = 1;
         let type_id = sim.interner.intern("NAWEAP_A");
         let id = sim
             .spawn_anim_object(&rules, runtime_descriptor(type_id, 0))
             .unwrap();
 
         assert_eq!(sim.anim(id).unwrap().runtime.rate_reload, 6);
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
-        sim.session.binary_frame = 5;
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap();
+        sim.session.set_binary_frame_for_test(5);
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap();
         assert_eq!(sim.anim(id).unwrap().runtime.current_frame, 0);
-        sim.session.binary_frame = 6;
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+        sim.session.set_binary_frame_for_test(6);
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap();
         assert_eq!(sim.anim(id).unwrap().runtime.current_frame, 1);
     }
 
@@ -5511,11 +7804,14 @@ mod tests {
             [SimSoundEvent::AnimationStarted { anim_id, .. }] if *anim_id == id
         ));
 
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default()); // guard
-        sim.session.binary_frame = 1;
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default()); // frame 1
-        sim.session.binary_frame = 2;
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default()); // frame 2 -> SECOND in place + Middle
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap(); // guard
+        sim.session.set_binary_frame_for_test(1);
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap(); // frame 1
+        sim.session.set_binary_frame_for_test(2);
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap(); // frame 2 -> SECOND in place + Middle
         let anim = sim.anim(id).unwrap();
         assert_eq!(sim.interner.resolve(anim.type_id), "SECOND");
         assert_eq!(anim.runtime.current_frame, 0);
@@ -5527,10 +7823,12 @@ mod tests {
             2,
         );
 
-        sim.session.binary_frame = 3;
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default()); // SECOND frame 1 (Next does not restore guard)
-        sim.session.binary_frame = 4;
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default()); // SECOND frame 2 -> destroy
+        sim.session.set_binary_frame_for_test(3);
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap(); // SECOND frame 1 (Next does not restore guard)
+        sim.session.set_binary_frame_for_test(4);
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap(); // SECOND frame 2 -> destroy
         sim.destroy_anim(id, &rules);
         assert!(!sim.anim(id).unwrap().runtime.inactive);
         assert!(sim.substrate.pending_delete.contains_object(&id));
@@ -5557,7 +7855,7 @@ mod tests {
             .unwrap();
         let world = sim.anim_absolute_coord(id).unwrap();
         let stop = sim.interner.intern("ENDCUE");
-        sim.sound_events.clear();
+        sim.sound_events.clear_for_test();
         sim.destroy_anim(id, &rules);
         sim.destroy_anim(id, &rules);
         // Original4255D5 releases +1A0 before425618 plays the optional
@@ -5572,7 +7870,7 @@ mod tests {
         assert_eq!(sim.substrate.pending_delete.object_ids(), vec![id]);
         assert!(!sim.anim(id).unwrap().in_logic_vector);
         assert_eq!(sim.display_layers().layer_of(id), None);
-        assert!(!sim.reveal_anim(id, Some(&rules), true));
+        assert!(!sim.reveal_anim(id, &rules, true));
         sim.process_pending_delete();
         assert!(sim.anim(id).is_none());
     }
@@ -5580,8 +7878,9 @@ mod tests {
     #[test]
     fn trailer_without_preintern_is_visited_and_guarded_in_same_live_walk() {
         let rules = runtime_rules(
+            // Sticky= keeps CHILD an ordinary anim (`ArtRegistry::anim_presentation_only`).
             "[PARENT]\nRate=0\nEnd=2\nTrailerAnim=CHILD\nTrailerSeperation=1\n\n\
-             [CHILD]\nRate=900\nEnd=2\nLoopCount=1\n",
+             [CHILD]\nRate=900\nEnd=2\nLoopCount=1\nSticky=yes\n",
             &[("PARENT", 2), ("CHILD", 2)],
         );
         let mut sim = Simulation::new();
@@ -5592,7 +7891,8 @@ mod tests {
             .unwrap();
 
         sim.for_each_live_object(|sim, id| {
-            sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+            sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+                .unwrap();
         });
 
         let order = sim.live_object_order_snapshot();
@@ -5625,7 +7925,11 @@ mod tests {
         sim.set_anim_owner_object(anim_id, Some(building_id), &rules);
         assert_eq!(sim.anim(anim_id).unwrap().owner_entity, Some(building_id));
 
-        assert!(sim.anim_pointer_expired(anim_id, building_id, None));
+        assert!(sim.anim_pointer_expired(
+            anim_id,
+            building_id,
+            crate::rules::ruleset::RuleSet::empty_for_test()
+        ));
         assert_eq!(
             sim.substrate
                 .entities
@@ -5645,7 +7949,8 @@ mod tests {
             &rules,
             None,
             crate::sim::world::FrameEffects::default(),
-        );
+        )
+        .unwrap();
         assert!(
             sim.entities()
                 .get(building_id)
@@ -5659,6 +7964,39 @@ mod tests {
     }
 
     #[test]
+    fn building_limbo_uninits_its_damage_fire_anims() {
+        let (mut sim, rules, building_id) = damage_fire_fixture(false);
+        sim.substrate
+            .entities
+            .get_mut(building_id)
+            .unwrap()
+            .health
+            .set_for_test(50);
+        sim.update_building_damage_fire(building_id, &rules);
+        let fires = sim
+            .substrate
+            .entities
+            .get(building_id)
+            .unwrap()
+            .damage_fires
+            .anim_ids;
+        let anim_id = fires[0].expect("slot zero");
+
+        // The building is alive: only Building Limbo 4458E4 retires the fires.
+        sim.techno_limbo_with_rules(building_id, &rules, None);
+
+        let building = sim.substrate.entities.get(building_id).unwrap();
+        assert!(building.is_object_alive());
+        assert!(building.damage_fires.anim_ids.iter().all(Option::is_none));
+        assert!(
+            building.damage_fires.active,
+            "Limbo leaves Building+5E8 as it was"
+        );
+        assert!(!sim.live_object_order_snapshot().contains(&anim_id));
+        assert!(sim.substrate.pending_delete.contains_object(&anim_id));
+    }
+
+    #[test]
     fn pointer_expiry_runs_owner_and_attached_bullet_arms_independently() {
         let (mut sim, rules, owner) = damage_fire_fixture(false);
         let fire_type = sim.interner.get("FIRE01").unwrap();
@@ -5666,10 +8004,10 @@ mod tests {
             .spawn_anim_object(&rules, runtime_descriptor(fire_type, 0))
             .unwrap();
         sim.set_anim_owner_object(anim, Some(owner), &rules);
-        sim.set_anim_attached_bullet(anim, Some(owner));
+        sim.substrate.set_anim_attached_bullet(anim, Some(owner));
         // Pointer fields are independently compared at425164 and4251AD;
         // clearing the owner must not skip attached-Bullet UnInit.
-        assert!(sim.anim_pointer_expired(anim, owner, Some(&rules)));
+        assert!(sim.anim_pointer_expired(anim, owner, &rules));
         let object = sim.anim(anim).unwrap();
         assert_eq!(object.owner_entity, None);
         assert_eq!(object.attached_bullet(), None);
@@ -5689,14 +8027,16 @@ mod tests {
                 AnimWorldCoord { x: 0, y: 0, z: 0 },
             )
             .unwrap();
-        sim.anim_mut_by_id(anim_id).unwrap().owner_entity = Some(building_id);
+        sim.substrate
+            .anims
+            .set_owner_entity_for_test(anim_id, Some(building_id));
         sim.substrate
             .entities
             .get_mut(building_id)
             .unwrap()
             .damage_fires
             .anim_ids[0] = Some(anim_id);
-        sim.rebuild_building_anim_slot_indices();
+        sim.substrate.rebuild_building_anim_slot_indices();
         // Supply the common post-UnInit retirement state through its existing
         // membership owner;19B remains the independent native expiry byte.
         sim.conceal_anim(anim_id);
@@ -5991,6 +8331,27 @@ mod tests {
     }
 
     #[test]
+    fn unspawnable_damage_fire_type_leaves_the_slots_empty() {
+        let (mut sim, mut rules, building_id) = damage_fire_fixture(false);
+        for fire in &mut rules.general.damage_fire_types {
+            fire.name = "NOSUCHFIRE".to_string();
+        }
+        sim.substrate
+            .entities
+            .get_mut(building_id)
+            .unwrap()
+            .health
+            .set_for_test(50);
+
+        sim.update_building_damage_fire(building_id, &rules);
+
+        let building = sim.substrate.entities.get(building_id).unwrap();
+        assert!(building.damage_fires.active);
+        assert!(building.damage_fires.anim_ids.iter().all(Option::is_none));
+        assert_eq!(sim.live_object_order_snapshot(), vec![building_id]);
+    }
+
+    #[test]
     fn empty_fire_type_list_sets_cache_without_rng_or_slots() {
         let (mut sim, mut rules, building_id) = damage_fire_fixture(false);
         rules.general.damage_fire_types.clear();
@@ -6070,7 +8431,7 @@ mod tests {
             .health
             .set_for_test(50);
         sim.update_building_damage_fire(building_id, &rules);
-        sim.sound_events.clear();
+        sim.sound_events.clear_for_test();
         sim.substrate
             .entities
             .get_mut(building_id)
@@ -6091,71 +8452,6 @@ mod tests {
                 .count(),
             2,
         );
-    }
-
-    #[test]
-    fn occupiable_building_selects_condition_red_boundary() {
-        let (mut sim, rules, building_id) = damage_fire_fixture(true);
-        sim.substrate
-            .entities
-            .get_mut(building_id)
-            .unwrap()
-            .health
-            .set_for_test(26);
-        sim.update_building_damage_fire(building_id, &rules);
-        assert!(
-            !sim.substrate
-                .entities
-                .get(building_id)
-                .unwrap()
-                .damage_fires
-                .active
-        );
-        sim.substrate
-            .entities
-            .get_mut(building_id)
-            .unwrap()
-            .health
-            .set_for_test(25);
-        sim.update_building_damage_fire(building_id, &rules);
-        assert!(
-            sim.substrate
-                .entities
-                .get(building_id)
-                .unwrap()
-                .damage_fires
-                .active
-        );
-    }
-
-    #[test]
-    fn first_anim_visit_only_clears_guard() {
-        let (mut sim, rules, building_id) = damage_fire_fixture(false);
-        sim.substrate
-            .entities
-            .get_mut(building_id)
-            .unwrap()
-            .health
-            .set_for_test(50);
-        sim.update_building_damage_fire(building_id, &rules);
-        let anim_id = sim
-            .substrate
-            .entities
-            .get(building_id)
-            .unwrap()
-            .damage_fires
-            .anim_ids[0]
-            .unwrap();
-        let frame = sim.anim(anim_id).unwrap().runtime.current_frame;
-        sim.visit_anim(
-            anim_id,
-            &rules,
-            None,
-            crate::sim::world::FrameEffects::default(),
-        );
-        let anim = sim.anim(anim_id).unwrap();
-        assert_eq!(anim.runtime.current_frame, frame);
-        assert!(!anim.runtime.first_ai_guard);
     }
 
     #[test]
@@ -6204,9 +8500,10 @@ mod tests {
             "[General]\nDropZoneAnim=ARRWSE\n[AudioVisual]\nDropZoneRadius=4\n[Animations]\n0=ARRWSE\n[BuildingTypes]\n0=BLOCK\n[BLOCK]\nStrength=100\n[Clear]\nBuildable=yes\nFoot=100%\nTrack=100%\n",
         )).unwrap();
         let mut art = ArtRegistry::from_ini(&IniFile::from_str(
-            "[ARRWSE]\nLoopCount=2\nLoopEnd=4\nRate=450\nDemandLoad=true\nLayer=Top\nZAdjust=-300\nReport=Explosion06\nStopSound=ExplosionShard\nNext=none\n",
+            "[ARRWSE]\nLoopCount=2\nLoopEnd=4\nRate=450\nDemandLoad=true\nLayer=Top\nZAdjust=-300\nNext=none\n",
         ));
         art.bind_anim_frame_count_for_test("ARRWSE", 5);
+        art.set_anim_sounds_for_test("ARRWSE", Some("Explosion06"), Some("ExplosionShard"));
         rules.replace_art_registry_for_test(art);
         let map=crate::map::map_file::MapFile::from_bytes(
             b"[Map]\nTheater=TEMPERATE\nSize=0,0,16,16\nLocalSize=0,0,16,16\n[IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n[Waypoints]\n59=10010\n123=6005\n[Triggers]\nCUE=Player,<none>,Cue,0,1,1,1,0\n[Events]\nCUE=1,8,0,0\n[Actions]\nCUE=1,8,0,123,0,0,0,0,BH\n[Tags]\nCUETAG=0,Cue,CUE\n",
@@ -6220,31 +8517,27 @@ mod tests {
         let player = sim.interner.intern("Player");
         let other = sim.interner.intern("Other");
         for (id, human) in [(player, true), (other, false)] {
-            sim.houses.insert(
-                id,
-                crate::sim::house_state::HouseState::new(id, 0, None, human, 0, 10),
-            );
-            sim.session.house_order.push(id);
+            sim.houses
+                .register(crate::sim::house_state::HouseState::new(
+                    id, 0, None, human, 0, 10,
+                ));
         }
-        sim.session.current_house = Some(player);
-        sim.session.binary_frame = 1000;
+        sim.session.set_current_house_for_test(Some(player));
+        sim.session.set_binary_frame_for_test(1000);
         sim.session.install_waypoints(&map.waypoints);
         sim.initialize_trigger_definitions(
             &map,
             &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
             None,
             None,
+            None,
         );
-        sim.classify_map_triggers(Some(&rules));
+        sim.classify_map_triggers(&rules);
         (sim, rules, player)
     }
 
     fn waypoint_cue_spring_flare(sim: &mut Simulation, rules: &RuleSet) -> AnimId {
-        sim.advance_triggers(
-            Some(rules),
-            None,
-            crate::sim::world::FrameEffects::default(),
-        );
+        sim.advance_triggers(rules, None, crate::sim::world::FrameEffects::default());
         let anim = sim
             .substrate
             .anims
@@ -6278,8 +8571,9 @@ mod tests {
         assert!(!sim.fog.is_cell_revealed(player, 20, 20));
         let other = sim.interner.get("Other").unwrap();
         assert!(!sim.fog.is_cell_revealed(other, 10, 10));
-        sim.sound_events.clear();
-        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+        sim.sound_events.clear_for_test();
+        sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap();
         assert!(!sim.anim(id).unwrap().runtime.first_ai_guard);
         assert!(
             sim.sound_events.is_empty(),
@@ -6314,7 +8608,7 @@ mod tests {
             );
             building.health.set(0); //Native Cell47C520 has no Health/Alive admission.
             sim.substrate.entities.insert(building);
-            sim.substrate.next_stable_object_id = 101;
+            sim.set_next_stable_object_id_for_test(101);
             sim.substrate.occupancy.add(
                 10,
                 10,
@@ -6332,9 +8626,10 @@ mod tests {
                     0
                 }
             );
-            sim.sound_events.clear();
+            sim.sound_events.clear_for_test();
             let rng = sim.rng_state();
-            sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default());
+            sim.visit_anim(id, &rules, None, crate::sim::world::FrameEffects::default())
+                .unwrap();
             let anim = sim.anim(id).unwrap();
             if layer == MovementLayer::Ground {
                 assert!(anim.runtime.inactive);
@@ -6356,6 +8651,14 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
+#[path = "anim_move_flash_tests.rs"]
+mod move_flash_tests;
+
+#[cfg(all(test, any(tests_sim_a_b, tests_sim_trigger, tests_sim_world_t_z)))]
 #[path = "anim_meteor_tests.rs"]
 pub(in crate::sim) mod meteor_tests;
+
+#[cfg(all(test, tests_sim_a_b))]
+#[path = "anim_damage_tests.rs"]
+mod damage_tests;

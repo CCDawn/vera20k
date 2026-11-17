@@ -69,7 +69,9 @@ impl Simulation {
     /// block `0x004463F0..0x00446580`: for each of the owner's Supers
     /// matching the type's `SuperWeapon=`, construct slot 16 when its charge
     /// is (all but) complete, else slot 14, in the damaged or garrisoned
-    /// variant the opening's other slots take.
+    /// variant the opening's other slots take. Ares 3.0
+    /// BuildingClass_Place_SuperWeaponAnimsB 10034AE0 (hook `0x0044656D`)
+    /// skips the stock second loop to `0x00446580`, the end of this block.
     pub(crate) fn open_super_weapon_anims(
         &mut self,
         id: u64,
@@ -80,16 +82,36 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get(id) else {
             return;
         };
-        let owner = entity.owner();
-        let Some(index) = self
-            .object_type(entity.type_ref(), rules)
-            .and_then(|object| super_weapon_index(object, rules))
-        else {
-            return;
-        };
-        for remaining in
+        let remaining = if rules.ares_form() {
+            // Installed Ares4463F0 ->10034A60 replaces the retail Type-vs-
+            // definition-index scan. No eligible Super still creates14 when
+            // the primary definition exists (10034A91..10034ACD).
+            let selected =
+                crate::sim::superweapon::first_available_building_super(self, rules, entity)
+                    .map(|instance| instance.charge_remaining(self.session.binary_frame() as i32));
+            if let Some(remaining) = selected {
+                vec![remaining]
+            } else {
+                let primary = self
+                    .object_type(entity.type_ref(), rules)
+                    .and_then(|object| super_weapon_index(object, rules))
+                    .is_some();
+                if primary {
+                    self.set_building_anim_slot(id, SUPER_ANIM, damaged, garrisoned, 0, rules);
+                }
+                return;
+            }
+        } else {
+            let owner = entity.owner();
+            let Some(index) = self
+                .object_type(entity.type_ref(), rules)
+                .and_then(|object| super_weapon_index(object, rules))
+            else {
+                return;
+            };
             crate::sim::superweapon::supers_of_kind_remaining(self, rules, owner, index)
-        {
+        };
+        for remaining in remaining {
             let slot = if opens_charged(remaining) {
                 SUPER_ANIM_OPEN
             } else {
@@ -100,7 +122,9 @@ impl Simulation {
     }
 
     /// `BuildingClass::UpdateAnimation @ 0x004509D0`'s SuperAnim block
-    /// `0x00450F9E..0x00451145`, reached on every visit. Outside
+    /// `0x00450F9E..0x00451145`, reached on every visit (Ares 3.0
+    /// BuildingClass_ProcessAnims_SuperWeaponsB 10034B60, hook `0x00451132`,
+    /// skips the stock second pass to its end). Outside
     /// Construction and Selling, for a type with `ChargedAnimTime=` at most
     /// 990: for each of the owner's Supers matching the type's
     /// `SuperWeapon=`, a charge within `ChargedAnimTime` minutes of ready
@@ -114,6 +138,7 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get(id) else {
             return;
         };
+        let ares = rules.ares_form();
         let owner = entity.owner();
         let health = entity.health;
         if matches!(
@@ -125,17 +150,33 @@ impl Simulation {
         let Some(object) = self.object_type(entity.type_ref(), rules) else {
             return;
         };
-        let Some(index) = super_weapon_index(object, rules) else {
+        // The stock pass leaves here without a `SuperWeapon=` index; Ares
+        // asks for the building's available Super below instead.
+        let index = super_weapon_index(object, rules);
+        if !ares && index.is_none() {
             return;
-        };
+        }
         let charged_anim_time = object.charged_anim_time;
         if charged_anim_time > CHARGED_ANIM_TIME_LIMIT {
             return;
         }
         let strength = object.strength;
-        for remaining in
+        let remaining = if ares {
+            // Ares450F9E ->10034AF0: unavailable returns451145; only an
+            // actual selected instance reaches the shared retail timer body.
+            let Some(instance) =
+                crate::sim::superweapon::first_available_building_super(self, rules, entity)
+            else {
+                return;
+            };
+            vec![instance.charge_remaining(self.session.binary_frame() as i32)]
+        } else {
+            let Some(index) = index else {
+                return;
+            };
             crate::sim::superweapon::supers_of_kind_remaining(self, rules, owner, index)
-        {
+        };
+        for remaining in remaining {
             let (occupied, replacement) = if near_charged(remaining, charged_anim_time) {
                 (SUPER_ANIM, SUPER_ANIM_OPENING)
             } else {
@@ -155,7 +196,7 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 mod tests {
     //! Native comparisons (`tools/superweapon_oracle.py` sections
     //! `super_anim` and `opening_super_anim`; `--check` regenerates them).
@@ -243,7 +284,20 @@ mod tests {
             &art,
         )
         .unwrap();
-        rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
+        // The oracle writes the Type's name fields directly, leaving an
+        // unnamed variant empty where ReadINI would copy the normal name into
+        // it (`parse_building_anims`).
+        let mut registry = crate::rules::art_data::ArtRegistry::from_ini(&art);
+        for config in &mut registry.get_mut("SUPERB").unwrap().building_anims {
+            let slot = config.native_slot;
+            if !names.contains_key(format!("{slot}/1").as_str()) {
+                config.damaged_variant = None;
+            }
+            if !names.contains_key(format!("{slot}/2").as_str()) {
+                config.garrisoned_variant = None;
+            }
+        }
+        rules.install_art_data(registry);
         if let Some(minutes) = charged_anim_time {
             assert_eq!(
                 rules.object("SUPERB").unwrap().charged_anim_time.to_bits(),
@@ -255,8 +309,7 @@ mod tests {
         sim.resolve_type_handles(&rules);
         let owner = sim.interner.intern("Russians");
         sim.houses
-            .insert(owner, HouseState::new(owner, 1, None, true, 0, 10));
-        sim.session.house_order.push(owner);
+            .register(HouseState::new(owner, 1, None, true, 0, 10));
         sim.resolved_terrain = Some(test_grid(16, 16, test_flat_cell));
         crate::sim::arena_fixture::supply_native_map(&mut sim);
         let id = sim
@@ -266,20 +319,26 @@ mod tests {
         for slot in SUPER_ANIM..=SUPER_ANIM_CLOSING {
             sim.clear_building_anim_slot(id, slot);
         }
-        let weapons = sim.super_weapons.entry(owner).or_default();
+        let weapons = sim
+            .super_weapons
+            .map_mut_for_test()
+            .entry(owner)
+            .or_default();
         weapons.clear();
         for (index, row_super) in supers.iter().enumerate() {
             let type_id = sim.interner.intern(&format!("SW{index}"));
             let mut instance = SuperWeaponInstance::new(type_id, owner, 0);
-            instance.is_active = true;
-            instance.charge_start_tick = int(&row_super[1]);
-            instance.charge_duration = int(&row_super[2]);
+            instance.set_is_active_for_test(true);
+            instance.set_charge_start_tick_for_test(int(&row_super[1]));
+            instance.set_charge_duration_for_test(int(&row_super[2]));
             sim.super_weapons
+                .map_mut_for_test()
                 .get_mut(&owner)
                 .unwrap()
                 .insert(type_id, instance);
         }
-        sim.session.binary_frame = u32::try_from(int(&row["frame"])).unwrap();
+        sim.session
+            .set_binary_frame_for_test(u32::try_from(int(&row["frame"])).unwrap());
         sim.substrate
             .entities
             .get_mut(id)
@@ -295,7 +354,7 @@ mod tests {
             .filter_map(|slot| {
                 let anim = entity.building_art.anim_slots[usize::from(slot)]?;
                 let anim = sim.substrate.anims.get(anim)?;
-                Some((slot, sim.interner.resolve(anim.type_id).to_string()))
+                Some((slot, sim.interner.resolve(anim.type_id()).to_string()))
             })
             .collect()
     }

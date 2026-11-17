@@ -153,6 +153,12 @@ pub(crate) fn snap_after_successful_unlimbo(
     }
 }
 
+/// Whether [`sample_process_entry`] changes `entity`'s slope state for
+/// `sampled_slope`: it has one, and the slope differs from its target.
+pub(crate) fn process_entry_changes(entity: &GameEntity, sampled_slope: u8) -> bool {
+    state_for_entity(entity).is_some_and(|state| state.current_slope != sampled_slope)
+}
+
 /// Drive Process `0x004B050B..0x004B0557` and Ship Process
 /// `0x0069FC1B..0x0069FC67` sample before any track/movement branch.
 pub(crate) fn sample_process_entry(entity: &mut GameEntity, sampled_slope: u8, binary_frame: u32) {
@@ -161,7 +167,7 @@ pub(crate) fn sample_process_entry(entity: &mut GameEntity, sampled_slope: u8, b
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::{SlopeRenderPhase, SlopeTransitionState};
     use crate::map::entities::EntityCategory;
@@ -348,7 +354,14 @@ mod tests {
                 .map(|stashed| stashed.runtime_payload()),
             Some(LocomotorRuntimePayload::Drive(_))
         ));
-        assert!(stashed_drive.locomotor.as_mut().unwrap().end_piggyback());
+        assert!(
+            stashed_drive
+                .locomotor
+                .as_mut()
+                .unwrap()
+                .end_piggyback()
+                .is_some()
+        );
         assert_eq!(
             super::state_for_entity(&stashed_drive)
                 .unwrap()

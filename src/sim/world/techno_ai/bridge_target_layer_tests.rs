@@ -35,10 +35,7 @@ fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
         input["air_range_bonus"]
     );
     assert_eq!(json!(obj.strength), input["strength"]);
-    assert_eq!(
-        json!(crate::sim::combat::armor_index(&obj.armor)),
-        input["armor"]
-    );
+    assert_eq!(json!(obj.armor_id().index()), input["armor"]);
     assert_eq!(
         json!(rules.general.normal_targeting_delay),
         input["normal_delay"]
@@ -78,8 +75,9 @@ fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
         local_width: 20,
         local_height: 20,
     });
-    sim.session.game_mode_nonzero = true;
-    sim.session.binary_frame = 173;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    sim.session.set_binary_frame_for_test(173);
     for (id, owner, x) in [
         (1, "Americans", 10),
         (2, "Russians", 12),
@@ -87,8 +85,7 @@ fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
     ] {
         let owner = sim.intern(owner);
         sim.houses
-            .entry(owner)
-            .or_insert_with(|| HouseState::new(owner, 0, None, true, 0, 10));
+            .get_or_register_for_test(owner, || HouseState::new(owner, 0, None, true, 0, 10));
         let mut entity = GameEntity::new_at_frame_zero_for_test(
             id,
             x,
@@ -104,7 +101,7 @@ fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
             true,
         );
         entity.lifecycle.set_in_limbo_for_test(false);
-        entity.lifecycle.set_cell_marked(true);
+        entity.lifecycle.set_cell_marked_for_test(true);
         entity.set_in_playfield(true);
         entity.locomotor = Some(LocomotorState::from_object_type(obj, 0));
         entity
@@ -113,7 +110,8 @@ fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
         entity.passive_scan.set_last_target_scan_frame_for_test(0);
         entity.position.set_exact_z_leptons_for_test(Some(624));
         sim.substrate.entities.insert(entity);
-        sim.mission_assign_exact(id, MissionId::from_known(MissionType::Guard), 0)
+        sim.substrate
+            .mission_assign_exact(id, MissionId::from_known(MissionType::Guard), 0)
             .unwrap();
     }
     sim.resolve_type_handles(rules);
@@ -122,7 +120,8 @@ fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
 
 fn supply_step(sim: &mut Simulation, rules: &RuleSet, input: &Value) {
     use crate::sim::combat::TargetKind;
-    sim.session.binary_frame = input["frame"].as_u64().unwrap_or(173) as u32;
+    sim.session
+        .set_binary_frame_for_test(input["frame"].as_u64().unwrap_or(173) as u32);
     sim.substrate.occupancy = OccupancyGrid::new();
     for (index, id, x) in [(0, 1, 10), (1, 2, 12)] {
         let deck = input["on_bridge"][index].as_i64().unwrap_or(0) != 0;
@@ -197,7 +196,7 @@ fn supply_step(sim: &mut Simulation, rules: &RuleSet, input: &Value) {
         sim.assign_target_represented(
             1,
             None::<TargetKind>,
-            Some(rules),
+            rules,
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -329,7 +328,7 @@ fn native_passive_bridge_histories_preserve_timers_rng_assignment_and_cell_list_
             let main = sim.main_rng.logical_state();
             let map = sim.mapgen_rng.logical_state();
             let ids = sim.native_unique_ids.as_ref().unwrap().current_raw();
-            passive_acquire_step(&mut sim, 1, Some(&rules), ObjectAiCtx::default());
+            passive_acquire_step(&mut sim, 1, &rules, ObjectAiCtx::default());
             assert_state(&sim, &step["after"], &format!("{label}/{index} after"));
             assert_eq!(
                 sim.scenario_rng.native_state_hex(),
@@ -382,12 +381,12 @@ fn move_retail_fv(
         .unwrap()
         .passive_scan
         .set_passive_scan_timer_for_test(MissionTimer::armed(
-            runtime.simulation.session.binary_frame,
+            runtime.simulation.session.binary_frame(),
             1_000_000,
         ));
     let command = CommandEnvelope::new(
         owner,
-        runtime.simulation.session.tick + 1,
+        runtime.simulation.session.tick() + 1,
         Command::Move {
             entity_id: id,
             target_rx: destination.0,
@@ -411,7 +410,7 @@ fn move_retail_fv(
             stop_sent = true;
             CommandEnvelope::new(
                 owner,
-                runtime.simulation.session.tick + 1,
+                runtime.simulation.session.tick() + 1,
                 Command::Stop { entity_id: id },
             )
         });
@@ -543,23 +542,47 @@ pub(super) fn retail_hills_collapsed_scene(
             (cell.level, cell.slope_type, cell.base_land_type),
             (6, 0, 7)
         );
-        assert_eq!(cell.base_speed_costs.track, Some(100));
+        assert_eq!(
+            cell.base_speed_costs.track,
+            Some(crate::util::native_x87::NativeF32Bits::ONE)
+        );
         assert!(!cell.base_ground_walk_blocked);
         assert_ne!(cell.bridge_facts.raw_flags & 0x100, 0);
     }
-    let owner = scenario.sim().session.current_house.unwrap();
+    let owner = scenario.sim().session.current_house().unwrap();
     let source = move_retail_fv(&mut scenario, owner, (64, 72), (64, 69), (64, 69), true);
     // Initially same owner so movement preparation cannot cause combat. The
     // hostile House link is a supplied acquisition-entry boundary below.
     let target = move_retail_fv(&mut scenario, owner, (62, 69), (68, 69), (66, 69), false);
     observe(scenario.sim(), "after_ordinary_fv_moves");
     let enemy = scenario.runtime.simulation.intern("Russians");
+    // Snapshot401's House admission (d11222e2c) models the native House array:
+    // every registered House carries the name FromName50C170 reads and the
+    // array holds it once. Register the hostile House exactly that way, as
+    // the roster reader would, so the retail save/restore witnesses below
+    // keep validating state the native array can hold.
     scenario
         .runtime
         .simulation
         .houses
-        .entry(enemy)
-        .or_insert_with(|| HouseState::new(enemy, 0, None, true, 0, 10));
+        .get_or_register_for_test(enemy, || {
+            let mut house = HouseState::new(enemy, 0, None, true, 0, 10);
+            house.initialize_scenario_name("Russians");
+            // The synthetic House is only the acquisition-entry boundary the
+            // passive-scan steps below consume; it must sit the match out.
+            // Its one FV dies inside this fixture, so without MultiplayPassive
+            // the defeat gate (4F8E92..4F8F77) reads the House empty,
+            // MPlayer_Defeated (4FC3DE..4FC6B7) completes the match at the
+            // local house's win, and the savour expiry (4F85BE) later turns
+            // every frame tail terminal — after which the pending-delete
+            // drain (Main_Tick 55DE9F -> 725C70) no longer runs and a
+            // hut-consumed Engineer could never leave storage in its repair
+            // frame. MultiplayPassive is the defeat gate's own skip for
+            // houses that do not participate in the match result.
+            house.make_multiplay_passive();
+            house
+        });
+    if !scenario.runtime.simulation.houses.order().contains(&enemy) {}
     scenario
         .runtime
         .simulation
@@ -570,10 +593,11 @@ pub(super) fn retail_hills_collapsed_scene(
         let runtime = &mut scenario.runtime;
         runtime
             .simulation
+            .substrate
             .mission_assign_exact(
                 source,
                 MissionId::from_known(MissionType::Guard),
-                runtime.simulation.session.binary_frame,
+                runtime.simulation.session.binary_frame(),
             )
             .unwrap();
         let entity = runtime
@@ -587,13 +611,13 @@ pub(super) fn retail_hills_collapsed_scene(
         // reject earlier in T58; the busy deck source reaches Evaluate's G27.
         // The reverse direction rejects in InRange before G27.
         entity.rearm_timer.set_for_test(CdTimer::started(
-            runtime.simulation.session.binary_frame as i32,
+            runtime.simulation.session.binary_frame() as i32,
             10,
         ));
         passive_acquire_step(
             &mut runtime.simulation,
             source,
-            Some(&runtime.resources.rules),
+            &runtime.resources.rules,
             ObjectAiCtx {
                 overlay_registry: Some(&runtime.resources.overlay_registry),
                 ..Default::default()

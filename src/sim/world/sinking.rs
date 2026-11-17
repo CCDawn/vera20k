@@ -1,20 +1,24 @@
-//! Retained surface-ship death: Unit ReceiveDamage737E43 and AI7364A1.
+//! Retained sinking: Unit ReceiveDamage737E43, UnitAI7364A1 and AircraftAI414DB6.
 //!
 //! This owner alone mutates Techno+3CD/+3CE. The fatal receiver still runs
 //! Mark(UP), passenger/crew work and its ordinary tail; +3CD then suppresses
 //! immediate UnInit. PostWarpValidation and Squid culling also sink a living,
 //! still-marked hull through [`Simulation::begin_living_ship_sinking`]. Foot AI
-//! skips Process, observes the sound edge, and Unit AI lowers the raw
+//! skips Process, observes the sound edge, and Unit/Aircraft AI lowers the raw
 //! coordinate until its terminal RecordKill/UnInit.
-//! Native execution: tools/spatial_oracle/naval_occupants and naval_sink_tick.
+//! Native execution: tools/spatial_oracle/naval_sink_tick.
+//! Aircraft suffix control flow: AircraftClass::AI414DB6..414ED0.
 
 use super::{SimSoundEvent, Simulation, UninitContext};
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::anim_class::AnimWorldCoord;
 use crate::sim::components::AnimClassSpawnDescriptor;
+use crate::sim::intern::StringInterner;
 use crate::sim::movement::ground_pose::{ground_surface_z_at, position_world_coord};
+use crate::sim::world::FrameChannel;
 use crate::sim::world::FrameEffects;
+use crate::sim::world::ObjectSubstrate;
 
 /// Native callers of a living, still-marked hull's sink transition.
 pub(crate) enum LivingSinkTrigger {
@@ -64,7 +68,7 @@ impl Simulation {
         entity.health.set(1);
         entity.lifecycle.restore_alive();
         entity.sinking.active = true;
-        self.techno_death_stun(
+        self.stun(
             id,
             UninitContext::with_rules(rules).with_effects(frame_effects),
         );
@@ -72,7 +76,7 @@ impl Simulation {
 
     /// PostWarpValidation (`0x00718968..0x00718977`, `0x00718ABF..0x00718ACE`)
     /// and Squid culling (`0x00629C69..0x00629C80`) set +3CD and Stun
-    /// (vt+0x3A0) on a living object, which no receiver unmarked. Unit AI lowers it through
+    /// (vt+0x3A0) on a living object, which no receiver unmarked. Unit/Aircraft AI lowers it through
     /// SetLocation's marked arm until its terminal RecordKill/UnInit.
     pub(crate) fn begin_living_ship_sinking(
         &mut self,
@@ -92,17 +96,19 @@ impl Simulation {
             let announcement = self.substrate.entities.get(id).and_then(|entity| {
                 crate::sim::combat::death_announcement_event(
                     self.object_type(entity.type_ref(), rules)?,
+                    entity.type_ref(),
                     entity.category(),
                     entity.position.rx(),
                     entity.position.ry(),
                     entity.owner(),
+                    rules.ares_form(),
                 )
             });
             if let Some(event) = announcement {
                 self.dispatch_unit_lost_events(&[event]);
             }
         }
-        self.techno_death_stun(
+        self.stun(
             id,
             UninitContext::with_rules(rules).with_effects(frame_effects),
         );
@@ -111,8 +117,14 @@ impl Simulation {
     /// Foot4DABC7..4DACD7: voice first (no local-player gate), then the type
     /// SinkingSound or Rules+208 on Foot's existing sound handle. The falling
     /// edge releases that handle only when MoveSoundActive+53C is clear.
-    pub(crate) fn sinking_edge_sounds(&mut self, id: u64, rules: &RuleSet) {
-        let Some(entity) = self.substrate.entities.get(id) else {
+    pub(crate) fn sinking_edge_sounds(
+        interner: &StringInterner,
+        substrate: &mut ObjectSubstrate,
+        sound_events: &mut FrameChannel<SimSoundEvent>,
+        id: u64,
+        rules: &RuleSet,
+    ) {
+        let Some(entity) = substrate.entities.get(id) else {
             return;
         };
         let state = entity.sinking;
@@ -120,14 +132,14 @@ impl Simulation {
             return;
         }
         if state.active {
-            let object = self.object_type(entity.type_ref(), rules);
+            let object = interner.object_type(entity.type_ref(), rules);
             let voice = object.and_then(|object| object.voice_sinking.clone());
             let sound = object
                 .and_then(|object| object.sinking_sound.clone())
                 .or_else(|| rules.general.sinking_sound.clone());
             let coord = position_world_coord(&entity.position);
             if let Some(sound_id) = voice {
-                self.sound_events.push(SimSoundEvent::VocAt {
+                sound_events.emit(SimSoundEvent::VocAt {
                     sound_id,
                     audible_to: None,
                     rx: entity.position.rx(),
@@ -138,7 +150,7 @@ impl Simulation {
                 });
             }
             if let Some(sound) = sound {
-                self.sound_events.push(SimSoundEvent::AnimationStarted {
+                sound_events.emit(SimSoundEvent::AnimationStarted {
                     anim_id: id,
                     sound_id: sound,
                     world: AnimWorldCoord {
@@ -149,15 +161,14 @@ impl Simulation {
                 });
             }
         } else if !entity.move_sound.is_active() {
-            self.sound_events
-                .push(SimSoundEvent::ObjectSoundReleased { owner: id });
+            sound_events.emit(SimSoundEvent::ObjectSoundReleased { owner: id });
         }
-        if let Some(entity) = self.substrate.entities.get_mut(id) {
+        if let Some(entity) = substrate.entities.get_mut(id) {
             entity.sinking.sound_edge_seen = state.active;
         }
     }
 
-    /// Unit7364A1..7365BB, after Foot AI and before the class Alive/fire
+    /// Unit7364A1..7365BB and Aircraft414DB6..414ED0, after Foot AI and before the class
     /// suffix. Returns true only when the terminal arm UnInit'd the hull.
     /// Every reached visit lowers raw Z by five; GetHeight subtracts the live
     /// floor (and OnBridge height). Strictly below -400 records another kill
@@ -172,7 +183,11 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get(id) else {
             return false;
         };
-        if entity.category() != EntityCategory::Unit || !entity.sinking.active {
+        if !matches!(
+            entity.category(),
+            EntityCategory::Unit | EntityCategory::Aircraft
+        ) || !entity.sinking.active
+        {
             return false;
         }
         let mut coord = position_world_coord(&entity.position);
@@ -184,31 +199,31 @@ impl Simulation {
         )
         .unwrap_or(0);
         coord.z = coord.z.wrapping_sub(5);
-        // Unit7364E3 calls vt+1B4, Foot SetLocation4DB810. The fatal
+        // Unit7364E3/Aircraft414DF8 call vt+1B4, Foot SetLocation4DB810. The fatal
         // receiver's Mark(UP) makes its unmarked arm4DB868 applicable; a
         // Chrono Warp's sink leaves the hull marked, so it takes the marked
         // arm. Both rejoin the changed-coordinate/OpenTopped tail, not a
         // separate raw-Z setter. Native execution: naval_sink_tick.json.
-        self.foot_set_location_marked(id, coord, Some(rules), registry, frame_effects);
+        self.foot_set_location_marked(id, coord, rules, registry, frame_effects);
         if coord.z.wrapping_sub(floor) < -400 {
-            // UnitAI736500's terminal RecordKill(NULL) is a second callback,
-            // not a second accounting implementation. Native naval_sink_tick
-            // retains Health1 and records two total losses across both calls.
+            // Unit736500/Aircraft414E15 call their actual RecordKill(NULL)
+            // callback before UnInit. A fatal-receiver ship already recorded
+            // a loss; living warp sinks retain their producer's accounting.
             self.record_the_kill(
                 id,
                 crate::sim::combat::KillSource::Techno(None),
                 crate::sim::combat::KillCallback::Terminal,
-                UninitContext::new(Some(rules), registry).with_effects(frame_effects),
+                UninitContext::new(rules, registry).with_effects(frame_effects),
             );
             self.uninit_with_context(
                 id,
-                UninitContext::new(Some(rules), registry).with_effects(frame_effects),
+                UninitContext::new(rules, registry).with_effects(frame_effects),
             );
             self.sound_events
-                .push(SimSoundEvent::ObjectSoundReleased { owner: id });
+                .emit(SimSoundEvent::ObjectSoundReleased { owner: id });
             return true;
         }
-        if self.session.binary_frame & 3 == 0 {
+        if self.session.binary_frame() & 3 == 0 {
             // Scenario RandomRanged65C7E0 draws Y then X. Its rejection loop
             // is observable (seed zero spends three raw draws for this pair).
             let y = self.scenario_rng.next_range_i32_inclusive(-170, 170);
@@ -235,6 +250,10 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_p_s))]
 #[path = "sinking_tests.rs"]
 mod tests;
+
+#[cfg(all(test, tests_sim_world_p_s))]
+#[path = "aircraft_sinking_tests.rs"]
+mod aircraft_tests;

@@ -20,7 +20,7 @@ fn request_move(
     sim.assign_destination_represented(
         mover,
         Some(crate::sim::components::NavTargetRef::cell(goal.0, goal.1)),
-        Some(rules),
+        rules,
         Some(registry),
         crate::sim::world::FrameEffects::default(),
     )
@@ -31,7 +31,7 @@ fn request_move(
         mover,
         destination,
         0,
-        sim.playfield_bounds,
+        sim.playfield_bounds(),
     )
     .unwrap();
     let rng = sim.rng_state();
@@ -58,11 +58,17 @@ fn request_move(
     // current cell; no layer is kept per route cell.
     (
         result,
-        actor.navigation.path_replay.route_cells(),
-        actor.navigation.path_replay.remaining_directions().to_vec(),
+        actor.navigation.path_replay().route_cells(),
+        actor
+            .navigation
+            .path_replay()
+            .remaining_directions()
+            .to_vec(),
     )
 }
 
+/// Stock only: Ares 3.0 ThreatPosedEstimates_GetIndex `1005D4A0` (hook
+/// `0x0056BC54`) writes row 15 away from the cell this search and read take.
 #[test]
 fn live_avoid_threats_membership_reads_admitted_house_grid_through_search_and_snapshot() {
     let (mut sim, rules, registry) = crate::sim::world::entry_test_fixture::fixture_with_rules(
@@ -72,10 +78,11 @@ fn live_avoid_threats_membership_reads_admitted_house_grid_through_search_and_sn
     let russian = sim.interner.intern("Russians");
     for owner in [american, russian] {
         sim.houses
-            .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+            .register(HouseState::new(owner, 0, None, true, 0, 10));
     }
-    sim.session.house_order = vec![american, russian];
-    sim.session.game_mode_nonzero = true;
+    sim.houses.reorder_for_test(&[american, russian]);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     let mover = sim
         .spawn_object("MTNK", "Americans", 13, 15, 0, &rules)
         .unwrap();
@@ -168,7 +175,7 @@ fn live_avoid_threats_membership_reads_admitted_house_grid_through_search_and_sn
         team,
         mover,
         true,
-        Some(&rules),
+        &rules,
         crate::sim::world::FrameEffects::default(),
     );
     assert!(!sim.team_script_vm.member_avoids_threats(mover));

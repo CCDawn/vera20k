@@ -34,20 +34,20 @@ fn a_piece_at_a_bridge_deck_shadows_one_lepton_above_it() {
 /// skipped without them.
 #[test]
 fn a_dying_war_miners_tyres_draw_from_admission_to_the_pose_page() {
-    let Some(battle) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+    let Some(mut battle) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
         return;
     };
     let Some((_, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
         return;
     };
+    battle.rules.bind_effect_assets(&assets, "tem", "TEMPERATE");
     let rules = &battle.rules;
     let mut sim = Simulation::with_seed(17);
     sim.install_resolved_terrain_for_new_map(crate::map::resolved_terrain::test_flat_ground_grid(
         32,
     ));
-    let miner = sim.allocate_stable_id();
-    sim.substrate
-        .entities
+    let miner = sim.substrate_mut_for_test().allocate_stable_id();
+    sim.entities_mut_for_test()
         .insert(crate::sim::game_entity::GameEntity::test_default(
             miner,
             "HARV",
@@ -55,7 +55,7 @@ fn a_dying_war_miners_tyres_draw_from_admission_to_the_pose_page() {
             12,
             12,
         ));
-    sim.interner = crate::sim::intern::test_interner();
+    *sim.interner_mut_for_test() = crate::sim::intern::test_interner();
     assert!(matches!(
         sim.reveal(miner),
         crate::sim::world::RevealOutcome::Revealed { .. }
@@ -71,7 +71,15 @@ fn a_dying_war_miners_tyres_draw_from_admission_to_the_pose_page() {
     assert!(!ids.is_empty(), "the death threw no tyre");
     for _ in 0..6 {
         for &id in &ids {
-            sim.visit_voxel_anim(id, Some(rules));
+            sim.visit_voxel_anim(id, rules, crate::sim::world::FrameEffects::default())
+                .unwrap();
+            sim.process_pending_delete_with(
+                rules,
+                Some(rules.overlay_registry()),
+                crate::sim::world::FrameEffects::default(),
+                1,
+                sim.session().started(),
+            );
         }
     }
 
@@ -80,9 +88,11 @@ fn a_dying_war_miners_tyres_draw_from_admission_to_the_pose_page() {
     let first = sim.voxel_anims().get(ids[0]).unwrap().world_coord();
     let [x, y] = screen(first.x, first.y, first.z);
     let view = DebrisView {
-        terrain: sim.resolved_terrain.as_ref().unwrap(),
-        camera: [x - 400.0, y - 300.0],
-        viewport: [800.0, 600.0],
+        terrain: sim.resolved_terrain().unwrap(),
+        admission: TacticalAdmission {
+            corner: [x - 400.0, y - 300.0],
+            size: [800.0, 600.0],
+        },
         axis: DepthAxis::NONE,
     };
     let tire =
@@ -111,7 +121,7 @@ fn a_dying_war_miners_tyres_draw_from_admission_to_the_pose_page() {
     let mut cache = crate::render::unit_pose_cache::VxlPoseFrameCache::default();
     for &id in &ids {
         let piece = sim.voxel_anims().get(id).unwrap();
-        let kind = rules.voxel_anim_type(piece.type_id);
+        let kind = rules.voxel_anim_type(piece.type_id());
         assert_eq!(kind.image, "TIRE");
         let location = piece.world_coord();
         let palette = piece_palette(piece, kind, &sim, &house_colors, &light);
@@ -126,19 +136,19 @@ fn a_dying_war_miners_tyres_draw_from_admission_to_the_pose_page() {
             "a scheme Convert"
         );
         let mut rendered = None;
-        let object = voxel_anim_draw_instance(
-            id,
-            piece,
-            kind,
-            palette,
-            &view,
-            &order,
-            |image, section, m| {
+        let object =
+            voxel_anim_draw_instance(id, piece, kind, palette, &view, &order, |section, m| {
                 rendered = Some(m);
-                cache.render_tumble(&assets, image, section, m)
-            },
-        )
-        .expect("an admitted piece in view draws");
+                cache.render_tumble(
+                    &assets,
+                    rules.voxel_anim_model(piece.type_id())?,
+                    section,
+                    m,
+                    false,
+                    None,
+                )
+            })
+            .expect("an admitted piece in view draws");
         assert_eq!(object.parent.layer.0, DisplayLayer::AIR.index());
         assert_eq!(
             object.parent.display_order,
@@ -188,7 +198,15 @@ fn a_dying_war_miners_tyres_draw_from_admission_to_the_pose_page() {
     // Expiry removes every piece from the store and the Air layer.
     for _ in 0..200 {
         for &id in &ids {
-            sim.visit_voxel_anim(id, Some(rules));
+            sim.visit_voxel_anim(id, rules, crate::sim::world::FrameEffects::default())
+                .unwrap();
+            sim.process_pending_delete_with(
+                rules,
+                Some(rules.overlay_registry()),
+                crate::sim::world::FrameEffects::default(),
+                1,
+                sim.session().started(),
+            );
         }
     }
     assert!(sim.voxel_anims().is_empty());
@@ -204,12 +222,13 @@ fn a_dying_war_miners_tyres_draw_from_admission_to_the_pose_page() {
 /// this presentation fixture supplies the impact coordinate, not combat.
 #[test]
 fn an_unowned_retail_tyre_draws_with_the_global_plain_convert() {
-    let Some(battle) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+    let Some(mut battle) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
         return;
     };
     let Some((_, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
         return;
     };
+    battle.rules.bind_effect_assets(&assets, "tem", "TEMPERATE");
     let rules = &battle.rules;
     let tire_id = rules.voxel_anim_type_id_by_name("TIRE").unwrap();
     let kind = rules.voxel_anim_type(tire_id);
@@ -225,16 +244,25 @@ fn an_unowned_retail_tyre_draws_with_the_global_plain_convert() {
         IVec3::new(12 * 256 + 128, 12 * 256 + 128, 0),
         true,
         &mut Vec::new(),
+        rules,
     )
     .unwrap();
     let ids = sim.voxel_anims().ids();
     assert_eq!(ids.len(), 1);
     let id = ids[0];
     for _ in 0..6 {
-        sim.visit_voxel_anim(id, Some(rules));
+        sim.visit_voxel_anim(id, rules, crate::sim::world::FrameEffects::default())
+            .unwrap();
+        sim.process_pending_delete_with(
+            rules,
+            Some(rules.overlay_registry()),
+            crate::sim::world::FrameEffects::default(),
+            1,
+            sim.session().started(),
+        );
     }
     let piece = sim.voxel_anims().get(id).unwrap();
-    assert_eq!(piece.owner_house, None);
+    assert_eq!(piece.owner_house(), None);
     let mut light = CellLightGrid::new();
     let location = piece.world_coord();
     let cell = ((location.x / 256) as u16, (location.y / 256) as u16);
@@ -269,9 +297,11 @@ fn an_unowned_retail_tyre_draws_with_the_global_plain_convert() {
     let order = NativeDisplayOrder::from_display(sim.display_layers());
     let [x, y] = screen(location.x, location.y, location.z);
     let view = DebrisView {
-        terrain: sim.resolved_terrain.as_ref().unwrap(),
-        camera: [x - 400., y - 300.],
-        viewport: [800., 600.],
+        terrain: sim.resolved_terrain().unwrap(),
+        admission: TacticalAdmission {
+            corner: [x - 400., y - 300.],
+            size: [800., 600.],
+        },
         axis: DepthAxis::NONE,
     };
     let mut cache = crate::render::unit_pose_cache::VxlPoseFrameCache::default();
@@ -283,7 +313,16 @@ fn an_unowned_retail_tyre_draws_with_the_global_plain_convert() {
         palette,
         &view,
         &order,
-        |image, section, matrix| cache.render_tumble(&assets, image, section, matrix),
+        |section, matrix| {
+            cache.render_tumble(
+                &assets,
+                rules.voxel_anim_model(piece.type_id())?,
+                section,
+                matrix,
+                false,
+                None,
+            )
+        },
     )
     .expect("an unowned admitted tyre reaches the physical TIRE pose page");
     assert_eq!(object.parent.layer.0, DisplayLayer::AIR.index());

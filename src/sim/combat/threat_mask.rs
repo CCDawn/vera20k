@@ -24,8 +24,6 @@
 //!   unit's override returns nothing (`0x00743193..0x007431B5`).
 //! - `TechnoType NoAutoFire=` (`+0xD20`): a human object's scan returns
 //!   nothing (`0x006F8E19..0x006F8E41`).
-//! - `InfantryType Thief=` (`+0xEC5`): the mask gains `0x240`
-//!   (`0x0051E37C..0x0051E38C`).
 //! - `VehicleThief=` (`+0xEC6`): its early return of the NavCom target
 //!   within `0xF00` leptons (`0x0051E21C..0x0051E285`, UNCHECKED).
 
@@ -79,6 +77,8 @@ pub(super) struct InfantryScanner<C, W, L> {
     pub(super) infiltrate: bool,
     /// `VehicleThief=` (`+0xEC6`).
     pub(super) vehicle_thief: bool,
+    /// `Thief=` (`+0xEC5`), the final mask rewrite51E37C..51E38C.
+    pub(super) thief: bool,
     /// `C4=` (`+0xEC2`) or `HasWeaponAbility(C4)` (`0x0070D0D0`).
     pub(super) c4: bool,
     /// Slots 0 and 1's class bits.
@@ -128,6 +128,10 @@ where
     if scanner.c4 && !scanner.human {
         mask |= 0x20;
     }
+    // InfantryClass::GreatestThreat51E37C..51E38C, retail gamemd.exe.
+    if scanner.thief {
+        mask |= 0x240;
+    }
     ControlFlow::Continue(mask)
 }
 
@@ -145,11 +149,18 @@ pub(super) fn preamble_rewrite(
     category: EntityCategory,
     healer: bool,
     engineer: bool,
+    ares: bool,
 ) -> u32 {
+    // Ares 3.0 TechnoClass_FindTargetType_Heal (1004E4A0, hooks 0x6F8EE3 and
+    // 0x6F8F1F) replaces both healer `or` instructions after their
+    // `and ebx,3` with `or ebx,403Ch`: a healer of either class also looks
+    // for the infantry, vehicle and aircraft target classes of attackers.
+    let infantry_heal = if ares { 0x403C } else { 0x4008 };
+    let unit_heal = if ares { 0x403C } else { 0x4010 };
     match category {
-        EntityCategory::Infantry if healer => (mask & 3) | 0x4008,
+        EntityCategory::Infantry if healer => (mask & 3) | infantry_heal,
         EntityCategory::Infantry if engineer => mask & !0x18,
-        EntityCategory::Unit if healer => (mask & 3) | 0x4010,
+        EntityCategory::Unit if healer => (mask & 3) | unit_heal,
         _ => mask,
     }
 }
@@ -186,14 +197,18 @@ fn class_bit(category: EntityCategory) -> u32 {
 }
 
 /// `Evaluate_Candidate`'s class gate, `0x006F821A..0x006F824A`: the
-/// candidate's class bit, or the Unit bit and `vt+0x80` — a 1x1 building
-/// with `UndeploysInto=` (`0x00465D40`) or an aircraft on the floor
-/// (`0x0041B910` → `IsOnFloor`); false for infantry (`0x004263B0`).
-pub(super) fn admits_class(flags: u32, category: EntityCategory, vehicle_like: bool) -> bool {
-    flags & class_bit(category) != 0 || (flags & 2 != 0 && vehicle_like)
+/// candidate's class bit, or the Unit bit and the candidate's `vt+0x80`
+/// ([`super::vehicle_like`]), which runs only when the class bit is clear and
+/// the Unit bit set (`0x006F8242`).
+pub(super) fn admits_class(
+    flags: u32,
+    category: EntityCategory,
+    vehicle_like: impl FnOnce() -> bool,
+) -> bool {
+    flags & class_bit(category) != 0 || (flags & 2 != 0 && vehicle_like())
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod tests {
     use super::*;
 
@@ -242,6 +257,7 @@ mod tests {
             armed,
             infiltrate: false,
             vehicle_thief: false,
+            thief: false,
             c4: false,
             class_bits: || 0xBC,
             primary_warhead_spares_medium_and_wood: move || spares,
@@ -300,6 +316,7 @@ mod tests {
             armed: false,
             infiltrate: false,
             vehicle_thief: false,
+            thief: false,
             c4: false,
             class_bits: || 0xBC,
             primary_warhead_spares_medium_and_wood: || false,
@@ -321,22 +338,29 @@ mod tests {
     #[test]
     fn healers_and_engineers_rewrite_the_mask() {
         use EntityCategory::*;
-        assert_eq!(preamble_rewrite(0x21, Infantry, true, false), 0x4009);
-        assert_eq!(preamble_rewrite(0x22, Unit, true, false), 0x4012);
-        assert_eq!(preamble_rewrite(0x238, Infantry, false, true), 0x220);
-        assert_eq!(preamble_rewrite(0x238, Unit, false, true), 0x238);
-        assert_eq!(preamble_rewrite(0x21, Aircraft, true, true), 0x21);
+        // Ares 1004E4A0 (hooks 0x6F8EE3/0x6F8F1F) has its own expectation.
+        assert_eq!(preamble_rewrite(0x21, Infantry, true, false, false), 0x4009);
+        assert_eq!(preamble_rewrite(0x22, Unit, true, false, false), 0x4012);
+        assert_eq!(preamble_rewrite(0x21, Infantry, true, false, true), 0x403D);
+        assert_eq!(preamble_rewrite(0x22, Unit, true, false, true), 0x403E);
+        // The engineer and aircraft arms read no Ares rewrite.
+        for ares in [false, true] {
+            assert_eq!(preamble_rewrite(0x238, Infantry, false, true, ares), 0x220);
+            assert_eq!(preamble_rewrite(0x238, Unit, false, true, ares), 0x238);
+            assert_eq!(preamble_rewrite(0x21, Aircraft, true, true, ares), 0x21);
+        }
     }
 
     #[test]
     fn the_class_gate_admits_vehicle_like_candidates_under_the_unit_bit() {
         use EntityCategory::*;
-        assert!(admits_class(0x8042, Structure, false));
-        assert!(!admits_class(0x8042, Aircraft, false));
-        assert!(admits_class(0x8042, Aircraft, true));
-        assert!(!admits_class(0x40, Aircraft, true));
-        assert!(admits_class(0x4, Aircraft, false));
-        assert!(!admits_class(0x8000, Unit, false));
-        assert!(!admits_class(0, Infantry, false));
+        let unasked = || -> bool { panic!("vt+0x80 runs only past a clear class bit") };
+        assert!(admits_class(0x8042, Structure, unasked));
+        assert!(!admits_class(0x8042, Aircraft, || false));
+        assert!(admits_class(0x8042, Aircraft, || true));
+        assert!(!admits_class(0x40, Aircraft, unasked));
+        assert!(admits_class(0x4, Aircraft, unasked));
+        assert!(!admits_class(0x8000, Unit, unasked));
+        assert!(!admits_class(0, Infantry, unasked));
     }
 }

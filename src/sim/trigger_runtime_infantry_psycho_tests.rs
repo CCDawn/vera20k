@@ -1,5 +1,4 @@
-//! Execute91 6DDAF9..6DDB5A and Infantry5220F0, Steam gamemd
-//! 3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600.
+//! Execute91 6DDAF9..6DDB5A and Infantry5220F0, Steam gamemd.
 //! Instruction-established controls, exercised through production owners.
 use super::*;
 use crate::rules::{ini_parser::IniFile, ruleset::RuleSet};
@@ -47,13 +46,8 @@ fn attack_friendlies_uses_native_boolean_defaults_layers_and_retail_inputs() {
 #[test]
 fn unmatched_go_berzerk_does_not_abort_the_following_trigger_action() {
     let (mut sim, rules, registry, houses) = fixture(false);
-    sim.session.binary_frame = 8;
-    sim.raise_house_tags(
-        houses[1],
-        Some(&rules),
-        Some(&registry),
-        FrameEffects::default(),
-    );
+    sim.session.set_binary_frame_for_test(8);
+    sim.raise_house_tags(houses[1], &rules, Some(&registry), FrameEffects::default());
     assert!(sim.trigger_runtime.globals_set.contains(&7));
 }
 
@@ -71,8 +65,9 @@ fn fixture(
          [Projectiles]\n0=INVIS\n[INVIS]\nInviso=yes\nAA=yes\nAG=yes\n",
         if attack_friendlies { "yes" } else { "no" }
     ));
-    sim.session.current_house = Some(houses[0]);
-    sim.session.game_mode_nonzero = true;
+    sim.session.set_current_house_for_test(Some(houses[0]));
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     tests::install_event_ingress_map(
         &mut sim,
         &rules,
@@ -111,7 +106,7 @@ fn run(
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        Some(rules),
+        rules,
         Some(registry),
         FrameEffects::default(),
     )
@@ -180,7 +175,7 @@ fn go_berzerk_admission_uses_live_trigger_identity_and_the_infantry_array() {
         let entity = sim.substrate.entities.get_mut(actor).unwrap();
         match variant {
             "dead" => entity.lifecycle.set_object_alive_for_test(false),
-            "unmarked" => entity.lifecycle.set_cell_marked(false),
+            "unmarked" => entity.lifecycle.set_cell_marked_for_test(false),
             "limbo" => entity.lifecycle.set_in_limbo_for_test(true),
             "zero_health" => entity.health.set_for_test(0),
             _ => {}
@@ -236,13 +231,8 @@ fn ordered_go_berzerk_survives_snapshot_tag_removal_and_reconstruction_starts_cl
     let actor = spawn(&mut sim, &rules, "SHOOTER", "House0", 15);
     sim.attach_object_trigger_tag(actor, Some("CONTROLTAG"));
     let before = rng(&sim);
-    sim.session.binary_frame = 8;
-    sim.raise_house_tags(
-        houses[1],
-        Some(&rules),
-        Some(&registry),
-        FrameEffects::default(),
-    );
+    sim.session.set_binary_frame_for_test(8);
+    sim.raise_house_tags(houses[1], &rules, Some(&registry), FrameEffects::default());
     assert!(psycho(&sim, actor));
     assert!(sim.trigger_runtime.globals_set.contains(&7));
     assert_eq!(rng(&sim), before);
@@ -272,7 +262,7 @@ fn ordered_go_berzerk_survives_snapshot_tag_removal_and_reconstruction_starts_cl
     loaded.resolve_type_handles(&rules);
     loaded.uninit_with_context(
         actor,
-        crate::sim::world::UninitContext::new(Some(&rules), Some(&registry)),
+        crate::sim::world::UninitContext::new(&rules, Some(&registry)),
     );
     loaded.flush_pending_delete();
     let fresh = spawn(&mut loaded, &rules, "SHOOTER", "House0", 18);
@@ -323,7 +313,7 @@ fn psycho_stops_the_cell_on_an_ally_while_hunt_still_sees_the_enemy_behind_it() 
             None,
             None,
         )
-        .target()
+        .object()
     };
     assert_eq!(scan(&sim, ScanMission::Guard), Some(enemy));
     sim.attach_object_trigger_tag(actor, Some("CONTROLTAG"));
@@ -375,7 +365,7 @@ fn attack_friendlies_is_consumed_by_the_shared_ground_and_flat_scans() {
                 None,
                 None,
             )
-            .target();
+            .object();
             assert_eq!(result, enabled.then_some(ally), "enabled{enabled} {mask:?}");
         }
     }

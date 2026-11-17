@@ -5,7 +5,7 @@
 //! The expected trajectory/draw values come only from the executed native corpus.
 
 use super::super::foot_depth::floor_probe;
-use super::{geometry, projection_admitted};
+use super::{TacticalAdmission, geometry, projection_admitted};
 use crate::map::resolved_terrain::test_flat_ground_grid;
 use crate::sim::projectile::{
     ProjectileCollisionPhase, ProjectileCollisionPolicy, ProjectileCoord, ProjectilePayload,
@@ -85,6 +85,7 @@ fn original_cannon_launch_motion_and_live_bridge_draw_form_one_production_chain(
         Some(launch::LaunchSpeedProjectile {
             rot: kind.rot,
             floater: kind.floater,
+            gravity: kind.gravity(),
         }),
         rules.general.gravity,
         launch::fireat_launch_distance(origin, target),
@@ -107,7 +108,7 @@ fn original_cannon_launch_motion_and_live_bridge_draw_form_one_production_chain(
         vertical: kind.vertical,
         heading: None,
         arcing: kind.arcing,
-        gravity: projectile_gravity(rules.general.gravity, kind.floater),
+        gravity: projectile_gravity(rules.general.gravity, kind.gravity(), kind.floater),
         high_root: launch::high_arc_root(weapon.lobber, origin, Some(target)),
         voxel_downward: None,
         building_pitch_height: None,
@@ -137,16 +138,16 @@ fn original_cannon_launch_motion_and_live_bridge_draw_form_one_production_chain(
     let mut terrain = test_flat_ground_grid(32);
     terrain.test_set_native_allocated_cells(&cells.iter().copied().collect::<Vec<_>>());
     for &(x, y) in &cells {
-        let cell = terrain.cell_mut(x, y).unwrap();
+        let cell = terrain.cell_mut_for_test(x, y).unwrap();
         cell.level = initial["level"].as_u64().unwrap() as u8;
         cell.bridge_facts.raw_flags = initial["flags"].as_u64().unwrap() as u32;
     }
     sim.install_resolved_terrain_for_new_map(terrain);
-    let weapon_id = sim.interner.intern(&weapon.id);
-    let warhead_id = sim.interner.intern(weapon.warhead.as_deref().unwrap());
-    let projectile_type = sim.interner.intern(weapon.projectile.as_deref().unwrap());
-    let id = sim.allocate_stable_id();
-    sim.projectiles.spawn(
+    let weapon_id = sim.intern(&weapon.id);
+    let warhead_id = sim.intern(weapon.warhead.as_deref().unwrap());
+    let projectile_type = sim.intern(weapon.projectile.as_deref().unwrap());
+    let id = sim.substrate_mut_for_test().allocate_stable_id();
+    sim.projectiles_mut_for_test().spawn(
         id,
         ProjectileSpawn {
             native_unique_id: 0,
@@ -188,7 +189,7 @@ fn original_cannon_launch_motion_and_live_bridge_draw_form_one_production_chain(
     );
     assert!(sim.register_projectile(id, kind.flat));
     assert_eq!(
-        sim.projectiles.get(id).unwrap().position,
+        sim.projectiles().get(id).unwrap().position(),
         coord(&source["retained_xyz"])
     );
 
@@ -198,14 +199,18 @@ fn original_cannon_launch_motion_and_live_bridge_draw_form_one_production_chain(
         let flags = input["flags"].as_u64().unwrap() as u32;
         // These are supplied completed bridge transitions, just like the native
         // fixture. Changing the actual retained terrain exercises the live probe.
-        let terrain = sim.resolved_terrain.as_mut().unwrap();
+        let terrain = sim.resolved_terrain_mut_for_test().as_mut().unwrap();
         for &(x, y) in &cells {
-            terrain.cell_mut(x, y).unwrap().bridge_facts.raw_flags = flags;
+            terrain
+                .cell_mut_for_test(x, y)
+                .unwrap()
+                .bridge_facts
+                .raw_flags = flags;
         }
-        let terrain = sim.resolved_terrain.as_ref().unwrap();
+        let mut projectiles = std::mem::take(sim.projectiles_mut_for_test());
+        let terrain = sim.resolved_terrain().unwrap();
         let mut ordinary_visits = 0;
-        let advanced = sim
-            .projectiles
+        let advanced = projectiles
             .advance_one(
                 id,
                 tick,
@@ -240,20 +245,22 @@ fn original_cannon_launch_motion_and_live_bridge_draw_form_one_production_chain(
                 None,
             )
             .unwrap();
+        *sim.projectiles_mut_for_test() = projectiles;
+        let terrain = sim.resolved_terrain().unwrap();
         assert_eq!(ordinary_visits, 1);
         assert!(advanced.detonations.is_empty() && advanced.expired.is_empty());
-        let projectile = sim.projectiles.get(id).unwrap();
+        let projectile = sim.projectiles().get(id).unwrap();
         assert_eq!(
-            projectile.position,
+            projectile.position(),
             coord(&row["xyz"]),
             "tick {tick} retained position"
         );
         assert_eq!(
-            native_bits(projectile.velocity.native()),
+            native_bits(projectile.velocity().native()),
             bits(&row["velocity_bits"])
         );
         assert_eq!(
-            [projectile.position.x / 256, projectile.position.y / 256],
+            [projectile.position().x / 256, projectile.position().y / 256],
             [
                 input["mapped_cell"][0].as_i64().unwrap() as i32,
                 input["mapped_cell"][1].as_i64().unwrap() as i32
@@ -264,17 +271,17 @@ fn original_cannon_launch_motion_and_live_bridge_draw_form_one_production_chain(
         let state_before = sim.state_hash();
         let dummy_before = terrain.shared_cell_dummy().snapshot();
         let (ground, structural) =
-            floor_probe(terrain, projectile.position.x, projectile.position.y);
+            floor_probe(terrain, projectile.position().x, projectile.position().y).unwrap();
         assert_eq!(
             structural,
             flags & 0x100 != 0,
             "tick {tick} live structural flag"
         );
         let actual = geometry(
-            projectile.position,
+            projectile.position(),
             ground,
             structural,
-            projectile.on_bridge,
+            projectile.on_bridge(),
             kind.shadow,
         );
         let camera = [
@@ -282,7 +289,13 @@ fn original_cannon_launch_motion_and_live_bridge_draw_form_one_production_chain(
             input["camera"][1].as_i64().unwrap() as f32 + 15.0,
         ];
         assert_eq!(
-            projection_admitted(actual.body.point, camera, [800.0, 600.0]),
+            projection_admitted(
+                actual.body.point,
+                TacticalAdmission {
+                    corner: camera,
+                    size: [800.0, 600.0],
+                }
+            ),
             row["projection_visible"] == 1
         );
         let draws = row["draws"].as_array().unwrap();
@@ -311,7 +324,7 @@ fn original_cannon_launch_motion_and_live_bridge_draw_form_one_production_chain(
                 "tick {tick} draw Z-adjust"
             );
             assert_eq!(
-                u64::from(projectile_shp_frame(projectile, kind)),
+                u64::from(projectile_shp_frame(projectile, kind, 0, rules.ares_form())),
                 draw["frame"].as_u64().unwrap()
             );
         }
@@ -348,13 +361,13 @@ fn original_ifv_dragon_frame_getter_matches_retained_flights_and_all_directions(
     );
     assert!(!kind.rotates && !kind.shadow);
     let mut sim = Simulation::with_seed(31);
-    let weapon_id = sim.interner.intern(&weapon.id);
-    let warhead = sim.interner.intern(weapon.warhead.as_deref().unwrap());
-    let id = sim.allocate_stable_id();
+    let weapon_id = sim.intern(&weapon.id);
+    let warhead = sim.intern(weapon.warhead.as_deref().unwrap());
+    let id = sim.substrate_mut_for_test().allocate_stable_id();
     let rows = corpus["frames"].as_array().unwrap();
     assert_eq!(rows.len(), 166);
     let origin = coord(&rows[0]["position"]);
-    let projectile_type = sim.interner.intern(weapon.projectile.as_deref().unwrap());
+    let projectile_type = sim.intern(weapon.projectile.as_deref().unwrap());
     sim.admit_projectile(
         id,
         ProjectileSpawn {
@@ -391,13 +404,18 @@ fn original_ifv_dragon_frame_getter_matches_retained_flights_and_all_directions(
     );
     let mut directions = BTreeSet::new();
     for row in rows {
-        let projectile = sim.projectiles.get_mut(id).unwrap();
-        projectile.position = coord(&row["position"]);
-        projectile.velocity = crate::sim::projectile::ProjectileVelocity::from_native(
+        let projectile = sim.projectiles_mut_for_test().get_mut(id).unwrap();
+        projectile.set_position_for_test(coord(&row["position"]));
+        projectile.set_velocity_for_test(crate::sim::projectile::ProjectileVelocity::from_native(
             bits(&row["velocity"]["bits"]).map(NativeF64Bits::from_bits),
-        );
+        ));
         let before = sim.state_hash();
-        let frame = projectile_shp_frame(sim.projectiles.get(id).unwrap(), kind);
+        let frame = projectile_shp_frame(
+            sim.projectiles().get(id).unwrap(),
+            kind,
+            0,
+            rules.ares_form(),
+        );
         assert_eq!(
             u64::from(frame),
             row["native_frame"].as_u64().unwrap(),

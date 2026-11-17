@@ -38,6 +38,14 @@ impl From<TargetKind> for crate::sim::components::NavTargetRef {
 }
 
 impl TargetKind {
+    /// The object's id; `None` for a cell.
+    pub(crate) const fn object_id(self) -> Option<u64> {
+        match self {
+            Self::Entity(id) => Some(id),
+            Self::Cell(..) => None,
+        }
+    }
+
     /// Techno FireAt6FE55D passes the actual Object pointer to CreateBullet
     /// 46B050. Terrain reaches its existing Terrain receiver at impact.
     pub(crate) fn projectile_target(
@@ -46,11 +54,24 @@ impl TargetKind {
     ) -> crate::sim::projectile::ProjectileTarget {
         use crate::sim::projectile::ProjectileTarget;
         match self {
-            Self::Entity(id) if world.production.terrain_objects.contains_key(&id) => {
+            Self::Entity(id) if world.terrain_objects.objects().contains_key(&id) => {
                 ProjectileTarget::Terrain(id)
             }
             Self::Entity(id) => ProjectileTarget::Entity(id),
-            Self::Cell(rx, ry) => ProjectileTarget::Cell { rx, ry },
+            // The TarCom is a CellClass pointer: the shared dummy for a cell
+            // off the map ([`Self::cell_identity`]).
+            Self::Cell(rx, ry) => {
+                match world
+                    .resolved_terrain
+                    .as_ref()
+                    .and_then(|terrain| self.cell_identity(terrain))
+                {
+                    Some(crate::map::cell_index::NativeCellIdentity::Dummy) => {
+                        ProjectileTarget::DummyCell
+                    }
+                    _ => ProjectileTarget::Cell { rx, ry },
+                }
+            }
         }
     }
 
@@ -69,6 +90,48 @@ impl TargetKind {
             crate::map::cell_index::NativeCellIdentity::Dummy,
             crate::map::cell_index::NativeCellIdentity::Real,
         ))
+    }
+
+    /// The cell a Cell TarCom's GetCoords (+0x48) centres on, read through
+    /// [`Self::cell_identity`]: one off the map is wherever the shared dummy
+    /// was last stamped, with no lookup to restamp it. `None` for an Object.
+    pub(crate) fn tarcom_cell(self, terrain: Option<&ResolvedTerrainGrid>) -> Option<(u16, u16)> {
+        let Self::Cell(rx, ry) = self else {
+            return None;
+        };
+        Some(
+            match terrain.filter(|terrain| {
+                self.cell_identity(terrain)
+                    == Some(crate::map::cell_index::NativeCellIdentity::Dummy)
+            }) {
+                Some(terrain) => {
+                    let (x, y) = terrain.shared_cell_dummy().snapshot().coord;
+                    (x as u16, y as u16)
+                }
+                None => (rx, ry),
+            },
+        )
+    }
+
+    /// A Cell TarCom's +0x58 (`CellClass::GetTargetCoords @ 0x00486890`),
+    /// read through [`Self::cell_identity`]: one off the map reads the shared
+    /// dummy as it stands, with no lookup to restamp it. `None` for an Object.
+    pub(crate) fn cell_target_coord(
+        self,
+        terrain: Option<&ResolvedTerrainGrid>,
+    ) -> Option<crate::sim::projectile::ProjectileCoord> {
+        let Self::Cell(rx, ry) = self else {
+            return None;
+        };
+        let off_map = terrain.filter(|terrain| {
+            self.cell_identity(terrain) == Some(crate::map::cell_index::NativeCellIdentity::Dummy)
+        });
+        Some(match off_map {
+            Some(terrain) => {
+                crate::sim::projectile::dummy_cell_target_coord(&terrain.shared_cell_dummy())
+            }
+            None => crate::sim::projectile::cell_target_coord(terrain, rx, ry),
+        })
     }
 }
 
@@ -101,7 +164,7 @@ impl TarCom {
     /// An object that dies or is UnInit is dropped by its attackers:
     /// PointerExpired's TarCom arm (`0x007077C0`) calls the class setter with
     /// NULL (`0x00707A33`) in the killing hit's announcement
-    /// (`Simulation::object_destroy_callback`) and in UnInit's. An
+    /// (`Simulation::detach_all`) and in UnInit's. An
     /// infantryman deployed without `DeployFire=` refuses that write
     /// (`0x0051B273..0x0051B299`) and keeps the target.
     pub(crate) fn set(&mut self, target: Option<TargetKind>) {
@@ -163,10 +226,10 @@ pub(crate) fn target_present(
                 !target.death.is_dying() && target.health.current() > 0
             } else {
                 world
-                    .production
                     .terrain_objects
+                    .objects()
                     .get(&id)
-                    .is_some_and(|target| target.object_alive() && target.health != 0)
+                    .is_some_and(|target| target.object_alive() && target.health() != 0)
             }
         }
     }
@@ -193,23 +256,28 @@ pub(crate) fn resolve_target_coords(
                 .or_else(|| {
                     // Terrain7F522C+48 inherits Object5F65A0. Keep its retained
                     // coordinate readable during expiry, before Limbo/unlink.
-                    let target = world.production.terrain_objects.get(&id)?.world_coord();
+                    let target = world.terrain_objects.objects().get(&id)?.world_coord();
                     Some(target_xy_coords([target.x, target.y]))
                 })
         }
-        TargetKind::Cell(rx, ry) => Some(cell_center_coords(rx, ry)),
+        TargetKind::Cell(..) => target
+            .tarcom_cell(world.resolved_terrain.as_ref())
+            .map(|(rx, ry)| cell_center_coords(rx, ry)),
     }
 }
 
-/// ObjectClass::Distance_To5F6440: planar GetCoords distance, then the target
-/// building's (foundation width + height)*64 discount, clamped to zero. This
+/// ObjectClass::Distance_To5F6440 between live objects: their GetCoords XYs
+/// and the target building's stamped foundation, through the shared
+/// [`crate::util::native_x87::object_planar_distance`] arithmetic. This
 /// differs from the weapon CanFireAt/InRange gate and has no altitude bonus.
 /// Reuse the coordinate projection and deterministic native sqrt owner: exact
 /// integer sqrt changes observable lepton ties (1281 becomes1280 natively).
 /// Native comparisons: tools/spatial_oracle/aircraft_approach_range.{py,json}.
-/// The discount reads the same stamped foundation as the target's GetCoords.
-pub(crate) fn object_distance_to(
-    source: &GameEntity,
+/// Source identity comes from the shared Abstract ID space: a live Techno/
+/// Terrain uses the existing coordinate resolver; a Bullet uses its retained
+/// position owner. All callers resolve the same live source they previously read.
+pub fn object_distance_to(
+    source: u64,
     target: &TargetKind,
     world: &crate::sim::world::Simulation,
 ) -> Option<i32> {
@@ -217,25 +285,34 @@ pub(crate) fn object_distance_to(
         [
             i32::from(rx) * 256 + sx.to_num::<i32>(),
             i32::from(ry) * 256 + sy.to_num::<i32>(),
-            0,
         ]
     };
-    let from = planar(target_coords(source));
+    // Bullet GetCoords inherits Object5F65A0's retained Location. Installed
+    //Ares10053660 jumps to this same5F6440 owner before EMP; it does not use
+    //the separate 3D Distance5F6360 or a Bullet's final impact argument.
+    let from = if let Some(bullet) = world.projectiles.get(source) {
+        let coord = bullet.position();
+        [coord.x, coord.y]
+    } else {
+        planar(resolve_target_coords(&TargetKind::Entity(source), world)?)
+    };
     let to = planar(resolve_target_coords(target, world)?);
-    let distance = crate::util::native_x87::distance_3d_leptons(from, to);
-    if let TargetKind::Entity(id) = *target
-        && let Some(building) = world.substrate.entities.get(id)
-        && building.category() == EntityCategory::Structure
-    {
-        let (width, height) = foundation_dimensions(building.type_facts.foundation());
-        // Height query45ECA0 receives false: Bib never adds to this discount.
-        return Some(
-            distance
-                .wrapping_sub((i32::from(width) + i32::from(height)) * 64)
-                .max(0),
-        );
-    }
-    Some(distance)
+    // The discount reads the same stamped foundation as the target's GetCoords.
+    let foundation = match *target {
+        TargetKind::Entity(id) => world
+            .substrate
+            .entities
+            .get(id)
+            .filter(|building| building.category() == EntityCategory::Structure)
+            .map(|building| {
+                let (width, height) = building.type_facts.foundation().dimensions();
+                (i32::from(width), i32::from(height))
+            }),
+        TargetKind::Cell(..) => None,
+    };
+    Some(crate::util::native_x87::object_planar_distance(
+        from, to, foundation,
+    ))
 }
 
 /// Install a bare combat fixture's entity target. Production commands use
@@ -255,10 +332,13 @@ pub fn install_entity_attack_target_for_test(
         None => return false,
     };
 
+    // No RuleSet reaches this fixture adapter: it takes the answer of the
+    // empty rules a fixture without rules runs on.
     crate::sim::mission::concrete_effects::represented_assign_target_admitted(
         attacker,
         Some(TargetKind::Entity(target_id)),
         Some(TargetKind::Entity(target_id)),
+        RuleSet::empty_for_test().ares_form(),
     );
 
     true
@@ -278,9 +358,11 @@ pub fn install_cell_attack_target_for_test(
 ) -> bool {
     // Read weapon presence before the mutable borrow.
     let has_weapon = match entities.get(attacker_id) {
-        Some(a) => rules
-            .and_then(|r| interner.object_type(a.type_ref(), r))
-            .is_some_and(|obj| combat_weapon::is_armed(a, obj)),
+        Some(a) => rules.is_some_and(|rules| {
+            interner
+                .object_type(a.type_ref(), rules)
+                .is_some_and(|obj| combat_weapon::is_armed(a, obj, entities, rules, interner))
+        }),
         None => return false,
     };
 
@@ -304,6 +386,8 @@ pub fn install_cell_attack_target_for_test(
     crate::sim::mission::concrete_effects::represented_assign_target(
         attacker,
         Some(TargetKind::Cell(target_rx, target_ry)),
+        // An armed attacker was read from these rules above.
+        rules.is_some_and(RuleSet::ares_form),
     );
     true
 }
@@ -321,8 +405,8 @@ pub(super) fn attack_world_z_leptons(
             .map(|entity| object_world_z_leptons(entity, terrain))
             .or_else(|| {
                 world
-                    .production
                     .terrain_objects
+                    .objects()
                     .get(&entity_id)
                     .map(|target| target.world_coord().z)
             })
@@ -330,13 +414,54 @@ pub(super) fn attack_world_z_leptons(
         // FireAt6FE1FF and Get_Led_Target_Coords70BCB0 read Cell+58;
         // Bullet::Fire468707 freezes that same unled aim. The flight/impact
         // owners separately resolve ground contact and the final detonation.
-        TargetKind::Cell(rx, ry) => crate::sim::projectile::cell_target_coord(terrain, rx, ry).z,
+        TargetKind::Cell(..) => target.cell_target_coord(terrain).map_or(0, |coord| coord.z),
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_a_c))]
 mod tests {
     use super::*;
+
+    /// A Cell TarCom off the map is the shared fallback CellClass: the bullet
+    /// keeps that pointer, and reading its +0x58 reads the CellClass as it
+    /// stands, with no lookup to restamp it.
+    #[test]
+    fn an_off_map_cell_tarcom_is_the_shared_fallback_cellclass() {
+        use crate::map::resolved_terrain::ResolvedTerrainGrid;
+        use crate::sim::projectile::ProjectileTarget;
+        let mut sim = crate::sim::world::Simulation::new();
+        sim.install_resolved_terrain_for_new_map(ResolvedTerrainGrid::from_cells(
+            32,
+            32,
+            (0..32)
+                .flat_map(|y| {
+                    (0..32).map(move |x| crate::map::resolved_terrain::test_flat_cell(x, y))
+                })
+                .collect(),
+        ));
+        let target = TargetKind::Cell(40, 41);
+        assert_eq!(target.projectile_target(&sim), ProjectileTarget::DummyCell);
+        assert_eq!(
+            TargetKind::Cell(3, 4).projectile_target(&sim),
+            ProjectileTarget::Cell { rx: 3, ry: 4 }
+        );
+
+        // Converting the order's token stamps the fallback, as
+        // `0x006E6E20` does.
+        assert_eq!(sim.resolve_event_token(Some(target)), Some(target));
+        let terrain = sim.resolved_terrain.as_ref().unwrap();
+        assert_eq!(terrain.shared_cell_dummy().snapshot().coord, (40, 41));
+        // Another lookup restamps it; every TarCom read follows, as native's
+        // pointer reads do.
+        crate::sim::projectile::cell_ground_coord(Some(terrain), 45, 46);
+        let coord = target.cell_target_coord(Some(terrain)).unwrap();
+        assert_eq!((coord.x, coord.y), (45 * 256 + 128, 46 * 256 + 128));
+        assert_eq!(
+            resolve_target_coords(&target, &sim).map(|(rx, ry, ..)| (rx, ry)),
+            Some((45, 46))
+        );
+        assert_eq!(terrain.shared_cell_dummy().snapshot().coord, (45, 46));
+    }
 
     /// The saved shape before [`TarCom`]: `Option<AttackTarget { target }>`.
     #[derive(serde::Serialize)]

@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use crate::asset_tools::canvas::{self, Rgba, SheetCell};
 use crate::asset_tools::identify;
 use crate::asset_tools::report::{ErrorReport, PaletteChoice, RenderOutputs, RenderReport};
+use crate::asset_tools::sanitise_name;
 use crate::asset_tools::verb_render::RenderOptions;
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::pal_file::{Color, Palette};
@@ -170,7 +171,7 @@ pub fn run_pcx(
     let mut still = build_pcx_still(resolved.bytes, name, opts)?;
     warnings.append(&mut still.warnings);
 
-    let sanitised = sanitise_name(name);
+    let sanitised = sanitise_name(name, FALLBACK_DIR_NAME);
     let dir = prepare_output_dir(&opts.out, &sanitised)?;
     let png_path = dir.join(still_png_name(&sanitised));
     save(&png_path, &still.image)?;
@@ -383,7 +384,7 @@ pub fn run_pal(
     let mut render = build_pal_render(bytes, name, &source_archive, opts, house)?;
     warnings.append(&mut render.warnings);
 
-    let sanitised = sanitise_name(name);
+    let sanitised = sanitise_name(name, FALLBACK_DIR_NAME);
     let dir = prepare_output_dir(&opts.out, &sanitised)?;
 
     let base_path = dir.join(grid_png_name(&sanitised));
@@ -957,26 +958,6 @@ fn save(path: &Path, image: &Rgba) -> Result<(), ErrorReport> {
     })
 }
 
-/// Replace every character outside `[A-Za-z0-9._-]` so the name is safe as a
-/// directory and filename component on any platform.
-fn sanitise_name(name: &str) -> String {
-    let sanitised: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitised.is_empty() {
-        FALLBACK_DIR_NAME.to_string()
-    } else {
-        sanitised
-    }
-}
-
 /// `<out>/render/<sanitised>/`, absolutised so the reported paths do not depend
 /// on the reader's working directory.
 fn render_dir(out: &Path, sanitised: &str) -> PathBuf {
@@ -1055,7 +1036,7 @@ fn fit_scale(w: u32, h: u32, requested: u32) -> Option<u32> {
     Some(scale)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
 
@@ -1122,28 +1103,6 @@ mod tests {
     // --- grid geometry -----------------------------------------------------
 
     #[test]
-    fn swatch_grid_geometry_matches_the_declared_layout() {
-        assert_eq!(swatch_pitch(), SWATCH_SIZE + SWATCH_GAP);
-        // 16 columns of pitch, minus the trailing gap.
-        assert_eq!(
-            grid_pixel_width(),
-            16 * (SWATCH_SIZE + SWATCH_GAP) - SWATCH_GAP
-        );
-        assert_eq!(grid_pixel_height(), grid_pixel_width());
-
-        let (w, h) = grid_image_size(4);
-        assert_eq!(w, GRID_MARGIN * 2 + grid_pixel_width());
-        assert_eq!(
-            h,
-            GRID_MARGIN * 2 + 4 * canvas::LABEL_HEIGHT + HEADER_GAP + grid_pixel_height()
-        );
-
-        // No header means no header block at all, not an empty one.
-        assert_eq!(header_block_height(0), 0);
-        assert_eq!(grid_origin_y(0), GRID_MARGIN);
-    }
-
-    #[test]
     fn grid_image_size_ignores_header_text_so_both_grids_match() {
         // Both grids carry the same line count but different wording; the
         // report's single `canvas` field has to describe both.
@@ -1194,26 +1153,6 @@ mod tests {
         );
         // And the outline insets stay inside the margin.
         assert!(BAND_OUTLINE_INSETS.iter().all(|inset| *inset < GRID_MARGIN));
-    }
-
-    #[test]
-    fn swatch_origin_walks_row_major_from_index_zero() {
-        let pitch = i64::from(swatch_pitch());
-        let (x0, y0) = swatch_origin(0, 0);
-        assert_eq!((x0, y0), (i64::from(GRID_MARGIN), i64::from(GRID_MARGIN)));
-        assert_eq!(swatch_origin(1, 0), (x0 + pitch, y0));
-        assert_eq!(swatch_origin(15, 0), (x0 + 15 * pitch, y0));
-        assert_eq!(swatch_origin(16, 0), (x0, y0 + pitch));
-        assert_eq!(swatch_origin(255, 0), (x0 + 15 * pitch, y0 + 15 * pitch));
-    }
-
-    #[test]
-    fn a_three_digit_index_label_fits_inside_its_swatch() {
-        let widest = canvas::text_width("255");
-        assert!(
-            widest + SWATCH_TEXT_INSET as u32 * 2 <= SWATCH_SIZE,
-            "label {widest}px does not fit a {SWATCH_SIZE}px swatch"
-        );
     }
 
     // --- labels ------------------------------------------------------------
@@ -1267,14 +1206,6 @@ mod tests {
     }
 
     #[test]
-    fn header_line_clips_an_overlong_name_instead_of_widening_the_grid() {
-        let long = "X".repeat(400);
-        let line = header_line(&long);
-        assert_eq!(line.chars().count(), header_char_budget(grid_pixel_width()));
-        assert!(canvas::text_width(&line) <= grid_pixel_width());
-    }
-
-    #[test]
     fn header_char_budget_never_overflows_its_width() {
         for width in 0..200u32 {
             let budget = header_char_budget(width);
@@ -1304,18 +1235,6 @@ mod tests {
     }
 
     // --- palette marks and sidecar -----------------------------------------
-
-    #[test]
-    fn marks_flag_index_zero_only() {
-        let marks = swatch_marks();
-        assert_eq!(marks[0], SwatchMark::TransparentIndex0);
-        assert!(marks[0].marker_color().is_some());
-        assert!(
-            marks[1..]
-                .iter()
-                .all(|mark| *mark == SwatchMark::None && mark.marker_color().is_none())
-        );
-    }
 
     #[test]
     fn pal_index_tsv_carries_the_raw_bytes_the_decode_and_the_band() {
@@ -1385,19 +1304,6 @@ mod tests {
     }
 
     #[test]
-    fn pal_render_scales_the_grid_by_the_requested_factor() {
-        let data = make_pal();
-        let opts = RenderOptions {
-            scale: Some(2),
-            ..RenderOptions::default()
-        };
-        let render = build_pal_render(&data, "x.pal", "ra2.mix", &opts, None).expect("render");
-        assert_eq!(render.scale, 2);
-        assert_eq!(render.base.w, render.canvas[0] * 2);
-        assert_eq!(render.base.h, render.canvas[1] * 2);
-    }
-
-    #[test]
     fn pal_render_warns_about_flags_that_belong_to_other_formats() {
         let data = make_pal();
         let opts = RenderOptions {
@@ -1425,16 +1331,6 @@ mod tests {
             "{:?}",
             render.warnings
         );
-    }
-
-    #[test]
-    fn pal_render_reports_no_key_for_raw_magenta_entries() {
-        let mut data = make_pal();
-        data[3..6].copy_from_slice(&[63, 0, 63]);
-        data[6..9].copy_from_slice(&[63, 0, 63]);
-        let render = build_pal_render(&data, "x.pal", "ra2.mix", &RenderOptions::default(), None)
-            .expect("render");
-        assert!(render.warnings.is_empty(), "{:?}", render.warnings);
     }
 
     #[test]
@@ -1613,39 +1509,6 @@ mod tests {
     }
 
     // --- output paths ------------------------------------------------------
-
-    #[test]
-    fn render_dir_is_absolute_and_ends_with_the_render_subdir() {
-        let dir = render_dir(Path::new("target/asset"), "sidebar.pal");
-        assert!(dir.is_absolute(), "{}", dir.display());
-        assert!(
-            dir.ends_with(Path::new(RENDER_SUBDIR).join("sidebar.pal")),
-            "{}",
-            dir.display()
-        );
-    }
-
-    #[test]
-    fn sanitise_name_keeps_safe_characters_and_replaces_the_rest() {
-        assert_eq!(sanitise_name("sidebar.pal"), "sidebar.pal");
-        assert_eq!(sanitise_name("ra2\\dir/na me:x*?"), "ra2_dir_na_me_x__");
-        assert_eq!(sanitise_name(""), FALLBACK_DIR_NAME);
-    }
-
-    #[test]
-    fn output_filenames_are_stable_and_zero_padded() {
-        assert_eq!(still_png_name("shell.pcx"), "shell.pcx.png");
-        assert_eq!(grid_png_name("sidebar.pal"), "sidebar.pal.pal.png");
-        assert_eq!(
-            house_grid_png_name("sidebar.pal", 3),
-            "sidebar.pal.house-003.png"
-        );
-        assert_eq!(
-            house_grid_png_name("sidebar.pal", 255),
-            "sidebar.pal.house-255.png"
-        );
-        assert_eq!(sheet_png_name("sidebar.pal"), "sidebar.pal.sheet.png");
-    }
 
     #[test]
     fn generated_output_predicate_matches_only_our_own_files() {

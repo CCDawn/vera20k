@@ -2,7 +2,6 @@ use super::*;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::sim::house_state::HouseState;
 use crate::sim::intern::InternedId;
-use crate::sim::production::ProductionCategory;
 
 fn fixture() -> (Simulation, RuleSet, OverlayTypeRegistry, [InternedId; 2]) {
     let (mut sim, rules, registry) = crate::sim::world::entry_test_fixture::fixture_with_rules(
@@ -22,15 +21,19 @@ fn fixture() -> (Simulation, RuleSet, OverlayTypeRegistry, [InternedId; 2]) {
         } else {
             "OtherCountry"
         });
-        sim.houses.insert(
+        sim.houses.register(HouseState::new(
             name,
-            HouseState::new(name, i as u8, Some(country), i == 0, 10000, 10),
-        );
-        sim.session.house_order.push(name);
+            i as u8,
+            Some(country),
+            i == 0,
+            10000,
+            10,
+        ));
         name
     });
-    sim.session.current_house = Some(houses[0]);
-    sim.session.game_mode_nonzero = true;
+    sim.session.set_current_house_for_test(Some(houses[0]));
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     (sim, rules, registry, houses)
 }
 
@@ -41,7 +44,7 @@ fn spawn(sim: &mut Simulation, rules: &RuleSet, kind: &str, owner: &str, x: u16,
 fn clear_base(sim: &mut Simulation, owner: InternedId) {
     let house = sim.houses.get_mut(&owner).unwrap();
     house.set_base_geometry_for_test(None, 0);
-    house.alternate_base_center = (0, 0);
+    house.set_alternate_base_center_for_test((0, 0));
 }
 
 fn query(sim: &Simulation, rules: &RuleSet) -> Option<[i32; 3]> {
@@ -64,7 +67,7 @@ fn coord(sim: &Simulation, id: u64) -> [i32; 3] {
 fn home_uses_native_reverse_yard_primary_limbo_and_other_building_priorities() {
     // Original7315A0 controls: earliest_yard, primary_newer/older,
     // skip_limbo_primary, yard_ignores_health_alive and last_other.
-    // Steam3e81a617..08600. The original observes GetCoords ABI inputs;
+    // Steam gamemd. The original observes GetCoords ABI inputs;
     // these checks use actual production objects and their shared coordinate owner.
     let (mut sim, rules, _, houses) = fixture();
     let first = spawn(&mut sim, &rules, "YARD", "Local", 15, 15);
@@ -79,11 +82,10 @@ fn home_uses_native_reverse_yard_primary_limbo_and_other_building_priorities() {
         Some(coord(&sim, first)),
         "no primary: earliest yard"
     );
-    sim.production
-        .set_primary_factory_for_test(houses[0], ProductionCategory::Building, second);
+    sim.production.set_primary_factory_for_test(second);
     assert_eq!(query(&sim, &rules), Some(coord(&sim, second)));
-    sim.production
-        .set_primary_factory_for_test(houses[0], ProductionCategory::Building, first);
+    sim.production.clear_primary_factory(second);
+    sim.production.set_primary_factory_for_test(first);
     assert_eq!(query(&sim, &rules), Some(coord(&sim, first)));
     sim.substrate
         .entities
@@ -138,7 +140,7 @@ fn home_base_units_use_retained_count_rule_membership_and_existing_human_player_
     let misleading = spawn(&mut sim, &rules, "OTHERUNIT", "Local", 19, 17);
     let last = spawn(&mut sim, &rules, "BASEUNIT", "Local", 21, 17);
     clear_base(&mut sim, houses[0]);
-    assert!(sim.houses[&houses[0]].tracking.vehicles() != 0);
+    assert!(sim.houses[&houses[0]].tracking().vehicles() != 0);
     assert_eq!(query(&sim, &rules), Some(coord(&sim, last)));
     sim.substrate
         .entities
@@ -152,10 +154,15 @@ fn home_base_units_use_retained_count_rule_membership_and_existing_human_player_
         "DeploysInto is not BaseUnit membership"
     );
     assert_ne!(coord(&sim, misleading), coord(&sim, first));
-    sim.houses.get_mut(&houses[1]).unwrap().player_control = true;
-    sim.session.game_mode_nonzero = false;
+    sim.houses
+        .get_mut(&houses[1])
+        .unwrap()
+        .set_player_control_for_test(true);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false));
     assert_eq!(query(&sim, &rules), Some(coord(&sim, other)));
-    sim.session.game_mode_nonzero = true;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     assert_eq!(query(&sim, &rules), Some(coord(&sim, first)));
     let building = spawn(&mut sim, &rules, "OTHER", "Local", 16, 15);
     clear_base(&mut sim, houses[0]);
@@ -167,13 +174,15 @@ fn home_base_units_use_retained_count_rule_membership_and_existing_human_player_
 
     let (mut empty_owner, rules, _, houses) = fixture();
     spawn(&mut empty_owner, &rules, "BASEUNIT", "Other", 16, 17);
-    empty_owner.session.game_mode_nonzero = false;
+    empty_owner
+        .session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false));
     empty_owner
         .houses
         .get_mut(&houses[1])
         .unwrap()
-        .player_control = true;
-    assert_eq!(empty_owner.houses[&houses[0]].tracking.vehicles(), 0);
+        .set_player_control_for_test(true);
+    assert_eq!(empty_owner.houses[&houses[0]].tracking().vehicles(), 0);
     assert_eq!(query(&empty_owner, &rules), None);
 }
 
@@ -200,7 +209,7 @@ fn home_base_fallback_is_shared_and_local_input_cannot_write_simulation_dummy() 
     sim.houses
         .get_mut(&houses[0])
         .unwrap()
-        .alternate_base_center = (19, 20);
+        .set_alternate_base_center_for_test((19, 20));
     let cells = sim
         .resolved_terrain
         .as_ref()
@@ -212,7 +221,7 @@ fn home_base_fallback_is_shared_and_local_input_cannot_write_simulation_dummy() 
     sim.houses
         .get_mut(&houses[0])
         .unwrap()
-        .alternate_base_center = (500, 500);
+        .set_alternate_base_center_for_test((500, 500));
     let dummy = sim.effective_shared_cell_dummy();
     dummy.stamp_coord(7, 9);
     let before = sim.state_hash();
@@ -254,12 +263,11 @@ fn home_primary_and_base_geometry_survive_real_snapshot_restore() {
     let (mut sim, rules, _, houses) = fixture();
     let first = spawn(&mut sim, &rules, "YARD", "Local", 15, 15);
     let second = spawn(&mut sim, &rules, "YARD", "Local", 19, 15);
-    sim.production
-        .set_primary_factory_for_test(houses[0], ProductionCategory::Building, second);
+    sim.production.set_primary_factory_for_test(second);
     sim.houses
         .get_mut(&houses[0])
         .unwrap()
-        .alternate_base_center = (18, 19);
+        .set_alternate_base_center_for_test((18, 19));
     let expected = query(&sim, &rules);
     assert_eq!(expected, Some(coord(&sim, second)));
     assert_ne!(expected, Some(coord(&sim, first)));
@@ -270,6 +278,71 @@ fn home_primary_and_base_geometry_survive_real_snapshot_restore() {
     restored.restore_after_snapshot_load().unwrap();
     restored.resolve_type_handles(&rules);
     assert_eq!(query(&restored, &rules), expected);
-    restored.session.current_house = None;
+    restored.session.set_current_house_for_test(None);
     assert_eq!(query(&restored, &rules), None, "headless boundary");
+}
+
+/// CenterCameraOnPlayerTechnos (`0x004AC4F0`) averages the Location of the
+/// current player's Technos out of Limbo, whatever their class or ID, at Z 0.
+/// Another house's earlier building does not count. With none, the opening
+/// view is the base coordinate; an observer with no base gets no native view.
+#[test]
+fn opening_view_averages_player_technos_else_takes_the_base() {
+    let (mut sim, rules, registry, houses) = fixture();
+    spawn(&mut sim, &rules, "YARD", "Other", 15, 15);
+    let unit = spawn(&mut sim, &rules, "BASEUNIT", "Local", 16, 17);
+    let building = spawn(&mut sim, &rules, "OTHER", "Local", 20, 19);
+    let limbo = spawn(&mut sim, &rules, "BASEUNIT", "Local", 18, 17);
+    sim.substrate
+        .entities
+        .get_mut(limbo)
+        .unwrap()
+        .lifecycle
+        .set_in_limbo_for_test(true);
+    let location = |sim: &Simulation, id: u64| {
+        crate::sim::movement::ground_pose::position_world_xy(
+            &sim.substrate.entities.get(id).unwrap().position,
+        )
+    };
+    let ([ux, uy], [bx, by]) = (location(&sim, unit), location(&sim, building));
+    let (x, y) = ((ux + bx) / 2, (uy + by) / 2);
+    assert_eq!(
+        sim.opening_view_on_player_technos(None),
+        Some(([x, y, 0], ((x / 256) as u16, (y / 256) as u16)))
+    );
+    // The non-campaign post-map pass publishes it for the loader.
+    let roster = crate::map::houses::HouseRoster::default();
+    let output = sim
+        .finalize_scenario_post_map(crate::sim::scenario_post_map::ScenarioPostMapInput {
+            map_width: 33,
+            map_height: 33,
+            fill_silos: false,
+            rules: &rules,
+            overlay_registry: &registry,
+            house_roster: &roster,
+            skirmish_session: None,
+            campaign_map: None,
+        })
+        .unwrap();
+    assert_eq!(output.opening_view_coord, Some([x, y, 0]));
+    assert_eq!(
+        output.opening_view_cell,
+        Some(((x / 256) as u16, (y / 256) as u16))
+    );
+
+    for id in [unit, building] {
+        let entity = sim.substrate.entities.get_mut(id).unwrap();
+        entity.lifecycle.set_in_limbo_for_test(true);
+    }
+    sim.houses
+        .get_mut(&houses[0])
+        .unwrap()
+        .set_base_center((18, 19));
+    let [x, y, _] = sim.house_base_coordinate(houses[0], None);
+    assert_eq!(
+        sim.opening_view_on_player_technos(None),
+        Some(([x, y, 0], (18, 19)))
+    );
+    clear_base(&mut sim, houses[0]);
+    assert_eq!(sim.opening_view_on_player_technos(None), None);
 }

@@ -13,7 +13,7 @@ fn action(kind: i32, waypoint: u32) -> RuntimeAction {
         params: vec!["0".into(); 6],
         waypoint_index: Some(waypoint),
     };
-    RuntimeDefinitions::default().resolve_action(entry, None, None)
+    RuntimeDefinitions::default().resolve_action(entry, None, None, None)
 }
 
 fn run(
@@ -30,7 +30,7 @@ fn run(
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        Some(rules),
+        rules,
         None,
         FrameEffects::default(),
     )
@@ -69,11 +69,11 @@ fn lightning_strike_action_creates_one_cloud_bolt_over_the_waypoint() {
             .general
             .weather_con_clouds
             .iter()
-            .any(|name| name.eq_ignore_ascii_case(sim.interner.resolve(cloud.type_id)))
+            .any(|name| name.eq_ignore_ascii_case(sim.interner.resolve(cloud.type_id())))
     );
     // 53A140 places the cloud over the cell centre; no storm is started.
     assert_eq!(
-        (cloud.world_coord.x, cloud.world_coord.y),
+        (cloud.world_coord().x, cloud.world_coord().y),
         (30 * 256 + 128, 31 * 256 + 128)
     );
     assert!(!lightning_storm::has_deferment(&sim));
@@ -111,7 +111,7 @@ fn numeric_action(kind: i32, value: &str) -> RuntimeAction {
         .unwrap()
         .entries()[0]
         .clone();
-    RuntimeDefinitions::default().resolve_action(entry, None, None)
+    RuntimeDefinitions::default().resolve_action(entry, None, None, None)
 }
 
 fn scenario_hash(sim: &Simulation) -> String {
@@ -122,7 +122,7 @@ fn scenario_hash(sim: &Simulation) -> String {
 fn legacy_storm_actions_match_original_empty_target_rng_and_countdown_gates() {
     use lightning_storm::LightningStorm;
     // Original Execute44/45, static EmptyCell initializer6DCF10, Start539EB0
-    // and Scenario RNG (Steam3e81a617..08600). Declared map/House priors reuse
+    // and Scenario RNG (Steam gamemd). Declared map/House priors reuse
     // the existing storm oracle fixture; no incoming-House attribution.
     for (seed, size, raw, duration, target, expected_rng) in [
         (

@@ -172,26 +172,27 @@ fn assert_paid_deso_light_lifecycle(packet_path: &'static str, profile_path: &'s
     visit_paid_deso_light_lifecycle(profile_path, |phase, scene, output| {
         if output.is_none() {
             assert_eq!(phase, Some("loaded"));
-            assert_eq!(scene.sim().session.theater, theater_name);
-            assert!(scene.sim().radiation.is_empty());
+            assert_eq!(scene.sim().session().theater(), theater_name);
+            assert!(scene.sim().radiation().is_empty());
             lighting.install(
                 crate::map::lighting::CellLightGrid::new(),
                 crate::map::lighting::parse_lighting(&scene.map.ini),
                 2,
-                Some((scene.sim().resolved_terrain.as_ref().unwrap(), scene.sim())),
+                Some((scene.sim().resolved_terrain().unwrap(), scene.sim())),
+                None,
             );
             a = Some(ShroudBuffer::new(
                 &gpu.device,
                 &gpu.queue,
                 size,
-                [scene.sim().fog.width, scene.sim().fog.height],
+                [scene.sim().fog().width(), scene.sim().fog().height()],
                 frames.clone(),
                 [frame_w, frame_h],
                 crate::render::shroud_buffer::SHROUD_EDGE_LUT,
             ));
         } else {
             lighting.apply_events(
-                scene.sim().resolved_terrain.as_ref().unwrap(),
+                scene.sim().resolved_terrain().unwrap(),
                 &output.unwrap().lighting_events,
             );
         }
@@ -212,7 +213,7 @@ fn assert_paid_deso_light_lifecycle(packet_path: &'static str, profile_path: &'s
                 .simulation
                 .prepare_fog_view_for("VERA-OBSERVER")
         );
-        let terrain = scene.sim().resolved_terrain.as_ref().unwrap();
+        let terrain = scene.sim().resolved_terrain().unwrap();
         let live = terrain.cell(coords[0], coords[1]).unwrap();
         assert_eq!(terrain.presentation_tile(live), (tile_id, sub_tile));
         assert_eq!(u64::from(live.level), physical["level"].as_u64().unwrap());
@@ -240,7 +241,10 @@ fn assert_paid_deso_light_lifecycle(packet_path: &'static str, profile_path: &'s
                 .eq_ignore_ascii_case(row["material"]["filename"].as_str().unwrap()),
             "{phase}: production/native selected physical material"
         );
-        assert_eq!(profile(input), scene.sim().session.lighting.normal.into());
+        assert_eq!(
+            profile(input),
+            scene.sim().session().lighting().normal().into()
+        );
         let light = lighting
             .grid()
             .cell_light_at((coords[0], coords[1]))
@@ -273,16 +277,18 @@ fn assert_paid_deso_light_lifecycle(packet_path: &'static str, profile_path: &'s
                 - input["viewport_y"].as_i64().unwrap() as f32,
         ];
         let a = a.as_mut().unwrap();
-        a.rebuild_if_needed(
+        a.rebuild_submitted(
             &gpu.device,
             &gpu.queue,
-            &scene.sim().fog,
-            scene.sim().session.current_house.unwrap(),
+            scene.sim().fog(),
+            scene.sim().session().current_house().unwrap(),
             camera.camera_pos[0],
             camera.camera_pos[1],
             size[0],
             size[1],
             1.0,
+            None,
+            Default::default(),
         );
         let actual_a: Vec<_> = gpu
             .read_float_texels(a.gpu_source().0, [0, 0], size)
@@ -317,6 +323,7 @@ fn assert_paid_deso_light_lifecycle(packet_path: &'static str, profile_path: &'s
                 size[1] as f32,
                 Some(&lookup),
                 Some(terrain),
+                Vec::new(),
             );
             assert_eq!(instances.normal.len(), 1);
             pool.upload_on_device(
@@ -373,8 +380,8 @@ fn assert_retail_amcv_sight_raster(moving: bool) {
         "GoldSt.mmx",
         &[(LaunchCountry::France, AiDifficulty::Easy)],
     );
-    launch.player_name = "VERA-OBSERVER".into();
-    launch.local.start_position = LaunchStartPosition::Position(3);
+    launch.local_player_mut().name = "VERA-OBSERVER".into();
+    launch.local_slot_mut().start_position = LaunchStartPosition::Position(3);
     launch.opponents[0].start_position = LaunchStartPosition::Position(0);
     launch.options.unit_count = 0;
     launch.options.starting_credits = 10_000;
@@ -387,14 +394,14 @@ fn assert_retail_amcv_sight_raster(moving: bool) {
     launch.options.fog_of_war = false;
     let mut scene =
         crate::headless_scenario::load_session(&root, "GoldSt.mmx", 0x1234_5678, launch).unwrap();
-    assert_eq!(scene.sim().session.tick, 0);
-    let owner = scene.sim().session.current_house.unwrap();
+    assert_eq!(scene.sim().session().tick(), 0);
+    let owner = scene.sim().session().current_house().unwrap();
     let sources: Vec<_> = scene
         .sim()
         .entities()
         .iter_sorted()
         .filter(|(_, entity)| {
-            entity.owner() == owner && scene.sim().interner.resolve(entity.type_ref()) == "AMCV"
+            entity.owner() == owner && scene.sim().interner().resolve(entity.type_ref()) == "AMCV"
         })
         .map(|(id, _)| id)
         .collect();
@@ -474,7 +481,7 @@ fn assert_retail_amcv_sight_raster(moving: bool) {
         &gpu.device,
         &gpu.queue,
         size,
-        [scene.sim().fog.width, scene.sim().fog.height],
+        [scene.sim().fog().width(), scene.sim().fog().height()],
         frames,
         [frame_w, frame_h],
         crate::render::shroud_buffer::SHROUD_EDGE_LUT,
@@ -484,7 +491,8 @@ fn assert_retail_amcv_sight_raster(moving: bool) {
         crate::map::lighting::CellLightGrid::new(),
         crate::map::lighting::parse_lighting(&scene.map.ini),
         2,
-        Some((scene.sim().resolved_terrain.as_ref().unwrap(), scene.sim())),
+        Some((scene.sim().resolved_terrain().unwrap(), scene.sim())),
+        None,
     );
     let mut renderers = [
         wgpu::TextureFormat::Bgra8UnormSrgb,
@@ -508,7 +516,7 @@ fn assert_retail_amcv_sight_raster(moving: bool) {
                 }),
                 _ => None,
             }
-            .map(|command| CommandEnvelope::new(owner, scene.sim().session.tick + 1, command));
+            .map(|command| CommandEnvelope::new(owner, scene.sim().session().tick() + 1, command));
             let mut reached = false;
             for frame in 0..if step >= 3 { 8 } else { 160 } {
                 let commands = if frame == 0 { command.as_slice() } else { &[] };
@@ -549,11 +557,10 @@ fn assert_retail_amcv_sight_raster(moving: bool) {
             // An equal LocalSize writer would not exercise that callback.
             // No frame between demotion and restoration releases the source.
             let runtime = &mut scene.runtime;
-            assert!(
-                runtime
-                    .simulation
-                    .change_visible_map_area([2, 2, 1, 1], Some(&runtime.resources.rules),)
-            );
+            assert!(runtime.simulation.change_visible_map_area(
+                [2, 2, 1, 1],
+                crate::sim::world::UninitContext::with_rules(&runtime.resources.rules),
+            ));
             assert!(
                 !runtime
                     .simulation
@@ -562,11 +569,10 @@ fn assert_retail_amcv_sight_raster(moving: bool) {
                     .unwrap()
                     .in_playfield()
             );
-            assert!(
-                runtime
-                    .simulation
-                    .change_visible_map_area(restore_local_size, Some(&runtime.resources.rules),)
-            );
+            assert!(runtime.simulation.change_visible_map_area(
+                restore_local_size,
+                crate::sim::world::UninitContext::with_rules(&runtime.resources.rules),
+            ));
             assert!(
                 runtime
                     .simulation
@@ -575,7 +581,7 @@ fn assert_retail_amcv_sight_raster(moving: bool) {
                     .unwrap()
                     .in_playfield()
             );
-            assert_eq!(runtime.simulation.session.tick, 2);
+            assert_eq!(runtime.simulation.session().tick(), 2);
         }
         let entity = scene.sim().entities().get(source_id).unwrap();
         assert!(entity.lifecycle.object_alive() && !entity.lifecycle.in_limbo());
@@ -586,7 +592,7 @@ fn assert_retail_amcv_sight_raster(moving: bool) {
             coord.y,
             crate::sim::movement::ground_pose::object_world_z_leptons(
                 entity,
-                scene.sim().resolved_terrain.as_ref(),
+                scene.sim().resolved_terrain(),
             ),
         ];
         let native_history = if step == 1 { "arrival_1" } else { "arrival_2" };
@@ -611,7 +617,7 @@ fn assert_retail_amcv_sight_raster(moving: bool) {
                 .prepare_fog_view_for("VERA-OBSERVER")
         );
         let hash = scene.sim().state_hash();
-        let terrain = scene.sim().resolved_terrain.as_ref().unwrap();
+        let terrain = scene.sim().resolved_terrain().unwrap();
         let coords = [111, 22];
         let live = terrain.cell(coords[0], coords[1]).unwrap();
         assert_eq!(terrain.presentation_tile(live), (0, 0));
@@ -633,22 +639,27 @@ fn assert_retail_amcv_sight_raster(moving: bool) {
             })
             .unwrap();
         let input = &row["input"];
-        assert_eq!(profile(input), scene.sim().session.lighting.normal.into());
+        assert_eq!(
+            profile(input),
+            scene.sim().session().lighting().normal().into()
+        );
         let mut camera = camera(size);
         camera.camera_pos = [
             input["full_view"]["view_origin"][0].as_i64().unwrap() as f32,
             input["full_view"]["view_origin"][1].as_i64().unwrap() as f32 + 15.0,
         ];
-        source.rebuild_if_needed(
+        source.rebuild_submitted(
             &gpu.device,
             &gpu.queue,
-            &scene.sim().fog,
+            scene.sim().fog(),
             owner,
             camera.camera_pos[0],
             camera.camera_pos[1],
             size[0],
             size[1],
             1.0,
+            None,
+            Default::default(),
         );
         let actual_a: Vec<_> = gpu
             .read_float_texels(source.gpu_source().0, [0, 0], size)
@@ -718,6 +729,7 @@ fn assert_retail_amcv_sight_raster(moving: bool) {
                 size[1] as f32,
                 Some(&lookup),
                 Some(terrain),
+                Vec::new(),
             );
             assert_eq!(instances.normal.len(), 1);
             pool.upload_on_device(
@@ -1009,7 +1021,8 @@ fn assert_retail_tmp_rasters(packet: &Value, filename: &str, sub_tile: u8) {
                 crate::map::lighting::CellLightGrid::new(),
                 crate::map::lighting::parse_lighting(&scene.map.ini),
                 2,
-                Some((scene.sim().resolved_terrain.as_ref().unwrap(), scene.sim())),
+                Some((scene.sim().resolved_terrain().unwrap(), scene.sim())),
+                None,
             );
             (scene, lighting, hash)
         });
@@ -1042,6 +1055,7 @@ fn assert_retail_tmp_rasters(packet: &Value, filename: &str, sub_tile: u8) {
                 map.header.width = u32::from(coords[0].max(coords[1]));
                 map.header.height = map.header.width;
                 map.cells = vec![MapCell {
+                    legacy_ice_byte: 0,
                     rx: coords[0],
                     ry: coords[1],
                     tile_index: i32::from(tile_id),
@@ -1075,8 +1089,11 @@ fn assert_retail_tmp_rasters(packet: &Value, filename: &str, sub_tile: u8) {
             });
             let terrain = if actual_map {
                 assert_eq!(scene.map.header.theater, "TEMPERATE");
-                assert_eq!(profile(input), scene.sim().session.lighting.normal.into());
-                scene.sim().resolved_terrain.as_ref().unwrap()
+                assert_eq!(
+                    profile(input),
+                    scene.sim().session().lighting().normal().into()
+                );
+                scene.sim().resolved_terrain().unwrap()
             } else {
                 component_terrain.as_ref().unwrap()
             };
@@ -1174,6 +1191,7 @@ fn assert_retail_tmp_rasters(packet: &Value, filename: &str, sub_tile: u8) {
                 size[1] as f32,
                 Some(&lookup),
                 Some(terrain),
+                Vec::new(),
             );
             if row["output"]["selected_file_index"].as_u64().is_some() {
                 assert_eq!(instances.normal.len(), 1);
@@ -1249,6 +1267,7 @@ fn retail_partial_redraw_continuation_matches_full_reconstruction() {
     map.cells = inputs
         .iter()
         .map(|cell| MapCell {
+            legacy_ice_byte: 0,
             rx: cell["coords"][0].as_u64().unwrap() as u16,
             ry: cell["coords"][1].as_u64().unwrap() as u16,
             tile_index: cell["tile_id"].as_i64().unwrap() as i32,
@@ -1320,7 +1339,7 @@ fn retail_partial_redraw_continuation_matches_full_reconstruction() {
     sim.install_resolved_terrain_for_new_map(terrain);
     let hash = sim.state_hash();
     let rng = sim.rng_state();
-    let terrain = sim.resolved_terrain.as_ref().unwrap();
+    let terrain = sim.resolved_terrain().unwrap();
     let grid = build_terrain_grid_from_resolved(terrain, None);
     let lights = build_cell_light_grid_from_heights_and_units(
         terrain.iter().map(|cell| ((cell.rx, cell.ry), cell.level)),
@@ -1369,6 +1388,7 @@ fn retail_partial_redraw_continuation_matches_full_reconstruction() {
             size[1] as f32,
             Some(&lookup),
             Some(terrain),
+            Vec::new(),
         );
         assert!(!instances.normal.is_empty());
         let mut pool = InstanceBufferPool::new();

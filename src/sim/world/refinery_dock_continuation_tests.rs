@@ -138,11 +138,13 @@ fn fixture(row: &Value) -> Scene {
     // Native OTHER is a supplied radio object, neither House-listed nor
     // foundation-placed. Use membership owners to reproduce that prestate.
     let owner = s.sim.substrate.entities.get(s.other).unwrap().owner();
-    s.sim.update_house_tracking(
+    crate::sim::world::Simulation::update_house_tracking(
+        &mut s.sim.substrate,
+        &mut s.sim.houses,
         s.other,
         crate::sim::house_tracking::HouseTracking::remove_tracking,
     );
-    s.sim.leave_house_base_lists(s.other, owner);
+    s.sim.houses.leave_house_base_lists(s.other, owner);
     for y in 20..23 {
         for x in 20..24 {
             s.sim.substrate.occupancy.remove(x, y, s.other);
@@ -319,7 +321,7 @@ fn compare(s: &Scene, native: &Value, context: &str) {
     let house = s.sim.houses.get(&e.owner()).unwrap();
     let view = s.sim.scenario_rng.logical_view();
     let fields = json!({
-        "frame":s.sim.session.binary_frame, "cell":[at.x,at.y,at.z],
+        "frame":s.sim.session.binary_frame(), "cell":[at.x,at.y,at.z],
         "miner_mission":e.mission.current().raw(),"miner_queued":e.mission.queued().raw(),
         "miner_status":e.mission.handler_state(),
         "dispatch_timer":[e.mission.dispatch_timer().start_frame(),e.mission.dispatch_timer().delay()],
@@ -336,10 +338,14 @@ fn compare(s: &Scene, native: &Value, context: &str) {
         "facing":{"desired":e.body_facing.destination(),"start":e.body_facing.start_word(),"timer_start":e.body_facing.timer_start_frame().map_or(-1,|n|n as i32),"duration":e.body_facing.timer_duration()},
         "unloading":u8::from(e.miner.as_ref().is_some_and(|m|m.unload_active())),
         "harvesting":u8::from(e.miner.as_ref().is_some_and(|m|m.harvesting())),
-        "storage":storage,"balance":house.economy.credits(),"score":house.economy.score(),
+        "storage":storage,"balance":house.economy().credits(),"score":house.economy().score(),
         "scenario_rng":{"disabled":view.disabled,"index_a":view.index_a,"index_b":view.index_b,"state":view.words}
     });
     for (key, value) in fields.as_object().unwrap() {
+        // Ares' DepositTiberium (10044230, hook 0x73E4A2) adds no score.
+        if s.rules.ares() && key == "score" {
+            continue;
+        }
         assert_eq!(value, &native[key], "{context}: {key}");
     }
     for (id, field) in [
@@ -398,9 +404,9 @@ fn compare(s: &Scene, native: &Value, context: &str) {
 fn step(s: &mut Scene, step: &Value, context: &str) {
     let op = &step["input"];
     if let Some(frame) = op["frame"].as_u64() {
-        s.sim.session.binary_frame = frame as u32;
+        s.sim.session.set_binary_frame_for_test(frame as u32);
     }
-    let now = s.sim.session.binary_frame;
+    let now = s.sim.session.binary_frame();
     radio::take_transmit_log();
     match op["op"].as_str().unwrap() {
         "has_free_or_own" => assert_eq!(
@@ -416,24 +422,26 @@ fn step(s: &mut Scene, step: &Value, context: &str) {
         ),
         "tick" => {
             s.sim.mission_host_promote(s.miner, now, &s.rules);
-            let config = crate::sim::miner::MinerConfig::from_rules(&s.rules);
             super::dispatch_foot_mission(
                 &mut s.sim,
                 s.miner,
                 &s.rules,
                 super::ObjectAiCtx {
-                    miner_config: Some(&config),
                     overlay_registry: Some(registry()),
                     ..Default::default()
                 },
-            );
+            )
+            .unwrap();
             s.sim
                 .substrate
                 .entities
                 .get_mut(s.miner)
                 .unwrap()
                 .tick_native_stage(now as i32);
-            crate::sim::miner::miner_system::unit_ai_clear_harvesting(&mut s.sim, s.miner);
+            crate::sim::miner::miner_system::unit_ai_clear_harvesting(
+                &mut s.sim.substrate,
+                s.miner,
+            );
         }
         "enter" => assert_eq!(
             crate::sim::mission::enter::mission_enter(
@@ -457,10 +465,13 @@ fn step(s: &mut Scene, step: &Value, context: &str) {
             "{context}: delay"
         ),
         "find_bay" => {
+            let type_ref = s.sim.substrate.entities.get(s.miner).unwrap().type_ref();
+            let dock_types = &s.sim.interner.object_type(type_ref, &s.rules).unwrap().dock;
             let found = crate::sim::miner::miner_system::find_docking_bay(
                 &mut s.sim,
                 &s.rules,
                 s.miner,
+                dock_types,
                 op["wide"] == 1,
                 op["bypass"] == 1,
                 crate::sim::world::FrameEffects::default(),
@@ -491,7 +502,7 @@ fn step(s: &mut Scene, step: &Value, context: &str) {
                     target,
                     message,
                     RadioPayload::default(),
-                    Some(&s.rules),
+                    &s.rules,
                     crate::sim::world::FrameEffects::default()
                 )
                 .code() as i32,
@@ -534,7 +545,7 @@ fn step(s: &mut Scene, step: &Value, context: &str) {
                 &mut s.sim,
                 s.other,
                 RadioMessage::Break,
-                Some(&s.rules),
+                &s.rules,
                 crate::sim::world::FrameEffects::default(),
             );
         }
@@ -575,7 +586,7 @@ fn step(s: &mut Scene, step: &Value, context: &str) {
             );
             s.sim.set_unit_null_destination(
                 s.miner,
-                Some(&s.rules),
+                &s.rules,
                 Some(registry()),
                 crate::sim::world::FrameEffects::default(),
             );
@@ -583,7 +594,7 @@ fn step(s: &mut Scene, step: &Value, context: &str) {
                 .per_cell_process(
                     s.miner,
                     crate::sim::movement::PerCellReason::Arrival,
-                    Some(&s.rules),
+                    &s.rules,
                     Some(registry()),
                     crate::sim::world::FrameEffects::default(),
                 )
@@ -617,7 +628,7 @@ fn step(s: &mut Scene, step: &Value, context: &str) {
                 false,
                 Some(owner),
                 PointerExpiryControl::Uninit,
-                Some(&s.rules),
+                &s.rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
             );
@@ -673,13 +684,17 @@ fn replay(row: &Value) {
     }
 }
 
+/// The actual contact slots (admission, receiver and scanner) and the
+/// deposit busy retry and destroyed refinery histories.
 #[test]
-fn actual_contact_slots_match_original_admission_receiver_and_scanner() {
+fn contact_slots_and_deposit_histories_match_original_controls() {
     let c = corpus();
-    let rows = c["actual_slot_controls"].as_array().unwrap();
-    assert_eq!(rows.len(), 9);
-    for row in rows {
-        replay(row);
+    for (group, count) in [("actual_slot_controls", 9), ("deposit_histories", 3)] {
+        let rows = c[group].as_array().unwrap();
+        assert_eq!(rows.len(), count, "{group}");
+        for row in rows {
+            replay(row);
+        }
     }
 }
 
@@ -699,16 +714,6 @@ fn shared_enter_radio_and_depot_arrival_match_original_controls() {
         }
     }
     assert!(failures.is_empty(), "failed native controls: {failures:?}");
-}
-
-#[test]
-fn deposit_busy_retry_and_destroyed_refinery_match_original_histories() {
-    let c = corpus();
-    let rows = c["deposit_histories"].as_array().unwrap();
-    assert_eq!(rows.len(), 3);
-    for row in rows {
-        replay(row);
-    }
 }
 
 #[test]
@@ -734,6 +739,7 @@ fn independent_pending_entry_survives_save_load_and_changes_the_state_hash() {
         .unwrap()
         .mark_live_contact_with(s.miner);
     s.sim
+        .substrate
         .mission_assign_exact(
             s.refinery,
             MissionId::from_known(crate::sim::mission::MissionType::Repair),

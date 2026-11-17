@@ -3,21 +3,13 @@
 //! The simulation supplies retained Display order. Builders attach pieces to
 //! those parent slots before lowering them to atlas draw runs.
 
-use std::collections::BTreeMap;
-
 use crate::render::batch::SpriteInstance;
 use crate::render::surface_line::SurfaceDraw;
 use crate::render::tactical_draw_plan::{
-    BlitPolicy, BuildingOwnedPlan, BuildingPiece, BuildingPieceKind, CellDraw, CellDrawKind,
-    DrawId, ObjectDraw, RenderZPolicy, SpriteEncoding, TacticalDrawInput, TacticalDrawPlan,
-    TacticalLayer,
+    BlitPolicy, BuildingOwnedPlan, BuildingPiece, BuildingPieceKind, DrawId, ObjectDraw,
+    RenderZPolicy, SpriteEncoding, TacticalDrawInput, TacticalDrawPlan, TacticalLayer,
 };
-
-/// A cell-pass instance paired with the metadata needed by `YR TacticalClass::Draw`.
-pub(crate) struct PlannedCellInstance {
-    pub draw: CellDraw,
-    pub instance: SpriteInstance,
-}
+use crate::util::lookup_hash::{LookupMap, LookupSet};
 
 /// One GPU sprite that remains owned by a single building during lowering.
 ///
@@ -43,7 +35,6 @@ pub(crate) enum ObjectTexture {
     CombatLight(usize),
     /// Initial Building Extras status, sharing the late run's instance range.
     Status(usize),
-    OverlayAtlas,
     /// Per-piece native destination edit; never a texture-only coalesced draw.
     TerrainShp(crate::render::terrain_draw::TerrainPiece),
     /// An atlas SHP whose source mask performs a native destination edit.
@@ -55,6 +46,7 @@ pub(crate) enum ObjectTexture {
 }
 
 /// One already-resolved sprite owned by one retained Display parent object.
+#[derive(Clone)]
 pub(crate) struct ObjectPieceInstance {
     pub target: ObjectTexture,
     /// Which depth pipeline draws it (`RenderZPolicy::None` passthrough,
@@ -79,8 +71,18 @@ pub(crate) struct PlannedObjectInstance {
     pub pieces: Vec<ObjectPieceInstance>,
     pub building_pieces: Option<Vec<PlannedBuildingPieceInstance>>,
     pub body_draw: Option<ObjectBodyDraw>,
+    /// Destination stores the parent's draw call makes after its sprites, such
+    /// as the target laser at the end of `UnitClass::Draw_It` (`0x0073D43A`).
+    pub tail_draws: Vec<SurfaceDraw>,
     pub brackets: Option<crate::app::presentation::selection_brackets::BuildingBracketLines>,
     pub status: Option<crate::app::presentation::ui_overlays::TechnoExtras>,
+    /// The contacts a building draws again at the start of its Display slot,
+    /// in radio order ([`assign_tether_redraws`]).
+    ///
+    /// [`assign_tether_redraws`]: crate::app::presentation::instances::assign_tether_redraws
+    pub tether_redraws: Vec<DrawId>,
+    /// A Unit that draws only in its tether building's slot.
+    pub drawn_by_tether: bool,
 }
 
 impl PlannedObjectInstance {
@@ -90,8 +92,11 @@ impl PlannedObjectInstance {
             pieces,
             building_pieces: None,
             body_draw: None,
+            tail_draws: Vec::new(),
             brackets: None,
             status: None,
+            tether_redraws: Vec::new(),
+            drawn_by_tether: false,
         }
     }
 
@@ -101,8 +106,11 @@ impl PlannedObjectInstance {
             pieces: Vec::new(),
             building_pieces: Some(pieces),
             body_draw: None,
+            tail_draws: Vec::new(),
             brackets: None,
             status: None,
+            tether_redraws: Vec::new(),
+            drawn_by_tether: false,
         }
     }
 }
@@ -134,15 +142,32 @@ pub(crate) enum ObjectExtrasRun {
         parent: DrawId,
         bomb_clock: Option<u32>,
         wrench: Option<u32>,
+        /// Ares POWEROFF marker (10049FE0), after the wrench; `None` unless
+        /// the Rules were read the Ares way (`techno_extras_for_parent`).
+        power_off: Option<u32>,
         rank: Option<u32>,
         background: Option<u32>,
+        shield_background: Option<u32>,
         fills: std::ops::Range<u32>,
         scale: std::ops::Range<u32>,
         self_heal: Option<u32>,
         group_rectangles: std::ops::Range<u32>,
         group_text: std::ops::Range<u32>,
+        /// Phobos digital display text: per-entry backing/glyph ranges in
+        /// list order (rectangles, then glyphs).
+        digital_text: Vec<(std::ops::Range<u32>, std::ops::Range<u32>)>,
+        /// Phobos digital display custom-SHP glyphs: catalog index and the
+        /// uploaded instance index, in emission order.
+        digital_shapes: Vec<(u32, u32)>,
         talk_bubble: Option<u32>,
     },
+}
+
+/// One parent's fixed-pixel health draw after wheel resampling.
+pub(crate) struct FrameHealthBar {
+    pub background: Option<u32>,
+    pub shield_background: Option<u32>,
+    pub fills: std::ops::Range<u32>,
 }
 
 /// One native layer output: exact integer parent order plus flat GPU instances.
@@ -150,6 +175,9 @@ pub(crate) enum ObjectExtrasRun {
 pub(crate) struct ObjectLayerPass {
     pub instances: Vec<SpriteInstance>,
     pub runs: Vec<ObjectDrawRun>,
+    /// Building6D9920 draws bases before rally6D4648. Base and later dynamic
+    /// Display runs share one flat instance upload; each range draws once.
+    pub building_base_runs: Vec<ObjectDrawRun>,
     /// Native6D913C/6D9153 lines and Particle body points, in parent order.
     pub surface_draws: Vec<Vec<crate::render::surface_line::SurfaceDraw>>,
     /// Frame-local uploads of `surface_draws`, prepared after the shared A plane.
@@ -161,6 +189,9 @@ pub(crate) struct ObjectLayerPass {
     pub extras_lines: Vec<crate::render::surface_line::SurfaceLine>,
     pub extras_instances: Vec<SpriteInstance>,
     pub extras_runs: Vec<ObjectExtrasRun>,
+    /// Wheel-zoom health commands removed from both world Extras visits.
+    /// Indices still refer to the single `extras_instances` upload.
+    pub frame_health: Vec<FrameHealthBar>,
     /// Aligned with `instances`; retained for executable ordering checks.
     #[cfg(test)]
     pub owners: Vec<DrawId>,
@@ -168,26 +199,50 @@ pub(crate) struct ObjectLayerPass {
 
 /// Frame-local lookup derived solely from the five retained Display vectors.
 /// The sim owns all registration and sorting; atlas builders only read ranks.
-#[derive(Default)]
+/// Built once for each presentation frame
+/// (`PresentationFrame::display_order`) for every Display member and only
+/// looked up, so it takes the lookup hasher, sized up front.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct NativeDisplayOrder {
-    positions: BTreeMap<DrawId, (TacticalLayer, u64)>,
+    positions: LookupMap<DrawId, (TacticalLayer, u64)>,
 }
 
 impl NativeDisplayOrder {
     pub(crate) fn from_display(display: &crate::sim::world::display_layers::DisplayLayers) -> Self {
-        Self {
-            positions: (0..5u8)
-                .flat_map(|index| {
-                    let layer = crate::sim::world::display_layers::DisplayLayer::from_index(index)
-                        .expect("native Display layer index");
-                    display
-                        .members(layer)
-                        .iter()
-                        .enumerate()
-                        .map(move |(rank, &id)| (id, (TacticalLayer(index), rank as u64)))
-                })
-                .collect(),
+        use crate::sim::world::display_layers::DisplayLayer;
+        let layer = |index| DisplayLayer::from_index(index).expect("native Display layer index");
+        let members: usize = (0..5u8)
+            .map(|index| display.members(layer(index)).len())
+            .sum();
+        let mut positions = LookupMap::with_capacity_and_hasher(members, Default::default());
+        for index in 0..5u8 {
+            for (rank, &id) in display.members(layer(index)).iter().enumerate() {
+                positions.insert(id, (TacticalLayer(index), rank as u64));
+            }
         }
+        Self { positions }
+    }
+
+    /// [`Self::from_display`] for `sim`'s Display, with each presentation anim
+    /// (`Simulation::presentation_anims`) after the members of its layer, in
+    /// the order they were made.
+    pub(crate) fn from_world(sim: &crate::sim::world::Simulation) -> Self {
+        let display = sim.display_layers();
+        let mut order = Self::from_display(display);
+        let mut next = [0u64; 5];
+        for (index, slot) in next.iter_mut().enumerate() {
+            let layer = crate::sim::world::display_layers::DisplayLayer::from_index(index as u8)
+                .expect("native Display layer index");
+            *slot = display.members(layer).len() as u64;
+        }
+        for (id, layer) in sim.presentation_anims() {
+            let index = usize::from(layer.index());
+            order
+                .positions
+                .insert(id, (TacticalLayer(layer.index()), next[index]));
+            next[index] += 1;
+        }
+        order
     }
 
     #[cfg(test)]
@@ -199,6 +254,12 @@ impl NativeDisplayOrder {
                 .map(|(rank, &id)| (id, (TacticalLayer(2), rank as u64)))
                 .collect(),
         }
+    }
+
+    /// `id`'s place in the Display walk, `None` for an id no layer holds:
+    /// ordering by it is the order of `DisplayLayers::ordered_ids`.
+    pub(crate) fn position(&self, id: DrawId) -> Option<(TacticalLayer, u64)> {
+        self.positions.get(&id).copied()
     }
 
     pub(crate) fn object_draw(&self, id: DrawId, encoding: SpriteEncoding) -> Option<ObjectDraw> {
@@ -216,69 +277,42 @@ impl NativeDisplayOrder {
     }
 }
 
-/// Lower a complete cell family while preserving the existing GPU instance type.
-///
-/// `TacticalDrawPlan` owns the family ordering; this adapter only maps ordered
-/// IDs back to the existing instances. Duplicate IDs are rejected at the source.
-#[cfg(test)]
-pub(crate) fn lower_cell_instances(entries: Vec<PlannedCellInstance>) -> Vec<SpriteInstance> {
-    lower_cell_instances_with_policy(entries).0
-}
-
-/// Keep the fixed-cell policy beside each lowered instance. An overlay's
-/// native SHP depth behavior must survive lowering without sorting walls into
-/// a separate batch or moving the still unsupported slope-shape draws.
-pub(crate) fn lower_cell_instances_with_policy(
-    entries: Vec<PlannedCellInstance>,
-) -> (Vec<SpriteInstance>, Vec<RenderZPolicy>) {
-    let mut instances = BTreeMap::new();
-    let inputs = entries.into_iter().map(|entry| {
-        assert!(
-            instances.insert(entry.draw.id, entry.instance).is_none(),
-            "each planned cell instance must have a unique draw id"
-        );
-        TacticalDrawInput::Cell(entry.draw)
-    });
-    let plan = TacticalDrawPlan::build(inputs);
-    let mut ordered = Vec::with_capacity(instances.len());
-    let mut render_z = Vec::with_capacity(instances.len());
-    for draw in plan
-        .cell_pass
-        .terrain
-        .iter()
-        .chain(&plan.cell_pass.smudges)
-        .chain(&plan.cell_pass.overlays)
-        .chain(&plan.cell_pass.primary_objects)
-    {
-        render_z.push(draw.policy.render_z);
-        ordered.push(
-            instances
-                .remove(&draw.id)
-                .expect("plan entry must resolve to its existing GPU instance"),
-        );
-    }
-    (ordered, render_z)
-}
-
 /// Restore the retained Display vector order after the class-specific builders.
 /// Native Tactical6D8F39 reads members in order; neither sprite depth nor a new
 /// GetYSort query participates. Building pieces remain contiguous in their slot.
 pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [ObjectLayerPass; 5] {
-    let mut ordinary = BTreeMap::new();
-    let mut buildings = BTreeMap::new();
-    let mut brackets = BTreeMap::new();
-    let mut status = BTreeMap::new();
-    let mut body_draws = BTreeMap::new();
+    // Side tables of the frame's Display parents, keyed by parent id. They
+    // are only filled and then taken by key in plan order, never walked, so
+    // they take the lookup hasher: a B-tree shifted the large status values
+    // on every insert, each frame for every drawn object.
+    let parents = entries.len();
+    let mut ordinary = LookupMap::with_capacity_and_hasher(parents, Default::default());
+    let mut buildings = LookupMap::default();
+    let mut brackets = LookupMap::default();
+    let mut status = LookupMap::with_capacity_and_hasher(parents, Default::default());
+    let mut body_draws = LookupMap::default();
+    let mut tail_draws = LookupMap::default();
+    let mut tether_redraws = LookupMap::default();
+    let mut drawn_by_tether = LookupSet::default();
     let mut inputs = Vec::with_capacity(entries.len());
 
     for entry in entries {
         let id = entry.parent.id;
+        if !entry.tether_redraws.is_empty() {
+            tether_redraws.insert(id, entry.tether_redraws);
+        }
+        if entry.drawn_by_tether {
+            drawn_by_tether.insert(id);
+        }
         if let Some(draw) = entry.body_draw {
             assert!(
                 entry.pieces.is_empty() && entry.building_pieces.is_none(),
                 "one Display body uses sprites or one surface operation"
             );
             assert!(body_draws.insert(id, draw).is_none());
+        }
+        if !entry.tail_draws.is_empty() {
+            assert!(tail_draws.insert(id, entry.tail_draws).is_none());
         }
         if let Some(lines) = entry.brackets {
             assert!(brackets.insert(id, lines).is_none());
@@ -287,25 +321,18 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
             assert!(status.insert(id, strip).is_none());
         }
         if let Some(pieces) = entry.building_pieces {
-            let mut resolved = BTreeMap::new();
+            // A building's pieces carry their own index as local id.
+            let mut resolved = Vec::with_capacity(pieces.len());
             let planned = pieces
                 .into_iter()
                 .enumerate()
                 .map(|(index, piece)| {
                     let piece_id = index as DrawId;
-                    assert!(
-                        resolved
-                            .insert(
-                                piece_id,
-                                ObjectPieceInstance {
-                                    target: piece.target,
-                                    render_z: piece.policy.render_z,
-                                    instance: piece.instance,
-                                },
-                            )
-                            .is_none(),
-                        "each building-owned piece must have a unique local id"
-                    );
+                    resolved.push(Some(ObjectPieceInstance {
+                        target: piece.target,
+                        render_z: piece.policy.render_z,
+                        instance: piece.instance,
+                    }));
                     BuildingPiece {
                         id: piece_id,
                         kind: piece.kind,
@@ -331,6 +358,23 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
         }
     }
 
+    // A tether redraw repeats each contact's own draw, sprites and tail stores
+    // alike, whichever of the two Display slots comes first.
+    let mut redrawn: LookupMap<DrawId, Vec<(DrawId, Vec<ObjectPieceInstance>, Vec<SurfaceDraw>)>> =
+        tether_redraws
+            .into_iter()
+            .map(|(building, contacts)| {
+                let draws = contacts
+                    .into_iter()
+                    .filter_map(|contact: DrawId| {
+                        let pieces = ordinary.get(&contact)?.clone();
+                        let tails = tail_draws.get(&contact).cloned().unwrap_or_default();
+                        Some((contact, pieces, tails))
+                    })
+                    .collect();
+                (building, draws)
+            })
+            .collect();
     let plan = TacticalDrawPlan::build(inputs);
     let mut layers: [ObjectLayerPass; 5] = std::array::from_fn(|_| ObjectLayerPass::default());
     for layer in plan.object_layers {
@@ -353,12 +397,22 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                     lowered.extras_instances.push(instance);
                     index
                 });
+                let power_off = strip.power_off.map(|instance| {
+                    let index = lowered.extras_instances.len() as u32;
+                    lowered.extras_instances.push(instance);
+                    index
+                });
                 let rank = strip.rank.map(|instance| {
                     let index = lowered.extras_instances.len() as u32;
                     lowered.extras_instances.push(instance);
                     index
                 });
                 let background = strip.background.map(|instance| {
+                    let index = lowered.extras_instances.len() as u32;
+                    lowered.extras_instances.push(instance);
+                    index
+                });
+                let shield_background = strip.shield_background.map(|instance| {
                     let index = lowered.extras_instances.len() as u32;
                     lowered.extras_instances.push(instance);
                     index
@@ -378,6 +432,24 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                 let rectangles_end = lowered.extras_instances.len() as u32;
                 lowered.extras_instances.extend(strip.group.text);
                 let text_end = lowered.extras_instances.len() as u32;
+                let mut digital_text = Vec::with_capacity(strip.digital_text.len());
+                for text in strip.digital_text {
+                    let rectangles_start = lowered.extras_instances.len() as u32;
+                    lowered.extras_instances.extend(text.rectangles);
+                    let rectangles_end = lowered.extras_instances.len() as u32;
+                    lowered.extras_instances.extend(text.text);
+                    let text_end = lowered.extras_instances.len() as u32;
+                    digital_text.push((rectangles_start..rectangles_end, rectangles_end..text_end));
+                }
+                let digital_shapes = strip
+                    .digital_shapes
+                    .into_iter()
+                    .map(|(catalog, instance)| {
+                        let index = lowered.extras_instances.len() as u32;
+                        lowered.extras_instances.push(instance);
+                        (catalog, index)
+                    })
+                    .collect();
                 let talk_bubble = strip.talk_bubble.map(|instance| {
                     let index = lowered.extras_instances.len() as u32;
                     lowered.extras_instances.push(instance);
@@ -388,13 +460,17 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                     parent: owner,
                     bomb_clock,
                     wrench,
+                    power_off,
                     rank,
                     background,
+                    shield_background,
                     fills: start..end,
                     scale: end..scale_end,
                     self_heal,
                     group_rectangles: rectangles_start..rectangles_end,
                     group_text: rectangles_end..text_end,
+                    digital_text,
+                    digital_shapes,
                     talk_bubble,
                 }
             });
@@ -406,11 +482,15 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                 if let Some(ObjectExtrasRun::Status {
                     bomb_clock,
                     wrench,
+                    power_off,
                     rank,
                     fills,
                     ..
                 }) = &strip
-                    && (bomb_clock.is_some() || wrench.is_some() || rank.is_some())
+                    && (bomb_clock.is_some()
+                        || wrench.is_some()
+                        || rank.is_some()
+                        || power_off.is_some())
                 {
                     split_prefix = Some(lowered.extras_runs.len());
                     lowered.extras_runs.push(ObjectExtrasRun::Status {
@@ -418,13 +498,17 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                         parent: owner,
                         bomb_clock: *bomb_clock,
                         wrench: *wrench,
+                        power_off: *power_off,
                         rank: *rank,
                         background: None,
+                        shield_background: None,
                         fills: fills.start..fills.start,
                         scale: fills.start..fills.start,
                         self_heal: None,
                         group_rectangles: fills.start..fills.start,
                         group_text: fills.start..fills.start,
+                        digital_text: Vec::new(),
+                        digital_shapes: Vec::new(),
                         talk_bubble: None,
                     });
                 }
@@ -472,29 +556,39 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
             if let Some(ObjectExtrasRun::Status {
                 bomb_clock,
                 wrench,
+                power_off,
                 rank,
                 background,
+                shield_background,
                 fills,
                 scale,
                 self_heal,
                 group_rectangles,
                 group_text,
+                digital_text,
+                digital_shapes,
                 talk_bubble,
                 ..
             }) = strip
             {
                 let bomb_clock = bomb_clock.filter(|_| split_prefix.is_none());
                 let wrench = wrench.filter(|_| split_prefix.is_none());
+                let power_off = power_off.filter(|_| split_prefix.is_none());
+                let marker = power_off.is_some();
                 let rank = rank.filter(|_| split_prefix.is_none());
                 if bomb_clock.is_some()
                     || wrench.is_some()
+                    || marker
                     || rank.is_some()
                     || background.is_some()
+                    || shield_background.is_some()
                     || !fills.is_empty()
                     || !scale.is_empty()
                     || self_heal.is_some()
                     || !group_rectangles.is_empty()
                     || !group_text.is_empty()
+                    || !digital_text.is_empty()
+                    || !digital_shapes.is_empty()
                     || talk_bubble.is_some()
                 {
                     if is_building {
@@ -508,13 +602,17 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                         parent: owner,
                         bomb_clock,
                         wrench,
+                        power_off,
                         rank,
                         background,
+                        shield_background,
                         fills,
                         scale,
                         self_heal,
                         group_rectangles,
                         group_text,
+                        digital_text,
+                        digital_shapes,
                         talk_bubble,
                     });
                 }
@@ -535,13 +633,28 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                     }
                 }
             }
+            // Display6D916C's43DA80 opens with the tether redraw (43DAA0), after
+            // this building's Extras and before its voxel turret.
+            for (contact, pieces, tails) in redrawn.remove(&owner).unwrap_or_default() {
+                for piece in pieces {
+                    let run = push_object_piece(lowered, contact, piece);
+                    append_object_run(&mut lowered.runs, run);
+                }
+                if !tails.is_empty() {
+                    push_surface_draws(lowered, tails);
+                }
+            }
+            let refused = drawn_by_tether.contains(&owner);
             match entry {
                 crate::render::tactical_draw_plan::LayerEntry::Object(_) => {
-                    for piece in ordinary
+                    let pieces = ordinary
                         .remove(&owner)
-                        .expect("planned Display object must retain its sprites")
-                    {
-                        push_object_piece(lowered, owner, piece);
+                        .expect("planned Display object must retain its sprites");
+                    // Unit73B0B0 refuses the body to a tethered Unit; its
+                    // building's redraw draws it.
+                    for piece in pieces.into_iter().filter(|_| !refused) {
+                        let run = push_object_piece(lowered, owner, piece);
+                        append_object_run(&mut lowered.runs, run);
                     }
                 }
                 crate::render::tactical_draw_plan::LayerEntry::Building(building) => {
@@ -549,16 +662,45 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                         .remove(&owner)
                         .expect("planned building must retain its owned sprites");
                     for planned in building.pieces {
-                        let piece = pieces
-                            .remove(&planned.id)
+                        let piece = usize::try_from(planned.id)
+                            .ok()
+                            .and_then(|index| pieces.get_mut(index))
+                            .and_then(Option::take)
                             .expect("planned building piece must retain its sprite");
-                        push_object_piece(lowered, owner, piece);
+                        let run = push_object_piece(lowered, owner, piece);
+                        // Building6D9920 ->43CEA0(...,0) draws43D290's base
+                        // before rally6D4648. Display6D916C passes1 instead:
+                        //43CEA0 dispatches only the voxel turret43DA80 there.
+                        let runs = if planned.kind == BuildingPieceKind::PoweredOrActiveOverlay {
+                            &mut lowered.runs
+                        } else {
+                            &mut lowered.building_base_runs
+                        };
+                        append_object_run(runs, run);
                     }
                 }
+            }
+            if let Some(draws) = tail_draws.remove(&owner).filter(|_| !refused) {
+                push_surface_draws(lowered, draws);
             }
         }
     }
     layers
+}
+
+/// FoggedObjectClass::DrawAll4D1890 has its own sorted index, outside
+/// Display. Lower in supplied order using the same primitive GPU writers.
+pub(crate) fn lower_fogged_object_pieces(
+    entries: impl IntoIterator<Item = (DrawId, Vec<ObjectPieceInstance>)>,
+) -> ObjectLayerPass {
+    let mut pass = ObjectLayerPass::default();
+    for (id, pieces) in entries {
+        for piece in pieces {
+            let run = push_object_piece(&mut pass, id, piece);
+            append_object_run(&mut pass.runs, run);
+        }
+    }
+    pass
 }
 
 fn push_combat_light(
@@ -620,51 +762,59 @@ pub(crate) fn lower_ground_object_instances(
     std::mem::take(&mut layers[2])
 }
 
-fn push_object_piece(pass: &mut ObjectLayerPass, owner: DrawId, piece: ObjectPieceInstance) {
+fn push_object_piece(
+    pass: &mut ObjectLayerPass,
+    owner: DrawId,
+    piece: ObjectPieceInstance,
+) -> ObjectDrawRun {
     // Unit73B140 composites its opaque source cache once; SHP705E00 selects
     // the packed leaves through Convert490E50. Source pieces retain their
     // parent here so hull/turret/barrel are not blended separately. Native
     // selectors and coverage: procedural_drawing_oracle/translucent_blitter_a.md.
-    let packed_parent = (matches!(
+    let packed_body = matches!(
         piece.target,
         ObjectTexture::UnitAtlasPage(_)
             | ObjectTexture::UnitPosePage(_)
             | ObjectTexture::ShpPage(_)
             | ObjectTexture::TerrainShp(crate::render::terrain_draw::TerrainPiece::Body)
     ) && piece.instance.draw_state.native_selector_bits() & 6 != 0
-        && piece.instance.draw_state.fx_flags & crate::render::draw_state::FX_SHADOW == 0)
-        .then_some(owner);
+        && piece.instance.draw_state.fx_flags & crate::render::draw_state::FX_SHADOW == 0;
+    // Anim42389E can select the no-Z shadow leaf496250. Its nonzero index
+    // stencil uses the existing packed-half operation, not Terrain's Z-tested
+    // edit pipeline. Retain the parent so it also fences adjacent edit spans.
+    let packed_shadow = matches!(
+        piece.target,
+        ObjectTexture::SpriteAtlasEdit(_, crate::render::terrain_draw::TerrainPiece::Shadow)
+    ) && piece.render_z == RenderZPolicy::None;
+    let packed_parent = (packed_body || packed_shadow).then_some(owner);
     let start = pass.instances.len() as u32;
-    if let Some(run) = pass.runs.last_mut().filter(|run| {
-        run.target == piece.target
-            && run.render_z == piece.render_z
-            && run.packed_parent == packed_parent
-            && run.start + run.count == start
-    }) {
-        run.count += 1;
-    } else {
-        pass.runs.push(ObjectDrawRun {
-            target: piece.target,
-            render_z: piece.render_z,
-            packed_parent,
-            start,
-            count: 1,
-        });
-    }
+    let run = ObjectDrawRun {
+        target: piece.target,
+        render_z: piece.render_z,
+        packed_parent,
+        start,
+        count: 1,
+    };
     pass.instances.push(piece.instance);
     #[cfg(test)]
     pass.owners.push(owner);
+    run
 }
 
-pub(crate) fn cell_draw_kind(is_wall: bool) -> CellDrawKind {
-    if is_wall {
-        CellDrawKind::WallOverlay
+fn append_object_run(runs: &mut Vec<ObjectDrawRun>, next: ObjectDrawRun) {
+    if let Some(run) = runs.last_mut().filter(|run| {
+        run.target == next.target
+            && run.render_z == next.render_z
+            && run.packed_parent == next.packed_parent
+            && run.start + run.count == next.start
+    }) {
+        run.count += next.count;
     } else {
-        CellDrawKind::FlatOverlay
+        runs.push(next);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation_render))]
 mod tests {
     use super::*;
     use crate::render::draw_state::DrawState;
@@ -689,7 +839,7 @@ mod tests {
                     policy: BlitPolicy::z_read(SpriteEncoding::Rle),
                 },
                 vec![ObjectPieceInstance {
-                    target: ObjectTexture::OverlayAtlas,
+                    target: ObjectTexture::ShpPage(0),
                     render_z: RenderZPolicy::ReadOnly,
                     instance: SpriteInstance::default(),
                 }],
@@ -734,60 +884,48 @@ mod tests {
         assert_eq!((pass.runs[3].start, pass.runs[3].count), (2, 1));
     }
 
+    /// A parent's tail stores (the target laser at the end of
+    /// `UnitClass::Draw_It`, `0x0073D43A`) follow its own sprites in its
+    /// Display slot and precede the next parent's.
     #[test]
-    fn building_health_reuses_late_ranges_before_each_parent_body() {
-        use crate::app::presentation::{
-            selection_brackets::BuildingBracketLines, ui_overlays::TechnoExtras,
+    fn tail_draws_follow_their_parents_sprites() {
+        let store = |word| SurfaceDraw::OpaqueRect {
+            rect: [0, 0, 1, 1],
+            word,
         };
-        let parent = |id, rank| {
-            let mut parent = PlannedObjectInstance::building(
+        let parent = |id, display_order, tail_draws: Vec<SurfaceDraw>| {
+            let piece = || ObjectPieceInstance {
+                target: ObjectTexture::ShpPage(0),
+                render_z: RenderZPolicy::ReadOnly,
+                instance: SpriteInstance::default(),
+            };
+            let mut parent = PlannedObjectInstance::object(
                 ObjectDraw {
                     id,
                     layer: TacticalLayer(2),
-                    display_order: rank,
+                    display_order,
                     policy: BlitPolicy::z_read(SpriteEncoding::Rle),
                 },
-                vec![PlannedBuildingPieceInstance {
-                    kind: BuildingPieceKind::Body,
-                    z_bias: 0,
-                    policy: BlitPolicy::z_read(SpriteEncoding::Rle),
-                    target: ObjectTexture::OverlayAtlas,
-                    instance: SpriteInstance::default(),
-                }],
+                vec![piece(), piece()],
             );
-            parent.brackets = Some(BuildingBracketLines {
-                behind: vec![],
-                extras: vec![],
-            });
-            parent.status = Some(TechnoExtras {
-                bomb_clock: None,
-                wrench: None,
-                rank: None,
-                background: None,
-                fills: vec![SpriteInstance::default(); 15],
-                scale: Vec::new(),
-                group: Default::default(),
-                talk_bubble: None,
-                self_heal: None,
-            });
+            parent.tail_draws = tail_draws;
             parent
         };
-        let pass = lower_ground_object_instances(vec![parent(1, 1), parent(900, 0)]);
-        assert_eq!(pass.owners, [900, 1]);
-        assert_eq!(pass.extras_instances.len(), 30);
-        assert!(matches!(&pass.extras_runs[..], [
-            ObjectExtrasRun::Status { parent:900, fills:a, .. },
-            ObjectExtrasRun::Status { parent:1, fills:b, .. },
-        ] if *a == (0..15) && *b == (15..30)));
+        let pass = lower_ground_object_instances(vec![
+            parent(8, 1, Vec::new()),
+            parent(7, 0, vec![store(1), store(2)]),
+        ]);
+        assert_eq!(pass.owners, [7, 7, 8, 8]);
+        assert_eq!(pass.surface_draws, [vec![store(1), store(2)]]);
         assert_eq!(
-            pass.runs.iter().map(|run| run.target).collect::<Vec<_>>(),
+            pass.runs
+                .iter()
+                .map(|run| (run.target, run.start, run.count))
+                .collect::<Vec<_>>(),
             [
-                ObjectTexture::SurfaceLines(0),
-                ObjectTexture::Status(0),
-                ObjectTexture::OverlayAtlas,
-                ObjectTexture::SurfaceLines(1),
-                ObjectTexture::Status(1),
-                ObjectTexture::OverlayAtlas,
+                (ObjectTexture::ShpPage(0), 0, 2),
+                (ObjectTexture::SurfaceLines(0), 2, 0),
+                (ObjectTexture::ShpPage(0), 2, 2),
             ]
         );
     }
@@ -815,7 +953,7 @@ mod tests {
                 kind: BuildingPieceKind::Body,
                 z_bias: 0,
                 policy: BlitPolicy::z_read(SpriteEncoding::Rle),
-                target: ObjectTexture::OverlayAtlas,
+                target: ObjectTexture::ShpPage(0),
                 instance: SpriteInstance::default(),
             }],
         );
@@ -828,16 +966,19 @@ mod tests {
             wrench: None,
             rank: Some(SpriteInstance::default()),
             background: None,
+            shield_background: None,
             fills: vec![SpriteInstance::default(); 15],
             scale: Vec::new(),
             group: Default::default(),
             talk_bubble: None,
             self_heal: None,
+            ..Default::default()
         });
         let pass = lower_ground_object_instances(vec![parent]);
-        // Native6D913C Behind,6D9153 Extras:6F5382 rank,6F5396..5E10
-        // selected Building lines,6F5E27 health, then the body.6D9789 repeats
-        // rank->Extras-lines->health, using the same uploaded instances.
+        // Native6D9920 draws the base before rally. Display6D913C Behind,
+        //6D9153 Extras:6F5382 rank,6F5396..5E10 selected Building lines,
+        //6F5E27 health, then the dynamic turret.6D9789 repeats rank->Extras
+        // lines->health, using the same uploaded instances.
         assert_eq!(
             pass.surface_draws,
             [
@@ -858,93 +999,15 @@ mod tests {
                 ObjectTexture::Status(0),
                 ObjectTexture::SurfaceLines(1),
                 ObjectTexture::Status(2),
-                ObjectTexture::OverlayAtlas,
             ]
         );
-    }
-
-    #[test]
-    fn late_extras_interleave_rank_health_and_brackets_by_display_parent() {
-        use crate::app::presentation::{
-            selection_brackets::BuildingBracketLines, ui_overlays::TechnoExtras,
-        };
-        use crate::render::surface_line::{SurfaceLine, SurfaceLineBlend};
-        let parent = |id, rank| {
-            PlannedObjectInstance::object(
-                ObjectDraw {
-                    id,
-                    layer: TacticalLayer(2),
-                    display_order: rank,
-                    policy: BlitPolicy::z_read(SpriteEncoding::Plain),
-                },
-                vec![],
-            )
-        };
-        let mut first = parent(901, 0);
-        first.status = Some(TechnoExtras {
-            bomb_clock: None,
-            wrench: None,
-            rank: Some(SpriteInstance {
-                position: [0.0, 0.0],
-                ..Default::default()
-            }),
-            background: Some(SpriteInstance {
-                position: [1.0, 0.0],
-                ..Default::default()
-            }),
-            fills: vec![SpriteInstance {
-                position: [2.0, 0.0],
-                ..Default::default()
-            }],
-            scale: vec![SpriteInstance {
-                position: [3.0, 0.0],
-                ..Default::default()
-            }],
-            group: Default::default(),
-            talk_bubble: None,
-            self_heal: None,
-        });
-        let mut middle = parent(3, 1);
-        middle.brackets = Some(BuildingBracketLines {
-            behind: vec![],
-            extras: vec![SurfaceLine {
-                from: [0, 0],
-                to: [8, 0],
-                z_adjust: [14, 14],
-                blend: SurfaceLineBlend::Replace(65535),
-            }],
-        });
-        let mut last = parent(2, 2);
-        last.status = Some(TechnoExtras {
-            bomb_clock: None,
-            wrench: None,
-            rank: None,
-            background: None,
-            fills: vec![SpriteInstance {
-                position: [4.0, 0.0],
-                ..Default::default()
-            }],
-            scale: Vec::new(),
-            group: Default::default(),
-            talk_bubble: None,
-            self_heal: None,
-        });
-        let pass = lower_ground_object_instances(vec![last, middle, first]);
-        assert!(matches!(&pass.extras_runs[..], [
-            ObjectExtrasRun::Status { parent: 901, rank: Some(0), background: Some(1), fills: a, scale: s, .. },
-            ObjectExtrasRun::Lines { parent: 3, .. },
-            ObjectExtrasRun::Status { parent: 2, rank: None, background: None, fills: b, .. },
-        ] if *a == (2..3) && *s == (3..4) && *b == (4..5)));
         assert_eq!(
-            pass.extras_instances
+            pass.building_base_runs
                 .iter()
-                .map(|s| s.position[0])
+                .map(|run| run.target)
                 .collect::<Vec<_>>(),
-            [0.0, 1.0, 2.0, 3.0, 4.0]
+            [ObjectTexture::ShpPage(0)]
         );
-        let empty = lower_ground_object_instances(vec![parent(901, 0)]);
-        assert!(empty.extras_runs.is_empty());
-        assert!(empty.extras_instances.is_empty());
     }
 
     #[test]
@@ -1081,8 +1144,8 @@ mod tests {
             .find(|row| row["input"]["name"] == "one_adjacent_sort_pass_per_call")
             .unwrap();
         let mut sim = Simulation::new();
-        let owner = sim.interner.intern("Americans");
-        let type_id = sim.interner.intern("E1");
+        let owner = sim.intern("Americans");
+        let type_id = sim.intern("E1");
         for (i, actor) in row["input"]["actors"]
             .as_array()
             .unwrap()
@@ -1107,7 +1170,7 @@ mod tests {
                 128 + actor["delta"][0].as_i64().unwrap(),
             ));
             entity.position.set_sub_y_for_test(SimFixed::from_num(128));
-            sim.entities_mut().insert(entity);
+            sim.entities_mut_for_test().insert(entity);
         }
         sim.set_logic_order_for_test(vec![4, 3, 2, 1]);
         for (step, observed) in row["input"]["steps"]
@@ -1118,9 +1181,11 @@ mod tests {
         {
             let id = step["actor"].as_u64().map(|index| index + 1);
             match step["op"].as_str().unwrap() {
-                "submit" => sim.submit_object_display(id.unwrap(), DisplayLayer::GROUND, None),
+                "submit" => {
+                    sim.submit_object_display_for_test(id.unwrap(), DisplayLayer::GROUND, None)
+                }
                 "coordinates" => {
-                    let entity = sim.entities_mut().get_mut(id.unwrap()).unwrap();
+                    let entity = sim.entities_mut_for_test().get_mut(id.unwrap()).unwrap();
                     entity.position.set_sub_x_for_test(SimFixed::from_num(
                         step["xyz"][0].as_i64().unwrap() - 2560,
                     ));
@@ -1166,61 +1231,6 @@ mod tests {
         }
     }
 
-    fn cell(id: DrawId, is_wall: bool) -> PlannedCellInstance {
-        PlannedCellInstance {
-            draw: CellDraw {
-                id,
-                kind: cell_draw_kind(is_wall),
-                policy: BlitPolicy::translucent(SpriteEncoding::Terrain, RenderZPolicy::None),
-            },
-            instance: SpriteInstance {
-                draw_state: DrawState {
-                    fx_flags: id as u32,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        }
-    }
-
-    #[test]
-    fn cell_lowering_keeps_walls_in_the_fixed_overlay_family() {
-        let lowered = lower_cell_instances(vec![cell(4, false), cell(3, true), cell(2, false)]);
-        assert_eq!(
-            lowered
-                .iter()
-                .map(|instance| instance.draw_state.fx_flags)
-                .collect::<Vec<_>>(),
-            [4, 3, 2]
-        );
-    }
-
-    #[test]
-    fn cell_lowering_preserves_mixed_depth_policies_beside_their_instances() {
-        let mut wall = cell(3, true);
-        wall.draw.policy.render_z = RenderZPolicy::ReadWrite;
-        wall.instance.z_adjust = -62.0;
-        wall.instance.z_gradient = 2;
-        let (lowered, policies) =
-            lower_cell_instances_with_policy(vec![cell(4, false), wall, cell(2, false)]);
-        assert_eq!(
-            policies,
-            [
-                RenderZPolicy::None,
-                RenderZPolicy::ReadWrite,
-                RenderZPolicy::None
-            ]
-        );
-        assert_eq!(
-            lowered
-                .iter()
-                .map(|i| i.draw_state.fx_flags)
-                .collect::<Vec<_>>(),
-            [4, 3, 2]
-        );
-        assert_eq!((lowered[1].z_adjust, lowered[1].z_gradient), (-62.0, 2));
-    }
-
     fn marked_piece(target: ObjectTexture, marker: u32) -> ObjectPieceInstance {
         ObjectPieceInstance {
             target,
@@ -1239,6 +1249,150 @@ mod tests {
         order
             .object_draw(id, SpriteEncoding::Plain)
             .expect("registered parent")
+    }
+
+    #[test]
+    fn building_base_and_dynamic_draws_follow_native_phases_and_ground_order() {
+        // Original6D9920 walks Ground's8A0394 vector, selects Building RTTI6,
+        // and calls43CEA0/43D290 before rally6D4648. Mobile bodies and the
+        // independently registered slot Anims remain in the later6D8DB0 pass.
+        let order = NativeDisplayOrder::new(&[10, 20, 30, 40]);
+        let building = |id, pieces: &[(BuildingPieceKind, u32)]| {
+            PlannedObjectInstance::building(
+                plain_parent(&order, id),
+                pieces
+                    .iter()
+                    .map(|&(kind, marker)| PlannedBuildingPieceInstance {
+                        kind,
+                        z_bias: 0,
+                        policy: if kind == BuildingPieceKind::PoweredOrActiveOverlay {
+                            BlitPolicy::z_read(SpriteEncoding::Voxel)
+                        } else {
+                            BlitPolicy::opaque(SpriteEncoding::Plain)
+                        },
+                        target: if kind == BuildingPieceKind::PoweredOrActiveOverlay {
+                            ObjectTexture::UnitAtlasPage(7)
+                        } else {
+                            ObjectTexture::ShpPage(0)
+                        },
+                        instance: marked_piece(ObjectTexture::ShpPage(0), marker).instance,
+                    })
+                    .collect(),
+            )
+        };
+        let pass = lower_ground_object_instances(vec![
+            building(40, &[(BuildingPieceKind::Body, 40)]),
+            PlannedObjectInstance::object(
+                plain_parent(&order, 30),
+                vec![marked_piece(ObjectTexture::ShpPage(0), 30)],
+            ),
+            building(
+                20,
+                &[
+                    (BuildingPieceKind::Bib, 22),
+                    (BuildingPieceKind::Shadow, 21),
+                    (BuildingPieceKind::Body, 20),
+                    (BuildingPieceKind::PoweredOrActiveOverlay, 29),
+                ],
+            ),
+            PlannedObjectInstance::object(
+                plain_parent(&order, 10),
+                vec![marked_piece(ObjectTexture::UnitAtlasPage(0), 10)],
+            ),
+        ]);
+        let early_markers: Vec<_> = pass
+            .building_base_runs
+            .iter()
+            .flat_map(|run| run.start..run.start + run.count)
+            .map(|index| pass.instances[index as usize].draw_state.fx_flags)
+            .collect();
+        assert_eq!(early_markers, [20, 21, 22, 40]);
+        let display_markers: Vec<_> = pass
+            .runs
+            .iter()
+            .flat_map(|run| run.start..run.start + run.count)
+            .map(|index| pass.instances[index as usize].draw_state.fx_flags)
+            .collect();
+        assert_eq!(display_markers, [10, 29, 30]);
+        assert_eq!(pass.owners, [10, 20, 20, 20, 20, 30, 40]);
+    }
+
+    /// Display6D916C's43DA80 redraws an unloading building's tethered
+    /// contacts (43DAA0) after its Extras and before its voxel turret, and
+    /// Unit73B0B0 refuses the tethered Unit its own slot, laser included.
+    /// The redraw does not depend on which slot comes first; a contact the
+    /// Unit side does not refuse draws twice, and a refused one no building
+    /// redraws does not draw.
+    #[test]
+    fn an_unloading_building_draws_its_tethered_contacts_in_its_own_slot() {
+        let laser = |marker: i32| {
+            SurfaceDraw::Line(crate::render::surface_line::SurfaceLine {
+                from: [marker, 0],
+                to: [marker, 8],
+                z_adjust: [0, 0],
+                blend: crate::render::surface_line::SurfaceLineBlend::Replace(0),
+            })
+        };
+        let order = NativeDisplayOrder::new(&[10, 20, 30, 40, 50, 60]);
+        let unit = |id, refused| {
+            let mut unit = PlannedObjectInstance::object(
+                plain_parent(&order, id),
+                vec![marked_piece(ObjectTexture::UnitAtlasPage(0), id as u32)],
+            );
+            unit.tail_draws = vec![laser(id as i32)];
+            unit.drawn_by_tether = refused;
+            unit
+        };
+        let factory = |id, contacts: Vec<DrawId>| {
+            let mut factory = PlannedObjectInstance::building(
+                plain_parent(&order, id),
+                [
+                    (BuildingPieceKind::Body, id as u32),
+                    (BuildingPieceKind::PoweredOrActiveOverlay, id as u32 + 1),
+                ]
+                .into_iter()
+                .map(|(kind, marker)| PlannedBuildingPieceInstance {
+                    kind,
+                    z_bias: 0,
+                    policy: if kind == BuildingPieceKind::Body {
+                        BlitPolicy::opaque(SpriteEncoding::Plain)
+                    } else {
+                        BlitPolicy::z_read(SpriteEncoding::Voxel)
+                    },
+                    target: ObjectTexture::ShpPage(0),
+                    instance: marked_piece(ObjectTexture::ShpPage(0), marker).instance,
+                })
+                .collect(),
+            );
+            factory.tether_redraws = contacts;
+            factory
+        };
+        // 10 is drawn by 20, 40 by 30 (40's slot comes later), 50 is redrawn
+        // by 30 without refusing its own slot, and 60 refuses with no redraw.
+        let pass = lower_ground_object_instances(vec![
+            unit(10, true),
+            factory(20, vec![10]),
+            factory(30, vec![40, 50]),
+            unit(40, true),
+            unit(50, false),
+            unit(60, true),
+        ]);
+        let display_markers: Vec<_> = pass
+            .runs
+            .iter()
+            .flat_map(|run| run.start..run.start + run.count)
+            .map(|index| pass.instances[index as usize].draw_state.fx_flags)
+            .collect();
+        assert_eq!(display_markers, [10, 21, 40, 50, 31, 50]);
+        assert_eq!(
+            pass.surface_draws,
+            [
+                vec![laser(10)],
+                vec![laser(40)],
+                vec![laser(50)],
+                vec![laser(50)]
+            ]
+        );
     }
 
     #[test]
@@ -1299,57 +1453,6 @@ mod tests {
     }
 
     #[test]
-    fn only_native_body_selectors_split_opaque_atlas_batching() {
-        use crate::render::draw_state::FX_SHADOW;
-
-        let order = NativeDisplayOrder::new(&[1, 2, 3, 4]);
-        let mut rgba_alpha = marked_piece(ObjectTexture::UnitPosePage(0), 2);
-        rgba_alpha.instance.alpha = 0.5;
-        rgba_alpha.instance.draw_state.fx_params[0] = 0.25;
-        let mut shadow = marked_piece(ObjectTexture::UnitPosePage(0), 3);
-        shadow.instance.draw_state.fx_params[1] = 4.0;
-        shadow.instance.draw_state.fx_flags |= FX_SHADOW;
-        let mut terrain = marked_piece(
-            ObjectTexture::TerrainShp(crate::render::terrain_draw::TerrainPiece::Shadow),
-            4,
-        );
-        terrain.instance.draw_state.fx_params[1] = 4.0;
-        let pass = lower_ground_object_instances(vec![
-            PlannedObjectInstance::object(
-                plain_parent(&order, 1),
-                vec![marked_piece(ObjectTexture::UnitPosePage(0), 1)],
-            ),
-            PlannedObjectInstance::object(plain_parent(&order, 2), vec![rgba_alpha]),
-            PlannedObjectInstance::object(plain_parent(&order, 3), vec![shadow]),
-            PlannedObjectInstance::object(plain_parent(&order, 4), vec![terrain]),
-        ]);
-        assert_eq!(pass.runs.len(), 2);
-        assert_eq!(pass.runs[0].count, 3);
-        assert!(pass.runs.iter().all(|run| run.packed_parent.is_none()));
-    }
-
-    #[test]
-    fn gsi_13_03_far_tree_unit_near_tree_share_one_integer_ground_order() {
-        let order = NativeDisplayOrder::new(&[10, 20, 30]);
-        let pass = lower_ground_object_instances(vec![
-            PlannedObjectInstance::object(
-                order.object_draw(30, SpriteEncoding::Terrain).unwrap(),
-                vec![marked_piece(ObjectTexture::OverlayAtlas, 30)],
-            ),
-            PlannedObjectInstance::object(
-                plain_parent(&order, 20),
-                vec![marked_piece(ObjectTexture::UnitAtlasPage(3), 20)],
-            ),
-            PlannedObjectInstance::object(
-                order.object_draw(10, SpriteEncoding::Terrain).unwrap(),
-                vec![marked_piece(ObjectTexture::OverlayAtlas, 10)],
-            ),
-        ]);
-
-        assert_eq!(pass.owners, [10, 20, 30]);
-    }
-
-    #[test]
     fn gsi_13_03_equal_tree_unit_building_use_registration_not_atlas() {
         let order = NativeDisplayOrder::new(&[20, 30, 10]);
         let building = PlannedObjectInstance::building(
@@ -1365,7 +1468,7 @@ mod tests {
         let pass = lower_ground_object_instances(vec![
             PlannedObjectInstance::object(
                 order.object_draw(10, SpriteEncoding::Terrain).unwrap(),
-                vec![marked_piece(ObjectTexture::OverlayAtlas, 10)],
+                vec![marked_piece(ObjectTexture::ShpPage(1), 10)],
             ),
             building,
             PlannedObjectInstance::object(
@@ -1377,26 +1480,15 @@ mod tests {
         assert_eq!(pass.owners, [20, 30, 10]);
         assert_eq!(
             pass.runs.iter().map(|run| run.target).collect::<Vec<_>>(),
-            [
-                ObjectTexture::UnitAtlasPage(9),
-                ObjectTexture::ShpPage(0),
-                ObjectTexture::OverlayAtlas,
-            ]
+            [ObjectTexture::UnitAtlasPage(9), ObjectTexture::ShpPage(1),]
         );
-    }
-
-    #[test]
-    fn gsi_13_03_terrain_leaves_fixed_overlay_and_enters_ground_once() {
-        let fixed = lower_cell_instances(vec![cell(7, false)]);
-        let order = NativeDisplayOrder::new(&[8]);
-        let ground = lower_ground_object_instances(vec![PlannedObjectInstance::object(
-            order.object_draw(8, SpriteEncoding::Terrain).unwrap(),
-            vec![marked_piece(ObjectTexture::OverlayAtlas, 8)],
-        )]);
-
-        assert_eq!(fixed.len(), 1);
-        assert_eq!(ground.owners, [8]);
-        assert_eq!(ground.instances.len(), 1);
+        assert_eq!(
+            pass.building_base_runs
+                .iter()
+                .map(|run| run.target)
+                .collect::<Vec<_>>(),
+            [ObjectTexture::ShpPage(0)]
+        );
     }
 
     #[test]
@@ -1436,7 +1528,7 @@ mod tests {
             ),
             PlannedObjectInstance::object(
                 plain_parent(&order, 1),
-                vec![marked_piece(ObjectTexture::OverlayAtlas, 1)],
+                vec![marked_piece(ObjectTexture::ShpPage(2), 1)],
             ),
         ]);
 
@@ -1447,28 +1539,6 @@ mod tests {
                 .map(|instance| instance.draw_state.fx_flags)
                 .collect::<Vec<_>>(),
             [1, 22, 24, 21, 23, 3]
-        );
-    }
-    #[test]
-    fn speech_tail_only_parent_keeps_its_native_extras_slot() {
-        use crate::app::presentation::ui_overlays::TechnoExtras;
-        let mut parent = PlannedObjectInstance::object(
-            ObjectDraw {
-                id: 91,
-                layer: TacticalLayer(2),
-                display_order: 0,
-                policy: BlitPolicy::z_read(SpriteEncoding::Rle),
-            },
-            vec![],
-        );
-        parent.status = Some(TechnoExtras {
-            talk_bubble: Some(SpriteInstance::default()),
-            ..Default::default()
-        });
-        let pass = lower_ground_object_instances(vec![parent]);
-        assert_eq!(pass.extras_instances.len(), 1);
-        assert!(
-            matches!(&pass.extras_runs[..], [ObjectExtrasRun::Status { parent:91, talk_bubble:Some(0), fills, scale, group_text, .. }] if fills.is_empty() && scale.is_empty() && group_text.is_empty())
         );
     }
 }

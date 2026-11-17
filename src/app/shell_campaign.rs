@@ -3,7 +3,7 @@
 //! and creates `0x94`; Back (`0x686`, result -1) tears `0x94` down and state 1
 //! recreates Single Player.
 
-use std::time::Instant;
+use crate::util::time::Instant;
 
 use super::{App, AppState};
 use crate::app::shell_route::ShellRoute;
@@ -228,6 +228,8 @@ impl App {
         };
         let difficulty = campaign.difficulty();
         let voice = campaign.take_selection_voice();
+        // CampaignDialog52F28B rearms the process's initial-save attempt.
+        state.persistence.arm_initial_campaign_save();
         state.persistence.options_profile.difficulty = difficulty;
         if let Some(voice) = voice {
             Self::play_campaign_voice(state, voice);
@@ -246,6 +248,11 @@ impl App {
                 campaigns,
                 side.campaign_name(),
                 state.persistence.options_profile.difficulty,
+                None,
+                crate::app::match_bootstrap::CampaignLaunchOptions::for_speed_control(
+                    state.frontend.campaign_speed_control,
+                    state.persistence.options_profile.game_speed,
+                ),
                 &mut clock,
             )
         });

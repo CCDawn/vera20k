@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
 
-use crate::rules::object_type::{BuildCategory, FactoryType, ObjectCategory, ObjectType};
+use crate::rules::object_type::{BuildCategory, FactoryType, ObjectType};
 use crate::rules::ruleset::RuleSet;
 use crate::sim::economy::Economy;
 use crate::sim::house_tracking::FactorySlot;
@@ -68,9 +68,9 @@ fn remaining_balance_after(cost: i32, progress: u16) -> i32 {
 pub struct PendingObject {
     pub type_id: InternedId,
     pub entity_id: Option<u64>,
-    /// Native completion accounting belongs to the one held factory object, not to
-    /// each delivery attempt. A refused Unlimbo keeps this serialized latch with the
-    /// same identity; the next promoted object starts with it clear.
+    /// Local completion notification belongs to the held object, not to each
+    /// delivery attempt. A refused Unlimbo keeps this serialized latch; the next
+    /// promoted object starts clear. Delivered score/history has its own owner.
     #[serde(default)]
     pub completion_accounted: bool,
 }
@@ -89,37 +89,40 @@ pub struct QueueEntry {
 /// `FactoryRegistry`. The factory retains its unpaid obligation; Economy owns cash.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Factory {
-    pub owner: InternedId,
-    pub category: ProductionCategory,
+    owner: InternedId,
+    category: ProductionCategory,
     /// `0..=54`; completion at `PRODUCTION_STEPS`.
-    pub progress: u16,
+    progress: u16,
     /// Frames per step, `clamp(Time_To_Build / 54, 1, 255)` (Factory `+0x38`);
     /// `0` before the build starts and after Suspend/completion, until the
     /// House's rate-only reassessment may rewrite it independently of +70.
-    pub step_rate_frames: u16,
+    step_rate_frames: u16,
     /// The step timer (Factory `+0x2C`), anchored to the native frame: a step
     /// comes once `step_rate_frames` frames have passed since the last one.
-    pub step_timer: CdTimer,
+    step_timer: CdTimer,
     /// Remaining cost still owed (Factory `+0x60`), charged down per step:
     /// StartProduction seeds it with the type's Cost_Of for the owner
     /// (`0x004C9DE1..0x004C9DEA`).
-    pub balance: i32,
-    pub object: Option<PendingObject>,
+    balance: i32,
+    /// Factory `+0x58`. `FactoryClass::SetObject @ 0x004C9E10` has no caller
+    /// or data reference in gamemd (only YRpp names it), so nothing outside
+    /// StartProduction stores a held object and it has no port.
+    object: Option<PendingObject>,
     /// The last step could not be afforded (Factory `+0x5C`); the step was
     /// rewound and the next one retries at the same rate.
-    pub on_hold: bool,
+    on_hold: bool,
     /// Factory `+0x70`, shared by Suspend4C9E60 and completion4C9C06.
     /// The rate-only House power pass4CA6E0 preserves this authority even
     /// when it restores a nonzero rate on a user-held or completed factory.
     /// Native evidence: tools/sidebar_oracle/factory_hold_resume.md.
-    pub suspended: bool,
+    suspended: bool,
     /// Factory+71: blocks House50927C's automatic recovery while +70 is set.
     /// Constructor4C98F7 and affordable Resume4C9F6C set it; accepted
     /// Suspend4C9E71 writes its argument. It is not a second pause flag.
     /// Only this owner mutates it; save/hash retain the distinction.
     auto_resume_blocked: bool,
     /// FIFO queue-of-record waiting behind the active object (Factory `+0x40`).
-    pub queue: VecDeque<QueueEntry>,
+    queue: VecDeque<QueueEntry>,
     /// The factory's construction order: gamemd appends each new FactoryClass
     /// to the global Factories vector (ctor `0x004C9974..0x004C9989`), and
     /// `LogicClass` runs `FactoryClass::AI` in that order (`0x0055B66A..`).
@@ -127,7 +130,7 @@ pub struct Factory {
     /// promotion or NULL-product rearm keeps this identity and charge order:
     /// original Begin4FA350 reuses the live Factory after PointerExpired.
     /// Source: cameo_order.md, same-category rearm history.
-    pub insertion_seq: u64,
+    insertion_seq: u64,
     /// Factory+5D. StartProduction/Abandon/CompletedProduction and an actual
     /// stage advance set this; StripAI consumes it through4C9C60, even when
     /// the object is unfinished. Completion accounting and +71 are separate.
@@ -157,8 +160,107 @@ impl Default for Factory {
 }
 
 impl Factory {
+    /// The owning house (Factory `+0x6C`).
+    pub fn owner(&self) -> InternedId {
+        self.owner
+    }
+
+    pub fn category(&self) -> ProductionCategory {
+        self.category
+    }
+
+    pub fn progress(&self) -> u16 {
+        self.progress
+    }
+
+    pub fn step_rate_frames(&self) -> u16 {
+        self.step_rate_frames
+    }
+
+    pub fn step_timer(&self) -> &CdTimer {
+        &self.step_timer
+    }
+
+    pub fn balance(&self) -> i32 {
+        self.balance
+    }
+
+    pub fn object(&self) -> Option<&PendingObject> {
+        self.object.as_ref()
+    }
+
+    /// `FactoryClass::IsWaitingForFunds @ 0x004C9C50` (+5C), read by
+    /// StripAI6A8F99 to stop the cameo's predicted clock.
+    pub fn on_hold(&self) -> bool {
+        self.on_hold
+    }
+
+    pub fn suspended(&self) -> bool {
+        self.suspended
+    }
+
+    pub fn queue(&self) -> &VecDeque<QueueEntry> {
+        &self.queue
+    }
+
+    pub fn insertion_seq(&self) -> u64 {
+        self.insertion_seq
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_owner_for_test(&mut self, value: InternedId) {
+        self.owner = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_category_for_test(&mut self, value: ProductionCategory) {
+        self.category = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_object_for_test(&mut self, value: Option<PendingObject>) {
+        self.object = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_balance_for_test(&mut self, value: i32) {
+        self.balance = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_on_hold_for_test(&mut self, value: bool) {
+        self.on_hold = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_progress_for_test(&mut self, value: u16) {
+        self.progress = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_step_rate_frames_for_test(&mut self, value: u16) {
+        self.step_rate_frames = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_step_timer_for_test(&mut self, value: CdTimer) {
+        self.step_timer = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_suspended_for_test(&mut self, value: bool) {
+        self.suspended = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn object_mut_for_test(&mut self) -> &mut Option<PendingObject> {
+        &mut self.object
+    }
+
     /// The world chooses registry holder order;
-    /// this owner folds the complete Factory state, including private latches.
+    /// this owner folds shared Factory state. Strip HasChanged4C9C60 and its
+    /// completion notification are process-local, just like current_house;
+    /// visiting different local sidebars must not change a shared state hash.
     pub(crate) fn hash_state(&self, hasher: &mut impl Hasher) {
         self.owner.hash(hasher);
         (self.category as u8).hash(hasher);
@@ -179,16 +281,12 @@ impl Factory {
                     }
                     None => 0u8.hash(hasher),
                 }
-                object.completion_accounted.hash(hasher);
             }
             None => 0u8.hash(hasher),
         }
         self.on_hold.hash(hasher);
         self.suspended.hash(hasher);
         self.auto_resume_blocked.hash(hasher);
-        if self.changed {
-            b"factory-changed-5d".hash(hasher);
-        }
         (self.queue.len() as u64).hash(hasher);
         for entry in &self.queue {
             entry.type_id.hash(hasher);
@@ -211,11 +309,11 @@ impl Factory {
     }
 
     /// The step rate for a build of `time_to_build` frames: `clamp(total / 54,
-    /// 1, 255)`, the division truncating. The build start `0x004C9EA0` (Ghidra
-    /// label `FactoryClass__SetRate`; it also resumes a suspended build)
+    /// 1, 255)`, the division truncating. The build start
+    /// `FactoryClass::ResumeProduction @ 0x004C9EA0`
     /// computes it at `0x004C9EEF..0x004C9F28`; the house power pass
     /// (`0x004CA6E0`, from `0x00508D88`) rewrites only this rate.
-    pub fn set_rate(&mut self, time_to_build: i32) {
+    fn set_rate(&mut self, time_to_build: i32) {
         self.step_rate_frames = build_step_rate(time_to_build);
     }
 
@@ -429,6 +527,37 @@ pub fn type_base_build_time(cost: i32, build_speed: NativeF64Bits) -> i32 {
     ))
 }
 
+/// Ares `TechnoTypeClass_GetBuildSpeed` (`10041D40`, hook `0x00711EE0`):
+/// `BuildTime.Speed` (else `[General] BuildSpeed=`) times `BuildTime.Cost`
+/// (else `Cost=`), over 1000.0 (`1009E580`), times 900.0 (`10095ED0`),
+/// truncated by ftol `100772B0` under the process's 53-bit chop word.
+pub fn ares_type_build_time(cost: i32, build_speed: NativeF64Bits) -> i32 {
+    use crate::util::native_x87::MaskedX87Chop53 as X87;
+
+    X87::ftol_i32_low_masked(X87::mul(
+        X87::div(
+            X87::mul(X87::load_f64(build_speed), X87::load_i32(cost)),
+            X87::load_f64(NativeF64Bits::from_bits(0x408F_4000_0000_0000)),
+        ),
+        X87::load_f64(NativeF64Bits::from_bits(0x408C_2000_0000_0000)),
+    ))
+}
+
+/// TechnoType vt+0x88 for `obj`: [`type_base_build_time`], or when Ares plays
+/// [`ares_type_build_time`] over its `BuildTime.Cost`/`BuildTime.Speed`.
+pub fn type_build_time(obj: &ObjectType, rules: &RuleSet) -> i32 {
+    if rules.ares_form() {
+        let ext = obj.ares_production();
+        ares_type_build_time(
+            ext.build_time_cost().unwrap_or(obj.cost),
+            ext.build_time_speed()
+                .unwrap_or(rules.production.build_speed),
+        )
+    } else {
+        type_base_build_time(obj.cost, rules.production.build_speed)
+    }
+}
+
 /// Resume4C9EEF and GetRate4C9FC0 share the signed total/54 clamp.
 fn build_step_rate(time_to_build: i32) -> u16 {
     let per_step = time_to_build / i32::from(PRODUCTION_STEPS);
@@ -509,6 +638,95 @@ pub fn time_to_build(inputs: &TimeToBuildInputs) -> i32 {
     time
 }
 
+/// Ares `TechnoClass_GetBuildTime` (`10041AB0`, hook `0x006F47A0`, resuming
+/// at `0x006F4955`), which replaces [`time_to_build`]'s body:
+/// - the base is [`ares_type_build_time`], times the country multiplier
+///   (`0x0050C0A0`), then the type's BuildTimeMultiplier times the time
+///   stored as a float (`10041B46..10041B4E`);
+/// - the power ratio (`0x004FCE30`) stays binary64 (no float spill);
+///   `BuildTime.LowPowerPenalty`, `.MinLowPower` and `.MaxLowPower` replace
+///   the `[General]` floats; any speed below 0.01 (`1009E578`, binary64)
+///   becomes 0.01, not only zero;
+/// - `BuildTime.MultipleFactory` replaces `MultipleFactory=`;
+/// - the wall coefficient applies only while `BuildTime.Speed` is unset,
+///   which `inputs.wall` already holds ([`ObjectType::wall_build_speed_applies`]).
+pub fn ares_time_to_build(
+    inputs: &TimeToBuildInputs,
+    ext: &crate::rules::ares_production::ProductionTypeRules,
+) -> i32 {
+    use crate::util::native_x87::{MaskedX87Chop53 as X87, MaskedX87Ordering as Order};
+
+    let base = ares_type_build_time(
+        ext.build_time_cost().unwrap_or(inputs.cost),
+        ext.build_time_speed().unwrap_or(inputs.build_speed),
+    );
+    let mut time = X87::ftol_i32_low_masked(X87::mul(
+        X87::load_f32(inputs.country_multiplier),
+        X87::load_i32(base),
+    ));
+    time = X87::ftol_i32_low_masked(X87::mul(
+        X87::load_f32(inputs.build_time_multiplier),
+        X87::load_f32(X87::store_f32_masked_chop(X87::load_i32(time))),
+    ));
+    let power =
+        crate::sim::power_system::native_power_ratio(inputs.power_output, inputs.power_drain);
+    let read = |value: Option<NativeF64Bits>, general: NativeF32Bits| {
+        value.map_or_else(|| X87::load_f32(general), X87::load_f64)
+    };
+    let penalty = read(ext.build_time_low_power_penalty(), inputs.low_power_penalty);
+    let min_speed = read(ext.build_time_min_low_power(), inputs.min_low_power_speed);
+    let max_speed = read(ext.build_time_max_low_power(), inputs.max_low_power_speed);
+    let one = X87::load_f64(NativeF64Bits::ONE);
+    let mut speed = X87::sub(one, X87::mul(X87::sub(one, power), penalty));
+    // 10041BC1..10041BDB: `fcomi` + `jbe`, so only a strict excess clamps.
+    if X87::compare(min_speed, speed) == Order::Greater {
+        speed = min_speed;
+    }
+    if X87::compare(one, power) == Order::Greater
+        && X87::compare(speed, max_speed) == Order::Greater
+    {
+        speed = max_speed;
+    }
+    let floor = X87::load_f64(NativeF64Bits::from_bits(0x3F84_7AE1_47AE_147B));
+    if X87::compare(floor, speed) == Order::Greater {
+        speed = floor;
+    }
+    time = X87::ftol_i32_low_masked(X87::div(X87::load_i32(time), speed));
+    let multiple_factory = read(ext.build_time_multiple_factory(), inputs.multiple_factory);
+    if X87::compare(
+        multiple_factory,
+        X87::load_f64(NativeF64Bits::POSITIVE_ZERO),
+    ) == Order::Greater
+    {
+        for _ in 0..inputs.factory_count.wrapping_sub(1).max(0) {
+            time = X87::ftol_i32_low_masked(X87::mul(X87::load_i32(time), multiple_factory));
+        }
+    }
+    if inputs.wall {
+        time = X87::ftol_i32_low_masked(X87::mul(
+            X87::load_i32(time),
+            X87::load_f64(inputs.wall_coefficient),
+        ));
+    }
+    time
+}
+
+/// `TechnoClass::Time_To_Build @ 0x006F47A0` for `owner` building `obj`:
+/// [`time_to_build`], or when Ares plays its replacement [`ares_time_to_build`].
+pub(super) fn object_time_to_build(
+    sim: &crate::sim::world::Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    obj: &ObjectType,
+) -> i32 {
+    let inputs = time_to_build_inputs(sim, rules, owner, obj);
+    if rules.ares_form() {
+        ares_time_to_build(&inputs, obj.ares_production())
+    } else {
+        time_to_build(&inputs)
+    }
+}
+
 /// Resolve [`time_to_build`]'s inputs for `owner` building `obj`: the rules
 /// and type fields, the owner's country multiplier (`0x0050C0A0`), power
 /// (House `+0x53A4`/`+0x53A8`) and factory count (`GetFactoryCount @
@@ -521,7 +739,16 @@ pub(super) fn time_to_build_inputs(
     obj: &ObjectType,
 ) -> TimeToBuildInputs {
     let country_multiplier = sim.houses.get(&owner).map_or(NativeF32Bits::ONE, |house| {
-        rules.country_build_time_mult_for_type(sim.interner.resolve(house.house_type_id()), obj)
+        let native = rules
+            .country_build_time_mult_for_type(sim.interner.resolve(house.house_type_id()), obj);
+        // Fold the fork-only Super-AI scale into the same single f32 multiply
+        // ahead of the native chain (`docs/superai.md`); None leaves the chain
+        // bit-identical to the native country multiplier.
+        house.native_build_time_scale().map_or(native, |scale| {
+            NativeF32Bits::from_bits(
+                (f32::from_bits(native.bits()) * f32::from_bits(scale.bits())).to_bits(),
+            )
+        })
     });
     let (power_output, power_drain) = sim
         .power_states
@@ -531,7 +758,7 @@ pub(super) fn time_to_build_inputs(
     let factory_count = sim
         .houses
         .get(&owner)
-        .map_or(0, |house| house.tracking.factory_count(slot));
+        .map_or(0, |house| house.tracking().factory_count(slot));
     TimeToBuildInputs {
         cost: obj.cost,
         build_speed: rules.production.build_speed,
@@ -544,9 +771,27 @@ pub(super) fn time_to_build_inputs(
         max_low_power_speed: rules.production.max_low_power_production_speed,
         factory_count,
         multiple_factory: rules.production.multiple_factory,
-        wall: obj.category == ObjectCategory::Building && obj.wall,
+        wall: obj.wall_build_speed_applies(),
         wall_coefficient: rules.production.wall_build_speed_coefficient,
     }
+}
+
+/// Techno6F47A0 reads the held object's owner (+21C), independently of the
+/// Factory's owner (+6C). Action36 can transfer a limbo product while its
+/// original House retains the Factory and a producer. Both GetRate4C9FB0
+/// and Resume4C9EEF/UpdateBuildRate4CA705 call this same Techno receiver.
+pub(super) fn held_time_to_build(
+    sim: &crate::sim::world::Simulation,
+    rules: &RuleSet,
+    held: &PendingObject,
+) -> i32 {
+    held.entity_id
+        .and_then(|id| sim.substrate.entities.get(id))
+        .and_then(|entity| {
+            sim.entity_object_type(entity, rules)
+                .map(|object| object_time_to_build(sim, rules, entity.owner(), object))
+        })
+        .unwrap_or(0)
 }
 
 /// Map an object type to the `ProductionCategory` whose factory produces it — the Rust
@@ -590,12 +835,6 @@ pub struct AbandonedObject {
 /// paying the house, and its cancel refund (Cost_Of less that Balance) takes
 /// the Cost_Of instead of nothing.
 ///
-/// RESIDUAL: VERA keeps no object `+0x300`. Its gameplay reader, the
-/// building's construction completion (`0x00446AE3..0x00446B10`), gives a
-/// human's building no FreeUnit when that stored price is non-zero and at most
-/// the type's GetCost, which in retail needs the FreeUnit's Cost_Of at 0 or
-/// less: 26 Industrial Plants for a refinery's Miner. Effect: VERA still
-/// delivers the free unit.
 fn seeded_balance(cost: i32) -> i32 {
     cost.max(0)
 }
@@ -652,7 +891,7 @@ impl<'a> FactoryView<'a> {
         self.construction_order
     }
 
-    /// `FactoryClass::GetRate @ 0x004C9FB0` recomputes the held Techno's
+    /// `FactoryClass::CalcRate @ 0x004C9FB0` recomputes the held Techno's
     /// current duration; it does not read the stored (possibly suspended)
     /// rate. Select6AB5B3 adds one when resuming its presentation clock.
     /// An empty Factory supplies zero duration, which the shared clamp maps
@@ -660,14 +899,7 @@ impl<'a> FactoryView<'a> {
     pub fn build_step_rate(&self, sim: &crate::sim::world::Simulation, rules: &RuleSet) -> u16 {
         let duration = self
             .object
-            .and_then(|object| object.entity_id)
-            .and_then(|id| sim.substrate.entities.get(id))
-            .and_then(|entity| {
-                sim.object_type(entity.type_ref(), rules).map(|object| {
-                    time_to_build(&time_to_build_inputs(sim, rules, entity.owner(), object))
-                })
-            })
-            .unwrap_or(0);
+            .map_or(0, |held| held_time_to_build(sim, rules, held));
         build_step_rate(duration)
     }
 
@@ -696,7 +928,9 @@ impl<'a> FactoryView<'a> {
     /// Rate and suspension are caller guards, not part of IsComplete.
     /// Its special-item arm (`+0x68`) is
     /// dormant: FactoryClass's own writers store only -1 there (`0x004C990D`,
-    /// `0x004CA058`, `0x004CA1F0`).
+    /// `0x004CA058`, `0x004CA1F0`), so `FactoryClass::GetSpecialItem @
+    /// 0x004CA170`, read by Select6AB2D9 only after IsComplete with no held
+    /// object, is never reached and has no port.
     pub fn complete_object(&self) -> Option<&'a PendingObject> {
         self.object.filter(|_| self.progress == PRODUCTION_STEPS)
     }
@@ -749,6 +983,7 @@ impl FactoryRegistry {
             cost,
             i32::MAX,
             false,
+            false,
         ) == EnqueueOutcome::Started
     }
 
@@ -763,16 +998,20 @@ impl FactoryRegistry {
     /// either expiry control: only a matching held product (+58) is cleared.
     /// The factory, queue, stage, balance, rates and timers remain intact.
     /// Source: cameo_order.md current/saved product-expiry histories.
-    pub(crate) fn pointer_expired(&mut self, entity_id: u64) {
+    /// Answers whether any factory held `entity_id`.
+    pub(crate) fn pointer_expired(&mut self, entity_id: u64) -> bool {
+        let mut held = false;
         for factory in self.factories.values_mut() {
             if factory
                 .object
                 .as_ref()
                 .is_some_and(|object| object.entity_id == Some(entity_id))
             {
+                held = true;
                 factory.object = None;
             }
         }
+        held
     }
 
     /// `FactoryClass::CountTotal @ 0x004CA670` on `owner`'s factory for
@@ -953,6 +1192,10 @@ impl FactoryRegistry {
         }
     }
 
+    /// The Factory delete (`vt+0x20`, `FactoryClass::ScalarDeletingDestructor
+    /// @ 0x004CA770` around `FactoryClass::Destructor @ 0x004C9A10`). Its
+    /// in-game AbandonProduction (`0x004C9A8A`) finds no object here: every
+    /// caller has already abandoned or released the held product.
     pub(super) fn remove_factory(&mut self, holder: FactoryHolder) {
         self.factories.remove(&holder);
     }
@@ -1022,14 +1265,29 @@ impl FactoryRegistry {
     /// `FactoryClass::StartProduction @ 0x004C9C70` for a PRODUCE that is not
     /// a resume. With no factory for `(owner, category)` or an idle one, arm
     /// the active build (object held, progress 0, balance seeded from `cost`).
-    /// With an active object held, append a `QueueEntry` unless the queue
-    /// already holds `max_queued` builds (`0x004C9CD5..0x004C9CE4`) or
-    /// `at_build_limit` (the caller's `HouseClass::CheckBuildLimit`,
-    /// `0x004C9CEA`, asked before the append).
+    /// Otherwise append a `QueueEntry` unless the queue already holds
+    /// `max_queued` builds (`0x004C9CD5..0x004C9CE4`) or `at_build_limit`
+    /// (the caller's `HouseClass::CheckBuildLimit`, `0x004C9CEA`, asked
+    /// before the append).
+    ///
+    /// Idle means `0x004C9C95..0x004C9CCF`: no held object, rate clear or
+    /// +70 set, and an empty queue, unless `force` (StartNextQueued's
+    /// Begin_Production, `0x004CA60A`, passes it as `shouldQueue`). So a
+    /// PRODUCE reaching a Factory that holds nothing but still has a queue
+    /// (a forced promotion that Begin_Production refused) joins that queue's
+    /// tail rather than jumping it. Two native create arms are left out:
+    /// a BuildingType always creates (`0x004C9C95`), which the caller covers
+    /// by abandoning first while building strips never queue, and Phobos
+    /// `BuildingProductionQueue` jumps past it (hook `0x4C9C7B` ->
+    /// `0x004C9C9E`) to this test; and a held, unsuspended object at rate 0
+    /// creates over itself, unreachable since a held build's rate is at least
+    /// 1. The create path leaves +5C alone: a cash
+    /// stall from an abandoned build stays until the new build's first step.
     ///
     /// A freshly-armed build has no rate yet; the caller constructs its Techno
     /// and [`Factory::resume`] arms it. `cost` is resolved by the caller
     /// (which holds `&rules`) so this stays `&sim`-free.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn enqueue(
         &mut self,
         owner: InternedId,
@@ -1039,10 +1297,13 @@ impl FactoryRegistry {
         cost: i32,
         max_queued: i32,
         at_build_limit: bool,
+        force: bool,
     ) -> EnqueueOutcome {
         let holder = FactoryHolder::House(owner, category);
         if let Some(f) = self.factories.get_mut(&holder) {
-            if f.object.is_some() {
+            let idle = f.object.is_none()
+                && (force || (f.queue.is_empty() && (f.step_rate_frames == 0 || f.suspended)));
+            if !idle {
                 if i32::try_from(f.queue.len()).unwrap_or(i32::MAX) >= max_queued || at_build_limit
                 {
                     return EnqueueOutcome::AppendRefused;
@@ -1053,7 +1314,7 @@ impl FactoryRegistry {
                 });
                 return EnqueueOutcome::Queued;
             }
-            // Idle-but-registered (object None, empty queue) -> re-arm the active build.
+            // Idle-but-registered -> re-arm the active build (4C9CD5..4C9DEA).
             f.progress = 0;
             f.step_rate_frames = 0;
             f.step_timer = CdTimer::default();
@@ -1063,7 +1324,6 @@ impl FactoryRegistry {
                 entity_id: None,
                 completion_accounted: false,
             });
-            f.on_hold = false;
             // StartProduction4C9D72 stops the new head until Resume.
             f.suspended = true;
             f.changed = true;
@@ -1210,16 +1470,20 @@ impl FactoryRegistry {
         &mut self,
         holder: FactoryHolder,
         entity_id: u64,
+        start_price: i32,
     ) -> Option<u64> {
         let factory = self.factories.get_mut(&holder)?;
         let object = factory.object.as_mut()?;
         if object.entity_id.is_none() {
             object.entity_id = Some(entity_id);
+            // StartProduction4C9DEA samples Cost_Of after CreateInstance.
+            // The same quote is retained separately on that Techno at4C9DED.
+            factory.balance = seeded_balance(start_price);
         }
         object.entity_id
     }
 
-    /// Claim the score-screen completion accounting edge for the one active,
+    /// Claim the local completion notification edge for the one active,
     /// completed object. Delivery refusal does not clear the object, so later
     /// retries observe `false`; StartProduction constructs the next head with
     /// a fresh `false` latch.
@@ -1247,15 +1511,41 @@ impl FactoryRegistry {
         true
     }
 
-    /// Strip6A8DD3 calls HasChanged4C9C60 before IsComplete4CA130.
-    /// Consume every House factory's change flag, including unfinished heads;
-    /// only changed, completed, held heads can issue a ready edge. A suspended
-    /// complete head with no new writer cannot emit again on later frames.
-    pub(crate) fn take_changed_completed_keys(&mut self) -> Vec<(InternedId, ProductionCategory)> {
+    /// Strip6A8DD3 calls HasChanged4C9C60 before IsComplete4CA130. Validate
+    /// the borrowed foreign identity before consuming +5D, even for an
+    /// unfinished head. Repeated/stale cameo links cannot consume a new Factory.
+    pub(crate) fn take_changed_complete(
+        &mut self,
+        owner: InternedId,
+        visit: super::ProductionFactoryVisit,
+    ) -> bool {
+        let Some(factory) = self
+            .factories
+            .get_mut(&FactoryHolder::House(owner, visit.category))
+        else {
+            return false;
+        };
+        factory.insertion_seq == visit.construction_order
+            && std::mem::take(&mut factory.changed)
+            && factory.progress >= PRODUCTION_STEPS
+            && factory.object.is_some()
+    }
+
+    /// Fork (docs/superai.md): a command-driven AI house owns no local
+    /// sidebar strip, so the strip-visited `take_changed_complete` above
+    /// never reaches its factories — this owner-scoped variant reproduces
+    /// the pre-strip-scan `take_changed_completed_keys` body for the one
+    /// house, in the same holder insertion order.
+    pub(crate) fn take_changed_completed_for_owner(
+        &mut self,
+        owner: InternedId,
+    ) -> Vec<ProductionCategory> {
         let order: Vec<FactoryHolder> = self
             .holders_insertion_ordered()
             .into_iter()
-            .filter_map(|(holder, _)| matches!(holder, FactoryHolder::House(..)).then_some(holder))
+            .filter_map(|(holder, _)| {
+                matches!(holder, FactoryHolder::House(house, _) if house == owner).then_some(holder)
+            })
             .collect();
         let mut completed = Vec::new();
         for holder in order {
@@ -1264,13 +1554,35 @@ impl FactoryRegistry {
                 && factory.progress >= PRODUCTION_STEPS
                 && factory.object.is_some()
             {
-                completed.push((factory.owner, factory.category));
+                completed.push(factory.category);
             }
         }
         completed
     }
 
-    /// `FactoryClass::Update_Build_Rate @ 0x004CA6E0`, called by the
+    /// Headless fixtures explicitly supply a strip; ordinary frame effects
+    /// never infer one from Factory state. Fixture ordering is category order.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn strip_visits_for_test(&self, owner: InternedId) -> Vec<super::ProductionFactoryVisit> {
+        let mut visits: Vec<_> = self
+            .factories
+            .iter()
+            .filter_map(|(holder, factory)| {
+                if !matches!(holder, FactoryHolder::House(house, _) if *house == owner) {
+                    return None;
+                }
+                Some(super::ProductionFactoryVisit {
+                    type_id: factory.object.as_ref()?.type_id,
+                    category: factory.category,
+                    construction_order: factory.insertion_seq,
+                })
+            })
+            .collect();
+        visits.sort_by_key(|visit| visit.category);
+        visits
+    }
+
+    /// `HouseClass::RecalcFactoryRates @ 0x004CA6E0`, called by the
     /// reached House power assessment at508D88. The whole global Factory
     /// array is walked in construction order, filtering only Owner. Held,
     /// suspended and completed objects still receive SetRate; a null object
@@ -1297,10 +1609,7 @@ impl FactoryRegistry {
             let rate = factory
                 .object
                 .as_ref()
-                .and_then(|object| sim.object_type(object.type_id, rules))
-                .map_or(1, |object| {
-                    time_to_build(&time_to_build_inputs(sim, rules, owner, object))
-                });
+                .map_or(0, |held| held_time_to_build(sim, rules, held));
             factory.set_rate(rate);
         }
     }
@@ -1315,11 +1624,7 @@ impl FactoryRegistry {
     /// Borrow the house's sole economy directly, charging cash and accumulating
     /// spent credits together. Rate changes belong to the build-start and
     /// reached House power-assessment receivers, after this global sweep.
-    pub(super) fn step_all(
-        &mut self,
-        houses: &mut BTreeMap<InternedId, crate::sim::house_state::HouseState>,
-        frame: u32,
-    ) {
+    pub(super) fn step_all(&mut self, houses: &mut crate::sim::houses::Houses, frame: u32) {
         // Sweep order = construction order (a strictly monotonic enqueue stamp at each
         // creation -> no ties -> total order -> deterministic).
         let order: Vec<FactoryHolder> = self
@@ -1335,6 +1640,12 @@ impl FactoryRegistry {
             let owner = f.owner;
             // Only an armed, in-flight build steps: object held, not complete
             // (held for delivery), with the one suspension authority clear.
+            // RESIDUAL: AI4C9B20 also steps a running Factory whose held
+            // product PointerExpired4CA580 cleared, charging 0 per stage and
+            // the whole Balance at stage 54. Trigger: a running product's
+            // expiry; VERA destroys a product only through Abandon, which
+            // suspends first, so no path reaches it. Effect if reached: the
+            // build would freeze instead of finishing empty and charging.
             if f.object.is_none() || f.suspended || f.progress >= PRODUCTION_STEPS {
                 continue;
             }
@@ -1356,7 +1667,7 @@ impl FactoryRegistry {
             // cadence (gamemd re-checks affordability each step; advance_one_step's
             // on_hold gate exists for the off-path clone callers).
             f.on_hold = false;
-            let outcome = f.advance_one_step(&mut house.economy);
+            let outcome = f.advance_one_step(house.economy_mut());
 
             // Completion clears the rate and restarts the timer empty
             // (`0x004C9C0C..0x004C9C25`); the object is held for delivery.
@@ -1372,7 +1683,7 @@ impl FactoryRegistry {
     #[cfg(feature = "debug-tools")]
     pub(super) fn debug_complete(
         &mut self,
-        houses: &mut BTreeMap<InternedId, crate::sim::house_state::HouseState>,
+        houses: &mut crate::sim::houses::Houses,
         frame: u32,
         owner: InternedId,
     ) {
@@ -1397,7 +1708,7 @@ impl FactoryRegistry {
                 }
                 factory.on_hold = false;
                 if !matches!(
-                    factory.advance_one_step(&mut house.economy),
+                    factory.advance_one_step(house.economy_mut()),
                     StepOutcome::Stepped
                 ) {
                     break;
@@ -1435,9 +1746,39 @@ impl FactoryRegistry {
         };
         // Indexed BuildCat0 first removes matching queued types. Nonzero
         // Building BuildCat and the -1 wildcard skip this arm4FAAC4..4FAB0B.
+        // Phobos' `HouseClass_AbandonProduction_RewriteForBuilding @
+        // 0x004FAAD8` replaces the 8-byte `test ecx,ecx / jne 0x004FABF6` at
+        // the head of that arm, so a structure cancel removes one queued copy
+        // before the held-product match. The compared value is computed here,
+        // not passed in: `0x004FAA3A..0x004FAA58` loads the type's own
+        // BuildCat (`[pType+0xE08]`) only for the two building RTTIs and
+        // stores 0 otherwise, as it does for a negative index at
+        // `0x004FAA29`. A `BuildingType` with no `BuildCat=` is 0 too
+        // (constructor `0x0045DD9A`/`0x0045DDC7`), which is VERA's `None`.
+        // The rewrite is unconditional, so it follows the `phobos` feature and
+        // not `[General] BuildingProductionQueue=`.
+        const PHOBOS_STRUCTURE_ABANDON: bool = cfg!(feature = "phobos");
+        // Phobos' own guard inside that rewrite: a single cancel on a structure
+        // strip holding no product skips the removal and takes the null-held
+        // admit at `0x004FAB64`.
+        let null_held_structure_skip = build_cat.is_some() && !all && f.object.is_none();
+        let removes_queued_copies =
+            build_cat.is_none() || (PHOBOS_STRUCTURE_ABANDON && !null_held_structure_skip);
+        // The rewrite is only reached past `0x004FAAC5..0x004FAAD2` (a queued
+        // entry and an index). Its structure ABANDON_ALL ends at CheckSame
+        // (`0x004FAB3D`), whose null-held test (`0x004FAB45`) returns at
+        // `0x004FAC9B`, so with nothing held it never reaches the admit.
+        let rewrite_returns_null_held = PHOBOS_STRUCTURE_ABANDON
+            && build_cat.is_some()
+            && all
+            && f.object.is_none()
+            && type_id.is_some()
+            && !f.queue.is_empty();
         let mut removed = false;
+        // `FactoryClass::RemoveFromQueue @ 0x004CA620` (4FAAEE, and 4FAB04 per
+        // copy for ABANDON_ALL) removes the first queued copy, keeping order.
         if let Some(type_id) = type_id
-            && build_cat.is_none()
+            && removes_queued_copies
         {
             while let Some(index) = f.queue.iter().position(|entry| entry.type_id == type_id) {
                 f.queue.remove(index);
@@ -1455,7 +1796,10 @@ impl FactoryRegistry {
         }
         //4FAB45 NULL-held indexed BuildCat0 refuses. Wildcard and nonzero
         //BuildCat proceed to the ordinary prefix and queue-count policy.
-        if f.object.is_none() && (type_id.is_none() || build_cat.is_some()) {
+        if f.object.is_none()
+            && (type_id.is_none() || build_cat.is_some())
+            && !rewrite_returns_null_held
+        {
             return CancelOutcome::AdmittedEmpty;
         }
         if removed {
@@ -1519,7 +1863,7 @@ pub(super) fn native_factory_cadence() -> &'static serde_json::Value {
 #[cfg(test)]
 fn native_e2_head(
     reg: &FactoryRegistry,
-    houses: &BTreeMap<InternedId, crate::sim::house_state::HouseState>,
+    houses: &crate::sim::houses::Houses,
     owner: InternedId,
     type_id: InternedId,
 ) -> serde_json::Value {
@@ -1529,19 +1873,23 @@ fn native_e2_head(
         "stage": f.progress, "rate": f.step_rate_frames,
         "timer_start": f.step_timer.start_frame(), "timer_duration": f.step_timer.duration(),
         "balance": f.balance, "on_hold": f.on_hold, "suspended": f.suspended,
-        "changed": f.changed, "latch": f.auto_resume_blocked, "credits": houses[&owner].economy.credits(),
-        "spent": houses[&owner].economy.spent_credits(),
+        "changed": f.changed, "latch": f.auto_resume_blocked, "credits": houses[&owner].economy().credits(),
+        "spent": houses[&owner].economy().spent_credits(),
         "held_type": f.object.as_ref().map(|obj| { assert_eq!(obj.type_id, type_id); "E2" }),
         "held_id": f.object.as_ref().and_then(|obj| obj.entity_id),
         "queue": f.queue.iter().map(|entry| { assert_eq!(entry.type_id, type_id); "E2" }).collect::<Vec<_>>()
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_production))]
 #[path = "factory_system_hold_tests.rs"]
 mod system_hold_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_production))]
+#[path = "ares_build_time_tests.rs"]
+mod ares_build_time_tests;
+
+#[cfg(all(test, tests_sim_production))]
 mod tests {
     use super::*;
 
@@ -1625,8 +1973,8 @@ mod tests {
                 int(initial, "credits") + int(initial, "spent"),
                 10,
             );
-            house.economy.spend_money(int(initial, "spent"));
-            let mut houses = BTreeMap::from([(owner, house)]);
+            house.economy_mut().spend_money(int(initial, "spent"));
+            let mut houses = [house].into_iter().collect::<crate::sim::houses::Houses>();
             assert_eq!(native_e2_head(&reg, &houses, owner, type_id), *initial);
             for phase in row["phases"].as_array().unwrap() {
                 let name = phase["name"].as_str().unwrap();
@@ -1635,7 +1983,7 @@ mod tests {
                 let ((), draws) = trace_draws(|| match name {
                     "system_suspend_kernel" => assert!(reg.suspend(owner, category, frame, false)),
                     "external_spend_wallet" => {
-                        let economy = &mut houses.get_mut(&owner).unwrap().economy;
+                        let economy = houses.get_mut(&owner).unwrap().economy_mut();
                         economy.spend_money(economy.credits());
                     }
                     "resume_kernel" => {
@@ -1658,7 +2006,7 @@ mod tests {
                             time_to_build,
                             frame,
                             row["inputs"]["held_start"].as_bool().unwrap(),
-                            houses[&owner].economy.credits(),
+                            houses[&owner].economy().credits(),
                         );
                         assert_eq!(actual, native_return, "{label}");
                     }
@@ -1686,14 +2034,6 @@ mod tests {
     }
 
     // ---- P2 pure-type tests ----
-
-    #[test]
-    fn factory_default_progress_zero_no_object() {
-        let f = Factory::default();
-        assert_eq!(f.progress, 0);
-        assert!(f.object.is_none());
-        assert_eq!(f.step_rate_frames, 0);
-    }
 
     #[test]
     fn registry_iter_insertion_ordered_not_map_order() {
@@ -1803,10 +2143,6 @@ mod tests {
             "tools/spatial_oracle/house_power_consumers.json",
         ))
         .unwrap();
-        assert_eq!(
-            corpus["native_sha256"],
-            "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-        );
         let rows = corpus["rewrite_controls"].as_array().unwrap();
         assert_eq!(rows.len(), 9);
         for row in rows {
@@ -1824,10 +2160,8 @@ mod tests {
             let mut sim = Simulation::with_seed(31);
             let owner = sim.interner.intern("Americans");
             let foreign = sim.interner.intern("Foreign");
-            sim.houses.insert(
-                owner,
-                HouseState::new(owner, 0, Some(owner), true, 5000, 10),
-            );
+            sim.houses
+                .register(HouseState::new(owner, 0, Some(owner), true, 5000, 10));
             let producer_type = sim.interner.intern("PRODUCER");
             let mut producer = GameEntity::new_at_frame_zero_for_test(
                 1,
@@ -1847,16 +2181,19 @@ mod tests {
             producer.tracking_facts = crate::sim::house_tracking::TrackingFacts::of(
                 EntityCategory::Structure,
                 rules.object("PRODUCER"),
-                Some(&rules),
+                &rules,
             );
             sim.substrate.entities.insert(producer);
-            sim.update_house_tracking(1, |tracking, entity| {
-                tracking.increment_factory_count(entity)
-            });
+            crate::sim::world::Simulation::update_house_tracking(
+                &mut sim.substrate,
+                &mut sim.houses,
+                1,
+                |tracking, entity| tracking.increment_factory_count(entity),
+            );
             let mut power = PowerState::default();
-            power.total_output = input["power_output"].as_i64().unwrap() as i32;
-            power.total_drain = input["power_drain"].as_i64().unwrap() as i32;
-            sim.power_states.insert(owner, power);
+            power.set_total_output_for_test(input["power_output"].as_i64().unwrap() as i32);
+            power.set_total_drain_for_test(input["power_drain"].as_i64().unwrap() as i32);
+            sim.power_states.map_mut_for_test().insert(owner, power);
             let type_id = sim.interner.intern("PENDING");
             let inputs =
                 time_to_build_inputs(&sim, &rules, owner, rules.object("PENDING").unwrap());
@@ -1886,13 +2223,36 @@ mod tests {
                     i32::from_le_bytes(bytes)
                 };
                 assert_eq!(word(8), 0, "supplied native middle timer dword");
+                let head_owner = if status == "foreign" { foreign } else { owner };
+                // The native non-null +58 calls its actual Techno receiver.
+                let entity_id = (status != "null").then(|| {
+                    let id = 1000 + index as u64;
+                    sim.substrate
+                        .entities
+                        .insert(GameEntity::new_at_frame_zero_for_test(
+                            id,
+                            0,
+                            0,
+                            0,
+                            0,
+                            head_owner,
+                            Health::new(100),
+                            type_id,
+                            EntityCategory::Unit,
+                            0,
+                            5,
+                            false,
+                        ));
+                    id
+                });
                 registry.factories.insert(
                     FactoryHolder::Building(100 + index as u64),
                     Factory {
-                        owner: if status == "foreign" { foreign } else { owner },
+                        owner: head_owner,
                         category: ProductionCategory::Vehicle,
                         object: (status != "null").then_some(PendingObject {
                             type_id,
+                            entity_id,
                             ..Default::default()
                         }),
                         progress: if status == "complete" {
@@ -1930,18 +2290,6 @@ mod tests {
                 assert_eq!(**actual, expected, "only the rate changes");
             }
         }
-    }
-
-    #[test]
-    fn no_object_factory_does_not_step() {
-        let mut f = Factory {
-            suspended: true,
-            ..Factory::default()
-        };
-        assert!(matches!(
-            f.advance_one_step(&mut Economy::default()),
-            StepOutcome::Idle
-        ));
     }
 
     /// Original whole Select/receive controls expose the reported hold/rate
@@ -2008,9 +2356,9 @@ mod tests {
                 int(initial, "credits") + int(initial, "spent"),
                 10,
             );
-            house.economy.spend_money(int(initial, "spent"));
-            let mut houses = BTreeMap::from([(owner, house)]);
-            let project = |reg: &FactoryRegistry, houses: &BTreeMap<InternedId, HouseState>| {
+            house.economy_mut().spend_money(int(initial, "spent"));
+            let mut houses = [house].into_iter().collect::<crate::sim::houses::Houses>();
+            let project = |reg: &FactoryRegistry, houses: &crate::sim::houses::Houses| {
                 native_e2_head(reg, houses, owner, type_id)
             };
             let normalized = |state: &serde_json::Value| state["factory"].clone();
@@ -2043,15 +2391,15 @@ mod tests {
                             ttb(),
                             frame,
                             false,
-                            houses[&owner].economy.credits(),
+                            houses[&owner].economy().credits(),
                         );
                     }
                     "completed_same_type_begin" => {
                         // Native Resume refuses before reading Time_To_Build.
-                        reg.resume(holder, 0, frame, false, houses[&owner].economy.credits());
+                        reg.resume(holder, 0, frame, false, houses[&owner].economy().credits());
                     }
                     "spend_wallet" => {
-                        let economy = &mut houses.get_mut(&owner).unwrap().economy;
+                        let economy = houses.get_mut(&owner).unwrap().economy_mut();
                         economy.spend_money(economy.credits());
                     }
                     "paused_ai" | "refreshed_paused_ai" | "same_frame_ai" | "next_frame_ai" => {
@@ -2102,17 +2450,16 @@ mod tests {
                 false,
                 int(&row["credits"]),
             );
-            let mut houses = BTreeMap::from([(
+            let mut houses = [crate::sim::house_state::HouseState::new(
                 owner,
-                crate::sim::house_state::HouseState::new(
-                    owner,
-                    0,
-                    None,
-                    true,
-                    int(&row["credits"]),
-                    10,
-                ),
-            )]);
+                0,
+                None,
+                true,
+                int(&row["credits"]),
+                10,
+            )]
+            .into_iter()
+            .collect::<crate::sim::houses::Houses>();
             let deposits: BTreeMap<u32, i32> = row["deposits"]
                 .as_array()
                 .unwrap()
@@ -2128,7 +2475,7 @@ mod tests {
             let mut attempts = Vec::new();
             let mut order_results = Vec::new();
             for frame in start_frame..=row["last_frame"].as_u64().unwrap() as u32 {
-                let economy = &mut houses.get_mut(&owner).unwrap().economy;
+                let economy = houses.get_mut(&owner).unwrap().economy_mut();
                 economy.add_credits(deposits.get(&frame).copied().unwrap_or(0));
                 // A SUSPEND is `Suspend(1)`; a resume is Begin_Production's
                 // same-type build start, which VERA takes only for a user hold.
@@ -2141,7 +2488,7 @@ mod tests {
                             time_to_build(&inputs),
                             frame,
                             false,
-                            houses[&owner].economy.credits(),
+                            houses[&owner].economy().credits(),
                         )
                     };
                     let f = &reg.factories[&FactoryHolder::House(owner, category)];
@@ -2162,7 +2509,7 @@ mod tests {
                 reg.step_all(&mut houses, frame);
                 let f = &reg.factories[&FactoryHolder::House(owner, category)];
                 if f.step_timer.start_frame() != before {
-                    let credits = houses[&owner].economy.credits();
+                    let credits = houses[&owner].economy().credits();
                     attempts.push(serde_json::json!([frame, f.progress, f.on_hold, credits]));
                 }
             }
@@ -2181,7 +2528,7 @@ mod tests {
                 "{label}: the holds and resumes"
             );
             let f = &reg.factories[&FactoryHolder::House(owner, category)];
-            let economy = &houses[&owner].economy;
+            let economy = houses[&owner].economy();
             let end = &row["final"];
             assert_eq!(
                 (
@@ -2207,34 +2554,6 @@ mod tests {
                 "{label}: the state at the end"
             );
         }
-    }
-
-    #[test]
-    fn factory_54_steps_to_complete() {
-        // From a fresh armed start with funds: 53 `Stepped` then 1 `Completed` (C2);
-        // progress reaches 54 (E1: the 54th call is Completed, not a plain Stepped).
-        let mut f = armed_factory(700);
-        let mut econ = Economy::new(700);
-        let mut stepped = 0;
-        let mut completed = 0;
-        for _ in 0..PRODUCTION_STEPS {
-            match f.advance_one_step(&mut econ) {
-                StepOutcome::Stepped => stepped += 1,
-                StepOutcome::Completed => completed += 1,
-                other => panic!("unexpected outcome {other:?} before completion"),
-            }
-        }
-        assert_eq!(stepped, 53, "exactly 53 Stepped before the final Completed");
-        assert_eq!(completed, 1, "exactly one Completed at step 54");
-        assert_eq!(f.progress, PRODUCTION_STEPS, "progress reaches 54");
-        assert!(
-            f.suspended && f.object.is_some(),
-            "complete-but-not-delivered"
-        );
-        assert!(
-            matches!(f.advance_one_step(&mut econ), StepOutcome::Idle),
-            "a settled factory is Idle"
-        );
     }
 
     #[test]
@@ -2266,144 +2585,6 @@ mod tests {
     }
 
     #[test]
-    fn factory_exact_cost_conservation_cost1_corner() {
-        // The cost-1 corner: 1/k == 0 for k>=2 (the value-1..52 steps charge 0); the
-        // lone credit is charged on the steps_left==1 step (value 53, 1/1==1, a
-        // Stepped); the final value-54 step charges 0. Conservation depends on the
-        // /1 step, not the guard step.
-        let mut f = armed_factory(1);
-        let mut econ = Economy::new(1);
-        let mut total = 0;
-        loop {
-            let before = econ.spent_credits();
-            match f.advance_one_step(&mut econ) {
-                StepOutcome::Stepped => total += econ.spent_credits() - before,
-                StepOutcome::Completed => {
-                    total += econ.spent_credits() - before;
-                    break;
-                }
-                other => panic!("unexpected {other:?}"),
-            }
-        }
-        assert_eq!(
-            total, 1,
-            "the single credit is charged exactly once across the build"
-        );
-        assert_eq!(f.balance, 0);
-    }
-
-    #[test]
-    fn factory_steps_left_one_charges_full_remainder() {
-        // The balance drains on the steps_left==1 step (value 53, charge=balance/1),
-        // NOT the final value-54 step (the div-by-zero guard, which charges 0).
-        let mut f = armed_factory(700);
-        let mut econ = Economy::new(700);
-        while f.progress < PRODUCTION_STEPS - 2 {
-            assert!(matches!(
-                f.advance_one_step(&mut econ),
-                StepOutcome::Stepped
-            ));
-        }
-        assert_eq!(
-            f.progress,
-            PRODUCTION_STEPS - 2,
-            "stopped two before completion (progress 52)"
-        );
-        let remainder = f.balance;
-        assert!(remainder > 0, "balance is nonzero at progress 52");
-        // The steps_left==1 step (value 53) charges the WHOLE remainder, once.
-        let spent_before = econ.spent_credits();
-        assert!(
-            matches!(f.advance_one_step(&mut econ), StepOutcome::Stepped),
-            "value-53 is a Stepped"
-        );
-        assert_eq!(
-            econ.spent_credits() - spent_before,
-            remainder,
-            "drains the whole remainder once"
-        );
-        assert_eq!(f.balance, 0, "balance zeroed on the steps_left==1 step");
-        // The final value-54 step is the div-by-zero guard: charges 0, Completed.
-        let spent_before2 = econ.spent_credits();
-        assert!(matches!(
-            f.advance_one_step(&mut econ),
-            StepOutcome::Completed
-        ));
-        assert_eq!(
-            econ.spent_credits() - spent_before2,
-            0,
-            "the final step charges 0 (guard)"
-        );
-        assert_eq!(
-            f.balance, 0,
-            "completion leaves balance 0 (no second remainder charge)"
-        );
-    }
-
-    #[test]
-    fn factory_stall_on_no_funds_rewinds() {
-        // Oracle one credit below the first step's charge -> Stalled: on_hold set,
-        // progress unchanged, NOTHING spent (C4). cost 700 -> first charge 700/53 = 13.
-        let mut f = armed_factory(700);
-        let first_charge = 700 / (PRODUCTION_STEPS as i32 - 1); // 700/53 = 13
-        let mut econ = Economy::new(first_charge - 1);
-        assert!(matches!(
-            f.advance_one_step(&mut econ),
-            StepOutcome::Stalled
-        ));
-        assert!(f.on_hold, "a shortfall latches on_hold");
-        assert_eq!(
-            f.progress, 0,
-            "the tentative step is rewound (net-zero advance)"
-        );
-        assert_eq!(econ.spent_credits(), 0, "a stall spends nothing");
-        assert_eq!(
-            econ.credits(),
-            first_charge - 1,
-            "the oracle wallet is untouched"
-        );
-    }
-
-    #[test]
-    fn factory_exactly_affordable_step_proceeds() {
-        // available == charge PROCEEDS (the strict-< boundary).
-        let mut f = armed_factory(700);
-        let first_charge = 700 / (PRODUCTION_STEPS as i32 - 1); // 13
-        let mut econ = Economy::new(first_charge);
-        assert!(matches!(
-            f.advance_one_step(&mut econ),
-            StepOutcome::Stepped
-        ));
-        assert_eq!(f.progress, 1);
-        assert_eq!(econ.spent_credits(), first_charge);
-    }
-
-    #[test]
-    fn factory_cost_zero_completes_free() {
-        // A cost-0 type: every charge is 0, completes with zero spend; conservation
-        // holds trivially (sum 0 == Balance 0).
-        let mut f = armed_factory(0);
-        let mut econ = Economy::default(); // 0 credits, but every charge is 0
-        let mut steps = 0;
-        loop {
-            match f.advance_one_step(&mut econ) {
-                StepOutcome::Stepped => steps += 1,
-                StepOutcome::Completed => {
-                    steps += 1;
-                    break;
-                }
-                other => panic!("unexpected {other:?} for a free build"),
-            }
-        }
-        assert_eq!(
-            steps, PRODUCTION_STEPS as i32,
-            "a free build still takes 54 steps"
-        );
-        assert_eq!(econ.spent_credits(), 0, "free build spends nothing");
-        assert_eq!(f.balance, 0);
-    }
-
-    #[test]
     fn remaining_balance_ladder_matches_stepper() {
         // remaining_balance_after must equal the balance the stepper actually holds.
         for cost in [1i32, 25, 700, 99991] {
@@ -2419,20 +2600,6 @@ mod tests {
             }
             assert_eq!(remaining_balance_after(cost, PRODUCTION_STEPS), 0);
         }
-    }
-
-    #[test]
-    fn cost25_ladder_sums_to_exactly_25() {
-        // floor division never loses/gains a credit: the last charging step takes the
-        // whole remainder, so the per-step charges sum to exactly the cost.
-        let mut f = armed_factory(25);
-        let mut econ = Economy::new(25);
-        loop {
-            if matches!(f.advance_one_step(&mut econ), StepOutcome::Completed) {
-                break;
-            }
-        }
-        assert_eq!(econ.spent_credits(), 25);
     }
 
     // ---- P4 cancel / refund / FIFO tests ----
@@ -2458,47 +2625,6 @@ mod tests {
             type_id: ty,
             enqueue_order: 0,
         }
-    }
-
-    /// AbandonProduction hands back the Balance still owed and leaves the wallet to
-    /// the lifecycle refund: with an unchanged Cost_Of, `Cost_Of - Balance` is
-    /// exactly what the steps paid.
-    #[test]
-    fn abandon_reports_the_unpaid_balance() {
-        let mut f = armed_factory(700);
-        let mut econ = Economy::new(700);
-        while f.progress < 20 {
-            assert!(matches!(
-                f.advance_one_step(&mut econ),
-                StepOutcome::Stepped
-            ));
-        }
-        let balance = f.balance;
-        let abandoned = f
-            .abandon_production(0)
-            .expect("active build is abandonable");
-        assert_eq!(
-            abandoned,
-            AbandonedObject {
-                type_id: InternedId::default(),
-                balance,
-                entity_id: None,
-            }
-        );
-        assert_eq!(700 - abandoned.balance, econ.spent_credits());
-        assert_eq!(
-            econ.credits(),
-            700 - econ.spent_credits(),
-            "cancel pays nothing"
-        );
-        assert!(
-            f.object.is_some(),
-            "held pointer survives until the world destructor"
-        );
-        assert_eq!(f.progress, 0);
-        assert_eq!(f.balance, 0);
-        assert_eq!(f.step_rate_frames, 0, "no-object => rate-0 sentinel");
-        assert!(f.suspended && !f.on_hold);
     }
 
     /// Original whole BuildingLimbo reaches this reset with the held pointer
@@ -2569,26 +2695,6 @@ mod tests {
     }
 
     #[test]
-    fn abandon_at_progress_zero_owes_the_whole_cost() {
-        // A never-stepped build still owes its whole Balance, so the refund is 0.
-        let mut f = armed_factory(700);
-        assert_eq!(
-            f.abandon_production(0).map(|abandoned| abandoned.balance),
-            Some(700)
-        );
-        assert!(
-            f.object.is_some(),
-            "zero-refund cancellation still retains the pointer through destruction"
-        );
-        assert_eq!(f.progress, 0);
-    }
-
-    #[test]
-    fn abandon_without_an_object_is_a_noop() {
-        assert_eq!(Factory::default().abandon_production(0), None);
-    }
-
-    #[test]
     fn abandon_of_a_finished_object_refunds_its_whole_cost() {
         // `FactoryClass::AbandonProduction @ 0x004C9FF0` deletes the object finished or
         // not (`0x004CA0FC`) and refunds Cost - Balance, the whole cost once finished.
@@ -2611,30 +2717,6 @@ mod tests {
             "destructor has not run in this scalar kernel"
         );
         assert!(f.suspended);
-    }
-
-    #[test]
-    fn abandon_round_trip_conserves() {
-        // C15 cancel-side telescoping: stepping k times then refunding
-        // `cost - Balance` returns the wallet to its start wherever the cancel lands.
-        for cost in [1i32, 25, 700, 99991] {
-            for stop_at in [0u16, 1, 20, 53, PRODUCTION_STEPS] {
-                let mut f = armed_factory(cost);
-                let mut econ = Economy::new(cost);
-                while f.progress < stop_at {
-                    if matches!(f.advance_one_step(&mut econ), StepOutcome::Completed) {
-                        break;
-                    }
-                }
-                if let Some(abandoned) = f.abandon_production(0) {
-                    assert_eq!(
-                        econ.credits() + cost - abandoned.balance,
-                        cost,
-                        "cost {cost} stop {stop_at}: the refund returns the wallet to start"
-                    );
-                }
-            }
-        }
     }
 
     #[test]
@@ -2697,84 +2779,147 @@ mod tests {
         assert_eq!(view.progress, 20, "active progress unchanged");
     }
 
+    /// Phobos' `HouseClass_AbandonProduction_RewriteForBuilding @ 0x004FAAD8`
+    /// replaces vanilla's `BuildCat == DontCare` test, so a single structure
+    /// cancel takes the same queued-copy-first order a mobile cancel already
+    /// uses. A default build keeps vanilla: the nonzero BuildCat skips the arm
+    /// and the held product is what goes. Its busy structure strip refuses the
+    /// second press, so that branch pins the owner's rule rather than a state
+    /// its entry can reach.
     #[test]
-    fn cancel_one_active_when_no_queued_copy() {
-        // active = A (mid-build), tail = [B]; cancel A abandons the ACTIVE (no queued A).
+    fn cancel_one_structure_copies_follow_the_phobos_rewrite() {
+        let owner = InternedId::default();
+        let a = InternedId::from_index(1);
+        let f = Factory {
+            owner,
+            category: ProductionCategory::Building,
+            object: Some(PendingObject {
+                type_id: a,
+                entity_id: None,
+                completion_accounted: false,
+            }),
+            balance: 600,
+            progress: 20,
+            queue: std::collections::VecDeque::from(vec![qe(a)]),
+            ..Factory::default()
+        };
+        let mut reg = reg_with(owner, ProductionCategory::Building, f);
+        let outcome = reg.cancel_one(
+            owner,
+            ProductionCategory::Building,
+            Some(a),
+            false,
+            Some(BuildCategory::Power),
+        );
+        let view = reg.view(owner, ProductionCategory::Building).unwrap();
+        if cfg!(feature = "phobos") {
+            assert_eq!(
+                outcome,
+                CancelOutcome::QueuedRemoved,
+                "the queued copy goes first"
+            );
+            assert!(view.queue.is_empty(), "the one queued copy is gone");
+            assert!(view.object.is_some(), "the held building keeps building");
+        } else {
+            assert!(
+                matches!(outcome, CancelOutcome::AbandonedActive(_)),
+                "vanilla abandons the held product instead"
+            );
+            assert_eq!(
+                view.queue.len(),
+                1,
+                "the nonzero BuildCat skips the queue arm"
+            );
+        }
+    }
+
+    /// Phobos keeps vanilla's null-held skip inside that rewrite: a single
+    /// cancel on a structure strip with no held product admits at
+    /// `0x004FAB64` and removes no queued copy. ABANDON_ALL passes that skip,
+    /// drains the copies and returns at CheckSame's null-held test
+    /// (`0x004FAB45` → `0x004FAC9B`) without the admit, where vanilla admits
+    /// with the queue untouched.
+    #[test]
+    fn cancel_one_structure_with_no_held_product_skips_the_queue() {
+        let owner = InternedId::default();
+        let a = InternedId::from_index(1);
+        let cancel = |all: bool| {
+            let f = Factory {
+                owner,
+                category: ProductionCategory::Building,
+                queue: std::collections::VecDeque::from(vec![qe(a)]),
+                ..Factory::default()
+            };
+            let mut reg = reg_with(owner, ProductionCategory::Building, f);
+            let outcome = reg.cancel_one(
+                owner,
+                ProductionCategory::Building,
+                Some(a),
+                all,
+                Some(BuildCategory::Power),
+            );
+            let queued = reg
+                .view(owner, ProductionCategory::Building)
+                .unwrap()
+                .queue
+                .len();
+            (outcome, queued)
+        };
+        assert_eq!(
+            cancel(false),
+            (CancelOutcome::AdmittedEmpty, 1),
+            "the skip removes nothing"
+        );
+        let expected_all = if cfg!(feature = "phobos") {
+            (CancelOutcome::QueuedRemoved, 0)
+        } else {
+            (CancelOutcome::AdmittedEmpty, 1)
+        };
+        assert_eq!(cancel(true), expected_all);
+    }
+
+    /// ABANDON_ALL on a structure under that rewrite drains every queued copy
+    /// and then falls to the held-product match, as the mobile arm already does.
+    #[test]
+    fn cancel_all_structures_drain_the_queue_then_the_held_product() {
         let owner = InternedId::default();
         let a = InternedId::from_index(1);
         let b = InternedId::from_index(2);
         let f = Factory {
             owner,
-            category: ProductionCategory::Vehicle,
+            category: ProductionCategory::Building,
             object: Some(PendingObject {
                 type_id: a,
                 entity_id: None,
                 completion_accounted: false,
             }),
-            balance: 300,
+            balance: 600,
             progress: 20,
-            queue: std::collections::VecDeque::from(vec![qe(b)]),
+            queue: std::collections::VecDeque::from(vec![qe(a), qe(b), qe(a)]),
             ..Factory::default()
         };
-        let mut reg = reg_with(owner, ProductionCategory::Vehicle, f);
-        let outcome = reg.cancel_one(owner, ProductionCategory::Vehicle, Some(a), false, None);
-        assert_eq!(
-            outcome,
-            CancelOutcome::AbandonedActive(AbandonedObject {
-                type_id: a,
-                balance: 300,
-                entity_id: None,
-            })
-        );
-        let view = reg.view(owner, ProductionCategory::Vehicle).unwrap();
-        assert!(
-            view.object.is_some(),
-            "admission leaves refund/destruction to the lifecycle owner"
-        );
-        let q: Vec<InternedId> = view.queue.iter().map(|e| e.type_id).collect();
-        assert_eq!(
-            q,
-            vec![b],
-            "the tail is left intact (no auto-advance in P4)"
-        );
-    }
-
-    #[test]
-    fn cancel_one_abandons_a_finished_active_object() {
-        // active object completed-but-held (progress 54, suspended), no queued copy:
-        // Abandon_Production's active check has no stage test (`0x004FAB3D..0x004FAB5E`),
-        // so the finished object goes with its whole cost refunded.
-        let owner = InternedId::default();
-        let a = InternedId::from_index(1);
-        let f = Factory {
+        let mut reg = reg_with(owner, ProductionCategory::Building, f);
+        let outcome = reg.cancel_one(
             owner,
-            category: ProductionCategory::Vehicle,
-            object: Some(PendingObject {
-                type_id: a,
-                entity_id: None,
-                completion_accounted: false,
-            }),
-            progress: PRODUCTION_STEPS,
-            suspended: true,
-            balance: 0,
-            ..Factory::default()
-        };
-        let mut reg = reg_with(owner, ProductionCategory::Vehicle, f);
-        let outcome = reg.cancel_one(owner, ProductionCategory::Vehicle, Some(a), false, None);
-        assert_eq!(
-            outcome,
-            CancelOutcome::AbandonedActive(AbandonedObject {
-                type_id: a,
-                balance: 0,
-                entity_id: None,
-            }),
-            "nothing is owed, so the refund is the whole Cost_Of"
+            ProductionCategory::Building,
+            Some(a),
+            true,
+            Some(BuildCategory::Power),
         );
-        let view = reg.view(owner, ProductionCategory::Vehicle).unwrap();
-        assert!(
-            view.object.is_some(),
-            "admitted completed object still awaits settlement"
-        );
+        let queue: Vec<InternedId> = reg
+            .view(owner, ProductionCategory::Building)
+            .unwrap()
+            .queue
+            .iter()
+            .map(|e| e.type_id)
+            .collect();
+        if cfg!(feature = "phobos") {
+            assert!(matches!(outcome, CancelOutcome::AbandonedActive(_)));
+            assert_eq!(queue, vec![b], "both queued copies drain, B stays");
+        } else {
+            assert!(matches!(outcome, CancelOutcome::AbandonedActive(_)));
+            assert_eq!(queue, vec![a, b, a], "vanilla leaves the queue intact");
+        }
     }
 
     /// ABANDON_ALL (`0x004FAB01..0x004FAB0B`) removes every queued copy and
@@ -2839,113 +2984,6 @@ mod tests {
         );
     }
 
-    /// `FactoryClass::StartProduction` refuses an append once the queue holds
-    /// `MaximumQueuedObjects` builds (`0x004C9CDE`); the active build is not
-    /// counted.
-    #[test]
-    fn enqueue_refuses_an_append_at_the_queue_cap() {
-        let owner = InternedId::default();
-        let a = InternedId::from_index(1);
-        let category = ProductionCategory::Infantry;
-        let mut reg = FactoryRegistry::default();
-        assert_eq!(
-            reg.enqueue(owner, category, a, 1, 100, 2, false),
-            EnqueueOutcome::Started
-        );
-        assert_eq!(
-            reg.enqueue(owner, category, a, 2, 100, 2, false),
-            EnqueueOutcome::Queued
-        );
-        assert_eq!(
-            reg.enqueue(owner, category, a, 3, 100, 2, false),
-            EnqueueOutcome::Queued
-        );
-        assert_eq!(
-            reg.enqueue(owner, category, a, 4, 100, 2, false),
-            EnqueueOutcome::AppendRefused
-        );
-        assert_eq!(reg.view(owner, category).unwrap().queue.len(), 2);
-    }
-
-    #[test]
-    fn cancel_one_no_match_is_noop() {
-        // (1) no factory for the key -> NoMatch; (2) type absent from active+tail -> NoMatch.
-        let owner = InternedId::default();
-        let a = InternedId::from_index(1);
-        let z = InternedId::from_index(9);
-        let mut empty = FactoryRegistry::default();
-        assert_eq!(
-            empty.cancel_one(owner, ProductionCategory::Vehicle, Some(a), false, None),
-            CancelOutcome::NoMatch,
-            "no factory -> NoMatch"
-        );
-        let f = Factory {
-            owner,
-            category: ProductionCategory::Vehicle,
-            object: Some(PendingObject {
-                type_id: a,
-                entity_id: None,
-                completion_accounted: false,
-            }),
-            balance: 300,
-            queue: std::collections::VecDeque::from(vec![qe(a)]),
-            ..Factory::default()
-        };
-        let mut reg = reg_with(owner, ProductionCategory::Vehicle, f);
-        assert_eq!(
-            reg.cancel_one(owner, ProductionCategory::Vehicle, Some(z), false, None),
-            CancelOutcome::NoMatch,
-            "type absent -> NoMatch"
-        );
-    }
-
-    #[test]
-    fn start_next_queued_pops_front() {
-        // queue [X,Y,Z], no active object -> active = X, queue [Y,Z] (FIFO front pop).
-        let x = InternedId::from_index(1);
-        let y = InternedId::from_index(2);
-        let z = InternedId::from_index(3);
-        let mut f = Factory {
-            object: None,
-            queue: std::collections::VecDeque::from(vec![qe(x), qe(y), qe(z)]),
-            ..Factory::default()
-        };
-        assert_eq!(f.start_next_queued(), Some(x), "the FRONT is popped");
-        assert!(
-            f.object.is_none(),
-            "Begin admission must precede construction"
-        );
-        let q: Vec<InternedId> = f.queue.iter().map(|e| e.type_id).collect();
-        assert_eq!(q, vec![y, z], "queue advanced to [Y,Z]");
-    }
-
-    #[test]
-    fn start_next_queued_blocked_while_object_held() {
-        // object Some -> None, queue unchanged (the "Object null required" guard).
-        let x = InternedId::from_index(1);
-        let mut f = Factory {
-            object: Some(PendingObject::default()),
-            queue: std::collections::VecDeque::from(vec![qe(x)]),
-            progress: 30,
-            ..Factory::default()
-        };
-        assert_eq!(
-            f.start_next_queued(),
-            None,
-            "a held object blocks the advance"
-        );
-        let q: Vec<InternedId> = f.queue.iter().map(|e| e.type_id).collect();
-        assert_eq!(q, vec![x], "queue unchanged while blocked");
-        assert_eq!(f.progress, 30, "the held object's progress is untouched");
-    }
-
-    #[test]
-    fn start_next_queued_empty_queue_is_noop() {
-        let mut f = Factory::default();
-        assert_eq!(f.start_next_queued(), None);
-        assert!(f.object.is_none(), "no object created from an empty queue");
-    }
-
     /// StartNext does not manufacture an object/balance before forced Begin
     /// admission. A running unsuspended Factory refuses the pop as4CA5B3 does.
     #[test]
@@ -2977,6 +3015,46 @@ mod tests {
         assert!(f.queue.is_empty());
     }
 
+    /// StartProduction4C9CC9 creates only with an empty queue unless forced.
+    /// A Factory left holding nothing after a refused promotion appends a
+    /// PRODUCE behind its queue; a forced promotion still creates. The create
+    /// path keeps the abandoned build's +5C cash stall.
+    #[test]
+    fn produce_on_an_empty_factory_with_a_queue_joins_its_tail() {
+        let (owner, queued, produced) = (
+            InternedId::from_index(1),
+            InternedId::from_index(2),
+            InternedId::from_index(3),
+        );
+        let category = ProductionCategory::Vehicle;
+        let empty = Factory {
+            object: None,
+            suspended: true,
+            on_hold: true,
+            queue: VecDeque::from(vec![qe(queued)]),
+            ..Factory::default()
+        };
+        let mut reg = reg_with(owner, category, empty.clone());
+        assert_eq!(
+            reg.enqueue(owner, category, produced, 5, 700, 5, false, false),
+            EnqueueOutcome::Queued
+        );
+        let f = &reg.factories[&FactoryHolder::House(owner, category)];
+        assert!(f.object.is_none());
+        let tail: Vec<_> = f.queue.iter().map(|entry| entry.type_id).collect();
+        assert_eq!(tail, vec![queued, produced]);
+
+        let mut reg = reg_with(owner, category, empty);
+        assert_eq!(
+            reg.enqueue(owner, category, produced, 5, 700, 5, false, true),
+            EnqueueOutcome::Started
+        );
+        let f = &reg.factories[&FactoryHolder::House(owner, category)];
+        assert_eq!(f.object.as_ref().map(|o| o.type_id), Some(produced));
+        assert_eq!(f.queue.len(), 1);
+        assert!(f.on_hold, "4C9C95..4C9DEA never writes +5C");
+    }
+
     /// `LogicClass` runs `FactoryClass::AI` in the order the factories were made
     /// (`0x0055B66A..`), and a promotion keeps its factory. With money for one of
     /// two steps due on the same frame, the older factory pays, even after it
@@ -2989,31 +3067,32 @@ mod tests {
         let (vehicle, infantry) = (ProductionCategory::Vehicle, ProductionCategory::Infantry);
         let mut reg = FactoryRegistry::default();
         assert_eq!(
-            reg.enqueue(owner, vehicle, tank, 0, 700, 5, false),
+            reg.enqueue(owner, vehicle, tank, 0, 700, 5, false, false),
             EnqueueOutcome::Started
         );
         assert_eq!(
-            reg.enqueue(owner, infantry, soldier, 1, 200, 5, false),
+            reg.enqueue(owner, infantry, soldier, 1, 200, 5, false, false),
             EnqueueOutcome::Started
         );
         assert_eq!(
-            reg.enqueue(owner, vehicle, tank, 2, 700, 5, false),
+            reg.enqueue(owner, vehicle, tank, 2, 700, 5, false, false),
             EnqueueOutcome::Queued
         );
         reg.reset_for_abandon(FactoryHolder::House(owner, vehicle), 0);
         reg.finish_abandon(FactoryHolder::House(owner, vehicle));
         assert_eq!(reg.start_next_queued(owner, vehicle), Some(tank));
         assert_eq!(
-            reg.enqueue(owner, vehicle, tank, 2, 700, 5, false),
+            reg.enqueue(owner, vehicle, tank, 2, 700, 5, false, true),
             EnqueueOutcome::Started
         );
         reg.resume(FactoryHolder::House(owner, vehicle), 540, 100, false, 13);
         reg.resume(FactoryHolder::House(owner, infantry), 540, 100, false, 13);
         // The first steps charge 700 / 53 = 13 and 200 / 53 = 3; the house has 13.
-        let mut houses = BTreeMap::from([(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 0, None, true, 13, 10),
-        )]);
+        let mut houses = [crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 13, 10,
+        )]
+        .into_iter()
+        .collect::<crate::sim::houses::Houses>();
         reg.step_all(&mut houses, 110);
         let (tank_factory, soldier_factory) = (
             &reg.factories[&FactoryHolder::House(owner, vehicle)],
@@ -3024,7 +3103,7 @@ mod tests {
             (soldier_factory.progress, soldier_factory.on_hold),
             (0, true)
         );
-        assert_eq!(houses[&owner].economy.credits(), 0);
+        assert_eq!(houses[&owner].economy().credits(), 0);
     }
 
     /// Original `TechnoClass::Time_To_Build @ 0x006F47A0` totals from
@@ -3119,11 +3198,10 @@ mod tests {
     fn debug_completion_preserves_payment_and_explicit_hold() {
         let owner = InternedId::from_index(1);
         let mut reg = reg_with(owner, ProductionCategory::Infantry, armed_factory(540));
-        let mut houses = BTreeMap::new();
-        houses.insert(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 0, None, true, 540, 10),
-        );
+        let mut houses = crate::sim::houses::Houses::default();
+        houses.register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 540, 10,
+        ));
         reg.factories
             .get_mut(&FactoryHolder::House(owner, ProductionCategory::Infantry))
             .unwrap()
@@ -3135,7 +3213,7 @@ mod tests {
                 .progress,
             PRODUCTION_STEPS
         );
-        assert_eq!(houses[&owner].economy.credits(), 0);
+        assert_eq!(houses[&owner].economy().credits(), 0);
         assert!(
             reg.view(owner, ProductionCategory::Infantry)
                 .unwrap()

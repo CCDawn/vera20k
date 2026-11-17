@@ -42,9 +42,8 @@ fn coord(value: &Value) -> [i32; 3] {
 /// - RevealArea's coordinate (the cell's GetCoords, no deck over a bridge)
 ///   and radius (as read), for the pair of calls native makes with the
 ///   Super's house, final 0 then 1 and no other argument;
-/// - the launch event at the cell PlayAtCoord's coordinate is in, the app's
-///   cue (`sound_dispatch::launch_lines_match_native`). Native plays it at
-///   the coordinate's height (module RESIDUAL).
+/// - the launch event at PlayAtCoord's coordinate, its height included, the
+///   app's cue (`sound_dispatch::launch_lines_match_native`).
 ///
 /// The player's tail is the app's (`super_selection`, `sound_dispatch`).
 #[test]
@@ -60,11 +59,12 @@ fn the_launch_matches_native() {
         if row["bridge"] == true {
             let terrain = sim.resolved_terrain.as_mut().unwrap();
             let index = terrain.index(target.0, target.1).unwrap();
-            terrain.cells[index].bridge_facts.raw_flags = BRIDGE_FLAG_STRUCTURAL;
+            terrain.cells_mut_for_test()[index].bridge_facts.raw_flags = BRIDGE_FLAG_STRUCTURAL;
         }
         let sw_type = charge_super(&mut sim, owner, REVEAL);
         let charged = row["charged"] == true;
         sim.super_weapons
+            .map_mut_for_test()
             .get_mut(&owner)
             .unwrap()
             .get_mut(&sw_type)
@@ -98,24 +98,20 @@ fn the_launch_matches_native() {
             .collect();
         assert_eq!(observed, native, "{row}");
 
-        let sound: Vec<(u16, u16)> = events
+        let sound: Vec<[i32; 3]> = events
             .iter()
             .filter(|e| e[0] == "play_at")
-            .map(|e| {
-                let [x, y, _] = coord(&e[2]);
-                ((x / 256) as u16, (y / 256) as u16)
-            })
+            .map(|e| coord(&e[2]))
             .collect();
-        let pushed: Vec<(u16, u16)> = sim
+        let pushed: Vec<[i32; 3]> = sim
             .sound_events
             .iter()
             .filter_map(|event| match *event {
                 SimSoundEvent::SuperWeaponLaunched {
                     owner: by,
                     sw_type: kind,
-                    rx,
-                    ry,
-                } if by == owner && kind == sw_type => Some((rx, ry)),
+                    world,
+                } if by == owner && kind == sw_type => Some([world.x, world.y, world.z]),
                 _ => None,
             })
             .collect();
@@ -127,11 +123,12 @@ fn the_launch_matches_native() {
 /// Case 11 through a production click on retail rules
 /// (`PsychicRevealRadius=15`, `AllyReveal=yes`) on a map whose `Size=` is
 /// the corpus's 50x50 diamond, at a cell raised four levels: the launcher's
-/// map, and the map of the house it names its ally, gain exactly the cells
-/// RevealArea hands its leaf in `tools/spatial_oracle/reveal_area.json`'s
-/// row at (75, 50), z 416, radius 10 (the walk clamps 15 to 10:
-/// `reveal_area_tests`), its centre lifted two cells. A house that names the
-/// launcher its ally, unanswered, gains nothing.
+/// map gains exactly the cells RevealArea hands its leaf in
+/// `tools/spatial_oracle/reveal_area.json`'s row at (75, 50), z 416, radius
+/// 10 (the walk clamps 15 to 10: `reveal_area_tests`), its centre lifted two
+/// cells. The computer house it names its ally has no client map (RevealArea
+/// writes only PlayerPtr's, `0x00567AB0..0x00567B12`), and a house that names
+/// the launcher its ally, unanswered, gains nothing.
 #[test]
 fn a_launch_maps_the_native_cells_for_its_house_and_allies() {
     let Some(rules) = retail_rules_binding(&[]) else {
@@ -140,17 +137,17 @@ fn a_launch_maps_the_native_cells_for_its_house_and_allies() {
     assert_eq!(rules.general.psychic_reveal_radius, 15);
     let target = (75, 50);
     let (rules, mut sim, americans) = world_with(rules, 128, &[(target, 4)]);
-    sim.playfield_bounds = Some(crate::sim::cell_rect::PlayfieldBounds {
+    sim.set_playfield_bounds_for_test(Some(crate::sim::cell_rect::PlayfieldBounds {
         base: 50,
         off_fc: -128,
         off_100: -128,
         off_104: 256,
         off_108: 256,
-    });
-    sim.playfield_size_height = Some(50);
+    }));
+    sim.set_playfield_size_height_for_test(Some(50));
     let russians = sim.interner.intern("Russians");
     let yuri = sim.interner.intern("YuriCountry");
-    sim.house_alliances = [
+    *sim.house_alliances_mut_for_test() = [
         ("AMERICANS".to_string(), ["RUSSIANS".to_string()].into()),
         ("YURICOUNTRY".to_string(), ["AMERICANS".to_string()].into()),
     ]
@@ -193,6 +190,6 @@ fn a_launch_maps_the_native_cells_for_its_house_and_allies() {
             .collect()
     };
     assert_eq!(revealed(americans), native);
-    assert_eq!(revealed(russians), native);
+    assert!(revealed(russians).is_empty(), "a computer ally has no map");
     assert!(revealed(yuri).is_empty());
 }

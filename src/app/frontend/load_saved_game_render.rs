@@ -50,7 +50,7 @@ pub(crate) fn render_load_saved_game_page(
         let title_window = state
             .frontend
             .shell_page_title
-            .paint(std::time::Instant::now());
+            .paint(crate::util::time::Instant::now());
         let status_text = crate::app::App::load_saved_game_status_key(state)
             .map(|key| resolve_csf(state, key).into_owned())
             .unwrap_or_default();
@@ -161,7 +161,7 @@ pub(crate) fn render_load_saved_game_page(
         chrome,
         &buttons,
         crate::app::frontend::menu_page_render::MENU_PAGE_BUTTON_POLICY,
-        std::time::Instant::now(),
+        crate::util::time::Instant::now(),
         None,
     );
     let mut labels = Vec::new();
@@ -173,7 +173,7 @@ pub(crate) fn render_load_saved_game_page(
         labels.push(PaintLabel {
             text: resolve_csf(state, spec.csf_key),
             rect: owner_draw_button_label_rect(button.rect, pressed),
-            align: ShellAlign(ShellAlign::H_CENTER.0 | ShellAlign::V_CENTER.0),
+            align: ShellAlign::BUTTON_CAPTION,
             rgb: if enabled {
                 SHELL_TEXT_RGB_ENABLED
             } else {
@@ -186,7 +186,7 @@ pub(crate) fn render_load_saved_game_page(
         labels.push(PaintLabel {
             text: resolve_csf(state, LOAD_SAVED_GAME_PAGE.title_key),
             rect: layout.page.title,
-            align: ShellAlign::H_CENTER,
+            align: ShellAlign::PANEL_TITLE,
             rgb: SHELL_TEXT_RGB_ENABLED,
             path_a_reveal: Some(shell_reveal_path_a(window)),
         });
@@ -235,6 +235,7 @@ pub(crate) fn render_load_saved_game_page(
             text: &text,
             cursor: software_cursor(state, CURSOR_DEPTH),
             effects: None,
+            smooth_art: false,
         },
     );
     Ok(true)

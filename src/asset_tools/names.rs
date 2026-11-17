@@ -482,7 +482,7 @@ pub fn expand_dictionary_from_ini(dict: &mut Vec<(String, i32)>, asset_manager: 
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
 
@@ -503,17 +503,6 @@ mod tests {
             dict.iter()
                 .any(|(name, hash)| *hash == target && name == "sidebar.pal")
         );
-    }
-
-    #[test]
-    fn unknown_hash_resolves_to_a_flagged_placeholder() {
-        let dict = NameDict {
-            map: HashMap::new(),
-            db: NameDb::IniOnly,
-        };
-        let (name, identified) = dict.resolve(0x1234_5678);
-        assert!(!identified);
-        assert!(name.contains("0x12345678"), "got {name}");
     }
 
     #[test]

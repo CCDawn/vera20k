@@ -152,8 +152,8 @@ fn scene(golden: &Value, row: &Value) -> (Simulation, RuleSet, u64, u64) {
     let case = &row["input"];
     let rules = stock_rules(golden, case);
     let mut sim = Simulation::new();
-    sim.session.binary_frame = 200;
-    sim.session.game_options.game_speed = integer(&row["game_speed"]);
+    sim.session.set_binary_frame_for_test(200);
+    sim.session.game_options_mut_for_test().game_speed = integer(&row["game_speed"]);
     sim.native_unique_ids =
         Some(crate::sim::native_identity::NativeUniqueIdCursor::test_at_current_value(0));
     sim.main_rng =
@@ -161,8 +161,8 @@ fn scene(golden: &Value, row: &Value) -> (Simulation, RuleSet, u64, u64) {
     sim.scenario_rng =
         SimRng::from_native_state_hex_for_test(row["rng_before"]["scenario"].as_str().unwrap());
     let building = case["building"].as_str().unwrap();
-    let id = sim.allocate_stable_id();
-    let contact = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
+    let contact = sim.substrate.allocate_stable_id();
     let mut actor =
         GameEntity::test_default_of_category(contact, "HTNK", "A", 10, 10, EntityCategory::Unit);
     actor.set_type_ref_for_test(sim.interner.intern("HTNK"));
@@ -203,9 +203,7 @@ fn scene(golden: &Value, row: &Value) -> (Simulation, RuleSet, u64, u64) {
     // Negative native vector counts have no equivalent valid Rust vector;
     // this control supplies its empty predicate, without certifying malformed state.
     if case["garrison_count"].as_i64().unwrap_or(0) > 0 {
-        let mut cargo = crate::sim::passenger::PassengerCargo::new(1, 0.0);
-        cargo.board_forced_chain(&[(contact, 1.0)]);
-        entity.passenger_role = crate::sim::passenger::PassengerRole::transport(cargo);
+        entity.passenger_role.occupants_mut().add(contact);
     }
     sim.substrate.entities.insert(entity);
     let slot = integer(&case["slot"]) as u8;
@@ -237,19 +235,19 @@ fn scene(golden: &Value, row: &Value) -> (Simulation, RuleSet, u64, u64) {
     }
     if case["unmatched"] == true {
         entity.building_art.anim_slots[usize::from(slot)] = None;
-        sim.rebuild_building_anim_slot_indices();
+        sim.substrate.rebuild_building_anim_slot_indices();
     }
     (sim, rules, id, expired)
 }
 
 fn anim_state(sim: &Simulation, anim: &crate::sim::anim_class::AnimObject) -> Value {
-    let runtime = &anim.runtime;
+    let runtime = &anim.runtime();
     json!({
-        "type_name": sim.interner.resolve(anim.type_id), "native_id": anim.native_unique_id,
-        "location": [anim.world_coord.x, anim.world_coord.y, anim.world_coord.z],
-        "z_adjust": anim.z_adjust, "draw_flags": anim.draw_flags,
+        "type_name": sim.interner.resolve(anim.type_id()), "native_id": anim.native_unique_id(),
+        "location": [anim.world_coord().x, anim.world_coord().y, anim.world_coord().z],
+        "z_adjust": anim.z_adjust(), "draw_flags": anim.draw_flags(),
         "completion_marker": u8::from(anim.completed()), "slot_marker": u8::from(anim.is_building_anim()),
-        "owner_object": anim.owner_entity.unwrap_or(0),
+        "owner_object": anim.owner_entity().unwrap_or(0),
         "runtime": {
             "current_frame": runtime.current_frame, "frame_step": runtime.frame_step,
             "delay_remaining": runtime.delay_remaining, "rate_reload": runtime.rate_reload,
@@ -272,14 +270,15 @@ fn assert_boundary(sim: &Simulation, id: u64, native: &Value, name: &str) {
     for anim in rust_anims {
         let expected = expected_anims
             .iter()
-            .find(|a| integer(&a["native_id"]) == anim.native_unique_id)
+            .find(|a| integer(&a["native_id"]) == anim.native_unique_id())
             .unwrap();
         let observed = anim_state(sim, anim);
         for (key, value) in observed.as_object().unwrap() {
             assert_eq!(
-                value, &expected[key],
+                value,
+                &expected[key],
                 "{name}: Anim {} {key}",
-                anim.native_unique_id
+                anim.native_unique_id()
             );
         }
     }
@@ -307,13 +306,13 @@ fn assert_boundary(sim: &Simulation, id: u64, native: &Value, name: &str) {
         .building_art
         .anim_slots
         .iter()
-        .map(|id| id.map(|id| sim.anim(id).unwrap().native_unique_id))
+        .map(|id| id.map(|id| sim.anim(id).unwrap().native_unique_id()))
         .collect();
     assert_eq!(observed_ids, expected_ids, "{name}: all21 slots");
     let observed_logic: Vec<_> = sim
         .logic_order()
         .iter()
-        .map(|id| sim.anim(*id).unwrap().native_unique_id)
+        .map(|id| sim.anim(*id).unwrap().native_unique_id())
         .collect();
     let expected_logic: Vec<_> = native["logic"]
         .as_array()
@@ -353,33 +352,35 @@ fn original_64_slot_expiry_controls_and_actual_sprite_frame_histories() {
                     .anims
                     .get_mut(expired)
                     .unwrap()
-                    .runtime
+                    .runtime_mut_for_test()
                     .inactive = true;
             }
             for frame in row["frames"].as_array().unwrap() {
-                sim.session.binary_frame = integer(&frame["frame"]) as u32;
+                sim.session
+                    .set_binary_frame_for_test(integer(&frame["frame"]) as u32);
                 sim.visit_anim(
                     expired,
                     &rules,
                     None,
                     crate::sim::world::FrameEffects::default(),
-                );
+                )
+                .unwrap();
                 let anim = sim.anim(expired).unwrap();
                 assert_eq!(
-                    anim.runtime.current_frame,
+                    anim.runtime().current_frame,
                     integer(&frame["current"]),
                     "{name}: {frame}"
                 );
                 assert_eq!(
                     [
-                        anim.runtime.frame_timer.start_frame(),
-                        anim.runtime.frame_timer.duration()
+                        anim.runtime().frame_timer.start_frame(),
+                        anim.runtime().frame_timer.duration()
                     ],
                     [integer(&frame["timer"][0]), integer(&frame["timer"][2])],
                     "{name}: {frame}"
                 );
                 assert_eq!(
-                    anim.runtime.loop_remaining,
+                    anim.runtime().loop_remaining,
                     integer(&frame["loop"]) as u8,
                     "{name}: {frame}"
                 );
@@ -389,7 +390,7 @@ fn original_64_slot_expiry_controls_and_actual_sprite_frame_histories() {
                     "{name}: {frame}"
                 );
                 assert_eq!(
-                    anim.runtime.first_ai_guard,
+                    anim.runtime().first_ai_guard,
                     frame["first_guard"] == 1,
                     "{name}: {frame}"
                 );
@@ -402,7 +403,7 @@ fn original_64_slot_expiry_controls_and_actual_sprite_frame_histories() {
         } else if case["scalar_clear"] == true {
             sim.clear_building_anim_slot(id, integer(&case["slot"]) as u8);
         } else {
-            sim.building_anim_pointer_expired(expired, Some(&rules));
+            sim.building_anim_pointer_expired(expired, &rules);
         }
         assert_boundary(&sim, id, &row["after"], name);
         let after = sim.entities().get(id).unwrap();
@@ -455,7 +456,7 @@ fn original_stock_idle_body_publishes_ready_without_waiting_for_slot_completion(
                 .object(row["building"].as_str().unwrap())
                 .unwrap()
                 .has_turret,
-            &sim.session.game_options,
+            &sim.session.game_options(),
         );
         assert_eq!(
             entity.building_ready_latch(),
@@ -487,7 +488,7 @@ fn snapshot_restores_completed_retraction_and_independent_building_marker() {
             restored.anim(expired).unwrap().is_building_anim(),
             sim.anim(expired).unwrap().is_building_anim()
         );
-        restored.building_anim_pointer_expired(expired, Some(&rules));
+        restored.building_anim_pointer_expired(expired, &rules);
         assert_boundary(&restored, id, &row["after"], name);
     }
 }

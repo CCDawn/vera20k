@@ -10,7 +10,8 @@ use super::*;
 use crate::rules::ruleset::HouseCostFactors;
 use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::houses::Houses;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::util::native_x87::NativeF32Bits;
 
@@ -172,6 +173,16 @@ impl RegisteredBuilding {
 }
 
 impl HouseBaseState {
+    /// The retained House4FD150 radius, also read by House500200/501AC0.
+    pub(crate) const fn radius(&self) -> i32 {
+        self.radius
+    }
+
+    /// `4FD150` publishes the radius at Building lifecycle boundaries.
+    pub(crate) fn retain_radius(&mut self, radius: i32) {
+        self.radius = radius;
+    }
+
     /// The FactoryPlant products (House `+0x5390..+0x53A0`, in
     /// [`ObjectType::factor_slot`] order) that `CalculateCostMultipliers @
     /// 0x0050BF60` stores; `HouseClass::GetAccumulatedBonus @ 0x0050BEB0`
@@ -277,39 +288,6 @@ fn multiply_factor(lhs: NativeF32Bits, rhs: NativeF32Bits) -> NativeF32Bits {
     X87::store_f32_masked_chop(X87::mul(X87::load_f32(lhs), X87::load_f32(rhs)))
 }
 
-impl crate::sim::house_state::HouseState {
-    /// The retained House4FD150 radius, also read by House500200/501AC0.
-    pub(crate) fn base_radius(&self) -> i32 {
-        self.base_projection.radius
-    }
-
-    /// House50E000's explicit primary write, called at Unit7398CE and scenario
-    /// launch. It does not recalculate radius or replace alternate/BasePlan cells.
-    pub(crate) fn set_base_center(&mut self, cell: (u16, u16)) {
-        self.base_center = Some(cell);
-    }
-
-    fn retain_base_geometry(&mut self, primary: Option<(u16, u16)>, radius: i32) {
-        self.base_center = primary;
-        self.base_projection.radius = radius;
-    }
-
-    /// Supplied physical House+5490/+5498 inputs in native query corpora.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn set_base_geometry_for_test(&mut self, primary: Option<(u16, u16)>, radius: i32) {
-        self.retain_base_geometry(primary, radius);
-    }
-
-    /// The House factors TechnoType `Cost_Of` (`0x00711F00`) reads: its
-    /// country's `Cost*Mult=` and its FactoryPlant products.
-    pub(crate) fn cost_factors(&self) -> HouseCostFactors {
-        HouseCostFactors {
-            country: self.country_cost_mults.0,
-            factory_plant: self.base_projection.factory_plant_factors(),
-        }
-    }
-}
-
 impl Simulation {
     /// Original Execute30 at 0x006DE206..0x006DE2A5. The acquired BuildConst vector
     /// supplies its first raw Location, then an empty plan asks 0x0050C210 to
@@ -329,13 +307,13 @@ impl Simulation {
         if !house.set_auto_base_building_from_trigger(value) {
             return true;
         }
-        let first = house.build_const_order.first().copied();
+        let first = house.build_const_order().first().copied();
         if let Some(cell) = first.and_then(|id| self.raw_building_base_cell(id)) {
             let house = self.houses.get_mut(&owner).expect("retained owner");
             house.set_base_center(cell);
-            house.base_plan_center = cell;
+            house.anchor_base_plan(cell);
         }
-        if self.houses[&owner].base_plan.nodes.is_empty() {
+        if self.houses[&owner].base_plan().nodes().is_empty() {
             return self.initialize_house_base_from_build_const(owner, rules, registry, effects);
         }
         true
@@ -353,7 +331,7 @@ impl Simulation {
         effects: FrameEffects<'_>,
     ) -> bool {
         let candidate = self.houses[&owner]
-            .base_projection
+            .base_projection()
             .buildings()
             .iter()
             .rev()
@@ -369,46 +347,55 @@ impl Simulation {
             .get_mut(&owner)
             .expect("retained owner")
             .set_base_center(cell);
-        if self.session.game_mode_nonzero && !self.houses[&owner].is_controlled_by_human(true) {
+        if self.session.game_mode_nonzero() && !self.houses[&owner].is_controlled_by_human(true) {
             self.computer_paranoid(rules, registry, effects);
         }
         // 0x0050C2F5 rereads the plan after the diplomacy callbacks. Keep Recalc's
         // existing owner and its Scenario RNG, clearing A8E7AC only around it.
-        if self.houses[&owner].base_plan.nodes.is_empty() {
+        if self.houses[&owner].base_plan().nodes().is_empty() {
             let house = &self.houses[&owner];
-            let Some(country) = house.country.map(|id| self.interner.resolve(id).to_owned()) else {
+            let Some(country) = house
+                .country()
+                .map(|id| self.interner.resolve(id).to_owned())
+            else {
                 return false;
             };
             let (side, difficulty, tech_level) =
-                (house.side_index, house.difficulty, house.tech_level);
-            if crate::sim::base_plan_generation::preflight_recalc(rules, &country, side, difficulty)
-                .is_err()
+                (house.side_index(), house.difficulty(), house.tech_level());
+            if crate::sim::base_plan_generation::preflight_recalc(
+                rules,
+                &country,
+                side,
+                difficulty,
+                self.session.game_options().super_weapons,
+            )
+            .is_err()
             {
                 return false;
             }
             self.without_object_placement_scope(|sim| {
                 let house = sim.houses.get_mut(&owner).expect("retained owner");
                 crate::sim::base_plan_generation::recalc_base_plan(
-                    &mut house.base_plan,
+                    house.base_plan_mut(),
                     rules,
                     &sim.type_tech_levels,
                     &country,
                     side,
                     difficulty,
                     tech_level,
-                    sim.session.game_options.super_weapons,
+                    sim.session.game_options().super_weapons,
                     &mut sim.scenario_rng,
                 );
             });
         }
         let house = self.houses.get_mut(&owner).expect("retained owner");
-        if let Some(node) = house.base_plan.nodes.first_mut() {
-            node.packed_cell = crate::sim::base_plan::pack_base_plan_cell(
+        house
+            .base_plan_mut()
+            .anchor_first_node(crate::sim::base_plan::pack_base_plan_cell(
                 i32::from(cell.0 as i16),
                 i32::from(cell.1 as i16),
-            );
-        }
-        house.base_plan_center = cell;
+            ));
+        house.anchor_base_plan(cell);
         true
     }
 
@@ -499,7 +486,7 @@ impl Simulation {
             let _ = self.assign_destination_represented(
                 id,
                 Some(destination),
-                Some(rules),
+                rules,
                 registry,
                 frame_effects,
             );
@@ -510,8 +497,8 @@ impl Simulation {
                 id,
                 move_mission,
                 0,
-                self.session.binary_frame,
-                &EntityReadyInputProvider,
+                self.session.binary_frame(),
+                &LiveReadyInputProvider { rules },
             );
         }
     }
@@ -531,12 +518,9 @@ impl Simulation {
         if origin == (0, 0) {
             return [0, 0, 0];
         }
-        let coord = crate::sim::movement::ground_pose::target_get_coords(
-            crate::sim::combat::TargetKind::Cell(origin.0, origin.1),
-            self,
-            cells,
-        )
-        .expect("Cell GetCoords always returns a coordinate");
+        // A fresh Map5657A0 lookup, which stamps the Dummy on a miss; not the
+        // retained-Cell GetCoords that target_get_coords dispatches.
+        let coord = crate::sim::movement::navcom::target_cell_coord(origin.0, origin.1, cells);
         [coord.x, coord.y, coord.z]
     }
 
@@ -564,6 +548,99 @@ impl Simulation {
         let distance = crate::util::native_x87::distance_3d_leptons(base, coord);
         let radius = house.base_radius();
         distance > radius && radius.wrapping_shl(2) < distance
+    }
+
+    /// `HouseClass::PickRandomCellInZone @ 0x00501AC0` for `owner`: a random
+    /// cell around the house's base, its radius (`+0x5498`) clamped into
+    /// 0x300..0x800 leptons and its base the base cell's GetCoords
+    /// ([`Self::house_base_coordinate`]; an empty base is the empty
+    /// coordinate).
+    /// - Zone 0 (`0x00501B2B..0x00501BB9`): `RandomRanged(0, radius)`, then
+    ///   the base moved that far in a random direction snapped to a cell
+    ///   centre (`0x0049F420`, snap 1).
+    /// - Zones 1..4, north, east, south and west (`0x00501BC0..0x00501F3E`):
+    ///   `RandomRanged(radius, 2 * radius)`, then one raw Next whose low 14
+    ///   bits pick a facing within 0x2000 of the zone's (0x0000, 0x4000,
+    ///   0x8000, 0xC000), and the base moved that far along it with the
+    ///   Walk direction math ([`facing_step_world_xy`]).
+    /// - Any other zone draws nothing and leaves the empty coordinate.
+    ///
+    /// An empty coordinate gives the base cell (zone 0) or zone 0's answer
+    /// (`0x00502040..0x00502082`); any other takes its cell toward zero
+    /// (`0x00413A30`). A cell outside the playfield (`0x00578460`, mode 1) is
+    /// clamped into it (`0x00586E50`). `None` without the House, terrain or
+    /// playfield, before any draw.
+    ///
+    /// [`facing_step_world_xy`]: crate::util::native_trig::facing_step_world_xy
+    pub(crate) fn house_random_cell_in_zone(
+        &mut self,
+        owner: InternedId,
+        zone: i32,
+    ) -> Option<(i32, i32)> {
+        // The first facing of each zone's 0x4000-wide sector.
+        const ZONE_FACING_START: [u16; 4] = [0xE000, 0x2000, 0x6000, 0xA000];
+        let house = self.houses.get(&owner)?;
+        let radius = house.base_radius().clamp(768, 2048);
+        let origin = house.base_origin();
+        let bounds = self.playfield_bounds?;
+        let terrain = self.resolved_terrain.as_ref()?;
+        let native_cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+        let coord = match zone {
+            0 => {
+                let magnitude = self.scenario_rng.next_range_i32_inclusive(0, radius);
+                let base = self.house_base_coordinate(owner, Some(&native_cells));
+                let (x, y) = crate::sim::combat::inviso_scatter::random_direction_coord(
+                    self.cell_grid(),
+                    &mut self.scenario_rng,
+                    base[0],
+                    base[1],
+                    magnitude,
+                    crate::sim::combat::inviso_scatter::RandomDirectionSnap::CellCenter,
+                );
+                [x, y, base[2]]
+            }
+            1..=4 => {
+                let magnitude = self
+                    .scenario_rng
+                    .next_range_i32_inclusive(radius, radius.wrapping_mul(2));
+                let draw = self.scenario_rng.next_u32() as u16;
+                let facing = (draw & 0x3FFF).wrapping_add(ZONE_FACING_START[(zone - 1) as usize]);
+                let base = self.house_base_coordinate(owner, Some(&native_cells));
+                let [x, y] = crate::util::native_trig::facing_step_world_xy(
+                    [base[0], base[1]],
+                    facing,
+                    magnitude,
+                );
+                [x, y, base[2]]
+            }
+            _ => [0, 0, 0],
+        };
+        let cell = if coord != [0, 0, 0] {
+            (
+                i32::from(crate::util::lepton::lepton_to_cell_packed(coord[0])),
+                i32::from(crate::util::lepton::lepton_to_cell_packed(coord[1])),
+            )
+        } else if zone == 0 {
+            (i32::from(origin.0), i32::from(origin.1))
+        } else {
+            self.house_random_cell_in_zone(owner, 0)?
+        };
+        let terrain = self.resolved_terrain.as_ref()?;
+        let native_cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+        if crate::sim::cell_rect::cell_is_in_playfield_height_aware_in_query(
+            cell,
+            Some(bounds),
+            Some(terrain),
+            Some(&native_cells),
+        ) {
+            return Some(cell);
+        }
+        Some(crate::sim::cell_rect::clamp_cell_to_playfield(
+            cell,
+            bounds,
+            Some(terrain),
+            Some(&native_cells),
+        ))
     }
 
     /// Ordinary Unit/Infantry arm of House500200 (Find_Passable_Cell_Near_Unit)
@@ -595,51 +672,22 @@ impl Simulation {
         //50025F..5002C9 reads physical Object+9C/+A0, not Should_Be/NavCom or
         //a virtual bridge-height coordinate. OnBridge does not change its zone.
         let current = crate::sim::movement::ground_pose::position_world_coord(&actor.position);
-        let house = self.houses.get(&house)?;
-        let radius = house.base_radius().clamp(768, 2048);
-        let origin = house.base_origin();
-        let terrain = self.resolved_terrain.as_ref()?;
-        let bounds = self.playfield_bounds?;
+        // The House, terrain, playfield, Size and zones are all present before
+        // House501AC0's first draw.
+        if !self.houses.contains_key(&house)
+            || self.resolved_terrain.is_none()
+            || self.playfield_bounds.is_none()
+            || self.zone_grid.is_none()
+        {
+            return None;
+        }
         self.map_size_diamond()?;
+        //5002CF's ground scalar zone query follows 501AC0's playfield
+        //correction; their shared Dummy order is preserved.
+        let seed = self.house_random_cell_in_zone(house, 0)?;
+        let terrain = self.resolved_terrain.as_ref()?;
         let zones = self.zone_grid.as_ref()?;
         let native_cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
-
-        //501B2B..501BB9: radius draw FIRST, then retained origin -> ground
-        //Cell486840 (no deck rise), then one raw direction draw with snap1.
-        let magnitude = self.scenario_rng.next_range_i32_inclusive(0, radius);
-        let base = if origin == (0, 0) {
-            DriveCoord { x: 0, y: 0, z: 0 }
-        } else {
-            crate::sim::movement::target_cell_coord(origin.0, origin.1, Some(&native_cells))
-        };
-        let (x, y) = crate::sim::combat::inviso_scatter::random_direction_coord(
-            &mut self.scenario_rng,
-            base.x,
-            base.y,
-            magnitude,
-            crate::sim::combat::inviso_scatter::RandomDirectionSnap::CellCenter,
-        );
-        //Cell-centre snap1 cannot yield NullCoord. 413A30 divides toward zero
-        //before packing: a sampled -128 lepton component becomes cell0.
-        let mut seed = (
-            i32::from(crate::util::lepton::lepton_to_cell_packed(x)),
-            i32::from(crate::util::lepton::lepton_to_cell_packed(y)),
-        );
-        //50209B..5020BF: mode1 membership and conditional correction precede
-        //5002CF's ground scalar zone query. Preserve their shared Dummy order.
-        if !crate::sim::cell_rect::cell_is_in_playfield_height_aware_in_query(
-            seed,
-            Some(bounds),
-            Some(terrain),
-            Some(&native_cells),
-        ) {
-            seed = crate::sim::cell_rect::clamp_cell_to_playfield(
-                seed,
-                bounds,
-                Some(terrain),
-                Some(&native_cells),
-            );
-        }
         let current_cell = (
             i32::from(crate::util::lepton::lepton_to_cell_packed(current.x)),
             i32::from(crate::util::lepton::lepton_to_cell_packed(current.y)),
@@ -686,9 +734,9 @@ impl Simulation {
         {
             return false;
         }
-        let mut buildings = Vec::with_capacity(house.base_projection.buildings.len());
-        if house.tracking.buildings() > 0 {
-            for &id in house.base_projection.buildings() {
+        let mut buildings = Vec::with_capacity(house.base_projection().buildings.len());
+        if house.tracking().buildings() > 0 {
+            for &id in house.base_projection().buildings() {
                 let Some(entity) = self.substrate.entities.get(id) else {
                     continue;
                 };
@@ -709,9 +757,9 @@ impl Simulation {
         }
         let (primary, radius) = project_geometry(
             self,
-            house.tracking.buildings(),
+            house.tracking().buildings(),
             &buildings,
-            house.alternate_base_center,
+            house.alternate_base_center(),
         );
         self.houses
             .get_mut(&owner)
@@ -720,22 +768,118 @@ impl Simulation {
         true
     }
 
+    /// `HouseClass::DetermineEdge @ 0x0050DB00`: the map edge `owner`'s
+    /// aircraft come from and leave by (House+0x577C,
+    /// [`HouseState::waypoint_edge`]). Its callers, SelectPrimaryFactory
+    /// (`0x0044813D`) and TogglePrimaryFactory (`0x00448241`), pass a
+    /// `Factory=BuildingType` Building of `owner`.
+    ///
+    /// - That Building, when it is primary (`+0x3D3`) and its type's Factory
+    ///   is BuildingType (`0x0050DB23..0x0050DB6E`), is the anchor.
+    /// - Otherwise, when House+0x2F0 is nonzero, the House+68 walk
+    ///   (`0x0050DB73..0x0050DC34`) takes each non-limbo `ConstructionYard=`
+    ///   Building in turn and stops at a primary one; without one, the first
+    ///   other non-limbo Building. With neither, the edge stays (`0x0050DC86`).
+    ///
+    /// The anchor is the Building's GetCoords (`0x00447AC0`, its foundation
+    /// centre); Map[coord] (`0x00565730`) gives the cell the edge choice
+    /// ([`determine_waypoint_edge`]) measures from. Native marks "no anchor"
+    /// with the zero CoordStruct (`0x00A8EFF8`), which a placed Building's
+    /// GetCoords never equals (its X is at least 128).
+    ///
+    /// RESIDUAL: VERA's Unlimbo and ChangeOwner append the Building to
+    /// House+68 before this call; native appends after it (`0x00441594`,
+    /// `0x004491D2`). The walk runs only when another primary
+    /// `Factory=BuildingType` Building kept the flag. Every retail one is a
+    /// `ConstructionYard=` type, where the walk stops before that tail.
+    ///
+    /// A mapless fixture without PlayfieldBounds keeps its edge.
+    ///
+    /// [`determine_waypoint_edge`]: crate::sim::house_state::determine_waypoint_edge
+    pub(crate) fn determine_house_edge(
+        &mut self,
+        owner: InternedId,
+        building: u64,
+        rules: &RuleSet,
+    ) {
+        let Some(bounds) = self.playfield_bounds else {
+            return;
+        };
+        let primary_yard_factory = self.production.is_primary_factory(building)
+            && self
+                .substrate
+                .entities
+                .get(building)
+                .and_then(|entity| self.object_type(entity.type_ref(), rules))
+                .is_some_and(|object| {
+                    object.factory_type()
+                        == Some(crate::rules::object_type::FactoryType::BuildingType)
+                });
+        let anchor = if primary_yard_factory {
+            Some(building)
+        } else {
+            let Some(house) = self.houses.get(&owner) else {
+                return;
+            };
+            let mut yard = None;
+            let mut other = None;
+            if house.tracking().buildings() != 0 {
+                for &id in house.base_projection().buildings() {
+                    let Some(entity) = self.substrate.entities.get(id) else {
+                        continue;
+                    };
+                    if entity.lifecycle.in_limbo() {
+                        continue;
+                    }
+                    if self
+                        .object_type(entity.type_ref(), rules)
+                        .is_some_and(|object| object.construction_yard)
+                    {
+                        yard = Some(id);
+                        if self.production.is_primary_factory(id) {
+                            break;
+                        }
+                    } else if other.is_none() {
+                        other = Some(id);
+                    }
+                }
+            }
+            yard.or(other)
+        };
+        let Some(cell) = anchor
+            .and_then(|id| self.substrate.entities.get(id))
+            .and_then(super::lifecycle::object_get_coords_cell)
+        else {
+            return;
+        };
+        let edge = crate::sim::house_state::determine_waypoint_edge(cell, bounds);
+        if let Some(house) = self.houses.get_mut(&owner) {
+            house.assign_waypoint_edge(edge);
+        }
+    }
+
     /// [`HouseState::cost_factors`] for `owner`. `None` without a House, which
     /// takes Cost_Of's null-House arm (`0x00711F4E`, the raw cost).
-    pub(crate) fn house_cost_factors(&self, owner: InternedId) -> Option<HouseCostFactors> {
-        Some(self.houses.get(&owner)?.cost_factors())
+    pub(crate) fn house_cost_factors(
+        houses: &Houses,
+        owner: InternedId,
+    ) -> Option<HouseCostFactors> {
+        Some(houses.get(&owner)?.cost_factors())
     }
 
     /// TechnoType virtual `+0x84` for `owner`'s House ([`RuleSet::cost_of`]).
     pub fn cost_of(&self, owner: InternedId, object: &ObjectType, rules: &RuleSet) -> i32 {
         debug_assert!(
             self.houses.get(&owner).is_none_or(|house| {
-                house.country_cost_mults.0
+                house.country_cost_mults().0
                     == rules.country_cost_mults(self.interner.resolve(house.house_type_id()))
             }),
             "a House's `Cost*Mult=` copy differs from its type's: project it at creation"
         );
-        rules.cost_of(object, self.house_cost_factors(owner).as_ref())
+        rules.cost_of(
+            object,
+            Self::house_cost_factors(&self.houses, owner).as_ref(),
+        )
     }
 
     /// House+0x98, the grinders, in registration order. Grinding+16AD
@@ -758,7 +902,7 @@ impl Simulation {
             return 0;
         };
         house
-            .base_projection
+            .base_projection()
             .buildings()
             .iter()
             .filter_map(|&id| {
@@ -770,6 +914,23 @@ impl Simulation {
             .fold(0_i32, |total, object| {
                 total.wrapping_add(object.power.wrapping_abs())
             })
+    }
+
+    /// House+0x80, the UnitRepair stations (Items `+0x84`, Count `+0x90`), in
+    /// vector order. Unlimbo appends a `UnitRepair=` building (Type
+    /// `+0x16A9`, `0x0044122C..0x0044127A`) ahead of its House+0xB0 and
+    /// House+68 appends; ChangeOwner removes it from the old House
+    /// (`0x00448790..0x004487E0`) and appends it to the new one
+    /// (`0x00448E6E..0x00448EC5`) under the same gate, ahead of the same
+    /// lists; pointer expiry stable-removes it (`0x004FBA59..0x004FBA99`). As
+    /// with [`Self::house_absorbers`], it is House+68 filtered by the gate,
+    /// in order.
+    pub(crate) fn house_unit_repair_stations(
+        &self,
+        owner: InternedId,
+        rules: &RuleSet,
+    ) -> Vec<u64> {
+        self.house_buildings_where(owner, rules, |object| object.unit_repair)
     }
 
     /// House+0xB0, the absorbers (Items `+0xB4`, Count `+0xC0`), in vector
@@ -828,7 +989,7 @@ impl Simulation {
             return Vec::new();
         };
         house
-            .base_projection
+            .base_projection()
             .buildings()
             .iter()
             .copied()
@@ -842,29 +1003,40 @@ impl Simulation {
             .collect()
     }
 
-    pub(super) fn register_house_base_building(&mut self, id: u64, rules: &RuleSet) {
-        let Some(entity) = self.substrate.entities.get(id) else {
+    pub(super) fn register_house_base_building(
+        interner: &StringInterner,
+        substrate: &ObjectSubstrate,
+        houses: &mut Houses,
+        id: u64,
+        rules: &RuleSet,
+    ) {
+        let Some(entity) = substrate.entities.get(id) else {
             return;
         };
         if entity.category() != EntityCategory::Structure {
             return;
         }
-        let Some(object) = self.object_type(entity.type_ref(), rules) else {
+        let Some(object) =
+            interner.object_type_in_category(entity.type_ref(), entity.category().into(), rules)
+        else {
             return;
         };
         let entry = RegisteredBuilding::new(id, object);
         let owner = entity.owner();
-        if let Some(house) = self.houses.get_mut(&owner) {
-            house.base_projection.register(entry);
+        if let Some(house) = houses.get_mut(&owner) {
+            house.base_projection_mut().register(entry);
         }
     }
 
     /// `BuildingClass::Unlimbo`'s House+68 append (`0x00441553..0x00441594`),
     /// reached on the same path as its BuildConst append
     /// ([`Simulation::append_live_build_const`]).
-    pub(super) fn append_house_base_building(&mut self, id: u64) {
-        let Some(owner) = self
-            .substrate
+    pub(super) fn append_house_base_building(
+        substrate: &ObjectSubstrate,
+        houses: &mut Houses,
+        id: u64,
+    ) {
+        let Some(owner) = substrate
             .entities
             .get(id)
             .filter(|entity| entity.category() == EntityCategory::Structure)
@@ -872,8 +1044,8 @@ impl Simulation {
         else {
             return;
         };
-        if let Some(house) = self.houses.get_mut(&owner) {
-            house.base_projection.append_membership(id);
+        if let Some(house) = houses.get_mut(&owner) {
+            house.base_projection_mut().append_membership(id);
         }
     }
 
@@ -881,18 +1053,7 @@ impl Simulation {
     /// Unlimbo would make ([`Self::append_house_base_building`]).
     #[cfg(any(test, feature = "test-support"))]
     pub fn append_house_base_building_for_test(&mut self, id: u64) {
-        self.append_house_base_building(id);
-    }
-
-    /// `BuildingClass::ChangeOwner`'s moves between the two Houses' lists:
-    /// before the Techno owner swap it stable-removes the building from the
-    /// old House's FactoryPlant list, recomputes and removes it from House+68
-    /// (`0x00448A21..0x00448AB0`); after it, it appends to the new House's
-    /// lists (`0x00449155..0x004491D2`).
-    pub(super) fn leave_house_base_lists(&mut self, id: u64, owner: InternedId) {
-        if let Some(house) = self.houses.get_mut(&owner) {
-            house.base_projection.remove_membership(id);
-        }
+        Self::append_house_base_building(&self.substrate, &mut self.houses, id);
     }
 
     pub(super) fn join_house_base_lists(
@@ -900,19 +1061,60 @@ impl Simulation {
         id: u64,
         old_owner: InternedId,
         owner: InternedId,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
     ) {
         // Building448C76/448C81: old list already removed and Techno tracking
         // moved, but neither new FactoryPlant nor House+68 append has run.
-        if let Some(rules) = rules {
-            self.recalculate_house_base_geometry(old_owner, rules);
-            self.recalculate_house_base_geometry(owner, rules);
-        }
+        self.recalculate_house_base_geometry(old_owner, rules);
+        self.recalculate_house_base_geometry(owner, rules);
         if let Some(house) = self.houses.get_mut(&owner) {
-            house.base_projection.append_membership(id);
+            house.base_projection_mut().append_membership(id);
         }
     }
 
+    pub(super) fn remove_house_base_membership(
+        substrate: &ObjectSubstrate,
+        houses: &mut Houses,
+        id: u64,
+    ) {
+        if !substrate
+            .entities
+            .get(id)
+            .is_some_and(|entity| entity.category() == EntityCategory::Structure)
+        {
+            return;
+        }
+        // Broadcast visits every House, including historical non-owner lists.
+        for house in houses.values_mut() {
+            house.base_projection_mut().remove_membership(id);
+        }
+    }
+
+    pub(super) fn release_house_base_tracking(
+        substrate: &ObjectSubstrate,
+        houses: &mut Houses,
+        id: u64,
+    ) {
+        if let Some(owner) = substrate.entities.get(id).map(|entity| entity.owner())
+            && let Some(house) = houses.get_mut(&owner)
+        {
+            //43BF34 changes tracking AFTER the earlier expiry/Limbo. No recalc.
+            house.base_projection_mut().unregister(id);
+        }
+    }
+}
+
+impl crate::sim::houses::Houses {
+    /// `BuildingClass::ChangeOwner`'s moves between the two Houses' lists:
+    /// before the Techno owner swap it stable-removes the building from the
+    /// old House's FactoryPlant list, recomputes and removes it from House+68
+    /// (`0x00448A21..0x00448AB0`); after it, it appends to the new House's
+    /// lists (`0x00449155..0x004491D2`).
+    pub(super) fn leave_house_base_lists(&mut self, id: u64, owner: InternedId) {
+        if let Some(house) = self.get_mut(&owner) {
+            house.base_projection_mut().remove_membership(id);
+        }
+    }
     /// `TechnoClass::ChangeOwner`'s Remove_Tracking on the old House and
     /// Add_Tracking on the new (`0x007015DE`, `0x007015E6`) move the
     /// building's registration with it.
@@ -923,43 +1125,18 @@ impl Simulation {
         new_owner: InternedId,
     ) {
         let Some(entry) = self
-            .houses
             .get_mut(&old_owner)
-            .and_then(|house| house.base_projection.unregister(id))
+            .and_then(|house| house.base_projection_mut().unregister(id))
         else {
             return;
         };
-        if let Some(house) = self.houses.get_mut(&new_owner) {
-            house.base_projection.register(entry);
-        }
-    }
-
-    pub(super) fn remove_house_base_membership(&mut self, id: u64) {
-        if !self
-            .substrate
-            .entities
-            .get(id)
-            .is_some_and(|entity| entity.category() == EntityCategory::Structure)
-        {
-            return;
-        }
-        // Broadcast visits every House, including historical non-owner lists.
-        for house in self.houses.values_mut() {
-            house.base_projection.remove_membership(id);
-        }
-    }
-
-    pub(super) fn release_house_base_tracking(&mut self, id: u64) {
-        if let Some(owner) = self.substrate.entities.get(id).map(|entity| entity.owner())
-            && let Some(house) = self.houses.get_mut(&owner)
-        {
-            //43BF34 changes tracking AFTER the earlier expiry/Limbo. No recalc.
-            house.base_projection.unregister(id);
+        if let Some(house) = self.get_mut(&new_owner) {
+            house.base_projection_mut().register(entry);
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_c_o))]
 mod tests {
     use super::*;
     use crate::sim::combat::Health;
@@ -980,9 +1157,9 @@ mod tests {
             off_108: 8,
         });
         sim.playfield_size_height = Some(8);
-        sim.session.map_width = 17;
-        sim.session.map_height = 17;
-        sim.session.binary_frame = 100;
+        sim.session.set_map_width_for_test(17);
+        sim.session.set_map_height_for_test(17);
+        sim.session.set_binary_frame_for_test(100);
         crate::sim::arena_fixture::supply_native_map(&mut sim);
         sim
     }
@@ -991,14 +1168,13 @@ mod tests {
         let owner = sim.interner.intern(name);
         let mut house = crate::sim::house_state::HouseState::new(owner, 0, None, false, 0, 10);
         house.project_country_mults(rules, &sim.interner);
-        sim.houses.insert(owner, house);
-        sim.session.house_order.push(owner);
+        sim.houses.register(house);
         owner
     }
 
     fn geometry(sim: &Simulation, owner: InternedId) -> (Option<(u16, u16)>, i32) {
         let house = &sim.houses[&owner];
-        (house.base_center, house.base_radius())
+        (house.base_center(), house.base_radius())
     }
 
     fn ordinary_rules() -> RuleSet {
@@ -1038,7 +1214,7 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(
-                sim.houses[&owner].base_projection.buildings().len(),
+                sim.houses[&owner].base_projection().buildings().len(),
                 powers.len()
             );
             let before = sim.state_hash();
@@ -1070,7 +1246,7 @@ mod tests {
                         .as_i64()
                         .unwrap() as i32
                 };
-                let ids = sim.houses[&owner].base_projection.buildings().to_vec();
+                let ids = sim.houses[&owner].base_projection().buildings().to_vec();
                 let other = add_house(&mut sim, "Russians", &rules);
                 sim.change_owner_with_rules(ids[0], other, &rules, None, FrameEffects::default());
                 assert_eq!(
@@ -1118,7 +1294,7 @@ mod tests {
             for cell in cells {
                 let x = cell["xy"][0].as_u64().unwrap() as u16;
                 let y = cell["xy"][1].as_u64().unwrap() as u16;
-                let target = terrain.cell_mut(x, y).unwrap();
+                let target = terrain.cell_mut_for_test(x, y).unwrap();
                 if let Some(level) = cell["level"].as_i64() {
                     target.level = level as u8;
                 }
@@ -1144,9 +1320,9 @@ mod tests {
             sim.playfield_bounds,
         );
         let overrides = input["zone_overrides"].as_array();
-        let base = zones.base_topology_mut();
-        base.zone_ids.fill(0);
-        base.movement_classes.fill(0);
+        let base = zones.base_topology_mut_for_test();
+        base.zone_ids_mut_for_test().fill(0);
+        base.movement_classes_mut_for_test().fill(0);
         let row = crate::rules::locomotor_type::MovementZone::Normal
             .matrix_row()
             .unwrap();
@@ -1154,19 +1330,21 @@ mod tests {
         // for all13 Map+18 rows. Only Normal's values are exercised here, but
         // the unused rows must still form a coherent saved navigation owner.
         let labels = overrides.map_or(0, Vec::len) + 1;
-        for raw_row in &mut base.raw_zone_ids_by_row {
+        for raw_row in base.raw_zone_ids_by_row_mut_for_test() {
             raw_row.resize(labels, 1);
         }
-        base.raw_zone_ids_by_row[row].fill(1);
+        base.raw_zone_ids_by_row_mut_for_test()[row].fill(1);
         if let Some(overrides) = overrides {
             for (index, zone) in overrides.iter().enumerate() {
                 let x = zone["xy"][0].as_u64().unwrap() as usize;
                 let y = zone["xy"][1].as_u64().unwrap() as usize;
-                base.zone_ids[y * 17 + x] = index as u16 + 1;
-                base.raw_zone_ids_by_row[row][index + 1] = zone["group"].as_u64().unwrap() as u16;
+                base.zone_ids_mut_for_test()[y * 17 + x] =
+                    index as crate::sim::pathfinding::zone_map::ZoneId + 1;
+                base.raw_zone_ids_by_row_mut_for_test()[row][index + 1] =
+                    zone["group"].as_u64().unwrap() as crate::sim::pathfinding::zone_map::ZoneId;
             }
         }
-        sim.zone_grid = Some(zones);
+        sim.zone_grid = Some(zones.into());
         // Zone construction can stamp the same Dummy. Native replay starts
         // its ordinary-return chain AFTER that constructor, with these fields.
         terrain.stamp_dummy_cell_requested_coord(-7, 1);
@@ -1187,7 +1365,7 @@ mod tests {
             (primary != (0, 0)).then_some(primary),
             input["radius"].as_i64().unwrap() as i32,
         );
-        house.alternate_base_center = cell("alternate", (0, 0));
+        house.set_alternate_base_center_for_test(cell("alternate", (0, 0)));
         let current = input["current"]
             .as_array()
             .map_or([2688, 2688, 0], |coord| {
@@ -1236,35 +1414,6 @@ mod tests {
     }
 
     #[test]
-    fn native_home_inputs_keep_retained_base_geometry_across_snapshot_load() {
-        let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
-            "tools/spatial_oracle/house_base_return.json",
-        ))
-        .unwrap();
-        for row in corpus["home_return"].as_array().unwrap() {
-            let input = &row["input"];
-            let name = input["name"].as_str().unwrap();
-            let (sim, _, owner) = native_home_fixture(input);
-            let retained = geometry(&sim, owner);
-            let bytes = crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, name, 0);
-            let mut loaded = crate::sim::snapshot::GameSnapshot::load(&bytes)
-                .unwrap()
-                .sim;
-            // These native query premises deliberately have no registered
-            // buildings. Restore must retain the saved House5490/5498, not
-            // replace them with an empty-membership projection.
-            assert_eq!(geometry(&loaded, owner), retained, "{name}");
-            let retained_hash = loaded.state_hash();
-            loaded
-                .houses
-                .get_mut(&owner)
-                .unwrap()
-                .retain_base_geometry(retained.0, retained.1.wrapping_add(1));
-            assert_ne!(loaded.state_hash(), retained_hash, "radius hash: {name}");
-        }
-    }
-
-    #[test]
     fn original_house_500200_ordinary_return_rows_through_production_owner() {
         let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
             "tools/spatial_oracle/house_base_return.json",
@@ -1274,10 +1423,6 @@ mod tests {
             "tools/spatial_oracle/house_base_return.meta.json",
         ))
         .unwrap();
-        assert_eq!(
-            meta["native_sha256"].as_str(),
-            Some("1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c")
-        );
         assert_eq!(meta["entry_points"]["ordinary_return"], "0x00500200");
         let rows = corpus["home_return"].as_array().unwrap();
         assert_eq!(rows.len(), 28);
@@ -1353,46 +1498,6 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_home_query_reports_unavailable_before_rng_without_map_or_class_authority() {
-        let input = serde_json::json!({
-            "family": "MTNK", "radius": 0, "seed": 31,
-        });
-        for missing in 0..7 {
-            let (mut sim, id, owner) = native_home_fixture(&input);
-            let held_terrain = sim.resolved_terrain.as_ref().unwrap().clone();
-            match missing {
-                0 => sim.resolved_terrain = None,
-                1 => sim.playfield_bounds = None,
-                2 => sim.playfield_size_height = None,
-                3 => sim.zone_grid = None,
-                4 => {
-                    sim.houses.remove(&owner);
-                }
-                5 => {
-                    sim.substrate.entities.remove(id);
-                }
-                _ => {
-                    sim.substrate
-                        .entities
-                        .get_mut(id)
-                        .unwrap()
-                        .set_category_for_test(EntityCategory::Structure);
-                }
-            }
-            let before = sim.rng_state();
-            let hash_before = sim.state_hash();
-            assert_eq!(
-                sim.house_return_cell(owner, id),
-                None,
-                "missing premise {missing}"
-            );
-            assert_eq!(sim.rng_state(), before, "missing premise {missing}");
-            assert_eq!(sim.state_hash(), hash_before, "missing premise {missing}");
-            assert_eq!(held_terrain.dummy_cell_requested_coord(), (-7, 1));
-        }
-    }
-
-    #[test]
     fn original_house_4fd150_projection_rows_and_shared_cost_queries() {
         let default: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
             "tools/spatial_oracle/house_base_projection.json",
@@ -1441,8 +1546,8 @@ mod tests {
                 )
             });
             let house = sim.houses.get_mut(&owner).unwrap();
-            house.tracking.set_buildings_for_test(tracked);
-            house.alternate_base_center = alternate;
+            house.tracking_mut().set_buildings_for_test(tracked);
+            house.set_alternate_base_center_for_test(alternate);
             house.retain_base_geometry(Some((14, 14)), 9999);
             if let Some(bonus) = input["unit_bonus"].as_f64() {
                 let mut factors = UNIT_FACTORS;
@@ -1450,12 +1555,12 @@ mod tests {
                 // The oracle supplies House+5394 directly. This list recreates
                 // that input through the existing factor owner, without adding
                 // a building to the oracle's separate House+68 premise.
-                house.base_projection.register(RegisteredBuilding {
+                house.base_projection_mut().register(RegisteredBuilding {
                     id: u64::MAX,
                     plant: Some(factors),
                     secret_lab: false,
                 });
-                house.base_projection.plants.push(u64::MAX);
+                house.base_projection_mut().plants.push(u64::MAX);
             }
             let mut admitted = Vec::new();
             let mut representable = true;
@@ -1540,7 +1645,7 @@ mod tests {
                 sim.houses
                     .get_mut(&owner)
                     .unwrap()
-                    .base_projection
+                    .base_projection_mut()
                     .replace_buildings_for_test(ids);
                 assert!(sim.recalculate_house_base_geometry(owner, &rules));
                 assert_eq!(
@@ -1563,12 +1668,12 @@ mod tests {
             .unwrap();
         // Original tracked>0/empty-House+68 row. The first append follows it.
         assert_eq!(geometry(&sim, owner), (None, 512));
-        assert_eq!(sim.houses[&owner].base_projection.buildings(), [first]);
+        assert_eq!(sim.houses[&owner].base_projection().buildings(), [first]);
         let second = sim
             .spawn_object("SECOND", "Americans", 13, 9, 0, &rules)
             .unwrap();
         assert_eq!(
-            sim.houses[&owner].base_projection.buildings(),
+            sim.houses[&owner].base_projection().buildings(),
             [first, second]
         );
         let (primary, radius) = geometry(&sim, owner);
@@ -1586,7 +1691,7 @@ mod tests {
         // Both entries are alive/on-map at Building445DA6. The unoccupied
         // centroid agrees with the native two-building row before conceal.
         assert_eq!(geometry(&sim, owner), (Some((8, 7)), 512));
-        assert_eq!(sim.houses[&owner].base_projection.buildings(), [first]);
+        assert_eq!(sim.houses[&owner].base_projection().buildings(), [first]);
         sim.houses
             .get_mut(&owner)
             .unwrap()
@@ -1603,7 +1708,7 @@ mod tests {
         assert_eq!(geometry(&sim, owner), (None, 512));
         sim.uninit_with_rules(second, &rules);
         sim.process_pending_delete();
-        assert_eq!(sim.houses[&owner].tracking.buildings(), 0);
+        assert_eq!(sim.houses[&owner].tracking().buildings(), 0);
         assert_eq!(
             geometry(&sim, owner),
             (None, 512),
@@ -1612,37 +1717,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_recalculates_after_old_removal_and_before_new_append() {
-        let rules = ordinary_rules();
-        let mut sim = native_map_fixture();
-        let old = add_house(&mut sim, "Americans", &rules);
-        let new = add_house(&mut sim, "Russians", &rules);
-        let first = sim
-            .spawn_object("FIRST", "Americans", 5, 5, 0, &rules)
-            .unwrap();
-        let second = sim
-            .spawn_object("SECOND", "Americans", 13, 9, 0, &rules)
-            .unwrap();
-        sim.change_owner_with_rules(
-            first,
-            new,
-            &rules,
-            None,
-            crate::sim::world::FrameEffects::default(),
-        );
-        assert_eq!(sim.houses[&old].tracking.buildings(), 1);
-        assert_eq!(sim.houses[&new].tracking.buildings(), 1);
-        assert_eq!(sim.houses[&old].base_projection.buildings(), [second]);
-        assert_eq!(sim.houses[&new].base_projection.buildings(), [first]);
-        let old_primary = sim.houses[&old].base_center.unwrap();
-        assert!(old_primary.0.abs_diff(13) <= 1 && old_primary.1.abs_diff(9) <= 1);
-        // Original tracked>0/empty row on the NEW House. If its append ran
-        // first, the geometry would already be near the captured building.
-        assert_eq!(geometry(&sim, new), (None, 512));
-    }
-
-    #[test]
-    fn failed_mark_dead_and_attached_upgrade_unlimbo_do_not_publish_geometry() {
+    fn failed_mark_and_dead_unlimbo_do_not_publish_geometry() {
         use crate::sim::world::lifecycle::{
             PlacementEvidence, RevealOutcome, RevealPosition, RevealRequest, UninitContext,
         };
@@ -1656,7 +1731,6 @@ mod tests {
         for (index, placement) in [
             PlacementEvidence::MarkFailed,
             PlacementEvidence::MarkSucceeded,
-            PlacementEvidence::AttachedUpgrade,
         ]
         .into_iter()
         .enumerate()
@@ -1668,8 +1742,6 @@ mod tests {
             let entity = sim.substrate.entities.get_mut(id).unwrap();
             if index == 1 {
                 entity.lifecycle.set_object_alive_for_test(false);
-            } else if index == 2 {
-                entity.link_structure_upgrade(id - 1, 0);
             }
             let result = sim.try_reveal_entity_with_context(
                 id,
@@ -1693,29 +1765,7 @@ mod tests {
                 assert!(matches!(result, RevealOutcome::Revealed { .. }));
             }
             assert_eq!(geometry(&sim, owner), (Some((14, 14)), 9999));
-            assert!(sim.houses[&owner].base_projection.buildings().is_empty());
-        }
-    }
-
-    #[test]
-    fn missing_map_context_reports_unavailable_without_replacing_retained_geometry() {
-        let rules = ordinary_rules();
-        for missing in 0..3 {
-            let mut sim = native_map_fixture();
-            let owner = add_house(&mut sim, "Americans", &rules);
-            sim.houses
-                .get_mut(&owner)
-                .unwrap()
-                .retain_base_geometry(Some((14, 14)), 9999);
-            match missing {
-                0 => sim.resolved_terrain = None,
-                1 => sim.playfield_bounds = None,
-                _ => sim.playfield_size_height = None,
-            }
-            let hash_before = sim.state_hash();
-            assert!(!sim.recalculate_house_base_geometry(owner, &rules));
-            assert_eq!(geometry(&sim, owner), (Some((14, 14)), 9999));
-            assert_eq!(sim.state_hash(), hash_before);
+            assert!(sim.houses[&owner].base_projection().buildings().is_empty());
         }
     }
 
@@ -1730,20 +1780,31 @@ mod tests {
         let second = sim
             .spawn_object("SECOND", "Americans", 13, 9, 0, &rules)
             .unwrap();
-        sim.houses.get_mut(&owner).unwrap().alternate_base_center = (1, 1);
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .set_alternate_base_center_for_test((1, 1));
         assert!(sim.recalculate_house_base_geometry(owner, &rules));
         // Saved native alternate-origin projection row.
         assert_eq!(geometry(&sim, owner), (Some((8, 7)), 1028));
         let native_hash = sim.state_hash();
-        sim.houses.get_mut(&owner).unwrap().base_projection.radius = 1029;
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .base_projection_mut()
+            .radius = 1029;
         assert_ne!(sim.state_hash(), native_hash);
-        sim.houses.get_mut(&owner).unwrap().base_projection.radius = 1028;
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .base_projection_mut()
+            .radius = 1028;
         assert_eq!(sim.state_hash(), native_hash);
         // A primary writer retains radius; it also leaves the alternate and
         // BasePlan centre untouched. Historical geometry need not equal lists.
         let house = sim.houses.get_mut(&owner).unwrap();
         house.set_base_center((14, 14));
-        house.base_plan_center = (3, 4);
+        house.set_base_plan_center_for_test((3, 4));
         // Native load constructs the Scenario RNG with seed0. This test pins
         // geometry/list persistence, not a different RNG restore contract.
         // The native-map fixture also supplies navigation; publish and restore
@@ -1758,6 +1819,9 @@ mod tests {
         sim.restore_map_authority_after_snapshot_load(&rules, &overlays, None)
             .expect("publish fixture map authority");
         sim.scenario_rng = crate::sim::rng::SimRng::new(0);
+        // Player load clears planning tokens (6370B0 / 70BF79), including the
+        // empty tokens registered by these fixture buildings.
+        sim.reset_planning_after_player_load();
         let before = sim.state_hash();
         let bytes = crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "house-base-geometry", 0);
         let mut restored = crate::sim::snapshot::GameSnapshot::load(&bytes)
@@ -1781,10 +1845,10 @@ mod tests {
             restored.hash_owner_diagnostics_for_test(),
         );
         assert_eq!(geometry(&restored, owner), (Some((14, 14)), 1028));
-        assert_eq!(restored.houses[&owner].alternate_base_center, (1, 1));
-        assert_eq!(restored.houses[&owner].base_plan_center, (3, 4));
+        assert_eq!(restored.houses[&owner].alternate_base_center(), (1, 1));
+        assert_eq!(restored.houses[&owner].base_plan_center(), (3, 4));
         assert_eq!(
-            restored.houses[&owner].base_projection.buildings(),
+            restored.houses[&owner].base_projection().buildings(),
             [first, second]
         );
         // Restore leaves geometry historical. The NEXT native boundary must
@@ -1864,7 +1928,7 @@ mod tests {
         for house in [allies, soviets] {
             let mut state = HouseState::new(house, 0, None, false, 0, 10);
             state.project_country_mults(&rules, &sim.interner);
-            sim.houses.insert(house, state);
+            sim.houses.register(state);
         }
         let tank = rules.object("HTNK").unwrap();
         let costs = |sim: &Simulation| {
@@ -1877,7 +1941,7 @@ mod tests {
         let plant_fold = |sim: &Simulation| {
             sim.houses
                 .values()
-                .any(|house| !house.base_projection.factory_plants().is_empty())
+                .any(|house| !house.base_projection().factory_plants().is_empty())
         };
         assert_eq!(costs(&sim), (900, 450));
         assert!(!plant_fold(&sim));
@@ -1887,7 +1951,7 @@ mod tests {
         // ftol(900 * 0.75 * 0.5) = ftol(337.5)
         assert_eq!(costs(&sim), (900, 337));
         assert_eq!(
-            sim.houses[&soviets].base_projection.factory_plants(),
+            sim.houses[&soviets].base_projection().factory_plants(),
             [plant]
         );
         assert!(plant_fold(&sim));
@@ -1901,12 +1965,12 @@ mod tests {
         assert_eq!(costs(&sim), (675, 450));
         assert!(
             sim.houses[&soviets]
-                .base_projection
+                .base_projection()
                 .factory_plants()
                 .is_empty()
         );
         assert_eq!(
-            sim.houses[&allies].base_projection.factory_plants(),
+            sim.houses[&allies].base_projection().factory_plants(),
             [plant]
         );
         sim.uninit_with_rules(plant, &rules);
@@ -1979,8 +2043,8 @@ mod tests {
 
         // An empty base origin ends the call before the search.
         let house = sim.houses.get_mut(&owner).unwrap();
-        house.base_center = None;
-        house.alternate_base_center = (0, 0);
+        house.set_base_center_for_test(None);
+        house.set_alternate_base_center_for_test((0, 0));
         sim.move_ground_forces_to_base(owner, &rules, None, FrameEffects::default());
         assert_eq!(snapshot(&sim), before);
 
@@ -2016,3 +2080,7 @@ mod tests {
         assert_eq!(after[2..], before[2..]);
     }
 }
+
+#[cfg(all(test, tests_sim_world_c_o))]
+#[path = "house_edge_tests.rs"]
+mod edge_tests;

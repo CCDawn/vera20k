@@ -1,5 +1,5 @@
-//! Scenario countdown: original TAction23..27/103 and Event14. Steam gamemd
-//! SHA3e81a617..08600, Execute6DE418..6DE6DA, HasOccurred71EBE9 and shared
+//! Scenario countdown: original TAction23..27/103 and Event14. Steam gamemd:
+//! Execute6DE418..6DE6DA, HasOccurred71EBE9 and shared
 //! CdTimer426630/46B640. Captions retain the authored key, never localized
 //! app text, so language selection cannot affect synchronized state.
 
@@ -19,15 +19,43 @@ pub(crate) enum ScenarioTimerAction {
 pub(super) struct ScenarioCountdown {
     timer: CdTimer,
     caption: String,
+    #[serde(default)]
+    inherit: bool,
 }
 
 impl ScenarioCountdown {
+    pub(super) fn new(inherit: bool) -> Self {
+        Self {
+            inherit,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn is_default(&self) -> bool {
         self == &Self::default()
     }
 }
 
 impl ScenarioSession {
+    /// gamemd.exe FUN_004c6180 @0x004C6180, 4C61B4..4C61DD, stores the
+    /// signed remainder even when the countdown is stopped.
+    pub(crate) fn campaign_countdown_frames(&self) -> i32 {
+        self.scenario_countdown
+            .timer
+            .remaining(self.binary_frame as i32)
+    }
+
+    /// gamemd.exe EvadeClass__Do @0x004C6210, 4C629A..4C62DB: the receiving
+    /// map opts in, positive time starts running at its current frame, and
+    /// its caption is retained. Zero/negative time leaves its timer alone.
+    pub(crate) fn inherit_campaign_countdown(&mut self, frames: i32) {
+        if self.scenario_countdown.inherit && frames > 0 {
+            self.scenario_countdown
+                .timer
+                .start(self.binary_frame as i32, frames);
+        }
+    }
+
     /// Reset683610 leaves the shared timer stopped. Set/extend/shorten use
     /// the original constructor's running timer, even when previously paused.
     /// Native seconds are signed wrapping *15; shortening compares signed
@@ -76,6 +104,15 @@ impl ScenarioSession {
                 .expired(self.binary_frame as i32)
     }
 
+    /// LogicClass::PerTickUpdate55B17D..55B1D8, after the mutable Tag poll.
+    /// Re-read the timer here: an expiry action can start a new countdown.
+    /// Tactical6D4949 observes the stopped timer and removes its display line.
+    pub(crate) fn finish_scenario_timer_poll(&mut self) {
+        if self.scenario_timer_elapsed() {
+            self.change_scenario_timer(ScenarioTimerAction::Stop);
+        }
+    }
+
     /// Tactical6D4941 draws this line whenever the timer runs, including0.
     pub fn scenario_timer_view(&self) -> Option<(i32, &str)> {
         let state = &self.scenario_countdown;
@@ -86,9 +123,20 @@ impl ScenarioSession {
             )
         })
     }
+
+    /// Frame-only countdown read for observers (the defense AI's survival
+    /// clock), the running gate Tactical6D4941 uses: `None` while the timer
+    /// is stopped, the signed remaining frames while it runs.
+    pub fn scenario_countdown_remaining_frames(&self) -> Option<i32> {
+        (self.scenario_countdown.timer.start_frame() != PAUSED_START_FRAME).then(|| {
+            self.scenario_countdown
+                .timer
+                .remaining(self.binary_frame as i32)
+        })
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 mod tests {
     use super::*;
     use crate::sim::snapshot::GameSnapshot;
@@ -191,5 +239,22 @@ mod tests {
         assert!(restored.session.scenario_timer_elapsed());
         restored.session.set_scenario_timer_caption("");
         assert_eq!(restored.session.scenario_timer_view(), Some((0, "")));
+    }
+
+    #[test]
+    fn scenario_countdown_remaining_frames_reads_only_running_timers() {
+        let mut sim = Simulation::new();
+        assert_eq!(sim.session.scenario_countdown_remaining_frames(), None);
+        sim.session
+            .change_scenario_timer(ScenarioTimerAction::Set(10));
+        assert_eq!(
+            sim.session.scenario_countdown_remaining_frames(),
+            Some(150),
+            "ten native seconds run at 15 frames per second"
+        );
+        sim.session.binary_frame = 10;
+        assert_eq!(sim.session.scenario_countdown_remaining_frames(), Some(140));
+        sim.session.change_scenario_timer(ScenarioTimerAction::Stop);
+        assert_eq!(sim.session.scenario_countdown_remaining_frames(), None);
     }
 }

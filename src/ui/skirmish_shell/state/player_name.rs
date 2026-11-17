@@ -3,13 +3,15 @@
 use crate::map::scenario_menu::MapMenuEntry;
 use crate::sim::game_options::GameOptions;
 use crate::skirmish_launch::{
-    LaunchCountry, LaunchStartPosition, SKIRMISH_PLAYER_SLOT_COUNT, SkirmishLaunchOptions,
+    LaunchCountry, LaunchStartPosition, NETWORK_PLAYER_SLOT_COUNT, SKIRMISH_PLAYER_SLOT_COUNT,
+    SkirmishLaunchOptions,
 };
 use crate::skirmish_modes::{SkirmishGameMode, mode_by_id};
+use crate::ui::shell::list::ListScrollInteraction;
 use crate::ui::shell::trackbar::TrackbarHold;
 
 use super::super::SkirmishStatics;
-use super::super::layout::{SkirmishShellLayout, SkirmishTrackbarId};
+use super::super::layout::{SkirmishShellLayout, SkirmishTrackbarId, shown_player_rows};
 use super::trackbars::SkirmishTrackbarBounds;
 use super::{
     ChooseMapModalState, DropdownScrollDragState, DropdownScrollbarPressState, OpenComboDropdown,
@@ -233,8 +235,112 @@ impl PlayerNameEditState {
     }
 }
 
+/// One visible country row's Ares presentation.
+#[derive(Debug, Clone)]
+pub(crate) struct CountryMenuEntry {
+    country: Option<LaunchCountry>,
+    /// `Game_GetFlagSurface @ 0x1001DCE0` answer for this row; `None` keeps the
+    /// stock static country table.
+    flag: Option<String>,
+    status_key: Option<String>,
+}
+
+/// Derived country-menu projection, refreshed from the canonical Rules
+/// registry at shell entry. It never owns a participant's selected Country.
+#[derive(Debug, Clone)]
+pub(crate) struct CountryMenuCatalog {
+    items: Vec<super::SkirmishComboItem>,
+    entries: Vec<CountryMenuEntry>,
+}
+impl Default for CountryMenuCatalog {
+    fn default() -> Self {
+        Self {
+            items: vec![super::SkirmishComboItem::Country(
+                super::SkirmishCountryChoice::Random,
+            )],
+            entries: vec![CountryMenuEntry {
+                country: None,
+                flag: None,
+                status_key: None,
+            }],
+        }
+    }
+}
+impl CountryMenuCatalog {
+    pub(super) fn from_rules(rules: &crate::rules::ruleset::RuleSet) -> Self {
+        use crate::rules::ruleset::CountryIdx;
+        let items = super::combos::country_choices(rules);
+        let entries = items
+            .iter()
+            .map(|item| match item {
+                super::SkirmishComboItem::Country(super::SkirmishCountryChoice::Random) => {
+                    CountryMenuEntry {
+                        country: None,
+                        flag: Some("rani.pcx".to_owned()),
+                        status_key: Some("STT:PlayerSideRandom".to_owned()),
+                    }
+                }
+                super::SkirmishComboItem::Country(super::SkirmishCountryChoice::Country(
+                    country,
+                )) => {
+                    let id = rules.country_name(CountryIdx(country.raw_index()));
+                    CountryMenuEntry {
+                        country: Some(*country),
+                        flag: id.and_then(|id| rules.country_flag_surface(id)),
+                        status_key: id
+                            .and_then(|id| rules.country_status_key(id))
+                            .map(str::to_owned),
+                    }
+                }
+                _ => CountryMenuEntry {
+                    country: None,
+                    flag: None,
+                    status_key: None,
+                },
+            })
+            .collect();
+        Self { items, entries }
+    }
+
+    pub(super) fn items(&self) -> &[super::SkirmishComboItem] {
+        &self.items
+    }
+
+    /// Flag file this row draws. `None` keeps the stock static fallback.
+    pub(crate) fn flag_for_choice(&self, random: bool, country: LaunchCountry) -> Option<&str> {
+        if random {
+            return Some("rani.pcx");
+        }
+        self.entries
+            .iter()
+            .find(|entry| entry.country == Some(country))?
+            .flag
+            .as_deref()
+    }
+
+    /// Status-help CSF key for a row; `None` keeps the stock static fallback.
+    pub(crate) fn status_key_for_choice(
+        &self,
+        choice: super::SkirmishCountryChoice,
+    ) -> Option<&str> {
+        match choice {
+            super::SkirmishCountryChoice::Random => Some("STT:PlayerSideRandom"),
+            super::SkirmishCountryChoice::Country(country) => self
+                .entries
+                .iter()
+                .find(|entry| entry.country == Some(country))?
+                .status_key
+                .as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SkirmishShellState {
+    pub(crate) country_catalog: CountryMenuCatalog,
+    /// The colours the loaded rules list for a lobby: every colour combo,
+    /// claim and random draw of the shell reads this copy.
+    pub(crate) lobby_colors: crate::rules::skirmish_colors::SkirmishColorMode,
     pub selected_map_idx: usize,
     pub selected_mode_id: i32,
     pub player_name_edit: PlayerNameEditState,
@@ -260,8 +366,15 @@ pub struct SkirmishShellState {
     pub build_off_ally: bool,
     pub crates: bool,
     pub mcv_redeploy: bool,
-    pub zoom_enabled: bool,
+    /// Player rows 1.. : the retail seven, then VERA's rows up to thirty
+    /// players for maps with more starts.
     pub opponents: Vec<SkirmishShellOpponent>,
+    /// VERA: the index in [`Self::opponents`] of the first computer row the
+    /// page shows. A map with more than eight starts scrolls its computer
+    /// rows under the player's own row; 0 on a retail map.
+    pub(crate) first_opponent: usize,
+    /// VERA: the capture and arrow repeat of the scrollbar beside those rows.
+    pub(crate) opponent_scroll: ListScrollInteraction,
     pub selected_mode_allies_allowed: bool,
     pub selected_mode_must_ally: bool,
     pub pressed_owner_draw_button: Option<OwnerDrawButton>,
@@ -278,6 +391,9 @@ pub struct SkirmishShellState {
     /// the setup dialog on screen while that dialog keeps its working options.
     pub saved_seed_browser: Option<super::SavedSeedBrowserState>,
     pub validation_modal: Option<SkirmishValidationModalState>,
+    /// VERA's Game Options box, open over the page: it takes every press
+    /// and key until OK, Enter or Esc closes it.
+    pub game_options: Option<crate::ui::skirmish_shell::game_options::GameOptionsBox>,
     pub pending_ui_sounds: Vec<SkirmishShellUiSound>,
     /// The kind-1 statics; the status line holds the hover help.
     pub(crate) statics: SkirmishStatics,
@@ -296,6 +412,17 @@ pub enum SkirmishShellDialog {
 }
 
 impl SkirmishShellState {
+    pub fn refresh_country_catalog(&mut self, rules: &crate::rules::ruleset::RuleSet) {
+        self.country_catalog = CountryMenuCatalog::from_rules(rules);
+        self.lobby_colors = rules.skirmish_colors();
+        self.open_combo_dropdown = None;
+    }
+
+    /// The colours this shell's lobbies list.
+    pub fn lobby_colors(&self) -> crate::rules::skirmish_colors::SkirmishColorMode {
+        self.lobby_colors
+    }
+
     /// The dialog that shows on top of the Skirmish stack: the one decision
     /// for the slide target, the renderer and input. `None` while the
     /// chooser stays hidden after the random-map run, behind its Use Map's
@@ -320,6 +447,8 @@ impl Default for SkirmishShellState {
     fn default() -> Self {
         let options = SkirmishLaunchOptions::default();
         Self {
+            country_catalog: CountryMenuCatalog::default(),
+            lobby_colors: Default::default(),
             selected_map_idx: 0,
             selected_mode_id: 1,
             player_name_edit: PlayerNameEditState::default(),
@@ -341,8 +470,9 @@ impl Default for SkirmishShellState {
             build_off_ally: options.build_off_ally,
             crates: options.crates,
             mcv_redeploy: options.mcv_redeploy,
-            zoom_enabled: true,
             opponents: default_opponents(LaunchCountry::Russia),
+            first_opponent: 0,
+            opponent_scroll: ListScrollInteraction::default(),
             selected_mode_allies_allowed: true,
             selected_mode_must_ally: false,
             pressed_owner_draw_button: None,
@@ -354,6 +484,7 @@ impl Default for SkirmishShellState {
             random_map_setup_modal: None,
             saved_seed_browser: None,
             validation_modal: None,
+            game_options: None,
             pending_ui_sounds: Vec::new(),
             statics: SkirmishStatics::default(),
         }
@@ -390,12 +521,49 @@ impl SkirmishShellState {
     pub fn drain_pending_ui_sounds(&mut self) -> Vec<SkirmishShellUiSound> {
         std::mem::take(&mut self.pending_ui_sounds)
     }
+
+    /// The row slot (`0..shown`, [`SkirmishShellLayout::shown_rows`])
+    /// showing player row `row`: the player's own row always takes slot 0, a
+    /// computer row only while scrolled into view.
+    pub fn row_slot(&self, row: usize, shown: usize) -> Option<usize> {
+        if row == 0 {
+            return Some(0);
+        }
+        row.checked_sub(self.first_opponent)
+            .filter(|slot| (1..shown).contains(slot))
+    }
+
+    /// The player row that retail row slot `slot` shows.
+    pub fn slot_row(&self, slot: usize) -> usize {
+        if slot == 0 {
+            0
+        } else {
+            self.first_opponent + slot
+        }
+    }
+
+    /// The computer rows in view of `shown` row slots, as (row slot, player
+    /// row, its opponent); the map's capacity still hides rows
+    /// ([`player_row_visible`]).
+    pub fn paged_opponents(
+        &self,
+        shown: usize,
+    ) -> impl Iterator<Item = (usize, usize, &SkirmishShellOpponent)> {
+        (1..shown).filter_map(move |slot| {
+            let row = self.slot_row(slot);
+            self.opponents
+                .get(row - 1)
+                .map(|opponent| (slot, row, opponent))
+        })
+    }
 }
 
 /// A hover message to the status line ([`SkirmishStatics::hover`]). Returns
 /// whether the help changed.
 pub fn set_status_help_text(state: &mut SkirmishShellState, text: impl Into<String>) -> bool {
-    state.statics.hover(&text.into(), std::time::Instant::now())
+    state
+        .statics
+        .hover(&text.into(), crate::util::time::Instant::now())
 }
 
 pub fn clear_status_help_text(state: &mut SkirmishShellState) -> bool {
@@ -420,25 +588,41 @@ pub(super) fn inactive_ai_team_default(state: &SkirmishShellState) -> i32 {
 
 /// Whether a complete player-row control group is visible for the selected map.
 /// Slot zero is the local row and never hides; opponent rows are bounded by the
-/// selected map's native player-capacity query.
+/// selected map's native player-capacity query, and VERA's past the eighth
+/// show while scrolled into view.
 pub fn player_row_visible(state: &SkirmishShellState, maps: &[MapMenuEntry], row: usize) -> bool {
     if row == 0 {
         return true;
     }
-    let capacity = maps
-        .get(state.selected_map_idx)
-        .map(|map| visible_player_capacity(map.player_capacity))
-        .unwrap_or(SKIRMISH_PLAYER_SLOT_COUNT)
-        .min(SKIRMISH_PLAYER_SLOT_COUNT);
-    row < capacity
+    let rows = selected_player_rows(state, maps);
+    row < rows && state.row_slot(row, shown_player_rows(rows)).is_some()
 }
 
-fn visible_player_capacity(capacity: i32) -> usize {
-    capacity.clamp(0, SKIRMISH_PLAYER_SLOT_COUNT as i32) as usize
+/// The player rows the selected map admits: the retail eight with no map.
+pub fn selected_player_rows(state: &SkirmishShellState, maps: &[MapMenuEntry]) -> usize {
+    maps.get(state.selected_map_idx)
+        .map_or(SKIRMISH_PLAYER_SLOT_COUNT, |map| {
+            admitted_player_rows(map.player_capacity)
+        })
+}
+
+/// A map's player capacity as rows: VERA seats up to thirty players, as its
+/// rooms do; a retail map declares eight or fewer.
+fn admitted_player_rows(capacity: i32) -> usize {
+    capacity.clamp(0, NETWORK_PLAYER_SLOT_COUNT as i32) as usize
+}
+
+/// The last [`SkirmishShellState::first_opponent`] for `rows` admitted player
+/// rows, which shows the map's last computer rows; 0 while every row shows
+/// ([`shown_player_rows`]).
+pub(super) fn last_first_opponent(rows: usize) -> usize {
+    rows.saturating_sub(shown_player_rows(rows))
 }
 
 fn reset_rows_hidden_by_capacity(state: &mut SkirmishShellState, capacity: i32) {
-    let capacity = visible_player_capacity(capacity);
+    let capacity = admitted_player_rows(capacity);
+    state.first_opponent = state.first_opponent.min(last_first_opponent(capacity));
+    state.opponent_scroll.cancel();
     let visible_opponents = capacity.saturating_sub(1);
     let team_default = inactive_ai_team_default(state);
     for opponent in state.opponents.iter_mut().skip(visible_opponents) {
@@ -482,18 +666,20 @@ pub fn accept_selected_map(
     true
 }
 
-/// Apply the native first-open row hide pass for the initially selected map.
+/// Apply the native first-open row hide pass for the initially selected map
+/// and scroll back to the first rows. Native runs the pass only below eight
+/// players; at eight or more it would reset none of the retail rows, so
+/// running it always changes only VERA's rows past the map's capacity.
 pub fn initialize_rows_for_selected_map(state: &mut SkirmishShellState, maps: &[MapMenuEntry]) {
+    state.first_opponent = 0;
     let capacity = maps
         .get(state.selected_map_idx)
         .map(|map| map.player_capacity)
         .unwrap_or(SKIRMISH_PLAYER_SLOT_COUNT as i32);
-    if capacity < SKIRMISH_PLAYER_SLOT_COUNT as i32 {
-        reset_rows_hidden_by_capacity(state, capacity);
-    }
+    reset_rows_hidden_by_capacity(state, capacity);
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod multiplayer_dialog_value_tests {
     use super::*;
 
@@ -565,6 +751,21 @@ pub fn repair_teams_for_selected_mode(state: &mut SkirmishShellState, modes: &[S
 
 pub fn combo_dropdown_open(state: &SkirmishShellState) -> bool {
     state.open_combo_dropdown.is_some()
+}
+
+/// VERA: Esc closes a list that a Skirmish or random map control has open.
+/// True when one was open.
+pub fn close_combo_dropdown(state: &mut SkirmishShellState) -> bool {
+    let random_map = state
+        .random_map_setup_modal
+        .as_mut()
+        .is_some_and(|modal| modal.open_combo.take().is_some());
+    let combo = state.open_combo_dropdown.take().is_some();
+    if combo {
+        state.dropdown_scroll_drag = None;
+        state.dropdown_scroll_press = None;
+    }
+    random_map || combo
 }
 
 pub fn player_name_edit_rect_hit(layout: &SkirmishShellLayout, x: i32, y: i32) -> bool {
@@ -651,17 +852,4 @@ pub fn update_player_name_scroll_for_caret(
 /// focus/tab-order model. Returns true when focus state changed.
 pub fn handle_player_name_tab(state: &mut SkirmishShellState) -> bool {
     blur_player_name_edit(state)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fresh_shell_starts_with_an_unreserved_random_position() {
-        assert_eq!(
-            SkirmishShellState::default().player_start_position,
-            LaunchStartPosition::Auto
-        );
-    }
 }

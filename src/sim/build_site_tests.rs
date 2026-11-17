@@ -11,12 +11,14 @@ const RULES: &str = "[InfantryTypes]\n0=E1\n\
      [VehicleTypes]\n0=MTNK\n\
      [AircraftTypes]\n\
      [BuildingTypes]\n0=GAPOWR\n1=GAGATE\n2=GAWALL\n3=GAFENCE\n4=NAYARD\n5=GAPAVE\n6=GAPLUG\n\
+     7=NAGATE\n\
      [OverlayTypes]\n0=GASAND\n1=CYCL\n2=GAWALL\n3=TIB01\n\
      [General]\nGDIGateOne=GAGATE\n\
      [E1]\nStrength=125\nSpeed=4\n\
      [MTNK]\nStrength=400\nSpeed=6\n\
      [GAPOWR]\nStrength=750\n\
      [GAGATE]\nStrength=1000\nGate=yes\n\
+     [NAGATE]\nStrength=1000\nGate=yes\n\
      [GAWALL]\nStrength=300\nWall=yes\n\
      [GAFENCE]\nStrength=300\nLaserFence=yes\n\
      [NAYARD]\nStrength=1500\nWaterBound=yes\nNaval=yes\n\
@@ -38,6 +40,11 @@ struct Arena {
 
 fn arena(land: &str) -> Arena {
     let ini = IniFile::from_str(&format!("{RULES}{land}"));
+    let ini = if ini.section("Tiberiums").is_some() {
+        crate::rules::tiberium_type::with_tiberium_image_slots(&ini)
+    } else {
+        ini
+    };
     let art = IniFile::from_str(ART);
     let mut rules =
         RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).expect("build-site rules");
@@ -74,6 +81,7 @@ impl Arena {
             Some(ty),
             house,
             None,
+            None,
         )
     }
 
@@ -85,6 +93,7 @@ impl Arena {
             self.ty(ty),
             origin,
             house,
+            None,
             None,
         )
     }
@@ -99,7 +108,7 @@ impl Arena {
         let id = self.registry.id_for_name(name).expect("fixture overlay");
         let grid = self.sim.overlay_grid.as_mut().expect("overlay grid");
         grid.place_overlay(cell.0, cell.1, id, data);
-        grid.cell_mut(cell.0, cell.1).wall_owner = owner;
+        grid.cell_mut_for_test(cell.0, cell.1).wall_owner = owner;
     }
 }
 
@@ -130,10 +139,11 @@ fn the_empty_cell_and_cells_outside_the_playfield_refuse_but_place_anywhere_does
     assert!(!a.can_place("GAPLUG", (0, 0), None));
     assert!(a.can_place("GAPAVE", (0, 0), None));
     // Narrow the playfield's right edge to `x - y < 2`.
-    a.sim.playfield_bounds = Some(crate::sim::cell_rect::PlayfieldBounds {
-        off_104: 139,
-        ..crate::sim::arena_fixture::OPEN_PLAYFIELD
-    });
+    a.sim
+        .set_playfield_bounds_for_test(Some(crate::sim::cell_rect::PlayfieldBounds {
+            off_104: 139,
+            ..crate::sim::arena_fixture::OPEN_PLAYFIELD
+        }));
     assert!(a.can_place("GAPLUG", (11, 10), None));
     assert!(!a.can_place("GAPLUG", (12, 10), None));
     assert!(a.can_place("GAPOWR", (10, 10), None));
@@ -166,6 +176,25 @@ fn a_gate_stands_on_its_own_house_wall() {
     assert!(!a.cell_clear((11, 10), "GAGATE", Some(americans)));
 }
 
+/// Ares 10015780 (hook 0x47C8AB): any `Gate=` type stands on its own
+/// house's `Wall=yes` overlay; the stock arms admit only the `[General]`
+/// gates (NAGATE is none of them).
+#[test]
+fn a_gate_outside_the_general_list_stands_on_a_wall_only_under_ares() {
+    let mut a = arena(CLEAR_BUILDABLE);
+    let americans = a.house("Americans");
+    let soviets = a.house("Soviets");
+    a.overlay((10, 10), "GASAND", 0, Some(americans));
+    assert_eq!(
+        a.cell_clear((10, 10), "NAGATE", Some(americans)),
+        a.rules.ares_form()
+    );
+    assert!(!a.cell_clear((10, 10), "NAGATE", Some(soviets)));
+    // CYCL is no wall.
+    a.overlay((11, 10), "CYCL", 0, Some(americans));
+    assert!(!a.cell_clear((11, 10), "NAGATE", Some(americans)));
+}
+
 #[test]
 fn a_wall_rebuilds_only_over_its_own_damaged_wall() {
     let mut a = arena(CLEAR_BUILDABLE);
@@ -177,8 +206,8 @@ fn a_wall_rebuilds_only_over_its_own_damaged_wall() {
     assert!(!a.cell_clear((10, 10), "GAWALL", None));
 }
 
-/// Ore is a `Tiberium=` overlay that some TiberiumType claims; without one,
-/// `OverlayToTiberiumIndex` answers -1 and the overlay refuses the fence too.
+/// Ore is a `Tiberium=` overlay that a TiberiumType resolves. A registry with
+/// no Tiberium class is native-invalid; the fence safely refuses that input.
 #[test]
 fn a_laser_fence_may_stand_on_ore() {
     let mut a = arena(&format!(
@@ -191,13 +220,4 @@ fn a_laser_fence_may_stand_on_ore() {
     let mut without = arena(CLEAR_BUILDABLE);
     without.overlay((10, 10), "TIB01", 3, None);
     assert!(!without.cell_clear((10, 10), "GAFENCE", None));
-}
-
-#[test]
-fn a_gate_shares_its_cell_only_with_its_own_houses_laser_fence() {
-    let mut a = arena(CLEAR_BUILDABLE);
-    let americans = a.house("Americans");
-    a.spawn("MTNK", "Americans", (10, 10));
-    assert!(!a.cell_clear((10, 10), "GAGATE", Some(americans)));
-    assert!(a.cell_clear((12, 12), "GAGATE", Some(americans)));
 }

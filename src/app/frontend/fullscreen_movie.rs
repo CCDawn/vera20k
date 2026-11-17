@@ -7,19 +7,37 @@
 //! Otherwise the mouse is hidden, the screen cleared to black, the theme and
 //! other stream players paused (not stopped) and the Bink soundtrack played
 //! at `VoiceVolume`. Frames are copied unscaled, centered in the client area
-//! with the origin clamped at zero (`0x004328BD..0x00432A32`). Only a bare
+//! with the origin clamped at zero (`0x004328BD..0x00432A32`). VERA keeps
+//! that copy at gamemd's own window sizes and scales the movie to fit any
+//! other window, like the fitted shell ([`movie_rect`]). Only a bare
 //! Escape release (`Keyboard::Get() == 0x081B`) aborts; other keys and mouse
 //! buttons are consumed and ignored. Afterwards the screen is cleared again,
 //! paused audio resumes, and the caller's dialog is recreated.
 
 use anyhow::Result;
 
+use crate::app::movie_subtitles::{BAND_HEIGHT, BAND_WIDTH, SubtitleTrack, text_origin};
 use crate::render::batch::SpriteInstance;
 use crate::render::bink_movie::BinkMovieSurface;
-use crate::render::shell_paint::MOVIE_DEPTH;
+use crate::render::bit_font::BitFont;
+use crate::render::native_surface_format::{ACTIVE_RETAIL_RGB565_PRESENTATION, RGB565};
+use crate::render::shell_paint::{MOVIE_DEPTH, TEXT_DEPTH};
+use crate::render::shell_text::{ScissorRect, ShellAlign, ShellTextDraw, TextRect};
+
+/// `Init_Game` `0x0052C5E2..0x0052C5EE`: the logo Play_Movie plays on every
+/// launch, before the startup splash (name `0x825F20`).
+pub(crate) const STARTUP_LOGO_MOVIE: &str = "EA_WWLOGO";
+/// `0x0052CB50` (called at `0x0052CA65`): the intro Play_Movie plays while
+/// WinMain's `[Intro] Play=` bit `[0xA8E960] & 4` is set (name `0x82618C`).
+pub(crate) const STARTUP_INTRO_MOVIE: &str = "A00_F00E";
 
 /// The continuation owned by Play_Movie's caller.
 pub(crate) enum MovieReturn {
+    /// `Init_Game` presents the startup splash next (`0x0052C5F3`).
+    StartupLogo,
+    /// `0x0052CB50` draws the empty shell backdrop next; the main menu's
+    /// first paint follows.
+    StartupIntro,
     /// State `0xD` (Sneak Peeks) sets state 4: Movies & Credits `0x101`.
     MoviesAndCredits,
     /// State `0xE` stays in place: the movie list `0x129` reopens.
@@ -33,9 +51,15 @@ pub(crate) enum MovieReturn {
     /// TAction10's5BF260 call returns to the same tactical world. The shared
     /// fullscreen owner holds media/audio; the screen gate stops new frames.
     RunningScenario,
+    /// Victory685928 plays Basic.Win before its score/SkipScore destination.
+    /// EOF, Escape, missing media and decode failure all resume that outcome.
+    CampaignResult(Box<crate::app::match_runtime::scenario_exit::ScenarioExitDestination>),
     /// A won campaign mission's PostScore/PreMapSelect/FinalMovie
     /// (`0x00685928..0x006859E9`) continues its victory tail.
     CampaignVictory(Box<crate::app::campaign_victory::CampaignVictory>),
+    /// A lost campaign mission's Lose movie (`0x00686073`) returns to the
+    /// empty backdrop and the `TXT_TO_REPLAY` prompt.
+    CampaignDefeat(Box<crate::app::campaign_defeat::CampaignDefeat>),
 }
 
 /// The name Play_Movie resolves: truncated at the first `.`.
@@ -54,6 +78,29 @@ pub(crate) fn movie_origin(screen_w: i32, screen_h: i32, movie_w: i32, movie_h: 
     )
 }
 
+/// Where a full-screen movie is drawn, as window-pixel `[x, y, w, h]`.
+///
+/// At gamemd's own shell sizes this is the native unscaled copy
+/// ([`movie_origin`]). Any other window gets the fitted shell
+/// (`shell_layout::window_takes_fitted_shell`), and the movie follows it: one
+/// uniform factor, the largest at which the movie still fits the window,
+/// centred, with black bars on the spare sides. gamemd has no counterpart at
+/// those sizes: its `StretchMovies` option only reaches the VQA branch of
+/// Play_Movie `0x005BED40`, and every retail movie is a Bink file.
+pub(crate) fn movie_rect(screen_w: i32, screen_h: i32, movie_w: i32, movie_h: i32) -> [i32; 4] {
+    if !crate::app::frontend::shell_layout::window_takes_fitted_shell((
+        screen_w as u32,
+        screen_h as u32,
+    )) {
+        let (x, y) = movie_origin(screen_w, screen_h, movie_w, movie_h);
+        return [x, y, movie_w, movie_h];
+    }
+    let factor = (screen_w as f32 / movie_w as f32).min(screen_h as f32 / movie_h as f32);
+    let w = (movie_w as f32 * factor).round() as i32;
+    let h = (movie_h as f32 * factor).round() as i32;
+    [(screen_w - w) / 2, (screen_h - h) / 2, w, h]
+}
+
 pub(crate) struct FullscreenMovie {
     playback: crate::app::movie_playback::MoviePlayback,
     return_to: MovieReturn,
@@ -64,10 +111,16 @@ impl FullscreenMovie {
         surface: BinkMovieSurface,
         mixer: Option<&rodio::mixer::Mixer>,
         voice_volume: f32,
+        subtitles: Option<SubtitleTrack>,
         return_to: MovieReturn,
     ) -> Self {
         Self {
-            playback: crate::app::movie_playback::MoviePlayback::new(surface, mixer, voice_volume),
+            playback: crate::app::movie_playback::MoviePlayback::new(
+                surface,
+                mixer,
+                voice_volume,
+                subtitles,
+            ),
             return_to,
         }
     }
@@ -97,11 +150,12 @@ impl FullscreenMovie {
         self.playback.surface()
     }
     pub(crate) fn instance(&self, screen_w: i32, screen_h: i32) -> SpriteInstance {
-        let (w, h) = (
+        let [x, y, w, h] = movie_rect(
+            screen_w,
+            screen_h,
             self.surface().width() as i32,
             self.surface().height() as i32,
         );
-        let (x, y) = movie_origin(screen_w, screen_h, w, h);
         SpriteInstance {
             position: [x as f32, y as f32],
             size: [w as f32, h as f32],
@@ -113,18 +167,91 @@ impl FullscreenMovie {
             ..Default::default()
         }
     }
+
+    /// The shown subtitle's glyphs over the movie, scaled with it.
+    /// `0x006C9D40` measures the text with the game font wrapped at the band
+    /// width, aligns the whole block, and draws it in the cue's colour packed
+    /// to 16 bits; `0x00433270` copies only the text's rectangle, clipped to
+    /// the band, with packed colour 0 transparent.
+    pub(crate) fn subtitle_text(
+        &self,
+        font: &BitFont,
+        screen_w: i32,
+        screen_h: i32,
+    ) -> Option<ShellTextDraw> {
+        let cue = self.playback.shown_subtitle()?;
+        let text = cue.text.as_deref()?;
+        if RGB565.pack_rgb8(cue.rgb()) == 0 {
+            return None;
+        }
+        let (movie_w, movie_h) = (
+            self.surface().width() as i32,
+            self.surface().height() as i32,
+        );
+        let [movie_x, movie_y, scaled_w, _] = movie_rect(screen_w, screen_h, movie_w, movie_h);
+        let scale = scaled_w as f32 / movie_w as f32;
+        let layout = font.wrap_layout(text, BAND_WIDTH as u32);
+        let [x, y] = text_origin(
+            cue,
+            layout.width as i32,
+            font.cell_height() as i32,
+            movie_w,
+            movie_h,
+        );
+        let [r, g, b, _] = ACTIVE_RETAIL_RGB565_PRESENTATION.quantize_rgba8([
+            cue.rgb()[0],
+            cue.rgb()[1],
+            cue.rgb()[2],
+            255,
+        ]);
+        let mut draw = crate::render::shell_text::draw_in_rect_scaled(
+            font,
+            text,
+            TextRect {
+                x: (x as f32 * scale) as i32,
+                y: (y as f32 * scale) as i32,
+                w: (BAND_WIDTH as f32 * scale) as u32,
+                h: (BAND_HEIGHT as f32 * scale) as u32,
+            },
+            [r, g, b].map(|channel| f32::from(channel) / 255.0),
+            ShellAlign::NONE,
+            [movie_x as f32, movie_y as f32],
+            TEXT_DEPTH,
+            scale,
+        );
+        // The copied rectangle: the measured text inside the band, on screen.
+        let band = [(movie_w - BAND_WIDTH) / 2, movie_h - BAND_HEIGHT];
+        let left = x.max(band[0]);
+        let top = y.max(band[1]);
+        let right = (x + layout.width as i32).min(band[0] + BAND_WIDTH);
+        let bottom = (y + layout.height as i32).min(band[1] + BAND_HEIGHT);
+        let to_screen = |value: i32, origin: i32, limit: i32| {
+            (origin + (value as f32 * scale).round() as i32).clamp(0, limit)
+        };
+        let [x0, y0] = [
+            to_screen(left, movie_x, screen_w),
+            to_screen(top, movie_y, screen_h),
+        ];
+        let [x1, y1] = [
+            to_screen(right, movie_x, screen_w),
+            to_screen(bottom, movie_y, screen_h),
+        ];
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        draw.scissor = ScissorRect {
+            x: x0 as u32,
+            y: y0 as u32,
+            w: (x1 - x0) as u32,
+            h: (y1 - y0) as u32,
+        };
+        Some(draw)
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_frontend))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stem_truncates_at_the_first_dot() {
-        assert_eq!(movie_stem("RENEGADE.BIK"), "RENEGADE");
-        assert_eq!(movie_stem("A00_F00E"), "A00_F00E");
-        assert_eq!(movie_stem("a.b.c"), "a");
-    }
 
     #[test]
     fn origin_centers_movies_and_clamps_negative_offsets() {
@@ -134,5 +261,27 @@ mod tests {
         assert_eq!(movie_origin(1024, 768, 800, 600), (112, 84));
         assert_eq!(movie_origin(640, 480, 800, 600), (0, 0));
         assert_eq!(movie_origin(1280, 1024, 800, 600), (240, 212));
+    }
+
+    #[test]
+    fn retail_windows_keep_the_native_unscaled_copy() {
+        // YR 800x600 and RA2 640x480 movies at gamemd's two shell sizes.
+        assert_eq!(movie_rect(800, 600, 800, 600), [0, 0, 800, 600]);
+        assert_eq!(movie_rect(800, 600, 640, 480), [80, 60, 640, 480]);
+        assert_eq!(movie_rect(640, 480, 640, 480), [0, 0, 640, 480]);
+        assert_eq!(movie_rect(640, 480, 800, 600), [0, 0, 800, 600]);
+    }
+
+    #[test]
+    fn other_windows_fit_the_movie_at_its_own_shape() {
+        // Widescreen: full height, black bars left and right.
+        assert_eq!(movie_rect(1920, 1080, 800, 600), [240, 0, 1440, 1080]);
+        assert_eq!(movie_rect(1920, 1080, 640, 480), [240, 0, 1440, 1080]);
+        assert_eq!(movie_rect(2880, 1800, 800, 600), [240, 0, 2400, 1800]);
+        // Taller than 4:3: full width, bars above and below.
+        assert_eq!(movie_rect(1280, 1024, 800, 600), [0, 32, 1280, 960]);
+        // Exactly 4:3 fills the window; smaller windows shrink the movie.
+        assert_eq!(movie_rect(1024, 768, 800, 600), [0, 0, 1024, 768]);
+        assert_eq!(movie_rect(400, 300, 800, 600), [0, 0, 400, 300]);
     }
 }

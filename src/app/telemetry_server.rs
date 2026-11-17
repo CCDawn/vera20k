@@ -14,11 +14,13 @@ use std::fmt::Write as _;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::util::base64::base64_encode;
 
 const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const PROTOCOL: &str = "vera-telemetry.v1";
@@ -66,29 +68,6 @@ pub fn encode_text_frame(payload: &str) -> Vec<u8> {
     }
     frame.extend_from_slice(payload.as_bytes());
     frame
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let value = (u32::from(chunk[0]) << 16)
-            | (u32::from(chunk.get(1).copied().unwrap_or(0)) << 8)
-            | u32::from(chunk.get(2).copied().unwrap_or(0));
-        out.push(ALPHABET[(value >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(value >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(value >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[value as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 // Deliberately no Debug implementation: the secret never enters logs/snapshots.
@@ -157,6 +136,9 @@ struct Client {
 struct Shared {
     clients: Mutex<Vec<Client>>,
     stop: AtomicBool,
+    /// Connections accepted since the server started. A publisher compares it
+    /// with the value it last saw to know a client attached meanwhile.
+    attached: AtomicU64,
     admission: Admission,
     web_root: PathBuf,
     #[cfg(feature = "debug-tools")]
@@ -223,6 +205,7 @@ impl TelemetryServer {
         let shared = Arc::new(Shared {
             clients: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
+            attached: AtomicU64::new(0),
             admission: Admission {
                 authority: addr.to_string(),
                 localhost: format!("localhost:{}", addr.port()),
@@ -281,6 +264,12 @@ impl TelemetryServer {
         session: u64,
     ) -> Vec<crate::app::debug_tools::DebugCommand> {
         self.shared.commands().drain(session)
+    }
+
+    /// Connections accepted since the server started; a publisher that sees a
+    /// higher value than last time knows a client needs the match history.
+    pub fn attach_generation(&self) -> u64 {
+        self.shared.attached.load(Ordering::Acquire)
     }
 }
 
@@ -557,6 +546,9 @@ fn serve_connection(stream: &mut TcpStream, shared: &Shared, id: u64) -> io::Res
     );
     let (sender, receiver) = mpsc::sync_channel(CLIENT_QUEUE_DEPTH);
     shared.clients().push(Client { id, sender });
+    // Only an admitted dashboard counts: static asset requests also reach the
+    // accept loop, and they do not read snapshots.
+    shared.attached.fetch_add(1, Ordering::AcqRel);
     write_until(
         stream,
         response.as_bytes(),
@@ -882,6 +874,6 @@ pub fn start_from_env() -> Option<Result<TelemetryServer, String>> {
     Some(TelemetryServer::start(addr, root).map_err(|error| format!("telemetry server: {error}")))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 #[path = "telemetry_server_tests.rs"]
 mod tests;

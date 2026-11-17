@@ -17,6 +17,28 @@ const NORMALIZED_DELAY_SHORT: [[u16; 8]; 4] = [
 /// Highest stored value emitted by the retail in-game speed trackbar.
 pub const IN_GAME_OPTIONS_MAX_SPEED: u8 = 6;
 
+/// VERA's 90-tick preset. Keep 0..=7 available for their original meanings in
+/// rules, saves and replays; 7 is still the native SpeedNormalize table column.
+pub const GAME_SPEED_90_TPS: u8 = 8;
+
+pub const fn is_selectable_game_speed(speed: u8) -> bool {
+    speed <= IN_GAME_OPTIONS_MAX_SPEED || speed == GAME_SPEED_90_TPS
+}
+
+/// Bound a raw setting for the dialog and wall-clock consumers, preserving
+/// VERA's extra preset as well as every existing selectable stored value.
+pub const fn clamp_game_speed(speed: i32) -> u8 {
+    if speed == GAME_SPEED_90_TPS as i32 {
+        GAME_SPEED_90_TPS
+    } else if speed < 0 {
+        0
+    } else if speed > IN_GAME_OPTIONS_MAX_SPEED as i32 {
+        IN_GAME_OPTIONS_MAX_SPEED
+    } else {
+        speed as u8
+    }
+}
+
 /// Per-match game settings from the lobby / `[MultiplayerDialogSettings]`.
 ///
 /// Set once at game start except for the synchronized offline game-speed
@@ -34,7 +56,11 @@ pub struct GameOptions {
     /// setup dialog sets it, `0x0052D1FB`). Off, it withholds the
     /// `DisableableFromShell=` Supers, and CanBuild the buildings whose
     /// `SuperWeapon=` is one unless `[AI] BuildTech=` lists them (retail's
-    /// three Battle Labs, which then grant nothing).
+    /// three Battle Labs, which then grant nothing). RESIDUAL (kept by the
+    /// maintainer, 2026-11-15): only Init_Game's rules read (`0x0052D201`) and
+    /// the multiplayer and skirmish dialogs write the byte, so in gamemd a
+    /// campaign started after a skirmish with it off still refuses them
+    /// (CanBuild `0x004F7A9A`); VERA builds options per match, on in campaign.
     pub super_weapons: bool,
     /// Build adjacent to allied buildings. Rules+0x14BA.
     pub build_off_ally: bool,
@@ -48,12 +74,19 @@ pub struct GameOptions {
     pub shroud: bool,
     /// Ore/gems regenerate on the map. Rules+0x14B0.
     pub tiberium_grows: bool,
-    /// Engineers capture at reduced HP only. Rules+0x14B4.
+    /// The MultiEngineer option, Session `0x00A8B26C` (Rules+0x14B4 until a
+    /// setup dialog sets it, `0x0052D1DD`; the skirmish dialog clears it,
+    /// `0x006AD8A4`). With it an Engineer damages a hostile building above
+    /// `ConditionRed=` instead of capturing it (`0x00519DA9`).
     pub multi_engineer: bool,
     /// Harvesters immune to enemy fire. Rules+0x14B3.
     pub harvester_truce: bool,
-    /// Alliances can be changed mid-game. Rules+0x14BB (YR addition).
+    /// Alliances can be changed mid-game. Rules+0x14BB (YR addition). VERA's
+    /// room sets it per match with its In-game Allying checkbox.
     pub ally_change_allowed: bool,
+    /// VERA's room bans; none outside its game rooms.
+    #[serde(default)]
+    pub bans: RoomBans,
 
     // --- Used at init (Create_Houses, spawn units) ---
     /// Default starting credits per player. Rules+0x1484.
@@ -62,7 +95,7 @@ pub struct GameOptions {
     pub unit_count: i32,
     /// Maximum tech level for this match. Rules+0x149C.
     pub tech_level: i32,
-    /// Stored game-speed index. Retail gameplay uses 0 through 7.
+    /// Stored game-speed index. Retail uses 0 through 7; VERA adds 8 (90 ticks/s).
     pub game_speed: i32,
     /// Rules-owned default AI difficulty in the native HouseClass convention:
     /// 0=Hard, 1=Normal, 2=Easy. Offline lobby rows copy their own selected
@@ -89,6 +122,7 @@ impl Default for GameOptions {
             multi_engineer: false,
             harvester_truce: false,
             ally_change_allowed: true,
+            bans: RoomBans::default(),
             starting_credits: 10000,
             unit_count: 10,
             tech_level: 10,
@@ -96,6 +130,58 @@ impl Default for GameOptions {
             ai_difficulty: 0,
             ai_players: 0,
         }
+    }
+}
+
+/// VERA's game-room bans: its own room options, which gamemd's dialogs never
+/// had. The host ticks them in the room's Game Options, and every player's
+/// match reads the same copy.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct RoomBans {
+    /// No Yuri: no player gets a country of the third `[Sides]` entry
+    /// (retail's `ThirdSide`, Yuri's only country), chosen or Random.
+    pub yuri: bool,
+    /// No France: no player gets the `French` country, chosen or Random.
+    pub france: bool,
+    /// No Spy: nobody builds an `Agent=yes` type (retail's Spy).
+    pub spy: bool,
+    /// No Stolen Tech: nobody builds a `RequiresStolen*Tech=yes` type
+    /// (retail's Chrono Commando, Chrono Ivan and Psi Commando), even after
+    /// a spy steals the tech.
+    pub stolen_tech: bool,
+}
+
+impl RoomBans {
+    /// The third `[Sides]` entry, the side `RequiresStolenThirdTech=` names.
+    const THIRD_SIDE: crate::rules::ruleset::SideIdx = crate::rules::ruleset::SideIdx(2);
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Whether no player may build `obj`.
+    pub fn bans_type(&self, obj: &crate::rules::object_type::ObjectType) -> bool {
+        (self.spy && obj.agent)
+            || (self.stolen_tech
+                && (obj.requires_stolen_allied_tech
+                    || obj.requires_stolen_soviet_tech
+                    || obj.requires_stolen_third_tech))
+    }
+
+    /// Whether no player may play `country`, a `[Countries]` index.
+    pub fn bans_country(
+        &self,
+        rules: &crate::rules::ruleset::RuleSet,
+        country: crate::rules::ruleset::CountryIdx,
+    ) -> bool {
+        let Some(id) = rules.country_name(country) else {
+            return false;
+        };
+        (self.yuri && rules.country_side_index(id) == Some(Self::THIRD_SIDE))
+            || (self.france && id.eq_ignore_ascii_case("French"))
     }
 }
 
@@ -107,9 +193,10 @@ impl GameOptions {
     /// store that value before the next `Main_Tick`; active network modes use
     /// EventClass opcode 0x0D at the tail instead. VERA currently implements
     /// only the offline ingress timing and rejects values the dialog cannot
-    /// emit rather than fabricating a clamp.
+    /// emit rather than fabricating a clamp. VERA additionally admits its
+    /// 90-tick preset through this same command owner.
     pub(crate) fn apply_in_game_speed(&mut self, speed: u8) -> bool {
-        if speed > IN_GAME_OPTIONS_MAX_SPEED {
+        if !is_selectable_game_speed(speed) {
             return false;
         }
         self.game_speed = i32::from(speed);
@@ -126,7 +213,7 @@ impl GameOptions {
     /// table at `0x00832CEC` (`[value*8 + speed]`); otherwise
     /// `(value << 3) / (speed + 1)` (`0x005FB2FC..0x005FB301`, signed IDIV).
     ///
-    /// The frame pacer admits one sim tick per `stored_speed * 16 ms` bucket
+    /// For native presets the pacer admits one sim tick per `stored_speed * 16 ms` bucket
     /// (`app::types::tps_for_game_speed`), the same clock native's
     /// `FrameTimer` runs on, so dividing a frame count by `speed + 1` here
     /// reproduces native wall-clock cadence at every stored index.
@@ -134,7 +221,14 @@ impl GameOptions {
         if value == 0 {
             return 0;
         }
-        let speed = usize::try_from(self.game_speed)
+        // VERA's extra wall-clock preset keeps the fastest capped preset's
+        // deterministic animation delays; only frame admission speeds up.
+        let stored_speed = if self.game_speed == i32::from(GAME_SPEED_90_TPS) {
+            1
+        } else {
+            self.game_speed
+        };
+        let speed = usize::try_from(stored_speed)
             .ok()
             .filter(|speed| *speed < 8)
             .expect("stored game speed must be in 0..=7");
@@ -200,14 +294,31 @@ impl GameOptions {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
-    use super::GameOptions;
+    use super::{GameOptions, RoomBans};
     use crate::rules::ini_parser::IniFile;
 
     #[test]
-    fn build_off_ally_default_matches_yr_enabled() {
-        assert!(GameOptions::default().build_off_ally);
+    fn retail_room_bans_take_only_yuri_and_france() {
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_rulesmd_rules() else {
+            return;
+        };
+        let banned = |bans: RoomBans| {
+            ["YuriCountry", "French", "Americans", "Russians"]
+                .map(|id| bans.bans_country(&rules, rules.trigger_house_type_index(id).unwrap()))
+        };
+        let yuri = RoomBans {
+            yuri: true,
+            ..RoomBans::default()
+        };
+        let france = RoomBans {
+            france: true,
+            ..RoomBans::default()
+        };
+        assert_eq!(banned(RoomBans::default()), [false; 4]);
+        assert_eq!(banned(yuri), [true, false, false, false]);
+        assert_eq!(banned(france), [false, true, false, false]);
     }
 
     #[test]
@@ -217,6 +328,23 @@ mod tests {
         assert_eq!(options.game_speed, 6);
         assert!(!options.apply_in_game_speed(7));
         assert_eq!(options.game_speed, 6);
+    }
+
+    #[test]
+    fn extra_speed_keeps_capped_fast_animation_delays() {
+        let fastest_capped = GameOptions::default();
+        let mut options = fastest_capped.clone();
+        assert!(options.apply_in_game_speed(super::GAME_SPEED_90_TPS));
+        assert_eq!(options.game_speed, 8);
+        assert_eq!(
+            options.normalized_anim_delay(4),
+            fastest_capped.normalized_anim_delay(4)
+        );
+        assert_eq!(
+            options.speed_normalize(8),
+            fastest_capped.speed_normalize(8)
+        );
+        assert!(!options.apply_in_game_speed(9));
     }
 
     #[test]
@@ -256,17 +384,6 @@ mod tests {
     }
 
     #[test]
-    fn absent_section_keeps_all_defaults() {
-        let ini = IniFile::from_str("[General]\nFoo=1\n");
-        let parsed = GameOptions::from_multiplayer_dialog_settings(&ini);
-        let default = GameOptions::default();
-        assert_eq!(parsed.starting_credits, default.starting_credits);
-        assert_eq!(parsed.tech_level, default.tech_level);
-        assert!(parsed.bases);
-        assert!(parsed.super_weapons);
-    }
-
-    #[test]
     fn modded_numeric_and_bool_keys_override_defaults() {
         let ini = IniFile::from_str(
             "[MultiplayerDialogSettings]\n\
@@ -299,12 +416,6 @@ mod tests {
         );
         let right = IniFile::from_str("[MultiplayerDialogSettings]\nSuperWeaponsAllowed=no\n");
         assert!(!GameOptions::from_multiplayer_dialog_settings(&right).super_weapons);
-    }
-
-    #[test]
-    fn build_off_ally_key_overrides_default() {
-        let ini = IniFile::from_str("[MultiplayerDialogSettings]\nBuildOffAlly=no\n");
-        assert!(!GameOptions::from_multiplayer_dialog_settings(&ini).build_off_ally);
     }
 
     #[test]

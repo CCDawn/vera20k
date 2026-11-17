@@ -1,8 +1,7 @@
 //! Paid Moon Patrol AMCV -> concrete wall -> living sink through the bound runtime.
 //!
 //! Native Cell4865D0, UnitCanEnter73F48F/73FCD3, launch6CC864/6CC91D,
-//! PostWarp718AA9/718AC2 and Unit7364A1. Original gamemd SHA256
-//! 1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c.
+//! PostWarp718AA9/718AC2 and Unit7364A1. Original gamemd.
 //! Instruction/physical-retail expectations; this is a Rust production regression,
 //! not original whole-scene execution. All mutable game state comes from the
 //! normal Battle launch and commands; the input chooser only reads live owners.
@@ -30,7 +29,7 @@ const MAX_FRAMES: u64 = 48_000;
 fn advance(scene: &mut HeadlessScenario, command: Option<Command>) {
     let sim = scene.sim();
     assert!(
-        sim.session.tick < MAX_FRAMES,
+        sim.session.tick() < MAX_FRAMES,
         "paid Moon history exceeded frame bound"
     );
     let commands: Vec<_> = command
@@ -54,13 +53,30 @@ fn advance(scene: &mut HeadlessScenario, command: Option<Command>) {
                 }
                 _ => {}
             }
-            eprintln!("MOON_INPUT tick={} payload={payload}", sim.session.tick);
-            CommandEnvelope::new(sim.interner.get(OWNER).unwrap(), sim.session.tick, command)
+            eprintln!("MOON_INPUT tick={} payload={payload}", sim.session.tick());
+            CommandEnvelope::new(
+                sim.interner.get(OWNER).unwrap(),
+                sim.session.tick(),
+                command,
+            )
         })
         .collect();
+    // A local house's mobile product leaves only through the Strip visit's
+    // PLACE event (StripClass::AI 0x6A8B30 -> EventCtor_Place 0x4C6AE0 ->
+    // HouseClass::Place_Production 0x4FB0E0). Headless frames have no sidebar,
+    // so supply the fixture strip or the paid AMCV stays in its Factory.
+    let visits = sim
+        .production()
+        .factories()
+        .strip_visits_for_test(sim.interner.get(OWNER).unwrap());
     scene
         .runtime
-        .advance_frame(&commands, 22, TickLane::Ordinary, FrameEffects::default())
+        .advance_frame(
+            &commands,
+            22,
+            TickLane::Ordinary,
+            FrameEffects::default().with_production_strip(&visits, &|_| {}),
+        )
         .expect("ordinary bound-resource frame");
 }
 
@@ -110,9 +126,9 @@ fn wait_for(
         .collect();
     panic!(
         "{stage}: tick={} credits={} spent={} power={:?} queue={:?} options={options:?} movers={movers:?}",
-        sim.session.tick,
-        sim.houses[&owner].economy.credits(),
-        sim.houses[&owner].economy.spent_credits(),
+        sim.session.tick(),
+        sim.houses[&owner].economy().credits(),
+        sim.houses[&owner].economy().spent_credits(),
         power_balance_for_owner(sim, &scene.runtime.resources.rules, OWNER),
         queue_view_for_owner(sim, &scene.runtime.resources.rules, OWNER),
     );
@@ -179,7 +195,7 @@ fn placement(scene: &HeadlessScenario, name: &str, anchor: (u16, u16)) -> (u16, 
         .unwrap_or_else(|| {
             panic!(
                 "no ordinary legal {name} placement at tick {}",
-                sim.session.tick
+                sim.session.tick()
             )
         })
 }
@@ -193,7 +209,7 @@ fn buy_building(scene: &mut HeadlessScenario, name: &str, anchor: (u16, u16)) ->
     let sim = scene.sim();
     let owner = sim.interner.get(OWNER).unwrap();
     let type_id = sim.interner.get(name).unwrap();
-    let paid_before = sim.houses[&owner].economy.spent_credits();
+    let paid_before = sim.houses[&owner].economy().spent_credits();
     let price = sim.cost_of(
         owner,
         scene.runtime.resources.rules.object(name).unwrap(),
@@ -213,7 +229,7 @@ fn buy_building(scene: &mut HeadlessScenario, name: &str, anchor: (u16, u16)) ->
     .unwrap();
     assert!(scene.sim().entities().get(held).unwrap().in_limbo());
     assert_eq!(
-        scene.sim().houses[&owner].economy.spent_credits() - paid_before,
+        scene.sim().houses[&owner].economy().spent_credits() - paid_before,
         price
     );
     let (rx, ry) = placement(scene, name, anchor);
@@ -284,8 +300,8 @@ fn paid_moon_amcv_on_concrete_wall_sinks_alive_then_cleans_up() {
         "MoonPatr.yro",
         &[(LaunchCountry::Russia, AiDifficulty::Easy)],
     );
-    launch.player_name = OWNER.to_owned();
-    launch.local.start_position = LaunchStartPosition::Position(0);
+    launch.local_player_mut().name = OWNER.to_owned();
+    launch.local_slot_mut().start_position = LaunchStartPosition::Position(0);
     launch.opponents[0].start_position = LaunchStartPosition::Position(1);
     launch.options.starting_credits = 10_000;
     launch.options.unit_count = 0;
@@ -308,7 +324,7 @@ fn paid_moon_amcv_on_concrete_wall_sinks_alive_then_cleans_up() {
         .hash_state_every(std::num::NonZeroU64::new(MAX_FRAMES).unwrap());
     let sim = scene.sim();
     let owner = sim.interner.get(OWNER).unwrap();
-    assert_eq!(sim.houses[&owner].economy.credits(), 10_000);
+    assert_eq!(sim.houses[&owner].economy().credits(), 10_000);
     let starting: Vec<_> = sim
         .entities()
         .iter_sorted()
@@ -345,7 +361,7 @@ fn paid_moon_amcv_on_concrete_wall_sinks_alive_then_cleans_up() {
             .iter()
             .any(|option| option.type_id == type_id && option.enabled)
     );
-    let spent = scene.sim().houses[&owner].economy.spent_credits();
+    let spent = scene.sim().houses[&owner].economy().spent_credits();
     let price = scene.sim().cost_of(
         owner,
         scene.runtime.resources.rules.object("AMCV").unwrap(),
@@ -371,10 +387,10 @@ fn paid_moon_amcv_on_concrete_wall_sinks_alive_then_cleans_up() {
         },
     );
     assert_eq!(
-        scene.sim().houses[&owner].economy.spent_credits() - spent,
+        scene.sim().houses[&owner].economy().spent_credits() - spent,
         price
     );
-    let wallet = &scene.sim().houses[&owner].economy;
+    let wallet = scene.sim().houses[&owner].economy();
     assert!(
         i64::from(wallet.credits()) + i64::from(wallet.spent_credits()) > 10_000,
         "normal refinery income funds the opening"
@@ -417,7 +433,7 @@ fn paid_moon_amcv_on_concrete_wall_sinks_alive_then_cleans_up() {
         .expect("ordinary empty AMCV source choice");
     eprintln!(
         "MOON_STAGING tick={} mover={mover} from={from:?} source={source:?} moving={:?} mission={:?} queued={:?} nav={:?}",
-        sim.session.tick,
+        sim.session.tick(),
         motion_query::is_moving(sim.entities().get(mover).unwrap()),
         sim.entities().get(mover).unwrap().mission.current(),
         sim.entities().get(mover).unwrap().mission.queued(),
@@ -491,7 +507,7 @@ fn paid_moon_amcv_on_concrete_wall_sinks_alive_then_cleans_up() {
         Ok(7)
     );
     let health = sim.entities().get(mover).unwrap().health.current();
-    let losses = sim.houses[&owner].stats.units_lost();
+    let losses = sim.houses[&owner].stats().units_lost();
     advance(
         &mut scene,
         Some(Command::LaunchSuperWeapon {
@@ -552,14 +568,14 @@ fn paid_moon_amcv_on_concrete_wall_sinks_alive_then_cleans_up() {
     assert!(entity.is_object_alive() && entity.lifecycle.cell_marked());
     assert!(entity.navigation.nav_com().is_none());
     assert_eq!(
-        sim.houses[&owner].stats.units_lost(),
+        sim.houses[&owner].stats().units_lost(),
         losses,
         "718AC2 branch does not book an immediate kill"
     );
     let sink_z = position_world_coord(&entity.position).z;
     eprintln!(
         "MOON_SINK tick={} mover={mover} source={source:?} wall={wall:?} health={health} raw_z={sink_z} losses={losses}",
-        sim.session.tick
+        sim.session.tick()
     );
     advance(&mut scene, None);
     assert!(position_world_coord(&scene.sim().entities().get(mover).unwrap().position).z < sink_z);
@@ -570,7 +586,7 @@ fn paid_moon_amcv_on_concrete_wall_sinks_alive_then_cleans_up() {
         |scene| !scene.sim().entities().contains(mover),
     );
     let sim = scene.sim();
-    assert_eq!(sim.houses[&owner].stats.units_lost(), losses + 1);
+    assert_eq!(sim.houses[&owner].stats().units_lost(), losses + 1);
     assert!(!sim.occupancy().contains_entity(wall.0, wall.1, mover));
     assert!(!sim.occupancy().contains_entity(source.0, source.1, mover));
     assert_eq!(

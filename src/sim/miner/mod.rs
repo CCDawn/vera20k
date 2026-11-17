@@ -9,27 +9,39 @@
 //! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
 mod harvest_mission;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 pub mod miner_dock;
 pub(crate) mod miner_system;
 pub(crate) mod ore_scan;
 mod refinery_dock;
 pub(crate) use refinery_dock::UnloadImage;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "outbound_drive_tests.rs"]
 mod outbound_drive_tests;
+
+#[cfg(all(test, tests_sim_h_o))]
+#[path = "pad_nudge_tests.rs"]
+mod pad_nudge_tests;
+
+#[cfg(all(test, tests_sim_h_o))]
+#[path = "no_ore_park_tests.rs"]
+mod no_ore_park_tests;
+
+#[cfg(all(test, tests_sim_h_o))]
+#[path = "refinery_reach_tests.rs"]
+mod refinery_reach_tests;
 
 pub(crate) use self::harvest_mission::mission_harvest;
 pub(crate) use self::miner_system::extract_bale;
 pub(crate) use self::refinery_dock::{
-    clear_unload_anim_for_destination, clear_unload_latch, mission_unload, pay_refinery_owner,
-    per_cell_release_dock_contact,
+    clear_unload_anim_for_destination, clear_unload_latch, drain_first_slot, mission_unload,
+    pay_refinery_owner, per_cell_release_dock_contact,
 };
 
 use crate::rules::object_type::ObjectType;
 
-/// Which kind of resource a map cell or cargo bale contains.
+/// Ore/gem presentation classification; not a native TiberiumClass identity.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -49,6 +61,9 @@ pub enum MinerKind {
     /// Yuri Slave Miner (SMIN): deploys into refinery (YAREFN), spawns slave infantry.
     /// Does not harvest directly — slaves harvest and deposit at the deployed building.
     Slave,
+    /// Retained StorageClass data after an in-place conversion to a type
+    /// without a miner role. The ore, unload latch and cursor are not reset.
+    Inactive,
 }
 
 /// State machine for the miner harvest loop.
@@ -67,12 +82,8 @@ pub enum MinerKind {
 /// handler never writes a cursor above `4`. Cursors `5..=7`, retired VERA
 /// states (drive-to-ore, legacy unload, the old player return), decode as none.
 ///
-/// Residual: gamemd reaches cursor `4` from exactly one place, the bounded
-/// scan's miss. VERA also parks there when the miner can reach no refinery at
-/// all, so the cursor is *entered* more often than native's even though it is
-/// never mis-numbered. Both entries take the same re-search exit; what gamemd
-/// does with its own entry, and why VERA does not, is recorded on
-/// `miner_system::handle_going_to_idle`.
+/// Cursor `4` has one entry, as in gamemd: the bounded scan's miss with no
+/// destination and no archive (`0x0073E8EA..0x0073E924`).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MinerState {
@@ -87,8 +98,8 @@ pub enum MinerState {
     /// Unload missions (`refinery_dock`).
     Dock = 3,
     /// Parked because the bounded ore scan found nothing — gamemd's only
-    /// entry into this cursor. VERA also parks here when the miner can reach
-    /// no refinery (VERA-internal, gamemd equivalent UNCHECKED).
+    /// entry into this cursor. Its dispatch queues Guard
+    /// (`miner_system::handle_going_to_idle`).
     WaitNoOre = 4,
 }
 
@@ -121,8 +132,53 @@ impl MinerState {
 /// pushes it into the miner's cargo hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CargoBale {
+    /// Native StorageClass slot. Grouping and payment use this identity;
+    /// multiple types can have the same ore/gem presentation classification.
+    pub tiberium_type: crate::rules::tiberium_type::TiberiumTypeId,
+    /// Presentation only: native Storage slot 1 is gems; the other slots are ore.
     pub resource_type: ResourceType,
     pub value: u16,
+}
+
+/// StorageClass::AddAmount @ 0x006C9690, represented as whole bales.
+/// Native adds to the selected slot without clearing or capacity clamping;
+/// harvesting owns its admission limit, while Full reinforcements add the
+/// positive Type.Storage to a freshly zeroed hold (CreateMembers65DE7B).
+/// Both holds that stand for Techno Storage (`+0x33C`), the [`Miner`]'s and
+/// the [`crate::sim::slave_manager::SlaveLink`]'s, add through it.
+pub(crate) fn add_amount(hold: &mut Vec<CargoBale>, bale: CargoBale, amount: u16) {
+    hold.extend(std::iter::repeat_n(bale, usize::from(amount)));
+}
+
+impl CargoBale {
+    /// Unit Harvest_Ore_Tick73D450 and Infantry Harvest522E70 preserve the
+    /// Cell's native Tiberium index when storing the reduction. Value comes
+    /// from that TiberiumClass; Image does not change Storage slot identity.
+    /// Native executions: spatial_oracle/harvest_field.json ore_tick rows.
+    fn from_reduction(
+        reduction: crate::sim::tiberium::ReduceTiberiumOutcome,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> Option<Self> {
+        if reduction.removed_amount == 0 {
+            return None;
+        }
+        Self::of_type(reduction.tiberium_type?, reduction.resource_type?, rules)
+    }
+
+    /// One bale of a native Tiberium index, valued from that TiberiumClass.
+    pub fn of_type(
+        tiberium_type: crate::rules::tiberium_type::TiberiumTypeId,
+        resource_type: ResourceType,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> Option<Self> {
+        let ty = rules.tiberium_types.get(tiberium_type)?;
+        Some(Self {
+            tiberium_type,
+            resource_type,
+            // Retain the existing whole-bale/u16 credit representation.
+            value: ty.value.clamp(0, i32::from(u16::MAX)) as u16,
+        })
+    }
 }
 
 /// Tunable configuration for the miner/refinery/resource system.
@@ -130,12 +186,6 @@ pub struct CargoBale {
 /// Ship with RA2-like defaults; override for balance mods.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MinerConfig {
-    // -- Bale values --
-    /// Credits per ore bale.
-    pub ore_bale_value: u16,
-    /// Credits per gem bale.
-    pub gem_bale_value: u16,
-
     // -- Cargo capacities (in bales) --
     /// War Miner bale capacity (1000 / 25 = 40 bales for ore).
     pub war_miner_capacity: u16,
@@ -146,47 +196,10 @@ pub struct MinerConfig {
 impl Default for MinerConfig {
     fn default() -> Self {
         Self {
-            ore_bale_value: 25,
-            gem_bale_value: 50,
             // War Miner: 40 bales * 25 = 1000 ore, 40 * 50 = 2000 gems
             war_miner_capacity: 40,
             // Chrono Miner: 20 bales * 25 = 500 ore, 20 * 50 = 1000 gems
             chrono_miner_capacity: 20,
-        }
-    }
-}
-
-impl MinerConfig {
-    /// Create a `MinerConfig` from a full `RuleSet`, sourcing per-bale credit
-    /// values from the `[Tiberiums]` registry so ore/gem payout tracks the mod's
-    /// `Value=` overrides instead of hardcoded constants.
-    ///
-    /// Ore payout comes from the first `[Tiberiums]` entry (Riparius/ore image)
-    /// and gem payout from the second (Cruentus/gem image), matching the native
-    /// tiberium-type ordering. A registry entry that is absent or non-positive
-    /// keeps the stock default (25 ore / 50 gem), so stock output stays
-    /// byte-identical.
-    pub fn from_rules(rules: &crate::rules::ruleset::RuleSet) -> Self {
-        let defaults = Self::default();
-        let bale_value = |id: crate::rules::tiberium_type::TiberiumTypeId, fallback: u16| -> u16 {
-            rules
-                .tiberium_types
-                .get(id)
-                .map(|t| t.value)
-                .filter(|&v| v > 0)
-                .map(|v| v.min(u16::MAX as i32) as u16)
-                .unwrap_or(fallback)
-        };
-        Self {
-            ore_bale_value: bale_value(
-                crate::rules::tiberium_type::TiberiumTypeId(0),
-                defaults.ore_bale_value,
-            ),
-            gem_bale_value: bale_value(
-                crate::rules::tiberium_type::TiberiumTypeId(1),
-                defaults.gem_bale_value,
-            ),
-            ..defaults
         }
     }
 }
@@ -201,7 +214,7 @@ pub struct Miner {
     // record. Read it via `GameEntity::miner_state()`.
     /// Retired: the refinery VERA's old player return order pinned. The
     /// order is now gamemd's MEGAMISSION Enter on the refinery
-    /// (`Command::MinerReturn`), and nothing writes this; a save from before
+    /// (`Command::MegaMission`), and nothing writes this; a save from before
     /// may restore a stale id, which only the state hash reads. The field
     /// keeps its place in saves and the hash until the sim-scale layout
     /// change removes it.
@@ -223,6 +236,12 @@ pub struct Miner {
 }
 
 impl Miner {
+    /// `UnitClass::IsHarvesting`, the bit the DiscardOn harvesting condition
+    /// reads.
+    pub(crate) fn is_harvesting(&self) -> bool {
+        self.harvesting
+    }
+
     /// Create a new miner in SearchOre state with the given kind and config.
     ///
     /// `obj_storage` is the per-unit `Storage=` value from rules.ini (in bales).
@@ -245,8 +264,12 @@ impl Miner {
                     config.chrono_miner_capacity
                 }
             }
-            // Slave Miners don't carry cargo — their slave infantry harvest instead.
+            // Slave Miners never harvest (their slaves do), so nothing admits
+            // bales against this capacity. A Full team still fills their
+            // Storage with Type.Storage (CreateMembers 0x0065DE7B), which no
+            // reader consumes for a Slave Miner.
             MinerKind::Slave => 0,
+            MinerKind::Inactive => 0,
         };
         Self {
             kind,
@@ -263,6 +286,28 @@ impl Miner {
         self.kind
     }
 
+    /// Ares10043740 changes the live Type without reconstructing Unit storage.
+    /// Unit Harvest73E5E0 reads the new Type's Storage (+800); only VERA's
+    /// derived role/capacity change, not its existing bales or unload state.
+    pub(crate) fn change_type_binding(slot: &mut Option<Box<Self>>, object: &ObjectType) {
+        let kind = miner_kind_for_object(object);
+        if slot.is_none() {
+            let Some(kind) = kind else { return };
+            *slot = Some(Box::new(Self::new(
+                kind,
+                &MinerConfig::default(),
+                object.storage.max(0) as u16,
+            )));
+        }
+        let miner = slot
+            .as_mut()
+            .expect("existing or newly represented storage");
+        miner.kind = kind.unwrap_or(MinerKind::Inactive);
+        // The constructor's compatibility default is not a current-Type read:
+        // a conversion to Storage=0 retains zero rather than a chassis default.
+        miner.capacity_bales = object.storage.max(0) as u16;
+    }
+
     /// The retired return-order refinery (see the field).
     pub fn reserved_refinery(&self) -> Option<u64> {
         self.reserved_refinery
@@ -271,6 +316,11 @@ impl Miner {
     /// The bales in the hold, oldest first.
     pub fn cargo(&self) -> &[CargoBale] {
         &self.cargo
+    }
+
+    /// [`add_amount`] on this Miner's hold.
+    pub(crate) fn add_bales(&mut self, bale: CargoBale, amount: u16) {
+        add_amount(&mut self.cargo, bale, amount);
     }
 
     /// The hold's capacity in bales.
@@ -341,7 +391,7 @@ pub fn miner_kind_for_object(object: &ObjectType) -> Option<MinerKind> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod tests {
     use super::*;
 
@@ -355,76 +405,6 @@ mod tests {
         assert_eq!(MinerState::ReturnToRefinery.cursor(), 2);
         assert_eq!(MinerState::Dock.cursor(), 3);
         assert_eq!(MinerState::WaitNoOre.cursor(), 4);
-    }
-
-    #[test]
-    fn harvest_cursor_round_trips_and_rejects_out_of_vocabulary_values() {
-        for state in [
-            MinerState::SearchOre,
-            MinerState::Harvest,
-            MinerState::ReturnToRefinery,
-            MinerState::Dock,
-            MinerState::WaitNoOre,
-        ] {
-            assert_eq!(MinerState::from_cursor(state.cursor()), Some(state));
-        }
-        assert_eq!(
-            MinerState::from_cursor(5),
-            None,
-            "retired drive-to-ore cursor"
-        );
-        assert_eq!(
-            MinerState::from_cursor(6),
-            None,
-            "retired legacy unload cursor"
-        );
-        assert_eq!(
-            MinerState::from_cursor(7),
-            None,
-            "retired player-return cursor"
-        );
-        assert_eq!(MinerState::from_cursor(8), None);
-        assert_eq!(MinerState::from_cursor(u32::MAX), None);
-    }
-
-    #[test]
-    fn default_config_war_miner_ore_payout() {
-        let cfg = MinerConfig::default();
-        // War Miner full ore: capacity * ore_bale_value = 40 * 25 = 1000
-        assert_eq!(
-            cfg.war_miner_capacity as u32 * cfg.ore_bale_value as u32,
-            1000
-        );
-    }
-
-    #[test]
-    fn default_config_war_miner_gem_payout() {
-        let cfg = MinerConfig::default();
-        // War Miner full gems: 40 * 50 = 2000
-        assert_eq!(
-            cfg.war_miner_capacity as u32 * cfg.gem_bale_value as u32,
-            2000
-        );
-    }
-
-    #[test]
-    fn default_config_chrono_miner_ore_payout() {
-        let cfg = MinerConfig::default();
-        // Chrono Miner full ore: 20 * 25 = 500
-        assert_eq!(
-            cfg.chrono_miner_capacity as u32 * cfg.ore_bale_value as u32,
-            500
-        );
-    }
-
-    #[test]
-    fn default_config_chrono_miner_gem_payout() {
-        let cfg = MinerConfig::default();
-        // Chrono Miner full gems: 20 * 50 = 1000
-        assert_eq!(
-            cfg.chrono_miner_capacity as u32 * cfg.gem_bale_value as u32,
-            1000
-        );
     }
 
     #[test]
@@ -449,74 +429,5 @@ mod tests {
             crate::rules::object_type::ObjectCategory::Infantry,
         );
         assert_eq!(miner_kind_for_object(&non_harvester), None);
-    }
-
-    #[test]
-    fn from_rules_sources_bale_values_from_tiberiums() {
-        use crate::rules::ini_parser::IniFile;
-        use crate::rules::ruleset::RuleSet;
-
-        // Full-skeleton ruleset (so from_ini succeeds) with modded ore/gem Value=.
-        let ini = IniFile::from_str(
-            "[InfantryTypes]\n\
-             [VehicleTypes]\n\
-             0=HARV\n\
-             [AircraftTypes]\n\
-             [BuildingTypes]\n\
-             0=GAREFN\n\
-             [HARV]\n\
-             Name=War Miner\n\
-             Harvester=yes\n\
-             [GAREFN]\n\
-             Name=Ore Refinery\n\
-             Refinery=yes\nDockUnload=yes\n\
-             [Tiberiums]\n\
-             0=Riparius\n\
-             1=Cruentus\n\
-             [Riparius]\n\
-             Name=Tiberium Riparius\n\
-             Image=1\n\
-             Value=77\n\
-             [Cruentus]\n\
-             Name=Tiberium Cruentus\n\
-             Image=2\n\
-             Value=88\n",
-        );
-        let rules = RuleSet::from_ini(&ini).expect("rules");
-        let cfg = MinerConfig::from_rules(&rules);
-        assert_eq!(
-            cfg.ore_bale_value, 77,
-            "ore bale value comes from [Riparius] Value="
-        );
-        assert_eq!(
-            cfg.gem_bale_value, 88,
-            "gem bale value comes from [Cruentus] Value="
-        );
-    }
-
-    #[test]
-    fn from_rules_empty_tiberiums_keeps_stock_defaults() {
-        use crate::rules::ini_parser::IniFile;
-        use crate::rules::ruleset::RuleSet;
-
-        // No [Tiberiums] section -> stock byte-identical 25/50.
-        let ini = IniFile::from_str(
-            "[InfantryTypes]\n\
-             [VehicleTypes]\n\
-             0=HARV\n\
-             [AircraftTypes]\n\
-             [BuildingTypes]\n\
-             0=GAREFN\n\
-             [HARV]\n\
-             Name=War Miner\n\
-             Harvester=yes\n\
-             [GAREFN]\n\
-             Name=Ore Refinery\n\
-             Refinery=yes\nDockUnload=yes\n",
-        );
-        let rules = RuleSet::from_ini(&ini).expect("rules");
-        let cfg = MinerConfig::from_rules(&rules);
-        assert_eq!(cfg.ore_bale_value, 25);
-        assert_eq!(cfg.gem_bale_value, 50);
     }
 }

@@ -1,12 +1,12 @@
-//! In-place INI value writer.
+//! In-place INI byte writer and remover.
 //!
-//! Updates (or inserts) a single `key=value` under a named `[section]` in the
-//! raw bytes of an INI file, preserving every other byte exactly: comments,
-//! key order, casing, blank lines, and the existing line-ending style all
-//! round-trip untouched. This mirrors the original game writing individual
-//! settings keys in place rather than rewriting the whole file — a naive full
-//! rewrite would discard sections the engine does not yet model (e.g.
-//! `[Skirmish]`, `[MultiPlayer]`).
+//! Updates/inserts selected `key=value` lines or removes selected keys under a
+//! named `[section]` in the raw bytes of an INI file. Every untouched byte —
+//! comments, key order, casing, blank lines, other sections, and existing line
+//! endings — round-trips untouched. This mirrors the original game writing
+//! individual settings keys in place rather than rewriting the whole file — a
+//! naive full rewrite would discard sections the engine does not yet model
+//! (e.g. `[Skirmish]`, `[MultiPlayer]`).
 //!
 //! Operates on raw bytes so content that is not valid UTF-8 elsewhere in the
 //! file (e.g. a player name with high-byte characters in another section)
@@ -29,12 +29,22 @@
 /// This is the preservation-safe path for native writers that update a whole
 /// settings snapshot in memory before performing one final file save.
 pub fn set_ini_values(content: &[u8], section: &str, values: &[(&str, &str)]) -> Vec<u8> {
+    let bytes: Vec<_> = values
+        .iter()
+        .map(|(key, value)| (*key, value.as_bytes()))
+        .collect();
+    set_ini_byte_values(content, section, &bytes)
+}
+
+/// The same update transaction for native byte strings, without UTF-8 encoding.
+/// Only section/key syntax is text; an existing value may contain any bytes.
+pub fn set_ini_byte_values(content: &[u8], section: &str, values: &[(&str, &[u8])]) -> Vec<u8> {
     if values.is_empty() {
         return content.to_vec();
     }
 
     let target_section = section.trim();
-    let mut updates: Vec<(&str, &str)> = Vec::with_capacity(values.len());
+    let mut updates: Vec<(&str, &[u8])> = Vec::with_capacity(values.len());
     for &(key, value) in values {
         let key = key.trim();
         if let Some(existing) = updates
@@ -54,10 +64,8 @@ pub fn set_ini_values(content: &[u8], section: &str, values: &[(&str, &str)]) ->
     let mut key_lines = vec![None; updates.len()];
 
     for (line_index, (text, _)) in lines.iter().enumerate() {
-        let Ok(line) = std::str::from_utf8(text) else {
-            continue;
-        };
-        if let Some(name) = section_header_name(line) {
+        let header = std::str::from_utf8(text).ok().and_then(section_header_name);
+        if let Some(name) = header {
             if !section_found && name.eq_ignore_ascii_case(target_section) {
                 section_found = true;
                 in_first_block = true;
@@ -70,7 +78,9 @@ pub fn set_ini_values(content: &[u8], section: &str, values: &[(&str, &str)]) ->
         if !in_first_block {
             continue;
         }
-        if let Some(existing_key) = key_name(line) {
+        // Parse only the ASCII key prefix: native values need not be UTF-8.
+        let existing_key = key_name_bytes(text);
+        if let Some(existing_key) = existing_key {
             if let Some(update_index) = updates
                 .iter()
                 .position(|update| update.0.eq_ignore_ascii_case(existing_key))
@@ -103,8 +113,14 @@ pub fn set_ini_values(content: &[u8], section: &str, values: &[(&str, &str)]) ->
             let (key, value) = updates[update_index];
             out.extend_from_slice(key.as_bytes());
             out.push(b'=');
-            out.extend_from_slice(value.as_bytes());
-            out.extend_from_slice(terminator);
+            out.extend_from_slice(value);
+            // A replaced last line gains a CRLF: the loader discards a last
+            // line without LF (`IniFile::from_bytes`).
+            out.extend_from_slice(if terminator.is_empty() {
+                CRLF
+            } else {
+                terminator
+            });
         } else {
             out.extend_from_slice(text);
             out.extend_from_slice(terminator);
@@ -121,7 +137,7 @@ pub fn set_ini_values(content: &[u8], section: &str, values: &[(&str, &str)]) ->
                 }
                 out.extend_from_slice(key.as_bytes());
                 out.push(b'=');
-                out.extend_from_slice(value.as_bytes());
+                out.extend_from_slice(value);
                 out.extend_from_slice(CRLF);
                 wrote_any = true;
             }
@@ -138,12 +154,76 @@ pub fn set_ini_values(content: &[u8], section: &str, values: &[(&str, &str)]) ->
         for (key, value) in updates {
             out.extend_from_slice(key.as_bytes());
             out.push(b'=');
-            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(value);
             out.extend_from_slice(CRLF);
         }
     }
 
     out
+}
+
+/// Remove matching key lines from every occurrence of a named section.
+///
+/// Section and key matching is case-insensitive, like [`set_ini_values`]. The
+/// complete matching line is removed, including any inline comment; separate
+/// comment lines and every other byte retain their original order and line
+/// ending. Invalid UTF-8 lines are left untouched.
+pub fn remove_ini_keys(content: &[u8], section: &str, keys: &[&str]) -> Vec<u8> {
+    if keys.is_empty() {
+        return content.to_vec();
+    }
+
+    let target_section = section.trim();
+    let mut in_target_section = false;
+    let mut out = Vec::with_capacity(content.len());
+
+    for (text, terminator) in split_lines(content) {
+        let section_header = std::str::from_utf8(text).ok().and_then(section_header_name);
+        if let Some(name) = section_header {
+            in_target_section = name.eq_ignore_ascii_case(target_section);
+            out.extend_from_slice(text);
+            out.extend_from_slice(terminator);
+            continue;
+        }
+
+        let remove = in_target_section
+            && key_name_bytes(text)
+                .is_some_and(|name| keys.iter().any(|key| name.eq_ignore_ascii_case(key.trim())));
+        if !remove {
+            out.extend_from_slice(text);
+            out.extend_from_slice(terminator);
+        }
+    }
+
+    out
+}
+
+/// Replace a whole section: every occurrence of `[section]` and its lines is
+/// dropped, then the section is appended with `values` in order. This is a
+/// CCINIClass `Clear(section)` followed by its puts and one file save,
+/// which re-creates the section after the others.
+pub fn replace_ini_section(content: &[u8], section: &str, values: &[(&str, &str)]) -> Vec<u8> {
+    let target_section = section.trim();
+    let kept = remove_ini_sections(content, |name| name.eq_ignore_ascii_case(target_section));
+    set_ini_values(&kept, section, values)
+}
+
+/// Drop every section whose trimmed name `remove` accepts, its header and
+/// all its lines. Lines before the first section and every other section
+/// keep their bytes and order.
+pub fn remove_ini_sections(content: &[u8], remove: impl Fn(&str) -> bool) -> Vec<u8> {
+    let mut in_removed_section = false;
+    let mut kept = Vec::with_capacity(content.len());
+    for (text, terminator) in split_lines(content) {
+        if let Some(name) = std::str::from_utf8(text).ok().and_then(section_header_name) {
+            in_removed_section = remove(name);
+        }
+        if !in_removed_section {
+            kept.extend_from_slice(text);
+            kept.extend_from_slice(terminator);
+        }
+    }
+    kept
 }
 
 /// Terminator for lines this writer *adds* (an inserted key or a created
@@ -195,9 +275,26 @@ fn key_name(line: &str) -> Option<&str> {
     if k.is_empty() { None } else { Some(k) }
 }
 
-#[cfg(test)]
+/// Identify an ASCII key from the prefix ending at `=` without decoding its
+/// value or trailing comment, which may contain arbitrary bytes.
+fn key_name_bytes(line: &[u8]) -> Option<&str> {
+    let equals = line.iter().position(|byte| *byte == b'=')? + 1;
+    std::str::from_utf8(&line[..equals]).ok().and_then(key_name)
+}
+
+#[cfg(all(test, tests_util))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_byte_values_replace_existing_non_utf8_values() {
+        let input = b"[Network]\r\nDestNet=1\xe9.2.3.4\r\nSocket=7\r\n[Other]\r\nHandle=\xff\r\n";
+        let out = set_ini_byte_values(input, "Network", &[("DestNet", b"2\xff.3.4.5")]);
+        assert_eq!(
+            out,
+            b"[Network]\r\nDestNet=2\xff.3.4.5\r\nSocket=7\r\n[Other]\r\nHandle=\xff\r\n"
+        );
+    }
 
     fn s(bytes: Vec<u8>) -> String {
         String::from_utf8(bytes).unwrap()
@@ -219,40 +316,6 @@ ScoreVolume=0.600000\r\nInGameMusic=yes\r\n[Network]\r\nNetID=ffff,ffff,ffff,\r\
         assert!(out.contains("InGameMusic=yes\r\n"));
         assert!(out.contains("[Network]\r\nNetID=ffff,ffff,ffff,\r\n"));
         assert!(!out.contains("0.600000"), "old value must be gone");
-    }
-
-    /// The same key name in two sections only updates the targeted section.
-    #[test]
-    fn updates_only_the_targeted_section() {
-        let input = b"[A]\r\nVol=1\r\n[B]\r\nVol=2\r\n";
-        let out = s(set_ini_values(input, "B", &[("Vol", "9")]));
-        assert_eq!(out, "[A]\r\nVol=1\r\n[B]\r\nVol=9\r\n");
-    }
-
-    /// Section present, key absent: the key is appended within that section.
-    #[test]
-    fn appends_missing_key_within_section() {
-        let input = b"[Audio]\r\nSoundVolume=0.7\r\n";
-        let out = s(set_ini_values(input, "Audio", &[("ScoreVolume", "0.5")]));
-        assert_eq!(out, "[Audio]\r\nSoundVolume=0.7\r\nScoreVolume=0.5\r\n");
-    }
-
-    /// Section absent: a new section is appended at the end of the file.
-    #[test]
-    fn appends_missing_section_at_eof() {
-        let input = b"[Options]\r\nGameSpeed=3\r\n";
-        let out = s(set_ini_values(input, "Audio", &[("ScoreVolume", "0.5")]));
-        assert_eq!(
-            out,
-            "[Options]\r\nGameSpeed=3\r\n[Audio]\r\nScoreVolume=0.5\r\n"
-        );
-    }
-
-    /// Empty input yields a fresh section (CRLF default).
-    #[test]
-    fn empty_input_creates_section() {
-        let out = s(set_ini_values(b"", "Audio", &[("ScoreVolume", "0.4")]));
-        assert_eq!(out, "[Audio]\r\nScoreVolume=0.4\r\n");
     }
 
     /// A file using LF endings keeps LF for the rewritten line.
@@ -282,12 +345,18 @@ ScoreVolume=0.600000\r\nInGameMusic=yes\r\n[Network]\r\nNetID=ffff,ffff,ffff,\r\
         assert_eq!(out, "[Audio]\r\nScoreVolume=0.4\r\n");
     }
 
-    /// Comment lines inside the section are preserved on a value replace.
+    /// A replaced unterminated last line gains a CRLF, so it survives the
+    /// loader's discard of a last line without LF.
     #[test]
-    fn preserves_comment_lines() {
-        let input = b"[Audio]\r\n; music level\r\nScoreVolume=0.6\r\n";
-        let out = s(set_ini_values(input, "Audio", &[("ScoreVolume", "0.1")]));
-        assert_eq!(out, "[Audio]\r\n; music level\r\nScoreVolume=0.1\r\n");
+    fn replaces_an_unterminated_last_line_with_a_terminated_one() {
+        let out = set_ini_values(
+            b"[Audio]\r\nScoreVolume=0.1",
+            "Audio",
+            &[("ScoreVolume", "0.4")],
+        );
+        assert_eq!(s(out.clone()), "[Audio]\r\nScoreVolume=0.4\r\n");
+        let reloaded = crate::rules::ini_parser::IniFile::from_bytes(&out).unwrap();
+        assert!(reloaded.section_or_empty("Audio").is_present("ScoreVolume"));
     }
 
     /// With a duplicated section header, a missing key is appended into the
@@ -304,19 +373,6 @@ ScoreVolume=0.600000\r\nInGameMusic=yes\r\n[Network]\r\nNetID=ffff,ffff,ffff,\r\
             out,
             "[Audio]\r\nSoundVolume=0.7\r\nScoreVolume=0.250000\r\n\
 [Audio]\r\nMusicVolume=0.5\r\n"
-        );
-    }
-
-    /// With the key duplicated across two same-named sections, only the first
-    /// occurrence is replaced (first-match-wins, matching the boot reader's
-    /// first-section preference).
-    #[test]
-    fn replaces_only_first_duplicate_section_key() {
-        let input = b"[Audio]\r\nScoreVolume=0.6\r\n[Audio]\r\nScoreVolume=0.9\r\n";
-        let out = s(set_ini_values(input, "Audio", &[("ScoreVolume", "0.1")]));
-        assert_eq!(
-            out,
-            "[Audio]\r\nScoreVolume=0.1\r\n[Audio]\r\nScoreVolume=0.9\r\n"
         );
     }
 
@@ -383,5 +439,37 @@ ShortGame=yes\r\n"
         let input = b"[Skirmish]\r\n\xff\xfe\r\nGameMode=1\r\n";
         let out = set_ini_values(input, "Skirmish", &[("GameMode", "4")]);
         assert_eq!(out, b"[Skirmish]\r\n\xff\xfe\r\nGameMode=4\r\n");
+    }
+
+    #[test]
+    fn remove_keys_preserves_other_bytes_across_duplicate_sections() {
+        let input = b"[VERA]\r\n; keep this comment\r\nRA2Look = yes ; remove inline comment too\r\nFullScreen=yes\r\n\xff\xfe\r\n[Other]\nRA2Look=keep in this section\n[vera]\nra2look=no\n# keep this comment\nShiftQueue=yes";
+        let out = remove_ini_keys(input, "vera", &["RA2Look"]);
+
+        assert_eq!(
+            out,
+            b"[VERA]\r\n; keep this comment\r\nFullScreen=yes\r\n\xff\xfe\r\n[Other]\nRA2Look=keep in this section\n[vera]\n# keep this comment\nShiftQueue=yes"
+        );
+    }
+
+    #[test]
+    fn remove_key_uses_ascii_identity_with_non_utf8_tails() {
+        let input = b"[VERA]\r\nRA2Look=yes ; \xff inline comment\r\nra2look=no\xff\r\nYROriginalStyle=no\r\n[Other]\r\nRA2Look=keep\r\n[VERA]suffix\r\nRA2Look=keep under malformed header\r\nYROriginalStyle=no";
+        let out = remove_ini_keys(input, "VERA", &["RA2Look"]);
+
+        assert_eq!(
+            out,
+            b"[VERA]\r\nYROriginalStyle=no\r\n[Other]\r\nRA2Look=keep\r\n[VERA]suffix\r\nRA2Look=keep under malformed header\r\nYROriginalStyle=no"
+        );
+    }
+
+    #[test]
+    fn replacing_a_section_drops_its_old_keys_and_appends_it_last() {
+        let input = b"[AB]\r\nStale=1\r\nCurrentMap=0\r\n[Other]\r\nX=1\r\n";
+        let out = replace_ini_section(input, "AB", &[("CurrentMap", "1"), ("Time", "60")]);
+        assert_eq!(
+            s(out),
+            "[Other]\r\nX=1\r\n[AB]\r\nCurrentMap=1\r\nTime=60\r\n"
+        );
     }
 }

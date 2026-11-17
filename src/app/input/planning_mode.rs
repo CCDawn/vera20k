@@ -2,23 +2,53 @@
 //! Native PlanMgr6379C0/637A10, command536750 and connect63AD50.
 
 use crate::app::AppState;
+use crate::app::input::dispatch::selected_in_order;
 use crate::app::input::hotkeys::{HotkeyCommand, HotkeyResolution};
+use crate::app::match_runtime::sim_host::SimWrite;
 use crate::audio::events::{GameSoundEvent, SoundEventQueue};
-use crate::net::lockstep::SynchronizedCommand;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::command::CommandEnvelope;
 use crate::sim::selection::SelectionState;
-use crate::sim::world::{PlanningPressRefusal, Simulation};
+use crate::sim::world::{
+    PlanningAppendMessage, PlanningPressRefusal, PlanningSelectionCheck, Simulation,
+};
 use winit::event::ElementState;
 use winit::keyboard::KeyCode;
+
+/// The local house's PLANCOMMIT that leaving Planning Mode issues
+/// (Planning__EndMode ->637A10), stamped for the current tick.
+pub(crate) fn plan_commit_command(sim: &Simulation) -> Option<CommandEnvelope> {
+    let owner = sim.session().current_house()?;
+    let record = sim.encode_plan_commit_record(owner)?;
+    Some(CommandEnvelope::synchronized(record, sim.session().tick()))
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct PlanningInputState {
     active: bool,
     key: Option<KeyCode>,
-    refusal_tick: Option<u64>,
-    /// PlanMgr AC4BF0, a local display association retained after node delete.
+    /// AC4C08: one refusal message and ScoldSound per PlanMgr637270 pass.
+    refusal_latched: bool,
+    /// PlanMgr AC4BF0, the node a click with nothing selected retains
+    /// (0x0063B02F) for Delete (0x00731A10). Local display state, never
+    /// synchronized; a destroyed node's id no longer resolves.
     highlighted_node: Option<u64>,
+    /// AC4C90: the append's message for the next frame pass (0x006383BF).
+    frame_pass_message: Option<PlanningAppendMessage>,
+    /// AC4BF4..AC4C04: the help counters 0x0063A120 (0 Intro1Button,
+    /// 1 Intro1Key, 2 Intro3) and 0x0063A1B0 (3 LoopHelp, 4 DeleteHelp)
+    /// index. Planning__ResetState clears them (0x00637212).
+    help_shown: [i32; 5],
+    /// AC4C68/AC4C6C: the right press point 0x0063AAC0 keeps for the
+    /// highlight's release test, -1 when it keeps none.
+    right_press: [i32; 2],
+    /// AC4CB0 set by the right press 0x0063AAC0, holding the hover AC4CCC
+    /// that 0x00638E60 then stops updating, until the release 0x0063AB00.
+    right_hover: Option<Option<u64>>,
+    /// The hover node last found with the world home, which a draw beside
+    /// a lent tick reads (docs/sim-thread.md): the hover asks the selection,
+    /// which reads the live objects.
+    hover_seen: std::cell::RefCell<Option<u64>>,
 }
 
 impl PlanningInputState {
@@ -28,6 +58,9 @@ impl PlanningInputState {
     pub(crate) fn highlighted_node(&self) -> Option<u64> {
         self.highlighted_node
     }
+    /// Planning__ExecuteEvent's delete hands the local house's highlight to
+    /// the deleted node's first member successor (0x006380EE); the node's
+    /// destructor clears a highlight on the node itself.
     pub(crate) fn node_deleted(&mut self, node_id: u64, next_node: Option<u64>) {
         if next_node.is_some() {
             self.highlighted_node = next_node;
@@ -41,17 +74,20 @@ impl PlanningInputState {
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
+    /// Install supplied state for local-handler comparison fixtures. Player
+    /// load uses reset; it does not restore active YR planning.
+    #[cfg(test)]
     pub(crate) fn restore_active(&mut self, active: bool) {
-        self.active = active;
-        self.key = None;
-        self.refusal_tick = None;
-        self.highlighted_node = None;
+        *self = Self {
+            active,
+            ..Self::default()
+        };
     }
 
     /// The single PlanMgr6379C0/637A10 transition, also reached by
     /// House4FC1EE. Return the native OutList event to the caller's existing
     /// scheduler; a House visit must admit it before this frame's dispatch.
-    /// Original1cdd controls: tools/spatial_oracle/planning_local_defeat.
+    /// Original gamemd controls: tools/spatial_oracle/planning_local_defeat.
     pub(crate) fn set_active(
         &mut self,
         active: bool,
@@ -68,14 +104,14 @@ impl PlanningInputState {
         let commit = if active {
             None
         } else {
-            sim.and_then(|sim| {
-                let owner = sim.session.current_house()?;
-                let record = sim.encode_plan_commit_record(owner)?;
-                SynchronizedCommand::opaque(record).decode_for_simulation(sim, sim.session.tick)
-            })
+            sim.and_then(plan_commit_command)
         };
+        // Planning__EndMode clears AC4CCC and AC4BF0 (0x00637A52..0x00637A5E).
         if !active {
             self.highlighted_node = None;
+            if let Some(held) = self.right_hover.as_mut() {
+                *held = None;
+            }
         }
         self.active = active;
         selection.cancel_drag();
@@ -92,13 +128,96 @@ impl PlanningInputState {
         commit
     }
 
-    // Native63753F resets AC4C08 in the per-frame PlanMgr637270 pass.
-    fn admit_refusal(&mut self, tick: u64) -> bool {
-        if self.refusal_tick == Some(tick) {
+    fn admit_refusal(&mut self) -> bool {
+        !std::mem::replace(&mut self.refusal_latched, true)
+    }
+
+    /// One key walk's `calls` to 639FD0 (ClickedEvent6FFE00 in Planning
+    /// Mode). Each call posts the message with a ScoldSound when AC4C08 is
+    /// clear (`0x00639FD6..0x0063A09E`), then plays ScoldSound again whatever
+    /// the latch (`0x0063A0A3..0x0063A0BB`). Returns whether the message
+    /// posts and how many ScoldSounds start.
+    fn clicked_event_refusal(&mut self, calls: usize) -> (bool, usize) {
+        let posts = calls > 0 && self.admit_refusal();
+        (posts, calls + usize::from(posts))
+    }
+
+    /// The help counter test of 0x0063A1B0 (`threshold` 1) and 0x0063A120,
+    /// which counts every attempt it shows.
+    fn admit_help(&mut self, index: usize, threshold: i32) -> bool {
+        if self.help_shown[index] >= threshold {
             return false;
         }
-        self.refusal_tick = Some(tick);
+        self.help_shown[index] += 1;
         true
+    }
+
+    /// FUN_0063A120 after PlanningModeCommand__OnPress 0x00731A50 (DL=1) or
+    /// __OnRelease 0x00731A70 (DL=0): the message to show, if any. The
+    /// keyboard's (CL=0) show once per scenario; the button's (CL=1) compare
+    /// against count+1 and so show every time, still counting.
+    fn intro(&mut self, button: bool, press: bool) -> Option<&'static str> {
+        let (index, csf_key) = match (press, button) {
+            (true, true) => (0, "MSG:PlanningModeIntro1Button"),
+            (true, false) => (1, "MSG:PlanningModeIntro1Key"),
+            (false, _) => (2, "MSG:PlanningModeIntro3"),
+        };
+        let threshold = if button {
+            self.help_shown[index] + 1
+        } else {
+            1
+        };
+        self.admit_help(index, threshold).then_some(csf_key)
+    }
+
+    /// Planning__ConnectSelectionToNode 0x0063AD50 with nothing selected
+    /// (0x0063AD79 -> 0x0063B02F): retain the node as AC4BF0, then
+    /// 0x0063A1B0(4) answers DeleteHelp once.
+    fn retain_clicked_node(&mut self, node: u64) -> Option<&'static str> {
+        self.highlighted_node = Some(node);
+        self.admit_help(4, 1)
+            .then_some("MSG:PlanningModeDeleteHelp")
+    }
+
+    /// FUN_0063AAC0: hold the current hover (AC4CB0) and keep `point` only
+    /// while planning with nothing selected, else -1.
+    fn right_press(&mut self, hover: Option<u64>, empty_selection: bool, point: [i32; 2]) {
+        self.right_hover = Some(hover);
+        self.right_press = if self.active && empty_selection {
+            point
+        } else {
+            [-1, -1]
+        };
+    }
+
+    /// Game__PlanningManager_WM_RBUTTONUP 0x0063AB00: release the hover; a
+    /// release within 3 pixels of the press, planning with nothing selected,
+    /// drops the retained highlight.
+    fn right_release(&mut self, empty_selection: bool, point: [i32; 2]) {
+        self.right_hover = None;
+        if self.active
+            && empty_selection
+            && self.highlighted_node.is_some()
+            && (point[0] - self.right_press[0]).abs() <= 3
+            && (point[1] - self.right_press[1]).abs() <= 3
+        {
+            self.highlighted_node = None;
+        }
+    }
+
+    /// PlanMgr_Process_Frame's input head: a selection drops the retained
+    /// highlight (0x0063727B..0x0063728F); answers the queued AC4C90
+    /// message (0x0063744E), consumed (0x00637524).
+    fn begin_frame_pass(&mut self, empty_selection: bool) -> Option<PlanningAppendMessage> {
+        if !empty_selection {
+            self.highlighted_node = None;
+        }
+        self.frame_pass_message.take()
+    }
+
+    /// PlanMgr_Process_Frame's input tail: AC4C08 resets (0x0063753F).
+    fn end_frame_pass(&mut self) {
+        self.refusal_latched = false;
     }
 
     fn key_transition(
@@ -142,13 +261,16 @@ pub(crate) fn key_edge(
     else {
         return false;
     };
-    set_active(state, active);
+    // PlanningModeCommandClass::Execute 0x00536750 passes CL=0 (keyboard).
+    set_active(state, active, (!repeat).then_some(false));
     true
 }
 
-pub(crate) fn toggle(state: &mut AppState) {
+/// TabClass::Action 0x006D07B4/0x006D07BE passes CL=1 (the command-bar
+/// button); the retail hotkey route is the keyboard's.
+pub(crate) fn toggle(state: &mut AppState, button: bool) {
     let active = !state.match_state.input.planning.active();
-    set_active(state, active);
+    set_active(state, active, Some(button));
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,45 +280,124 @@ pub(crate) enum PlanningRefusal {
     Scatter,
     Deploy,
     Capacity,
+    Heterogeneous,
+    /// Refused with no message, sound or latch (a selection with no Techno).
+    Silent,
     Press(PlanningPressRefusal),
+    Append(PlanningAppendMessage),
 }
 
 impl PlanningRefusal {
-    fn csf_key(self) -> &'static str {
-        match self {
+    fn csf_key(self) -> Option<&'static str> {
+        Some(match self {
             Self::Guard => "MSG:PlanningModeNoGuardArea",
             Self::Stop => "MSG:PlanningModeNoStop",
             Self::Scatter => "MSG:PlanningModeNoScatter",
             Self::Deploy => "MSG:PlanningModeNoDeploy",
             Self::Capacity => "MSG:PlannerMaximum",
+            Self::Heterogeneous => "MSG:PlanningModeHeteroSel",
             // 0x0063A5A0 loads these literals; "X" is part of the key.
             Self::Press(PlanningPressRefusal::InvalidNode) => "MSG:PlanningModeInvalidNodeX",
             Self::Press(PlanningPressRefusal::NoAircraft) => "MSG:PlanningModeNoAircraft",
             Self::Press(PlanningPressRefusal::NoBuildings) => "MSG:PlanningModeNoBuildings",
             Self::Press(PlanningPressRefusal::NoUnknowns) => "MSG:PlanningModeNoUnknowns",
-        }
+            // 0x00638120 and PlanMgr637270 load these literals.
+            Self::Append(PlanningAppendMessage::PostTerminatingCommand) => {
+                "MSG:PostTerminatingCommand"
+            }
+            Self::Append(PlanningAppendMessage::PostContinualCommand) => "MSG:PostContinualCommand",
+            Self::Append(PlanningAppendMessage::PostLoop) => "MSG:PostLoop",
+            Self::Append(PlanningAppendMessage::NodeMaximum) => "MSG:NodeMaximum",
+            Self::Silent => return None,
+        })
     }
 }
 
-/// Guard730D60 ->63A0D0, ClickedEvent6FFE00 ->639FD0 and639130 share
+/// Guard730D60 ->63A0D0, 639130, the append 638120 and PlanMgr637270 share
 /// AC4C08, silent730A90 duration1E0, and Rules+700 ScoldSound.
+/// ClickedEvent6FFE00 ->639FD0 shares them too and scolds once more:
+/// [`refuse_clicked_event`].
 pub(crate) fn refuse(state: &mut AppState, action: PlanningRefusal) {
-    let Some(tick) = state
-        .match_state
-        .sim_runtime
-        .as_ref()
-        .map(|rt| rt.simulation.session.tick)
-    else {
+    let Some(csf_key) = action.csf_key() else {
         return;
     };
-    if !state.match_state.input.planning.admit_refusal(tick) {
+    if !state.match_state.input.planning.admit_refusal() {
         return;
     }
-    crate::app::input::messages::post_planning_refusal(state, action.csf_key());
+    crate::app::input::messages::post_planning_message(state, csf_key);
     let sound = state
         .rules()
         .and_then(|rules| rules.general.scold_sound.clone());
     ui_sound(state, sound);
+}
+
+/// ClickedEvent6FFE00 ->639FD0 for the Stop, Scatter and Deploy keys: the
+/// latched message of [`refuse`], and an unlatched second ScoldSound on every
+/// call. The Stop and Scatter walks end at their first refusal
+/// (`0x00730EF5`, ScatterSelectedObjects `0x00730FE0`), one call; the Deploy
+/// walk goes on (`0x00730D1D`), one call per object it admits.
+pub(crate) fn refuse_clicked_event(state: &mut AppState, action: PlanningRefusal, calls: usize) {
+    let Some(csf_key) = action.csf_key() else {
+        return;
+    };
+    let (posts, scolds) = state
+        .match_state
+        .input
+        .planning
+        .clicked_event_refusal(calls);
+    if posts {
+        crate::app::input::messages::post_planning_message(state, csf_key);
+    }
+    let sound = state
+        .rules()
+        .and_then(|rules| rules.general.scold_sound.clone());
+    for _ in 0..scolds {
+        ui_sound(state, sound.clone());
+    }
+}
+
+/// A sim lifecycle output of the append 0x00638120 for `owner`; only the
+/// local house's are shown (event house == PlayerPtr, 0x0063814C).
+pub(crate) fn append_output(
+    state: &mut AppState,
+    local: bool,
+    message: PlanningAppendMessage,
+    frame_pass: bool,
+) {
+    if !local {
+        return;
+    }
+    if frame_pass {
+        state.match_state.input.planning.frame_pass_message = Some(message);
+    } else {
+        refuse(state, PlanningRefusal::Append(message));
+    }
+}
+
+/// The input tail of PlanMgr_Process_Frame 0x00637270, once per logic
+/// frame: a selection drops the retained highlight (0x0063727B..0x0063728F);
+/// a queued AC4C90 message deselects everything through
+/// Tactical::Unselect_All 0x006DA740 (0x00637463) and posts under the latch
+/// (0x0063746C..0x0063751F); then AC4C08 resets (0x0063753F).
+/// Residual: Tactical::Unselect_All skips the beacon ClearSelection that
+/// VERA's shared unselect owner (0x0048DC90) also runs. Trigger: a selected
+/// beacon when a planned terminal order or fifteenth node executes. Effect:
+/// the beacon is deselected too. Frequency: rare.
+pub(crate) fn frame_pass(state: &mut AppState) {
+    let empty = selected_in_order(state).is_empty();
+    if let Some(message) = state.match_state.input.planning.begin_frame_pass(empty) {
+        crate::app::input::dispatch::unselect_all(state);
+        refuse(state, PlanningRefusal::Append(message));
+    }
+    state.match_state.input.planning.end_frame_pass();
+}
+
+/// 0x0063A120/0x0063A1B0's help: a silent 730A90 post with duration 1E0,
+/// no latch and no sound.
+fn post_help(state: &mut AppState, csf_key: Option<&str>) {
+    if let Some(csf_key) = csf_key {
+        crate::app::input::messages::post_planning_message(state, csf_key);
+    }
 }
 
 /// Host adaptation: a lost release must not leave the local mode latched.
@@ -204,7 +405,7 @@ pub(crate) fn refuse(state: &mut AppState, action: PlanningRefusal) {
 /// native WM_ACTIVATEAPP planning equivalence is not established here.
 pub(crate) fn release_on_focus_change(state: &mut AppState) {
     state.match_state.input.planning.key = None;
-    set_active(state, false);
+    set_active(state, false, None);
 }
 
 fn ui_sound(state: &mut AppState, sound: Option<String>) {
@@ -217,8 +418,16 @@ fn ui_sound(state: &mut AppState, sound: Option<String>) {
     }
 }
 
-fn set_active(state: &mut AppState, active: bool) {
-    let rt = state.match_state.sim_runtime.as_mut();
+/// `intro_source` is the OnPress/OnRelease CL source (true for the button);
+/// None for the host focus release, which has no native command.
+fn set_active(state: &mut AppState, active: bool, intro_source: Option<bool>) {
+    // 0x00731A50/0x00731A78 test Session+300 before 63A120.
+    let defeated = state
+        .match_state
+        .sim_runtime
+        .runtime()
+        .is_some_and(|rt| rt.simulation.local_player_defeated());
+    let rt = state.match_state.sim_runtime.write_sim(SimWrite::Command);
     let command = state.match_state.input.planning.set_active(
         active,
         rt.as_ref().map(|rt| &rt.simulation),
@@ -229,7 +438,13 @@ fn set_active(state: &mut AppState, active: bool) {
         &mut state.match_state.match_audio.sound_events,
     );
     if let (Some(rt), Some(command)) = (rt, command) {
-        rt.simulation.queue_command(command);
+        rt.simulation.issue_local_command(command);
+    }
+    if let Some(button) = intro_source
+        && !defeated
+    {
+        let message = state.match_state.input.planning.intro(button, active);
+        post_help(state, message);
     }
 }
 
@@ -240,14 +455,15 @@ pub(crate) fn queue_orders(
     state: &mut AppState,
     selected: &[u64],
     orders: Vec<CommandEnvelope>,
+    clicked_cell: Option<(u16, u16)>,
 ) -> bool {
-    let Some(rt) = state.match_state.sim_runtime.as_mut() else {
+    let Some(rt) = state.match_state.sim_runtime.write_sim(SimWrite::Command) else {
         return false;
     };
-    let Some(owner) = rt.simulation.session.current_house() else {
+    let Some(owner) = rt.simulation.session().current_house() else {
         return false;
     };
-    match queue_orders_in_sim(&mut rt.simulation, owner, selected, orders) {
+    match queue_orders_in_sim(&mut rt.simulation, owner, selected, orders, clicked_cell) {
         Ok(_) => true,
         Err(refusal) => {
             refuse(state, refusal);
@@ -261,10 +477,21 @@ fn queue_orders_in_sim(
     owner: crate::sim::intern::InternedId,
     selected: &[u64],
     orders: Vec<CommandEnvelope>,
+    clicked_cell: Option<(u16, u16)>,
 ) -> Result<bool, PlanningRefusal> {
     //4ABF7F's selection-wide admission precedes4AE750 for primary clicks
     // and ordinary planned missions. It is not a receiver/encoding guard.
-    if !sim.planning_selection_has_capacity(owner, selected) {
+    // 0x004ABF78 runs both checks before testing either, so under the
+    // per-frame refusal latch the mixed-selection message wins.
+    let check = sim.planning_selection_check(selected);
+    let capacity = sim.planning_selection_has_capacity(owner, selected);
+    match check {
+        PlanningSelectionCheck::Admit => {}
+        PlanningSelectionCheck::Heterogeneous => return Err(PlanningRefusal::Heterogeneous),
+        PlanningSelectionCheck::Refuse if capacity => return Err(PlanningRefusal::Silent),
+        PlanningSelectionCheck::Refuse => {}
+    }
+    if !capacity {
         return Err(PlanningRefusal::Capacity);
     }
     let mut added = false;
@@ -273,50 +500,72 @@ fn queue_orders_in_sim(
             order.payload,
             crate::sim::command::Command::TogglePrimaryFactory { .. }
                 | crate::sim::command::Command::SetRally { .. }
+                | crate::sim::command::Command::ArchiveObject { .. }
                 | crate::sim::command::Command::SellBuilding { .. }
                 | crate::sim::command::Command::UndeployBuilding { .. }
+                | crate::sim::command::Command::MoveFlash { .. }
         ) {
             // Selection4AE750 -> Building443410/4436F0 sends direct
             // PRIMARY17 / ARCHIVE1E / SELL16. These do not use
             // Player_Send_Command6FFBE0. The deploy key is separately
             // refused as DEPLOY9; a mobile self-click is Unload16.
-            sim.queue_command(order);
+            // ClickedAction_Cell builds the MoveFlash (`0x004D7EB5`) before
+            // its Move reaches Player_Send_Command.
+            let Some(order) = super::commands::encode_ordinary_local_command(sim, order) else {
+                continue;
+            };
+            sim.issue_local_command(order);
             added = true;
             continue;
         }
-        let Some(record) = sim.encode_planning_order_record(order.owner, &order.payload) else {
+        let Some(record) =
+            sim.encode_planning_order_record(order.owner, &order.payload, clicked_cell)
+        else {
             continue;
         };
-        if let Some(envelope) =
-            SynchronizedCommand::opaque(record).decode_for_simulation(sim, order.execute_tick)
-        {
-            sim.queue_command(envelope);
-            added = true;
-        }
+        sim.issue_local_command(CommandEnvelope::synchronized(record, order.execute_tick));
+        added = true;
     }
     Ok(added)
 }
 
-/// The hover node AC4CCC that the cursor 63AB60 and the release connect
-/// 63A8E0 read: an own node under the cursor the selection may connect to.
-pub(crate) fn node_at_cursor(state: &AppState) -> Option<(u16, u16)> {
-    let point = hover_native_screen(state)?;
-    let sim = &state.match_state.sim_runtime.as_ref()?.simulation;
-    let owner = sim.session.current_house()?;
-    sim.planning_node_at_screen(owner, &selected_in_order(state), point)
+/// The hover node AC4CCC (0x00638E60): an own node under the cursor the
+/// selection may connect to. While a right press holds AC4CB0 it keeps the
+/// node it had at the press (0x00638E60's early return).
+pub(crate) fn hover_node(state: &AppState) -> Option<u64> {
+    if let Some(held) = state.match_state.input.planning.right_hover {
+        // Planning nodes are not objects: the presentation copy keeps them.
+        let sim = &state.match_state.sim_runtime.runtime()?.simulation;
+        return held.filter(|&node| sim.planning_node_exists(node));
+    }
+    live_hover_node(state)
 }
 
-pub(crate) fn selected_in_order(state: &AppState) -> Vec<u64> {
-    crate::app::input::dispatch::selected_stable_ids_in_order(
-        state
-            .match_state
-            .sim_runtime
-            .as_ref()
-            .map(|rt| &rt.simulation),
-        state.rules(),
-        &state.match_state.input.selection_order,
-        state.match_state.input.selection_order_pending,
+fn live_hover_node(state: &AppState) -> Option<u64> {
+    crate::app::match_runtime::sim_host::home_answer(
+        &state.match_state.sim_runtime,
+        &state.match_state.input.planning.hover_seen,
+        || find_hover_node(state),
     )
+}
+
+fn find_hover_node(state: &AppState) -> Option<u64> {
+    let point = hover_native_screen(state)?;
+    let sim = &state.match_state.sim_runtime.runtime()?.simulation;
+    let owner = sim.session().current_house()?;
+    // Only a node under the cursor reads the selection, which walks every
+    // object: the cursor asks this at every draw.
+    sim.planning_node_id_at_screen(Some(owner), point)?;
+    sim.planning_hover_node(owner, &selected_in_order(state), point)
+}
+
+/// Planning__UpdateNodeHoverCursor 0x0063AB60 answers the planning cursor
+/// over the hover node, and nothing while AC4CB0 is set (0x0063AB76).
+pub(crate) fn node_at_cursor(state: &AppState) -> Option<u64> {
+    if state.match_state.input.planning.right_hover.is_some() {
+        return None;
+    }
+    live_hover_node(state)
 }
 
 /// ScrollClass's left press runs PlanMgr 0x0063A5A0 (0x00693187) before it
@@ -331,7 +580,7 @@ pub(crate) fn refuse_press_at_cursor(state: &mut AppState) -> bool {
     let Some(refusal) = state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .and_then(|rt| rt.simulation.planning_press_refusal(&selected, point))
     else {
         return false;
@@ -345,90 +594,136 @@ pub(crate) fn hover_native_screen(state: &AppState) -> Option<[i32; 2]> {
     if !state.match_state.input.planning.active() {
         return None;
     }
-    let (width, height) = crate::app::input::camera::tactical_viewport_size(state);
-    let (x, y) = (
-        state.match_state.input.cursor_x,
-        state.match_state.input.cursor_y,
-    );
-    if x < 0. || y < 0. || x >= width as f32 || y >= height as f32 {
+    if !crate::app::input::camera::cursor_over_battlefield(state) {
         return None;
     }
     Some(cursor_native_screen(state))
 }
 
 fn cursor_native_screen(state: &AppState) -> [i32; 2] {
-    let (x, y, _, _) = crate::app::input::camera::tactical_viewport_px(state);
-    input_native_screen(&state.match_state.input, [x as i32, y as i32])
+    input_native_screen(&state.match_state.input)
 }
 
-fn input_native_screen(
-    input: &crate::app::input::state::MatchInputState,
-    origin: [i32; 2],
-) -> [i32; 2] {
-    // Match the overlay's rounded camera and logical clip origin, using the
-    // shared inverse view transform before quantizing its native hit point.
+fn input_native_screen(input: &crate::app::input::state::MatchInputState) -> [i32; 2] {
+    // Match the overlay's rounded camera, using the shared inverse view
+    // transform before quantizing its native hit point. The camera is the
+    // world point at the frame's corner, so the cursor's frame pixel needs
+    // no battlefield origin.
     let point = crate::app::match_runtime::sim_tick::screen_point_to_world_with_camera(
         (input.cursor_x, input.cursor_y),
         (input.camera_x.round(), input.camera_y.round()),
         input.zoom_level,
     );
-    [
-        point.0.floor() as i32 - origin[0],
-        point.1.floor() as i32 - origin[1],
-    ]
+    [point.0.floor() as i32, point.1.floor() as i32]
 }
 
 /// PlanMgr 0x0063A8E0 on the left release: connect at an admitted hover
 /// node, or swallow a release over a node the selection may not connect to.
+/// Planning__ConnectSelectionToNode 0x0063AD50 retains the node as AC4BF0
+/// when nothing is selected (0x0063AD79 -> 0x0063B02F) and shows DeleteHelp
+/// once (0x0063B034); otherwise LoopHelp follows any collected actor
+/// (0x0063AFD9..0x0063B008).
+/// Residual: the press-held AC4C38 is not kept, so this connects the hover
+/// node of the release, and a left release during a held right press uses
+/// the live hover, not the AC4CCC 0x0063AAC0 froze. Trigger: a press and
+/// release over different nodes, or a left click while the right button is
+/// held. Effect: the connect or highlight lands on the release's node.
+/// Frequency: rare.
 pub(crate) fn connect_at_cursor(state: &mut AppState) -> bool {
     let selected = selected_in_order(state);
-    if node_at_cursor(state).is_none() {
+    let Some(node) = live_hover_node(state) else {
         return hover_native_screen(state).is_some_and(|point| {
             state
                 .match_state
                 .sim_runtime
-                .as_ref()
+                .runtime()
                 .is_some_and(|rt| rt.simulation.planning_release_refused(&selected, point))
         });
+    };
+    if selected.is_empty() {
+        let message = state.match_state.input.planning.retain_clicked_node(node);
+        post_help(state, message);
+        return true;
     }
     let point = cursor_native_screen(state);
-    if let Some(rt) = state.match_state.sim_runtime.as_mut()
-        && let Some(owner) = rt.simulation.session.current_house()
+    let mut collected = false;
+    if let Some(rt) = state.match_state.sim_runtime.write_sim(SimWrite::Command)
+        && let Some(owner) = rt.simulation.session().current_house()
     {
-        for actor in rt.simulation.planning_connect_actors(owner, &selected) {
+        for actor in rt.simulation.planning_connect_actors(&selected) {
+            collected = true;
             if let Some(record) = rt
                 .simulation
                 .encode_plan_connect_record_at_screen(owner, actor, point)
-                && let Some(command) = SynchronizedCommand::opaque(record)
-                    .decode_for_simulation(&rt.simulation, rt.simulation.session.tick)
             {
-                rt.simulation.queue_command(command);
+                let command = CommandEnvelope::synchronized(record, rt.simulation.session().tick());
+                rt.simulation.issue_local_command(command);
             }
         }
+    }
+    if collected && state.match_state.input.planning.admit_help(3, 1) {
+        post_help(state, Some("MSG:PlanningModeLoopHelp"));
     }
     true
 }
 
-/// Residual: native Delete (0x00731A10) deletes the retained highlight
-/// AC4BF0 (0x0063AC60), not the node under the cursor.
-pub(crate) fn delete_at_cursor(state: &mut AppState) {
-    if hover_native_screen(state).is_none() {
-        return;
+/// DeleteCommand__DeletePlanNodeOrBeacon 0x00731A10: with a retained
+/// highlight (FUN_0063AC60) queue its node delete event
+/// (Planning__QueueNodeDeleteEvent 0x00637D00); false without one, where
+/// Delete turns to the selected beacon (0x00731A24).
+pub(crate) fn delete_highlighted(state: &mut AppState) -> bool {
+    let Some(node) = state.match_state.input.planning.highlighted_node else {
+        return false;
+    };
+    let Some(rt) = state.match_state.sim_runtime.write_sim(SimWrite::Command) else {
+        return false;
+    };
+    if !rt.simulation.planning_node_exists(node) {
+        return false;
     }
-    let point = cursor_native_screen(state);
-    if let Some(rt) = state.match_state.sim_runtime.as_mut()
-        && let Some(owner) = rt.simulation.session.current_house()
+    if let Some(owner) = rt.simulation.session().current_house()
         && let Some(record) = rt
             .simulation
-            .encode_plan_node_delete_record_at_screen(owner, point)
-        && let Some(command) = SynchronizedCommand::opaque(record)
-            .decode_for_simulation(&rt.simulation, rt.simulation.session.tick)
+            .encode_plan_node_delete_record_for_node(owner, node)
     {
-        rt.simulation.queue_command(command);
+        let command = CommandEnvelope::synchronized(record, rt.simulation.session().tick());
+        rt.simulation.issue_local_command(command);
     }
+    true
 }
 
-#[cfg(test)]
+/// The tactical client point (logical pixels) ScrollClass hands PlanMgr's
+/// right-button handlers (0x006932BD..0x006932C4).
+fn tactical_point(state: &AppState) -> [i32; 2] {
+    let input = &state.match_state.input;
+    [
+        (input.cursor_x / input.zoom_level).floor() as i32,
+        (input.cursor_y / input.zoom_level).floor() as i32,
+    ]
+}
+
+/// FUN_0063AAC0, called on every tactical right press (0x006932D0) before
+/// the capture test.
+pub(crate) fn right_press(state: &mut AppState) {
+    let hover = hover_node(state);
+    let empty = selected_in_order(state).is_empty();
+    let point = tactical_point(state);
+    state
+        .match_state
+        .input
+        .planning
+        .right_press(hover, empty, point);
+}
+
+/// 0x0063AB00, called on every tactical right release (0x0069338A) before
+/// the capture test.
+pub(crate) fn right_release(state: &mut AppState) {
+    let empty = selected_in_order(state).is_empty();
+    let point = tactical_point(state);
+    state.match_state.input.planning.right_release(empty, point);
+}
+
+#[cfg(all(test, tests_app_input_d_z))]
 mod tests {
     use super::*;
     use crate::map::entities::EntityCategory;
@@ -450,27 +745,24 @@ mod tests {
                         target_rx: 5,
                         target_ry: 7,
                     },
+                    None,
                 )
                 .unwrap();
             let command = sim.decode_native_command_record(&record, 0).unwrap();
             assert!(sim.apply_command("Local", &command.payload, None));
-            let coord = sim.planning_draw_graph(local, &[], None, None).nodes[0].coord;
+            let coord = sim.planning_draw_graph(local, None, None).nodes[0].coord;
             let (x, y) = crate::util::lepton::absolute_leptons_to_screen(coord.x, coord.y, coord.z);
             let mut input = crate::app::input::state::MatchInputState::new(Default::default());
             input.camera_x = x - 100.25;
             input.camera_y = y - 80.75;
             input.zoom_level = zoom;
-            let origin = [13, 17];
             // Forward projection mirrors the render viewport, including its
-            // rounded camera and logical clip origin.
-            input.cursor_x = (x as i32 - input.camera_x.round() as i32 + origin[0]) as f32 * zoom;
-            input.cursor_y = (y as i32 - input.camera_y.round() as i32 + origin[1]) as f32 * zoom;
-            let point = input_native_screen(&input, origin);
-            assert_eq!(
-                sim.planning_node_at_screen(local, &[], point),
-                Some((5, 7)),
-                "zoom {zoom}"
-            );
+            // rounded camera.
+            input.cursor_x = (x as i32 - input.camera_x.round() as i32) as f32 * zoom;
+            input.cursor_y = (y as i32 - input.camera_y.round() as i32) as f32 * zoom;
+            let point = input_native_screen(&input);
+            let node = sim.planning_hover_node(local, &[], point);
+            assert!(node.is_some(), "zoom {zoom}");
             let connect = sim
                 .encode_plan_connect_record_at_screen(local, 43, point)
                 .unwrap();
@@ -478,12 +770,73 @@ mod tests {
             assert!(sim.apply_command("Local", &command.payload, None));
             assert_eq!(sim.planning_paths(local).len(), 2);
             let delete = sim
-                .encode_plan_node_delete_record_at_screen(local, point)
+                .encode_plan_node_delete_record_for_node(local, node.unwrap())
                 .unwrap();
             let command = sim.decode_native_command_record(&delete, 0).unwrap();
             assert!(sim.apply_command("Local", &command.payload, None));
             assert!(sim.planning_paths(local).is_empty());
         }
+    }
+
+    #[test]
+    fn empty_selection_click_retains_node_until_a_selection_or_right_click() {
+        let mut input = PlanningInputState::default();
+        input.restore_active(true);
+        assert_eq!(
+            input.retain_clicked_node(5),
+            Some("MSG:PlanningModeDeleteHelp")
+        );
+        assert_eq!(input.retain_clicked_node(5), None, "DeleteHelp is once");
+        assert_eq!(input.highlighted_node(), Some(5));
+        // 63AB00 compares |dx|,|dy| <= 3 against the 63AAC0 press point.
+        input.right_press(Some(9), true, [10, 10]);
+        assert_eq!(input.right_hover, Some(Some(9)));
+        input.right_release(true, [14, 10]);
+        assert_eq!(input.right_hover, None);
+        assert_eq!(input.highlighted_node(), Some(5));
+        input.right_press(None, true, [10, 10]);
+        input.right_release(true, [13, 7]);
+        assert_eq!(input.highlighted_node(), None);
+        // A press with a selection keeps -1, so its release keeps the node.
+        input.retain_clicked_node(5);
+        input.right_press(None, false, [10, 10]);
+        input.right_release(true, [10, 10]);
+        assert_eq!(input.highlighted_node(), Some(5));
+        assert_eq!(input.begin_frame_pass(true), None);
+        assert_eq!(input.highlighted_node(), Some(5));
+        input.begin_frame_pass(false);
+        assert_eq!(input.highlighted_node(), None);
+    }
+
+    /// 639FD0: the message and its ScoldSound are latched by AC4C08, the
+    /// second ScoldSound (`0x0063A0BB`) is not, and the Deploy walk calls it
+    /// once per admitted object.
+    #[test]
+    fn a_key_refusal_scolds_again_on_every_call_whatever_the_latch() {
+        let mut input = PlanningInputState::default();
+        assert_eq!(input.clicked_event_refusal(1), (true, 2), "Stop key");
+        assert_eq!(input.clicked_event_refusal(1), (false, 1), "repeat press");
+        input.end_frame_pass();
+        assert_eq!(input.clicked_event_refusal(3), (true, 4), "Deploy, 3 units");
+        assert_eq!(input.clicked_event_refusal(0), (false, 0));
+    }
+
+    #[test]
+    fn planning_intro_shows_once_by_key_and_every_time_by_button() {
+        let mut input = PlanningInputState::default();
+        assert_eq!(input.intro(false, true), Some("MSG:PlanningModeIntro1Key"));
+        assert_eq!(input.intro(false, true), None);
+        for _ in 0..2 {
+            assert_eq!(
+                input.intro(true, true),
+                Some("MSG:PlanningModeIntro1Button")
+            );
+            assert_eq!(input.intro(true, false), Some("MSG:PlanningModeIntro3"));
+        }
+        // The button's releases counted Intro3, so the key's never shows.
+        assert_eq!(input.intro(false, false), None);
+        input.reset();
+        assert_eq!(input.intro(false, false), Some("MSG:PlanningModeIntro3"));
     }
 
     #[test]
@@ -502,11 +855,10 @@ mod tests {
 
     fn populated_sim() -> (Simulation, crate::sim::intern::InternedId) {
         let mut sim = Simulation::new();
-        let local = sim.interner.intern("Local");
-        let kind = sim.interner.intern("TESTUNIT");
-        sim.houses
-            .insert(local, HouseState::new(local, 0, None, false, 0, 10));
-        sim.session.house_order = vec![local];
+        let local = sim.intern("Local");
+        let kind = sim.intern("TESTUNIT");
+        sim.houses_mut_for_test()
+            .register(HouseState::new(local, 0, None, false, 0, 10));
         for id in [42, 43] {
             let mut entity = GameEntity::new_at_frame_zero_for_test(
                 id,
@@ -523,7 +875,7 @@ mod tests {
                 false,
             );
             entity.lifecycle.set_in_limbo_for_test(false);
-            sim.substrate.entities.insert(entity);
+            sim.entities_mut_for_test().insert(entity);
         }
         (sim, local)
     }
@@ -564,7 +916,8 @@ mod tests {
                     &mut sim,
                     local,
                     &[42],
-                    vec![CommandEnvelope::new(local, 0, payload)]
+                    vec![CommandEnvelope::new(local, 0, payload)],
+                    None,
                 )
                 .is_ok_and(|added| !added)
             );
@@ -592,39 +945,19 @@ mod tests {
             ),
             (
                 7,
-                Command::EnterTransport {
-                    passenger_id: 42,
-                    transport_id: 43,
-                },
-            ),
-            (
-                7,
-                Command::EnterBunker {
-                    unit_id: 42,
-                    bunker_id: 43,
-                },
-            ),
-            (
-                7,
-                Command::RepairAtDepot {
-                    entity_id: 42,
-                    depot_id: 43,
-                },
-            ),
-            (
-                7,
-                Command::MinerReturn {
-                    entity_id: 42,
-                    target_refinery_id: Some(43),
-                },
+                Command::clicked_mission(
+                    42,
+                    crate::sim::mission::MissionType::Enter,
+                    crate::sim::combat::TargetKind::Entity(43),
+                ),
             ),
             (
                 10,
-                Command::HarvestCell {
-                    entity_id: 42,
-                    target_rx: 5,
-                    target_ry: 6,
-                },
+                Command::clicked_mission(
+                    42,
+                    crate::sim::mission::MissionType::Harvest,
+                    crate::sim::combat::TargetKind::Cell(5, 6),
+                ),
             ),
         ];
         for (mission, payload) in commands {
@@ -633,12 +966,13 @@ mod tests {
                     &mut sim,
                     local,
                     &[42],
-                    vec![CommandEnvelope::new(local, 0, payload.clone())]
+                    vec![CommandEnvelope::new(local, 0, payload.clone())],
+                    None,
                 )
                 .is_ok_and(|added| added),
                 "lost {payload:?}"
             );
-            let queued = sim.take_due_commands();
+            let queued = sim.take_frame_commands_for_test();
             assert_eq!(queued.len(), 1);
             let Command::PlanningRecord { record } = &queued[0].payload else {
                 panic!("ordinary order escaped planning");
@@ -657,12 +991,19 @@ mod tests {
                 rx: 5,
                 ry: 6,
             },
+            Command::ArchiveObject {
+                entity_id: 42,
+                target_id: 43,
+            },
             Command::SellBuilding { entity_id: 42 },
             Command::UndeployBuilding { entity_id: 42 },
+            Command::MoveFlash { rx: 5, ry: 6 },
         ] {
             let envelope = CommandEnvelope::new(local, 0, payload);
-            assert!(queue_orders_in_sim(&mut sim, local, &[42], vec![envelope.clone()]).unwrap());
-            assert_eq!(sim.take_due_commands(), vec![envelope]);
+            assert!(
+                queue_orders_in_sim(&mut sim, local, &[42], vec![envelope.clone()], None).unwrap()
+            );
+            assert_eq!(sim.take_frame_commands_for_test(), vec![envelope]);
         }
         for payload in [
             Command::DeployMcv { entity_id: 42 },
@@ -674,11 +1015,12 @@ mod tests {
                     &mut sim,
                     local,
                     &[42],
-                    vec![CommandEnvelope::new(local, 0, payload)]
+                    vec![CommandEnvelope::new(local, 0, payload)],
+                    None,
                 )
                 .unwrap()
             );
-            let queued = sim.take_due_commands();
+            let queued = sim.take_frame_commands_for_test();
             assert_eq!(queued.len(), 1);
             let Command::PlanningRecord { record } = &queued[0].payload else {
                 panic!("mobile self-click escaped Planning Mode");
@@ -711,15 +1053,19 @@ mod tests {
         let mut sim = Simulation::with_seed(0x004A_BFA9);
         sim.intern_rule_type_ids(rules);
         sim.resolve_type_handles(rules);
-        sim.session.game_mode_nonzero = true;
-        sim.session.game_options.short_game = false;
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        sim.session_mut_for_test()
+            .game_options_mut_for_test()
+            .short_game = false;
         let owner = sim.intern("Americans");
         let side = rules.country_side_index("Americans").unwrap().0;
         let mut house = HouseState::new(owner, side, Some(owner), true, 50_000, 10);
-        house.project_country_mults(rules, &sim.interner);
-        sim.houses.insert(owner, house);
-        sim.session.house_order.push(owner);
-        sim.session.current_house = Some(owner);
+        house.project_country_mults(rules, sim.interner());
+        sim.houses_mut_for_test().register(house);
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
         crate::sim::arena_fixture::flat_ground(&mut sim, rules);
         let first = sim
             .spawn_object("GAWEAP", "Americans", 6, 6, 0, rules)
@@ -727,8 +1073,8 @@ mod tests {
         let second = sim
             .spawn_object("GAWEAP", "Americans", 20, 6, 0, rules)
             .expect("stock nonprimary War Factory");
-        assert!(sim.production.is_primary_factory(first));
-        assert!(!sim.production.is_primary_factory(second));
+        assert!(sim.production().is_primary_factory(first));
+        assert!(!sim.production().is_primary_factory(second));
         Some((sim, retail, first, second))
     }
 
@@ -741,7 +1087,7 @@ mod tests {
         let Some((mut sim, retail, first, second)) = retail_primary_planning_fixture() else {
             return;
         };
-        let owner = sim.session.current_house().unwrap();
+        let owner = sim.session().current_house().unwrap();
         let overlays =
             OverlayTypeRegistry::from_ini(&retail.processed_rules, Some(&retail.fixed_art));
         let rules = retail.rules;
@@ -750,7 +1096,17 @@ mod tests {
             2,
             Command::TogglePrimaryFactory { entity_id: second },
         );
-        assert!(queue_orders_in_sim(&mut sim, owner, &[second], vec![order.clone()]).unwrap());
+        assert!(
+            queue_orders_in_sim(&mut sim, owner, &[second], vec![order.clone()], None).unwrap()
+        );
+        let (opcode, frame_stamp) = {
+            let queues = sim.network_command_queues();
+            let records = queues.local_records().unwrap();
+            assert_eq!(records.len(), 1);
+            (records[0].opcode(), records[0].frame_stamp())
+        };
+        assert_eq!(opcode, 0x11);
+        assert_eq!(frame_stamp, sim.session().binary_frame() as i32);
         assert_eq!(
             sim.pending_command_snapshot(),
             vec![order],
@@ -763,19 +1119,21 @@ mod tests {
         resources.overlay_registry = overlays;
         let mut runtime = SimRuntime {
             simulation: sim,
-            resources,
+            resources: resources.into(),
         };
-        for selected in [false, true] {
+        // The raw native stamp controls execution; the preserved diagnostic
+        // issue ordinal 2 above cannot postpone an event issued at frame0.
+        for selected in [true, true] {
             let due = runtime.simulation.take_due_commands();
             runtime
                 .advance_frame(&due, 67, TickLane::Ordinary, FrameEffects::default())
                 .expect("ordinary planning-active primary-selection frame");
             assert_eq!(
-                runtime.simulation.production.is_primary_factory(second),
+                runtime.simulation.production().is_primary_factory(second),
                 selected
             );
             assert_eq!(
-                runtime.simulation.production.is_primary_factory(first),
+                runtime.simulation.production().is_primary_factory(first),
                 !selected
             );
             assert!(runtime.simulation.planning_paths(owner).is_empty());
@@ -789,13 +1147,13 @@ mod tests {
         let admission = &corpus["planning_admission"];
         assert_eq!(
             PlanningRefusal::Capacity.csf_key(),
-            admission["csf"]["key"].as_str().unwrap()
+            admission["csf"]["key"].as_str()
         );
         for case in admission["controls"].as_array().unwrap() {
             let Some((mut sim, retail, first, second)) = retail_primary_planning_fixture() else {
                 return;
             };
-            let owner = sim.session.current_house().unwrap();
+            let owner = sim.session().current_house().unwrap();
             assert_eq!(
                 retail.rules.general.scold_sound.as_deref(),
                 admission["scold_sound"]["name"].as_str()
@@ -824,6 +1182,7 @@ mod tests {
                             target_rx: 25,
                             target_ry: 25,
                         },
+                        None,
                     )
                     .unwrap();
                 let envelope = sim.decode_native_command_record(&record, 0).unwrap();
@@ -841,6 +1200,7 @@ mod tests {
                     2,
                     Command::TogglePrimaryFactory { entity_id: second },
                 )],
+                None,
             );
             let native = &case["phases"][0];
             let admitted = native["admitted"].as_bool().unwrap();
@@ -860,7 +1220,7 @@ mod tests {
             }
             for (index, actor) in [first, second].into_iter().enumerate() {
                 assert_eq!(
-                    u8::from(sim.production.is_primary_factory(actor)),
+                    u8::from(sim.production().is_primary_factory(actor)),
                     native["state"]["primary"][index].as_u64().unwrap() as u8
                 );
             }
@@ -877,6 +1237,8 @@ mod tests {
                 let commit = sim.encode_plan_commit_record(owner).unwrap();
                 let envelope = sim.decode_native_command_record(&commit, 0).unwrap();
                 assert!(sim.apply_command("Americans", &envelope.payload, Some(&retail.rules)));
+                // PlanMgr 0x00637550 publishes the consumed orders after the DoList.
+                sim.publish_planning_commands_for_test();
                 assert!(sim.planning_paths(owner).is_empty());
                 assert_eq!(sim.pending_command_snapshot().len(), usize::from(count));
                 assert!(sim.planning_selection_has_capacity(owner, &[second]));
@@ -901,7 +1263,7 @@ mod tests {
                 )
             })
             .collect();
-        assert!(queue_orders_in_sim(&mut sim, local, &[43, 42], orders.clone()).unwrap());
+        assert!(queue_orders_in_sim(&mut sim, local, &[43, 42], orders.clone(), None).unwrap());
         let pending = sim.pending_command_snapshot();
         assert_eq!(pending.len(), 2);
         for (planned, ordinary) in pending.iter().zip(&orders) {
@@ -911,7 +1273,7 @@ mod tests {
                 planned.payload,
                 Command::PlanningRecord {
                     record: sim
-                        .encode_planning_order_record(local, &ordinary.payload)
+                        .encode_planning_order_record(local, &ordinary.payload, None)
                         .unwrap()
                 }
             );
@@ -935,14 +1297,19 @@ mod tests {
     }
 
     #[test]
-    fn restored_planning_preserves_mode_without_retaining_physical_key() {
+    fn fixture_activation_does_not_retain_physical_key() {
         let mut input = PlanningInputState::default();
         input.key_transition(true, KeyCode::KeyZ, true, false);
         input.restore_active(true);
         assert!(input.active());
         assert!(!input.owns_key(KeyCode::KeyZ));
+        input.key_transition(true, KeyCode::KeyZ, true, false);
+        input.node_deleted(99, Some(7));
+        assert!(input.owns_key(KeyCode::KeyZ));
         input.reset();
         assert!(!input.active());
+        assert!(!input.owns_key(KeyCode::KeyZ));
+        assert_eq!(input.highlighted_node(), None);
     }
 
     #[test]
@@ -966,12 +1333,21 @@ mod tests {
                 } else {
                     sim.intern(&format!("Other{slot}"))
                 };
-                sim.session.house_order.push(owner);
-                sim.houses
-                    .insert(owner, HouseState::new(owner, 0, None, slot == index, 0, 10));
+                sim.houses_mut_for_test().register(HouseState::new(
+                    owner,
+                    0,
+                    None,
+                    slot == index,
+                    0,
+                    10,
+                ));
             }
-            sim.session.current_house = Some(local);
-            sim.houses.get_mut(&local).unwrap().is_defeated = case["initial"]["session300"] != 0;
+            sim.session_mut_for_test()
+                .set_current_house_for_test(Some(local));
+            sim.houses_mut_for_test()
+                .get_mut(&local)
+                .unwrap()
+                .set_is_defeated_for_test(case["initial"]["session300"] != 0);
             let before_rng = sim.rng_state();
             let mut input = PlanningInputState::default();
             input.restore_active(case["initial"]["active"].as_bool().unwrap());
@@ -984,14 +1360,18 @@ mod tests {
             assert_eq!(case["detach"], serde_json::json!([]));
             for phase in case["phases"].as_array().unwrap() {
                 let frame = phase["frame"].as_u64().unwrap();
-                sim.session.tick = frame;
-                sim.session.binary_frame = frame as u32;
+                sim.session_mut_for_test().set_tick_for_test(frame);
+                sim.session_mut_for_test()
+                    .set_binary_frame_for_test(frame as u32);
                 let requested = match phase["input"].as_str().unwrap() {
                     "house_defeat_tail" => {
                         // The native component starts after the House flag
                         // store. Its production trigger is tested through the
                         // real lifecycle/House rung in planning_defeat_tests.
-                        sim.houses.get_mut(&local).unwrap().is_defeated = true;
+                        sim.houses_mut_for_test()
+                            .get_mut(&local)
+                            .unwrap()
+                            .set_is_defeated_for_test(true);
                         Some(false)
                     }
                     "keyboard_press" => input.key_transition(true, KeyCode::KeyZ, true, false),
@@ -1070,12 +1450,28 @@ mod tests {
     }
 
     #[test]
-    fn planning_refusal_is_latched_for_one_simulation_frame() {
+    fn planning_refusal_is_latched_until_the_frame_pass() {
         let mut input = PlanningInputState::default();
-        assert!(input.admit_refusal(17));
-        assert!(!input.admit_refusal(17));
-        assert!(input.admit_refusal(18));
+        assert!(input.admit_refusal());
+        assert!(!input.admit_refusal());
+        input.refusal_latched = false;
+        assert!(input.admit_refusal());
         input.restore_active(true);
-        assert!(input.admit_refusal(18));
+        assert!(input.admit_refusal());
+    }
+
+    #[test]
+    fn a_queued_append_message_posts_under_the_latch_then_the_latch_resets() {
+        let mut input = PlanningInputState::default();
+        input.frame_pass_message = Some(PlanningAppendMessage::NodeMaximum);
+        assert!(input.admit_refusal(), "an earlier refusal this frame");
+        assert_eq!(
+            input.begin_frame_pass(true),
+            Some(PlanningAppendMessage::NodeMaximum)
+        );
+        assert!(!input.admit_refusal(), "the queued post shares AC4C08");
+        assert_eq!(input.begin_frame_pass(true), None, "consumed once");
+        input.end_frame_pass();
+        assert!(input.admit_refusal(), "0x0063753F resets the latch");
     }
 }

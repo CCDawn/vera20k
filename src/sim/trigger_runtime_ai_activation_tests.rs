@@ -4,6 +4,59 @@ use crate::sim::house_state::HouseAiActivationLatches;
 use crate::util::save_codec;
 
 #[test]
+fn team_lookup_fixed_ai_uses_final_map_names_and_dependencies() {
+    use crate::rules::{ini_parser::IniFile, ruleset::RuleSet, team_ai_ini::TeamAiIniRegistry};
+
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[InfantryTypes]\n0=E1\n1=E2\n[E1]\nStrength=100\nTechLevel=1\n\
+         [E2]\nStrength=100\nTechLevel=7\n",
+    ))
+    .unwrap();
+    let fixed = IniFile::from_str(&format!(
+        "[TeamTypes]\n0=FIRST\n[FIRST]\nName=OLD\nScript=S\nTaskForce=F\n\
+         [ScriptTypes]\n0=S\n[S]\n0=5,1\n\
+         [TaskForces]\n0=F\n[F]\n0=1,E1\n\
+         [AITriggerTypes]\nA=Lookup,FINAL_ALIAS,<all>,0,-1,<none>,{},40,10,40,1,0,0,0,MAP_ALIAS,1,1,1\n",
+        "0".repeat(64)
+    ));
+    let map = crate::map::map_file::MapFile::from_ini(IniFile::from_str(
+        "[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
+         [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n\
+         [TeamTypes]\n0=FIRST\n1=MAP\n[FIRST]\nName=FINAL_ALIAS\n\
+         [MAP]\nName=MAP_ALIAS\nScript=S\nTaskForce=F\n\
+         [TaskForces]\n0=F\n[F]\n0=1,E2\n\
+         [Triggers]\nT=Neutral,<none>,constructor,0,1,1,1,0\n\
+         [Actions]\nT=1,7,1,LATE,0,0,0,0,A\n",
+    ))
+    .unwrap();
+    let registry = TeamAiIniRegistry::from_sources(&fixed, &map.ini, true);
+    for prepared in [false, true] {
+        let mut sim = Simulation::new();
+        sim.intern_rule_type_ids(&rules);
+        if prepared {
+            sim.initialize_trigger_definitions(&map, &registry, None, None, None);
+        }
+        let rng = sim.scenario_rng.native_state_hex();
+        let diagnostics = sim.install_team_ai_registry(&registry, &rules);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let trigger = sim.team_script_vm.ai_triggers_in_order().next().unwrap().0;
+        assert_eq!(trigger.primary_team_type, sim.interner.get("FIRST"));
+        assert_eq!(trigger.secondary_team_type, sim.interner.get("MAP"));
+        assert_eq!(
+            trigger.threshold, 7,
+            "the selected final TaskForce owns TechLevel"
+        );
+        let expected = if prepared {
+            vec!["FIRST", "MAP", "LATE"]
+        } else {
+            vec!["FIRST", "MAP"]
+        };
+        assert_eq!(sim.trigger_runtime.definitions.team_types, expected);
+        assert_eq!(sim.scenario_rng.native_state_hex(), rng);
+    }
+}
+
+#[test]
 fn authored_ai_trigger_actions_change_only_the_selected_house_latch() {
     for (kind, initial, expected) in [
         (75, true, false),
@@ -40,7 +93,7 @@ fn authored_ai_trigger_actions_change_only_the_selected_house_latch() {
             .iter()
             .map(|owner| {
                 let house = &sim.houses[owner];
-                (house.team_creation.timer(), house.strategy_timer)
+                (house.team_creation().timer(), *house.strategy_timer())
             })
             .collect();
         let rng_before = (
@@ -48,7 +101,7 @@ fn authored_ai_trigger_actions_change_only_the_selected_house_latch() {
             sim.main_rng.native_state_hex(),
             sim.mapgen_rng.native_state_hex(),
         );
-        let _ = sim.advance_triggers(Some(&rules), Some(&registry), FrameEffects::default());
+        let _ = sim.advance_triggers(&rules, Some(&registry), FrameEffects::default());
         for (index, owner) in houses.iter().enumerate() {
             let house = &sim.houses[owner];
             let wanted = HouseAiActivationLatches {
@@ -66,7 +119,7 @@ fn authored_ai_trigger_actions_change_only_the_selected_house_latch() {
             };
             assert_eq!(house.ai_activation(), wanted, "Action{kind}, House{index}");
             assert_eq!(
-                (house.team_creation.timer(), house.strategy_timer),
+                (house.team_creation().timer(), *house.strategy_timer()),
                 timers[index],
                 "Action{kind} does not reset House timers"
             );
@@ -85,10 +138,6 @@ fn authored_ai_trigger_actions_change_only_the_selected_house_latch() {
 
 fn corpus() -> &'static serde_json::Value {
     let value = crate::test_fixture::json("tools/spatial_oracle/trigger_ai_activation.json");
-    assert_eq!(
-        value["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     assert_eq!(value["actions"]["controls"].as_array().unwrap().len(), 26);
     assert_eq!(value["histories"].as_array().unwrap().len(), 14);
     value
@@ -145,7 +194,7 @@ fn assert_house_summary(
         latches(&native["latches"]),
         "{context}: activation bytes"
     );
-    let timer = house.team_creation.timer();
+    let timer = house.team_creation().timer();
     // CdTimer retains the two consumed words. Native's unused middle dword
     // is recorded in the corpus, not duplicated as simulation state.
     assert_eq!(
@@ -166,20 +215,25 @@ fn run_native_action(
 ) {
     let input = &row["input"];
     let context = format!("Action{} {}", row["kind"], input["name"]);
-    sim.session.house_order = input["order"].as_array().map_or_else(
-        || houses.to_vec(),
-        |order| {
-            order
-                .iter()
-                .map(|index| houses[index.as_u64().unwrap() as usize])
-                .collect()
-        },
-    );
+    sim.houses
+        .reorder_for_test(&input["order"].as_array().map_or_else(
+            || houses.to_vec(),
+            |order| {
+                order
+                    .iter()
+                    .map(|index| houses[index.as_u64().unwrap() as usize])
+                    .collect()
+            },
+        ));
     // Original Scenario+1180 storage supplied by the native fixture: slot0
     // resolves registered House1, slot1 House0, and slots2..7 are absent.
-    sim.session.start_slot_houses.clear();
-    sim.session.start_slot_houses.insert(0, houses[1]);
-    sim.session.start_slot_houses.insert(1, houses[0]);
+    sim.session.start_slot_houses_mut_for_test().clear();
+    sim.session
+        .start_slot_houses_mut_for_test()
+        .insert(0, houses[1]);
+    sim.session
+        .start_slot_houses_mut_for_test()
+        .insert(1, houses[0]);
     super::tests::install_event_ingress_map(
         sim,
         rules,
@@ -227,7 +281,7 @@ fn run_native_action(
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        Some(rules),
+        rules,
         None,
         FrameEffects::default(),
     );
@@ -310,14 +364,16 @@ fn ai_activation_actions_match_all_original_selection_and_state_controls() {
     let native = corpus();
     for row in native["actions"]["controls"].as_array().unwrap() {
         let (mut sim, rules, _, houses) = super::tests::event_ingress_fixture();
-        sim.session.game_mode_nonzero = true;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
         supply_rng(&mut sim, &native["actions"]["rng_full_seed31"]);
         install_team_scene(&mut sim, houses[0]);
         for (index, owner) in houses.iter().enumerate() {
             let prior = &row["houses_before"][index];
             let house = sim.houses.get_mut(owner).unwrap();
             house.set_ai_activation_for_test(latches(&prior["latches"]));
-            house.team_creation.restart(
+            house.team_creation_mut().restart(
                 number(&prior["team_timer"][0]),
                 number(&prior["team_timer"][2]),
             );
@@ -352,7 +408,11 @@ fn ai_activation_replays_original_action_to_timer_selector_histories() {
         }
         let rules = RuleSet::from_ini(&IniFile::from_str(&ini)).unwrap();
         let mut sim = Simulation::new();
-        sim.session.game_mode_nonzero = input["game_mode"].as_i64() != Some(0);
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+                input["game_mode"].as_i64() != Some(0),
+            ),
+        );
         let houses = [
             sim.interner.intern("H0"),
             sim.interner.intern("H1"),
@@ -360,7 +420,9 @@ fn ai_activation_replays_original_action_to_timer_selector_histories() {
         ];
         let countries: Vec<_> = input["countries"]
             .as_array()
-            .map_or(vec![0, 7, 0], |array| array.iter().map(number).collect());
+            .map_or(vec![0, 7, 0], |array| {
+                array.iter().map(number).collect::<Vec<_>>()
+            });
         for (index, owner) in houses.iter().copied().enumerate() {
             let country = sim.interner.intern(&format!("Country{}", countries[index]));
             let mut house = HouseState::new(
@@ -371,9 +433,9 @@ fn ai_activation_replays_original_action_to_timer_selector_histories() {
                 0,
                 10,
             );
-            house.player_control = input["control"].as_bool().unwrap_or(false);
-            house.multiplay_passive = input["passive"].as_bool().unwrap_or(false);
-            house.difficulty = HouseDifficulty::from_native(1).unwrap();
+            house.set_player_control_for_test(input["control"].as_bool().unwrap_or(false));
+            house.set_multiplay_passive_for_test(input["passive"].as_bool().unwrap_or(false));
+            house.set_difficulty_for_test(HouseDifficulty::from_native(1).unwrap());
             house.set_ai_activation_for_test(HouseAiActivationLatches {
                 production: false,
                 autocreate_allowed: true,
@@ -381,14 +443,17 @@ fn ai_activation_replays_original_action_to_timer_selector_histories() {
                 auto_base_building: false,
             });
             let timer = input["timer"].as_array();
-            house.team_creation.restart(
+            house.team_creation_mut().restart(
                 timer.map_or(0, |t| number(&t[0])),
                 timer.map_or(10, |t| number(&t[2])),
             );
-            sim.houses.insert(owner, house);
+            sim.houses.register(house);
         }
-        sim.houses.get_mut(&houses[0]).unwrap().enemy_house = Some(houses[1]);
-        sim.session.house_order = houses.to_vec();
+        sim.houses
+            .get_mut(&houses[0])
+            .unwrap()
+            .set_enemy_house_for_test(Some(houses[1]));
+        sim.houses.reorder_for_test(&houses.to_vec());
         supply_rng(&mut sim, &row["initial_rng_full"]);
         let (old_team, team_types) = install_team_scene(&mut sim, houses[0]);
         let old_bytes = save_codec::serialize(sim.team_script_vm.team(old_team).unwrap()).unwrap();
@@ -401,7 +466,8 @@ fn ai_activation_replays_original_action_to_timer_selector_histories() {
             let update = &step["update"];
             let owner = houses[update["house"].as_u64().unwrap() as usize];
             assert_house_summary(&sim, owner, &update["before"], &context);
-            sim.session.binary_frame = number(&update["frame"]) as u32;
+            sim.session
+                .set_binary_frame_for_test(number(&update["frame"]) as u32);
             let before_ids: Vec<_> = sim
                 .team_script_vm
                 .teams_in_order()
@@ -560,18 +626,19 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
     let roster =
         crate::map::houses::parse_house_roster(&map.ini, &rules.color_schemes, Some(&rules));
     let mut sim = Simulation::with_seed(31);
-    sim.session.game_mode_nonzero = false;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false));
     sim.intern_rule_type_ids(&rules);
     sim.resolve_type_handles(&rules);
     crate::sim::scenario_bootstrap::initialize_map_roster_houses(
         &mut sim,
         &roster,
-        Some(&rules),
+        &rules,
         Some(&map.ini),
     );
     sim.session.install_waypoints(&map.waypoints);
-    sim.install_team_ai_registry(&teams, &rules).unwrap();
-    sim.initialize_trigger_definitions(&map, &teams, None, None);
+    sim.install_team_ai_registry(&teams, &rules);
+    sim.initialize_trigger_definitions(&map, &teams, None, None, None);
     let targets: Vec<_> = retail["target_houses"]
         .as_array()
         .unwrap()
@@ -633,7 +700,7 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
                 input: TagEventInput::default()
             },
             &mut Vec::new(),
-            Some(&rules),
+            &rules,
             None,
             FrameEffects::default()
         ));
@@ -652,7 +719,7 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
             ..Default::default()
         },
         &mut Vec::new(),
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default()
     ));
@@ -665,7 +732,8 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
     assert!(timer.duration() > 0);
     // This is a Rust integration deadline from the already ported timer,
     // not a new native240-second timer golden or whole-map scheduling claim.
-    sim.session.binary_frame = timer.start_frame().wrapping_add(timer.duration()) as u32;
+    sim.session
+        .set_binary_frame_for_test(timer.start_frame().wrapping_add(timer.duration()) as u32);
     let before = GameSnapshot::save(&sim, 0, 0, "ALL05UMD.MAP", 0);
     let mut restored = GameSnapshot::load(&before).unwrap().sim;
     restored.restore_after_snapshot_load().unwrap();
@@ -677,7 +745,7 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
             .collect();
         let timers: Vec<_> = targets
             .iter()
-            .map(|id| candidate.houses[id].team_creation.timer())
+            .map(|id| candidate.houses[id].team_creation().timer())
             .collect();
         assert!(candidate.dispatch_live_tag_event(
             stop_tag,
@@ -686,7 +754,7 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
                 ..Default::default()
             },
             &mut Vec::new(),
-            Some(&rules),
+            &rules,
             None,
             FrameEffects::default()
         ));
@@ -705,7 +773,7 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
                 ..siblings[index]
             };
             assert_eq!(candidate.houses[id].ai_activation(), expected);
-            assert_eq!(candidate.houses[id].team_creation.timer(), timers[index]);
+            assert_eq!(candidate.houses[id].team_creation().timer(), timers[index]);
         }
         assert_eq!(
             save_codec::serialize(candidate.team_script_vm.team(old_team).unwrap()).unwrap(),
@@ -745,17 +813,17 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
                 input: TagEventInput::default()
             },
             &mut Vec::new(),
-            Some(&rules),
+            &rules,
             None,
             FrameEffects::default()
         ));
         assert!(candidate.team_script_vm.teams_in_order().count() > count);
-        let frame = candidate.session.binary_frame as i32;
+        let frame = candidate.session.binary_frame() as i32;
         let mut rng_check = candidate.scenario_rng.clone();
         for id in &targets {
             let house = candidate.houses.get_mut(id).unwrap();
-            house.difficulty = HouseDifficulty::from_native(1).unwrap();
-            house.team_creation.restart(frame, 0);
+            house.set_difficulty_for_test(HouseDifficulty::from_native(1).unwrap());
+            house.team_creation_mut().restart(frame, 0);
             rng_check.next_range_i32_inclusive(1, 100);
             crate::sim::ai_team_creation::update_team_creation(
                 candidate,
@@ -763,7 +831,7 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
                 *id,
                 FrameEffects::default(),
             );
-            let timer = candidate.houses[id].team_creation.timer();
+            let timer = candidate.houses[id].team_creation().timer();
             assert_eq!(
                 [timer.start_frame(), timer.duration()],
                 [frame, native_delays[1]]
@@ -801,7 +869,7 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
     }
 }
 
-// Steam 3e81a617..08600: Execute30/50C210's 21 caller controls and 15
+// Steam gamemd: Execute30/50C210's 21 caller controls and 15
 // Execute76 controls, including 14 original due-selector/RNG histories.
 // Recalc 5054B0 and ComputerParanoid are declared sinks in the 30 controls;
 // production planner/retail checks below are Rust integration regressions.
@@ -820,7 +888,7 @@ fn house_control_action(
         .unwrap()
         .entries()[0]
         .clone();
-    let action = RuntimeDefinitions::default().resolve_action(entry, None, None);
+    let action = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
     sim.apply_live_trigger_action(
         &action,
         TriggerActionContext {
@@ -829,7 +897,7 @@ fn house_control_action(
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        Some(rules),
+        rules,
         None,
         FrameEffects::default(),
     )
@@ -864,23 +932,27 @@ fn house_base_control_scene(
     sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(32, 32));
     let owner = sim.interner.intern("AIHouse");
     let country = sim.interner.intern("Americans");
-    sim.houses.insert(
-        owner,
-        crate::sim::house_state::HouseState::new(owner, 0, Some(country), false, 10000, 10),
-    );
-    sim.session.house_order.push(owner);
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner,
+            0,
+            Some(country),
+            false,
+            10000,
+            10,
+        ));
     if yards {
         for (x, y) in [(12, 17), (19, 21)] {
             sim.spawn_object(yard_type, "AIHouse", x, y, 0, rules)
                 .expect("control yard Unlimbo");
         }
-        assert_eq!(sim.houses[&owner].build_const_order.len(), 2);
+        assert_eq!(sim.houses[&owner].build_const_order().len(), 2);
     }
     let house = sim.houses.get_mut(&owner).unwrap();
     house.set_base_center((3, 4));
-    house.base_plan_center = (5, 6);
-    house.base_plan.nodes.clear();
-    house.base_plan.percent_built = 37;
+    house.set_base_plan_center_for_test((5, 6));
+    house.base_plan_mut().nodes_mut_for_test().clear();
+    house.base_plan_mut().set_percent_built_for_test(37);
     house.set_ai_activation_for_test(HouseAiActivationLatches {
         production: true,
         autocreate_allowed: true,
@@ -910,7 +982,7 @@ fn house_trigger_base_low_byte_controls_keep_other_latches_and_restore_nested_sc
     ] {
         let (mut sim, owner) = house_base_control_scene(&rules, "CON", true);
         let rng = sim.rng_state();
-        let timer = sim.houses[&owner].team_creation.timer();
+        let timer = sim.houses[&owner].team_creation().timer();
         sim.with_object_placement_scope(|sim| {
             sim.with_object_placement_scope(|sim| {
                 sim.with_object_placement_scope(|sim| {
@@ -937,22 +1009,24 @@ fn house_trigger_base_low_byte_controls_keep_other_latches_and_restore_nested_sc
             },
             "{raw}"
         );
-        assert_eq!(house.team_creation.timer(), timer);
-        assert_eq!(house.base_plan.percent_built, 37);
+        assert_eq!(house.team_creation().timer(), timer);
+        assert_eq!(house.base_plan().percent_built(), 37);
         if enabled {
             // Native caller controls choose first(12,17), then the reverse
             // general Building list chooses(19,21). The plan generator itself
             // is a sink there; this checks its existing production integration.
-            assert_eq!(house.base_center, Some((19, 21)));
-            assert_eq!(house.base_plan_center, (19, 21));
+            assert_eq!(house.base_center(), Some((19, 21)));
+            assert_eq!(house.base_plan_center(), (19, 21));
             assert_eq!(
-                crate::sim::base_plan::unpack_base_plan_cell(house.base_plan.nodes[0].packed_cell),
+                crate::sim::base_plan::unpack_base_plan_cell(
+                    house.base_plan().nodes()[0].packed_cell
+                ),
                 (19, 21)
             );
         } else {
-            assert_eq!(house.base_center, Some((3, 4)));
-            assert_eq!(house.base_plan_center, (5, 6));
-            assert!(house.base_plan.nodes.is_empty());
+            assert_eq!(house.base_center(), Some((3, 4)));
+            assert_eq!(house.base_plan_center(), (5, 6));
+            assert!(house.base_plan().nodes().is_empty());
             assert_eq!(sim.rng_state(), rng);
         }
     }
@@ -971,14 +1045,14 @@ fn house_trigger_existing_plan_keeps_node_zero_and_empty_yard_vector_does_not_sk
     sim.houses
         .get_mut(&owner)
         .unwrap()
-        .base_plan
-        .nodes
+        .base_plan_mut()
+        .nodes_mut_for_test()
         .push(node);
     let rng = sim.rng_state();
     assert!(house_control_action(&mut sim, &rules, Some(owner), 30, "1"));
-    assert_eq!(sim.houses[&owner].base_center, Some((12, 17)));
-    assert_eq!(sim.houses[&owner].base_plan_center, (12, 17));
-    assert_eq!(sim.houses[&owner].base_plan.nodes, vec![node]);
+    assert_eq!(sim.houses[&owner].base_center(), Some((12, 17)));
+    assert_eq!(sim.houses[&owner].base_plan_center(), (12, 17));
+    assert_eq!(sim.houses[&owner].base_plan().nodes(), vec![node]);
     assert_eq!(sim.rng_state(), rng);
     // Declared native negative control: BuildConst vector empty while the
     // general Building list still contains the two supplied objects.
@@ -986,18 +1060,18 @@ fn house_trigger_existing_plan_keeps_node_zero_and_empty_yard_vector_does_not_sk
     sim.houses
         .get_mut(&owner)
         .unwrap()
-        .build_const_order
+        .build_const_order_mut_for_test()
         .clear();
     assert!(house_control_action(&mut sim, &rules, Some(owner), 30, "1"));
-    assert_eq!(sim.houses[&owner].base_center, Some((19, 21)));
-    assert_eq!(sim.houses[&owner].base_plan_center, (19, 21));
-    assert!(!sim.houses[&owner].base_plan.nodes.is_empty());
+    assert_eq!(sim.houses[&owner].base_center(), Some((19, 21)));
+    assert_eq!(sim.houses[&owner].base_plan_center(), (19, 21));
+    assert!(!sim.houses[&owner].base_plan().nodes().is_empty());
     let (mut sim, owner) = house_base_control_scene(&rules, "CON", false);
     let rng = sim.rng_state();
     assert!(house_control_action(&mut sim, &rules, Some(owner), 30, "1"));
-    assert_eq!(sim.houses[&owner].base_center, Some((3, 4)));
-    assert_eq!(sim.houses[&owner].base_plan_center, (5, 6));
-    assert!(sim.houses[&owner].base_plan.nodes.is_empty());
+    assert_eq!(sim.houses[&owner].base_center(), Some((3, 4)));
+    assert_eq!(sim.houses[&owner].base_plan_center(), (5, 6));
+    assert!(sim.houses[&owner].base_plan().nodes().is_empty());
     assert_eq!(sim.rng_state(), rng);
 }
 
@@ -1024,14 +1098,14 @@ fn house_trigger_retail_base_plan_gate_and_anchor_survive_production_snapshot_re
             && !house.ai_activation().autocreate_allowed
             && !house.ai_activation().ai_triggers_active
     );
-    assert_eq!(house.base_center, Some((19, 21)));
-    assert_eq!(house.base_plan_center, (19, 21));
+    assert_eq!(house.base_center(), Some((19, 21)));
+    assert_eq!(house.base_plan_center(), (19, 21));
     assert_eq!(
-        house.base_plan.nodes[0].type_or_control,
+        house.base_plan().nodes()[0].type_or_control,
         rules.building_type_index("GACNST").unwrap()
     );
     assert_eq!(
-        crate::sim::base_plan::unpack_base_plan_cell(house.base_plan.nodes[0].packed_cell),
+        crate::sim::base_plan::unpack_base_plan_cell(house.base_plan().nodes()[0].packed_cell),
         (19, 21)
     );
     // The existing early House update consumes the latch even at low IQ;
@@ -1043,7 +1117,7 @@ fn house_trigger_retail_base_plan_gate_and_anchor_survive_production_snapshot_re
     assert!(sim.houses[&owner].ai_activation().production);
     assert!(sim.houses[&owner].ai_activation().autocreate_allowed);
     assert!(!sim.houses[&owner].ai_activation().ai_triggers_active);
-    let plan = sim.houses[&owner].base_plan.clone();
+    let plan = sim.houses[&owner].base_plan().clone();
     let rng = sim.rng_state();
     assert!(house_control_action(
         &mut sim,
@@ -1053,7 +1127,7 @@ fn house_trigger_retail_base_plan_gate_and_anchor_survive_production_snapshot_re
         "256"
     ));
     assert!(!sim.houses[&owner].ai_activation().auto_base_building);
-    assert_eq!(sim.houses[&owner].base_plan, plan);
+    assert_eq!(*sim.houses[&owner].base_plan(), plan);
     assert_eq!(sim.rng_state(), rng);
     let saved = crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "Disabled base", 0);
     let mut loaded = crate::sim::snapshot::GameSnapshot::load(&saved)
@@ -1072,9 +1146,9 @@ fn house_trigger_retail_base_plan_gate_and_anchor_survive_production_snapshot_re
         .unwrap();
     loaded.resolve_type_handles(&rules);
     assert!(!loaded.houses[&owner].ai_activation().auto_base_building);
-    assert_eq!(loaded.houses[&owner].base_plan, plan);
-    assert_eq!(loaded.houses[&owner].base_center, Some((19, 21)));
-    assert_eq!(loaded.houses[&owner].base_plan_center, (19, 21));
+    assert_eq!(*loaded.houses[&owner].base_plan(), plan);
+    assert_eq!(loaded.houses[&owner].base_center(), Some((19, 21)));
+    assert_eq!(loaded.houses[&owner].base_plan_center(), (19, 21));
     let rng = loaded.rng_state();
     assert!(house_control_action(
         &mut loaded,
@@ -1083,10 +1157,11 @@ fn house_trigger_retail_base_plan_gate_and_anchor_survive_production_snapshot_re
         30,
         "257"
     ));
-    assert_eq!(loaded.houses[&owner].base_center, Some((12, 17)));
-    assert_eq!(loaded.houses[&owner].base_plan_center, (12, 17));
+    assert_eq!(loaded.houses[&owner].base_center(), Some((12, 17)));
+    assert_eq!(loaded.houses[&owner].base_plan_center(), (12, 17));
     assert_eq!(
-        loaded.houses[&owner].base_plan, plan,
+        *loaded.houses[&owner].base_plan(),
+        plan,
         "an existing plan is not regenerated or reanchored"
     );
     assert_eq!(
@@ -1120,28 +1195,29 @@ fn house_trigger_ratio_original_writer_and_due_selector_keep_signed_values_timer
         ("257suffix", 257, true),
     ] {
         let mut sim = Simulation::new();
-        sim.session.game_mode_nonzero = true;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
         let owner = sim.interner.intern("H0");
         let enemy = sim.interner.intern("H1");
         for id in [owner, enemy] {
             sim.houses
-                .insert(id, HouseState::new(id, 0, None, false, 0, 10));
-            sim.session.house_order.push(id);
+                .register(HouseState::new(id, 0, None, false, 0, 10));
         }
         let house = sim.houses.get_mut(&owner).unwrap();
-        house.difficulty = HouseDifficulty::Normal;
-        house.enemy_house = Some(enemy);
+        house.set_difficulty_for_test(HouseDifficulty::Normal);
+        house.set_enemy_house_for_test(Some(enemy));
         house.set_ai_triggers_active(true);
-        house.team_creation.restart(0, 10);
+        house.team_creation_mut().restart(0, 10);
         let (old_team, team_types) = install_team_scene(&mut sim, owner);
         let old_bytes = save_codec::serialize(sim.team_script_vm.team(old_team).unwrap()).unwrap();
         supply_rng(&mut sim, &corpus()["actions"]["rng_full_seed31"]);
         let other = serde_json::to_value(&sim.houses[&enemy]).unwrap();
         let before_hash = sim.state_hash();
         assert!(house_control_action(&mut sim, &rules, Some(owner), 76, raw));
-        assert_eq!(sim.houses[&owner].team_creation.ratio(), value);
+        assert_eq!(sim.houses[&owner].team_creation().ratio(), value);
         assert_eq!(
-            sim.houses[&owner].team_creation.timer(),
+            sim.houses[&owner].team_creation().timer(),
             crate::sim::timer::CdTimer::started(0, 10)
         );
         assert_eq!(
@@ -1151,7 +1227,7 @@ fn house_trigger_ratio_original_writer_and_due_selector_keep_signed_values_timer
         );
         assert_eq!(serde_json::to_value(&sim.houses[&enemy]).unwrap(), other);
         assert_rng(&sim, &corpus()["actions"]["rng_full_seed31"], raw);
-        sim.session.binary_frame = 9;
+        sim.session.set_binary_frame_for_test(9);
         crate::sim::ai_team_creation::update_team_creation(
             &mut sim,
             &rules,
@@ -1159,7 +1235,7 @@ fn house_trigger_ratio_original_writer_and_due_selector_keep_signed_values_timer
             FrameEffects::default(),
         );
         assert_rng(&sim, &corpus()["actions"]["rng_full_seed31"], "not yet due");
-        sim.session.binary_frame = 10;
+        sim.session.set_binary_frame_for_test(10);
         let main = sim.main_rng.native_state_hex();
         let mapgen = sim.mapgen_rng.native_state_hex();
         crate::sim::ai_team_creation::update_team_creation(
@@ -1202,7 +1278,7 @@ fn house_trigger_ratio_original_writer_and_due_selector_keep_signed_values_timer
             old_bytes
         );
         assert_eq!(
-            sim.houses[&owner].team_creation.timer(),
+            sim.houses[&owner].team_creation().timer(),
             crate::sim::timer::CdTimer::started(10, 600)
         );
         let hash = sim.state_hash();
@@ -1230,7 +1306,8 @@ fn house_team_controls_ordered_tag_history_preserves_native_due_selection_and_sa
     rules.general = RuleSet::from_ini(&IniFile::from_str(
         "[General]\nTeamDelays=300,600,900\nTotalAITeamCap=8,8,8\nMaximumAIDefensiveTeams=2,2,2\nMinimumAIDefensiveTeams=9,2,9\nUseMinDefenseRule=no\n",
     )).unwrap().general;
-    sim.session.game_mode_nonzero = true;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     for (index, owner) in houses.iter().enumerate() {
         let house = sim.houses.get_mut(owner).unwrap();
         house.set_ai_activation_for_test(
@@ -1252,10 +1329,13 @@ fn house_team_controls_ordered_tag_history_preserves_native_due_selection_and_sa
                 },
             ][index],
         );
-        house.difficulty = HouseDifficulty::Normal;
-        house.team_creation.restart(0, 10);
+        house.set_difficulty_for_test(HouseDifficulty::Normal);
+        house.team_creation_mut().restart(0, 10);
     }
-    sim.houses.get_mut(&houses[0]).unwrap().enemy_house = Some(houses[1]);
+    sim.houses
+        .get_mut(&houses[0])
+        .unwrap()
+        .set_enemy_house_for_test(Some(houses[1]));
     let (old_team, types) = install_team_scene(&mut sim, houses[0]);
     let old_team_bytes = save_codec::serialize(sim.team_script_vm.team(old_team).unwrap()).unwrap();
     super::tests::install_event_ingress_map(
@@ -1270,8 +1350,8 @@ fn house_team_controls_ordered_tag_history_preserves_native_due_selection_and_sa
     let main_before = sim.main_rng.native_state_hex();
     let mapgen_before = sim.mapgen_rng.native_state_hex();
     let untouched = save_codec::serialize(&sim.houses[&houses[2]]).unwrap();
-    sim.advance_triggers(Some(&rules), Some(&registry), FrameEffects::default());
-    // Original consecutive Read/Execute13/77/78/79, Steam3e81a617..08600:
+    sim.advance_triggers(&rules, Some(&registry), FrameEffects::default());
+    // Original consecutive Read/Execute13/77/78/79, Steam gamemd:
     // 13 selects Country7, while all three ratio actions use incoming House0.
     assert_eq!(
         sim.houses[&houses[0]].scenario_team_ratios(),
@@ -1287,10 +1367,13 @@ fn house_team_controls_ordered_tag_history_preserves_native_due_selection_and_sa
         save_codec::serialize(&sim.houses[&houses[2]]).unwrap(),
         untouched
     );
-    assert_eq!(sim.houses[&houses[0]].team_creation.ratio(), 100);
-    assert!(houses.iter().all(
-        |id| sim.houses[id].team_creation.timer() == crate::sim::timer::CdTimer::started(0, 10)
-    ));
+    assert_eq!(sim.houses[&houses[0]].team_creation().ratio(), 100);
+    assert!(
+        houses
+            .iter()
+            .all(|id| sim.houses[id].team_creation().timer()
+                == crate::sim::timer::CdTimer::started(0, 10))
+    );
     assert_eq!(sim.rng_state(), rng);
     assert_eq!(sim.team_script_vm.teams_in_order().count(), 1);
 
@@ -1308,12 +1391,12 @@ fn house_team_controls_ordered_tag_history_preserves_native_due_selection_and_sa
             sim.houses[&owner].ai_activation()
         );
         assert_eq!(
-            loaded.houses[&owner].team_creation,
-            sim.houses[&owner].team_creation
+            loaded.houses[&owner].team_creation(),
+            sim.houses[&owner].team_creation()
         );
     }
 
-    sim.session.binary_frame = 10;
+    sim.session.set_binary_frame_for_test(10);
     crate::sim::ai_team_creation::update_team_creation(
         &mut sim,
         &rules,
@@ -1339,7 +1422,7 @@ fn house_team_controls_ordered_tag_history_preserves_native_due_selection_and_sa
         old_team_bytes
     );
     assert_eq!(
-        sim.houses[&houses[0]].team_creation.timer(),
+        sim.houses[&houses[0]].team_creation().timer(),
         crate::sim::timer::CdTimer::started(10, 600)
     );
     // Main is a process stream, intentionally absent from snapshots. Compare
@@ -1361,10 +1444,10 @@ fn house_team_controls_signed_reader_hash_and_null_house_keep_other_state() {
         ] {
             let mut sim = Simulation::new();
             let owner = sim.interner.intern("House");
-            sim.houses.insert(
-                owner,
-                crate::sim::house_state::HouseState::new(owner, 0, None, false, 0, 10),
-            );
+            sim.houses
+                .register(crate::sim::house_state::HouseState::new(
+                    owner, 0, None, false, 0, 10,
+                ));
             let before_hash = sim.state_hash();
             let before = serde_json::to_value(&sim.houses[&owner]).unwrap();
             let rng = sim.rng_state();

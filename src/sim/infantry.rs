@@ -13,16 +13,13 @@
 //! - Infantry actions and completion use the single Doing/Stage owner in
 //!   `movement::infantry_action`; this fear receiver requests actions without
 //!   advancing or copying that clock.
-//! - **The one-in-three voice comment** on the second fidget. It draws from the
-//!   process-global stream, not the scenario one — its gate is local-player-only
-//!   and therefore client-dependent, which is exactly why it cannot sit on the
-//!   lockstep stream. Not drawn here, so it cannot disturb the scenario cursor.
-//!   Needs the audio seam. Frequency: roughly one idle turn in nine, audio only.
-//! - Idle NULL-source Scatter (`51D0D0`) on roll8 for COW/AI Fraidycat still
-//!   returns a logged residual below. It can consume additional Scenario
-//!   draws and alter navigation before the mission's cadence draw. The fear
-//!   receiver calls the existing NULL Scatter owner; its complete Fraidycat
-//!   transaction remains separately bounded by that owner's evidence.
+//! - The second fidget's one-in-three `VoiceComment=` draws on Main, not the
+//!   Scenario stream: its gate is local-player-only and therefore
+//!   client-dependent ([`crate::sim::world::Simulation::infantry_idle_comment`]).
+//! - The idle NULL-source Scatter (`51D0D0`, from the panic and roll-8 arms)
+//!   drops the owner's bridge-state answer: none of the three native callers
+//!   reads the idle result, and a Guard/AreaGuard/Hunt civilian's first Walk
+//!   Process has no Enter mission to change bridge state with.
 //!
 //! The actor-local fear receiver executes at InfantryAI51BF0B after Process.
 //! It reads NavCom and the actual locomotor motion query independently.
@@ -78,7 +75,7 @@ impl InfantryRuntime {
         self.psycho
     }
 
-    /// Infantry5220F0, Steam gamemd3e81a617..08600.
+    /// Infantry5220F0, Steam gamemd.
     pub(crate) fn make_psycho(&mut self) {
         self.psycho = true;
     }
@@ -166,8 +163,6 @@ const FIRST_HIT_FEAR: u16 = 100;
 const FEAR_LATCH_CEILING: u16 = 99;
 const REPEATED_RED_ADD: u16 = 50;
 const REPEATED_YELLOW_ADD: u16 = 25;
-#[cfg(any(test, feature = "test-support"))]
-const REPEATED_GREEN_ADD: u16 = 12;
 const PRONE_THRESHOLD: u16 = 50;
 
 /// `InfantryClass::ReceiveDamage @ 0x00517FA0`'s fear gate: InfantryType `+0xEBC`
@@ -176,16 +171,48 @@ pub fn is_fear_application_blocked(obj: &ObjectType, entity: &GameEntity) -> boo
     obj.fearless || has_weapon_ability(entity.veterancy.rank_kind(), obj, Ability::Fearless)
 }
 
+/// InfantryClass::FireAt @0x0051DF60, retail gamemd.exe instructions:
+/// 51DF82..51DFAA, after the base returns a Bullet. This write has no
+/// Fearless/FEARLESS gate; mission queuing remains with the FireAt caller.
+pub(crate) fn apply_empty_magazine_panic(obj: &ObjectType, entity: &mut GameEntity) -> bool {
+    if entity.lifecycle.in_limbo()
+        || !obj.fraidycat
+        || entity.ammo().is_none_or(|ammo| ammo.current() != 0)
+    {
+        return false;
+    }
+    entity
+        .infantry
+        .as_mut()
+        .expect("Infantry FireAt requires its class runtime")
+        .fear_level = MAX_FEAR;
+    true
+}
+
 pub fn can_decay_fear(obj: &ObjectType) -> bool {
     !obj.fearless
 }
 
+/// `gamemd.exe` Infantry521C10..521C3B (Foot virtual +518).
 pub fn apply_panic_force(obj: &ObjectType, entity: &mut GameEntity) {
     if is_fear_application_blocked(obj, entity) {
         return;
     }
     if let Some(infantry) = entity.infantry.as_mut() {
         infantry.fear_level = MAX_FEAR;
+    }
+}
+
+/// `gamemd.exe` Infantry521C40..521C5A (Foot virtual +51C): type Fearless
+/// vetoes the fear0 write. Unlike Panic, this does not test the FEARLESS
+/// ability or change stance, Doing, Stage, timers, targets or mission.
+/// Unit/Aircraft inherit the empty Foot41C110 receiver.
+pub(crate) fn apply_unpanic_force(obj: &ObjectType, entity: &mut GameEntity) {
+    if obj.fearless {
+        return;
+    }
+    if let Some(infantry) = entity.infantry.as_mut() {
+        infantry.fear_level = 0;
     }
 }
 
@@ -199,10 +226,18 @@ pub fn apply_fear_from_damage(
     condition_red_ratio: f64,
     condition_yellow_ratio: f64,
 ) {
-    if damage_landed == 0
-        || entity.health.current() == 0
-        || is_fear_application_blocked(obj, entity)
-    {
+    if damage_landed == 0 || entity.health.current() == 0 {
+        return;
+    }
+    let latch = damager_present
+        && entity
+            .infantry
+            .as_ref()
+            .is_some_and(|infantry| infantry.fear_level <= FEAR_LATCH_CEILING);
+    // Retail gamemd.exe InfantryClass::ReceiveDamage @0x00517FA0:
+    //518C5C..518C91 returns from the sourced Fraidycat latch before the
+    //Fearless/FEARLESS gates at518C94/518CC8. Panic keeps its shared gate.
+    if !(latch && obj.fraidycat) && is_fear_application_blocked(obj, entity) {
         return;
     }
     let Some(infantry) = entity.infantry.as_mut() else {
@@ -212,7 +247,7 @@ pub fn apply_fear_from_damage(
     // ceiling *sets* fear outright — 300 for a Fraidycat, 100 otherwise — instead
     // of adding to it. Only a hit with no damager, or one taken while fear is
     // already above the ceiling, runs the health-band ladder below.
-    if damager_present && infantry.fear_level <= FEAR_LATCH_CEILING {
+    if latch {
         infantry.fear_level = if obj.fraidycat {
             MAX_FEAR
         } else {
@@ -251,7 +286,7 @@ fn repeated_fear_add(
 }
 
 impl crate::sim::world::Simulation {
-    /// Original `InfantryClass` fear receiver5200B0, called by InfantryAI at
+    /// gamemd.exe `InfantryClass__Fear_Decay_Handler @ 0x005200B0`, called by InfantryAI at
     /// 51BF0B after Foot Process and before FireAtTarget5206B0/sequencer520AE0.
     /// Caller owns survival/warped admission. Returns the existing NULL Scatter
     /// owner's immediate Process bridge-state-change result.
@@ -271,6 +306,22 @@ impl crate::sim::world::Simulation {
             return Ok(false);
         };
         if actor.category() != crate::map::entities::EntityCategory::Infantry {
+            return Ok(false);
+        }
+        let ares = rules.ares_form();
+        // Ares InfantryClass_UpdatePanic1004CC80 (hook5200B3): a
+        // Deactivated infantryman only counts its fear down, even Fearless,
+        // and takes none of the stance, refill or Scatter work.
+        if ares && actor.deactivated.is_offline() {
+            if let Some(infantry) = self
+                .substrate
+                .entities
+                .get_mut(id)
+                .and_then(|actor| actor.infantry.as_mut())
+                && infantry.fear_level > 0
+            {
+                infantry.fear_level -= 1;
+            }
             return Ok(false);
         }
         let infantry = actor
@@ -293,13 +344,36 @@ impl crate::sim::world::Simulation {
                     .expect("retained Infantry runtime")
                     .fear_level -= 1;
             }
-            // REQUIRED SEPARATE MECHANISM:5200E1..520105 reads live
-            // Techno+2FC after fear reaches0, calls the shared IsArmed701120
-            // if Ammo0, and refills from Type+684. The shared Ammo owner now
-            // retains the constructor/chrono count, but this fear refill and
-            // ordinary ground fire debit cycle remain separate. Stock E1's
-            // negative count bypasses this arm. Saved zero-ammo controls
-            // retain its native producer for that lifecycle migration.
+            // InfantryClass__Fear_Decay_Handler @0x005200B0, retail gamemd.exe:
+            //5200E1..520105: only this positive-fear visit reaching zero can refill an empty
+            // armed actor. Copy the current type's signed Ammo; no reload
+            // timer, RNG draw or detach belongs to this arm. Installed Ares
+            // InfantryClass_UpdatePanic_DontReload (5200D7) resumes at 52010B.
+            if !ares {
+                let refill = self.substrate.entities.get(id).and_then(|actor| {
+                    if actor.infantry.as_ref()?.fear_level != 0 || actor.ammo()?.current() != 0 {
+                        return None;
+                    }
+                    let object = self.object_type(actor.type_ref(), rules)?;
+                    crate::sim::combat::combat_weapon::is_armed(
+                        actor,
+                        object,
+                        &self.substrate.entities,
+                        rules,
+                        &self.interner,
+                    )
+                    .then_some(object.ammo)
+                });
+                if let Some(type_ammo) = refill {
+                    self.substrate
+                        .entities
+                        .get_mut(id)
+                        .expect("retained fear receiver")
+                        .ammo_mut()
+                        .expect("empty Techno ammo was read above")
+                        .refill_empty_from_type(type_ammo);
+                }
+            }
             let actor = self
                 .substrate
                 .entities
@@ -325,14 +399,31 @@ impl crate::sim::world::Simulation {
                         .houses
                         .get(&actor.owner())
                         .ok_or("Infantry fear requires its native House")?
-                        .is_controlled_by_human(self.session.game_mode_nonzero);
+                        .is_controlled_by_human(self.session.game_mode_nonzero());
                     //52018E..1BA: only a human owner tests these separate
                     // inputs. A movement order is not IsMoving+10.
                     let under_way = human
                         && (actor.navigation.nav_com().is_some()
                             || crate::sim::movement::motion_query::is_moving(actor)
                                 .ok_or("Infantry fear requires active IsMoving state")?);
-                    if !under_way && !fraidycat {
+                    // Ares 3.0 InfantryClass_UpdatePanic_ProneWater 100256F0
+                    // (hook 0x005201CC): no prone Down on a Beach or Water
+                    // cell (GetCell's LandType); the tail at 0x005201DC runs.
+                    let wet = if ares {
+                        use crate::rules::terrain_rules::LandType;
+                        self.resolved_terrain
+                            .as_ref()
+                            .and_then(|terrain| {
+                                terrain.cell(actor.position.rx(), actor.position.ry())
+                            })
+                            .is_some_and(|cell| {
+                                cell.land_type == LandType::Beach.as_index()
+                                    || cell.land_type == LandType::Water.as_index()
+                            })
+                    } else {
+                        false
+                    };
+                    if !under_way && !fraidycat && !wet {
                         //5201CE..1D6: Crawls and accepted/refused prone/clock
                         // writes belong solely to Infantry51D6F0.
                         let _accepted = self.infantry_do_action(id, 5, false, rules, effects)?;
@@ -385,10 +476,6 @@ impl crate::sim::world::Simulation {
 // Idle actions
 // ---------------------------------------------------------------------------
 
-/// Lower end of the idle wait, in frames per unit of `IdleActionFrequency`.
-const IDLE_WAIT_FLOOR_FRAMES: i32 = 450;
-/// Upper end of the idle wait, in frames per unit of `IdleActionFrequency`.
-const IDLE_WAIT_CEILING_FRAMES: i32 = 1800;
 /// Inclusive top of the draw gamemd uses as the idle wait's random fraction,
 /// scaled by the recorded native reciprocal at `0x007E3570`.
 const IDLE_WAIT_FRACTION_MAX: u32 = 0x7fff_fffe;
@@ -417,41 +504,11 @@ enum IdleAction {
     Nothing,
     /// Rolls 3, 4, 5 — the first fidget.
     Fidget1,
-    /// Rolls 1, 2, 7 — the second fidget. gamemd also rolls a one-in-three
-    /// voice comment here for a local-player-owned man; that draw comes off the
-    /// process-global stream and is not modelled (see the module residual).
+    /// Rolls 1, 2, 7 — the second fidget, followed by the one-in-three
+    /// voice comment ([`crate::sim::world::Simulation::infantry_idle_comment`]).
     Fidget2,
     /// Rolls 6, 8, 9, 10 — turn to a random facing.
     TurnInPlace,
-}
-
-/// The frames an infantryman waits before his next idle turn.
-///
-/// Infantry51CDD9..51CE26 stores the two products as doubles, reloads their
-/// difference, scales the signed draw by native7E3570, then consumes ftol's low
-/// DWORD. The timer controls subsequent Scenario draws: the old milliunit
-/// ratio changed this outcome for reader-admitted frequencies. Reuse the
-/// existing deterministic arithmetic owner instead of quantizing or clamping.
-/// Native execution: `anytown_damage/foot_missions` idle controls.
-fn idle_wait_frames(frequency: f64, fraction: u32) -> u32 {
-    use crate::util::native_x87::{MaskedX87Chop53 as X87, NativeF64Bits};
-    let frequency = X87::load_f64(NativeF64Bits::from_bits(frequency.to_bits()));
-    let ceiling = X87::load_f64(X87::store_f64_masked_chop(X87::mul(
-        frequency,
-        X87::load_i32(IDLE_WAIT_CEILING_FRAMES),
-    )));
-    let floor = X87::load_f64(X87::store_f64_masked_chop(X87::mul(
-        frequency,
-        X87::load_i32(IDLE_WAIT_FLOOR_FRAMES),
-    )));
-    let fraction = X87::mul(
-        X87::load_i32(fraction as i32),
-        X87::load_f64(crate::sim::rng::RANDOM_RANGED_UNIT_SCALE),
-    );
-    X87::ftol_i32_low_masked(X87::add(
-        X87::mul(X87::sub(ceiling, floor), fraction),
-        floor,
-    )) as u32
 }
 
 /// Turn one idle roll into the action it selects.
@@ -511,6 +568,7 @@ enum IdleTurn {
 
 /// Single Infantry51CDB0 decision body. The world receiver applies its class
 /// action immediately, before a mission caller can spend its cadence draw.
+/// `ares` is the game's `RuleSet::ares_form`.
 fn select_idle_action(
     entity: &mut GameEntity,
     object: &ObjectType,
@@ -518,23 +576,39 @@ fn select_idle_action(
     frequency: f64,
     rng: &mut crate::sim::rng::SimRng,
     frame: u32,
+    ares: bool,
 ) -> Result<IdleTurn, String> {
     use crate::sim::movement::infantry_action::{DO_IDLE1, DO_IDLE2};
     if !idle_action_ready(entity, frame)? {
         return Ok(IdleTurn::Refused);
     }
-    let wait = idle_wait_frames(
-        frequency,
+    // 51CDD9..51CE26: the timer controls subsequent Scenario draws, so its
+    // frames take the native arithmetic, unquantized and unclamped.
+    // Native execution: `anytown_damage/foot_missions` idle controls.
+    let (wait, _) = crate::util::native_random::minutes_timer_frames(
+        crate::util::native_x87::NativeF64Bits::from_bits(frequency.to_bits()),
         rng.next_range_u32_inclusive(0, IDLE_WAIT_FRACTION_MAX),
     );
     let infantry = entity.infantry.as_mut().expect("admitted Infantry");
-    infantry.idle_action_timer.defer(frame, wait);
+    infantry.idle_action_timer.defer(frame, wait as u32);
     //51CE35..3E precede both the panic gate and every action/facing draw.
     if object.fraidycat && !controlled_by_human && infantry.fear_level > IDLE_PANIC_FEAR {
         return Ok(IdleTurn::NullSourceScatter);
     }
-    let biased_type = object.id.eq_ignore_ascii_case(IDLE_BIASED_TYPE);
     let mut roll = rng.next_range_u32_inclusive(0, IDLE_ROLL_MAX);
+    // Ares 3.0 InfantryClass_Idle (10049740, hook 0x51CE9A) tests `IsCow`
+    // in place of the ID, and under EMP takes no bias and leaves the roll
+    // register (EDI) holding the frame it loaded at 0x0051CE10.
+    let biased_type = if ares {
+        if entity.emp_remaining() > 0 {
+            roll = frame;
+            false
+        } else {
+            object.techno_combat().roles().is_cow()
+        }
+    } else {
+        object.id.eq_ignore_ascii_case(IDLE_BIASED_TYPE)
+    };
     if biased_type && rng.next_range_u32_inclusive(0, IDLE_ROLL_MAX) < IDLE_BIAS_THRESHOLD {
         roll = 8;
     }
@@ -563,6 +637,7 @@ impl crate::sim::world::Simulation {
         &mut self,
         id: u64,
         rules: &crate::rules::ruleset::RuleSet,
+        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> Result<bool, String> {
         let Some(actor) = self.substrate.entities.get(id) else {
@@ -587,7 +662,8 @@ impl crate::sim::world::Simulation {
             controlled_by_human,
             rules.general.idle_action_frequency,
             &mut self.scenario_rng,
-            self.session.binary_frame,
+            self.session.binary_frame(),
+            rules.ares_form(),
         )?;
         match turn {
             IdleTurn::Refused => return Ok(false),
@@ -595,31 +671,74 @@ impl crate::sim::world::Simulation {
                 //51CEEA/51CF4C pass action9/10, force0, random-stage0 for
                 // every Infantry class, including ordinary ground E1.
                 let _accepted = self.infantry_do_action(id, action, false, rules, effects)?;
+                if action == crate::sim::movement::infantry_action::DO_IDLE2 {
+                    self.infantry_idle_comment(id, rules, effects);
+                }
             }
             IdleTurn::NullSourceScatter => {
-                // The existing damage Scatter owner accepts a real source;
-                // native idle passes NullCoordA8F200, forced1, no-Kick0. Its
-                // additional navigation/RNG path remains a separate mechanism.
-                log::debug!("infantry {id} idle NULL-source Scatter is not represented");
+                // vt+0x174 Scatter(NullCoord 0xA8F200, forced 1, no-kidding
+                // 0): the panic arm 0x0051CE60..0x0051CE76 and the roll-8 arm
+                // 0x0051D049.
+                self.scatter(
+                    id,
+                    None,
+                    crate::sim::movement::ScatterFlags::new(true, false),
+                    rules,
+                    registry,
+                    effects,
+                )?;
             }
             IdleTurn::Spent => {}
         }
         Ok(true)
+    }
+
+    /// `0x0051CF52..0x0051CFCB`, after the second fidget's Do_Action: an
+    /// unselected (`+0x83`) man of a `HouseClass::IsHumanPlayer @ 0x0050B6F0`
+    /// house whose type has a `VoiceComment=` takes one Main
+    /// `RandomRanged(0, 2)` (`0x0051CF90`) and on 0 plays the first comment at
+    /// his Location (`VocClass::PlayAt @ 0x007509E0`).
+    pub(crate) fn infantry_idle_comment(
+        &mut self,
+        id: u64,
+        rules: &crate::rules::ruleset::RuleSet,
+        effects: FrameEffects<'_>,
+    ) {
+        let Some(actor) = self.substrate.entities.get(id) else {
+            return;
+        };
+        if actor.selection.is_selected() || !self.house_is_human_player(actor.owner()) {
+            return;
+        }
+        let Some(comment) = self
+            .object_type(actor.type_ref(), rules)
+            .and_then(|object| object.voice_comment.first())
+        else {
+            return;
+        };
+        if self.main_rng.next_range_i32_inclusive(0, 2) != 0 {
+            return;
+        }
+        let event = crate::sim::world::SimSoundEvent::voc_at_location(
+            comment.clone(),
+            actor,
+            self.resolved_terrain.as_ref(),
+        );
+        self.sound_events.emit(event);
+        effects.flush_sound(self, rules);
     }
 }
 
 /// Test compatibility for old logic-vector fixtures. Production mission
 /// callers use the synchronous object receiver above. This adapter keeps only
 /// outer AI/logic-vector gates and delegates every idle decision to its owner;
-/// returned fidgets require the real Do_Action receiver to enact them.
+/// returned fidgets require the real Do_Action receiver to enact them. It
+/// drops a NULL-source Scatter turn, which production enacts.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn tick_idle_actions(
     entities: &mut crate::sim::entity_store::EntityStore,
     order: &[u64],
-    houses: &std::collections::BTreeMap<
-        crate::sim::intern::InternedId,
-        crate::sim::house_state::HouseState,
-    >,
+    houses: &crate::sim::houses::Houses,
     rules: &crate::rules::ruleset::RuleSet,
     interner: &crate::sim::intern::StringInterner,
     rng: &mut crate::sim::rng::SimRng,
@@ -650,6 +769,7 @@ pub(crate) fn tick_idle_actions(
             rules.general.idle_action_frequency,
             rng,
             frame,
+            rules.ares_form(),
         )
         .expect("native idle fixture requires represented Infantry state")
         {
@@ -663,11 +783,24 @@ pub fn is_prone_for_damage(entity: &GameEntity) -> bool {
     entity.infantry.is_some_and(|infantry| infantry.is_prone)
 }
 
-pub fn apply_prone_speed(speed: SimFixed, crawls: bool) -> SimFixed {
+/// `InfantryClass::GetMovementSpeed @ 0x00521D80`'s prone arm: retail applies
+/// the two integer sequences below at `0x00521DA4..0x00521DBB` (`Crawls=`) and
+/// `0x00521DBC..0x00521DC3` (no `Crawls=`).
+///
+/// Phobos's `InfantryClass_CurrentSpeed_ProneSpeed` hook at `0x00521D94`
+/// replaces both with `static_cast<int>(speed * ProneSpeed)`, so a `multiplier`
+/// short-circuits them. The product is a plain IEEE double; Rust's `as i32`
+/// truncates toward zero, as the C++ cast does. Every multiplier the readers
+/// store is a widened binary32 or a 0.67/1.5 default, so the product of a
+/// whole speed truncates alike under x87 and SSE2.
+pub fn apply_prone_speed(speed: SimFixed, crawls: bool, multiplier: Option<f64>) -> SimFixed {
     if speed <= SIM_ZERO {
         return speed;
     }
     let whole_speed = speed.to_num::<i32>().max(0);
+    if let Some(multiplier) = multiplier {
+        return SimFixed::from_num((f64::from(whole_speed) * multiplier) as i32);
+    }
     let adjusted = if crawls {
         (whole_speed.saturating_mul(2) + 2) / 3
     } else {
@@ -676,12 +809,15 @@ pub fn apply_prone_speed(speed: SimFixed, crawls: bool) -> SimFixed {
     SimFixed::from_num(adjusted)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
+#[path = "infantry_damage_fear_tests.rs"]
+mod damage_fear_tests;
+
+#[cfg(all(test, tests_sim_h_o))]
 mod tests {
     use super::*;
     use crate::map::entities::EntityCategory;
     use crate::rules::ini_parser::IniFile;
-    use crate::rules::object_type::ObjectCategory;
     use crate::rules::ruleset::RuleSet;
     use crate::sim::combat::Health;
     use crate::sim::game_entity::GameEntity;
@@ -689,9 +825,17 @@ mod tests {
     use crate::sim::intern::test_intern;
 
     fn rules_for(section: &str) -> RuleSet {
-        RuleSet::from_ini(&IniFile::from_str(&format!(
-            "[InfantryTypes]\n0=E1\n\n[VehicleTypes]\n\n[AircraftTypes]\n\n[BuildingTypes]\n\n[E1]\nStrength=100\nArmor=flak\nSpeed=4\n{section}\n"
-        )))
+        rules_with_art(section, &IniFile::empty())
+    }
+
+    /// [`rules_for`] with `art` as the fixed ART its passes read.
+    fn rules_with_art(section: &str, art: &IniFile) -> RuleSet {
+        RuleSet::from_ini_with_fixed_art_for_test(
+            &IniFile::from_str(&format!(
+                "[InfantryTypes]\n0=E1\n\n[VehicleTypes]\n\n[AircraftTypes]\n\n[BuildingTypes]\n\n[E1]\nStrength=100\nArmor=flak\nSpeed=4\n{section}\n"
+            )),
+            art,
+        )
         .expect("rules should parse")
     }
 
@@ -758,21 +902,6 @@ mod tests {
     }
 
     #[test]
-    fn first_hit_and_fraidycat_set_fear() {
-        let rules = rules_for("");
-        let obj = rules.object("E1").unwrap();
-        let mut e = infantry(90);
-        apply_fear_from_damage(obj, &mut e, 10, true, 0.25, 0.5);
-        assert_eq!(e.infantry.unwrap().fear_level, FIRST_HIT_FEAR);
-
-        let rules = rules_for("Fraidycat=yes\n");
-        let obj = rules.object("E1").unwrap();
-        let mut e = infantry(90);
-        apply_fear_from_damage(obj, &mut e, 10, true, 0.25, 0.5);
-        assert_eq!(e.infantry.unwrap().fear_level, MAX_FEAR);
-    }
-
-    #[test]
     fn hit_inside_the_latch_band_snaps_fear_back_up() {
         // The gap this pins: a hit taken while fear is already part-way decayed.
         // gamemd re-latches to 100 (300 Fraidycat) anywhere in 0..=99, which is
@@ -799,27 +928,8 @@ mod tests {
         assert_eq!(e.infantry.unwrap().fear_level, MAX_FEAR);
     }
 
-    #[test]
-    fn above_the_latch_band_still_takes_the_health_ladder() {
-        // The boundary the latch must not swallow: at 100 the ladder applies, so
-        // a full-health hit adds 12 rather than resetting to 100.
-        let rules = rules_for("");
-        let obj = rules.object("E1").unwrap();
-        let mut e = infantry(100);
-        e.infantry.as_mut().unwrap().fear_level = FEAR_LATCH_CEILING + 1;
-        apply_fear_from_damage(obj, &mut e, 10, true, 0.25, 0.5);
-        assert_eq!(
-            e.infantry.unwrap().fear_level,
-            FEAR_LATCH_CEILING + 1 + REPEATED_GREEN_ADD
-        );
-    }
-
     fn fear_corpus() -> &'static serde_json::Value {
         let native = crate::test_fixture::json("tools/spatial_oracle/infantry_fear_action.json");
-        assert_eq!(
-            native["native_sha256"],
-            "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-        );
         assert_eq!(native["rows"].as_array().unwrap().len(), 46);
         native
     }
@@ -845,12 +955,6 @@ mod tests {
                 "no"
             }
         };
-        let mut rules = rules_for(&format!(
-            "Locomotor={{4A582744-9839-11d1-B709-00A024DDAFD1}}\n\
-             Fearless={}\nFraidycat={}\n",
-            yes_no("fearless", false),
-            yes_no("fraidycat", false)
-        ));
         let records: String = crate::rules::infantry_sequence::NATIVE_SEQUENCE_NAMES
             .iter()
             .enumerate()
@@ -864,6 +968,15 @@ mod tests {
             "[E1]\nSequence=FearFixture\nCrawls={}\n[FearFixture]\n{records}",
             yes_no("crawls", true)
         ));
+        let mut rules = rules_with_art(
+            &format!(
+                "Locomotor={{4A582744-9839-11d1-B709-00A024DDAFD1}}\n\
+                 Fearless={}\nFraidycat={}\n",
+                yes_no("fearless", false),
+                yes_no("fraidycat", false)
+            ),
+            &art,
+        );
         rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
         // Native fixture supplies Type+EBD directly. The production reader
         // binds that Crawls byte from ART, not RULES, before Down51D77A.
@@ -873,12 +986,13 @@ mod tests {
             "supplied native Crawls input: {}",
             input["name"]
         );
-        rules.bind_animation_sequences(
-            &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-        );
         let mut sim = Simulation::with_seed(31);
-        sim.session.binary_frame = 100;
-        sim.session.game_mode_nonzero = input["game_mode_nonzero"].as_bool().unwrap_or(true);
+        sim.session.set_binary_frame_for_test(100);
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+                input["game_mode_nonzero"].as_bool().unwrap_or(true),
+            ),
+        );
         sim.scenario_rng = SimRng::new(31);
         sim.main_rng = SimRng::new(31).into();
         sim.mapgen_rng = SimRng::new(31);
@@ -891,8 +1005,8 @@ mod tests {
             0,
             10,
         );
-        house.player_control = input["player_control"].as_bool().unwrap_or(false);
-        sim.houses.insert(owner, house);
+        house.set_player_control_for_test(input["player_control"].as_bool().unwrap_or(false));
+        sim.houses.register(house);
         let mut actor = GameEntity::new_at_frame_zero_for_test(
             1,
             0,
@@ -1051,6 +1165,31 @@ mod tests {
         assert_eq!(compared, 42);
     }
 
+    /// Ares 100256F0 (hook 0x5201CC): the native `down_threshold51` control
+    /// goes prone on clear ground, but not standing on a Beach cell.
+    #[test]
+    fn ares_panicking_infantry_does_not_go_prone_on_a_beach() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        use crate::rules::terrain_rules::LandType;
+        let native = fear_corpus();
+        let row = native["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["input"]["name"] == "down_threshold51")
+            .unwrap();
+        for (land, prone) in [(LandType::Clear, true), (LandType::Beach, false)] {
+            let (mut sim, rules) = fear_fixture(row);
+            let mut terrain = crate::map::resolved_terrain::test_retail_clear_grid(4, 4);
+            terrain.cell_mut_for_test(0, 0).unwrap().land_type = land.as_index();
+            sim.install_resolved_terrain_for_new_map(terrain);
+            sim.infantry_fear_turn(1, &rules, None, crate::sim::world::FrameEffects::default())
+                .unwrap();
+            let infantry = sim.entities().get(1).unwrap().infantry.as_ref().unwrap();
+            assert_eq!(infantry.is_prone, prone, "{land:?}");
+        }
+    }
+
     #[test]
     fn native_fear_down_uses_actual_walk_motion_not_movement_order() {
         let native = fear_corpus();
@@ -1066,6 +1205,16 @@ mod tests {
                 .unwrap()
         );
         assert_native_fear_state(&sim, row);
+    }
+
+    /// WEEDGUY is the retail infantry without an ARTMD image section, so it
+    /// keeps the InfantryTypeClass constructor's Crawls (`0x00523788`).
+    #[test]
+    fn retail_weedguy_keeps_the_constructor_crawls() {
+        let Some(rules) = retail_e1_rules() else {
+            return;
+        };
+        assert!(rules.object("WEEDGUY").unwrap().crawls);
     }
 
     /// Stock E1's Crawls/Fearless/Fraidycat/Ammo/Walk inputs come through
@@ -1182,16 +1331,8 @@ mod tests {
         assert_eq!(e.infantry.unwrap().fear_level, 0);
     }
 
-    fn idle_corpus() -> serde_json::Value {
-        let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
-            "tools/spatial_oracle/anytown_damage/foot_missions.json",
-        ))
-        .unwrap();
-        assert_eq!(
-            native["native_sha256"],
-            "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-        );
-        native
+    fn idle_corpus() -> &'static serde_json::Value {
+        crate::test_fixture::json("tools/spatial_oracle/anytown_damage/foot_missions.json")
     }
 
     fn native_rng_state(rng: &crate::sim::rng::SimRng) -> serde_json::Value {
@@ -1212,10 +1353,145 @@ mod tests {
         let mut rules =
             RuleSet::from_processed_rules(&layers.process_with_fixed_art(&art).unwrap()).unwrap();
         rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-        rules.bind_animation_sequences(
-            &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-        );
         Some(rules)
+    }
+
+    /// A frightened computer-owned civilian's idle turn scatters it from no
+    /// source (`0x0051CE60..0x0051CE76`, vtable `+0x174` with NullCoord,
+    /// forced 1, no-kidding 0): after the idle wait draw, the Scatter draws
+    /// and the civilian heads for a nearby cell at once. A human's
+    /// civilian takes neither arm.
+    #[test]
+    fn a_frightened_computer_civilian_scatters_on_its_idle_turn() {
+        use crate::sim::components::NavTargetRef;
+        use crate::sim::movement::infantry_action::DO_READY;
+        let Some(rules) = retail_e1_rules() else {
+            return;
+        };
+        assert!(rules.object("CIV1").unwrap().fraidycat);
+        let run = |owner: &str| {
+            let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x51CE60);
+            let civilian = sim
+                .spawn_object("CIV1", owner, 10, 10, 0, &rules)
+                .expect("CIV1 spawns");
+            let frame = sim.session.binary_frame();
+            let actor = sim.substrate.entities.get_mut(civilian).unwrap();
+            actor
+                .mission_leaf
+                .set_infantry_doing_verified(DO_READY)
+                .unwrap();
+            let infantry = actor.infantry.as_mut().unwrap();
+            infantry.set_fear_level_for_test(IDLE_PANIC_FEAR + 1);
+            // The idle timer is due.
+            infantry.idle_action_timer = crate::sim::mission::MissionTimer::armed(frame, 0);
+            // The panic arm's own draw is the idle wait.
+            let mut replay = sim.scenario_rng.clone();
+            let ((), wait) = crate::sim::rng::trace_draws(|| {
+                replay.next_range_u32_inclusive(0, IDLE_WAIT_FRACTION_MAX);
+            });
+            let (admitted, draws) = crate::sim::rng::trace_draws(|| {
+                sim.infantry_idle_action(
+                    civilian,
+                    &rules,
+                    None,
+                    crate::sim::world::FrameEffects::default(),
+                )
+                .unwrap()
+            });
+            let nav = sim
+                .substrate
+                .entities
+                .get(civilian)
+                .unwrap()
+                .navigation
+                .nav_com();
+            // Traced draws carry their call site, so compare the stream words.
+            let word =
+                |draw: &serde_json::Value| (draw["before_indices"].clone(), draw["value"].clone());
+            let scatter_draws =
+                (draws.first().map(word) == wait.first().map(word)).then(|| draws.len() - 1);
+            (admitted, scatter_draws, nav)
+        };
+        let (admitted, scatter_draws, nav) = run("Russians");
+        assert!(admitted);
+        assert!(
+            scatter_draws.is_some_and(|draws| draws > 0),
+            "the idle wait, then the Scatter's draws: {scatter_draws:?}"
+        );
+        let Some(NavTargetRef::Cell { rx, ry }) = nav else {
+            panic!("no scatter destination: {nav:?}");
+        };
+        assert!((rx, ry) != (10, 10) && rx.abs_diff(10) <= 1 && ry.abs_diff(10) <= 1);
+        assert_eq!(run("Americans").2, None);
+    }
+
+    /// `0x0051CF52..0x0051CFCB`: after the second fidget, a human player's man
+    /// whose type reads `VoiceComment=` (`0x00524193`) takes one Main
+    /// `RandomRanged(0, 2)` and on 0 plays the first comment; a computer's man
+    /// draws nothing.
+    #[test]
+    fn second_fidget_draws_main_for_a_human_players_voice_comment() {
+        use crate::rules::sound_ini::SoundRegistry;
+        use crate::sim::movement::infantry_action::DO_READY;
+        use crate::sim::rng::SimRng;
+        let Some(mut rules) = retail_e1_rules() else {
+            return;
+        };
+        let sounds = SoundRegistry::from_ini(&IniFile::from_str("[SoundList]\n0=Hi\n1=Bye\n"));
+        rules
+            .bind_type_sound_references(&IniFile::from_str("[E1]\nVoiceComment=Hi,Bye\n"), &sounds);
+        assert_eq!(rules.object("E1").unwrap().voice_comment, ["Hi", "Bye"]);
+        // A Scenario seed whose idle roll (after the wait draw) is fidget 2.
+        let scenario_seed = (0..64)
+            .find(|&seed| {
+                let mut rng = SimRng::new(seed);
+                rng.next_range_u32_inclusive(0, IDLE_WAIT_FRACTION_MAX);
+                let roll = rng.next_range_u32_inclusive(0, IDLE_ROLL_MAX);
+                idle_action_for_roll(roll) == IdleAction::Fidget2
+            })
+            .unwrap();
+        // The Main cursor before the turn, Main after it, and the comments.
+        let run = |owner: &str, arena_seed: u64| {
+            let mut sim = crate::sim::arena_fixture::rival_arena(&rules, arena_seed);
+            let man = sim.spawn_object("E1", owner, 10, 10, 0, &rules).unwrap();
+            let frame = sim.session.binary_frame();
+            let actor = sim.substrate.entities.get_mut(man).unwrap();
+            actor
+                .mission_leaf
+                .set_infantry_doing_verified(DO_READY)
+                .unwrap();
+            actor.infantry.as_mut().unwrap().idle_action_timer =
+                crate::sim::mission::MissionTimer::armed(frame, 0);
+            sim.scenario_rng = SimRng::new(scenario_seed);
+            sim.sound_events.clear_for_test();
+            let before = sim.main_rng.snapshot_for_test();
+            assert!(
+                sim.infantry_idle_action(man, &rules, None, Default::default())
+                    .unwrap()
+            );
+            let comments: Vec<String> = sim
+                .sound_events
+                .iter()
+                .filter_map(|event| match event {
+                    crate::sim::world::SimSoundEvent::VocAt { sound_id, .. } => {
+                        Some(sound_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            (before, sim.main_rng.state(), comments)
+        };
+        // An arena whose Main draw comes out 0, so the comment plays.
+        let (mut before, after, comments) = (0..64)
+            .map(|arena_seed| run("Americans", arena_seed))
+            .find(|(before, ..)| before.clone().next_range_i32_inclusive(0, 2) == 0)
+            .unwrap();
+        before.next_range_i32_inclusive(0, 2);
+        assert_eq!(after, before.state(), "exactly one Main RandomRanged(0, 2)");
+        assert_eq!(comments, ["Hi"]);
+        let (before, after, comments) = run("Russians", 0);
+        assert_eq!(after, before.state(), "no Main draw");
+        assert!(comments.is_empty());
     }
 
     /// Full original51CDB0 + actual75AB30 + original51D6F0 on the physical
@@ -1249,13 +1525,13 @@ mod tests {
             let after = &row["after"];
             let name = input["name"].as_str().unwrap();
             let mut sim = Simulation::new();
-            sim.session.binary_frame = 1;
+            sim.session.set_binary_frame_for_test(1);
             // The historical native idle VM retains GameOptions+A8EB60=0
             // through bootstrap, companion and the physical Rules read.
             // Original5FB2E0 maps action-delay3 to5 at this supplied index;
             // an Options constructor/settings load is outside this receipt.
             // Reproduction: foot_missions.md's idle Options input proof.
-            sim.session.game_options.game_speed = 0;
+            sim.session.game_options_mut_for_test().game_speed = 0;
             sim.scenario_rng = SimRng::new(input["scenario_seed"].as_u64().unwrap());
             assert_eq!(
                 native_rng_state(&sim.scenario_rng),
@@ -1351,8 +1627,13 @@ mod tests {
             let nav_before = actor.navigation.nav_com();
             sim.substrate.entities.insert(actor);
             let (admitted, draws) = trace_draws(|| {
-                sim.infantry_idle_action(1, &rules, crate::sim::world::FrameEffects::default())
-                    .unwrap()
+                sim.infantry_idle_action(
+                    1,
+                    &rules,
+                    None,
+                    crate::sim::world::FrameEffects::default(),
+                )
+                .unwrap()
             });
             assert_eq!(admitted, row["returned_al"] != 0, "{name} return AL");
             let actor = sim.substrate.entities.get(1).unwrap();
@@ -1440,7 +1721,12 @@ mod tests {
                 .iter()
                 .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
                 .collect();
-            f64::from_le_bytes(bytes.try_into().unwrap())
+            crate::util::native_x87::NativeF64Bits::from_bits(u64::from_le_bytes(
+                bytes.try_into().unwrap(),
+            ))
+        };
+        let wait = |frequency, draw| {
+            crate::util::native_random::minutes_timer_frames(frequency, draw).0 as u32
         };
         let original = native["rows"]
             .as_array()
@@ -1469,11 +1755,11 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(
-            idle_wait_frames(bits(constructor_frequency), draw(original)),
+            wait(bits(constructor_frequency), draw(original)),
             original["after"]["idle_timer"][2].as_u64().unwrap() as u32,
         );
         assert_eq!(
-            idle_wait_frames(
+            wait(
                 bits(
                     retail["input"]["idle_control"]["idle_action_frequency_bits"]
                         .as_str()
@@ -1492,28 +1778,49 @@ mod tests {
     #[test]
     fn prone_speed_rounding_is_exact() {
         assert_eq!(
-            apply_prone_speed(SimFixed::from_num(10), true),
+            apply_prone_speed(SimFixed::from_num(10), true, None),
             SimFixed::from_num(7)
         );
         assert_eq!(
-            apply_prone_speed(SimFixed::from_num(11), true),
+            apply_prone_speed(SimFixed::from_num(11), true, None),
             SimFixed::from_num(8)
         );
         assert_eq!(
-            apply_prone_speed(SimFixed::from_num(10), false),
+            apply_prone_speed(SimFixed::from_num(10), false, None),
             SimFixed::from_num(15)
         );
         assert_eq!(
-            apply_prone_speed(SimFixed::from_num(11), false),
+            apply_prone_speed(SimFixed::from_num(11), false, None),
             SimFixed::from_num(16)
         );
     }
 
+    /// Phobos replaces both retail integer arms with `(int)(speed * ProneSpeed)`,
+    /// a double product truncated toward zero. The default 1.5 matches the
+    /// retail `speed + speed / 2`, but 0.67 is not `speed - speed / 3`: ten
+    /// leptons crawl at 6 here and at 7 there.
     #[test]
-    fn object_category_import_keeps_rules_fixture_infantry() {
+    fn phobos_prone_multiplier_truncates_the_double_product() {
+        for (speed, multiplier, expected) in [
+            (10, 0.67, 6),
+            (11, 0.67, 7),
+            (10, 1.5, 15),
+            (11, 1.5, 16),
+            (3, 0.67, 2),
+            (3, 2.0, 6),
+            (5, 0.5, 2),
+            // The retail crawl arm keeps one lepton at 1.
+            (1, 0.67, 0),
+        ] {
+            assert_eq!(
+                apply_prone_speed(SimFixed::from_num(speed), true, Some(multiplier)),
+                SimFixed::from_num(expected),
+                "{speed} x {multiplier}"
+            );
+        }
         assert_eq!(
-            rules_for("").object("E1").unwrap().category,
-            ObjectCategory::Infantry
+            apply_prone_speed(SimFixed::from_num(0), true, Some(0.67)),
+            SimFixed::from_num(0)
         );
     }
 }

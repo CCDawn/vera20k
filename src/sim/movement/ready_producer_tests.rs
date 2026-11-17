@@ -61,7 +61,7 @@ fn speed_crate_reaches_the_next_moving_query() {
     let mut entity = driving_mtnk();
     let rules = mtnk_rules();
     let interner = crate::sim::intern::test_interner();
-    let houses = std::collections::BTreeMap::new();
+    let houses = crate::sim::houses::Houses::default();
     let speed = SpeedRules::new(&rules, &interner, &houses);
 
     let full = speed.owner_current_speed(&entity);
@@ -69,14 +69,14 @@ fn speed_crate_reaches_the_next_moving_query() {
     entity
         .foot_speed
         .set_speed_fraction(SimFixed::lit("0.75") / SimFixed::from_num(full));
-    assert!(!is_moving_now(&entity, Some(speed), 100));
+    assert!(!is_moving_now(&entity, speed, 100));
 
     assert!(
         entity
             .foot_speed
             .accept_speed_crate(NativeF64Bits::from_bits(2.0f64.to_bits()))
     );
-    assert!(is_moving_now(&entity, Some(speed), 100));
+    assert!(is_moving_now(&entity, speed, 100));
 }
 
 /// Standing exactly on the stale head-to point reads not-moving. This is native
@@ -99,7 +99,16 @@ fn unit_parked_on_its_head_to_reports_not_moving() {
             ))
     );
 
-    let state = ready_state_for(&entity, None, 100).expect("Drive has a producer");
+    let state = ready_state_for(
+        &entity,
+        crate::sim::movement::SpeedRules::new(
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            &crate::sim::intern::test_interner(),
+            &crate::sim::houses::Houses::default(),
+        ),
+        100,
+    )
+    .expect("Drive has a producer");
     assert!(!state.is_moving_now());
 }
 
@@ -169,8 +178,8 @@ fn retained_motion_and_walk_readiness_match_original_queries() {
                 else {
                     unreachable!()
                 };
-                state.set_head(head);
-                state.set_moving(input["moving"].as_bool().unwrap());
+                state.set_head_for_test(head);
+                state.set_moving_for_test(input["moving"].as_bool().unwrap());
                 // The harness pokes Foot+0x578 directly, including -1, which
                 // SetSpeedFraction (its only writer) never stores: the owner
                 // stores +0 for it. IsMovingNow's `<= 0` test (0x0075AB52..63)
@@ -183,17 +192,25 @@ fn retained_motion_and_walk_readiness_match_original_queries() {
         }
         // A Foot+5E0 route must not affect any represented query.
         for has_order in [false, true] {
-            entity.navigation.path_replay = if has_order {
+            entity.navigation.set_path_replay_for_test(if has_order {
                 order_route()
             } else {
                 Default::default()
-            };
+            });
             entity.navigation.set_nav_com_for_test(
                 has_order.then(|| crate::sim::components::NavTargetRef::cell(6, 5)),
             );
             if kind == LocomotorKind::Walk {
                 assert_eq!(
-                    is_moving_now(&entity, None, 100),
+                    is_moving_now(
+                        &entity,
+                        crate::sim::movement::SpeedRules::new(
+                            crate::rules::ruleset::RuleSet::empty_for_test(),
+                            &crate::sim::intern::test_interner(),
+                            &crate::sim::houses::Houses::default()
+                        ),
+                        100
+                    ),
                     row["moving_now"].as_bool().unwrap(),
                     "{row}"
                 );

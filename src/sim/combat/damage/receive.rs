@@ -3,10 +3,10 @@
 //! live in combat::object_health and execute once after this preparation.
 //! The represented order follows Techno701900 and Object5F5390.
 
-use super::gates::evaluate_gates;
+use super::gates::{evaluate_early_gates, evaluate_late_gates};
 use super::kernel::apply_warhead_damage;
 use super::{DamageGate, DamageOutcome, DefenceDivisors, ImmunityInputs, TargetDamageView};
-use crate::util::native_x87::MaskedX87Chop53 as X;
+use crate::util::native_x87::{MaskedX87Chop53 as X, NativeF64Bits};
 
 /// `TechnoClass::ReceiveDamage @ 0x00701900`'s defence divides for a
 /// defended, non-negative hit (`0x00701939..0x007019E3`), each an x87 divide
@@ -17,6 +17,12 @@ use crate::util::native_x87::MaskedX87Chop53 as X;
 ///
 /// Native execution: `tools/spatial_oracle/damage_build.py` (`receive` rows).
 pub(crate) fn defence_divides(damage: i32, divisors: &DefenceDivisors) -> i32 {
+    defence_divides_unfloored(damage, divisors).max(1)
+}
+
+/// The same divides without `0x007019D8`'s `< 1 -> 1` floor, which the
+/// Phobos shield hook suppresses for the zero packet it owns.
+fn defence_divides_unfloored(damage: i32, divisors: &DefenceDivisors) -> i32 {
     let mut damage = X::ftol_i32_low_masked(X::div(
         X::load_i32(damage),
         X::mul(
@@ -24,21 +30,26 @@ pub(crate) fn defence_divides(damage: i32, divisors: &DefenceDivisors) -> i32 {
             X::load_f64(divisors.unit_armor),
         ),
     ));
+    // Phobos 0x00701966 divides the stock result again by the active effects'
+    // armor product, as a C++ double divide and int cast.
+    if divisors.ae_armor != 1.0 {
+        damage = crate::sim::attach_effect::divide_i32(damage, divisors.ae_armor);
+    }
     if let Some(rank_armor) = divisors.rank_armor {
         damage = X::ftol_i32_low_masked(X::div(X::load_i32(damage), X::load_f64(rank_armor)));
     }
-    damage.max(1)
+    damage
 }
 
 /// Prepare the receiver packet without committing HP or predicting its result.
-/// `cell_spread`/`percent_at_max`/`verses_f64` are the warhead's decoded kernel
+/// `cell_spread`/`percent_at_max`/`armor_multiplier` are the warhead's decoded kernel
 /// inputs (see kernel::apply_warhead_damage). `distance_leptons` is the impact
 /// distance in the kernel lepton unit (256 leptons/cell).
 pub(crate) fn receive_damage(
     incoming: i32,
     cell_spread: f64,
     percent_at_max: f64,
-    verses_f64: &[f64; 11],
+    armor_multiplier: NativeF64Bits,
     target: &TargetDamageView,
     divisors: &DefenceDivisors,
     gates: &ImmunityInputs,
@@ -47,6 +58,7 @@ pub(crate) fn receive_damage(
     max_damage: i32,
 ) -> DamageOutcome {
     let unaffected = DamageOutcome {
+        readiness_damage: None,
         apply_object_damage: false,
         hp_delta: 0,
         post_object_damage: None,
@@ -55,20 +67,43 @@ pub(crate) fn receive_damage(
         reached_survivor_postlude: false,
     };
 
-    // Nonnegative receiver divides (`0x0070192B..0x00701933` skips them for
+    // Positive receiver divides (`0x0070192B..0x00701933` skips them for
     // ignoreDefenses or a heal). gamemd runs them BEFORE the immunity gates
-    // (TypeImmune included), so the gates are evaluated below.
+    // (TypeImmune included), so the gates are evaluated below. A zero packet
+    // still divides (0 stays 0); only the later `< 1 -> 1` floor is suppressed
+    // when the Phobos shield hook owns the zero, as `0x7019D8` does.
     let mut dmg = incoming;
     if !gates.ignore_defenses && dmg >= 0 {
-        dmg = defence_divides(dmg, divisors);
+        dmg = defence_divides_unfloored(dmg, divisors);
+        if !gates.skip_low_damage_check {
+            dmg = dmg.max(1);
+        }
     }
 
-    // Immunity gates (after the divides; TypeImmune handled inside).
-    match evaluate_gates(gates) {
-        DamageGate::Nullified => return unaffected,
+    // Techno701ADB..701B62 changes readiness after TypeImmune/IC/warp,
+    // before later gates can reject the HP damage. Keep that packet even
+    // when a later gate returns early; the live receiver owns its mutation.
+    let (gate, readiness_damage) = match evaluate_early_gates(gates) {
+        Some(gate) => (gate, None),
+        None => (evaluate_late_gates(gates), Some(dmg)),
+    };
+    let unaffected = DamageOutcome {
+        readiness_damage,
+        ..unaffected
+    };
+    match gate {
+        DamageGate::Nullified { clear_damage } => {
+            return DamageOutcome {
+                // Techno701A2C and701CFC/1D1F/1D3E retain the defended value;
+                // the other early gates write zero through the actual pointer.
+                post_object_damage: Some(if clear_damage { 0 } else { dmg }),
+                ..unaffected
+            };
+        }
         DamageGate::Invulnerable => {
             return DamageOutcome {
                 invulnerability_impact_damage: Some(dmg.wrapping_shl(1)),
+                post_object_damage: Some(0),
                 ..unaffected
             };
         }
@@ -80,16 +115,16 @@ pub(crate) fn receive_damage(
                 dmg,
                 cell_spread,
                 percent_at_max,
-                verses_f64,
-                target.armor,
+                armor_multiplier,
                 0,
                 scenario_no_damage,
                 max_damage,
             );
             return DamageOutcome {
+                readiness_damage,
                 apply_object_damage: false,
                 hp_delta: 0,
-                post_object_damage: None,
+                post_object_damage: Some(psychedelic_value),
                 psychedelic_value: Some(psychedelic_value),
                 invulnerability_impact_damage: None,
                 reached_survivor_postlude: false,
@@ -122,6 +157,17 @@ pub(crate) fn receive_damage(
         };
     }
 
+    // Ares ObjectClass_ReceiveDamage_Relative (10053A80, hook 0x5F53E5):
+    // after the entry gate and before the Verses kernel, RelativeDamage
+    // replaces the packet and keeps its sign; ignoreDefenses does not skip it.
+    if let Some(relative) = target.relative_damage {
+        dmg = if dmg < 0 {
+            relative.wrapping_neg()
+        } else {
+            relative
+        };
+    }
+
     // Verses kernel (falloff -> Verses -> cap; also re-runs the D1/D2 early-outs).
     let delta = if gates.ignore_defenses {
         dmg
@@ -130,8 +176,7 @@ pub(crate) fn receive_damage(
             dmg,
             cell_spread,
             percent_at_max,
-            verses_f64,
-            target.armor,
+            armor_multiplier,
             distance_leptons,
             scenario_no_damage,
             max_damage,
@@ -141,6 +186,7 @@ pub(crate) fn receive_damage(
     // Object HP mutation, Building minimum, packet clamp and return-code
     // classification belong to object_health::commit, after preparation.
     DamageOutcome {
+        readiness_damage,
         apply_object_damage: true,
         hp_delta: delta,
         post_object_damage: Some(delta),
@@ -150,14 +196,42 @@ pub(crate) fn receive_damage(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 pub(crate) mod tests {
     use super::*;
-    use crate::sim::combat::damage::{
-        ArmorClass, DefenceDivisors, ImmunityInputs, TargetDamageView,
-    };
+    use crate::sim::combat::damage::{DefenceDivisors, ImmunityInputs, TargetDamageView};
 
     const MAXD: i32 = 10000;
+
+    /// Phobos `TechnoClass_ReceiveDamage_ArmorMultiplier` (`0x00701966`)
+    /// divides the stock result by the AttachEffect armor product before the
+    /// STRONGER rank divide, with a C++ double divide and int cast.
+    #[test]
+    fn attach_effect_armor_divides_between_the_stock_and_rank_divides() {
+        let divided = |ae_armor, rank_armor| {
+            super::defence_divides(
+                100,
+                &DefenceDivisors {
+                    ae_armor,
+                    rank_armor,
+                    ..DefenceDivisors::default()
+                },
+            )
+        };
+        assert_eq!(divided(2.0, None), 50);
+        assert_eq!(divided(0.5, None), 200);
+        assert_eq!(
+            divided(2.0, Some(NativeF64Bits::from_bits(1.5_f64.to_bits()))),
+            33,
+            "the rank divide follows the effect divide"
+        );
+        assert_eq!(divided(1.0, None), 100, "identity");
+        assert_eq!(
+            divided(0.0, None),
+            1,
+            "an infinite quotient casts to INT_MIN and floors to 1"
+        );
+    }
 
     /// A TechnoType whose rank lists hold (or lack) `ability`.
     pub(crate) fn object_with_ability(
@@ -305,6 +379,7 @@ pub(crate) mod tests {
             let divisors = DefenceDivisors {
                 house_type_armor: NativeF32Bits::from_bits(row.armor_mult_for_type),
                 unit_armor: NativeF64Bits::from_bits(input.armor_mult.unwrap_or(1.0_f64.to_bits())),
+                ae_armor: 1.0,
                 rank_armor: stronger.then(|| NativeF64Bits::from_bits(veteran_armor.to_bits())),
             };
             assert_eq!(
@@ -317,9 +392,9 @@ pub(crate) mod tests {
 
     fn tgt(_strength: i32, hp: i32) -> TargetDamageView {
         TargetDamageView {
-            armor: ArmorClass(5),
             current_hp: hp,
             object_immune: false,
+            relative_damage: None,
         }
     }
     fn allow() -> ImmunityInputs {
@@ -328,10 +403,47 @@ pub(crate) mod tests {
             ..Default::default()
         }
     }
-    fn verses(v: f64) -> [f64; 11] {
-        let mut t = [1.0; 11];
-        t[5] = v;
-        t
+    fn multiplier(v: f64) -> NativeF64Bits {
+        NativeF64Bits::from_bits(v.to_bits())
+    }
+
+    /// `0x7019D8` floors a damaged packet to 1; the Phobos shield hook's
+    /// `SkipLowDamageCheck` suppresses it only for the zero packet it wrote.
+    /// Both runs still divide first, so an unflagged zero becomes 1 and a
+    /// flagged one stays 0.
+    #[test]
+    fn the_shield_zero_packet_suppresses_the_low_damage_floor() {
+        let target = tgt(300, 300);
+        let unflagged = receive_damage(
+            0,
+            0.0,
+            1.0,
+            multiplier(1.0),
+            &target,
+            &DefenceDivisors::default(),
+            &allow(),
+            0,
+            false,
+            MAXD,
+        );
+        assert_eq!(unflagged.post_object_damage, Some(1));
+        let flagged = receive_damage(
+            0,
+            0.0,
+            1.0,
+            multiplier(1.0),
+            &target,
+            &DefenceDivisors::default(),
+            &ImmunityInputs {
+                affects_allies: true,
+                skip_low_damage_check: true,
+                ..Default::default()
+            },
+            0,
+            false,
+            MAXD,
+        );
+        assert_eq!(flagged.post_object_damage, Some(0));
     }
 
     /// `ObjectClass::ReceiveDamage @ 0x005F5390` returns before the kernel for
@@ -343,7 +455,7 @@ pub(crate) mod tests {
             400,
             0.0,
             1.0,
-            &verses(0.25),
+            multiplier(0.25),
             &tgt(300, 0),
             &DefenceDivisors::default(),
             &allow(),
@@ -373,7 +485,7 @@ pub(crate) mod tests {
             400,
             0.0,
             1.0,
-            &verses(1.0),
+            multiplier(1.0),
             &tgt(300, 0),
             &DefenceDivisors::default(),
             &ignoring,
@@ -391,7 +503,7 @@ pub(crate) mod tests {
             400,
             0.0,
             1.0,
-            &verses(0.25),
+            multiplier(0.25),
             &tgt(300, 1),
             &DefenceDivisors::default(),
             &allow(),
@@ -409,7 +521,7 @@ pub(crate) mod tests {
             500,
             0.0,
             1.0,
-            &verses(1.0),
+            multiplier(1.0),
             &tgt(300, 50),
             &DefenceDivisors::default(),
             &allow(),
@@ -427,7 +539,7 @@ pub(crate) mod tests {
             10,
             0.0,
             1.0,
-            &verses(0.0001),
+            multiplier(0.0001),
             &tgt(1000, 1000),
             &DefenceDivisors::default(),
             &allow(),
@@ -449,7 +561,7 @@ pub(crate) mod tests {
             100,
             0.0,
             1.0,
-            &verses(1.0),
+            multiplier(1.0),
             &tgt(300, 300),
             &DefenceDivisors::default(),
             &g,
@@ -471,7 +583,7 @@ pub(crate) mod tests {
             100,
             0.0,
             1.0,
-            &verses(1.0),
+            multiplier(1.0),
             &tgt(300, 300),
             &DefenceDivisors::default(),
             &g,

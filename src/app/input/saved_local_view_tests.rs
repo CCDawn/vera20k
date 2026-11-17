@@ -14,15 +14,60 @@ use crate::sim::world::Simulation;
 use crate::ui::sidebar::gadget_flash::SidebarGadgetState;
 use crate::util::save_codec;
 
+#[test]
+fn repair_sell_keep_super_release_priority_and_cancel_before_the_super() {
+    use super::TacticalPointerMode;
+    use crate::ui::sidebar::gadget_flash::SelectionMode;
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    assert_eq!(
+        retail
+            .rules
+            .super_weapon("NukeSpecial")
+            .unwrap()
+            .action
+            .as_deref(),
+        Some("Nuke")
+    );
+    for mode in [SelectionMode::Repair, SelectionMode::Sell] {
+        let mut input = MatchInputState::new(Default::default());
+        input.targeting_mode = Some(TargetingMode::SuperWeapon("NukeSpecial".into()));
+        let mut sidebar = SidebarGadgetState::new();
+        assert!(
+            sidebar.toggle_selection_mode(mode, false, 1),
+            "entry requests UnselectAll"
+        );
+        assert_eq!(
+            input.tactical_pointer_mode(&sidebar, true),
+            TacticalPointerMode::SuperWeapon("NukeSpecial")
+        );
+        assert_eq!(
+            input.tactical_pointer_mode(&sidebar, false),
+            TacticalPointerMode::Ordinary
+        );
+        assert!(input.cancel_pointer_mode(&mut sidebar));
+        assert!(!sidebar.repair_mode_on && !sidebar.sell_mode_on);
+        assert_eq!(
+            input.targeting_mode,
+            Some(TargetingMode::SuperWeapon("NukeSpecial".into()))
+        );
+        assert!(input.cancel_pointer_mode(&mut sidebar));
+        assert_eq!(input.targeting_mode, None);
+        assert!(!input.cancel_pointer_mode(&mut sidebar));
+    }
+}
+
 fn fixture() -> (Simulation, RuleSet, MatchInputState) {
     let rules = RuleSet::from_ini(&IniFile::from_str(
         "[VehicleTypes]\n1=UNIT\n[UNIT]\nStrength=100\n",
     ))
     .unwrap();
     let mut sim = Simulation::new();
-    let owner = sim.interner.intern("local");
-    let type_ref = sim.interner.intern("UNIT");
-    sim.session.current_house = Some(owner);
+    let owner = sim.intern("local");
+    let type_ref = sim.intern("UNIT");
+    sim.session_mut_for_test()
+        .set_current_house_for_test(Some(owner));
     for id in 1..=3 {
         let mut entity = GameEntity::new_at_frame_zero_for_test(
             id,
@@ -41,12 +86,11 @@ fn fixture() -> (Simulation, RuleSet, MatchInputState) {
         entity.lifecycle.set_object_alive_for_test(true);
         entity.lifecycle.set_in_limbo_for_test(false);
         entity.selection.set_selected_for_test(id != 2);
-        sim.entities_mut().insert(entity);
+        entity.set_object_group_for_test(if id == 1 { 8 } else { 9 });
+        sim.entities_mut_for_test().insert(entity);
     }
     let mut input = MatchInputState::new(Default::default());
     input.selection_order = vec![3, 1];
-    input.control_groups[0] = vec![2, 3];
-    input.control_groups[9] = vec![1];
     input.follow_target = Some(3);
     (sim, rules, input)
 }
@@ -71,6 +115,60 @@ fn serialized_capture_with(
 
 fn commit(prepared: PreparedSavedLocalView, input: &mut MatchInputState) {
     prepared.commit_into(input, &mut SidebarGadgetState::new());
+}
+
+#[test]
+fn player_load_resets_q_producer_state_without_committing_incoming_commands() {
+    let (mut sim, rules, mut source) = fixture();
+    let mut sounds = crate::audio::events::SoundEventQueue::default();
+    source.planning.set_active(
+        true,
+        Some(&sim),
+        Some(&rules),
+        &mut source.selection_state,
+        &mut sounds,
+    );
+    assert!(source.planning.active());
+    let saved = serialized_capture(&source, &sim, &rules);
+    assert!(
+        !saved.modes().planning,
+        "active YR PlanMgr mode is not a saved Display cursor mode"
+    );
+
+    // Imported earlier VERA view data may contain this bit. It must not
+    // reactivate Q, even though native Mouse raw load retains a DIFFERENT
+    // legacy Display waypoint byte. Reset6370B0 leaves637AA0 false.
+    let mut encoded = serde_json::to_value(saved).unwrap();
+    encoded["modes"]["planning"] = serde_json::json!(true);
+    let saved: SavedLocalView = serde_json::from_value(encoded).unwrap();
+    let owner = sim.session().current_house().unwrap();
+    sim.queue_command(CommandEnvelope::new(
+        owner,
+        2,
+        Command::Stop { entity_id: 1 },
+    ));
+    let queued = sim.pending_command_snapshot();
+    let prepared = PreparedSavedLocalView::new(saved, &sim, &rules).unwrap();
+    let mut outgoing = MatchInputState::new(Default::default());
+    outgoing.planning.set_active(
+        true,
+        Some(&sim),
+        Some(&rules),
+        &mut outgoing.selection_state,
+        &mut sounds,
+    );
+    assert!(outgoing.planning.active());
+    outgoing.planning.node_deleted(99, Some(7));
+    assert_eq!(outgoing.planning.highlighted_node(), Some(7));
+    commit(prepared, &mut outgoing);
+    assert!(!outgoing.planning.active());
+    assert_eq!(outgoing.planning.highlighted_node(), None);
+    assert_eq!(
+        sim.pending_command_snapshot(),
+        queued,
+        "restoration cannot enqueue PLANCOMMIT into the incoming world"
+    );
+    assert!(!serialized_capture(&outgoing, &sim, &rules).modes().planning);
 }
 
 #[test]
@@ -101,7 +199,6 @@ fn saved_view_replaces_reused_ids_and_preserves_order_and_raw_bookmarks() {
         let mut outgoing = MatchInputState::new(Default::default());
         outgoing.selection_order = vec![1, 3];
         outgoing.selection_order_pending = true;
-        outgoing.control_groups[4] = vec![1, 2, 3];
         outgoing.follow_target = Some(1);
         outgoing.last_control_group_press = Some((9, std::time::Instant::now()));
         outgoing.view_bookmarks.seed_all(9, 9);
@@ -114,9 +211,20 @@ fn saved_view_replaces_reused_ids_and_preserves_order_and_raw_bookmarks() {
         commit(prepared, &mut outgoing);
         assert_eq!(outgoing.selection_order, [3, 1]);
         assert!(!outgoing.selection_order_pending);
-        assert_eq!(outgoing.control_groups[0], [2, 3]);
-        assert_eq!(outgoing.control_groups[9], [1]);
-        assert!(outgoing.control_groups[1..9].iter().all(Vec::is_empty));
+        assert_eq!(sim.projected_control_groups()[0], [2, 3]);
+        assert_eq!(sim.projected_control_groups()[9], [1]);
+        assert!(
+            sim.projected_control_groups()[1..9]
+                .iter()
+                .all(Vec::is_empty)
+        );
+        assert!(
+            serde_json::to_value(serialized_capture(&outgoing, &sim, &rules))
+                .unwrap()
+                .get("control_groups")
+                .is_none(),
+            "the entity snapshot is the only group owner"
+        );
         assert_eq!(outgoing.follow_target, Some(3));
         assert_eq!(outgoing.last_control_group_press, None);
         assert_eq!(
@@ -137,7 +245,7 @@ fn pending_selection_survives_load_until_the_existing_queue_owner_drains_it() {
     let (mut sim, rules, mut input) = fixture();
     input.selection_order = vec![2, 1];
     input.selection_order_pending = true;
-    let owner = sim.session.current_house.unwrap();
+    let owner = sim.session().current_house().unwrap();
     sim.queue_command(CommandEnvelope::new(
         owner,
         2,
@@ -165,7 +273,7 @@ fn pending_selection_survives_load_until_the_existing_queue_owner_drains_it() {
     // Model the existing queue receiver draining/refusing this command. The
     // shared reconciliation closes pending mode against committed flags;
     // persistence itself neither applies selection nor invents admission.
-    sim.session.tick = 1;
+    sim.session_mut_for_test().set_tick_for_test(1);
     assert_eq!(sim.take_due_commands().len(), 1);
     let saved = serialized_capture(&restored, &sim, &rules);
     assert!(!saved.selection_order_pending());
@@ -184,14 +292,6 @@ fn malformed_local_view_is_rejected_before_the_outgoing_input_changes() {
         ("selection_order", serde_json::json!([3])),
         ("selection_order_pending", serde_json::json!(true)),
         ("follow_target", serde_json::json!(99)),
-        (
-            "control_groups",
-            serde_json::json!([[2, 3], [], [], [], [], [], [], [], [], [1, 2]]),
-        ),
-        (
-            "control_groups",
-            serde_json::json!([[2, 99], [], [], [], [], [], [], [], [], [1]]),
-        ),
         (
             "modes",
             serde_json::json!({"repair": false, "sell": false, "planning": false,
@@ -226,18 +326,14 @@ fn malformed_local_view_is_rejected_before_the_outgoing_input_changes() {
         );
         assert_eq!(serialized_capture(&input, &sim, &rules), saved);
     }
-    let mut wrong_slots = original;
-    wrong_slots["control_groups"] = serde_json::json!([[], []]);
-    assert!(serde_json::from_value::<SavedLocalView>(wrong_slots).is_err());
 }
 
 #[test]
 fn capture_prunes_departed_references_but_preserves_saved_idle_follow() {
     let (sim, rules, mut input) = fixture();
-    input.control_groups[0].push(99);
     input.follow_target = Some(99);
     let saved = serialized_capture(&input, &sim, &rules);
-    assert_eq!(saved.control_groups()[0], [2, 3]);
+    assert_eq!(sim.projected_control_groups()[0], [2, 3]);
     assert_eq!(saved.follow_target(), None);
     assert_eq!(input.follow_target, Some(99), "capture is read-only");
     let prepared = PreparedSavedLocalView::new(saved, &sim, &rules).unwrap();
@@ -276,7 +372,7 @@ fn idle_saved_view_replaces_outgoing_building_placement_and_preview() {
     let (sim, rules, source) = fixture();
     let saved = serialized_capture(&source, &sim, &rules);
     let mut outgoing = MatchInputState::new(Default::default());
-    let owner = sim.session.current_house.unwrap();
+    let owner = sim.session().current_house().unwrap();
     assert!(outgoing.begin_building_placement("UNIT", 1, owner));
     outgoing.building_placement_preview = Some(crate::sim::production::BuildingPlacementPreview {
         rx: 10,
@@ -295,7 +391,9 @@ fn idle_saved_view_replaces_outgoing_building_placement_and_preview() {
         }],
         wall_autofill_cells: vec![],
     });
-    outgoing.submit_building_placement();
+    outgoing.submit_building_placement(
+        &mut crate::app::sidebar_projection::SidebarProjectionState::default(),
+    );
     assert!(outgoing.begin_building_placement("UNIT", 3, owner));
 
     commit(
@@ -330,13 +428,16 @@ fn saved_superweapon_targeting_survives_roundtrip_without_charge_admission() {
     assert_eq!(outgoing.targeting_mode, source.targeting_mode);
 }
 
-/// The swizzled placement product/type and House index +11AC, and the
-/// Repair/Sell bytes, come back as saved; the preview is recomputed later.
+/// The swizzled placement product/type and House index +11AC, the
+/// foundation latch +0x1174/+0x1181, and the Repair/Sell bytes, come back as
+/// saved; the preview is recomputed later.
 #[test]
 fn saved_placement_and_sell_mode_survive_roundtrip() {
     let (sim, rules, mut source) = fixture();
-    let owner = sim.session.current_house.unwrap();
+    let owner = sim.session().current_house().unwrap();
     assert!(source.begin_building_placement("UNIT", 1, owner));
+    source.foundation_latch =
+        crate::app::input::state::FoundationLatch::from_saved(Some(((8, 4), false)));
     let saved = serialized_capture(&source, &sim, &rules);
     let mut outgoing = MatchInputState::new(Default::default());
     commit(
@@ -346,6 +447,7 @@ fn saved_placement_and_sell_mode_survive_roundtrip() {
     assert_eq!(outgoing.targeting_mode, source.targeting_mode);
     assert_eq!(outgoing.building_placement_issuer(), Some(owner));
     assert!(outgoing.building_placement_preview.is_none());
+    assert_eq!(outgoing.foundation_latch, source.foundation_latch);
 
     let (_, _, idle) = fixture();
     let mut selling = SidebarGadgetState::new();
@@ -358,4 +460,20 @@ fn saved_placement_and_sell_mode_survive_roundtrip() {
         .commit_into(&mut outgoing, &mut sidebar);
     assert!(sidebar.sell_mode_on && !sidebar.repair_mode_on);
     assert_eq!(outgoing.targeting_mode, None);
+}
+
+/// MouseLoad 5BDF70 restores TabClass IsCommandBarOpen (+0x5544) with the raw
+/// Mouse body, so a bar saved closed stays closed over an outgoing open bar.
+#[test]
+fn saved_closed_command_bar_survives_roundtrip() {
+    let (sim, rules, idle) = fixture();
+    let mut closed = SidebarGadgetState::new();
+    closed.command_bar_closed = true;
+    let saved = serialized_capture_with(&idle, &closed, &sim, &rules);
+    let mut sidebar = SidebarGadgetState::new();
+    let mut outgoing = MatchInputState::new(Default::default());
+    PreparedSavedLocalView::new(saved, &sim, &rules)
+        .unwrap()
+        .commit_into(&mut outgoing, &mut sidebar);
+    assert!(sidebar.command_bar_closed);
 }

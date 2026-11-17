@@ -173,7 +173,7 @@ fn fixture(rules: &RuleSet, input: &Value) -> (Simulation, BTreeSet<(u16, u16)>)
         .collect();
     let level = input["level"].as_i64().unwrap() as i8;
     let mut terrain = crate::map::resolved_terrain::test_flat_ground_grid(32);
-    for cell in &mut terrain.cells {
+    for cell in terrain.cells_mut_for_test() {
         cell.level = level as u8;
         // The structural flag is already gone when collapse calls47DD70.
         // A stale derived deck value must not decide the producer's Z.
@@ -238,34 +238,38 @@ fn retail_bridge_debris_matches_original_producer_and_constructor_rng() {
             .collect();
         for ((anim, expected), constructor) in actual.iter().zip(expected).zip(constructors) {
             assert_eq!(
-                sim.interner.resolve(anim.type_id),
+                sim.interner.resolve(anim.type_id()),
                 expected["type"].as_str().unwrap(),
                 "{input}"
             );
             assert_eq!(
-                serde_json::json!([anim.world_coord.x, anim.world_coord.y, anim.world_coord.z]),
+                serde_json::json!([
+                    anim.world_coord().x,
+                    anim.world_coord().y,
+                    anim.world_coord().z
+                ]),
                 expected["location"],
                 "{input}"
             );
             assert_eq!(
-                u64::from(anim.runtime.delay_remaining),
-                constructor["delay"].as_u64().unwrap(),
+                i64::from(anim.runtime().delay_remaining),
+                constructor["delay"].as_i64().unwrap(),
                 "{input}"
             );
             assert_eq!(
-                u64::from(anim.draw_flags),
+                u64::from(anim.draw_flags()),
                 constructor["flags"].as_u64().unwrap(),
                 "{input}"
             );
             assert_eq!(
-                anim.bounce.is_some(),
+                anim.bounce().is_some(),
                 expected["is_bouncing"] == 1,
                 "{input}"
             );
-            if let Some(body) = anim.bounce {
+            if let Some(body) = anim.bounce() {
                 for (actual, key) in [
-                    (body.position, "position_bits"),
-                    (body.velocity, "velocity_bits"),
+                    (body.position(), "position_bits"),
+                    (body.velocity(), "velocity_bits"),
                 ] {
                     assert_eq!(
                         serde_json::json!(actual.map(|value| value.bits())),
@@ -274,12 +278,12 @@ fn retail_bridge_debris_matches_original_producer_and_constructor_rng() {
                     );
                 }
                 assert_eq!(
-                    body.elasticity.bits(),
+                    body.elasticity().bits(),
                     expected["bounce"]["elasticity_bits"].as_u64().unwrap(),
                     "{input}"
                 );
                 assert_eq!(
-                    body.gravity.bits(),
+                    body.gravity().bits(),
                     expected["bounce"]["gravity_bits"].as_u64().unwrap(),
                     "{input}"
                 );
@@ -290,3 +294,22 @@ fn retail_bridge_debris_matches_original_producer_and_constructor_rng() {
 
 #[path = "bridge_debris_flight_tests.rs"]
 mod flight_tests;
+
+/// The executed debris gates (`0x0047DE5D..0x0047DE72` against 0.95 and
+/// `0x0047DF4C..0x0047DF61` against 0.5) at their boundary draws: under chop,
+/// draw `0x3FFFFFFF` still throws MetallicDebris.
+#[test]
+fn the_debris_gates_take_the_native_boundary_draws() {
+    for (gate, threshold) in [
+        ("bridge_outer", BRIDGE_DEBRIS_OUTER_GATE),
+        ("bridge_metallic", BRIDGE_METALLIC_GATE),
+    ] {
+        for (band, draw, passed) in crate::util::native_random::native_gate_rows(gate) {
+            assert_eq!(
+                draw < threshold,
+                passed,
+                "{gate}: band {band:e}, draw {draw:#x}"
+            );
+        }
+    }
+}

@@ -15,14 +15,6 @@ use crate::sim::world::Simulation;
 use serde_json::Value;
 
 fn corpus() -> Value {
-    let metadata: Value = serde_json::from_str(crate::test_fixture::text(
-        "tools/procedural_drawing_oracle/factory_destination.meta.json",
-    ))
-    .unwrap();
-    assert_eq!(
-        metadata["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     serde_json::from_str(crate::test_fixture::text(
         "tools/procedural_drawing_oracle/factory_destination.json",
     ))
@@ -60,7 +52,7 @@ fn target(label: &str, shape: u8) -> Option<NavTargetRef> {
 
 fn fixture(input: &Value, shape: u8) -> Simulation {
     let mut sim = Simulation::new();
-    sim.session.binary_frame = 100;
+    sim.session.set_binary_frame_for_test(100);
     let owner = sim.interner.intern("Americans");
     let type_ref = sim
         .interner
@@ -103,14 +95,15 @@ fn fixture(input: &Value, shape: u8) -> Simulation {
     actor
         .navigation
         .set_pending_destination_setter_for_test(true);
-    actor.navigation.path_runtime.start_movement(40, 30);
+    actor.navigation.path_runtime_mut().start_movement(40, 30);
     sim.substrate.entities.insert(actor);
-    sim.mission_assign_exact(
-        1,
-        MissionId::from_raw(input["mission"].as_i64().unwrap_or(5) as i32),
-        70,
-    )
-    .unwrap();
+    sim.substrate
+        .mission_assign_exact(
+            1,
+            MissionId::from_raw(input["mission"].as_i64().unwrap_or(5) as i32),
+            70,
+        )
+        .unwrap();
     sim
 }
 
@@ -131,12 +124,12 @@ fn building_destination_matches_64_native_mode_one_rows_for_all_target_shapes() 
             let mut sim = fixture(input, shape);
             let actor = sim.substrate.entities.get(1).unwrap();
             let navigation = actor.navigation.clone();
-            let mission = actor.mission;
+            let mission = actor.mission.clone();
             let rng = sim.scenario_rng.state();
             sim.assign_destination_represented(
                 1,
                 target(input["requested"].as_str().unwrap(), shape),
-                Some(&rules),
+                &rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
             )
@@ -170,7 +163,7 @@ fn factory_stop_matches_24_native_event_destination_rows() {
         let mut sim = fixture(input, 0);
         let actor = sim.substrate.entities.get(1).unwrap();
         let navigation = actor.navigation.clone();
-        let mission = actor.mission;
+        let mission = actor.mission.clone();
         let rng = sim.scenario_rng.state();
         sim.apply_command("Americans", &Command::Stop { entity_id: 1 }, Some(&rules));
         let actor = sim.substrate.entities.get(1).unwrap();

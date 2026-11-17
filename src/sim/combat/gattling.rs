@@ -154,6 +154,13 @@ impl GattlingState {
 
     /// `IncreaseGattlingStage(ticks) @ 0x0070DE70`.
     ///
+    /// `ares_cycle` is `None` for gamemd's body and, in an Ares game, the
+    /// type's `Gattling.Cycle`: TechnoClass_UpdateGattling_Cycle (Ares.dll
+    /// 1004B6C0, hook 0x70DEBA) replaces the cap test, so a cyclic type at
+    /// the cap restarts at stage 0 with the loop hard-stopped (`0x405D40` on
+    /// `+0x4A4`) and the latch clear, and the stage test reads the value the
+    /// hook leaves (`[esp+0x10]`) rather than the one the call started from.
+    ///
     /// `report_count(i)` is `GetWeapon(i)->WeaponType->Report.Count`, `None`
     /// when slot `i` names no WeaponType. `next_random` is `g_MainRng.Next()`,
     /// called at most once.
@@ -162,11 +169,13 @@ impl GattlingState {
     /// `GetWeapon(2 * stage)` names no WeaponType (a stage past the authored
     /// weapons); VERA plays nothing and leaves the latch clear. Unreachable
     /// with retail data.
+    #[allow(clippy::too_many_arguments)]
     pub fn increase(
         &mut self,
         table: &GattlingStages,
         elite: bool,
         ticks: i32,
+        ares_cycle: Option<bool>,
         report_count: impl Fn(i32) -> Option<i32>,
         mut stop: impl FnMut(),
         next_random: impl FnOnce() -> u32,
@@ -175,14 +184,27 @@ impl GattlingState {
         // The cap is tested before the add (`JGE`), against the value as
         // it was; the stage test below reads that same value.
         let before = self.value;
-        if before < table.threshold(stages, elite) {
+        let below_cap = before < table.threshold(stages, elite);
+        if below_cap {
             self.value = before.wrapping_add(table.rate_up().wrapping_mul(ticks));
         }
+        let tested = match ares_cycle {
+            None => before,
+            Some(cyclic) => {
+                if !below_cap && cyclic {
+                    self.value = 0;
+                    self.stage = 0;
+                    stop(); // AudioController::DTOR_1 on +0x4A4.
+                    self.report_latch = false;
+                }
+                self.value
+            }
+        };
         let mut effects = Increase::default();
         let mut stage = self.stage;
         if stage >= 0
             && stage < stages.wrapping_sub(1)
-            && table.threshold(stage + 1, elite) <= before
+            && table.threshold(stage + 1, elite) <= tested
         {
             stage += 1;
             self.stage = stage;
@@ -344,7 +366,9 @@ pub const fn gattling_sound_owner(techno: u64) -> u64 {
     techno | GATTLING_SOUND_TAG
 }
 
-pub(crate) const fn gattling_sound_techno(owner: u64) -> Option<u64> {
+/// The techno whose +4A4 handle this owner names. Its AI owns positional
+/// updates, so the client must not re-drive it again at the frame tail.
+pub const fn gattling_sound_techno(owner: u64) -> Option<u64> {
     if owner & GATTLING_SOUND_TAG != 0 {
         Some(owner & !GATTLING_SOUND_TAG)
     } else {
@@ -371,6 +395,7 @@ impl crate::sim::world::Simulation {
                     entity.veterancy.rank(),
                     0,
                 )
+                .and_then(|record| record.weapon_id)
                 .is_some(),
             ))
         }) else {
@@ -389,9 +414,9 @@ impl crate::sim::world::Simulation {
                 StageCall::Update => self.gattling_update(id, rules, 1, effects),
             }
         }
-        if let Some(entity) = self.substrate.entities.get_mut(id)
-            && unit_turret_anim_advances(is_gattling, outcome, entity.gattling.value())
-        {
+        if let Some(entity) = self.substrate.entities.get_mut_if(id, |entity| {
+            unit_turret_anim_advances(is_gattling, outcome, entity.gattling.value())
+        }) {
             entity.turret_anim_frame.advance();
         }
     }
@@ -416,24 +441,27 @@ impl crate::sim::world::Simulation {
         let mut state = entity.gattling;
         let weapon = |index: i32| {
             crate::sim::combat::combat_weapon::weapon_for_index(obj, veterancy, index)
-                .map(|(weapon_id, _)| rules.weapon(weapon_id))
+                .and_then(|record| record.weapon_id)
+                .map(|weapon_id| rules.weapon(weapon_id))
         };
         let owner = gattling_sound_owner(id);
         // Share the process owner's draw capability without retaining its
         // mutex across Stop. The retained source locks output gate -> Main.
         let main_draws = self.main_rng.draws();
+        let ares_cycle = rules.ares().then(|| obj.techno_combat().gattling_cyclic());
         let effects = state.increase(
             &obj.gattling_stages,
             elite,
             ticks,
+            ares_cycle,
             |index| weapon(index).map(|weapon| weapon.map_or(0, |weapon| weapon.report_count())),
             || {
                 // Native70DF74 and70DF9C finish Stop405D40, including the
                 // driver endpoint and handle clear, before Report's65C780.
                 // Source: tools/input_oracle/gattling_loop.json.
                 self.sound_events
-                    .push(crate::sim::world::SimSoundEvent::GattlingLoopStop { owner });
-                frame_effects.flush_sound(self, Some(rules));
+                    .emit(crate::sim::world::SimSoundEvent::GattlingLoopStop { owner });
+                frame_effects.flush_sound(self, rules);
             },
             || main_draws.next_u32(),
         );
@@ -446,12 +474,12 @@ impl crate::sim::world::Simulation {
                 .and_then(|weapon| weapon.report_item(report.item as usize))
         {
             self.sound_events
-                .push(crate::sim::world::SimSoundEvent::GattlingLoop {
+                .emit(crate::sim::world::SimSoundEvent::GattlingLoop {
                     owner,
                     sound_id: sound.to_owned(),
                     world,
                 });
-            frame_effects.flush_sound(self, Some(rules));
+            frame_effects.flush_sound(self, rules);
         }
     }
 
@@ -476,10 +504,10 @@ impl crate::sim::world::Simulation {
             // including an already cleared handle. The sound owner validates
             // Type0/stale handles. Source: gattling_loop.json's Unit release.
             self.sound_events
-                .push(crate::sim::world::SimSoundEvent::GattlingLoopRelease {
+                .emit(crate::sim::world::SimSoundEvent::GattlingLoopRelease {
                     owner: gattling_sound_owner(id),
                 });
-            frame_effects.flush_sound(self, Some(rules));
+            frame_effects.flush_sound(self, rules);
         });
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             entity.gattling = state;
@@ -500,7 +528,7 @@ impl crate::sim::world::Simulation {
             // TechnoLimbo6F6C6B releases4A4 before6F6C76 clears the latch.
             // Nested cleanup retains the frame rules even when it needs none.
             self.sound_events
-                .push(crate::sim::world::SimSoundEvent::GattlingLoopRelease {
+                .emit(crate::sim::world::SimSoundEvent::GattlingLoopRelease {
                     owner: gattling_sound_owner(id),
                 });
             context.effects().flush_sound(self, context.rules());
@@ -511,6 +539,6 @@ impl crate::sim::world::Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 #[path = "gattling_tests.rs"]
 mod tests;

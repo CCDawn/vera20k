@@ -20,13 +20,22 @@ pub(crate) enum ShellRoute {
     MoviesAndCredits,
     /// Movie list `0x129`, reached from Movies & Credits.
     MovieList,
+    /// VERA's Mods page (`ui::mods_shell`), reached from the main menu.
+    Mods,
     /// Campaign selection `0x94`, reached from Single Player.
     Campaign,
     /// Load Saved Game `0xB7`, reached from Single Player.
     LoadSavedGame,
-    /// Westwood Online welcome `0x10E` (and its `TXT_APIMISSING` box),
-    /// reached from Internet.
-    WolWelcome,
+    /// Westwood Online before the lobby, reached from Internet: welcome
+    /// `0x10E`, login `0x10F`, the wait box `0xC4` and the boxes
+    /// `0xD0`/`0x126` over the empty backdrop.
+    Wol,
+    /// The Westwood Online custom-match lobby `0x113`.
+    WolLobby,
+    /// LAN discovery BB.
+    LanLobby,
+    /// LAN host BC or guest BD; MatchSession owns the host role.
+    NetworkSetup,
     /// The native skirmish shell `0x102`. It is entered only from the
     /// single-player shell (directly, or on resume after a match), so Back
     /// returns there.
@@ -48,6 +57,11 @@ impl ShellRoute {
         matches!(self, Self::MovieList)
     }
 
+    /// VERA's Mods page.
+    pub(crate) fn mods(self) -> bool {
+        matches!(self, Self::Mods)
+    }
+
     /// Campaign selection `0x94`.
     pub(crate) fn campaign(self) -> bool {
         matches!(self, Self::Campaign)
@@ -58,9 +72,25 @@ impl ShellRoute {
         matches!(self, Self::LoadSavedGame)
     }
 
-    /// Westwood Online welcome `0x10E`.
-    pub(crate) fn wol_welcome(self) -> bool {
-        matches!(self, Self::WolWelcome)
+    /// Westwood Online before the lobby.
+    pub(crate) fn wol(self) -> bool {
+        matches!(self, Self::Wol)
+    }
+
+    pub(crate) fn wol_lobby(self) -> bool {
+        matches!(self, Self::WolLobby)
+    }
+
+    /// Any Westwood Online surface: one WOL visit owns both routes.
+    pub(crate) fn wol_visit(self) -> bool {
+        self.wol() || self.wol_lobby()
+    }
+
+    pub(crate) fn lan_lobby(self) -> bool {
+        matches!(self, Self::LanLobby)
+    }
+    pub(crate) fn network_setup(self) -> bool {
+        matches!(self, Self::NetworkSetup)
     }
 
     pub(crate) fn skirmish(self) -> bool {
@@ -68,7 +98,7 @@ impl ShellRoute {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::ShellRoute;
 
@@ -81,9 +111,11 @@ mod tests {
             ShellRoute::SinglePlayer,
             ShellRoute::MoviesAndCredits,
             ShellRoute::MovieList,
+            ShellRoute::Mods,
             ShellRoute::Campaign,
             ShellRoute::LoadSavedGame,
-            ShellRoute::WolWelcome,
+            ShellRoute::Wol,
+            ShellRoute::WolLobby,
             ShellRoute::Skirmish,
         ] {
             // At most one surface active — the predicates cannot both hold.
@@ -91,9 +123,11 @@ mod tests {
                 route.single_player(),
                 route.movies_and_credits(),
                 route.movie_list(),
+                route.mods(),
                 route.campaign(),
                 route.load_saved_game(),
-                route.wol_welcome(),
+                route.wol(),
+                route.wol_lobby(),
                 route.skirmish(),
             ];
             assert!(active.iter().filter(|&&on| on).count() <= 1);

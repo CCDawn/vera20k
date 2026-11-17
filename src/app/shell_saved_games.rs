@@ -8,7 +8,7 @@ use crate::ui::shell::list::ListMetrics;
 use crate::ui::shell::saved_file_input::{self, BrowserInputResult};
 use crate::ui::skirmish_shell::seed_list::SeedListGeometry;
 use crate::ui::skirmish_shell::{
-    SavedSeedLayout, SavedSeedMode, SavedSeedOutcome, SavedSeedPrompt, SavedSeedPromptPurpose,
+    SavedSeedLayout, SavedSeedMode, SavedSeedOutcome, SavedSeedPromptPurpose,
 };
 use std::path::PathBuf;
 use winit::keyboard::KeyCode;
@@ -52,27 +52,14 @@ impl App {
         body: String,
         confirm: bool,
     ) {
-        let affirmative = Self::csf_label(
-            state,
-            if confirm { "TXT_YES" } else { "TXT_OK" },
-            if confirm { "Yes" } else { "OK" },
-        );
-        let negative = confirm.then(|| Self::csf_label(state, "TXT_NO", "No"));
+        let prompt = Self::saved_browser_prompt(state, purpose, body, confirm);
         if let Some(browser) = state
             .match_state
             .match_presentation
             .saved_game_browser
             .as_mut()
         {
-            browser.description_edit.focused = false;
-            browser.pressed_control = None;
-            browser.scroll_repeat_at = None;
-            browser.prompt = Some(SavedSeedPrompt {
-                purpose,
-                body,
-                affirmative,
-                negative,
-            });
+            browser.show_prompt(prompt);
         }
     }
 
@@ -194,22 +181,22 @@ impl App {
                 }
             }
             SavedSeedOutcome::Load(path) => {
-                match crate::app::persistence::commands::try_load_save_file(state, &path) {
-                    Ok(()) => {
-                        state.match_state.match_presentation.saved_game_browser = None;
-                        Self::enter_in_game_menu_state(state, InGameMenuState::Closed);
-                    }
-                    Err(error) => {
-                        log::warn!("Load browser: {}: {error}", path.display());
-                        let body =
-                            Self::csf_label(state, "TXT_ERROR_LOADING_GAME", "Error loading game.");
-                        Self::show_saved_game_prompt(
-                            state,
-                            SavedSeedPromptPurpose::Error,
-                            body,
-                            false,
-                        );
-                    }
+                let loadable = state
+                    .match_state
+                    .match_presentation
+                    .saved_game_browser
+                    .as_ref()
+                    .and_then(|browser| browser.selected_entry())
+                    .is_none_or(|row| row.loadable);
+                if loadable {
+                    crate::app::persistence::commands::request_saved_game_load(state, path);
+                } else {
+                    Self::show_saved_game_prompt(
+                        state,
+                        SavedSeedPromptPurpose::Error,
+                        crate::i18n::tr("VERA:SaveFromOtherVersionText"),
+                        false,
+                    );
                 }
             }
             SavedSeedOutcome::Delete(file_name) => {
@@ -232,6 +219,24 @@ impl App {
         }
     }
 
+    pub(crate) fn finish_saved_game_load(
+        state: &mut AppState,
+        path: &std::path::Path,
+        result: Result<(), crate::app::persistence::PreparedLoadError>,
+    ) {
+        match result {
+            Ok(()) => {
+                state.match_state.match_presentation.saved_game_browser = None;
+                Self::enter_in_game_menu_state(state, InGameMenuState::Closed);
+            }
+            Err(error) => {
+                log::warn!("Load browser: {}: {error}", path.display());
+                let body = Self::csf_label(state, "TXT_ERROR_LOADING_GAME", "Error loading game.");
+                Self::show_saved_game_prompt(state, SavedSeedPromptPurpose::Error, body, false);
+            }
+        }
+    }
+
     fn apply_saved_game_input(state: &mut AppState, result: BrowserInputResult<PathBuf>) {
         match result {
             BrowserInputResult::None => {}
@@ -239,10 +244,10 @@ impl App {
             BrowserInputResult::PromptAnswer(answer) => {
                 Self::resolve_saved_game_prompt(state, answer)
             }
-            BrowserInputResult::ButtonPressed => {
-                Self::play_skirmish_shell_generic_click_sound(state)
+            // B7/2B4/2B5's action and Back are owner-draw (0x0061376B).
+            BrowserInputResult::ButtonPressed | BrowserInputResult::PromptButtonPressed => {
+                Self::play_main_menu_button_sound(state)
             }
-            BrowserInputResult::PromptButtonPressed => Self::play_main_menu_button_sound(state),
             BrowserInputResult::RowClicked => Self::play_skirmish_shell_generic_click_sound(state),
         }
     }
@@ -286,7 +291,7 @@ impl App {
                 &layout,
                 extent,
                 pointer,
-                std::time::Instant::now(),
+                crate::util::time::Instant::now(),
                 saved_file_input::host_double_click_limits(),
             )
         } else {
@@ -320,7 +325,7 @@ impl App {
             &layout,
             y,
             pointer_moved,
-            std::time::Instant::now(),
+            crate::util::time::Instant::now(),
         ) {
             return;
         }
@@ -332,15 +337,7 @@ impl App {
             .w - 2)
                 .max(0) as u32;
             let edit = &mut browser.description_edit;
-            edit.first_visible_unit = edit.first_visible_unit.min(edit.caret);
-            while edit.first_visible_unit < edit.caret {
-                let text =
-                    String::from_utf16_lossy(&edit.units[edit.first_visible_unit..edit.caret]);
-                if state.renderer.bit_font.text_width(&text) <= available {
-                    break;
-                }
-                edit.first_visible_unit += 1;
-            }
+            edit.scroll_to_caret(available, |text| state.renderer.bit_font.text_width(text));
         }
     }
 }

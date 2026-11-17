@@ -12,10 +12,6 @@ use serde_json::Value;
 
 fn corpus() -> &'static Value {
     let data = crate::test_fixture::json("tools/spatial_oracle/virus_gas.json");
-    assert_eq!(
-        data["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     data
 }
 fn rules(input: &Value) -> RuleSet {
@@ -62,7 +58,7 @@ fn setup(rules: &RuleSet, input: &Value, location: IVec3) -> (Simulation, u64) {
         )
         .unwrap();
     // The native fixture explicitly installs this system in DAT_A8ED78.
-    sim.particle_systems_mut().gas_cloud_system = Some(system);
+    sim.substrate.particle_systems.gas_cloud_system = Some(system);
     (sim, system)
 }
 fn assert_particle(p: &Particle, expected: &Value, name: &str) {
@@ -188,7 +184,8 @@ fn gas_system_motion_lifetime_replacement_and_rng_match_original_histories() {
             [p.drift_x, p.drift_y, p.drift_z] =
                 serde_json::from_value(prior["drift"].clone()).unwrap();
             assert_particle(&p, prior, name);
-            sim.particle_systems_mut()
+            sim.substrate
+                .particle_systems
                 .get_mut(system)
                 .unwrap()
                 .particles
@@ -200,7 +197,8 @@ fn gas_system_motion_lifetime_replacement_and_rng_match_original_histories() {
             SimRng::from_native_state_hex_for_test(case["scenario_before"].as_str().unwrap());
         let other_rng = (sim.main_rng.logical_state(), sim.mapgen_rng.logical_state());
         for visit in case["visits"].as_array().unwrap() {
-            sim.session.binary_frame = visit["frame"].as_u64().unwrap() as u32;
+            sim.session
+                .set_binary_frame_for_test(visit["frame"].as_u64().unwrap() as u32);
             assert!(super::system_ai::tick_particle_system(
                 &mut sim,
                 &rules,

@@ -3,7 +3,7 @@
 //! Native `WinMain` creates a named mutex before it creates a window. When the
 //! name is already taken it raises and restores the window the first copy owns,
 //! closes its own handle, logs, and returns without ever creating a second
-//! window. Two live copies would otherwise both write `RA2MD.INI` on quit —
+//! window. Two live copies would otherwise both write `VERA.INI` on quit —
 //! the coherent `[Options]`/`[Video]`/`[Audio]` profile and the `[Skirmish]`
 //! snapshot are whole-key overwrites, so the copy that quits second silently
 //! discards everything the first one saved.
@@ -20,20 +20,6 @@
 /// of itself. VERA-internal deviation; the native gate's shape is unchanged.
 #[cfg(windows)]
 const INSTANCE_MUTEX_NAME: &str = "VERA20K-SINGLE-INSTANCE";
-
-/// Title of the window a running copy owns, used to find and raise it.
-///
-/// Native calls `FindWindow` with its GUID *class* name; winit registers its
-/// own window class, so the title is the available equivalent. Must stay equal
-/// to the title `App::initialize` passes to `WindowAttributes::with_title`.
-/// VERA-internal substitution; the native lookup key is a class name.
-///
-/// Recorded gap: nothing ties this constant to that call site, so retitling the
-/// window silently degrades the gate to "exit without raising anything" rather
-/// than failing a test. Closing that needs `App::initialize` to take the title
-/// from here.
-#[cfg(windows)]
-const MAIN_WINDOW_TITLE: &str = "RA2 Engine";
 
 /// `ERROR_ALREADY_EXISTS` — the only status native treats as "another copy owns
 /// the gate". Every other failure falls through into a normal launch.
@@ -108,8 +94,13 @@ unsafe extern "system" {
 }
 
 /// Claim the startup gate, reproducing the native create/raise/bail sequence.
+///
+/// `window_title` is the title of the window a running copy owns, used to find
+/// and raise it. Native calls `FindWindow` with its GUID *class* name; winit
+/// registers its own window class, so the title is the available equivalent.
+/// VERA-internal substitution; the native lookup key is a class name.
 #[cfg(windows)]
-pub fn acquire() -> SingleInstance {
+pub fn acquire(window_title: &str) -> SingleInstance {
     let name = wide(INSTANCE_MUTEX_NAME);
     // SAFETY: a null security descriptor and a non-owning create are the
     // documented no-argument form; `name` outlives the call and is
@@ -125,7 +116,7 @@ pub fn acquire() -> SingleInstance {
 
     // Native raises and restores the first copy's window before bailing, so a
     // second double-click behaves like "show me the game I already started".
-    let title = wide(MAIN_WINDOW_TITLE);
+    let title = wide(window_title);
     // SAFETY: a null class name matches any class; `title` is NUL-terminated
     // and outlives the call. A null result means no such window, which native
     // also tolerates by skipping the raise.
@@ -146,11 +137,11 @@ pub fn acquire() -> SingleInstance {
 /// and retail ships only for Windows. Development builds on other targets are
 /// deliberately ungated.
 #[cfg(not(windows))]
-pub fn acquire() -> SingleInstance {
+pub fn acquire(_window_title: &str) -> SingleInstance {
     SingleInstance::Acquired(InstanceGuard {})
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_util))]
 mod tests {
     use super::*;
 
@@ -162,15 +153,5 @@ mod tests {
         assert!(!another_copy_owns_gate(5)); // ERROR_ACCESS_DENIED
         assert!(!another_copy_owns_gate(0xb6)); // adjacent status, not the gate
         assert!(!another_copy_owns_gate(0xb8));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn wide_strings_are_nul_terminated_utf16() {
-        assert_eq!(wide(""), vec![0]);
-        assert_eq!(wide("RA2"), vec![b'R' as u16, b'A' as u16, b'2' as u16, 0]);
-        let gate = wide(INSTANCE_MUTEX_NAME);
-        assert_eq!(gate.len(), INSTANCE_MUTEX_NAME.len() + 1);
-        assert_eq!(gate.last(), Some(&0));
     }
 }

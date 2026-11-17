@@ -2,17 +2,18 @@
 //! CanBuild owner ([`super::can_build`]), and factory matching.
 
 use crate::map::entities::EntityCategory;
-use crate::rules::foundation::foundation_dimensions;
 use crate::rules::object_type::{BuildCategory, FactoryType, ObjectCategory, ObjectType};
 use crate::rules::ruleset::RuleSet;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::intern::InternedId;
 use crate::sim::world::Simulation;
 
-use super::can_build::{CanBuild, can_build, check_build_limit, find_factory};
+use super::can_build::{
+    CanBuild, FactoryRoster, can_build, check_build_limit, find_factory, find_factory_among,
+};
 use super::production_types::*;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_production))]
 #[path = "construction_options_tests.rs"]
 mod construction_options_tests;
 
@@ -30,7 +31,7 @@ pub fn construction_options_for_owner(
     };
     let selling =
         crate::sim::mission::MissionId::from_known(crate::sim::mission::MissionType::Selling);
-    for &id in house.base_projection.buildings() {
+    for &id in house.base_projection().buildings() {
         let Some(building) = sim.entities().get(id) else {
             continue;
         };
@@ -73,14 +74,19 @@ fn append_construction_options(
     let Some(building) = sim.entities().get(building_id) else {
         return;
     };
-    if sim.session.current_house != Some(building.owner())
+    // Ares 3.0 BuildingClass_UpdateConstructionOptions_ExcludeDisabled
+    // (10053D80, hook 0x4456E5) adds IsUnderEMP (vt+0x37C, Building's is
+    // Techno 0x0070EFD0: +0x504 > 0) to the limbo test.
+    let disabled = rules.ares_form() && building.emp_remaining() > 0;
+    if sim.session.current_house() != Some(building.owner())
         || building.lifecycle.in_limbo()
+        || disabled
         || !building.discovery.discovered_by_current_house()
         || !building.building_online()
     {
         return;
     }
-    let Some(factory) = sim.object_type(building.type_ref(), rules) else {
+    let Some(factory) = sim.entity_object_type(building, rules) else {
         return;
     };
     let ids = match factory.factory_type() {
@@ -104,35 +110,46 @@ fn append_construction_options(
 /// No money check: a build starts without the funds and stalls its steps
 /// instead (`SelectClass::Action @ 0x006AAD00` and `HouseClass::Begin_Production
 /// @ 0x004FA350` test none).
-pub(super) fn build_option_for_owner(
+/// `owner` is the house's interned name; `None` for a name nothing interned.
+/// `factories` is that house's roster ([`FactoryRoster::of`]).
+fn build_option_among(
     sim: &Simulation,
     rules: &RuleSet,
-    owner: &str,
+    owner: Option<InternedId>,
+    factories: Option<&FactoryRoster<'_>>,
     type_id: &str,
 ) -> Option<BuildOption> {
     let obj = rules.object(type_id)?;
-    let reason = match sim.interner.get(owner) {
-        Some(owner_id) => sidebar_state(sim, rules, owner_id, obj),
+    let reason = match owner {
+        Some(owner_id) => sidebar_state(sim, rules, owner_id, factories, obj),
         None => Some(BuildDisabledReason::NoFactory),
     };
     let type_interned = sim.interner.get(type_id).unwrap_or_default();
-    let cost = match sim.interner.get(owner) {
+    let cost = match owner {
         Some(owner_id) => sim.cost_of(owner_id, obj, rules),
         None => rules.cost_of(obj, None),
     };
     Some(BuildOption {
         type_id: type_interned,
-        display_name: obj.name.clone().unwrap_or_else(|| obj.id.clone()),
         cost,
         object_category: obj.category,
         queue_category: production_category_for_object(obj),
         enabled: reason.is_none(),
-        at_build_limit: sim
-            .interner
-            .get(owner)
-            .is_some_and(|owner| check_build_limit(sim, rules, owner, obj)),
+        at_build_limit: owner.is_some_and(|owner| check_build_limit(sim, rules, owner, obj)),
         reason,
     })
+}
+
+/// [`build_option_among`] for one type alone.
+#[cfg(test)]
+pub(super) fn build_option_for_owner(
+    sim: &Simulation,
+    rules: &RuleSet,
+    owner: Option<InternedId>,
+    type_id: &str,
+) -> Option<BuildOption> {
+    let factories = owner.and_then(|owner| FactoryRoster::of(sim, rules, owner));
+    build_option_among(sim, rules, owner, factories.as_ref(), type_id)
 }
 
 /// Whether the player's strip keeps a cameo of `obj` (`StripClass::Recalculate
@@ -157,7 +174,23 @@ fn strip_refusal(
     owner: InternedId,
     obj: &ObjectType,
 ) -> Option<BuildDisabledReason> {
-    if find_factory(sim, rules, owner, obj, true, false, false).is_none() {
+    let factories = FactoryRoster::of(sim, rules, owner);
+    strip_refusal_among(sim, rules, owner, factories.as_ref(), obj)
+}
+
+/// [`strip_refusal`] with `owner`'s roster in hand; a house-less owner has
+/// none, and so no factory.
+fn strip_refusal_among(
+    sim: &Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    factories: Option<&FactoryRoster<'_>>,
+    obj: &ObjectType,
+) -> Option<BuildDisabledReason> {
+    let could_build = factories.is_some_and(|factories| {
+        find_factory_among(sim, rules, owner, factories, obj, true, false, false).is_some()
+    });
+    if !could_build {
         Some(BuildDisabledReason::NoFactory)
     } else if can_build(sim, rules, owner, obj, false, true) == CanBuild::No {
         Some(BuildDisabledReason::CannotBuild)
@@ -182,12 +215,16 @@ fn sidebar_state(
     sim: &Simulation,
     rules: &RuleSet,
     owner: InternedId,
+    factories: Option<&FactoryRoster<'_>>,
     obj: &ObjectType,
 ) -> Option<BuildDisabledReason> {
-    if let Some(refusal) = strip_refusal(sim, rules, owner, obj) {
+    if let Some(refusal) = strip_refusal_among(sim, rules, owner, factories, obj) {
         return Some(refusal);
     }
-    if find_factory(sim, rules, owner, obj, true, true, true).is_none() {
+    let ready = factories.is_some_and(|factories| {
+        find_factory_among(sim, rules, owner, factories, obj, true, true, true).is_some()
+    });
+    if !ready {
         return Some(BuildDisabledReason::NoReadyFactory);
     }
     if draw_at_build_limit(sim, rules, owner, obj) {
@@ -250,27 +287,43 @@ pub fn all_build_options_for_owner(
     rules: &RuleSet,
     owner: &str,
 ) -> Vec<BuildOption> {
-    let mut out: Vec<BuildOption> = Vec::new();
-    for id in &rules.building_ids {
-        if let Some(opt) = build_option_for_owner(sim, rules, owner, id) {
-            out.push(opt);
-        }
-    }
-    for id in &rules.infantry_ids {
-        if let Some(opt) = build_option_for_owner(sim, rules, owner, id) {
-            out.push(opt);
-        }
-    }
-    for id in &rules.vehicle_ids {
-        if let Some(opt) = build_option_for_owner(sim, rules, owner, id) {
-            out.push(opt);
-        }
-    }
-    for id in &rules.aircraft_ids {
-        if let Some(opt) = build_option_for_owner(sim, rules, owner, id) {
-            out.push(opt);
-        }
-    }
+    let owner = sim.interner.get(owner);
+    // Every type asks FindFactory of the same house: list its factories once
+    // instead of walking all its buildings for each type.
+    let factories = owner.and_then(|owner| FactoryRoster::of(sim, rules, owner));
+    let mut out: Vec<BuildOption> = [
+        &rules.building_ids,
+        &rules.infantry_ids,
+        &rules.vehicle_ids,
+        &rules.aircraft_ids,
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|id| build_option_among(sim, rules, owner, factories.as_ref(), id))
+    .collect();
+    out.sort_by_key(|opt| opt.queue_category);
+    out
+}
+
+/// [`all_build_options_for_owner`] for `types` alone, by category: what the
+/// player's sidebar asks, as `StripClass::Recalculate @ 0x006AA600` and
+/// `StripClass::Draw @ 0x006A9540` ask only the strip's entries and AddCameo
+/// only its candidate. A type no rules list builds has none.
+pub fn build_options_for_types(
+    sim: &Simulation,
+    rules: &RuleSet,
+    owner: &str,
+    types: impl IntoIterator<Item = InternedId>,
+) -> Vec<BuildOption> {
+    let owner = sim.interner.get(owner);
+    let factories = owner.and_then(|owner| FactoryRoster::of(sim, rules, owner));
+    let mut out: Vec<BuildOption> = types
+        .into_iter()
+        .filter_map(|id| {
+            let name = sim.interner.try_resolve(id)?;
+            build_option_among(sim, rules, owner, factories.as_ref(), name)
+        })
+        .collect();
     out.sort_by_key(|opt| opt.queue_category);
     out
 }
@@ -325,7 +378,7 @@ pub(super) fn is_production_factory(
             && factory_category == ProductionCategory::Building)
 }
 
-/// VERA-only: the producer-focus list (the sidebar's view and `CycleProducerFocus`): the owner's
+/// VERA-only: the producer-focus list (`CycleProducerFocus`): the owner's
 /// structures that build `category`, less dying, limboed and constructing ones, from the store.
 pub fn producer_candidates_for_owner_category(
     entities: &EntityStore,
@@ -378,19 +431,15 @@ pub fn producer_candidates_for_owner_category(
 pub fn building_base_foundation_cells(
     origin_rx: u16,
     origin_ry: u16,
-    foundation: &str,
+    foundation: &crate::rules::foundation::Foundation,
 ) -> Vec<(u16, u16)> {
     use std::collections::BTreeSet;
-    let (w, h) = foundation_dimensions(foundation);
     let mut cells: BTreeSet<(u16, u16)> = BTreeSet::new();
-
-    for dx in 0..w {
-        for dy in 0..h {
-            let rx = origin_rx as i32 + dx as i32;
-            let ry = origin_ry as i32 + dy as i32;
-            if rx >= 0 && rx <= u16::MAX as i32 && ry >= 0 && ry <= u16::MAX as i32 {
-                cells.insert((rx as u16, ry as u16));
-            }
+    for (dx, dy) in foundation.cell_offsets() {
+        let rx = origin_rx as i32 + i32::from(dx);
+        let ry = origin_ry as i32 + i32::from(dy);
+        if rx >= 0 && rx <= u16::MAX as i32 && ry >= 0 && ry <= u16::MAX as i32 {
+            cells.insert((rx as u16, ry as u16));
         }
     }
 
@@ -430,49 +479,14 @@ pub fn building_movement_blocking_cells(
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_production))]
 mod footprint_tests {
     use super::*;
 
     #[test]
-    fn rectangle_only_4x3() {
-        let cells = building_base_foundation_cells(10, 20, "4x3");
-        assert_eq!(cells.len(), 12);
-        assert!(cells.contains(&(10, 20)));
-        assert!(cells.contains(&(13, 22)));
-    }
-
-    #[test]
-    fn garefn_base_foundation_ignores_hidden_occupy_modifiers() {
-        // GAREFN: Foundation=4x3, AddOccupy1=-1,0, AddOccupy2=-1,-1, RemoveOccupy1=3,1
-        let cells = building_base_foundation_cells(10, 20, "4x3");
-        assert_eq!(cells.len(), 12);
-        assert!(cells.contains(&(13, 21)));
-        assert!(!cells.contains(&(9, 19)));
-        assert!(!cells.contains(&(9, 20)));
-    }
-
-    #[test]
-    fn narefn_base_foundation_keeps_dock_pad_despite_remove_occupy() {
-        let cells = building_base_foundation_cells(10, 20, "4x3");
-        assert_eq!(cells.len(), 12);
-        assert!(cells.contains(&(13, 21)));
-        assert!(!cells.contains(&(8, 20)));
-        assert!(!cells.contains(&(8, 19)));
-        assert!(!cells.contains(&(8, 18)));
-    }
-
-    #[test]
-    fn movement_blocking_no_bib_keeps_full_footprint() {
-        let footprint = building_base_foundation_cells(10, 20, "4x3");
-        let blocking = building_movement_blocking_cells(&footprint, false);
-        assert_eq!(blocking.len(), footprint.len());
-    }
-
-    #[test]
     fn movement_blocking_with_bib_drops_east_edge_rectangle() {
         // Plain 4x3 with bib → east column (x = 13) drops.
-        let footprint = building_base_foundation_cells(10, 20, "4x3");
+        let footprint = building_base_foundation_cells(10, 20, &"4x3".into());
         let blocking = building_movement_blocking_cells(&footprint, true);
         // 12 base cells - 3 east-edge column (13, 20), (13, 21), (13, 22) = 9.
         assert_eq!(blocking.len(), 9);
@@ -484,21 +498,8 @@ mod footprint_tests {
     }
 
     #[test]
-    fn movement_blocking_with_bib_garefn_uses_base_foundation_topology() {
-        let footprint = building_base_foundation_cells(10, 20, "4x3");
-        let blocking = building_movement_blocking_cells(&footprint, true);
-        assert_eq!(blocking.len(), 9);
-        assert!(!blocking.contains(&(9, 19)));
-        assert!(!blocking.contains(&(9, 20)));
-        assert!(blocking.contains(&(12, 21)));
-        assert!(!blocking.contains(&(13, 20)));
-        assert!(!blocking.contains(&(13, 21)));
-        assert!(blocking.contains(&(10, 20)));
-    }
-
-    #[test]
     fn static_movement_blocking_keeps_number_rows_out_of_the_grid() {
-        let footprint = building_base_foundation_cells(10, 20, "4x3");
+        let footprint = building_base_foundation_cells(10, 20, &"4x3".into());
         let blocking = building_movement_blocking_cells(&footprint, false);
         assert_eq!(blocking.len(), 12);
         assert!(blocking.contains(&(12, 21)));

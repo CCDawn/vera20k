@@ -9,46 +9,27 @@
 
 use crate::map::entities::EntityCategory;
 use crate::sim::components::DriveCoord;
-use crate::sim::movement::locomotor::LocomotorState;
-use crate::util::fixed_math::{SIM_ONE, SIM_ZERO, SimFixed};
+#[cfg(test)]
+use crate::util::fixed_math::SimFixed;
+use crate::util::native_x87::{NativeF64Bits, X87Chop53 as X};
 
 /// Fly interface+84 /4CFE20 reads TYPE Speed, not Foot's adjusted speed.
-/// The retained fraction follows the existing SimFixed policy. Its dyadic
-/// product with the bounded type integer is exact in i64; truncate toward zero
-/// once, before trig. Do not truncate a per-second displacement or multiply
-/// two I16F16 values that can overflow at high authored speed/fraction.
-pub(crate) fn current_fly_speed(type_speed: i32, fraction: SimFixed) -> i32 {
-    (i64::from(type_speed) * i64::from(fraction.to_bits()) / 65536) as i32
+/// FILD signed type speed, FMUL retained binary64, then ftol's low EAX.
+/// Motion pays this old current before the late target writer and ramp.
+pub(crate) fn current_fly_speed(type_speed: i32, fraction: NativeF64Bits) -> i32 {
+    X::ftol_i32_low_masked(X::mul(
+        X::load_i32(type_speed),
+        X::load_f64(fraction).expect("constructor-owned Fly speed is finite"),
+    ))
 }
-
-/// Per-tick speed ramp step for Fly aircraft (0.1 per tick).
-/// Original: _DAT_007e3860 = 0.1 (verified from binary).
-/// Full acceleration 0->1 takes 10 ticks.
-const FLY_SPEED_RAMP_STEP: SimFixed = SimFixed::lit("0.1");
-
-/// The target speed of a Fly crawling in under the 0.1 slowdown floor
-/// (`0x004CE27C`).
-const FLY_CRAWL_SPEED: SimFixed = SimFixed::lit("0.1");
 
 /// The 0.05 current speed of Process's creep (`0x004CE2D1`) and of
 /// Horizontal_Step's landing test (`0x007E8AE8`).
-pub(crate) const MIN_CREEP_SPEED: SimFixed = SimFixed::lit("0.05");
+pub(crate) const MIN_CREEP_SPEED: NativeF64Bits = NativeF64Bits::from_bits(0x3fa9_9999_9999_999a);
 
 /// `TechnoTypeClass` constructor `SlowdownDistance` (`0x00710BB2`), for a
 /// mover without a resolved type.
 const DEFAULT_SLOWDOWN_DISTANCE: i32 = 500;
-
-/// Process `0x004CE441..0x004CE495`: the current speed (`+0x48`) chases the
-/// target speed (`+0x40`) by 0.1 a frame.
-pub(crate) fn ramp_fly_speed(state: &mut super::fly_height::FlyRuntime) {
-    let target = state.target_speed();
-    let current = state.current_speed();
-    if current < target {
-        state.set_current_speed((current + FLY_SPEED_RAMP_STEP).min(target));
-    } else if current > target {
-        state.set_current_speed((current - FLY_SPEED_RAMP_STEP).max(target));
-    }
-}
 
 /// What `0x004D0180` reads to decide whether a Fly slows for its destination.
 #[derive(Debug, Clone, Copy)]
@@ -108,82 +89,7 @@ pub(crate) struct FlySpeedFacts {
     pub slowdown_distance: i32,
 }
 
-/// Fly Process `0x004CE145..0x004CE2DB`: the target speed (`+0x40`) that the
-/// ramp chases, rewritten on every frame the Fly is moving and its owner
-/// lives, is not landing, has climbed to half its takeoff height and holds a
-/// destination:
-/// - `0x004D0180` refusing: full speed. A locked aircraft, a cruising FlyBy
-///   and a cruising strafer or fighter with ammo never slow for their
-///   destination.
-/// - HunterSeeker: full speed while it has a Target and is not taking off,
-///   else a stop.
-/// - Otherwise `distance / SlowdownDistance`, capped at 1. Under 0.1 it is a
-///   0.1 crawl beyond 85 leptons and, within, a stop that halves the current
-///   speed. A current speed above the integer distance drops to it (only at
-///   distance 0). A Fly already at a standstill short of its destination gets
-///   a 0.05 current speed, which only the IsDropship attitude reads before the
-///   ramp (`0x004CE46F`) takes it back to the zero target: it moves nothing.
-///
-/// Native keeps binary64 and VERA SimFixed, each result within one quantum of
-/// native: the ratio truncates to Q16, and the halving rounds a dropped half
-/// away from zero, so it is zero exactly when native's is (a speed of one
-/// quantum truncated to zero would take the creep's branch). The floor test
-/// is the exact `10 * distance <= SlowdownDistance`, assuming gamemd's chop
-/// control word `0x0E7F`, under which the oracle runs: the chop quotient of
-/// an exact tenth falls below the stored 0.1. Rounded to nearest it would
-/// equal 0.1 and take the ratio arm (a 0.1 target for that frame, no
-/// halving). The rows of `tools/spatial_oracle/fly_target_speed` hold the
-/// native outputs.
-pub(crate) fn write_fly_target_speed(loco: &mut LocomotorState, facts: &FlySpeedFacts) {
-    let Some(state) = loco.fly_runtime_mut() else {
-        return;
-    };
-    let taking_off = state.taking_off();
-    if facts.health <= 0
-        || state.landing()
-        || (taking_off && facts.height < state.target_height() / 2)
-        || state.destination() == (DriveCoord { x: 0, y: 0, z: 0 })
-    {
-        return;
-    }
-    if !fly_may_slow(state.landing(), state.cruise_mode(), &facts.slow) {
-        state.set_target_speed(SIM_ONE);
-        return;
-    }
-    if facts.hunter_seeker {
-        state.set_target_speed(if !taking_off && facts.target {
-            SIM_ONE
-        } else {
-            SIM_ZERO
-        });
-        return;
-    }
-    let distance = i64::from(facts.distance);
-    let slowdown = i64::from(facts.slowdown_distance);
-    // A zero SlowdownDistance divides to +inf (NaN at distance 0), which the
-    // cap turns into full speed; a negative one is always under the floor.
-    if slowdown == 0 || (slowdown > 0 && distance * 10 > slowdown) {
-        state.set_target_speed(if slowdown == 0 || distance >= slowdown {
-            SIM_ONE
-        } else {
-            SimFixed::from_bits(((distance << 16) / slowdown) as i32)
-        });
-    } else if distance > 0x55 {
-        state.set_target_speed(FLY_CRAWL_SPEED);
-    } else {
-        let bits = state.current_speed().to_bits();
-        state.set_current_speed(SimFixed::from_bits(bits / 2 + bits % 2));
-        state.set_target_speed(SIM_ZERO);
-    }
-    if distance << 16 < i64::from(state.current_speed().to_bits()) {
-        state.set_current_speed(SimFixed::from_bits((distance << 16) as i32));
-    }
-    if state.target_speed() == SIM_ZERO && state.current_speed() == SIM_ZERO && distance > 0 {
-        state.set_current_speed(MIN_CREEP_SPEED);
-    }
-}
-
-/// The facts [`write_fly_target_speed`] reads from a live mover. Ammo is
+/// The facts [`FlyRuntime::write_target_speed`] reads from a live mover. Ammo is
 /// represented on Aircraft only; no stock non-aircraft owner flies. Native reads
 /// them in `FlyLocomotionClass::UpdateFlightMotion` (`0x004CD600`), `0x004CE145..0x004CE2DB`.
 pub(crate) fn fly_speed_facts(
@@ -227,19 +133,6 @@ pub(crate) fn fly_speed_facts(
         target: entity.attack_target.target().is_some(),
         slowdown_distance: object.map_or(DEFAULT_SLOWDOWN_DISTANCE, |o| o.slowdown_distance),
     }
-}
-
-/// Spawn owns Aircraft initialization. Legacy/headless movers may lack the
-/// Secondary controller; initialize it once from the body's heading without
-/// replacing an existing live turn. The body's rate stands in for `ROT=`:
-/// the Aircraft constructor (`0x00413FD2..0x00414015`) gives both
-/// controllers that one value.
-pub fn ensure_fly_secondary_facing(entity: &mut crate::sim::game_entity::GameEntity) {
-    let initial = entity.body_facing.destination();
-    let body = &entity.body_facing;
-    entity
-        .barrel_facing
-        .get_or_insert_with(|| super::FacingClass::with_rate_of(initial, body));
 }
 
 /// Shared represented MoveTo/BeginTakeoff refusal gates. EMP still requires
@@ -297,7 +190,22 @@ pub fn current_fly_height(
     queried_flight_height(entity, cells.as_ref())
 }
 
-fn queried_flight_height(
+/// Aircraft IFlyControl41B6A0 through its shared live cargo/radio owner.
+/// Read-only locomotor and presentation callers must use the same landing base.
+pub fn aircraft_landing_base(
+    entity: &crate::sim::game_entity::GameEntity,
+    entities: &crate::sim::entity_store::EntityStore,
+    rules_context: Option<(
+        &crate::rules::ruleset::RuleSet,
+        &crate::sim::intern::StringInterner,
+    )>,
+) -> i32 {
+    crate::sim::aircraft::landing_base::landing_base(entity, entities, rules_context)
+}
+
+/// [`current_fly_height`] through the caller's cell query. A draw passes its
+/// isolated query, so a miss stamps its own dummy, not the simulation's.
+pub fn queried_flight_height(
     entity: &crate::sim::game_entity::GameEntity,
     cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
 ) -> i32 {
@@ -315,8 +223,9 @@ fn queried_flight_height(
 }
 
 /// Object5F5F40: retained Location less the live ground and optional deck.
-/// Both Techno and Terrain queries use the same ground/height boundary.
-pub(crate) fn object_height_in_query(
+/// Techno, Terrain and the Anim draw (DrawIt42310A) queries use the same
+/// ground/height boundary; a draw passes its isolated query.
+pub fn object_height_in_query(
     coord: DriveCoord,
     on_bridge: bool,
     cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
@@ -368,7 +277,9 @@ pub(crate) fn is_high_flying(
     query_flight_predicate(entity, cells.as_ref(), rules_context, true)
 }
 
-pub(crate) fn is_high_flying_in_query(
+/// The existing high-flight dispatch through a caller-owned query identity.
+/// Presentation supplies an isolated query so drawing cannot stamp lockstep state.
+pub fn is_high_flying_in_query(
     entity: &crate::sim::game_entity::GameEntity,
     cells: &crate::map::resolved_terrain::NativeCellQuery<'_>,
     rules_context: Option<(
@@ -400,11 +311,9 @@ fn query_flight_predicate(
 }
 
 /// Shared Object virtual+50/+54 (5F6B60/5F6B90), after class overrides.
-pub(crate) fn object_flight_predicate(
-    marked: bool,
-    height: impl FnOnce() -> i32,
-    high: bool,
-) -> bool {
+/// Callers with a read-only terrain snapshot can supply its height without
+/// stamping the simulation's shared fallback Cell (presentation does this).
+pub fn object_flight_predicate(marked: bool, height: impl FnOnce() -> i32, high: bool) -> bool {
     // The original short-circuits before GetHeight; a map query can stamp the
     // shared fallback cell even when its numeric result would be discarded.
     marked && (height() >= crate::util::lepton::HIGH_FLIGHT_THRESHOLD_LEPTONS as i32) == high
@@ -501,19 +410,25 @@ pub(crate) fn update_fly_height(
             has_passenger,
             is_dropship: object.is_some_and(|o| o.is_dropship),
             flight_level,
+            hunter_seeker: rules_context
+                .filter(|(rules, _)| rules.ares_form())
+                .and_then(|(rules, _)| {
+                    let o = object.filter(|o| o.hunter_seeker)?;
+                    Some(o.techno_combat().hunter_seeker_climb(rules.ares_general()))
+                }),
         });
     entity.position.put_z(output.world_z);
     entity.on_bridge.store(output.on_bridge);
     output
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_movement, tests_sim_a_b)))]
 pub(crate) mod tests {
     use super::*;
     use crate::rules::locomotor_type::LocomotorKind;
     use crate::sim::game_entity::GameEntity;
-    use crate::sim::movement::locomotor::AirMovePhase;
-    use crate::util::fixed_math::SIM_HALF;
+    use crate::sim::movement::locomotor::{AirMovePhase, LocomotorState};
+    use crate::util::fixed_math::SIM_ONE;
 
     /// Fly `+0x34`: the Fly holds a move request. MoveTo sets it; only a
     /// landing at its destination (`0x004CEF5F`) and Stop clear it.
@@ -531,12 +446,18 @@ pub(crate) mod tests {
         let mut entity = GameEntity::test_default(1, "ORCA", "Americans", 10, 10);
         entity.locomotor = Some(make_fly_loco());
         sim.substrate.entities.insert(entity);
+        sim.interner = crate::sim::intern::test_interner();
 
-        let ok = sim.move_air_coordinate(
+        let ok = crate::sim::world::Simulation::move_air_coordinate(
+            &mut sim.interner,
+            &sim.session,
+            &mut sim.substrate,
+            &mut sim.sound_events,
+            &sim.resolved_terrain,
             1,
             crate::sim::movement::target_cell_coord(20, 15, None),
             None,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
         );
         assert!(ok);
 
@@ -550,7 +471,7 @@ pub(crate) mod tests {
             (destination.x, destination.y),
             (20 * 256 + 128, 15 * 256 + 128)
         );
-        assert!(e.navigation.path_replay.remaining_directions().is_empty());
+        assert!(e.navigation.path_replay().remaining_directions().is_empty());
 
         // Should trigger ascending.
         let loco = e.locomotor.as_ref().expect("has loco");
@@ -585,7 +506,7 @@ pub(crate) mod tests {
         sim.assign_destination_represented(
             id,
             Some(crate::sim::components::NavTargetRef::cell(20, 15)),
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -630,12 +551,18 @@ pub(crate) mod tests {
         let mut entity = GameEntity::test_default(1, "ORCA", "Americans", 10, 10);
         entity.locomotor = Some(make_fly_loco());
         sim.substrate.entities.insert(entity);
+        sim.interner = crate::sim::intern::test_interner();
 
-        let ok = sim.move_air_coordinate(
+        let ok = crate::sim::world::Simulation::move_air_coordinate(
+            &mut sim.interner,
+            &sim.session,
+            &mut sim.substrate,
+            &mut sim.sound_events,
+            &sim.resolved_terrain,
             1,
             crate::sim::movement::target_cell_coord(10, 10, None),
             None,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
         );
         assert!(ok);
         // Native MoveTo accepts a nonnull destination even at the owner cell.
@@ -645,45 +572,42 @@ pub(crate) mod tests {
 
     fn make_fly_loco() -> LocomotorState {
         let mut loco = LocomotorState::for_test_kind(LocomotorKind::Fly);
-        loco.fly_runtime_mut().unwrap().set_target_speed(SIM_ONE);
+        loco.fly_runtime_mut()
+            .unwrap()
+            .set_target_speed_for_test(SIM_ONE);
         loco
     }
 
     #[test]
     fn test_fly_speed_ramp() {
         let mut fly = crate::sim::movement::fly_height::FlyRuntime::default();
-        fly.set_target_speed(SIM_ONE);
-        // After 5 ramps: should be ~0.5 (fixed-point 0.1 is approximate).
-        for _ in 0..5 {
-            ramp_fly_speed(&mut fly);
+        fly.set_target_speed_for_test(SIM_ONE);
+        // Original grounded MoveTo -> Process pays these fractions through
+        // ApparentSpeed. The tenth PC53/chop addition is still below one.
+        for native_paid in [3, 7, 10, 13, 17, 20, 24, 27, 31, 34] {
+            fly.ramp_speed();
+            assert_eq!(current_fly_speed(35, fly.current_speed()), native_paid);
         }
-        let half_diff = (fly.current_speed() - SIM_HALF).abs();
-        assert!(
-            half_diff < SimFixed::lit("0.001"),
-            "Expected ~0.5, got {:?}",
-            fly.current_speed()
-        );
-        // After 5 more: should reach exactly 1.0 (clamped by min(target)).
-        for _ in 0..5 {
-            ramp_fly_speed(&mut fly);
-        }
-        assert_eq!(fly.current_speed(), SIM_ONE);
+        assert_ne!(fly.current_speed(), NativeF64Bits::ONE);
+        fly.ramp_speed();
+        assert_eq!(fly.current_speed(), NativeF64Bits::ONE);
+        assert_eq!(current_fly_speed(35, fly.current_speed()), 35);
     }
 
     #[test]
     fn test_fly_speed_ramp_decel() {
         let mut fly = crate::sim::movement::fly_height::FlyRuntime::default();
-        fly.set_current_speed(SIM_ONE);
+        fly.set_current_speed_for_test(SIM_ONE);
         for _ in 0..10 {
-            ramp_fly_speed(&mut fly);
+            fly.ramp_speed();
         }
-        assert_eq!(fly.current_speed(), SIM_ZERO);
+        assert_eq!(fly.current_speed(), NativeF64Bits::POSITIVE_ZERO);
     }
 
     /// Every row of `tools/spatial_oracle/fly_target_speed`, the original
-    /// Process target-speed writer, through [`write_fly_target_speed`]: the
-    /// gate, `0x004D0180`, HunterSeeker and the slowdown law. Target and
-    /// current speed land within one Q16 quantum of the native binary64.
+    /// Process target-speed writer, through [`FlyRuntime::write_target_speed`]: the
+    /// gate, `0x004D0180`, HunterSeeker and the slowdown law. The declared Q16
+    /// priors convert losslessly; both resulting binary64 stores match exactly.
     #[test]
     fn native_target_speed_rows() {
         let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
@@ -713,8 +637,8 @@ pub(crate) mod tests {
             }))
             .unwrap();
             let fly = loco.fly_runtime_mut().unwrap();
-            fly.set_target_speed(SimFixed::from_bits(int("target_speed", 65536)));
-            fly.set_current_speed(SimFixed::from_bits(int("current", 32768)));
+            fly.set_target_speed_for_test(SimFixed::from_bits(int("target_speed", 65536)));
+            fly.set_current_speed_for_test(SimFixed::from_bits(int("current", 32768)));
             let facts = FlySpeedFacts {
                 health: int("health", 100),
                 // The takeoff rows stand over one level-0 cell.
@@ -731,24 +655,25 @@ pub(crate) mod tests {
                 target: flag("target"),
                 slowdown_distance: int("slowdown", 500),
             };
-            write_fly_target_speed(&mut loco, &facts);
+            loco.fly_runtime_mut().unwrap().write_target_speed(&facts);
             let fly = loco.fly_runtime().unwrap();
-            for (actual, native) in [
-                (fly.target_speed(), &row["target_speed"]),
-                (fly.current_speed(), &row["current"]),
+            for (actual, key) in [
+                (fly.target_speed(), "target_speed_bits"),
+                (fly.current_speed(), "current_bits"),
             ] {
-                let native = native.as_f64().unwrap() * 65536.0;
-                assert!(
-                    (f64::from(actual.to_bits()) - native).abs() < 1.0,
-                    "{}: {} vs native {native}",
+                let native = u64::from_str_radix(row[key].as_str().unwrap(), 16).unwrap();
+                assert_eq!(
+                    actual.bits(),
+                    native,
+                    "{} {key}: {:016x} vs native {native:016x}",
                     input["name"],
-                    actual.to_bits()
+                    actual.bits()
                 );
             }
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "object_flight_tests.rs"]
 mod object_flight_tests;

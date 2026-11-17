@@ -8,12 +8,16 @@
 //! instructions (not executed): only a positive `house+0x54E8` enters the entry
 //! (`0x005C99EB`), and a surviving house then gets `v + v/2 + Random(v/2, v)`,
 //! one Scenario RNG draw at `0x005C9A21` unless `v` is 0 (`0x0065C7E0` draws
-//! nothing when min equals max). The native traversal (`Houses[]` order,
-//! skipping `MultiplayPassive` types and the observer house) remains
-//! UNCHECKED against the sim's canonical house registration order used here.
-//! Presentation never advances the gameplay Scenario stream directly.
+//! nothing when min equals max). The traversal walks `Houses[]` and skips a
+//! null House, a `MultiplayPassive` type and the observer House
+//! (`[0x00AC1198]`, `0x005C98CD..0x005C98EB`); the sim's House
+//! registration order is that array's order. Presentation never advances the
+//! gameplay Scenario stream directly.
 
+use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
+use crate::sim::rng::SimRng;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::world::Simulation;
 
 /// One sim-owned row before localization, colour selection, or display sorting.
@@ -35,10 +39,124 @@ pub struct TerminalScoreSnapshot {
     pub rows: Vec<TerminalScoreRowSnapshot>,
 }
 
+/// The match's terminal score, latched once at the natural win/loss edge and
+/// never replaced. Serialized and hashed so a save at the outcome wait cannot
+/// repeat its Scenario RNG draws after load.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct TerminalScore {
+    snapshot: Option<TerminalScoreSnapshot>,
+}
+
+impl TerminalScore {
+    pub(crate) fn snapshot(&self) -> Option<&TerminalScoreSnapshot> {
+        self.snapshot.as_ref()
+    }
+
+    fn latch(&mut self, snapshot: TerminalScoreSnapshot) {
+        debug_assert!(self.snapshot.is_none(), "the terminal score latches once");
+        self.snapshot = Some(snapshot);
+    }
+}
+
+/// One human House's row for the co-op result dialogs: `0x0046DA70` (BC6)
+/// and `0x0049B7E0` (the progress record) fill the same fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CooperativeScoreRow {
+    pub owner: InternedId,
+    /// `+0x2C`: the House is not defeated (`+0x1F5`).
+    pub survived: bool,
+    pub kills: u32,
+    pub losses: u32,
+    /// Losses plus the four on-map counters' totals (`+0x5550`, `+0x5564`,
+    /// `+0x5578`, `+0x558C`), not the produced count.
+    pub built: u32,
+    /// `+0x54E8` when positive, else 0; no survivor bonus and no draw.
+    pub score: i32,
+}
+
+/// `Houses[]` order without passive types or the observer House
+/// (`0x005C98CD..0x005C98EB`).
+///
+/// The terminal latch and the live projection must select the same Houses, and
+/// this module's one per-client read stays in one place: the architecture
+/// guard pins `is_observer_house` here to a single site, because a value that
+/// differs per client must not steer anything a peer shares.
+fn score_contenders(houses: &Houses, session: &ScenarioSession) -> Vec<InternedId> {
+    houses
+        .in_order()
+        .filter(|house| !house.multiplay_passive() && !session.is_observer_house(house.name()))
+        .map(|house| house.name())
+        .collect()
+}
+
 impl Simulation {
+    /// `0x0046DA70`/`0x0049B7E0`: one row per House that is not
+    /// `MultiplayPassive` and is human (`+0x1EC`, `0x0050B730` in GameMode
+    /// != 0), in `Houses[]` order.
+    pub fn cooperative_score_rows(&self) -> Vec<CooperativeScoreRow> {
+        self.houses
+            .in_order()
+            .filter(|house| !house.multiplay_passive() && house.is_human())
+            .map(|house| {
+                let stats = house.stats();
+                CooperativeScoreRow {
+                    owner: house.name(),
+                    survived: !house.is_defeated(),
+                    kills: stats.kills(),
+                    losses: stats.losses(),
+                    built: stats
+                        .losses()
+                        .wrapping_add(house.tracking().active_total() as u32),
+                    score: house.economy().score().max(0),
+                }
+            })
+            .collect()
+    }
+
+    /// Cooperative `+0xA0`'s won test (`0x005C371E..0x005C3761`): some human
+    /// House (`0x0050B730`) is not defeated. The terminal flag itself is
+    /// only logged.
+    pub fn cooperative_humans_won(&self) -> bool {
+        self.houses
+            .in_order()
+            .any(|house| house.is_human() && !house.is_defeated())
+    }
+
     /// Read the already-finalized raw terminal score rows without mutation.
     pub fn terminal_score_snapshot(&self) -> Option<&TerminalScoreSnapshot> {
-        self.terminal_score_snapshot.as_ref()
+        self.terminal_score_snapshot.snapshot()
+    }
+
+    /// The rows a score page would show right now, without the terminal latch
+    /// and without the survivor's victory bonus.
+    ///
+    /// A match the player abandons has no natural win/loss edge to latch at,
+    /// and leaving must not consume the Scenario RNG draws the terminal
+    /// snapshot owns — those belong to the deterministic stream. The rows
+    /// therefore carry the raw `+0x54E8` score only, the value `0x005C99EB`
+    /// adds before the survivor's `Random` bonus.
+    pub fn live_score_snapshot(&self) -> TerminalScoreSnapshot {
+        let session = self.session();
+        let mut rows = Vec::new();
+        for owner in score_contenders(&self.houses, session) {
+            let Some(house) = self.houses.get(&owner) else {
+                continue;
+            };
+            let raw_score = house.economy().score();
+            let stats = house.stats();
+            rows.push(TerminalScoreRowSnapshot {
+                owner,
+                country: house.country(),
+                survived: !house.is_defeated(),
+                kills: stats.kills(),
+                losses: stats.losses(),
+                built: stats.built(),
+                raw_score,
+                score: raw_score.max(0),
+            });
+        }
+        TerminalScoreSnapshot { rows }
     }
 
     /// Latch the snapshot at the natural win/loss terminal edge.
@@ -48,45 +166,39 @@ impl Simulation {
     /// [`Simulation::terminal_score_snapshot`]. The first call consumes
     /// Scenario RNG once for each surviving positive-score contender; later
     /// calls are no-ops so the cursor cannot advance twice.
-    pub(super) fn finalize_terminal_score_snapshot(&mut self) -> bool {
-        if self.terminal_score_snapshot.is_some() {
+    pub(super) fn finalize_terminal_score_snapshot(
+        session: &ScenarioSession,
+        scenario_rng: &mut SimRng,
+        terminal_score_snapshot: &mut TerminalScore,
+        houses: &Houses,
+    ) -> bool {
+        if terminal_score_snapshot.snapshot().is_some() {
+            return false;
+        }
+        // GameExit's co-op arm (`0x00685843..0x0068586A`): in a LAN or WOL
+        // game (GameMode 3 or 4) mode vt+8 draws the empty backdrop instead
+        // of the score dialog, so such a mode makes none of its draws there.
+        // A skirmish in the mode gets the dialog.
+        if session.game_mode().is_network()
+            && session
+                .multiplayer_mode_class()
+                .is_some_and(|class| class.policy().skips_network_score_dialog)
+        {
             return false;
         }
 
-        // The sim's canonical HouseClass registration order owns deterministic
-        // house traversal; the keyed house store is only a lookup table. Append
-        // unregistered fixture houses deterministically so standalone tests and
-        // malformed inputs retain a bounded compatibility path. Whether the
-        // native score dialog uses this exact traversal remains UNCHECKED.
-        let mut contenders = Vec::new();
-        for owner in self
-            .session
-            .house_order
-            .iter()
-            .copied()
-            .chain(self.houses.keys().copied())
-        {
-            if self
-                .houses
-                .get(&owner)
-                .is_some_and(|house| !house.multiplay_passive)
-                && !contenders.contains(&owner)
-            {
-                contenders.push(owner);
-            }
-        }
+        // Houses[] order, without passive types or observer Houses.
+        let contenders = score_contenders(houses, session);
         let mut rows = Vec::with_capacity(contenders.len());
         for owner in contenders {
-            let Some((country, survived, stats, raw_score)) =
-                self.houses.get(&owner).map(|house| {
-                    (
-                        house.country,
-                        !house.is_defeated,
-                        house.stats,
-                        house.economy.score(),
-                    )
-                })
-            else {
+            let Some((country, survived, stats, raw_score)) = houses.get(&owner).map(|house| {
+                (
+                    house.country(),
+                    !house.is_defeated(),
+                    house.stats(),
+                    house.economy().score(),
+                )
+            }) else {
                 continue;
             };
             // 0x005C99EB..0x005C99F5 adds only a positive score to the zeroed
@@ -96,9 +208,7 @@ impl Simulation {
             let base = raw_score.max(0);
             let score = if survived && base > 0 {
                 let half = base / 2;
-                let bonus = self
-                    .scenario_rng
-                    .next_range_u32_inclusive(half as u32, base as u32);
+                let bonus = scenario_rng.next_range_u32_inclusive(half as u32, base as u32);
                 base.wrapping_add(half).wrapping_add(bonus as i32)
             } else {
                 base
@@ -116,15 +226,15 @@ impl Simulation {
         }
 
         let snapshot = TerminalScoreSnapshot { rows };
-        self.terminal_score_snapshot = Some(snapshot);
+        terminal_score_snapshot.latch(snapshot);
         true
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 mod tests {
     use super::*;
-    use crate::sim::house_state::{HouseOutcomeKind, HouseOutcomeState, HouseState};
+    use crate::sim::house_state::{HouseOutcomeKind, HouseState};
 
     struct HouseFixture<'a> {
         name: &'a str,
@@ -141,18 +251,70 @@ mod tests {
     fn insert_house(sim: &mut Simulation, fixture: HouseFixture<'_>) -> InternedId {
         let owner = sim.interner.intern(fixture.name);
         let mut house = HouseState::new(owner, 0, None, false, 0, 10);
-        house.is_defeated = fixture.defeated;
-        house.multiplay_passive = fixture.passive;
-        house.economy.set_score_for_test(fixture.score);
-        house.stats = crate::sim::house_state::MatchStatistics::from_totals_for_test(
-            fixture.units_killed,
-            fixture.buildings_killed,
-            fixture.units_lost,
-            fixture.buildings_lost,
-            fixture.built,
+        house.set_is_defeated_for_test(fixture.defeated);
+        house.set_multiplay_passive_for_test(fixture.passive);
+        house.economy_mut().set_score_for_test(fixture.score);
+        house.set_stats_for_test(
+            crate::sim::house_state::MatchStatistics::from_totals_for_test(
+                fixture.units_killed,
+                fixture.buildings_killed,
+                fixture.units_lost,
+                fixture.buildings_lost,
+                fixture.built,
+            ),
         );
-        sim.houses.insert(owner, house);
+        sim.houses.register(house);
         owner
+    }
+
+    #[test]
+    fn live_rows_report_raw_scores_without_latching_or_drawing() {
+        let mut sim = Simulation::with_seed(0x51C0_1234);
+        let alpha = insert_house(
+            &mut sim,
+            HouseFixture {
+                name: "Alpha",
+                defeated: false,
+                passive: false,
+                score: 100,
+                units_killed: 2,
+                buildings_killed: 3,
+                units_lost: 4,
+                buildings_lost: 5,
+                built: 6,
+            },
+        );
+        let lost = insert_house(
+            &mut sim,
+            HouseFixture {
+                name: "Lost",
+                defeated: true,
+                passive: false,
+                score: 250,
+                units_killed: 1,
+                buildings_killed: 0,
+                units_lost: 0,
+                buildings_lost: 0,
+                built: 0,
+            },
+        );
+
+        let rows = sim.live_score_snapshot();
+
+        assert!(
+            sim.terminal_score_snapshot().is_none(),
+            "leaving a match must not latch the terminal snapshot"
+        );
+        let row = |owner| rows.rows.iter().find(|row| row.owner == owner).unwrap();
+        let survivor = row(alpha);
+        assert_eq!(survivor.raw_score, 100);
+        assert_eq!(
+            survivor.score, 100,
+            "no survivor bonus: that draw belongs to the terminal edge"
+        );
+        assert!(survivor.survived);
+        assert_eq!(row(lost).score, 250);
+        assert!(!row(lost).survived);
     }
 
     #[test]
@@ -200,7 +362,7 @@ mod tests {
                 built: 0,
             },
         );
-        insert_house(
+        let passive = insert_house(
             &mut sim,
             HouseFixture {
                 name: "Passive",
@@ -229,13 +391,19 @@ mod tests {
             },
         );
 
-        sim.session.house_order = vec![omega, alpha, defeated, zero];
+        sim.houses
+            .reorder_for_test(&[omega, passive, alpha, defeated, zero]);
         let mut expected_rng = sim.clone_scenario_rng();
         let omega_score = 50 + 25 + expected_rng.next_range_u32_inclusive(25, 50) as i32;
         let alpha_score = 100 + 50 + expected_rng.next_range_u32_inclusive(50, 100) as i32;
         let before_hash = sim.state_hash();
 
-        assert!(sim.finalize_terminal_score_snapshot());
+        assert!(Simulation::finalize_terminal_score_snapshot(
+            &sim.session,
+            &mut sim.scenario_rng,
+            &mut sim.terminal_score_snapshot,
+            &sim.houses
+        ));
         let snapshot = sim
             .terminal_score_snapshot()
             .expect("terminal score snapshot")
@@ -294,10 +462,15 @@ mod tests {
                 },
             ));
         }
-        sim.session.house_order = owners;
+        sim.houses.reorder_for_test(&owners);
         let cursor = sim.clone_scenario_rng().state();
 
-        assert!(sim.finalize_terminal_score_snapshot());
+        assert!(Simulation::finalize_terminal_score_snapshot(
+            &sim.session,
+            &mut sim.scenario_rng,
+            &mut sim.terminal_score_snapshot,
+            &sim.houses
+        ));
         let snapshot = sim.terminal_score_snapshot().expect("snapshot");
         for row in &snapshot.rows {
             assert_eq!(row.raw_score, -40);
@@ -306,67 +479,77 @@ mod tests {
         assert_eq!(sim.clone_scenario_rng().state(), cursor);
     }
 
+    /// 0x005C98E5: an observer House takes no row and draws nothing, and a
+    /// VERA room's every observer is one.
     #[test]
-    fn terminal_score_snapshot_is_latched_without_repeating_rng_draws() {
-        let mut sim = Simulation::with_seed(0x51C0_5678);
-        let owner = insert_house(
-            &mut sim,
-            HouseFixture {
-                name: "Alpha",
-                defeated: false,
-                passive: false,
-                score: 100,
-                units_killed: 0,
-                buildings_killed: 0,
-                units_lost: 0,
-                buildings_lost: 0,
-                built: 0,
-            },
+    fn observer_houses_take_no_score_row() {
+        let mut sim = Simulation::with_seed(0x51C0_0B5E);
+        let mut owners = Vec::new();
+        for name in ["Player", "Observer", "Spectator"] {
+            owners.push(insert_house(
+                &mut sim,
+                HouseFixture {
+                    name,
+                    defeated: false,
+                    passive: false,
+                    score: 50,
+                    units_killed: 0,
+                    buildings_killed: 0,
+                    units_lost: 0,
+                    buildings_lost: 0,
+                    built: 0,
+                },
+            ));
+        }
+        sim.houses.reorder_for_test(&owners);
+        sim.session.install_multiplayer_house_identity(
+            crate::skirmish_modes::MpModeClass::Battle,
+            vec![owners[1], owners[2]],
         );
-        sim.session.house_order.push(owner);
+        let mut one_draw = sim.clone_scenario_rng();
+        one_draw.next_range_u32_inclusive(25, 50);
 
-        assert!(sim.finalize_terminal_score_snapshot());
-        let first = sim
-            .terminal_score_snapshot()
-            .expect("first terminal score snapshot")
-            .clone();
-        let cursor_after_first = sim.clone_scenario_rng().state();
-        let hash_after_first = sim.state_hash();
-        assert!(!sim.finalize_terminal_score_snapshot());
-        let second = sim
-            .terminal_score_snapshot()
-            .expect("latched terminal score snapshot")
-            .clone();
-
-        assert_eq!(second, first);
-        assert_eq!(sim.clone_scenario_rng().state(), cursor_after_first);
-        assert_eq!(sim.state_hash(), hash_after_first);
+        assert!(Simulation::finalize_terminal_score_snapshot(
+            &sim.session,
+            &mut sim.scenario_rng,
+            &mut sim.terminal_score_snapshot,
+            &sim.houses
+        ));
+        let snapshot = sim.terminal_score_snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot
+                .rows
+                .iter()
+                .map(|row| row.owner)
+                .collect::<Vec<_>>(),
+            [owners[0]]
+        );
+        assert_eq!(sim.clone_scenario_rng().state(), one_draw.state());
     }
 
     fn natural_terminal_sim(seed: u64) -> Simulation {
         let mut sim = Simulation::with_seed(seed);
-        sim.session.game_mode_nonzero = true;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
         let human = sim.interner.intern("Human");
         let mut human_house = HouseState::new(human, 0, None, true, 0, 10);
-        human_house.is_defeated = true;
-        human_house.economy.set_score_for_test(200);
-        human_house.supply_outcome_state_for_test(
+        human_house.set_is_defeated_for_test(true);
+        human_house.economy_mut().set_score_for_test(200);
+        human_house.supply_result_flags_for_test(
             false,
             true,
-            Some(HouseOutcomeState {
-                kind: HouseOutcomeKind::Defeat,
-                exit_ready: true,
-            }),
             crate::sim::timer::CdTimer::default(),
         );
-        sim.houses.insert(human, human_house);
-        sim.session.current_house = Some(human);
+        sim.houses.register(human_house);
+        sim.session.set_current_house_for_test(Some(human));
 
+        // A second human: an AI House draws Scenario RNG in every frame's
+        // House AI, which these tests keep apart from the score's draws.
         let opponent = sim.interner.intern("Opponent");
-        let mut opponent_house = HouseState::new(opponent, 1, None, false, 0, 10);
-        opponent_house.economy.set_score_for_test(100);
-        sim.houses.insert(opponent, opponent_house);
-        sim.session.house_order = vec![human, opponent];
+        let mut opponent_house = HouseState::new(opponent, 1, None, true, 0, 10);
+        opponent_house.economy_mut().set_score_for_test(100);
+        sim.houses.register(opponent_house);
         sim
     }
 
@@ -376,7 +559,7 @@ mod tests {
         // At normal play's cadence the ending frame hashes off the interval.
         // It does not commit, so its tick stays the last committed one.
         sim.hash_state_every(crate::sim::replay::PLAY_HASH_INTERVAL);
-        sim.session.tick = 7;
+        sim.session.set_tick_for_test(7);
 
         let first = sim.advance_tick(&[], None, None, None, 67);
 
@@ -405,7 +588,9 @@ mod tests {
     #[test]
     fn campaign_terminal_does_not_finalize_skirmish_bonus_or_draw_rng() {
         let mut sim = natural_terminal_sim(0x51C0_CAFE);
-        sim.session.game_mode_nonzero = false;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false),
+        );
         let cursor = sim.clone_scenario_rng().state();
 
         let tick = sim.advance_tick(&[], None, None, None, 67);
@@ -416,21 +601,27 @@ mod tests {
     }
 
     #[test]
-    fn another_humans_ready_result_does_not_finalize_the_current_players_score() {
+    fn another_humans_defeat_head_routes_victory_for_the_current_player() {
         let mut sim = natural_terminal_sim(0x51C0_9ABD);
-        sim.session.current_house = sim.interner.get("Opponent");
-        let cursor = sim.clone_scenario_rng().state();
+        sim.session
+            .set_current_house_for_test(sim.interner.get("Opponent"));
         let tick = sim.advance_tick(&[], None, None, None, 67);
-        assert!(tick.frame_committed);
-        assert!(!tick.terminal_score_finalized);
-        assert!(sim.terminal_score_snapshot().is_none());
-        assert_eq!(sim.clone_scenario_rng().state(), cursor);
+        // HouseClass::Update4F87A5..4F87BB maps a nonlocal Lost head
+        // to the process victory request before MainTick's terminal gate.
+        assert!(!tick.frame_committed);
+        assert!(tick.terminal_score_finalized);
+        assert!(sim.terminal_score_snapshot().is_some());
+        assert_eq!(
+            sim.ready_outcome_for_owner(sim.interner.get("Opponent").unwrap())
+                .map(|outcome| outcome.kind),
+            Some(HouseOutcomeKind::Victory)
+        );
     }
 
     #[test]
     fn quit_and_connection_alone_do_not_score_but_ready_outcome_wins_exit_race() {
         let mut quit_only = Simulation::with_seed(0x51C0_B001);
-        quit_only.quit_requested = true;
+        quit_only.set_quit_requested_for_test(true);
         let quit_cursor = quit_only.clone_scenario_rng().state();
         let quit_tick = quit_only.advance_tick(&[], None, None, None, 67);
         assert!(!quit_tick.frame_committed);
@@ -439,7 +630,7 @@ mod tests {
         assert_eq!(quit_only.clone_scenario_rng().state(), quit_cursor);
 
         let mut connection_only = Simulation::with_seed(0x51C0_B002);
-        connection_only.connection_lost = true;
+        connection_only.set_connection_lost_for_test(true);
         let connection_cursor = connection_only.clone_scenario_rng().state();
         let connection_tick = connection_only.advance_tick(&[], None, None, None, 67);
         assert!(!connection_tick.frame_committed);
@@ -525,7 +716,8 @@ mod tests {
             score: 225,
         };
         mutate(&mut row, alternate);
-        sim.terminal_score_snapshot = Some(TerminalScoreSnapshot { rows: vec![row] });
+        sim.terminal_score_snapshot
+            .latch(TerminalScoreSnapshot { rows: vec![row] });
         sim.state_hash()
     }
 
@@ -533,7 +725,9 @@ mod tests {
     fn every_terminal_score_row_field_is_hash_authoritative() {
         let absent = Simulation::new().state_hash();
         let mut present_empty = Simulation::new();
-        present_empty.terminal_score_snapshot = Some(TerminalScoreSnapshot::default());
+        present_empty
+            .terminal_score_snapshot
+            .latch(TerminalScoreSnapshot::default());
         assert_ne!(absent, present_empty.state_hash());
 
         let base = hash_with_score_row(|_, _| {});
@@ -545,5 +739,138 @@ mod tests {
         assert_ne!(base, hash_with_score_row(|row, _| row.built += 1));
         assert_ne!(base, hash_with_score_row(|row, _| row.raw_score += 1));
         assert_ne!(base, hash_with_score_row(|row, _| row.score += 1));
+    }
+
+    /// GameExit takes Cooperative's no-score arm only in a LAN or WOL game
+    /// (`0x0068584F..0x00685856`); a skirmish in the mode gets the dialog.
+    #[test]
+    fn cooperative_skips_the_score_draws_only_online() {
+        use crate::sim::scenario_session::ScenarioGameMode;
+        for (game_mode, scored) in [
+            (ScenarioGameMode::Lan, false),
+            (ScenarioGameMode::Skirmish, true),
+        ] {
+            let mut sim = Simulation::with_seed(0x5C4E_F000);
+            sim.session.set_game_mode(game_mode);
+            sim.session.install_multiplayer_house_identity(
+                crate::skirmish_modes::MpModeClass::Cooperative,
+                Vec::new(),
+            );
+            insert_house(
+                &mut sim,
+                HouseFixture {
+                    name: "Alpha",
+                    defeated: false,
+                    passive: false,
+                    score: 100,
+                    units_killed: 0,
+                    buildings_killed: 0,
+                    units_lost: 0,
+                    buildings_lost: 0,
+                    built: 0,
+                },
+            );
+            let before = sim.clone_scenario_rng().state();
+            assert_eq!(
+                Simulation::finalize_terminal_score_snapshot(
+                    &sim.session,
+                    &mut sim.scenario_rng,
+                    &mut sim.terminal_score_snapshot,
+                    &sim.houses
+                ),
+                scored,
+                "{game_mode:?}"
+            );
+            assert_eq!(sim.terminal_score_snapshot().is_some(), scored);
+            assert_eq!(sim.clone_scenario_rng().state() != before, scored);
+        }
+    }
+
+    #[test]
+    fn cooperative_rows_take_human_houses_with_on_map_built_counts() {
+        use crate::map::entities::EntityCategory;
+        let mut sim = Simulation::with_seed(7);
+        let enemy = insert_house(
+            &mut sim,
+            HouseFixture {
+                name: "Enemy",
+                defeated: false,
+                passive: false,
+                score: 900,
+                units_killed: 9,
+                buildings_killed: 0,
+                units_lost: 0,
+                buildings_lost: 0,
+                built: 0,
+            },
+        );
+        let host = insert_house(
+            &mut sim,
+            HouseFixture {
+                name: "Host",
+                defeated: true,
+                passive: false,
+                score: -5,
+                units_killed: 2,
+                buildings_killed: 1,
+                units_lost: 3,
+                buildings_lost: 1,
+                built: 40,
+            },
+        );
+        let guest = insert_house(
+            &mut sim,
+            HouseFixture {
+                name: "Guest",
+                defeated: false,
+                passive: false,
+                score: 70,
+                units_killed: 0,
+                buildings_killed: 0,
+                units_lost: 0,
+                buildings_lost: 0,
+                built: 0,
+            },
+        );
+        let tank = sim.interner.intern("MTNK");
+        let yard = sim.interner.intern("GACNST");
+        for owner in [host, guest] {
+            let house = sim.houses.get_mut(&owner).unwrap();
+            house.set_is_human_for_test(true);
+        }
+        let tracking = sim.houses.get_mut(&host).unwrap().tracking_mut_for_test();
+        tracking.set_active_for_test(EntityCategory::Unit, tank, 4);
+        tracking.set_active_for_test(EntityCategory::Structure, yard, 2);
+        let _ = enemy;
+
+        let rows = sim.cooperative_score_rows();
+        assert_eq!(
+            rows,
+            vec![
+                CooperativeScoreRow {
+                    owner: host,
+                    survived: false,
+                    kills: 3,
+                    losses: 4,
+                    // Losses 4 plus six on the map; the produced 40 is unused.
+                    built: 10,
+                    score: 0,
+                },
+                CooperativeScoreRow {
+                    owner: guest,
+                    survived: true,
+                    kills: 0,
+                    losses: 0,
+                    built: 0,
+                    score: 70,
+                },
+            ]
+        );
+        assert!(sim.cooperative_humans_won());
+        sim.houses
+            .get_mut(&guest)
+            .unwrap()
+            .set_is_defeated_for_test(true);
+        assert!(!sim.cooperative_humans_won(), "the enemy is not human");
     }
 }

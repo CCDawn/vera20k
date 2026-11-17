@@ -3,16 +3,15 @@
 //! Split from the monolithic HouseClass into purpose-specific systems. This module
 //! holds the lightweight core: identity, economy scalars, and defeat/victory flags.
 //!
-//! Stored in `Simulation.houses: BTreeMap<InternedId, HouseState>` keyed by
-//! interned owner name for deterministic iteration (BTreeMap + InternedId give
-//! sorted order natively; all peers intern in the same order).
+//! Each House's state lives in the House array, [`crate::sim::houses::Houses`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::map::playfield::local_to_packed_cell;
 use crate::rules::object_type::ObjectCategory;
 use crate::sim::cell_rect::PlayfieldBounds;
 use crate::sim::economy::Economy;
+use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
 use crate::sim::timer::CdTimer;
 use crate::util::native_x87::{NativeF32Bits, NativeF64Bits};
@@ -165,15 +164,12 @@ pub enum HouseOutcomeKind {
     Defeat,
 }
 
-/// Persistent HouseClass result transition.
-///
-/// The countdown is the existing private House+298 CdTimer, shared with
-/// AllowWin-tag teardown. This is a result/exit latch, never a second timer.
-/// The wall-clock Vox drain that follows `exit_ready` belongs to the app.
+/// Read-only result projection. House flags describe a pending result;
+/// ScenarioSession owns the independent request after House's Vox wait.
+/// The countdown remains the sole private House+298 CdTimer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct HouseOutcomeState {
     pub kind: HouseOutcomeKind,
-    pub exit_ready: bool,
 }
 
 /// Persistent HouseClass strategy-emergency state.
@@ -185,22 +181,51 @@ pub struct HouseOutcomeState {
 ///
 /// The emergency block of `HouseClass::AI_Building_Strategy @ 0x004FD7A0`
 /// (`sim::house_strategy`) steps the mode; All_To_Hunt sets the latch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HouseStrategyEmergencyState {
-    pub(crate) mode: i32,
-    pub(crate) all_to_hunt_bias: bool,
-    pub(crate) last_building_attack_frame: i32,
+    mode: i32,
+    all_to_hunt_bias: bool,
+    last_building_attack_frame: i32,
     #[serde(default = "last_attacker_house_index_default")]
-    pub(crate) last_attacker_house_index: i32,
+    last_attacker_house_index: i32,
+    /// Phobos HouseExt `AIFireSaleDelayTimer` (persisted): None until the
+    /// first last-legs tick with a positive `[General] AIFireSaleDelay=`.
+    #[serde(default)]
+    ai_fire_sale_delay_timer: Option<CdTimer>,
+}
+
+impl std::hash::Hash for HouseStrategyEmergencyState {
+    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        self.mode.hash(hasher);
+        self.all_to_hunt_bias.hash(hasher);
+        self.last_building_attack_frame.hash(hasher);
+        self.last_attacker_house_index.hash(hasher);
+        // Phobos extension state; keep the native-only hash while unset.
+        if let Some(timer) = self.ai_fire_sale_delay_timer {
+            b"phobos-ai-fire-sale-delay-v1".hash(hasher);
+            timer.hash(hasher);
+        }
+    }
 }
 
 const fn last_attacker_house_index_default() -> i32 {
     -1
 }
 
+/// Ares HouseExt constructor's SWLastIndex.
+fn no_super_index() -> i32 {
+    -1
+}
+
 /// [`HouseState::strategy_timer`]'s constructor value: started at frame 0
 /// with no delay, so expired.
 pub(crate) const fn strategy_timer_at_construction() -> CdTimer {
+    CdTimer::started(0, 0)
+}
+
+/// HouseClass::Constructor004F5BAE..004F5BBA starts the enemy-search
+/// countdown at the construction frame,0, with no delay.
+pub(crate) const fn enemy_search_timer_at_construction() -> CdTimer {
     CdTimer::started(0, 0)
 }
 
@@ -218,29 +243,79 @@ impl Default for HouseStrategyEmergencyState {
             all_to_hunt_bias: false,
             last_building_attack_frame: 0,
             last_attacker_house_index: last_attacker_house_index_default(),
+            ai_fire_sale_delay_timer: None,
         }
     }
 }
 
 impl HouseStrategyEmergencyState {
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) const fn mode(&self) -> i32 {
         self.mode
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) const fn all_to_hunt_bias(&self) -> bool {
         self.all_to_hunt_bias
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) const fn last_building_attack_frame(&self) -> i32 {
+    pub const fn last_building_attack_frame(&self) -> i32 {
         self.last_building_attack_frame
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) const fn last_attacker_house_index(&self) -> i32 {
         self.last_attacker_house_index
+    }
+
+    /// Strategy's emergency block (`0x004FD7A0..0x004FD848`) on `House+0x250`:
+    /// state four only asks for Fire_Sale and All_To_Hunt (true). Otherwise
+    /// zero becomes one below 25 credits and one becomes zero at 25 or more
+    /// (a zero that just became one asks again); then three ends once the
+    /// last building attack (`+0x54D8`) is more than 900 frames ago, and any
+    /// other state becomes three within those 900 frames.
+    pub(crate) fn advance(
+        &mut self,
+        current_frame: i32,
+        mut available_wallet: impl FnMut() -> i32,
+    ) -> bool {
+        const LOW_WALLET_THRESHOLD: i32 = 25;
+        const ATTACK_SUPPRESSION_FRAMES: i32 = 900;
+        if self.mode == 4 {
+            return true;
+        }
+
+        if self.mode == 0 && available_wallet() < LOW_WALLET_THRESHOLD {
+            self.mode = 1;
+        }
+        if self.mode == 1 && available_wallet() >= LOW_WALLET_THRESHOLD {
+            self.mode = 0;
+        }
+
+        let deadline = self
+            .last_building_attack_frame
+            .wrapping_add(ATTACK_SUPPRESSION_FRAMES);
+        if self.mode == 3 {
+            if deadline < current_frame {
+                self.mode = 0;
+            }
+        } else if current_frame < deadline {
+            self.mode = 3;
+        }
+
+        false
+    }
+
+    /// Phobos HouseExt `AIFireSaleDelayTimer`, None until first armed.
+    pub(crate) const fn ai_fire_sale_delay_timer(&self) -> Option<CdTimer> {
+        self.ai_fire_sale_delay_timer
+    }
+
+    pub(crate) fn start_ai_fire_sale_delay(&mut self, frame: i32, delay: i32) {
+        self.ai_fire_sale_delay_timer = Some(CdTimer::started(frame, delay));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_mode_for_test(&mut self, mode: i32) {
+        self.mode = mode;
     }
 
     /// Trigger action9 (6DEAFF) and Team script30 (6E99E5) write only
@@ -275,11 +350,14 @@ impl HouseStrategyEmergencyState {
 /// maintain the ordered packed-cell perimeter vector.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BaseReservationState {
-    pub(crate) min_x: i32,
-    pub(crate) min_y: i32,
-    pub(crate) width: i32,
-    pub(crate) height: i32,
-    pub(crate) perimeter_cells: Vec<u32>,
+    min_x: i32,
+    min_y: i32,
+    width: i32,
+    height: i32,
+    /// Primary vector House+5720 (items5724, count5730), maintained by
+    /// Mark455F10/Clear4561F0 and consumed by FindBaseBuildingSite5060B0.
+    /// The separate defense-candidate vector+5738 is not this authority.
+    perimeter_cells: Vec<u32>,
 }
 
 impl BaseReservationState {
@@ -305,6 +383,12 @@ impl BaseReservationState {
         Self::update_axis(&mut self.min_y, &mut self.height, start_y, height);
     }
 
+    /// Original HouseClass::AI_ScanBasePerimeter508BA2..508BCC replaces
+    /// the four committed bounds after appending all generated plan nodes.
+    pub(crate) fn commit_perimeter_expansion(&mut self, bounds: (i32, i32, i32, i32)) {
+        (self.min_x, self.min_y, self.width, self.height) = bounds;
+    }
+
     pub(crate) fn append_perimeter_cell_if_absent(&mut self, packed_cell: u32) {
         if !self.perimeter_cells.contains(&packed_cell) {
             self.perimeter_cells.push(packed_cell);
@@ -328,7 +412,6 @@ impl BaseReservationState {
         (self.min_x, self.min_y, self.width, self.height)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn perimeter_cells(&self) -> &[u32] {
         &self.perimeter_cells
     }
@@ -354,9 +437,7 @@ pub struct HouseAiActivationLatches {
 /// (`0x004F5855..0x004F586D`); `BuildingClass::Infiltrate @ 0x004571E0` is
 /// their only writer (operand census of each offset, 2026-10-12) and never
 /// clears one.
-#[derive(
-    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SpyGains {
     /// `+0x2BC`: the third side's technology, read by CanBuild for
     /// `RequiresStolenThirdTech=` (`0x004F79DA`).
@@ -371,6 +452,47 @@ struct SpyGains {
     veteran_infantry: bool,
     /// `+0x2C0`: veteran units.
     veteran_units: bool,
+    /// Ares HouseExt `+0x48`: veteran `Naval=` units, from
+    /// `SpyEffect.NavalVeterancy` (`BuildingExt::ExtData::InfiltratedBy @
+    /// 10012000`), never cleared.
+    #[serde(default)]
+    naval_veterancy: bool,
+    /// Ares HouseExt `+0x49`: veteran aircraft (`SpyEffect.AircraftVeterancy`).
+    #[serde(default)]
+    aircraft_veterancy: bool,
+    /// Ares HouseExt `+0x4A`: veteran buildings (`SpyEffect.BuildingVeterancy`).
+    #[serde(default)]
+    building_veterancy: bool,
+}
+
+// The five native bytes fold as a derive would; the Ares bytes only once
+// one is set, so a house in a game without Ares folds what it always did.
+impl std::hash::Hash for SpyGains {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.third_tech.hash(state);
+        self.soviet_tech.hash(state);
+        self.allied_tech.hash(state);
+        self.veteran_infantry.hash(state);
+        self.veteran_units.hash(state);
+        if self.naval_veterancy || self.aircraft_veterancy || self.building_veterancy {
+            b"ares-spy-veterancy-v1".hash(state);
+            self.naval_veterancy.hash(state);
+            self.aircraft_veterancy.hash(state);
+            self.building_veterancy.hash(state);
+        }
+    }
+}
+
+/// The veterancy one Ares infiltration gives its house
+/// (`BuildingExt::ExtData::InfiltratedBy @ 10012000`): the House bytes
+/// `+0x2BF`/`+0x2C0` and the HouseExt bytes `+0x48..+0x4A`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AresSpyVeterancy {
+    pub(crate) infantry: bool,
+    pub(crate) units: bool,
+    pub(crate) naval: bool,
+    pub(crate) aircraft: bool,
+    pub(crate) buildings: bool,
 }
 
 /// The four class-local indices use ObjectCategory's registry order. Keeping
@@ -384,6 +506,46 @@ impl Default for LastBuiltTypes {
     }
 }
 
+/// What House+0x1602A holds. Localized text stays app-side, so the House
+/// keeps where its name comes from rather than the resolved string.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HouseUiName {
+    /// The constructor's copy of its HouseType's UIName text (`0x004F62FF`),
+    /// also Read_Scenario_INI's fallback for an empty `UIName=`
+    /// (`0x00500CF7..0x00500D05`).
+    #[default]
+    TypeName,
+    /// `TXT_COMPUTER`: CreateHouses' computer Houses
+    /// (`0x00688252..0x00688270`).
+    Computer,
+    /// A human node's handle (`0x00688092..0x006880A4`).
+    Handle(String),
+    /// Read_Scenario_INI's `UIName=` CSF key (`0x00500C5D..0x00500CF5`).
+    Csf(String),
+}
+
+impl HouseUiName {
+    /// The field holds at most 20 wide characters: CreateHouses copies
+    /// `wcsncpy(.., 0x15)` and terminates +0x16052; Read_Scenario_INI
+    /// terminates `aUIName[0x14]`.
+    pub const CAPACITY_UTF16: usize = 20;
+
+    pub fn handle(name: &str) -> Self {
+        Self::Handle(Self::bounded(name))
+    }
+
+    /// `text` cut to the field's 20 UTF-16 units, never splitting a pair.
+    pub fn bounded(text: &str) -> String {
+        let mut units = 0;
+        text.chars()
+            .take_while(|c| {
+                units += c.len_utf16();
+                units <= Self::CAPACITY_UTF16
+            })
+            .collect()
+    }
+}
+
 /// Per-player game state.
 ///
 /// Created once per player at game start, lives for the duration of the match.
@@ -392,15 +554,31 @@ impl Default for LastBuiltTypes {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct HouseState {
     /// Owner name as interned ID (resolve via interner for display).
-    pub name: InternedId,
+    name: InternedId,
     /// House+15FF4's bounded narrow name, independent of its owner key and
     /// participant display handle. Fresh scenario initialization installs it
     /// before map objects; None marks partial diagnostic Houses that have not
     /// run that admission. Save504080/Load503040 retain the native name.
     #[serde(default)]
     native_scenario_name: Option<String>,
+    /// House+0x1602A, the player-facing name every message, score and
+    /// Diplomacy row reads.
+    #[serde(default)]
+    ui_name: HouseUiName,
+    /// House+0x248: the player sent EXIT (`Execute_DoList 0x0064C7E7`).
+    /// Diplomacy hides its chat box (`0x00658525`); nothing else in live
+    /// play reads it.
+    #[serde(default)]
+    left_game: bool,
     #[serde(default)]
     native_construction: Option<NativeHouseConstruction>,
+    /// Fork-only Super-AI knob (`docs/superai.md`): a per-house scale on
+    /// production build times, folded into the native country/type chain in
+    /// `time_to_build`. None is the native behavior — the Super tier's
+    /// half-speed build is the one documented simulation-side exception the
+    /// fork makes. Nothing native writes this; it is not a gamemd port.
+    #[serde(default)]
+    native_build_time_scale: Option<NativeF32Bits>,
     #[serde(default)]
     scenario_parameters: HouseScenarioParameters,
     /// House+16C's retained initial Techno records. ReadScenario684C1B calls
@@ -415,27 +593,43 @@ pub struct HouseState {
     #[serde(default)]
     allow_win_tags: i32,
     /// The sole House+298 result timer. Constructor4F5825/4F582B writes
-    /// (-1,0); AllowWin-tag destruction starts60 at6E50B1, and FlagWin/Lose
-    /// normally replaces it with SavourDelay. Actions67/68 preserve it;
+    /// (-1,0); AllowWin-tag destruction starts60 at6E50B1, Flag_To_Die
+    /// starts0 at4FC9B6, and FlagWin/Lose normally replaces it with SavourDelay. Actions67/68 preserve it;
     /// 69 resumes the same paused timer. Native replay controls:
     /// tools/spatial_oracle/tag_lifecycle (active_cleanup histories).
     #[serde(default)]
     allow_win_timer: CdTimer,
-    /// Stable rules-owned side index. Stock YR uses 0=Allied, 1=Soviet,
+    /// Native signed Country+BC identity (ctor511416=-1), retained by the House.
+    /// House+1E8 selects only0/1/2; its branch consumers treat all others alike.
+    /// Stock YR uses 0=Allied, 1=Soviet,
     /// 2=Yuri, 3=Civilian, and 4=Mutant.
-    pub side_index: u8,
+    side_index: i32,
     /// Country interned ID from map INI `Country=` key (e.g., "Americans", "Russians").
-    pub country: Option<InternedId>,
+    country: Option<InternedId>,
+    /// Ares3.0 HouseExt+4C: ordered permanent Country plans. Constructor
+    ///10021072 leaves it empty; live factory ownership is a separate source.
+    #[serde(default)]
+    permanent_factory_plans: Vec<crate::rules::ruleset::CountryIdx>,
     /// Native HouseClass `IsHuman` byte.
-    pub is_human: bool,
+    is_human: bool,
     /// Native HouseClass `PlayerControl` byte. It differs from `IsHuman` in
     /// scenario modes and participates independently in EventClass admission.
     #[serde(default)]
-    pub player_control: bool,
+    player_control: bool,
     /// Per-house native difficulty. Human houses retain Normal unless a map or
     /// game-mode initializer explicitly assigns another native value.
     #[serde(default)]
-    pub difficulty: HouseDifficulty,
+    difficulty: HouseDifficulty,
+    /// Registration index into `Rules.personalities`, assigned once when a
+    /// skirmish computer house is created.
+    ///
+    /// Product extension (no native counterpart). Persisted because it decides
+    /// which AI triggers this house suppresses or reweights, so a save that
+    /// dropped it would reload as a different opponent. `None` — every human
+    /// house, every campaign house, and every rules set without
+    /// `[AIPersonalities]` — leaves the trigger table exactly as retail has it.
+    #[serde(default)]
+    personality: Option<u16>,
     /// Original House scalar difficulty fields. All seven biases begin at1.0
     /// and both delays at0.0; the shared SetDifficulty owner replaces them.
     #[serde(default)]
@@ -448,12 +642,10 @@ pub struct HouseState {
     /// Stock `Neutral` (Civilian) and `Special` (JP) both set it, and they exist
     /// in every skirmish, so without it the alive set can never shrink to one.
     ///
-    /// Stamped once at house creation, while a `RuleSet` is still in hand, and
-    /// then read straight off the house — the house rung takes
-    /// `rules: Option<&RuleSet>` and never has to resolve the country itself. A
-    /// house built with no rules available is stamped `false`, the INI default
-    /// for `MultiplayPassive=`; there is no runtime fallback, because gamemd has
-    /// none.
+    /// Stamped once at house creation from the country's rules, and then read
+    /// straight off the house, so the house rung never resolves the country
+    /// itself. A house a fixture builds directly keeps `false`, the INI default
+    /// for `MultiplayPassive=`.
     ///
     /// Persisted state, and versioned as such: it is an authoritative input to
     /// the win/loss outcome, so a save that dropped it would reload as an
@@ -461,26 +653,50 @@ pub struct HouseState {
     /// the state hash and the retail multiplayer checksum, which fold the
     /// mutable `HouseClass` bytes — gamemd keeps this one on the house type.
     #[serde(default)]
-    pub multiplay_passive: bool,
-    /// The HouseType's `Cost*Mult=`, projected from the rules at creation.
-    /// Like the flag above it is the type's, so it is left out of the state
-    /// hash.
+    multiplay_passive: bool,
+    /// This house's decisions are owned by an external command-layer
+    /// controller, so the native AI rungs stand down for it and the launch's
+    /// tier treatment grants its opening credits. Not a gamemd port: native
+    /// `HouseClass` has no such byte, so it stays out of the retail-state
+    /// concerns entirely.
     #[serde(default)]
-    pub country_cost_mults: CountryCostMults,
+    command_driven: bool,
+    /// Fork-only driver policy (`docs/superai.md`): the treatment a
+    /// command-driven house launched with, stored as a
+    /// [`DriverPolicy`](crate::sim::driver::DriverPolicy) so a driver can
+    /// carry knob combinations beyond any fixed tier set; the driver
+    /// rebuild (fresh
+    /// launch and saved-game restore alike) reads the policy back
+    /// instead of guessing from the build-time scale. `None` for every
+    /// native house and pre-mark saves, which fall back to the scale
+    /// heuristic. Like the flag above it stays out of every native-state
+    /// concern.
+    #[serde(default)]
+    super_tier: Option<crate::sim::driver::DriverPolicy>,
+    /// The HouseType's `Cost*Mult=`, projected from the rules at creation.
+    /// Like `multiplay_passive` it is the type's, so it is left out of the
+    /// state hash.
+    #[serde(default)]
+    country_cost_mults: CountryCostMults,
     /// The HouseType's `Speed*Mult=`, projected with the cost factors and
     /// likewise left out of the state hash. Read through [`Self::speed_bonus`].
     #[serde(default)]
     country_speed_mults: CountrySpeedMults,
     /// Whether this player has been eliminated.
-    pub is_defeated: bool,
+    is_defeated: bool,
+    /// House+1F6, constructor4F5722=false. Flag_To_Die4FC980 arms
+    /// the shared+298 timer; Update4F87F3 clears this before Blowup_All.
+    #[serde(default)]
+    to_die: bool,
+    /// House+1F9: Constructor4F54A0 clears this at4F5734. Fly's
+    /// PlayfieldLatch4CD510 sets it for each qualifying evacuated passenger's
+    /// owner; TEvent::HasOccurred71E940 event18 reads it. Original gamemd.exe.
+    #[serde(default)]
+    civilians_evacuated: bool,
     /// Victory flag.
     has_won: bool,
     /// Defeat flag. Note: Flag_To_Lose clears HasWon first.
     has_lost: bool,
-    /// Accepted win/loss transition plus the deterministic SavourDelay target.
-    /// App-owned wall waits and audio teardown are intentionally excluded.
-    #[serde(default)]
-    outcome_state: Option<HouseOutcomeState>,
     /// HouseClass+0x241 map-clear byte folded by the retail multiplayer
     /// checksum. Distinct from the fog owner's+0x240 reveal guard, which
     /// TAction17 reads (6E0FE8) and gap re-admission clears independently.
@@ -488,7 +704,7 @@ pub struct HouseState {
     /// Defeat/reveal paths set this independently of the win/loss flags, and
     /// shroud restoration can clear it again.
     #[serde(default)]
-    pub map_is_clear: bool,
+    map_is_clear: bool,
     /// Aggregate active SpySat state for this house.
     ///
     /// This is the edge-trigger authority for whole-map reveal/restoration.
@@ -496,12 +712,18 @@ pub struct HouseState {
     /// non-limbo, non-selling SpySat in house building order decides it:
     /// warp-out clears the latch; otherwise that provider sets it.
     #[serde(default)]
-    pub spy_sat_active: bool,
+    spy_sat_active: bool,
+    /// House+24B: Constructor4F57A7 arms the first local Update's full
+    /// Map4ADCD0 sight pass. Update4F9353 clears it before the callback;
+    /// Fill_In_Data's earlier mobile-only pass leaves it armed. Save/Load
+    /// retains this byte with the House. Executed: house_initial_sight.
+    #[serde(default)]
+    initial_sight_refresh_pending: bool,
     /// The object counts the defeat gate reads (`house_tracking`), written by
     /// the lifecycle authority at construction, deletion, Limbo, Unlimbo and
     /// owner change.
     #[serde(default)]
-    pub tracking: crate::sim::house_tracking::HouseTracking,
+    tracking: crate::sim::house_tracking::HouseTracking,
     /// House+1FC: retained tech-tree invalidation, initially set by
     /// HouseCtor4F5746. Building Limbo445D99, GrandOpening446A61,
     /// DiscoveredBy44D61A and ChangeOwner44936E/449379 set it again.
@@ -532,44 +754,44 @@ pub struct HouseState {
     /// lifecycle boundaries rather than when a consumer requests a destination.
     /// The existing House base owner publishes this with its private radius;
     /// launch/deploy's explicit House50E000 writes retain that radius.
-    pub base_center: Option<(u16, u16)>,
+    base_center: Option<(u16, u16)>,
     #[serde(default)]
-    pub(crate) base_projection: crate::sim::world::HouseBaseState,
+    base_projection: crate::sim::world::HouseBaseState,
     /// Alternate base-placement cell written by trigger actions 137/138.
     ///
     /// This is the packed-zero `HouseClass+0x5494` authority. It is distinct
     /// from the launch/primary `base_center` (`HouseClass+0x5490`) and defaults
     /// to the native invalid sentinel `(0, 0)`.
     #[serde(default)]
-    pub alternate_base_center: (u16, u16),
+    alternate_base_center: (u16, u16),
     /// Stable IDs in native HouseClass's owned `[AI] BuildConst=` vector order
     /// (`RulesClass__ReadAI @ 0x00672AE0`, binding
     /// `0x00672B14..0x00672C01`). Successful Unlimbo/re-entry and capture
     /// append at the tail; Limbo and old-owner transfer stable-remove in place.
     #[serde(default)]
-    pub build_const_order: Vec<u64>,
+    build_const_order: Vec<u64>,
     /// Ordered native `BaseClass` plan authority. Scenario nodes are installed
     /// before map-object Unlimbo; later ordinary planning remains disconnected.
     #[serde(default)]
-    pub base_plan: crate::sim::base_plan::BasePlanState,
+    base_plan: crate::sim::base_plan::BasePlanState,
     /// Packed-zero-default center owned by native `BaseClass` at
     /// `HouseClass+0x5750`. A successful non-controlled ConstructionYard
     /// deploy writes this after anchoring BasePlan node zero; it is distinct
     /// from the launch/primary `base_center` at `HouseClass+0x5490`.
     #[serde(default)]
-    pub base_plan_center: (u16, u16),
+    base_plan_center: (u16, u16),
     /// Native `HouseClass+0x5700` BaseClass reservation writer outputs.
     #[serde(default)]
-    pub base_reservation: BaseReservationState,
+    base_reservation: BaseReservationState,
     /// House TechLevel: launch options offline, or the campaign map reader with
     /// Scenario's retained mission counter as its default.
-    pub tech_level: i32,
+    tech_level: i32,
     /// Live HouseClass CurrentIQ (+0x24C), used by AI behavior thresholds.
     ///
     /// Named scenario houses read their own `IQ=`. Generated skirmish computer
     /// houses are stamped from `[IQ] MaxIQLevels`; generated human and special
     /// houses retain the native constructor value zero.
-    pub current_iq: i32,
+    current_iq: i32,
     /// HouseClass `+0x1D0`: the map section's `IQ=`, which only
     /// `HouseClass::Read_Scenario_INI` writes (`0x00500DBA`, with CurrentIQ).
     /// `ScenarioClass::Full_Init` reads the map's houses only in a campaign
@@ -577,22 +799,31 @@ pub struct HouseState {
     /// (`0x004F56BD`). Its one gameplay reader is the computer's low-credit
     /// sale (`[IQ] SellBack`, `0x004507A4`); the House CRC does not fold it.
     #[serde(default)]
-    pub authored_iq: i32,
+    authored_iq: i32,
     /// Native `AngerStruct` scores keyed by the other house's stable identity.
     ///
     /// gamemd stores an O(N^2) vector in global HouseClass creation order. The
-    /// Rust house registry already owns that exact order in
-    /// `ScenarioSession::house_order`, so only touched scores live here; enemy
-    /// selection still scans session order, never this map's key order.
+    /// Rust House array already owns that exact order in
+    /// `Houses::order`, so only touched scores live here; enemy selection
+    /// still scans that order, never this map's key order.
     #[serde(default)]
-    pub grudge_scores: BTreeMap<InternedId, i32>,
+    grudge_scores: BTreeMap<InternedId, i32>,
+    /// HouseClass's ScoutStruct marks (+561C), consumed by Script_Scout6EE800.
+    /// Constructor4F602A..4F6181 registers every peer with mark0; unmarked
+    /// peers are implicit in Houses::order(), including later registrations.
+    /// Save50422D..50427B retains the marks. Rust snapshots retain logical
+    /// identities: native Load503641 only fixes up the final peer pointer,
+    /// whose allocation-dependent stale-address effects are not reproduced.
+    #[serde(default)]
+    scouted_houses: BTreeSet<InternedId>,
     /// House selected by `HouseClass::UpdateAngerNodes`, or native `-1` as None.
     #[serde(default)]
-    pub enemy_house: Option<InternedId>,
-    /// Edge of the playfield where this house spawns paradrop carriers.
-    /// Encoding: 0=N, 1=E, 2=S, 3=W. Launch setup seeds it from the assigned
-    /// start anchor; committed structures refresh it through lifecycle authority.
-    pub waypoint_edge: u8,
+    enemy_house: Option<InternedId>,
+    /// House+0x577C, the map edge this house's aircraft come from and leave
+    /// by. Encoding: 0=N, 1=E, 2=S, 3=W. The constructor writes North
+    /// (`0x004F5C79`); only DetermineEdge
+    /// ([`crate::sim::world::Simulation::determine_house_edge`]) changes it.
+    waypoint_edge: u8,
     /// End-of-match score-screen statistics (Kills / Losses / Built columns).
     ///
     /// gamemd keeps the same three quantities on the house: per-house
@@ -608,7 +839,7 @@ pub struct HouseState {
     /// booked its first loss and records another at terminal depth. These
     /// live values also feed TerminalScoreSnapshot's Scenario RNG bound and
     /// participate in the deterministic hash from schema227.
-    pub stats: MatchStatistics,
+    stats: MatchStatistics,
     /// House+244: Engineer PerCell519F4F records that this House has had a
     /// building captured. Constructor4F577D clears it, and the original
     /// TEvent Evaluate71F0E1 reads it for event kind3 (tables71F328/71F350).
@@ -620,7 +851,7 @@ pub struct HouseState {
     /// House4F57DE..4F57F0 initializes +26C/+270/+274/+278 to -1.
     /// Record_Last_Built4FB6B0 writes before DontScore; Building discovery
     /// 44D601 also writes its owner's building slot outside ScenarioInit.
-    /// Executed controls: tag_lifecycle --build-type-events (Steam3e81a617).
+    /// Executed controls: tag_lifecycle --build-type-events (Steam gamemd).
     #[serde(default)]
     last_built_types: LastBuiltTypes,
     /// Successful scored factory deliveries by category and native Type
@@ -652,6 +883,36 @@ pub struct HouseState {
     /// `BuildingClass::Infiltrate` (`sim::spy_infiltration`).
     #[serde(default)]
     spy_gains: SpyGains,
+    /// Ares HouseExt `+0x58` Academies: this house's on-map buildings whose
+    /// type has a positive `Academy.*Veterancy`, in the order
+    /// `HouseExt::UpdateAcademy` (`10022760`) appended them. Placement
+    /// (hook `0x00446366`) adds, Limbo (`0x00445905`) and a capture's old
+    /// owner (`0x00448AB2`) remove, the captor (`0x004491D5`) adds.
+    #[serde(default)]
+    ares_academies: Vec<u64>,
+    /// Ares HouseExt `+0x34` ReverseEngineered: the TechnoTypes this house
+    /// reverse engineered at a `ReverseEngineersVictims=` grinder, in the
+    /// order `HouseExt::ExtData::ReverseEngineer` (`10022360`) appended them
+    /// (AresMap find-or-insert `10020250`). RequirementsMet (`10021FF0`)
+    /// answers Overridden for a listed type and trigger event 78 reads it;
+    /// `SpyEffect.UndoReverseEngineer` (`10012000`) empties it.
+    #[serde(default)]
+    ares_reverse_engineered: Vec<crate::rules::superweapon_type::TechnoTypeReference>,
+    /// Ares HouseExt `+0x40` StolenTech (constructor 0): the bits of every
+    /// `SpyEffect.StolenTechIndex=` building this house's spies entered
+    /// (`BuildingExt::ExtData::InfiltratedBy @ 10012000`), which
+    /// `Prerequisite.StolenTechs=` asks (RequirementsMet `10021FF0`).
+    /// Nothing clears it.
+    #[serde(default)]
+    ares_stolen_tech: u32,
+    /// Ares HouseExt `+0x14` SWLastIndex (constructor -1): the
+    /// `[SuperWeaponTypes]` index of the last Super a new-type handler
+    /// launched that was neither PostClick nor `SW.AutoFire` (common Launch
+    /// 10032ED0). Fire_SW's PostClick pairing (hook 4FAE72, 10034C90), the
+    /// ChronoWarp's source (1006FB60) and the PostClick presentation of the
+    /// common Launch read it.
+    #[serde(default = "no_super_index")]
+    ares_last_super: i32,
     /// House+2D8: how many of this house's `PowersUnit=` buildings are
     /// counted as operational (each building's `+0x662`). The constructor
     /// clears it; `sim::powered_unit` is its only writer.
@@ -666,21 +927,26 @@ pub struct HouseState {
     #[serde(default)]
     discovered_by_current_house: bool,
     /// Sole credit balance and economy statistics; serialized and hashed.
-    pub economy: Economy,
+    economy: Economy,
     /// Snapshot/hash authority for the Strategy emergency-state block.
     #[serde(default)]
-    pub strategy_emergency: HouseStrategyEmergencyState,
+    strategy_emergency: HouseStrategyEmergencyState,
     /// `HouseClass+0x5634`/`+0x563C`, the timer that runs Strategy
     /// (`sim::house_strategy::update_strategy`). The constructor starts it at
     /// the construction frame, which is frame 0, with no delay
     /// (`0x004F5B9D..0x004F5BA8`). Persisted and hashed (schema v234).
     #[serde(default = "strategy_timer_at_construction")]
-    pub(crate) strategy_timer: CdTimer,
+    strategy_timer: CdTimer,
+    /// House+5640/+5648. Post_Map_Init00686A12..00686A2B starts it once;
+    /// AI_Building_Strategy004FD50F..004FD538 only reads it. HouseSave504080
+    /// preserves it in the raw House payload; snapshots and hashes do too.
+    #[serde(default = "enemy_search_timer_at_construction")]
+    enemy_search_timer: CdTimer,
     /// The team timer and `RatioAITriggerTeam=` (`HouseClass+0x5798`/`+0x57A0`,
     /// `+0x565C`), owned by `sim::ai_team_creation`. Persisted and hashed
     /// (schema v238).
     #[serde(default)]
-    pub team_creation: crate::sim::ai_team_creation::HouseTeamCreation,
+    team_creation: crate::sim::ai_team_creation::HouseTeamCreation,
     /// Native House bytes `+0x1EE`, `+0x1EF`, `+0x1F2`, and `+0x1F3`. All four
     /// persist, while Production, AutocreateAllowed, and AITriggersActive
     /// directly enter House CRC.
@@ -690,12 +956,12 @@ pub struct HouseState {
     /// (`HouseClass+0x1E4`, `+0x564C`, `+0x1F0`), owned by
     /// `sim::ai_base_building`. Persisted and hashed (schema v232).
     #[serde(default)]
-    pub(crate) ai_production: crate::sim::ai_base_building::HouseAiProduction,
+    ai_production: crate::sim::ai_base_building::HouseAiProduction,
     /// The computer's Unit, Infantry and Aircraft choices (`HouseClass+0x5650`,
     /// `+0x5654`, `+0x5658`), owned by `sim::ai_unit_choice`. Persisted and
     /// hashed (schema v238).
     #[serde(default)]
-    pub(crate) ai_unit_choices: crate::sim::ai_unit_choice::HouseAiUnitChoices,
+    ai_unit_choices: crate::sim::ai_unit_choice::HouseAiUnitChoices,
     /// Native `HouseClass+0x242`: "a harvester of this house found no ore".
     ///
     /// Exhaustive instruction census (`search_instructions` operand `+0x242]`,
@@ -710,15 +976,14 @@ pub struct HouseState {
     ///   production bias).
     ///
     /// No clearing writer exists anywhere: once set it stays set for the rest
-    /// of the match (save/load carries the raw House block). The
-    /// `Mission_Guard` arm (ii) reader is implemented
-    /// (`techno_ai/mission_handlers.rs`, AI houses only); the
-    /// `AI_Choose_Unit` reader belongs to the deferred AI lane, which is why
-    /// AI-house miners take a VERA-internal re-scan bridge instead of the
-    /// native Guard park (`miner_system::handle_going_to_idle`).
+    /// of the match (save/load carries the raw House block). Both readers are
+    /// ported: `Mission_Guard` arm (ii) in `techno_ai/mission_handlers.rs`,
+    /// which keeps an AI-house miner parked on Guard
+    /// (`miner_system::handle_going_to_idle`), and `AI_Choose_Unit` in
+    /// `ai_unit_choice`.
     /// Persisted and hashed (schema v132).
     #[serde(default)]
-    pub harvester_no_ore: bool,
+    harvester_no_ore: bool,
     /// Native `HouseClass+0x57D4`: the `EVA_InsufficientFunds` nag timer
     /// (`HouseClass::Update 0x004F8B3C..0x004F8C53`: the expiry test
     /// `0x004F8B4E..0x004F8B63`, the restart `0x004F8BD0..0x004F8BE1`). Only
@@ -726,24 +991,29 @@ pub struct HouseState {
     /// house runs it and the app keeps the local filter. Persisted and hashed
     /// (schema v133).
     #[serde(default = "eva_funds_timer_at_construction")]
-    pub eva_funds_timer: CdTimer,
+    eva_funds_timer: CdTimer,
     /// Native `[0x00A8F040]`, the `EVA_LowPower` one-shot guard
     /// (`0x004F8D02` test, `0x004F8D61` set, `0x004F8DAB` clear). It is a
     /// process global gated behind `this == PlayerPtr`, so one flag per human
-    /// house is the same state. Persisted and hashed (schema v133).
+    /// house is the same state. Persisted and hashed (schema v133). RESIDUAL
+    /// (kept by the maintainer, 2026-11-15): nothing saves, loads or resets
+    /// the global, so after a load gamemd warns again if still short, and a
+    /// match that ended short leaves the next one silent until power returns.
     #[serde(default)]
-    pub eva_low_power_guard: bool,
+    eva_low_power_guard: bool,
     /// Native `HouseClass+0x245`: a building's auto-repair start sets it
     /// (`0x004506FF`), and while set no other building of the house starts
     /// one. [`HouseState::release_repair_latch`] clears it. Persisted and
     /// hashed (schema v216).
     #[serde(default)]
-    pub(crate) repair_start_latch: bool,
+    repair_start_latch: bool,
     /// Native `HouseClass+0x280` timer: the auto-repair start of a house no
     /// human controls arms it (`0x00450764..0x00450779`), and the latch holds
     /// until it expires. The constructor starts it at the construction frame
-    /// with no time left. Persisted and hashed (schema v216).
-    pub(crate) repair_latch_timer: CdTimer,
+    /// with no time left. Persisted and hashed (schema v216). RESIDUAL
+    /// (invisible): native Load's NoInit restarts it (0x004F5327..0x004F5339),
+    /// so a loaded computer may repair 36-90 frames sooner there.
+    repair_latch_timer: CdTimer,
     /// House+57E4..+15FF3: native retained 130x130 padded spatial threat map.
     /// Constructor4F61EF/4F6312 clears it. Save504093 and Load5031C9 retain
     /// it through the raw House stream; rebuilding from current objects loses
@@ -764,6 +1034,12 @@ struct HouseSuperWeaponTargets {
     /// it for the warning anim and the missile (`0x0044C9DC`, `0x0044CAA9`).
     /// Constructor (0, 0) (`0x004F5C8D`).
     nuke_target: (u16, u16),
+    /// `+0x5780` EMPTarget, constructor (0, 0) (`0x004F5C7F`): where the
+    /// EMP cannons' Missile mission aims (`0x0044CD42..0x0044D006`). Ares's
+    /// EMPulse Activate (10071200) and the cannon hook 44CCE7 (10036570)
+    /// write it; nothing in the stock game does.
+    #[serde(default)]
+    emp_target: (u16, u16),
     /// House+54F0; constructor4F5A81/88 writes (0,0). TAction135/136
     /// change this preference, not the already-launched NukeTarget+5784.
     #[serde(default)]
@@ -780,7 +1056,7 @@ struct HouseSuperWeaponTargets {
     defense_frame: i32,
     /// House+54EC: constructor4F5A77 writes1; active Execute35 stores the
     /// signed Action+90 at6DE1F1. AI target pickers read it independently of
-    /// the scripted target cell. Steam gamemd3e81a617..08600.
+    /// the scripted target cell. Steam gamemd.
     #[serde(default = "default_super_target_kind")]
     preferred_kind: i32,
 }
@@ -793,6 +1069,7 @@ impl Default for HouseSuperWeaponTargets {
     fn default() -> Self {
         Self {
             nuke_target: (0, 0),
+            emp_target: (0, 0),
             preferred_target: (0, 0),
             defense_cell: (0, 0),
             defense_frame: -100,
@@ -801,7 +1078,740 @@ impl Default for HouseSuperWeaponTargets {
     }
 }
 
+const ANGER_DECAY_PERIOD_FRAMES: i32 = 100;
+
 impl HouseState {
+    /// Apply the unconditional House-update anger decay without enemy
+    /// reselection.
+    ///
+    /// gamemd-derived: `HouseClass__Update @ 0x004F8440`. On exact signed frame
+    /// multiples of 100, native forward-walks the registered peer vector and
+    /// decrements only scores strictly greater than one.
+    pub(crate) fn decay_anger_scores(&mut self, house_order: &[InternedId], current_frame: i32) {
+        if current_frame % ANGER_DECAY_PERIOD_FRAMES != 0 {
+            return;
+        }
+        for &peer in house_order {
+            if peer == self.name {
+                continue;
+            }
+            if let Some(score) = self.grudge_scores.get_mut(&peer)
+                && *score > 1
+            {
+                *score = score.wrapping_sub(1);
+            }
+        }
+    }
+
+    // ---- Operations named for the native writes ---------------------------
+
+    /// `FUN_0050DFE0` (trigger action 137) writes House+0x5494, the
+    /// alternate base centre.
+    pub(crate) fn set_alternate_base(&mut self, cell: (u16, u16)) {
+        self.alternate_base_center = cell;
+    }
+
+    /// `FUN_0050DFF0` (trigger action 138) writes packed zero to House+0x5494.
+    pub(crate) fn clear_alternate_base(&mut self) {
+        self.alternate_base_center = (0, 0);
+    }
+
+    /// The base plan's anchor cell, written where the plan is (re)centred.
+    pub(crate) fn anchor_base_plan(&mut self, cell: (u16, u16)) {
+        self.base_plan_center = cell;
+    }
+
+    /// HouseClass::Read_Scenario_INI stores `IQ=` as both the authored IQ
+    /// (+0x1D0) and CurrentIQ (+0x24C) (`0x00500DBA..0x00500DC0`).
+    pub(crate) fn install_scenario_iq(&mut self, iq: i32) {
+        self.current_iq = iq;
+        self.authored_iq = iq;
+    }
+
+    /// ScenarioClass::Create_Houses stamps a generated computer slot with
+    /// Rules.MaxIQLevels in non-campaign sessions.
+    pub(crate) fn stamp_computer_iq(&mut self, max_iq_levels: i32) {
+        self.current_iq = max_iq_levels;
+    }
+
+    /// The anger rescan's pick: the eligible peer with the highest grudge,
+    /// or none.
+    pub(crate) fn assign_enemy(&mut self, enemy: Option<InternedId>) {
+        self.enemy_house = enemy;
+    }
+
+    /// The enemy is forgotten (defeated, or now an ally).
+    pub(crate) fn forget_enemy(&mut self) {
+        self.enemy_house = None;
+    }
+
+    /// UpdateAngerNodes' node update: `delta` joins the peer's grudge,
+    /// creating the node unless `delta` is zero.
+    pub(crate) fn add_anger(&mut self, peer: InternedId, delta: i32) {
+        if delta != 0 || self.grudge_scores.contains_key(&peer) {
+            let score = self.grudge_scores.entry(peer).or_insert(0);
+            *score = score.wrapping_add(delta);
+        }
+    }
+
+    pub(crate) fn has_scouted_house(&self, peer: InternedId) -> bool {
+        self.scouted_houses.contains(&peer)
+    }
+
+    /// HouseClass::Mark_Threat_Source00504860: mark a registered peer, with
+    /// no alliance, defeat, human or passive gate. The shared House array
+    /// supplies the constructor-registered peer list without duplicating it.
+    pub(crate) fn mark_scouted_house(&mut self, peer: InternedId, order: &[InternedId]) {
+        if peer != self.name && order.contains(&peer) {
+            self.scouted_houses.insert(peer);
+        }
+    }
+
+    pub(crate) fn hash_scouted_houses(&self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        if !self.scouted_houses.is_empty() {
+            b"house-scout-marks-v1".hash(hasher);
+            self.scouted_houses.hash(hasher);
+        }
+    }
+
+    /// The House update's EVA pass retains the funds-nag timer and the
+    /// low-power guard it advanced.
+    pub(crate) fn retain_eva_nag_state(&mut self, funds_timer: CdTimer, low_power_guard: bool) {
+        self.eva_funds_timer = funds_timer;
+        self.eva_low_power_guard = low_power_guard;
+    }
+
+    /// `MOV byte ptr [ECX+0x242], 1` at `0x0073E911`: a harvester found no ore.
+    pub(crate) fn note_harvester_no_ore(&mut self) {
+        self.harvester_no_ore = true;
+    }
+
+    /// MPlayer_Defeated's Defeated flag (`+0x1F5`, `0x004FC0C2`).
+    pub(crate) fn mark_defeated(&mut self) {
+        self.is_defeated = true;
+    }
+
+    /// House+0x241: the whole map is clear for this House.
+    pub(crate) fn mark_map_clear(&mut self) {
+        self.map_is_clear = true;
+    }
+
+    /// Reshroud and the map reset clear House+0x241.
+    pub(crate) fn mark_map_shrouded(&mut self) {
+        self.map_is_clear = false;
+    }
+
+    /// MultiplayPassive from the House's country ([`resolve_multiplay_passive`]).
+    pub(crate) fn resolve_multiplay_passive(
+        &mut self,
+        rules: &crate::rules::ruleset::RuleSet,
+        country: Option<&str>,
+    ) {
+        self.multiplay_passive = resolve_multiplay_passive(rules, country);
+    }
+
+    /// Harness Houses that sit the match out (the benchmark and synthetic
+    /// digest worlds) take `MultiplayPassive`, which the defeat gate and the
+    /// game-over alive scan skip. A native House takes it only from its
+    /// country at construction ([`Self::resolve_multiplay_passive`]); no
+    /// native write changes it later.
+    pub fn make_multiplay_passive(&mut self) {
+        self.multiplay_passive = true;
+    }
+
+    /// Fork-only: hand this house's decisions to the external command-layer
+    /// controller (`docs/superai.md`); the native AI rungs stand down for it
+    /// (no upstream caller sets this) and the launch's driver treatment
+    /// supplies its opening credits. The policy rides along so the driver
+    /// rebuild recovers it later; anything convertible into a
+    /// [`DriverPolicy`](crate::sim::driver::DriverPolicy) is accepted (the
+    /// driver plugin's difficulty ladder implements one). Not a gamemd port.
+    pub fn make_command_driven(&mut self, treatment: impl Into<crate::sim::driver::DriverPolicy>) {
+        self.command_driven = true;
+        self.super_tier = Some(treatment.into());
+    }
+
+    /// Player control (`+0x1ED`): Create_Houses (`688109..10F`) grants it to
+    /// the local source node only; Read_Scenario_INI reads `PlayerControl=`.
+    pub(crate) fn assign_player_control(&mut self, controlled: bool) {
+        self.player_control = controlled;
+    }
+
+    /// `68AD0C/68AD18`: the campaign's selected House becomes human
+    /// (`+0x1EC`) and player-controlled (`+0x1ED`).
+    pub(crate) fn make_campaign_player(&mut self) {
+        self.is_human = true;
+        self.player_control = true;
+    }
+
+    /// The House's reinforcement edge ([`determine_waypoint_edge`]).
+    pub(crate) fn assign_waypoint_edge(&mut self, edge: u8) {
+        self.waypoint_edge = edge;
+    }
+
+    /// The auto-repair start latch, set as a repair starts.
+    pub(crate) fn latch_repair_start(&mut self) {
+        self.repair_start_latch = true;
+    }
+
+    /// `0x00450759`: the latch timer for a House no human controls.
+    pub(crate) fn arm_repair_latch(&mut self, now: i32, duration: i32) {
+        self.repair_latch_timer.start(now, duration);
+    }
+
+    /// `HouseClass::Update @ 0x004F8FBE..0x004F9032`: the Strategy timer
+    /// restarts at this frame with the delay `AI_Building_Strategy` returned.
+    pub(crate) fn restart_strategy_timer(&mut self, frame: i32, delay: i32) {
+        self.strategy_timer.start(frame, delay);
+    }
+
+    /// ScenarioClass::Post_Map_Init006869EA..00686A2B: only IsHuman and
+    /// MultiplayPassive gate this one-time start; PlayerControl does not.
+    pub(crate) fn initialize_enemy_search_timer(
+        &mut self,
+        frame: i32,
+        general: &crate::rules::ruleset::GeneralRules,
+    ) {
+        if !self.is_human() && !self.multiplay_passive() {
+            self.enemy_search_timer
+                .start(frame, self.difficulty_value(general.ai_hate_delays()));
+        }
+    }
+
+    /// House+577A, stored after SpySat's map callback (`509069/509017`).
+    pub(crate) fn record_spy_sat(&mut self, active: bool) {
+        self.spy_sat_active = active;
+    }
+
+    /// Append a construction-eligible building once, in arrival order.
+    pub(crate) fn append_build_const(&mut self, stable_id: u64) -> bool {
+        if self.build_const_order.contains(&stable_id) {
+            return false;
+        }
+        self.build_const_order.push(stable_id);
+        true
+    }
+
+    /// Stable-remove a building from the construction order.
+    pub(crate) fn remove_build_const(&mut self, stable_id: u64) {
+        if let Some(index) = self
+            .build_const_order
+            .iter()
+            .position(|&id| id == stable_id)
+        {
+            self.build_const_order.remove(index);
+        }
+    }
+
+    /// The retained House4FD150 radius, also read by House500200/501AC0.
+    pub(crate) fn base_radius(&self) -> i32 {
+        self.base_projection.radius()
+    }
+
+    /// House50E000's explicit primary write, called at Unit7398CE and scenario
+    /// launch. It does not recalculate radius or replace alternate/BasePlan cells.
+    pub(crate) fn set_base_center(&mut self, cell: (u16, u16)) {
+        self.base_center = Some(cell);
+    }
+
+    /// `4FD150`'s publication of the primary centre with its radius.
+    pub(crate) fn retain_base_geometry(&mut self, primary: Option<(u16, u16)>, radius: i32) {
+        self.base_center = primary;
+        self.base_projection.retain_radius(radius);
+    }
+
+    /// Supplied physical House+5490/+5498 inputs in native query corpora.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_base_geometry_for_test(&mut self, primary: Option<(u16, u16)>, radius: i32) {
+        self.retain_base_geometry(primary, radius);
+    }
+
+    /// The House factors TechnoType `Cost_Of` (`0x00711F00`) reads: its
+    /// country's `Cost*Mult=` and its FactoryPlant products.
+    pub(crate) fn cost_factors(&self) -> crate::rules::ruleset::HouseCostFactors {
+        crate::rules::ruleset::HouseCostFactors {
+            country: self.country_cost_mults.0,
+            factory_plant: self.base_projection.factory_plant_factors(),
+        }
+    }
+
+    // ---- Sub-owners: their own operations carry the rules ----------------
+
+    pub(crate) fn tracking_mut(&mut self) -> &mut crate::sim::house_tracking::HouseTracking {
+        &mut self.tracking
+    }
+
+    pub(crate) fn base_projection_mut(&mut self) -> &mut crate::sim::world::HouseBaseState {
+        &mut self.base_projection
+    }
+
+    pub(crate) fn economy_mut(&mut self) -> &mut Economy {
+        &mut self.economy
+    }
+
+    pub(crate) fn team_creation_mut(
+        &mut self,
+    ) -> &mut crate::sim::ai_team_creation::HouseTeamCreation {
+        &mut self.team_creation
+    }
+
+    pub(crate) fn ai_production_mut(
+        &mut self,
+    ) -> &mut crate::sim::ai_base_building::HouseAiProduction {
+        &mut self.ai_production
+    }
+
+    pub(crate) fn ai_unit_choices_mut(
+        &mut self,
+    ) -> &mut crate::sim::ai_unit_choice::HouseAiUnitChoices {
+        &mut self.ai_unit_choices
+    }
+
+    pub(crate) fn base_plan_mut(&mut self) -> &mut crate::sim::base_plan::BasePlanState {
+        &mut self.base_plan
+    }
+
+    pub(crate) fn base_reservation_mut(&mut self) -> &mut BaseReservationState {
+        &mut self.base_reservation
+    }
+
+    pub(crate) fn strategy_emergency_mut(&mut self) -> &mut HouseStrategyEmergencyState {
+        &mut self.strategy_emergency
+    }
+
+    pub(crate) fn stats_mut(&mut self) -> &mut MatchStatistics {
+        &mut self.stats
+    }
+
+    // ---- Fixture operations ----------------------------------------------
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_side_index_for_test(&mut self, value: i32) {
+        self.side_index = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_country_for_test(&mut self, value: Option<InternedId>) {
+        self.country = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_is_human_for_test(&mut self, value: bool) {
+        self.is_human = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_player_control_for_test(&mut self, value: bool) {
+        self.player_control = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_difficulty_for_test(&mut self, value: HouseDifficulty) {
+        self.difficulty = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_multiplay_passive_for_test(&mut self, value: bool) {
+        self.multiplay_passive = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_ui_name_for_test(&mut self, name: HouseUiName) {
+        self.ui_name = name;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_is_defeated_for_test(&mut self, value: bool) {
+        self.is_defeated = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_map_is_clear_for_test(&mut self, value: bool) {
+        self.map_is_clear = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_spy_sat_active_for_test(&mut self, value: bool) {
+        self.spy_sat_active = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_base_center_for_test(&mut self, value: Option<(u16, u16)>) {
+        self.base_center = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_alternate_base_center_for_test(&mut self, value: (u16, u16)) {
+        self.alternate_base_center = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_build_const_order_for_test(&mut self, value: Vec<u64>) {
+        self.build_const_order = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_base_plan_center_for_test(&mut self, value: (u16, u16)) {
+        self.base_plan_center = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_tech_level_for_test(&mut self, value: i32) {
+        self.tech_level = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_current_iq_for_test(&mut self, value: i32) {
+        self.current_iq = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_authored_iq_for_test(&mut self, value: i32) {
+        self.authored_iq = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_enemy_house_for_test(&mut self, value: Option<InternedId>) {
+        self.enemy_house = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_waypoint_edge_for_test(&mut self, value: u8) {
+        self.waypoint_edge = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_strategy_timer_for_test(&mut self, value: CdTimer) {
+        self.strategy_timer = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_harvester_no_ore_for_test(&mut self, value: bool) {
+        self.harvester_no_ore = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_eva_funds_timer_for_test(&mut self, value: CdTimer) {
+        self.eva_funds_timer = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_eva_low_power_guard_for_test(&mut self, value: bool) {
+        self.eva_low_power_guard = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_repair_start_latch_for_test(&mut self, value: bool) {
+        self.repair_start_latch = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_repair_latch_timer_for_test(&mut self, value: CdTimer) {
+        self.repair_latch_timer = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_tracking_for_test(&mut self, value: crate::sim::house_tracking::HouseTracking) {
+        self.tracking = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_stats_for_test(&mut self, value: MatchStatistics) {
+        self.stats = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_economy_for_test(&mut self, value: Economy) {
+        self.economy = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn economy_mut_for_test(&mut self) -> &mut Economy {
+        &mut self.economy
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn tracking_mut_for_test(&mut self) -> &mut crate::sim::house_tracking::HouseTracking {
+        &mut self.tracking
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn build_const_order_mut_for_test(&mut self) -> &mut Vec<u64> {
+        &mut self.build_const_order
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn grudge_scores_mut_for_test(&mut self) -> &mut BTreeMap<InternedId, i32> {
+        &mut self.grudge_scores
+    }
+
+    pub const fn name(&self) -> InternedId {
+        self.name
+    }
+
+    pub const fn side_index(&self) -> i32 {
+        self.side_index
+    }
+
+    pub const fn country(&self) -> Option<InternedId> {
+        self.country
+    }
+
+    pub(crate) fn permanent_factory_plans(&self) -> &[crate::rules::ruleset::CountryIdx] {
+        &self.permanent_factory_plans
+    }
+
+    ///10021130 checks membership before appending. Selling/capture/loss does
+    /// not revoke a plan, and this append does not write tech-recheck/timers.
+    pub(crate) fn acquire_factory_plan(&mut self, country: crate::rules::ruleset::CountryIdx) {
+        if !self.permanent_factory_plans.contains(&country) {
+            self.permanent_factory_plans.push(country);
+        }
+    }
+
+    /// House.ReadINI500CC5 ->100244C9..10024516 appends without a dedupe
+    /// guard. Only the scenario reader invokes this; CreateHouses does not.
+    pub(crate) fn read_scenario_factory_plan(
+        &mut self,
+        country: Option<crate::rules::ruleset::CountryIdx>,
+    ) {
+        if let Some(country) = country {
+            self.permanent_factory_plans.push(country);
+        }
+    }
+
+    pub const fn is_human(&self) -> bool {
+        self.is_human
+    }
+
+    pub const fn player_control(&self) -> bool {
+        self.player_control
+    }
+
+    pub const fn difficulty(&self) -> HouseDifficulty {
+        self.difficulty
+    }
+
+    /// The fork-only Super-AI build-time scale, if the tier set one (see
+    /// the field's docs).
+    pub const fn native_build_time_scale(&self) -> Option<NativeF32Bits> {
+        self.native_build_time_scale
+    }
+
+    /// Set the fork-only Super-AI build-time scale; the launch tier setup
+    /// is its only writer.
+    pub fn set_native_build_time_scale(&mut self, scale: NativeF32Bits) {
+        self.native_build_time_scale = Some(scale);
+    }
+
+    /// The commander personality driving this house, if `[AIPersonalities]`
+    /// registered one for it. See [`crate::rules::personality`].
+    pub const fn personality(&self) -> Option<u16> {
+        self.personality
+    }
+
+    /// Installed once by the skirmish launch (`crate::rules::personality`) when
+    /// the slot asked for a commander. Nothing else writes it: a house keeps
+    /// its commander for the match, and the talking-head layer only reads it.
+    pub const fn set_personality(&mut self, personality: Option<u16>) {
+        self.personality = personality;
+    }
+
+    /// The strategy half of a commander, applied once right after
+    /// [`Self::set_personality`] — the person who talks also fights
+    /// differently.
+    ///
+    /// `TriggerRatio=` becomes the `+0x565C` starting value, so a map's
+    /// `RatioAITriggerTeam=` (read after the launch houses are built) and
+    /// trigger op 76 still overwrite it. `TeamDelayPercent=` re-paces the first
+    /// team timer here; every later one is scaled at its restart
+    /// (`ai_team_creation::update_team_creation`), which keeps the personality
+    /// in rules instead of duplicating it into the house's saved state.
+    pub(crate) fn apply_commander_strategy(
+        &mut self,
+        definition: &crate::rules::personality::PersonalityDef,
+        general: &crate::rules::ruleset::GeneralRules,
+        array_index: i32,
+        frame: i32,
+    ) {
+        use crate::rules::personality::{NEUTRAL_WEIGHT_PERCENT, scale_team_delay};
+        self.team_creation
+            .set_trigger_ratio(definition.trigger_ratio);
+        if definition.team_delay_percent == NEUTRAL_WEIGHT_PERCENT {
+            return;
+        }
+        // Only the difficulty row is scaled; `175 * HouseIndex` stays as the
+        // per-house phase offset, or every house would restart on one frame.
+        let delay = self.difficulty_value(&general.team_delays);
+        let delay = scale_team_delay(delay, definition.team_delay_percent)
+            .wrapping_add(array_index.wrapping_mul(175));
+        self.team_creation.restart(frame, delay);
+    }
+
+    pub const fn multiplay_passive(&self) -> bool {
+        self.multiplay_passive
+    }
+
+    /// Fork-only driver-ownership flag (see the field's docs): the native AI
+    /// rungs read this to stand down for a command-layer-driven house.
+    pub const fn command_driven(&self) -> bool {
+        self.command_driven
+    }
+
+    /// The stored driver policy itself (fork-only, `docs/superai.md`); the
+    /// per-tick credit loop applies it, and the driver plugin's ladder
+    /// infers the launch tier back from it. `None` for native houses and
+    /// saves written before the policy existed.
+    pub const fn super_tier_policy(&self) -> Option<&crate::sim::driver::DriverPolicy> {
+        match &self.super_tier {
+            Some(policy) => Some(policy),
+            None => None,
+        }
+    }
+
+    pub const fn country_cost_mults(&self) -> CountryCostMults {
+        self.country_cost_mults
+    }
+
+    pub const fn is_defeated(&self) -> bool {
+        self.is_defeated
+    }
+
+    pub const fn map_is_clear(&self) -> bool {
+        self.map_is_clear
+    }
+
+    pub const fn civilians_evacuated(&self) -> bool {
+        self.civilians_evacuated
+    }
+
+    /// Fly::PlayfieldLatch4CD589..4CD58F only sets the passenger House's
+    /// retained byte. It is not reset by later deaths or further evacuations.
+    pub(crate) fn mark_civilians_evacuated(&mut self) {
+        self.civilians_evacuated = true;
+    }
+
+    pub const fn spy_sat_active(&self) -> bool {
+        self.spy_sat_active
+    }
+
+    pub(crate) const fn initial_sight_refresh_pending(&self) -> bool {
+        self.initial_sight_refresh_pending
+    }
+
+    pub(super) fn take_initial_sight_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.initial_sight_refresh_pending)
+    }
+
+    pub const fn tracking(&self) -> &crate::sim::house_tracking::HouseTracking {
+        &self.tracking
+    }
+
+    pub const fn base_center(&self) -> Option<(u16, u16)> {
+        self.base_center
+    }
+
+    pub(crate) const fn base_projection(&self) -> &crate::sim::world::HouseBaseState {
+        &self.base_projection
+    }
+
+    pub const fn alternate_base_center(&self) -> (u16, u16) {
+        self.alternate_base_center
+    }
+
+    pub fn build_const_order(&self) -> &[u64] {
+        &self.build_const_order
+    }
+
+    pub const fn base_plan(&self) -> &crate::sim::base_plan::BasePlanState {
+        &self.base_plan
+    }
+
+    pub const fn base_plan_center(&self) -> (u16, u16) {
+        self.base_plan_center
+    }
+
+    pub const fn base_reservation(&self) -> &BaseReservationState {
+        &self.base_reservation
+    }
+
+    pub const fn tech_level(&self) -> i32 {
+        self.tech_level
+    }
+
+    pub const fn current_iq(&self) -> i32 {
+        self.current_iq
+    }
+
+    pub const fn authored_iq(&self) -> i32 {
+        self.authored_iq
+    }
+
+    pub const fn grudge_scores(&self) -> &BTreeMap<InternedId, i32> {
+        &self.grudge_scores
+    }
+
+    pub const fn enemy_house(&self) -> Option<InternedId> {
+        self.enemy_house
+    }
+
+    pub const fn waypoint_edge(&self) -> u8 {
+        self.waypoint_edge
+    }
+
+    pub const fn stats(&self) -> &MatchStatistics {
+        &self.stats
+    }
+
+    pub const fn economy(&self) -> &Economy {
+        &self.economy
+    }
+
+    pub const fn strategy_emergency(&self) -> &HouseStrategyEmergencyState {
+        &self.strategy_emergency
+    }
+
+    pub const fn strategy_timer(&self) -> &CdTimer {
+        &self.strategy_timer
+    }
+
+    pub(crate) const fn enemy_search_timer(&self) -> &CdTimer {
+        &self.enemy_search_timer
+    }
+
+    pub const fn team_creation(&self) -> &crate::sim::ai_team_creation::HouseTeamCreation {
+        &self.team_creation
+    }
+
+    pub const fn ai_production(&self) -> &crate::sim::ai_base_building::HouseAiProduction {
+        &self.ai_production
+    }
+
+    pub const fn ai_unit_choices(&self) -> &crate::sim::ai_unit_choice::HouseAiUnitChoices {
+        &self.ai_unit_choices
+    }
+
+    pub const fn harvester_no_ore(&self) -> bool {
+        self.harvester_no_ore
+    }
+
+    pub const fn eva_funds_timer(&self) -> &CdTimer {
+        &self.eva_funds_timer
+    }
+
+    pub const fn eva_low_power_guard(&self) -> bool {
+        self.eva_low_power_guard
+    }
+
+    pub const fn repair_start_latch(&self) -> bool {
+        self.repair_start_latch
+    }
+
+    pub const fn repair_latch_timer(&self) -> &CdTimer {
+        &self.repair_latch_timer
+    }
+
     /// Final fresh-reader name: HouseReadINI500A62 or offline generated
     /// CreateHouses688072/688238. The original copies at most20 narrow bytes;
     /// parsed INI names use one widened scalar per native byte. No case/space
@@ -821,8 +1831,24 @@ impl HouseState {
         );
     }
 
-    pub(crate) fn native_scenario_name(&self) -> Option<&str> {
+    pub fn native_scenario_name(&self) -> Option<&str> {
         self.native_scenario_name.as_deref()
+    }
+
+    pub fn ui_name(&self) -> &HouseUiName {
+        &self.ui_name
+    }
+
+    pub(crate) fn set_ui_name(&mut self, name: HouseUiName) {
+        self.ui_name = name;
+    }
+
+    pub fn left_game(&self) -> bool {
+        self.left_game
+    }
+
+    pub(crate) fn mark_left_game(&mut self) {
+        self.left_game = true;
     }
 
     pub(crate) fn validate_scenario_name(&self) -> Result<(), &'static str> {
@@ -832,6 +1858,11 @@ impl HouseState {
                 || name.chars().any(|c| u32::from(c) > 255)
         }) {
             return Err("House native name exceeds its terminated20-byte storage");
+        }
+        if let HouseUiName::Handle(name) = &self.ui_name
+            && name.encode_utf16().count() > HouseUiName::CAPACITY_UTF16
+        {
+            return Err("House UI name exceeds its terminated 20-character storage");
         }
         Ok(())
     }
@@ -860,9 +1891,31 @@ impl HouseState {
         self.stats.record_built();
     }
 
+    /// Every item [`Self::produced_count`] holds for `category` whose type's
+    /// `Naval=` is `naval`, summed: how many such objects this House has
+    /// finished. War Factory and Naval Yard products feed one counter; this
+    /// keeps them apart, as the two kinds of factory are. A VERA reader
+    /// (`app::input::primary_rotation`); gamemd has no such total.
+    pub fn produced_total(
+        &self,
+        rules: &crate::rules::ruleset::RuleSet,
+        category: ObjectCategory,
+        naval: bool,
+    ) -> i64 {
+        self.produced_type_counts[category as usize]
+            .iter()
+            .filter(|&(&index, _)| {
+                rules
+                    .type_array_at(category, index)
+                    .is_some_and(|object| object.naval == naval)
+            })
+            .map(|(_, &count)| i64::from(count))
+            .sum()
+    }
+
     /// Counter49FAE0's logical item query. Sparse lookup replaces native
     /// allocation/zero-fill; allocator capacity has no gameplay consumer here.
-    pub(crate) fn produced_count(&self, category: ObjectCategory, type_index: i32) -> i32 {
+    pub fn produced_count(&self, category: ObjectCategory, type_index: i32) -> i32 {
         self.produced_type_counts[category as usize]
             .get(&type_index)
             .copied()
@@ -1045,7 +2098,7 @@ impl HouseState {
     }
 
     /// Active Execute77/78/79 stores the full signed Action+90 at
-    /// 6DF38E/6DF3B8/6DF3E2 (Steam gamemd 3e81a617..08600). These are the
+    /// 6DF38E/6DF3B8/6DF3E2 (Steam gamemd). These are the
     /// existing ReadScenarioINI500B40 fields +5660/+5664/+5668, independent
     /// of the live AI-trigger selector's +565C ratio. No timer or RNG write.
     pub(crate) fn set_aircraft_team_ratio(&mut self, value: i32) {
@@ -1131,6 +2184,17 @@ impl HouseState {
         self.super_weapon_targets.nuke_target = cell;
     }
 
+    /// The cell the house's EMP cannons fire at (`HouseClass+0x5780`).
+    pub(crate) fn emp_target(&self) -> (u16, u16) {
+        self.super_weapon_targets.emp_target
+    }
+
+    /// SW_EMPulse::Activate (Ares 3.0 `100711C0`) and the EMP cannon's
+    /// Missile hook (`10036570`, hook 0x44CCE7) aim the cannons at `cell`.
+    pub(crate) fn aim_emp_cannons(&mut self, cell: (u16, u16)) {
+        self.super_weapon_targets.emp_target = cell;
+    }
+
     /// House+54EC, separate from the scripted offensive target cell.
     pub(crate) fn preferred_super_weapon_target_kind(&self) -> i32 {
         self.super_weapon_targets.preferred_kind
@@ -1169,6 +2233,17 @@ impl HouseState {
         )
     }
 
+    /// Inputs for Ares `IsTargetConstraintsEligible`10032110: the house's
+    /// chosen enemy (`+0x5600`) and its scripted offensive cell (`+0x54F0`).
+    pub fn target_constraints_observations(
+        &self,
+    ) -> crate::rules::superweapon_targeting::HouseTargetingObservations {
+        crate::rules::superweapon_targeting::HouseTargetingObservations {
+            has_enemy: self.enemy_house.is_some(),
+            offensive_cell: self.super_weapon_targets.preferred_target,
+        }
+    }
+
     /// The launch alert's stores (`0x004FB0BD`, `0x004FB0C9`), also made by
     /// House50DA20 from TAction1406E4460 with the current binary frame.
     pub(crate) fn alert_super_weapon_defense(&mut self, cell: (u16, u16), frame: i32) {
@@ -1177,9 +2252,9 @@ impl HouseState {
     }
 
     /// House50DA50, reached by TAction1416E44C0: clear the alert and restore
-    /// its constructor frame (-100). Original Steam gamemd3e81a617..08600,
-    /// instruction reading. Native also clears +54F8, which currently retains
-    /// its constructor zero here (ai_fire's secondary-cell residual).
+    /// its constructor frame (-100). Original Steam gamemd,
+    /// instruction reading. Native also clears +54F8, which nothing in gamemd
+    /// sets (see `superweapon::ai_fire`), so it stays zero here.
     pub(crate) fn clear_super_weapon_defense(&mut self) {
         self.super_weapon_targets.defense_cell = (0, 0);
         self.super_weapon_targets.defense_frame = -100;
@@ -1208,6 +2283,10 @@ impl HouseState {
             std::hash::Hash::hash(b"house-preferred-super-target-v377", hasher);
             std::hash::Hash::hash(&cells.preferred_target, hasher);
         }
+        if cells.emp_target != default.emp_target {
+            std::hash::Hash::hash(b"house-emp-target-v1", hasher);
+            std::hash::Hash::hash(&cells.emp_target, hasher);
+        }
     }
     /// The old House's notification before the arrival's Building ChangeOwner.
     pub(crate) fn notify_building_capture(&mut self) {
@@ -1226,11 +2305,13 @@ impl HouseState {
 
     /// House+54E0 is forgotten if it names `building`: the new owner's clear
     /// in `BuildingClass::ChangeOwner` (`0x00448C8C`) and
-    /// `HouseClass::PointerExpired` (`0x004FB9BB`).
-    pub(crate) fn forget_lost_building(&mut self, building: u64) {
-        if self.lost_building == Some(building) {
+    /// `HouseClass::PointerExpired` (`0x004FB9BB`). Answers whether it did.
+    pub(crate) fn forget_lost_building(&mut self, building: u64) -> bool {
+        let named = self.lost_building == Some(building);
+        if named {
             self.lost_building = None;
         }
+        named
     }
 
     /// House+54E0, read by a computer engineer's Greatest_Threat.
@@ -1295,6 +2376,40 @@ impl HouseState {
         self.request_tech_recheck();
     }
 
+    /// The veterancy arms of Ares' infiltration (`10012000`): set each
+    /// granted byte, then House+1FC once any was. Answers whether any was.
+    pub(crate) fn grant_ares_spy_veterancy(&mut self, gains: AresSpyVeterancy) -> bool {
+        let gains_any = gains != AresSpyVeterancy::default();
+        let spy = &mut self.spy_gains;
+        spy.veteran_infantry |= gains.infantry;
+        spy.veteran_units |= gains.units;
+        spy.naval_veterancy |= gains.naval;
+        spy.aircraft_veterancy |= gains.aircraft;
+        spy.building_veterancy |= gains.buildings;
+        if gains_any {
+            self.request_tech_recheck();
+        }
+        gains_any
+    }
+
+    /// Ares HouseExt `+0x48`, read by the Unit constructor and InitFromType
+    /// hooks (`0x00735678`, `0x0074689B`) and `CameoIsElite @ 1003D800`.
+    pub fn naval_veterancy(&self) -> bool {
+        self.spy_gains.naval_veterancy
+    }
+
+    /// Ares HouseExt `+0x49`, read by `AircraftClass_Init_Academy`
+    /// (`0x00413FD2`) and `CameoIsElite`.
+    pub fn aircraft_veterancy(&self) -> bool {
+        self.spy_gains.aircraft_veterancy
+    }
+
+    /// Ares HouseExt `+0x4A`, read by `BuildingClass_Init_Academy`
+    /// (`0x00442D1B`) and `CameoIsElite`.
+    pub fn building_veterancy(&self) -> bool {
+        self.spy_gains.building_veterancy
+    }
+
     /// House `+0x2BF`, read by `InfantryClass::InitFromType` (`0x00517D2A`).
     pub fn veteran_infantry(&self) -> bool {
         self.spy_gains.veteran_infantry
@@ -1343,6 +2458,107 @@ impl HouseState {
             std::hash::Hash::hash(b"house-spy-gains-v1", hasher);
             std::hash::Hash::hash(&self.spy_gains, hasher);
         }
+        // The other veterancy grant a house holds, folded while it has one.
+        if !self.ares_academies.is_empty() {
+            std::hash::Hash::hash(b"ares-house-academies-v1", hasher);
+            std::hash::Hash::hash(&self.ares_academies, hasher);
+        }
+        // The technology a house took at its grinders, folded while it has any.
+        if !self.ares_reverse_engineered.is_empty() {
+            std::hash::Hash::hash(b"ares-house-reverse-engineered-v1", hasher);
+            std::hash::Hash::hash(&self.ares_reverse_engineered, hasher);
+        }
+        // The technology bits its spies stole, folded once it has any.
+        if self.ares_stolen_tech != 0 {
+            std::hash::Hash::hash(b"ares-house-stolen-tech-v1", hasher);
+            std::hash::Hash::hash(&self.ares_stolen_tech, hasher);
+        }
+    }
+
+    /// The StolenTech arm of Ares' infiltration (`10012000`): OR the
+    /// building type's `SpyEffect.StolenTechIndex` bits into HouseExt
+    /// `+0x40`, then set House+1FC.
+    pub(crate) fn steal_ares_tech(&mut self, bits: u32) {
+        self.ares_stolen_tech |= bits;
+        self.request_tech_recheck();
+    }
+
+    /// Whether this house holds every StolenTech bit of `required`
+    /// (`Prerequisite.StolenTechs`); an empty set is met (`10021FF0`).
+    pub(crate) fn has_ares_stolen_techs(&self, required: u32) -> bool {
+        self.ares_stolen_tech & required == required
+    }
+
+    /// The list half of `HouseExt::ExtData::ReverseEngineer` (`10022360`):
+    /// append `reversed` unless it is listed (AresMap find-or-insert
+    /// `10020250`). Answers whether it was appended.
+    pub(crate) fn record_ares_reverse_engineered(
+        &mut self,
+        reversed: &crate::rules::superweapon_type::TechnoTypeReference,
+    ) -> bool {
+        if self.ares_reverse_engineered.contains(reversed) {
+            return false;
+        }
+        self.ares_reverse_engineered.push(reversed.clone());
+        true
+    }
+
+    /// Whether this house reverse engineered the type `id` of `category`
+    /// (HouseExt `+0x34`), as RequirementsMet (`10021FF0`) and trigger event
+    /// 78 ask. Both sides hold the Rules registry's stored IDs.
+    pub(crate) fn has_ares_reverse_engineered(
+        &self,
+        category: crate::rules::object_type::ObjectCategory,
+        id: &str,
+    ) -> bool {
+        self.ares_reverse_engineered
+            .iter()
+            .any(|kind| kind.category == category && kind.id == id)
+    }
+
+    /// `SpyEffect.UndoReverseEngineer` (`BuildingExt::ExtData::InfiltratedBy
+    /// @ 10012000`): empty the list, then set House+1FC.
+    pub(crate) fn undo_ares_reverse_engineering(&mut self) {
+        self.ares_reverse_engineered.clear();
+        self.request_tech_recheck();
+    }
+
+    /// `HouseExt::ExtData::UpdateAcademy` (`10022760`): append an academy
+    /// not yet listed, or remove a listed one; anything else is a no-op.
+    pub(crate) fn update_ares_academy(&mut self, building: u64, added: bool) {
+        let listed = self.ares_academies.iter().position(|&id| id == building);
+        match (added, listed) {
+            (true, None) => self.ares_academies.push(building),
+            (false, Some(index)) => {
+                self.ares_academies.remove(index);
+            }
+            _ => {}
+        }
+    }
+
+    /// Ares HouseExt Academies, which `ApplyAcademy` (`10020750`) walks.
+    pub(crate) fn ares_academies(&self) -> &[u64] {
+        &self.ares_academies
+    }
+
+    /// Ares HouseExt SWLastIndex, -1 when no Super set it.
+    pub(crate) fn ares_last_super(&self) -> i32 {
+        self.ares_last_super
+    }
+
+    /// The common Launch's write (10032F99): the House remembers the Super
+    /// it launched last.
+    pub(crate) fn remember_ares_last_super(&mut self, index: i32) {
+        self.ares_last_super = index;
+    }
+
+    /// Folded only once a launch set it, so other houses hash as earlier
+    /// schemas did.
+    pub(crate) fn hash_ares_last_super(&self, hasher: &mut impl std::hash::Hasher) {
+        if self.ares_last_super != no_super_index() {
+            std::hash::Hash::hash(b"ares-house-last-super-v1", hasher);
+            std::hash::Hash::hash(&self.ares_last_super, hasher);
+        }
     }
 
     /// Folded only while set, so a house that never lost a building hashes as
@@ -1373,6 +2589,27 @@ impl HouseState {
         }
     }
 
+    /// Lend the spatial threat grid out, leaving none
+    /// ([`crate::sim::house_threat::HouseSpatialThreat::none`]).
+    pub(crate) fn take_spatial_threat(&mut self) -> crate::sim::house_threat::HouseSpatialThreat {
+        std::mem::replace(
+            &mut self.spatial_threat,
+            crate::sim::house_threat::HouseSpatialThreat::none(),
+        )
+    }
+
+    /// Give back the grid [`Self::take_spatial_threat`] lent out.
+    pub(crate) fn restore_spatial_threat(
+        &mut self,
+        grid: crate::sim::house_threat::HouseSpatialThreat,
+    ) {
+        self.spatial_threat = grid;
+    }
+
+    pub(crate) fn configure_spatial_threat_grid(&mut self, grid: crate::map::cell_index::CellGrid) {
+        self.spatial_threat.configure(grid);
+    }
+
     pub(crate) fn spatial_threat_values(&self) -> &[i32] {
         self.spatial_threat.values()
     }
@@ -1386,12 +2623,15 @@ impl HouseState {
         self.spatial_threat.at_padded_index(index)
     }
 
+    /// `ares` is the caller's `rules.ares_form()`, for the index the writers
+    /// take (`HouseSpatialThreat::caller_index`).
     pub(crate) fn adjust_spatial_threat(
         &mut self,
         cell: (i16, i16),
         delta: i32,
+        ares: bool,
     ) -> Result<(), String> {
-        self.spatial_threat.adjust(cell, delta)
+        self.spatial_threat.adjust(cell, delta, ares)
     }
 
     pub(crate) fn clear_spatial_threat(&mut self) {
@@ -1562,18 +2802,38 @@ impl HouseState {
             .unwrap_or(0)
     }
 
-    /// Active offline EventClass house-scan eligibility.
-    #[cfg(any(test, feature = "test-support"))]
+    /// `Execute_DoList 0x0064C4FB..0x0064C50D` admits a registered House
+    /// when either IsHuman or PlayerControl is set, in every session mode.
+    /// Fork (docs/superai.md): a command-driven house rides the same DoList
+    /// with the fork's AI driver as its only command source — native never
+    /// queues player events for a computer house, so admitting them changes
+    /// no native-reachable state, and refusing them left every Super-AI
+    /// order admitted but never dispatched (observed: six MAX houses, 6
+    /// DeployMcv each recorded in the replay, zero executed, the whole match
+    /// frozen).
     pub const fn event_dispatch_eligible(&self) -> bool {
-        self.is_human || self.player_control
+        self.is_human || self.player_control || self.command_driven
     }
 
     /// Native mode-aware House-control predicate shared by successful Building
     /// Unlimbo BasePlan satisfaction and the early House-update activation.
     /// `HouseClass::IsControlledByHuman @ 0x0050B730` supplies the former;
     /// `HouseClass__Update @ 0x004F8440` inlines the same branch shape.
-    pub(crate) const fn is_controlled_by_human(&self, game_mode_nonzero: bool) -> bool {
+    pub const fn is_controlled_by_human(&self, game_mode_nonzero: bool) -> bool {
         self.is_human || (!game_mode_nonzero && self.player_control)
+    }
+
+    /// HouseClass's power (AI_AssessPower508CBD..508CF0), radar
+    /// (UpdateTacticalRadarAvailability508ECD..508EF1) and SpySat
+    /// (Update_SpySat508FA2..508FDF) scans share this discovery admission.
+    /// Source: original gamemd instructions. Noncampaign scans admit hidden
+    /// providers, including the current player's; campaign computer Houses
+    /// do too. Only controlled campaign Houses require Techno+41B.
+    pub(crate) const fn building_services_require_discovery(
+        &self,
+        game_mode_nonzero: bool,
+    ) -> bool {
+        !game_mode_nonzero && self.is_controlled_by_human(game_mode_nonzero)
     }
 
     /// The cell the house bases itself around: the alternate base centre
@@ -1604,7 +2864,7 @@ impl HouseState {
 
     /// Active TAction74/75 stores only House+1F2 at6DF2FA/6DF339.
     /// The House team timer, selector RNG and existing Teams remain with
-    /// ai_team_creation. Steam3e81a617; trigger_action_values --ai-activation.
+    /// ai_team_creation. Steam gamemd; trigger_action_values --ai-activation.
     pub(crate) fn set_ai_triggers_active(&mut self, active: bool) {
         self.ai_activation.ai_triggers_active = active;
     }
@@ -1640,7 +2900,7 @@ impl HouseState {
     }
 
     /// Execute13 6DEB18 -> shared House selector6E45E0 ->6DEB41 writes
-    /// only House+1EF=1 (Steam gamemd 3e81a617..08600). This neither
+    /// only House+1EF=1 (Steam gamemd). This neither
     /// co-enables the other activation bytes nor immediately creates a team.
     pub(crate) fn enable_scripted_autocreate(&mut self) {
         self.ai_activation.autocreate_allowed = true;
@@ -1653,8 +2913,11 @@ impl HouseState {
     /// accepts any nonzero AutoBaseBuilding or signed `CurrentIQ >=
     /// Rules+0x143C`, then writes AutoBaseBuilding, Production, and
     /// AutocreateAllowed in that order without touching AITriggersActive.
+    /// Fork-only first clause (`docs/superai.md`): a command-driven house's
+    /// activation latches stay down so the native AI never takes it over.
     pub(crate) fn update_ai_activation(&mut self, game_mode_nonzero: bool, iq_production: i32) {
-        if self.is_controlled_by_human(game_mode_nonzero)
+        if self.command_driven
+            || self.is_controlled_by_human(game_mode_nonzero)
             || (!self.ai_activation.auto_base_building && self.current_iq < iq_production)
         {
             return;
@@ -1662,6 +2925,31 @@ impl HouseState {
         self.ai_activation.auto_base_building = true;
         self.ai_activation.production = true;
         self.ai_activation.autocreate_allowed = true;
+    }
+
+    pub const fn is_to_die(&self) -> bool {
+        self.to_die
+    }
+
+    /// Original4FC980: idempotent current-flag return, no RNG or outcome.
+    /// Repeated calls preserve the existing shared timer's anchor/duration.
+    pub(crate) fn flag_to_die(&mut self, frame: i32) -> bool {
+        if !self.has_won && !self.to_die && !self.has_lost {
+            self.to_die = true;
+            self.allow_win_timer.start(frame, 0);
+        }
+        self.to_die
+    }
+
+    /// Update4F87C2..4F87FA clears the latch before the shared Blowup_All
+    /// receiver. Other+298 writers may have postponed the originally zero timer.
+    pub(crate) fn take_due_to_die(&mut self, frame: i32) -> bool {
+        if self.to_die && self.allow_win_timer.expired(frame) {
+            self.to_die = false;
+            true
+        } else {
+            false
+        }
     }
 
     pub const fn has_won(&self) -> bool {
@@ -1673,7 +2961,14 @@ impl HouseState {
     }
 
     pub const fn outcome(&self) -> Option<HouseOutcomeState> {
-        self.outcome_state
+        let kind = if self.has_won {
+            HouseOutcomeKind::Victory
+        } else if self.has_lost {
+            HouseOutcomeKind::Defeat
+        } else {
+            return None;
+        };
+        Some(HouseOutcomeState { kind })
     }
 
     /// Read the sole House+298 countdown in the native signed frame domain.
@@ -1683,24 +2978,19 @@ impl HouseState {
 
     /// Numeric state block4FC9EE..4FCA59. The complete Flag_To_Win port
     /// (including input/audio effects) belongs to world::house_defeat.
-    /// +1F6 is Flag_To_Die, not Draw; its unported network/DESTRUCT producer
-    /// is outside this offline campaign/skirmish route.
+    /// Pending Flag_To_Die+1F6 blocks victory at4FCA04.
     pub fn accept_win_result(&mut self, frame: i32, savour_frames: i32, skip_timer: bool) -> bool {
-        if self.has_won || self.has_lost {
+        if self.has_won || self.to_die || self.has_lost {
             return false;
         }
         self.has_won = true;
         if !skip_timer {
             self.allow_win_timer.start(frame, savour_frames);
         }
-        self.outcome_state = Some(HouseOutcomeState {
-            kind: HouseOutcomeKind::Victory,
-            exit_ready: false,
-        });
         true
     }
 
-    /// Numeric state block4FCBDE..4FCC42: clear Win before the Lost test,
+    /// Numeric state block4FCBDE..4FCC42: clear Win before ToDie/Lost tests,
     /// then accept/re-arm only once. Actions68 preserve the existing timer.
     pub(crate) fn accept_lose_result(
         &mut self,
@@ -1709,17 +2999,13 @@ impl HouseState {
         skip_timer: bool,
     ) -> bool {
         self.has_won = false;
-        if self.has_lost {
+        if self.to_die || self.has_lost {
             return false;
         }
         self.has_lost = true;
         if !skip_timer {
             self.allow_win_timer.start(frame, savour_frames);
         }
-        self.outcome_state = Some(HouseOutcomeState {
-            kind: HouseOutcomeKind::Defeat,
-            exit_ready: false,
-        });
         true
     }
 
@@ -1728,39 +3014,37 @@ impl HouseState {
         self.allow_win_timer.resume(frame);
     }
 
-    /// House4F85BE/4F86FE: exact zero on+298 admits the result's Vox wait.
-    /// Campaign Win also requires AllowWin-tags+27C<=0; Lose does not.
-    pub(crate) fn advance_outcome_savour(&mut self, frame: i32, game_mode_nonzero: bool) -> bool {
-        let Some(outcome) = self.outcome_state.as_mut() else {
-            return false;
-        };
-        if self.allow_win_timer.expired(frame)
-            && (outcome.kind == HouseOutcomeKind::Defeat
-                || game_mode_nonzero
-                || self.allow_win_tags <= 0)
-        {
-            outcome.exit_ready = true;
+    /// HouseClass::Update4F85BE/4F86FE admits the whole-Vox wait on
+    /// exact zero of+298. Campaign victory also requires AllowWin+27C<=0.
+    pub(crate) fn pending_outcome(
+        &self,
+        frame: i32,
+        game_mode_nonzero: bool,
+    ) -> Option<HouseOutcomeKind> {
+        let kind = self.outcome()?.kind;
+        (self.allow_win_timer.expired(frame)
+            && (kind == HouseOutcomeKind::Defeat || game_mode_nonzero || self.allow_win_tags <= 0))
+            .then_some(kind)
+    }
+
+    /// House4F8657 clears Won only after the Vox wait. The defeat path
+    /// 4F8780..4F87BB deliberately retains Lost; neither owns session flags.
+    pub(crate) fn complete_outcome(&mut self, kind: HouseOutcomeKind) {
+        if kind == HouseOutcomeKind::Victory {
+            self.has_won = false;
         }
-        outcome.exit_ready
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn supply_outcome_state_for_test(
-        &mut self,
-        won: bool,
-        lost: bool,
-        state: Option<HouseOutcomeState>,
-        timer: CdTimer,
-    ) {
+    pub(crate) fn supply_result_flags_for_test(&mut self, won: bool, lost: bool, timer: CdTimer) {
         self.has_won = won;
         self.has_lost = lost;
-        self.outcome_state = state;
         self.allow_win_timer = timer;
     }
 
     pub fn new(
         name: InternedId,
-        side_index: u8,
+        side_index: impl Into<i32>,
         country: Option<InternedId>,
         is_human: bool,
         credits: i32,
@@ -1769,26 +3053,35 @@ impl HouseState {
         Self {
             name,
             native_scenario_name: None,
+            ui_name: HouseUiName::TypeName,
+            left_game: false,
             native_construction: None,
+            native_build_time_scale: None,
             scenario_parameters: HouseScenarioParameters::default(),
             initial_techno_records: Vec::new(),
-            side_index,
+            side_index: side_index.into(),
             country,
+            permanent_factory_plans: Vec::new(),
             is_human,
             player_control: is_human,
             difficulty: HouseDifficulty::Normal,
             difficulty_biases: HouseDifficultyBiases::default(),
+            personality: None,
             multiplay_passive: false,
+            command_driven: false,
+            super_tier: None,
             country_cost_mults: CountryCostMults::default(),
             country_speed_mults: CountrySpeedMults::default(),
             is_defeated: false,
+            to_die: false,
+            civilians_evacuated: false,
             has_won: false,
             has_lost: false,
-            outcome_state: None,
             allow_win_tags: 0,
             allow_win_timer: CdTimer::default(),
             map_is_clear: false,
             spy_sat_active: false,
+            initial_sight_refresh_pending: true,
             tracking: Default::default(),
             tech_recheck: true,
             self_heal_infantry: 0,
@@ -1804,6 +3097,7 @@ impl HouseState {
             current_iq: 0,
             authored_iq: 0,
             grudge_scores: BTreeMap::new(),
+            scouted_houses: BTreeSet::new(),
             enemy_house: None,
             waypoint_edge: 0,
             stats: MatchStatistics::default(),
@@ -1812,11 +3106,16 @@ impl HouseState {
             produced_type_counts: Default::default(),
             lost_building: None,
             spy_gains: SpyGains::default(),
+            ares_academies: Vec::new(),
+            ares_reverse_engineered: Vec::new(),
+            ares_stolen_tech: 0,
+            ares_last_super: no_super_index(),
             powered_unit_centers: 0,
             discovered_by_current_house: false,
             economy: Economy::new(credits),
             strategy_emergency: HouseStrategyEmergencyState::default(),
             strategy_timer: strategy_timer_at_construction(),
+            enemy_search_timer: enemy_search_timer_at_construction(),
             team_creation: Default::default(),
             ai_activation: HouseAiActivationLatches::default(),
             ai_production: Default::default(),
@@ -1837,10 +3136,10 @@ impl crate::sim::world::Simulation {
     /// internal House identity. Only fully initialized scenario Houses take
     /// this path; generated preconsumed and partial diagnostic rows retain
     /// their explicit internal-key projection in the map constructor owner.
-    pub(crate) fn scenario_house_named(&self, requested: &str) -> Option<InternedId> {
+    pub(crate) fn scenario_house_named(houses: &Houses, requested: &str) -> Option<InternedId> {
         let index = crate::map::houses::find_house_index(
-            self.session.house_order.iter().map(|owner| {
-                self.houses
+            houses.order().iter().map(|owner| {
+                houses
                     .get(owner)
                     .expect("registered House array entry")
                     .native_scenario_name()
@@ -1848,7 +3147,7 @@ impl crate::sim::world::Simulation {
             }),
             requested,
         )?;
-        Some(self.session.house_order[index])
+        Some(houses.order()[index])
     }
 }
 
@@ -1882,7 +3181,7 @@ pub struct MatchStatistics {
     built: u32,
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "house_statistics_tests.rs"]
 mod statistics_tests;
 
@@ -1920,14 +3219,35 @@ impl MatchStatistics {
         *counter = counter.wrapping_add(1);
     }
 
-    /// RecordKill7030AC/7031DC and ChangeOwner70164D increment the kill table.
-    /// The existing total projection keeps their sum, rather than a second
-    /// per-house table. Both callers share its mutation and numeric semantics.
-    pub(crate) fn record_kill(&mut self, category: crate::map::entities::EntityCategory) {
-        let counter = if category == crate::map::entities::EntityCategory::Structure {
-            &mut self.buildings_killed
-        } else {
-            &mut self.units_killed
+    /// RecordKill7030AC/7031DC and ChangeOwner70164D increment the kill table
+    /// entry at the victim owner's House index (`TechnoClass::
+    /// GetOwningHouseIndex @ 0x006F9DB0`, read before ChangeOwner's owner
+    /// store). The score screen (`0x005C996D..0x005C9995`) and the Diplomacy
+    /// dialog (`0x00658330`) sum the 20 entries of each table, so the totals
+    /// kept here are those sums. Each table is followed by its loss counter:
+    /// units `+0x53E4`, UnitsLost `+0x5434`, buildings `+0x5438`,
+    /// BuildingsLost `+0x5488`, then WhoLastHurtMe `+0x548C`, so a kill of
+    /// House 20 or later lands past its table. Both callers share its
+    /// mutation and numeric semantics.
+    pub(crate) fn record_kill(
+        &mut self,
+        category: crate::map::entities::EntityCategory,
+        victim_house: Option<usize>,
+    ) {
+        let structure = category == crate::map::entities::EntityCategory::Structure;
+        let base = if structure { 21 } else { 0 };
+        let counter = match victim_house.map_or(base, |house| house.saturating_add(base)) {
+            0..=19 => &mut self.units_killed,
+            20 => &mut self.units_lost,
+            21..=40 => &mut self.buildings_killed,
+            41 => &mut self.buildings_lost,
+            // WhoLastHurtMe, which only `HouseClass::ComputeCRC @ 0x0050300D`
+            // reads, the sync check VERA's state hash replaces. RESIDUAL: a
+            // 23rd House, beyond gamemd's 8 players and retail's 14
+            // countries (a map adding countries, or a VERA game with more
+            // players), would reach ComputedBaseCenter (`+0x5490`) and later
+            // AI fields; VERA leaves them.
+            _ => return,
         };
         *counter = counter.wrapping_add(1);
     }
@@ -1954,7 +3274,7 @@ impl MatchStatistics {
         }
     }
 
-    /// Score-screen Kills column: units + buildings destroyed.
+    /// Score-screen and Diplomacy Kills: the sum of both kill tables.
     pub const fn kills(&self) -> u32 {
         self.units_killed.wrapping_add(self.buildings_killed)
     }
@@ -1967,7 +3287,7 @@ impl MatchStatistics {
 
 /// Look up a HouseState by interned owner ID (O(1) BTreeMap lookup).
 pub fn house_state_for_owner_id(
-    houses: &std::collections::BTreeMap<InternedId, HouseState>,
+    houses: &crate::sim::houses::Houses,
     owner_id: InternedId,
 ) -> Option<&HouseState> {
     houses.get(&owner_id)
@@ -1977,7 +3297,7 @@ pub fn house_state_for_owner_id(
 /// Requires the interner to convert the name to an InternedId first.
 /// Returns None if the name is not interned or no house matches.
 pub fn house_state_for_owner<'a>(
-    houses: &'a std::collections::BTreeMap<InternedId, HouseState>,
+    houses: &'a crate::sim::houses::Houses,
     owner: &str,
     interner: &crate::sim::intern::StringInterner,
 ) -> Option<&'a HouseState> {
@@ -1987,7 +3307,7 @@ pub fn house_state_for_owner<'a>(
 
 /// Mutable version of `house_state_for_owner`.
 pub fn house_state_for_owner_mut<'a>(
-    houses: &'a mut std::collections::BTreeMap<InternedId, HouseState>,
+    houses: &'a mut crate::sim::houses::Houses,
     owner: &str,
     interner: &crate::sim::intern::StringInterner,
 ) -> Option<&'a mut HouseState> {
@@ -1995,30 +3315,27 @@ pub fn house_state_for_owner_mut<'a>(
     houses.get_mut(&id)
 }
 
-/// Resolve an owner's ore-income `IncomeMult` (parts-per-million; 1_000_000 = 1.0×) by
-/// routing through its country: `HouseState.country` (InternedId) -> country name ->
-/// `RuleSet::country_income_ppm`. An owner with no house, no country, or an unknown
-/// country resolves to the neutral 1.0 (no income change) — so stock YR (all countries
-/// 1.0, the key commented out) is the identity.
-pub fn income_ppm_for_owner(
-    houses: &std::collections::BTreeMap<InternedId, HouseState>,
+/// Resolve the live owner's HouseType+148 float through its current country.
+/// Unknown diagnostic owners/countries use the constructor's neutral1.0.
+pub fn income_mult_for_owner(
+    houses: &crate::sim::houses::Houses,
     interner: &crate::sim::intern::StringInterner,
     rules: &crate::rules::ruleset::RuleSet,
     owner: &str,
-) -> i64 {
+) -> crate::util::native_x87::NativeF32Bits {
     house_state_for_owner(houses, owner, interner)
         .and_then(|h| h.country)
-        .map(|c| rules.country_income_ppm(interner.resolve(c)))
-        .unwrap_or(crate::rules::ruleset::INCOME_PPM_SCALE)
+        .map(|c| rules.country_income_mult(interner.resolve(c)))
+        .unwrap_or(crate::util::native_x87::NativeF32Bits::ONE)
 }
 
 /// Map side name string to numeric index.
 /// "Allies"/"GDI" → 0, "Soviet"/"Nod" → 1, "ThirdSide"/"YuriCountry" → 2.
-pub fn side_index_from_name(side: Option<&str>) -> u8 {
+pub fn side_index_from_name(side: Option<&str>) -> i32 {
     side_index_alias(side).unwrap_or(0)
 }
 
-fn side_index_alias(side: Option<&str>) -> Option<u8> {
+fn side_index_alias(side: Option<&str>) -> Option<i32> {
     match side.map(|s| s.to_ascii_lowercase()).as_deref() {
         Some("allied" | "allies" | "gdi") => Some(0),
         Some("soviet" | "nod" | "russia") => Some(1),
@@ -2031,17 +3348,26 @@ fn side_index_alias(side: Option<&str>) -> Option<u8> {
 ///
 /// Rules-owned country membership is authoritative. An explicit side name is
 /// the next-best source for incomplete scenario data, followed by the legacy
-/// stock aliases and finally the caller's bounded fallback.
+/// stock aliases and finally the caller's explicit fallback.
 pub fn resolve_house_side_index(
     rules: &crate::rules::ruleset::RuleSet,
     country: Option<&str>,
     side: Option<&str>,
-    fallback: u8,
-) -> u8 {
+    fallback: i32,
+) -> i32 {
+    // The Country's Side for any index, as Ares 3.0
+    // HouseClass_CTOR_FixSideIndices 10024030 (hook 0x004F645F) gives a
+    // constructor-only House; the stock constructor keeps -1 past side 2.
+    // Map Houses then take their type's Side in ReadINI (`0x00500B40`), so
+    // Ares' Neutral/Special exception there changes nothing for them.
+    // A registered constructor-only Country has Side=-1. It is an actual
+    // native value, not a missing-country invitation to use the fallback.
     country
-        .and_then(|country| rules.country_side_index(country))
-        .or_else(|| side.and_then(|side| rules.side_index(side)))
-        .map(|index| index.0)
+        .and_then(|country| rules.country_side_index_raw(country))
+        .or_else(|| {
+            side.and_then(|side| rules.side_index(side))
+                .map(|index| i32::from(index.0))
+        })
         .or_else(|| side_index_alias(side))
         .unwrap_or(fallback)
 }
@@ -2049,28 +3375,19 @@ pub fn resolve_house_side_index(
 /// Resolve a house's `MultiplayPassive` fact from its country/house-type rules.
 ///
 /// The RuleSet identity owner resolves missing Country to entry0 and known
-/// names through its shared alias lookup. Missing rules or an unresolved
-/// constructor retain the reader's false default.
+/// names through its shared alias lookup. An unresolved constructor retains
+/// the reader's false default.
 pub fn resolve_multiplay_passive(
-    rules: Option<&crate::rules::ruleset::RuleSet>,
+    rules: &crate::rules::ruleset::RuleSet,
     country: Option<&str>,
 ) -> bool {
-    let Some(rules) = rules else {
-        return false;
-    };
     let key = rules.scenario_country_name(country);
     key.is_some_and(|key| rules.country_multiplay_passive(key))
 }
 
 /// Resolve a house type's `WallOwner=` permission. Missing data keeps the native
 /// constructor default of `true`; an absent `Country=` binds to registry entry zero.
-pub fn resolve_wall_owner(
-    rules: Option<&crate::rules::ruleset::RuleSet>,
-    country: Option<&str>,
-) -> bool {
-    let Some(rules) = rules else {
-        return true;
-    };
+pub fn resolve_wall_owner(rules: &crate::rules::ruleset::RuleSet, country: Option<&str>) -> bool {
     let key = rules.scenario_country_name(country);
     key.is_none_or(|key| rules.country_wall_owner(key))
 }
@@ -2083,7 +3400,9 @@ fn native_edge_distance(anchor: (u16, u16), reference: (i32, i32)) -> i32 {
     ])
 }
 
-/// HouseClass-style playfield edge selection for a committed anchor cell.
+/// `HouseClass::DetermineEdge`'s edge choice (`0x0050DCAF..0x0050DEC1`) from
+/// its anchor cell; [`crate::sim::world::Simulation::determine_house_edge`]
+/// finds the anchor.
 ///
 /// The four asymmetric reference points live in the map's LocalSize frame and
 /// must be skewed into cell-grid coordinates before comparison. Strictly-better
@@ -2108,7 +3427,7 @@ pub(crate) fn determine_waypoint_edge(anchor: (u16, u16), bounds: PlayfieldBound
     best_edge
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod ai_activation_latch_tests {
     use super::{HouseAiActivationLatches, HouseDifficulty, HouseState};
 
@@ -2284,16 +3603,87 @@ mod ai_activation_latch_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod outcome_tests {
     use super::{HouseOutcomeKind, HouseState};
+
+    #[test]
+    fn flag_to_die_producer_and_update_gate_match_original_execution() {
+        use crate::sim::timer::CdTimer;
+        let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/pending_house_death.json",
+        ))
+        .unwrap();
+        for row in corpus["flags"].as_array().unwrap() {
+            let mut house = HouseState::new(Default::default(), 0, None, true, 0, 10);
+            let frame = row["frame"].as_i64().unwrap() as i32;
+            if row["initial"][0] == 1 {
+                house.flag_to_die(frame);
+            }
+            house.supply_result_flags_for_test(
+                row["initial"][1] == 1,
+                row["initial"][2] == 1,
+                CdTimer::started(
+                    row["initial_timer"][0].as_i64().unwrap() as i32,
+                    row["initial_timer"][1].as_i64().unwrap() as i32,
+                ),
+            );
+            assert_eq!(
+                house.flag_to_die(frame),
+                row["result"] == 1,
+                "{}",
+                row["name"]
+            );
+            let snapshot = |house: &HouseState| {
+                serde_json::json!({
+                "flags":[u8::from(house.is_to_die()),u8::from(house.has_won()),u8::from(house.has_lost())],
+                "timer":[house.outcome_timer().start_frame(),house.outcome_timer().duration()]})
+            };
+            assert_eq!(snapshot(&house), row["produced"]);
+            assert_eq!(house.flag_to_die(frame + 1), row["repeated_result"] == 1);
+            assert_eq!(snapshot(&house), row["produced"]);
+            assert_eq!(
+                house.take_due_to_die(frame + 1),
+                row["blowup"].as_bool().unwrap()
+            );
+            assert_eq!(snapshot(&house), row["consumed"]);
+        }
+    }
+
+    #[test]
+    fn flag_to_die_shares_result_timer_and_blocks_terminal_results_until_consumed() {
+        use crate::sim::timer::CdTimer;
+        let mut house = HouseState::new(Default::default(), 0, None, true, 0, 10);
+        assert!(!house.is_to_die());
+        assert!(house.flag_to_die(20));
+        assert_eq!(house.outcome_timer(), CdTimer::started(20, 0));
+        assert!(house.flag_to_die(40));
+        assert_eq!(house.outcome_timer(), CdTimer::started(20, 0));
+        assert!(!house.accept_win_result(40, 90, false));
+        assert!(!house.accept_lose_result(40, 90, false));
+        assert!(house.outcome().is_none());
+        // AllowWin Tag destruction can replace the same timer after admission.
+        house.supply_allow_win_tag_state(0, CdTimer::started(20, 60));
+        assert!(!house.take_due_to_die(79));
+        assert!(house.take_due_to_die(80));
+        assert!(!house.is_to_die());
+        assert!(!house.take_due_to_die(80));
+        assert!(house.accept_lose_result(80, 90, false));
+        assert!(!house.flag_to_die(81));
+        assert_eq!(house.outcome_timer(), CdTimer::started(80, 90));
+
+        let mut winner = HouseState::new(Default::default(), 0, None, true, 0, 10);
+        assert!(winner.accept_win_result(10, 90, false));
+        assert!(!winner.flag_to_die(11));
+        assert_eq!(winner.outcome_timer(), CdTimer::started(10, 90));
+    }
 
     #[test]
     fn gsi_01_04_savour_gates_exact_frame_and_defeat_restarts_pending_victory() {
         let mut house = HouseState::new(Default::default(), 0, None, true, 0, 10);
         assert!(house.accept_win_result(100, 90, false));
-        assert!(!house.advance_outcome_savour(189, true));
-        assert!(house.advance_outcome_savour(190, true));
+        assert!(!house.pending_outcome(189, true).is_some());
+        assert!(house.pending_outcome(190, true).is_some());
 
         let mut replaced = HouseState::new(Default::default(), 0, None, true, 0, 10);
         assert!(replaced.accept_win_result(100, 90, false));
@@ -2301,7 +3691,7 @@ mod outcome_tests {
         assert!(!replaced.has_won);
         assert!(replaced.has_lost);
         assert_eq!(
-            replaced.outcome_state.expect("defeat outcome").kind,
+            replaced.outcome().expect("defeat outcome").kind,
             HouseOutcomeKind::Defeat
         );
         assert_eq!(
@@ -2323,28 +3713,28 @@ mod outcome_tests {
         house.supply_allow_win_tag_state(1, paused);
         assert!(house.accept_win_result(100, 90, true));
         assert_eq!(house.outcome_timer(), paused, "67 must not write a timer");
-        assert!(!house.advance_outcome_savour(1000, false));
+        assert!(!house.pending_outcome(1000, false).is_some());
         house.resume_result_timer(1000);
         assert_eq!(house.outcome_timer().duration(), 60);
         assert!(
-            !house.advance_outcome_savour(1060, false),
+            !house.pending_outcome(1060, false).is_some(),
             "AllowWin count blocks Win"
         );
         house.removed_allow_win_tag(1060);
-        assert!(!house.advance_outcome_savour(1119, false));
-        assert!(house.advance_outcome_savour(1120, false));
+        assert!(!house.pending_outcome(1119, false).is_some());
+        assert!(house.pending_outcome(1120, false).is_some());
 
         let mut loss = HouseState::new(Default::default(), 0, None, true, 0, 10);
         loss.supply_allow_win_tag_state(5, crate::sim::timer::CdTimer::default());
         assert!(loss.accept_lose_result(0, 90, true));
         assert!(
-            loss.advance_outcome_savour(0, false),
+            loss.pending_outcome(0, false).is_some(),
             "68 preserves expired ctor timer; no AllowWin gate"
         );
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod difficulty_tests {
     use super::{HouseDifficulty, HouseState, NativeF64Bits};
 
@@ -2399,6 +3789,7 @@ mod difficulty_tests {
                     build_time: bits(&v[6]),
                     repair_delay: bits(&v[7]),
                     build_delay: bits(&v[8]),
+                    ..Default::default()
                 }
             });
             let difficulty =
@@ -2468,7 +3859,7 @@ mod difficulty_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod multiplay_passive_tests {
     use super::resolve_multiplay_passive;
     use crate::rules::ini_parser::IniFile;
@@ -2486,10 +3877,10 @@ mod multiplay_passive_tests {
     #[test]
     fn named_country_resolves_its_own_multiplay_passive() {
         let rules = rules_with_country_order("Americans", "Neutral");
-        assert!(resolve_multiplay_passive(Some(&rules), Some("Neutral")));
-        assert!(!resolve_multiplay_passive(Some(&rules), Some("Americans")));
+        assert!(resolve_multiplay_passive(&rules, Some("Neutral")));
+        assert!(!resolve_multiplay_passive(&rules, Some("Americans")));
         // Case-insensitive, like every other country lookup.
-        assert!(resolve_multiplay_passive(Some(&rules), Some("neutral")));
+        assert!(resolve_multiplay_passive(&rules, Some("neutral")));
     }
 
     #[test]
@@ -2499,26 +3890,29 @@ mod multiplay_passive_tests {
         // does not fall back to the house's own section name — with `Neutral`
         // sitting at entry 1, a section-name fallback would answer `true` here.
         let americans_first = rules_with_country_order("Americans", "Neutral");
-        assert!(!resolve_multiplay_passive(Some(&americans_first), None));
+        assert!(!resolve_multiplay_passive(&americans_first, None));
 
         // Flip the registry order and the same absent key now follows entry 0.
         let neutral_first = rules_with_country_order("Neutral", "Americans");
-        assert!(resolve_multiplay_passive(Some(&neutral_first), None));
+        assert!(resolve_multiplay_passive(&neutral_first, None));
     }
 
     #[test]
     fn missing_rules_or_unknown_country_is_not_passive() {
         let rules = rules_with_country_order("Americans", "Neutral");
-        assert!(!resolve_multiplay_passive(None, Some("Neutral")));
-        assert!(!resolve_multiplay_passive(None, None));
         assert!(!resolve_multiplay_passive(
-            Some(&rules),
-            Some("Nonexistent")
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            Some("Neutral")
         ));
+        assert!(!resolve_multiplay_passive(
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            None
+        ));
+        assert!(!resolve_multiplay_passive(&rules, Some("Nonexistent")));
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod waypoint_edge_tests {
     use super::*;
 
@@ -2552,5 +3946,56 @@ mod waypoint_edge_tests {
         };
         assert_eq!(local_to_packed_cell(bounds, 32, 124), (100, 102));
         assert_eq!(determine_waypoint_edge((69, 115), bounds), 2);
+    }
+}
+
+#[cfg(all(test, tests_sim_h_o))]
+mod signed_country_side_tests {
+    use super::*;
+    use crate::rules::{ini_parser::IniFile, ruleset::RuleSet};
+
+    #[test]
+    fn registered_country_retains_negative_side_instead_of_declared_fallback() {
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[Countries]\n0=Bound\n1=Unbound\n[Sides]\nAllied=Bound\n",
+        ))
+        .unwrap();
+        assert_eq!(resolve_house_side_index(&rules, Some("Bound"), None, 9), 0);
+        assert_eq!(
+            resolve_house_side_index(&rules, Some("Unbound"), Some("Allied"), 9),
+            -1
+        );
+        assert_eq!(resolve_house_side_index(&rules, Some("Absent"), None, 9), 9);
+        let house = HouseState::new(Default::default(), -1, None, false, 0, 10);
+        let bytes = crate::util::save_codec::serialize(&house).unwrap();
+        let restored: HouseState = crate::util::save_codec::deserialize(&bytes).unwrap();
+        assert_eq!(restored.side_index, -1);
+    }
+}
+
+#[cfg(all(test, tests_sim_h_o))]
+mod produced_total_tests {
+    use super::*;
+    use crate::rules::{ini_parser::IniFile, ruleset::RuleSet};
+
+    /// VERA primary rotation counts War Factory and Naval Yard products
+    /// apart, though both feed the one Vehicle counter.
+    #[test]
+    fn ships_and_tanks_are_counted_apart() {
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[VehicleTypes]\n0=TANK\n1=BOAT\n[TANK]\nStrength=1\n[BOAT]\nStrength=1\nNaval=yes\n",
+        ))
+        .unwrap();
+        let mut house = HouseState::new(Default::default(), 0, None, false, 0, 10);
+        house.set_produced_count_for_test(ObjectCategory::Vehicle, 0, 3);
+        house.set_produced_count_for_test(ObjectCategory::Vehicle, 1, 2);
+        assert_eq!(
+            house.produced_total(&rules, ObjectCategory::Vehicle, false),
+            3
+        );
+        assert_eq!(
+            house.produced_total(&rules, ObjectCategory::Vehicle, true),
+            2
+        );
     }
 }

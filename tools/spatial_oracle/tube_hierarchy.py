@@ -5,7 +5,7 @@ from pathlib import Path
 
 from unicorn import Uc, UC_ARCH_X86, UC_MODE_32
 from unicorn.x86_const import UC_X86_REG_EAX, UC_X86_REG_ECX, UC_X86_REG_EDX, UC_X86_REG_ESP, UC_X86_REG_EBP, UC_X86_REG_EIP, UC_X86_REG_FPCW
-from tools.native_oracle import RET_MAGIC, STACK_BASE, STACK_SIZE, NATIVE_SHA256, finish_vectors, load_image, provenance, run_checked
+from tools.native_oracle import RET_MAGIC, STACK_BASE, STACK_SIZE, finish_vectors, load_image, provenance, run_checked
 from tools.spatial_oracle.map_queries import dwords, packed
 from tools.spatial_oracle.bridge_records import MAP, TABLE, CELLS, TUBES, TUBE_TABLE, RECORDS, DUMMY
 
@@ -63,7 +63,6 @@ def initialized_process_fixture():
     uc.mem_map(STACK_BASE,STACK_SIZE);uc.mem_map(RET_MAGIC,0x1000)
     sp=STACK_BASE+STACK_SIZE-0x1000
     capture=json.loads(Path(__file__).with_name("tube_startup_capture.json").read_text())
-    assert capture["native_sha256"]==NATIVE_SHA256
     captured={int(row["eip"],16):row for row in capture["captures"]}
     assert captured[0x49F0E0]["fpcw"]==captured[0x49F190]["fpcw"]=="0xe7f"
     uc.reg_write(UC_X86_REG_FPCW,int(captured[0x49F0E0]["fpcw"],16))

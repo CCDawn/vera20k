@@ -53,6 +53,7 @@ from tools.procedural_drawing_oracle import rally
 from tools.sidebar_oracle import stock
 from tools.spatial_oracle.crate_speed_effect import VTABLES
 from tools.spatial_oracle.bridge_damage_admission import call, words, MEM, TABLE, SP, MAP
+from tools.native_oracle import require
 
 SHP, SCRATCH, CELL_BASE = MEM + 0xB0000, MEM + 0xD0000, 0x32000000
 NEIGHBORS = ((-1,-1,64),(0,-1,128),(1,-1,1),(-1,0,32),(1,0,2),
@@ -1126,7 +1127,7 @@ def generate_building_brackets():
     controls = [dict(name='clear'), dict(name='mixed_a', alpha='mixed'),
                 dict(name='occluding_z', occluding_rect=[40, 40, 120, 120], occluding_z=32700),
                 dict(name='native_ground_body_z', native_z_runs=ground.pop('native_z_runs'))]
-    return dict(schema_version=1, native_sha256=native.image_sha256(), palette=palette_evidence,
+    return dict(schema_version=1, palette=palette_evidence,
                 geometry=geometry, ground_occlusion=ground,
                 raster_controls=[building_bracket_pixels(geometry, case) for case in controls])
 
@@ -3039,7 +3040,7 @@ def generate_unit_health(*, building=False, rank=False, passenger=False, ammo=Fa
         assert tail_defaults['organic']==tail_type()['organic']==False
     else:
         assert tail_defaults == tail_type()
-    result = dict(schema_version=1, native_sha256=native.image_sha256(), physical_inputs=physical,
+    result = dict(schema_version=1, physical_inputs=physical,
                   readers=dict(constructor=constructor, layers=layers, result=fields(),
                                ordinary_tail_constructor=tail_defaults),
                   palette=palette_result, raster_controls=rows, original_code_unchanged=True)
@@ -3328,7 +3329,6 @@ def generate_primary_factory_status(*, power=False):
 
     producer_path=Path(__file__).resolve().parents[1]/'spatial_oracle/building_manual_primary.json'
     producer=json.loads(producer_path.read_text())
-    assert producer['native_sha256']==native.image_sha256()
     history=producer['cases'][0]
     assert history['input']['name']=='ordinary_self_click_switch_back_and_stale_event'
     on=history['phases'][3]['state']['primary'][1]
@@ -3529,7 +3529,7 @@ def generate_primary_factory_status(*, power=False):
             _status_reader_block(m,0x461225,0x46125D,
                 {UC_X86_REG_EBP:typ,UC_X86_REG_EBX:typ+0x24,
                  UC_X86_REG_ESI:INI,UC_X86_REG_EDI:typ+0x1F8})
-            assert m.invoke(0x45EC90,typ)==1
+            require(m.invoke(0x45EC90,typ)==1, 'native 0x45EC90 returned an unexpected result')
         for index,pointer in enumerate(actors):
             u.mem_write(pointer,actor_templates[index])
             u.mem_write(pointer+0x99,b'\0')
@@ -3630,7 +3630,7 @@ def generate_primary_factory_status(*, power=False):
     physical=scene['sources']+factory_sources+[
         dict(name='ARTMD.INI',archive='ra2md.mix/localmd.mix',sha256=sha(m.assets['ARTMD.INI'])),
         dict(name='GAME.FNT',archive='ra2.mix/local.mix',sha256=sha(font_raw))]
-    result=dict(schema_version=1,native_sha256=native.image_sha256(),
+    result=dict(schema_version=1,
         producer_priors=producer_priors,physical_inputs=physical,
         raw_file_inputs=dict(theater=scene['terrain']['theater']['name'],absent=absent_probes,
             boundary='Explicit physical temperate-name absences and GG/temperate-buildup byte winners; original filename probes/fallback execute in the existing TMP RawFile transport. Native archive search is not executed.'),
@@ -4437,7 +4437,7 @@ def generate_radial_indicator():
         circular_planes=dict(scroll_bytes=0,row_width=160,height=160),
         projection_factor_f64_bits='3FC25E5374344960',session_mode=1,placement_preview=False,
         selected_ray=dict(z=[-500,-500],write_z=False,channels=[True,True,True]))
-    return dict(schema_version=1,native_sha256=native.image_sha256(),size=list(draw.size),
+    return dict(schema_version=1,size=list(draw.size),
         transport=transport,
         reader_inputs=readers,cubic_lut=lut,tangent=tangent,
         scenes=scene_rows,ray_controls=rays)
@@ -4690,7 +4690,7 @@ def generate_superweapon_range_controls():
         raise native.OracleError('Native radial helper numeric controls changed')
     fallback = _superweapon_loop_control(
         'retail_lm_zero_single_ring', 0x3FB33333, 0)['pulse_draws'][0]
-    return dict(native_sha256=native.image_sha256(), fpcw='0E3F',
+    return dict(fpcw='0E3F',
                 loop_controls=loop_controls,
                 pulse_controls=dict(house_rgb=[33, 67, 101],
                     lm_below_one=fallback,
@@ -4943,8 +4943,8 @@ def generate_infantry_berserk_body():
                          timeout_us=120000000, instruction_limit=10000000)
                 assert expected_entries <= reached and len(draws) == 2
                 body, shadow = (dict(draw) for draw in draws)
-                assert body.pop('return_pc') == 0x70645D and body['frame'] == frame
-                assert shadow.pop('return_pc') == 0x706602
+                require(body.pop('return_pc') == 0x70645D and body['frame'] == frame, 'body draw did not return to 0x70645D')
+                require(shadow.pop('return_pc') == 0x706602, 'shadow draw did not return to 0x706602')
                 final = shadow.pop('rgb565_le_hex')
                 invariants = dict(
                     source_unchanged=bytes(u.mem_read(shp, len(assets['GI.SHP']))) == assets['GI.SHP'],
@@ -5121,7 +5121,7 @@ def generate_infantry_berserk_body():
             projection_inclusive_padding=[360,180],zero_camera_point=zero_point,
             zero_camera_raw_return=zero_return,zero_camera_returned_al=zero_return&255,
             camera_frame='Original Tactical+B0/B4 projected-world top-left; no VERA row bias')
-        return dict(schema_version=1, native_sha256=native.image_sha256(),shared=shared,
+        return dict(schema_version=1, shared=shared,
             rows=rows,viewport_rows=viewport_rows)
     finally:
         u.hook_del(hook)

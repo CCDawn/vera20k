@@ -43,15 +43,19 @@ fn values_or(value: &Value, fallback: [i32; 3]) -> [i32; 3] {
 fn weapon_ini(name: &str, input: &Value) -> String {
     let is_laser = input["is_laser"].as_bool().unwrap_or(true);
     let house = input["house_color"].as_bool().unwrap_or(true);
+    let single = input["single_color"].as_bool().unwrap_or(false);
     let big = input["big_laser"].as_bool().unwrap_or(false);
     let duration = input["duration_byte"].as_i64().unwrap_or(15);
     let [r, g, b] = values_or(&input["inner"], [100, 120, 140]);
     let [or, og, ob] = values_or(&input["outer"], [10, 20, 30]);
     let [sr, sg, sb] = values_or(&input["spread"], [0, 0, 0]);
+    let thickness = input["laser_thickness"]
+        .as_i64()
+        .map_or_else(String::new, |value| format!("LaserThickness={value}\n"));
     format!(
-        "[{name}]\nIsLaser={is_laser}\nIsHouseColor={house}\nIsBigLaser={big}\n\
+        "[{name}]\nIsLaser={is_laser}\nIsHouseColor={house}\nIsSingleColor={single}\nIsBigLaser={big}\n\
          LaserDuration={duration}\nLaserInnerColor={r},{g},{b}\n\
-         LaserOuterColor={or},{og},{ob}\nLaserOuterSpread={sr},{sg},{sb}\n"
+         LaserOuterColor={or},{og},{ob}\nLaserOuterSpread={sr},{sg},{sb}\n{thickness}"
     )
 }
 
@@ -68,12 +72,13 @@ fn fixture_rules(input: &Value) -> RuleSet {
     };
     let rules_ini = crate::sim::arena_fixture::clear_ground_ini(&format!(
         "[General]\nPrismType=ATESLA\nPrismSupportDuration={support_duration}\nPrismSupportDelay=45\n\
-         [VehicleTypes]\n0=UNIT\n1=TARGET\n\
+         [VehicleTypes]\n0=UNIT\n1=TARGET\n[InfantryTypes]\n0=INF\n\
          [BuildingTypes]\n0=ATESLA\n1=OTHER\n2=GAPOWR\n\
          [ATESLA]\nImage=GAPRIS\nStrength=600\nTurret=no\nPrimary={primary}\nSecondary=LaserProbe\n\
          [OTHER]\nImage=OTHERART\nStrength=600\nTurret=no\nPrimary={primary}\nSecondary=LaserProbe\n\
          [GAPOWR]\nStrength=750\n\
          [UNIT]\nImage=UNITART\nStrength=600\nPrimary=LaserProbe\n\
+         [INF]\nStrength=125\nPrimary=LaserProbe\n\
          [TARGET]\nStrength=1000\n{selected}{current}"
     ));
     let art_ini = IniFile::from_str(
@@ -111,7 +116,7 @@ fn place(sim: &mut Simulation, id: u64, kind: &str, category: EntityCategory, at
     sim.substrate.entities.insert(entity);
 }
 
-fn assert_birth(actual: LaserBirth, expected: &Value, name: &str) {
+fn assert_birth(actual: LaserBirth, expected: &Value, name: &str, rules: &RuleSet) {
     assert_eq!(
         actual.frame,
         expected["timer_start"].as_i64().unwrap() as i32,
@@ -133,16 +138,20 @@ fn assert_birth(actual: LaserBirth, expected: &Value, name: &str) {
         expected["duration"].as_i64().unwrap() as i32,
         "{name} duration"
     );
-    assert_eq!(
-        actual.width,
-        expected["width"].as_i64().unwrap() as i32,
-        "{name} width"
-    );
-    assert_eq!(
-        actual.supported,
-        expected["supported"] == 1,
-        "{name} support flag"
-    );
+    // The native widths are stock FireAt's; Ares Fire_IsLaser (100563D0)
+    // replaces them ([`ares_laser_thickness_sets_the_fire_at_and_spawn_laser_widths`]).
+    if !rules.ares() {
+        assert_eq!(
+            actual.width,
+            expected["width"].as_i64().unwrap() as i32,
+            "{name} width"
+        );
+        assert_eq!(
+            actual.supported,
+            expected["supported"] == 1,
+            "{name} support flag"
+        );
+    }
 }
 
 #[test]
@@ -160,7 +169,7 @@ fn admitted_laser_births_match_original_building_and_unit_callers() {
         }
         let rules = fixture_rules(input);
         let mut sim = Simulation::new();
-        sim.session.binary_frame = 200;
+        sim.session.set_binary_frame_for_test(200);
         let unit = input["unit_boundary"].is_array();
         let source_kind = if unit {
             "UNIT"
@@ -210,6 +219,7 @@ fn admitted_laser_births_match_original_building_and_unit_callers() {
             .entities
             .get_mut(1)
             .unwrap()
+            .building
             .prism_support_count
             .set_for_test(count);
         if input["kind"] == "support" {
@@ -245,7 +255,7 @@ fn admitted_laser_births_match_original_building_and_unit_callers() {
             assert!(births.is_empty(), "{name}");
         } else {
             assert_eq!(births.len(), 1, "{name}");
-            assert_birth(births[0], &row["laser"], name);
+            assert_birth(births[0], &row["laser"], name, &rules);
             if row["laser"]["house_color"] == 1 {
                 assert_eq!(births[0].color, LaserColor::House(owner), "{name}");
             } else {
@@ -266,6 +276,161 @@ fn admitted_laser_births_match_original_building_and_unit_callers() {
     assert_eq!(compared, 27);
 }
 
+/// FireAt `0x006FF549..0x006FF571`: an infantryman's (LUNR's) house-colour
+/// laser is 2 wide like a Unit's; an explicit-colour one keeps 1.
+#[test]
+fn an_infantry_house_color_laser_is_two_wide() {
+    for (house_color, width) in [(true, 2), (false, 1)] {
+        let rules = fixture_rules(&json!({ "house_color": house_color }));
+        let mut sim = Simulation::new();
+        sim.session.set_binary_frame_for_test(200);
+        place(
+            &mut sim,
+            1,
+            "INF",
+            EntityCategory::Infantry,
+            [3200, 3200, 0],
+        );
+        place(&mut sim, 2, "TARGET", EntityCategory::Unit, [640, 640, 0]);
+        laser::fired(
+            &mut sim,
+            &rules,
+            1,
+            TargetKind::Entity(2),
+            0,
+            rules.weapon("LaserProbe").unwrap(),
+            0,
+        );
+        let widths = sim
+            .lifecycle_outputs
+            .iter()
+            .filter_map(|output| match output {
+                LifecycleOutput::LaserCreated(birth) => Some(birth.width),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(widths, [width], "house colour {house_color}");
+    }
+}
+
+/// Ares TechnoClass_Fire_IsLaser (100563D0, hook 0x6FF4DE) replaces FireAt's
+/// widths: without `LaserThickness=` a non-building beam is 2 wide whatever
+/// its colour and a non-Prism building's 3; a set thickness replaces both,
+/// supported above 3 for a non-building. TechnoClass_FireLaser (100563A0,
+/// hook 0x6FD438) gives a direct SpawnLaser a thickness above 1.
+#[test]
+fn ares_laser_thickness_sets_the_fire_at_and_spawn_laser_widths() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let fire = |kind: &str, category, input: Value| {
+        let rules = fixture_rules(&input);
+        let mut sim = Simulation::new();
+        sim.session.set_binary_frame_for_test(200);
+        place(&mut sim, 1, kind, category, [3200, 3200, 0]);
+        place(&mut sim, 2, "TARGET", EntityCategory::Unit, [640, 640, 0]);
+        laser::fired(
+            &mut sim,
+            &rules,
+            1,
+            TargetKind::Entity(2),
+            0,
+            rules.weapon("LaserProbe").unwrap(),
+            0,
+        );
+        sim.lifecycle_outputs
+            .iter()
+            .find_map(|output| match output {
+                LifecycleOutput::LaserCreated(birth) => Some((birth.width, birth.supported)),
+                _ => None,
+            })
+    };
+    let infantry = EntityCategory::Infantry;
+    let building = EntityCategory::Structure;
+    assert_eq!(
+        fire("INF", infantry, json!({ "house_color": false })),
+        Some((2, false))
+    );
+    assert_eq!(fire("OTHER", building, json!({})), Some((3, false)));
+    assert_eq!(
+        fire("INF", infantry, json!({ "laser_thickness": 5 })),
+        Some((5, true))
+    );
+    assert_eq!(
+        fire("OTHER", building, json!({ "laser_thickness": 5 })),
+        Some((5, false))
+    );
+
+    let rules = fixture_rules(&json!({ "laser_thickness": 5 }));
+    let mut sim = Simulation::new();
+    place(&mut sim, 1, "UNIT", EntityCategory::Unit, [1280, 1280, 0]);
+    place(&mut sim, 2, "TARGET", EntityCategory::Unit, [1536, 1280, 0]);
+    let birth = *laser::create(
+        &mut sim,
+        &rules,
+        1,
+        crate::sim::projectile::ProjectileTarget::Entity(2),
+        0,
+        rules.weapon("LaserProbe").unwrap(),
+        Some(ProjectileCoord::new(1280, 1280, 0)),
+    )
+    .unwrap();
+    assert_eq!((birth.width, birth.supported), (5, false));
+}
+
+/// Phobos `TechnoClass_LaserZap_IsSingleColor` (`0x6FD446`): a stock FireAt
+/// laser with `IsSingleColor=` and no house colour keeps only its
+/// `LaserInnerColor=`; `IsHouseColor=` still wins, and an ordinary laser
+/// keeps the full inner/outer/spread triple.
+#[cfg(feature = "phobos")]
+#[test]
+fn stock_single_color_laser_keeps_only_the_inner_colour() {
+    fn birth(
+        house_color: bool,
+        single_color: bool,
+    ) -> (LaserColor, crate::sim::intern::InternedId) {
+        let rules = fixture_rules(&json!({
+            "house_color": house_color,
+            "single_color": single_color,
+            "inner": [11, 22, 33],
+            "outer": [44, 55, 66],
+            "spread": [7, 8, 9],
+        }));
+        let mut sim = Simulation::new();
+        place(&mut sim, 1, "UNIT", EntityCategory::Unit, [1280, 1280, 0]);
+        place(&mut sim, 2, "TARGET", EntityCategory::Unit, [1536, 1280, 0]);
+        let owner = sim.substrate.entities.get(1).unwrap().owner();
+        let birth = *laser::create(
+            &mut sim,
+            &rules,
+            1,
+            crate::sim::projectile::ProjectileTarget::Entity(2),
+            0,
+            rules.weapon("LaserProbe").unwrap(),
+            Some(ProjectileCoord::new(1280, 1280, 0)),
+        )
+        .unwrap();
+        (birth.color, owner)
+    }
+
+    assert_eq!(
+        birth(false, true).0,
+        LaserColor::Explicit {
+            inner: [11, 22, 33],
+            outer: [0; 3],
+            spread: [0; 3]
+        }
+    );
+    assert_eq!(
+        birth(false, false).0,
+        LaserColor::Explicit {
+            inner: [11, 22, 33],
+            outer: [44, 55, 66],
+            spread: [7, 8, 9]
+        }
+    );
+    let (color, owner) = birth(true, true);
+    assert_eq!(color, LaserColor::House(owner));
+}
+
 #[test]
 fn direct_laser_keeps_explicit_source_and_native_constructor_defaults() {
     let corpus = native();
@@ -278,7 +443,7 @@ fn direct_laser_keeps_explicit_source_and_native_constructor_defaults() {
     let input = &row["input"];
     let rules = fixture_rules(input);
     let mut sim = Simulation::new();
-    sim.session.binary_frame = 200;
+    sim.session.set_binary_frame_for_test(200);
     place(
         &mut sim,
         1,
@@ -338,27 +503,30 @@ fn direct_laser_keeps_explicit_source_and_native_constructor_defaults() {
 }
 
 #[test]
+// The stock support beam; an Ares supporter without a support target does
+// not beam (`techno_ai::ares_prism_forwarding`).
 fn production_frame_orders_laser_update_before_delayed_support_birth() {
     let rules = fixture_rules(&json!({}));
     let mut sim = Simulation::new();
     let owner = sim.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+        .register(HouseState::new(owner, 0, None, true, 0, 10));
     crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
     let tower = sim
         .spawn_object("ATESLA", "Americans", 12, 12, 0, &rules)
         .unwrap();
     sim.resolve_type_handles(&rules);
-    sim.session.binary_frame = 200;
+    sim.session.set_binary_frame_for_test(200);
     let to = ProjectileCoord::new(3600, 2700, 0);
     let source = sim.substrate.entities.get_mut(tower).unwrap();
     source
+        .building
         .pending_building_fire
         .set_for_test(Some(PendingBuildingFire::new(
             1,
             DelayedFire::SupportBeam { to },
         )));
-    source.prism_support_count.set_for_test(2);
+    source.building.prism_support_count.set_for_test(2);
     source.mission_leaf.set_building_ready_latch(1);
     source.mission.apply_test_fixture(MissionTestFixture {
         current: MissionId::from_known(MissionType::Guard),
@@ -370,11 +538,11 @@ fn production_frame_orders_laser_update_before_delayed_support_birth() {
         ai_counter: 0,
         dispatch_timer: MissionDispatchTimer::from_raw(200, 100),
     });
-    sim.lifecycle_outputs.clear();
+    sim.lifecycle_outputs.clear_for_test();
     let frame = sim
         .advance_app_frame(
             &[],
-            Some(&rules),
+            &rules,
             None,
             67,
             TickLane::Ordinary,
@@ -403,10 +571,15 @@ fn production_frame_orders_laser_update_before_delayed_support_birth() {
         .iter()
         .find(|row| row["input"]["name"] == "support")
         .unwrap();
-    assert_birth(*birth, &expected["laser"], "production support visit");
+    assert_birth(
+        *birth,
+        &expected["laser"],
+        "production support visit",
+        &rules,
+    );
     let source = sim.substrate.entities.get(tower).unwrap();
-    assert!(source.pending_building_fire.pending().is_none());
-    assert_eq!(source.prism_support_count.count(), 0);
+    assert!(source.building.pending_building_fire.pending().is_none());
+    assert_eq!(source.building.prism_support_count.count(), 0);
     assert_eq!(
         source.rearm_timer.timer(),
         CdTimer::from_raw(
@@ -434,11 +607,8 @@ fn retail_delayed_main_uses_preclear_count_and_failed_admission_emits_no_laser()
         let mut sim = Simulation::new();
         for (index, name) in ["Americans", "Russians"].into_iter().enumerate() {
             let owner = sim.intern(name);
-            sim.houses.insert(
-                owner,
-                HouseState::new(owner, index as u8, None, true, 0, 10),
-            );
-            sim.session.house_order.push(owner);
+            sim.houses
+                .register(HouseState::new(owner, index as u8, None, true, 0, 10));
         }
         sim.install_resolved_terrain_for_new_map(
             crate::map::resolved_terrain::test_flat_ground_grid(64),
@@ -453,19 +623,20 @@ fn retail_delayed_main_uses_preclear_count_and_failed_admission_emits_no_laser()
             .spawn_object("GAPOWR", "Russians", target_x, 48, 0, rules)
             .unwrap();
         sim.resolve_type_handles(rules);
-        sim.power_states.clear();
-        sim.session.binary_frame = 200;
+        sim.power_states.map_mut_for_test().clear();
+        sim.session.set_binary_frame_for_test(200);
         let source = sim.substrate.entities.get_mut(tower).unwrap();
         source
             .attack_target
             .set_for_test(Some(TargetKind::Entity(target)));
         source
+            .building
             .pending_building_fire
             .set_for_test(Some(PendingBuildingFire::new(
                 1,
                 DelayedFire::Weapon(WeaponSlot::Primary),
             )));
-        source.prism_support_count.set_for_test(1);
+        source.building.prism_support_count.set_for_test(1);
         source.rearm_timer.set_for_test(CdTimer::started(100, 0));
         source.mission_leaf.set_building_ready_latch(1);
         source.mission.apply_test_fixture(MissionTestFixture {
@@ -478,11 +649,11 @@ fn retail_delayed_main_uses_preclear_count_and_failed_admission_emits_no_laser()
             ai_counter: 0,
             dispatch_timer: MissionDispatchTimer::from_raw(200, 100),
         });
-        sim.lifecycle_outputs.clear();
+        sim.lifecycle_outputs.clear_for_test();
         let frame = sim
             .advance_app_frame(
                 &[],
-                Some(rules),
+                rules,
                 None,
                 67,
                 TickLane::Ordinary,
@@ -506,26 +677,35 @@ fn retail_delayed_main_uses_preclear_count_and_failed_admission_emits_no_laser()
         if target_x == 45 {
             assert_eq!(births.len(), 1, "{births:?}");
             assert!(update < births[0].0);
-            assert_birth(births[0].1, &expected["laser"], "retail delayed main");
+            assert_birth(
+                births[0].1,
+                &expected["laser"],
+                "retail delayed main",
+                rules,
+            );
             assert_eq!(
                 sim.substrate
                     .entities
                     .get(tower)
                     .unwrap()
+                    .building
                     .prism_support_count
                     .count(),
                 0
             );
         } else {
             assert!(births.is_empty(), "out-of-range delayed shot");
+            // Ares Update_Prism (100169A0) clears SupportingPrisms whether
+            // or not the shot left.
             assert_eq!(
                 sim.substrate
                     .entities
                     .get(tower)
                     .unwrap()
+                    .building
                     .prism_support_count
                     .count(),
-                1
+                if rules.ares() { 0 } else { 1 }
             );
         }
     }

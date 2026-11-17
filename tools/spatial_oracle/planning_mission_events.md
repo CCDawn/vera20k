@@ -13,7 +13,7 @@ stopping at entry to enqueue `0x6521C0`. Twelve controls cover existing
 Attack/Move/AreaGuard/AttackMove and Enter7, Capture8, Eaten9, Harvest10,
 Unload16 (NULL or building-self Target), Sabotage17 and Patrol25.
 The publication wrapper changes only the planning byte at event offset `0x1D`.
-The adjacent metadata pins the executable and supplied tokens. This is record
+The adjacent metadata records the supplied tokens. This is record
 construction/copy evidence, not complete gameplay or input admission parity.
 `sim::command::tests::destination_missions_preserve_native_constructor_and_planning_fields`
 consumes these native outputs. It excludes the numeric value of a NULL auxiliary
@@ -36,10 +36,9 @@ click route:
 retains the mission/tokens, constructs the event and publishes through `637DD0`.
 Committed records use the existing Event receiver `4C71F6..4C74BA`; no separate
 C4, capture, cargo or docking state belongs to the planner. Ordinary and
-planned Enter share the class setters' Enter arms and VERA's bunker adapter.
-The bunker adapter remains a substitute for the unported Unit
-destination-setter bunker/radio arm; these tests do not certify that larger
-mechanism's parity.
+planned Enter share the class setters' Enter arms, including tank-bunker
+destination and radio contact handling. The joined original-code controls in
+[bunker_entry.md](bunker_entry.md) cover that route separately from the planner.
 
 Special-event distinctions:
 

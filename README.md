@@ -1,25 +1,87 @@
 <img src="docs/images/new-conscirpt-hero-image.png" alt="VERA20K hero image" width="100%">
 
 <p align="center" dir="ltr">
-  <a href="README.sv.md" lang="sv">Svenska</a> · <a href="README.zh-CN.md" lang="zh-CN">简体中文</a> · <a href="README.de.md" lang="de">Deutsch</a> · <a href="README.ar.md" lang="ar" dir="rtl">العربية</a> · <a href="README.ru.md" lang="ru">Русский</a> · <a href="README.th.md" lang="th">ไทย</a> · <a href="README.tr.md" lang="tr">Türkçe</a> · <strong>English</strong>
-  &nbsp;&nbsp;
-  <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/macos.yml?query=branch%3Amain" title="Latest macOS library test run (run manually)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/macos.yml/badge.svg?branch=main" alt="macOS library tests" height="20" align="middle"></a>
-  <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/linux.yml?query=branch%3Amain" title="Latest Linux library test run (run manually)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/linux.yml/badge.svg?branch=main" alt="Linux library tests" height="20" align="middle"></a>
-  <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/windows.yml?query=branch%3Amain" title="Latest Windows library test run (run manually)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/windows.yml/badge.svg?branch=main" alt="Windows library tests" height="20" align="middle"></a>
-  <a href="https://discord.gg/kmjRUn5m5F"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&amp;logo=discord&amp;logoColor=white" alt="Join Discord" height="20" align="middle"></a>
-  <img src="https://img.shields.io/badge/QQ_group-1097193563-1EBAFC?style=flat&amp;logo=qq&amp;logoColor=white" alt="QQ group" height="20" align="middle">
+  <a href="README.vi.md" lang="vi">Tiếng Việt</a> · <a href="README.sv.md" lang="sv">Svenska</a> · <a href="README.zh-CN.md" lang="zh-CN">简体中文</a> · <a href="README.de.md" lang="de">Deutsch</a> · <a href="README.ar.md" lang="ar" dir="rtl">العربية</a> · <a href="README.es.md" lang="es">Español</a> · <a href="README.ja.md" lang="ja">日本語</a> · <a href="README.ru.md" lang="ru">Русский</a> · <a href="README.th.md" lang="th">ไทย</a> · <a href="README.tr.md" lang="tr">Türkçe</a> · <strong>English</strong>
+</p>
+<p align="center" dir="ltr">
+  <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/linux.yml?query=branch%3Amain" title="Latest Linux library test run (run manually)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/linux.yml/badge.svg?branch=main" alt="Linux library tests" height="23" align="middle"></a>
+  <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/windows.yml?query=branch%3Amain" title="Latest Windows library test run (run manually)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/windows.yml/badge.svg?branch=main" alt="Windows library tests" height="23" align="middle"></a>
+  <a href="https://discord.gg/kmjRUn5m5F"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fdiscord.com%2Fapi%2Fv10%2Finvites%2FkmjRUn5m5F%3Fwith_counts%3Dtrue&amp;query=%24.approximate_presence_count&amp;suffix=%20online&amp;label=VERA20K%20Discord&amp;color=5865F2&amp;style=flat&amp;logo=discord&amp;logoColor=white" alt="Join Discord" height="23" align="middle"></a>
+  <img src="https://img.shields.io/badge/VERA20K_QQ-1097193563-1EBAFC?style=flat&amp;logo=qq&amp;logoColor=white" alt="QQ group (VERA20K)" height="23" align="middle">
+  <img src="https://img.shields.io/badge/ra20k.com_QQ-319832195-1EBAFC?style=flat&amp;logo=qq&amp;logoColor=white" alt="QQ group (ra20k.com)" height="23" align="middle">
 </p>
 
 <!-- Keep all translated READMEs in sync when changing the text below. -->
 
 # VERA20K
 
-VERA20K is a community-led rewrite of the original engine, `gamemd.exe`. It uses the original
-game files, so you'll need your own copy of Red Alert 2: Yuri's Revenge.
+VERA20K is a new engine for Red Alert 2: Yuri's Revenge. It plays like the original, with the same
+units, maps and look, and runs on Windows, macOS and Linux. It's built for bigger battles, with up
+to 30 players and 20,000 units on one map.
+
+> **Fork note:** this branch adds **Super AI**, a stronger computer opponent — see [SUPERAI.md](SUPERAI.md).
+> The same build also carries a **defense persona**: on wave-defense maps the AI detects the
+> map form and co-defends automatically — fortifying the attack routes, staffing the objective
+> ring and holding the line with you. Setup and play instructions live in the
+> [defense-AI guide (中文)](docs/defense-ai-install.zh.md).
+
+### Defense AI showcase（防守 AI 展示）
+
+Shots from live defense matches — tower rings on the shared objective, fort lines laddered
+along the wave approaches, garrisons and quality units held in reserve:
+
+<table>
+  <tr>
+    <td><img src="docs/images/defense-ai/allied-fort-line.png" alt="Allied fort line: prism towers, pillboxes and walls layered in depth" width="100%"></td>
+    <td><img src="docs/images/defense-ai/yuri-corridor-guns.png" alt="Yuri corridor guns: gattling towers and walls climbing the approach" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center">盟军：光棱塔+碉堡+围墙层层设防</td>
+    <td align="center">尤里：走廊炮阵沿进攻路线梯次推进</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/defense-ai/yuri-tower-ring-snow.png" alt="Yuri tower ring on snow: a walled base cluster with tech online" width="100%"></td>
+    <td><img src="docs/images/defense-ai/allied-base-stand.png" alt="Allied base standing against the incoming armor wave" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center">尤里：雪地图塔环驻守、科技成型</td>
+    <td align="center">盟军：重兵囤防迎击装甲波次</td>
+  </tr>
+</table>
+
+### Skirmish AI showcase（对战 AI 展示）
+
+The same opponent in open skirmish:
+
+<table>
+  <tr>
+    <td><img src="docs/images/skirmish-ai/massed-armor-push.png" alt="Massed armor and infantry staged for the push" width="100%"></td>
+    <td><img src="docs/images/skirmish-ai/yuri-base-superweapons.png" alt="Yuri base at full tech with superweapons charging" width="100%"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/skirmish-ai/fortified-stronghold.png" alt="A fortified stronghold with hundreds of units at scale" width="100%"></td>
+    <td></td>
+  </tr>
+</table>
 
 VERA20K is made by gamers, for gamers, and gamers have the final say in where it goes.
 
 <img src="docs/images/vera20k-screenshots.png" alt="VERA20K skirmish setup screen and in-game view" width="100%">
+
+## Download and play
+
+1. Install Red Alert 2: Yuri's Revenge from Steam or the EA app.
+2. Download VERA20K for your system from the [releases page](https://github.com/YuriPlanet/vera20k/releases).
+3. Open the file you downloaded. It finds your game and sets up VERA20K in its own folder.
+
+Stuck? See the [help page](https://vera20k.org/help).
+
+It's in active development: skirmish is playable on Windows, macOS and Linux, campaigns partly
+work, and online multiplayer (experimental) is now available. Earlier versions and what changed in
+each are on the [releases page](https://github.com/YuriPlanet/vera20k/releases).
+
+To launch single-player YR skirmishes or campaigns from a CnCNet client, see the
+[offline client setup](integrations/cncnet/README.md).
 
 ## Project goals
 
@@ -28,17 +90,18 @@ VERA20K is made by gamers, for gamers, and gamers have the final say in where it
 3. Incorporate known RTS features and some never seen before.
 4. Integrated multiplayer client
 
-## Current status
+See the [roadmap](https://github.com/orgs/YuriPlanet/projects/1) for current priorities
+and future plans.
 
-**In active development.**
+## Contributing
 
-- **Skirmish:** Playable on Windows, Linux and macOS, with original and random maps,
-  base building, harvesting, combat and save/load.
-- **Campaigns:** Missions can launch; support remains incomplete.
-- **AI:** Parts of the original AI handle base building and scripted attacks.
-- **Ongoing work:** Gameplay accuracy, visuals and performance.
-- **Multiplayer:** Network play is not available yet.
-- **Scale:** Battles with 30 players and 20,000 units have not yet been demonstrated.
+Contributors can take responsibility for engine areas, with broad freedom to make changes that
+move VERA20K forward.
+
+Maintainers will help with review, integration and merging. You'll keep full credit for your
+contribution.
+
+Discussion is on [Discord](https://discord.gg/kmjRUn5m5F) and in the QQ group (1097193563).
 
 ## Architecture
 
@@ -59,15 +122,11 @@ Arrows show data flow:
 
 You need:
 
-- **The game:** Red Alert 2: Yuri's Revenge.
-- **Rust and Git:** current stable [Rust](https://rustup.rs/), installed with rustup, and
+- **Rust and Git:** [Rust](https://rustup.rs/) 1.97 or later, installed with rustup, and
   [Git](https://git-scm.com/).
 - **Build tools:** on Windows, the Visual Studio C++ build tools, which the Rust installer offers
   to install; on macOS, `xcode-select --install`; on Debian and Ubuntu,
-  `sudo apt install build-essential libasound2-dev pkg-config`.
-- **Graphics:** a GPU with Vulkan, DirectX 12 or Metal.
-
-VERA20K has been played on Windows, Linux and macOS.
+  `sudo apt install build-essential libasound2-dev libxkbcommon-x11-0 pkg-config`.
 
 ```sh
 git clone https://github.com/YuriPlanet/vera20k.git
@@ -85,25 +144,29 @@ and playtesting. Agents follow [AGENTS.md](AGENTS.md).
 
 ## Customization
 
-Optional features (e.g. Ares) should be configurable through INI files, with client toggles
-where appropriate.
+VERA20K plays like the original game by default. New features, including extensions from
+mods such as Ares, stay off until they are turned on with one of:
 
-## Contributing
+- **A VERA player option**, in **Options**, saved under `[VERA]` in `VERA.INI`.
+- **A build option**, such as `--features phobos` for the supported [Phobos extensions](docs/phobos.md).
+- **An INI key**, set by a mod or a map. Ares keys, or a mod that ships `ares.mix`, turn on
+  the supported [Ares extensions](docs/ares.md).
 
-Help is welcome. You can write code, refactor the engine, test the game, share ideas, or play
-it next to the original and tell us what feels wrong. Open a PR and we'll take it from there.
-Discussion is on [Discord](https://discord.gg/kmjRUn5m5F) and in the QQ group (1097193563).
+Sound, graphics and controls are saved in `VERA.INI`. Gameplay rules come from lobby
+settings, mods or maps.
+
+The [modding guide](docs/modding.md) explains how to make your own mods.
 
 ## Support
 
-<a href="https://paypal.me/vera20k"><img src="docs/images/paypal-support.svg" alt="Support VERA20K via PayPal" height="40"></a>
+<a href="https://paypal.me/vera20k"><img src="https://img.shields.io/badge/Donate_via_PayPal-FFC439?style=flat&amp;logo=paypal&amp;logoColor=003087" alt="Support VERA20K via PayPal" height="23"></a>
 
 All donations received are distributed
 to contributors according to the [TIBTRE contribution ledger](https://github.com/YuriPlanet/tibtre-ledger).
 
 Payouts to contributors:
 
-<p><img src="https://img.shields.io/badge/PayPal-003087?style=flat&amp;logo=paypal&amp;logoColor=white" alt="PayPal" height="20"> <img src="https://img.shields.io/badge/China_UnionPay-E21836?style=flat" alt="China UnionPay" height="20"> <img src="https://img.shields.io/badge/Alipay-1677FF?style=flat&amp;logo=alipay&amp;logoColor=white" alt="Alipay" height="20"> <img src="https://img.shields.io/badge/Vipps-FF5B24?style=flat" alt="Vipps" height="20"> <img src="https://img.shields.io/badge/SEPA-2D4B9A?style=flat&amp;logo=sepa&amp;logoColor=white" alt="SEPA" height="20"> <img src="https://img.shields.io/badge/Bitcoin-F7931A?style=flat&amp;logo=bitcoin&amp;logoColor=white" alt="Bitcoin" height="20"></p>
+<p><img src="https://img.shields.io/badge/PayPal-003087?style=flat&amp;logo=paypal&amp;logoColor=white" alt="PayPal" height="23"> <img src="https://img.shields.io/badge/China_UnionPay-E21836?style=flat&amp;logo=data:image/svg%2Bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii02IC02IDI2OCAxNzIiPjxwYXRoIGQ9Ik01MC4wNDE2MzEsMC4wMDA2Njc1NjMzMDUgTDExMy44MjAyMTEsMC4wMDA2Njc1NjMzMDUgQzEyMi43MjMxMjcsMC4wMDA2Njc1NjMzMDUgMTI4LjI2MDQzOCw3LjI1NzMxMzQ1IDEyNi4xODM1NTgsMTYuMTg5NzY1NyBMOTYuNDkwMDcxNSwxNDMuNjc1NDE2IEM5NC4zOTQ1MzY1LDE1Mi41NzY3NzcgODUuNDgwNzM5LDE1OS44Mzk2NDEgNzYuNTcxNjA1LDE1OS44Mzk2NDEgTDEyLjc5OTI0MzMsMTU5LjgzOTY0MSBDMy45MDg3NjQsMTU5LjgzOTY0MSAtMS42NDA5ODQ0NCwxNTIuNTc2Nzc3IDAuNDM1ODk2MjA4LDE0My42NzU0MTYgTDMwLjE0MTgxODYsMTYuMTg5NzY1NyBDMzIuMjE4Njk5Myw3LjI1NzMxMzQ1IDQxLjEyNzgzMzMsMC4wMDA2Njc1NjMzMDUgNTAuMDQxNjMxLDAuMDAwNjY3NTYzMzA1IiBmaWxsPSIjRTIxODM2IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iOCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxwYXRoIGQ9Ik0xMDguNTEzMjgzLDAuMDAwNjY3NTYzMzA1IEwxODEuODU3MDE4LDAuMDAwNjY3NTYzMzA1IEMxOTAuNzU4Mzc4LDAuMDAwNjY3NTYzMzA1IDE4Ni43NDQ1MjcsNy4yNTczMTM0NSAxODQuNjUwNTQ2LDE2LjE4OTc2NTcgTDE1NC45NjE3MjQsMTQzLjY3NTQxNiBDMTUyLjg3ODYyNSwxNTIuNTc2Nzc3IDE1My41Mjg0MjcsMTU5LjgzOTY0MSAxNDQuNjA4NDExLDE1OS44Mzk2NDEgTDcxLjI2NDY3NzUsMTU5LjgzOTY0MSBDNjIuMzQ0NjYxNSwxNTkuODM5NjQxIDU2LjgyNDQ0OTUsMTUyLjU3Njc3NyA1OC45MTk5ODUsMTQzLjY3NTQxNiBMODguNjA3MjUyNSwxNi4xODk3NjU3IEM5MC43MTUyMjQsNy4yNTczMTM0NSA5OS42MDU3MDM1LDAuMDAwNjY3NTYzMzA1IDEwOC41MTMyODMsMC4wMDA2Njc1NjMzMDUiIGZpbGw9IiMwMDQ0N0MiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSI4IiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8%2BPHBhdGggZD0iTTE3OC45NDc4MywwLjAwMDY2NzU2MzMwNSBMMjQyLjcyNjQwOSwwLjAwMDY2NzU2MzMwNSBDMjUxLjY0MTc2MiwwLjAwMDY2NzU2MzMwNSAyNTcuMTc5MDc0LDcuMjU3MzEzNDUgMjU1LjA4NTA5MywxNi4xODk3NjU3IEwyMjUuMzk2MjcxLDE0My42NzU0MTYgQzIyMy4zMDA3MzYsMTUyLjU3Njc3NyAyMTQuMzgwNzE5LDE1OS44Mzk2NDEgMjA1LjQ2NjkyMiwxNTkuODM5NjQxIEwxNDEuNzE3ODc5LDE1OS44Mzk2NDEgQzEzMi43OTc4NjMsMTU5LjgzOTY0MSAxMjcuMjY1MjE1LDE1Mi41NzY3NzcgMTI5LjM1NDUzMiwxNDMuNjc1NDE2IEwxNTkuMDQ4MDE3LDE2LjE4OTc2NTcgQzE2MS4xMjQ4OTksNy4yNTczMTM0NSAxNzAuMDI3ODE0LDAuMDAwNjY3NTYzMzA1IDE3OC45NDc4MywwLjAwMDY2NzU2MzMwNSIgZmlsbD0iIzAwN0I4NCIgc3Ryb2tlPSIjZmZmIiBzdHJva2Utd2lkdGg9IjgiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48L3N2Zz4%3D" alt="China UnionPay" height="23"> <img src="https://img.shields.io/badge/Alipay-1677FF?style=flat&amp;logo=alipay&amp;logoColor=white" alt="Alipay" height="23"> <img src="https://img.shields.io/badge/Vipps-FF5B24?style=flat&amp;logo=data:image/svg%2Bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjQzLjUgMjEuNSAyNyAyNyI%2BPHBhdGggZD0iTTU3LjMsNDAuNmMzLjcsMCw1LjgtMS44LDcuOC00LjRjMS4xLTEuNCwyLjUtMS43LDMuNS0wLjlzMS4xLDIuMywwLDMuN2MtMi45LDMuOC02LjYsNi4xLTExLjMsNi4xIGMtNS4xLDAtOS42LTIuOC0xMi43LTcuN2MtMC45LTEuMy0wLjctMi43LDAuMy0zLjRzMi41LTAuNCwzLjQsMUM1MC41LDM4LjMsNTMuNSw0MC42LDU3LjMsNDAuNnogTTY0LjIsMjguM2MwLDEuOC0xLjQsMy0zLDMgcy0zLTEuMi0zLTNzMS40LTMsMy0zQzYyLjgsMjUuMyw2NC4yLDI2LjYsNjQuMiwyOC4zeiIgZmlsbD0iI2ZmZiIvPjwvc3ZnPg%3D%3D" alt="Vipps" height="23"> <img src="https://img.shields.io/badge/SEPA-2D4B9A?style=flat&amp;logo=sepa&amp;logoColor=white" alt="SEPA" height="23"> <img src="https://img.shields.io/badge/Bitcoin-F7931A?style=flat&amp;logo=bitcoin&amp;logoColor=white" alt="Bitcoin" height="23"></p>
 
 ## Credits and legal
 
@@ -111,6 +174,26 @@ Thanks to OpenRA, XCC Mixer, the ModEnc wiki, Project Perfect Mod, EA's GPL sour
 Command & Conquer and Red Alert, World-Altering Editor, Final Alert, YRpp, Ares, Phobos and
 many others.
 
-Licensed under the [GPLv3](LICENSE-GPL). This repository contains no game files. Command &
-Conquer and Red Alert are trademarks of Electronic Arts Inc., and the screenshots show game art
-owned by Electronic Arts. VERA20K is not affiliated with or endorsed by Electronic Arts.
+Copyright © 2026 Halvor Nikolai Rusten and VERA20K contributors.
+Licensed under the [GPLv3](LICENSE-GPL) with [additional terms](LEGAL.md#additional-terms).
+This repository contains no game files. Command &
+Conquer and Red Alert are trademarks of Electronic Arts Inc., and the screenshots and the app
+icon, Red Alert 2's red star, show game art owned by Electronic Arts. VERA20K is not affiliated
+with or endorsed by Electronic Arts.
+
+This product includes software developed by the [Ares Contributors](LICENSES/Ares.txt).
+This product includes software developed by the [Phobos Developers](docs/phobos.md#original-project-and-authors).
+
+**Read the [legal notice](LEGAL.md) before you share, sell or fork VERA20K.**
+
+## Documentation
+
+- [WebAssembly preview](docs/wasm.md): an opt-in single-player build that runs in a browser.
+- [Modding guide](docs/modding.md): what mods can and can't do, and how VERA20K differs from the original game.
+- [INI profiles](docs/ini-roots.md): choosing rules, art and AI files.
+- [Ares](docs/ares.md), [Phobos](docs/phobos.md), [NPatch](docs/npatch.md) and [VeraX](docs/verax.md): extension support and limitations.
+- [Engine overview](docs/index.md): code layout and how the engine fits together.
+- [Developer tools](tools/README.md): builds, tests and asset inspection.
+- [Map testing](tools/map_observation.md): scripted scenarios, screenshots and match observations.
+- [Native comparisons](tools/native_oracle.md): comparing behavior with the original game.
+- [Ghidra workflow](docs/ghidra-workflow.md): inspecting the original engine.

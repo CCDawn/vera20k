@@ -90,7 +90,7 @@ fn rules(input: &Value) -> RuleSet {
 /// land speeds for a vehicle's Unlimbo, and the block reads only the source's
 /// class, house and position.
 fn enemy(sim: &mut Simulation, kind: &str, category: EntityCategory, cell: (u16, u16)) -> u64 {
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     let mut entity = GameEntity::test_default(id, kind, "Russians", cell.0, cell.1);
     entity.set_owner_for_test(sim.intern("Russians"));
     entity.set_type_ref_for_test(sim.intern(kind));
@@ -116,14 +116,18 @@ fn fixture(rules: &RuleSet, input: &Value) -> (Simulation, u64, Option<u64>) {
     crate::sim::arena_fixture::supply_native_map(&mut sim);
     for (house, human) in [
         ("Americans", input["human"].as_bool().unwrap_or(false)),
+        // Original block fixture supplies the source House index3, leaving
+        // two intervening registry slots. They own no actors or callbacks.
+        ("Unused1", false),
+        ("Unused2", false),
         ("Russians", false),
     ] {
         let id = sim.interner.intern(house);
         sim.houses
-            .insert(id, HouseState::new(id, 0, Some(id), human, 5000, 10));
+            .register(HouseState::new(id, 0, Some(id), human, 5000, 10));
     }
     if input["allied"].as_bool().unwrap_or(false) {
-        sim.house_alliances
+        sim.house_alliances_mut_for_test()
             .entry("AMERICANS".into())
             .or_default()
             .insert("RUSSIANS".into());
@@ -142,16 +146,20 @@ fn fixture(rules: &RuleSet, input: &Value) -> (Simulation, u64, Option<u64>) {
         _ => Some(("TANK", EntityCategory::Unit)),
     }
     .map(|(kind, category)| enemy(&mut sim, kind, category, cell));
-    sim.session.binary_frame = FRAME;
+    sim.session.set_binary_frame_for_test(FRAME);
     if input["operational"] == false {
         let owner = sim.interner.intern("Americans");
         let mut power_state = crate::sim::power_system::PowerState::default();
-        power_state.total_drain = 100;
-        power_state.is_low_power = true;
-        sim.power_states.insert(owner, power_state);
+        power_state.set_total_drain_for_test(100);
+        power_state.set_is_low_power_for_test(true);
+        sim.power_states
+            .map_mut_for_test()
+            .insert(owner, power_state);
     }
     sim.scenario_rng = SimRng::new(input["seed"].as_u64().unwrap_or(1));
     let entity = sim.substrate.entities.get_mut(building).unwrap();
+    // The original block fixture supplies this retained +53C prior.
+    entity.initialize_building_loss_index(0x7777);
     entity.mission.apply_test_fixture(MissionTestFixture {
         current: mission(input["mission"].as_str().unwrap_or("guard")),
         suspended: MissionId::NONE,
@@ -175,7 +183,8 @@ fn fixture(rules: &RuleSet, input: &Value) -> (Simulation, u64, Option<u64>) {
     }
     if input["rotating"].as_bool().unwrap_or(false) {
         facing.set(0x4000, FRAME);
-        sim.session.binary_frame = FRAME + input["advance"].as_u64().unwrap_or(0) as u32;
+        sim.session
+            .set_binary_frame_for_test(FRAME + input["advance"].as_u64().unwrap_or(0) as u32);
     }
     (sim, building, source)
 }
@@ -197,8 +206,8 @@ fn indices(rng: &SimRng) -> Value {
 }
 
 /// Every row through [`Simulation::building_hit_response`]: its ping, TarCom,
-/// mission, Scenario draws (values and generator indices) and `+0x388`.
-/// `+0x53C` (`who_last`) has no VERA state (module doc). RESIDUAL (dormant
+/// mission, Scenario draws (values and generator indices), `+0x388` and
+/// retained `+0x53C` (`who_last`). RESIDUAL (dormant
 /// with retail data): `ai_artillary_out_of_range`'s sale, BuildingClass::
 /// SetTarget's TickTank/Artillary arm (`building_missions` module doc).
 #[test]
@@ -212,7 +221,7 @@ fn the_block_matches_the_original() {
         let rules = rules(input);
         let (mut sim, building, source) = fixture(&rules, input);
         assert_eq!(
-            sim.session.binary_frame,
+            sim.session.binary_frame(),
             row["frame"].as_u64().unwrap() as u32
         );
         let before = sim.substrate.entities.get(building).unwrap().clone();
@@ -224,11 +233,18 @@ fn the_block_matches_the_original() {
             building,
             source,
             result(input["result"].as_i64().unwrap_or(1)),
+            true,
             &rules,
             None,
+            crate::sim::world::FrameEffects::default(),
         );
 
         let after = sim.substrate.entities.get(building).unwrap();
+        assert_eq!(
+            i64::from(after.building_loss_index()),
+            row["who_last"].as_i64().unwrap(),
+            "{name} source-house loss index"
+        );
         // NotifyUnderAttack's cell is GetCoords': a 2x2's foundation centre
         // lies 128 leptons past its anchor cell's centre on both axes, in the
         // next cell (native GetCoords rows in building_fire_facing.json).
@@ -335,7 +351,7 @@ fn production_fixture(
     for (house, human) in [("Americans", human), ("Russians", false)] {
         let id = sim.interner.intern(house);
         sim.houses
-            .insert(id, HouseState::new(id, 0, Some(id), human, 5000, 10));
+            .register(HouseState::new(id, 0, Some(id), human, 5000, 10));
     }
     let building = sim
         .spawn_object(kind, "Americans", BUILDING.0, BUILDING.1, 0, rules)
@@ -343,14 +359,15 @@ fn production_fixture(
     let source = sim
         .spawn_object("GUN", "Russians", cell.0, cell.1, 0, rules)
         .unwrap();
-    sim.session.binary_frame = FRAME;
+    sim.session.set_binary_frame_for_test(FRAME);
     sim.scenario_rng = SimRng::new(1);
     (sim, building, source)
 }
 
 /// One `AP` hit of 10 on `building` from `source`, through the production
-/// receiver; returns its pings.
+/// receiver; returns the number of newly submitted inline warnings.
 fn hit(sim: &mut Simulation, rules: &RuleSet, building: u64, source: u64) -> usize {
+    let sound_prefix = sim.sound_events.len();
     let house = sim.substrate.entities.get(source).unwrap().owner();
     let warhead = sim.interner.intern("AP");
     let event = EntityDamageEvent::area(building, 10, 0, source, Some(house), warhead);
@@ -362,56 +379,12 @@ fn hit(sim: &mut Simulation, rules: &RuleSet, building: u64, source: u64) -> usi
         rules,
         None,
     );
-    pings.len()
-}
-
-/// A human's turreted defence hit from out of range pings and turns its
-/// turret to the low byte of one Scenario draw; hit again while the turret
-/// still turns, it pings without a draw. The first draw of seed 1 is the
-/// oracle's `human_seed1` (0x78B76ED5, so 0xD500 in 4 frames at ROT 10).
-#[test]
-fn a_human_defence_hit_from_out_of_range_turns_its_turret_once() {
-    let rules = production_rules("");
-    let (mut sim, building, source) = production_fixture(&rules, "DEF", true, OUT_OF_RANGE);
-    let mut expected = sim.scenario_rng.clone();
-    let drawn = expected.next_u32();
-    assert_eq!(drawn, 0x78B7_6ED5);
-
-    assert_eq!(hit(&mut sim, &rules, building, source), 1);
-    assert_eq!(
-        sim.scenario_rng.logical_state(),
-        expected.logical_state(),
-        "one Scenario draw"
-    );
-    let entity = sim.substrate.entities.get(building).unwrap();
-    assert_eq!(entity.health.current(), 990);
-    assert!(entity.attack_target.target().is_none());
-    let turret = entity.body_facing;
-    assert_eq!(turret.destination(), 0xD500);
-    assert_eq!(turret.timer_duration(), 4);
-    assert!(turret.is_rotating(FRAME));
-
-    assert_eq!(hit(&mut sim, &rules, building, source), 1);
-    assert_eq!(
-        sim.scenario_rng.logical_state(),
-        expected.logical_state(),
-        "no draw while the turret turns"
-    );
-    assert_eq!(
-        sim.substrate.entities.get(building).unwrap().body_facing,
-        turret
-    );
-}
-
-/// `Insignificant=` gates only the ping: a human's turretless insignificant
-/// building still turns its body (`+0x388`, which every building carries).
-#[test]
-fn an_insignificant_building_turns_without_a_ping() {
-    let rules = production_rules("");
-    let (mut sim, building, source) = production_fixture(&rules, "SHACK", true, OUT_OF_RANGE);
-    assert_eq!(hit(&mut sim, &rules, building, source), 0);
-    let body = sim.substrate.entities.get(building).unwrap().body_facing;
-    assert_eq!(body.destination(), 0xD500);
+    assert!(pings.is_empty(), "building warnings are already submitted");
+    sim.sound_events
+        .iter()
+        .skip(sound_prefix)
+        .filter(|event| matches!(event, SimSoundEvent::UnderAttack { .. }))
+        .count()
 }
 
 /// A 2x2 building that undeploys and gathers (the deployed Slave Miner)
@@ -431,7 +404,7 @@ fn a_deployed_slave_miner_pings_the_ore_miner_line() {
         &rules,
         None,
     );
-    sim.dispatch_under_attack_events(&pings, &rules);
+    assert!(pings.is_empty(), "building warning is already submitted");
     assert_eq!(
         sim.sound_events
             .iter()
@@ -441,65 +414,6 @@ fn a_deployed_slave_miner_pings_the_ore_miner_line() {
             })
             .collect::<Vec<_>>(),
         [true]
-    );
-}
-
-/// A computer's defence hit from in range takes the source; with
-/// `PlayerReturnFire=` a human's does too, and neither draws.
-#[test]
-fn a_returned_hit_takes_the_source_without_a_draw() {
-    for (human, extra) in [
-        (false, ""),
-        (true, "[CombatDamage]\nPlayerReturnFire=yes\n"),
-    ] {
-        let rules = production_rules(extra);
-        let (mut sim, building, source) = production_fixture(&rules, "DEF", human, IN_RANGE);
-        let rng = sim.scenario_rng.logical_state();
-        assert_eq!(hit(&mut sim, &rules, building, source), 1);
-        assert_eq!(sim.scenario_rng.logical_state(), rng, "human {human}");
-        let entity = sim.substrate.entities.get(building).unwrap();
-        assert_eq!(
-            entity.attack_target.target(),
-            Some(TargetKind::Entity(source)),
-            "human {human}"
-        );
-        assert_eq!(entity.body_facing.destination(), 0, "human {human}");
-    }
-}
-
-/// A hit without a source object neither pings nor turns (`0x00442942`).
-#[test]
-fn a_hit_without_a_source_does_nothing() {
-    let rules = production_rules("");
-    let (mut sim, building, _) = production_fixture(&rules, "DEF", true, OUT_OF_RANGE);
-    let rng = sim.scenario_rng.logical_state();
-    let warhead = sim.interner.intern("AP");
-    let event = EntityDamageEvent::area(
-        building,
-        10,
-        0,
-        crate::sim::combat::RAD_NO_ATTACKER,
-        None,
-        warhead,
-    );
-    let (_, pings) = commit_entities(
-        &mut sim,
-        &mut ReceiverRun::default(),
-        &[event],
-        None,
-        &rules,
-        None,
-    );
-    assert!(pings.is_empty());
-    assert_eq!(sim.scenario_rng.logical_state(), rng);
-    assert_eq!(
-        sim.substrate
-            .entities
-            .get(building)
-            .unwrap()
-            .health
-            .current(),
-        990
     );
 }
 

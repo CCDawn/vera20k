@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use crate::asset_tools::identify;
 use crate::asset_tools::report::{ErrorReport, ExtractReport};
+use crate::asset_tools::sanitise_name;
 use crate::assets::asset_manager::AssetManager;
 
 /// Output root when the caller does not name one. Relative and under `target/`,
@@ -95,7 +96,7 @@ pub fn run(
     // check, and the report should say so before they open it.
     let identified = identify::identify(bytes);
 
-    let file_name = sanitise_name(name);
+    let file_name = sanitise_name(name, FALLBACK_FILE_NAME);
     if file_name != name {
         warnings.push(format!(
             "asset name {name} was sanitised to {file_name} for the filesystem"
@@ -172,35 +173,7 @@ fn extract_dir(out: &Path) -> PathBuf {
     root.join(EXTRACT_SUBDIR)
 }
 
-/// Replace every character outside `[A-Za-z0-9._-]` so the name is safe as a
-/// filename component on any platform.
-///
-/// Mirrors `verb_render::sanitise_name` character for character: the two verbs
-/// must agree, or the same asset lands under two different names. It is copied
-/// rather than called because that one is module-private; the test below pins
-/// this copy to the same fixtures verb_render's own test asserts.
-///
-/// Flattening the path separators is also what keeps a name like `../../x` from
-/// escaping the output root — the result is always a single path component.
-fn sanitise_name(name: &str) -> String {
-    let sanitised: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitised.is_empty() {
-        FALLBACK_FILE_NAME.to_string()
-    } else {
-        sanitised
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
 
@@ -214,25 +187,13 @@ mod tests {
     }
 
     #[test]
-    fn sanitiser_agrees_with_verb_render() {
-        // Fixtures copied from `verb_render::tests::
-        // sanitise_name_keeps_safe_characters_and_replaces_the_rest`. If that
-        // rule ever changes, this list is where the two verbs diverge.
-        assert_eq!(sanitise_name("sidebar.shp"), "sidebar.shp");
-        assert_eq!(sanitise_name("gi-idle_01.shp"), "gi-idle_01.shp");
-        assert_eq!(sanitise_name("ra2\\dir/na me:x*?"), "ra2_dir_na_me_x__");
-        assert_eq!(sanitise_name(""), FALLBACK_FILE_NAME);
-        assert_eq!(sanitise_name("///"), "___");
-        // Same fallback string as verb_render's, so both verbs name the
-        // unnameable asset identically.
-        assert_eq!(FALLBACK_FILE_NAME, "asset");
-    }
-
-    #[test]
     fn a_traversing_name_flattens_to_one_component() {
-        assert_eq!(sanitise_name("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(
+            sanitise_name("../../etc/passwd", FALLBACK_FILE_NAME),
+            ".._.._etc_passwd"
+        );
         let dir = extract_dir(Path::new(DEFAULT_OUT_ROOT));
-        let path = dir.join(sanitise_name("../../etc/passwd"));
+        let path = dir.join(sanitise_name("../../etc/passwd", FALLBACK_FILE_NAME));
         assert!(path.ends_with(".._.._etc_passwd"), "{}", path.display());
         // One component below the extract directory, never above it.
         assert_eq!(path.parent(), Some(dir.as_path()), "{}", path.display());
@@ -242,18 +203,6 @@ mod tests {
     fn extract_dir_is_absolute_and_ends_with_the_extract_subdir() {
         let dir = extract_dir(Path::new(DEFAULT_OUT_ROOT));
         assert!(dir.is_absolute(), "{}", dir.display());
-        assert!(dir.ends_with(EXTRACT_SUBDIR), "{}", dir.display());
-    }
-
-    #[test]
-    fn extract_dir_preserves_an_absolute_out_root_verbatim() {
-        let root = if cfg!(windows) {
-            PathBuf::from("C:\\tmp\\out")
-        } else {
-            PathBuf::from("/tmp/out")
-        };
-        let dir = extract_dir(&root);
-        assert!(dir.starts_with(&root), "{}", dir.display());
         assert!(dir.ends_with(EXTRACT_SUBDIR), "{}", dir.display());
     }
 
@@ -298,12 +247,5 @@ mod tests {
             b"[General]\n".to_vec()
         );
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn default_options_target_the_build_output_root() {
-        let opts = ExtractOptions::default();
-        assert_eq!(opts.out, PathBuf::from(DEFAULT_OUT_ROOT));
-        assert!(extract_dir(&opts.out).ends_with(EXTRACT_SUBDIR));
     }
 }

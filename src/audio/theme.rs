@@ -22,37 +22,26 @@
 //! User-requested YR parity exception: preserve this expanded gameplay playlist
 //! during future parity work unless the user explicitly asks to change it.
 
+use std::ops::Range;
+
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::aud_file;
-use crate::audio::sfx::decode_wav;
-use crate::rules::ini_parser::{IniFile, IniSection};
+use crate::assets::mix_archive::SharedBytes;
+use crate::assets::wav_file::{WavFile, WavPcmCursor};
+use crate::audio::sfx::upmix_i16_to_f32_stereo;
+#[cfg(test)]
+use crate::rules::ini_parser::IniFile;
+#[cfg(test)]
+use crate::rules::theme_ini::catalog_from_ini;
+pub(crate) use crate::rules::theme_ini::missing_install_music;
+use crate::rules::theme_ini::{ThemeCatalog, ThemeEntry};
 use crate::util::native_x87::X87Chop53;
 
-/// Theme fade length. Native is rate-based, not duration-based: the stream's
-/// own `VolumeInterp` (`stream+0x14 -> +0x10`) is initialised by
-/// `StreamPlayer__PlayFile` with `SetTargetImmediate(0x4000)` (`MOV EDX,0x4000`
-/// @ `0x00407E7D`); the stream constructor (`FUN_00401000`) builds that
-/// interpolator with `FUN_00407100` (rate `0x10624D`, 1000 ms per-tick elapsed
-/// cap) and then `FUN_004071A0(range 0x4000, 1000 ms)`, which recomputes the
-/// same rate `(0x4000 << 16) / 1000 = 0x10624D` per ms; `0x004080C0` -> `VolumeInterp__SetTarget @
-/// 0x00407170` retargets it to 0, and `VolumeInterp__Tick @ 0x004071C0` steps
-/// `current += rate * elapsed_ms` toward `target << 16`. Because the stream
-/// interpolator always starts at full scale 0x4000 — ScoreVolume lives in a
-/// separate interpolator (`0x0087E744`, `OptionsClass::SetScoreVolume @
-/// 0x005FA4A0` targets `volume * 0x4000`) that multiplies on top — the fade
-/// takes `(0x4000 << 16) / 0x10624D` = 1000.0007 ms for every ScoreVolume.
-/// VERA-internal residual: the native integer stepper needs 1001 whole
-/// milliseconds to reach zero and clamps a stalled frame's elapsed at 1000 ms;
-/// Rust uses a 1000 ms linear ramp on wall time (at most 1 ms difference,
-/// inaudible, per fade).
-const THEME_FADE_MS: u64 = 1_000;
-const THEME_INI_NAME: &str = "thememd.ini";
-const RA2_THEME_INI_NAME: &str = "theme.ini";
 const MENU_THEME_SECTION: &str = "INTRO";
 /// `Next_Song` shuffle rejection budget (`CMP EDI,0x3E8` @ `0x00720AC6`).
 const SHUFFLE_TRIES: u32 = 1_000;
 
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
 #[path = "theme_saved_tests.rs"]
 mod saved_tests;
 
@@ -70,43 +59,47 @@ pub(crate) enum MusicOutputState {
     Idle,
     /// The current source is still playing.
     Playing,
+    /// The current source is still playing and the stream's own volume
+    /// interp is moving (`Audio__IsStreamPlayerVolumeInterpolating`, read by
+    /// `Still_Playing` at `0x00720FE1`).
+    Ramping,
     /// The current source reached its physical end.
     Finished,
+    /// A movie holds the stream (`Audio__HoldAllStreamPlayersAgainstStop @
+    /// 0x00408200`, `Audio__PauseAllStreamPlayers @ 0x00408270`): the pause
+    /// moves the playing bit to the paused bit, so `IsPlaying` reads 0, and
+    /// `Stop @ 0x00407F40` and `PlayFile @ 0x00407B60` do nothing.
+    Held,
 }
 
 impl MusicOutputState {
     fn stream_exists(self) -> bool {
         self != Self::Unavailable
     }
-}
 
-/// One `[Themes]` entry (native 0x290-byte record, ctor inside `0x00720590`,
-/// reader `0x00720480`, scan `0x007207F0`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ThemeEntry {
-    /// `[Themes]` value = section key (+0x000). `From_Name` matches this only.
-    pub(crate) key: String,
-    /// `Sound=` with leading `$`/`#` stripped (+0x100); `.WAV` appended at play.
-    pub(crate) sound: String,
-    /// `Name=` CSF key for the native localized +0x200 display name. B8's
-    /// projection resolves it using the process CSF, with a 63-UTF16-unit cap.
-    pub(crate) name_key: String,
-    /// Whole seconds from native WAV metadata scan `7207F0`; independent of
-    /// physical playback length (especially for IMA ADPCM music).
-    pub(crate) duration_seconds: u32,
-    /// `Scenario=` (+0x280, default 0).
-    pub(crate) scenario: i32,
-    /// `Normal=` (+0x288, default yes).
-    pub(crate) normal: bool,
-    /// `Repeat=` (+0x289, default no). Keyed by entry, never by `Sound=` stem.
-    pub(crate) repeat: bool,
-    /// `Side=` name (+0x28C holds the resolved index; default -1 = any side).
-    pub(crate) side_name: Option<String>,
-    /// Resolved `Side=` index, -1 when unset. Unknown names natively register
-    /// a fresh `SideClass` that never equals the player's side.
-    pub(crate) side: i32,
-    /// `CCFileClass::IsAvailable(Sound + ".WAV")` (+0x28A).
-    pub(crate) available: bool,
+    pub(crate) fn playing(self) -> bool {
+        matches!(self, Self::Playing | Self::Ramping)
+    }
+
+    /// The stream as the next step of the same native call chain reads it
+    /// again, once this step's Stop, PlayFile and SetTarget have run.
+    fn after(self, action: &ThemeAction) -> Self {
+        if !self.stream_exists() || self == Self::Held {
+            return self;
+        }
+        let state = if action.start.is_some() {
+            Self::Playing
+        } else if action.stop_output {
+            Self::Idle
+        } else {
+            self
+        };
+        if action.fade_out && state.playing() {
+            Self::Ramping
+        } else {
+            state
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,19 +128,131 @@ pub(crate) struct ThemeGates {
     pub(crate) startup_suppressed: bool,
 }
 
-/// Device-independent PCM payload ready for optional physical submission.
-#[derive(Debug)]
+/// A song ready for optional physical submission, pulled as interleaved
+/// stereo samples.
+///
+/// gamemd-derived: `ThemeClass::Play_Song @ 0x00720BB0` hands the file to
+/// `StreamPlayer__PlayFile @ 0x00407B60`, which streams it through the one
+/// block decoder `IMA_ADPCM__DecodeBlock @ 0x0040AA70` rather than decoding it
+/// whole. Preparation reads the WAV header and decodes the first piece, whose
+/// failure is the whole decode's empty result; the rest decodes as the output
+/// pulls, on the device thread. The VERA-only AUD fallback arrives whole.
 pub(crate) struct PreparedTrack {
     pub(crate) stem: String,
-    pub(crate) samples: Vec<f32>,
     pub(crate) sample_rate: u32,
+    /// Decoded samples; those from `pulled` on are still to play.
+    pcm: Vec<f32>,
+    pulled: usize,
+    /// The WAV payload left to decode; `None` once decoded through, or for
+    /// a track decoded whole.
+    stream: Option<WavStream>,
+}
+
+/// A WAV song's payload, read from a share of its archive storage so neither
+/// thread copies it.
+struct WavStream {
+    file: SharedBytes,
+    payload: Range<usize>,
+    channels: u16,
+    cursor: WavPcmCursor,
+    piece: Vec<i16>,
+}
+
+impl PreparedTrack {
+    /// A track decoded whole up front.
+    pub(crate) fn decoded(stem: String, samples: Vec<f32>, sample_rate: u32) -> Self {
+        Self {
+            stem,
+            sample_rate,
+            pcm: samples,
+            pulled: 0,
+            stream: None,
+        }
+    }
+
+    /// A WAV song decoding as it is pulled; `None` wherever the whole-file
+    /// `decode_wav` fails or yields no samples, or the rate is zero.
+    pub(super) fn streamed(stem: &str, file: &SharedBytes) -> Option<Self> {
+        let wav = WavFile::parse(file)?;
+        let cursor = WavPcmCursor::new(&wav)?;
+        if wav.sample_rate == 0 {
+            return None;
+        }
+        let mut track = Self {
+            stem: stem.to_string(),
+            sample_rate: wav.sample_rate,
+            pcm: Vec::new(),
+            pulled: 0,
+            stream: Some(WavStream {
+                payload: wav.data_range(),
+                channels: wav.channels,
+                file: file.clone(),
+                cursor,
+                piece: Vec::new(),
+            }),
+        };
+        track.decode_next();
+        if track.exhausted() {
+            return None;
+        }
+        file.read_ahead();
+        Some(track)
+    }
+
+    /// Every sample has been pulled.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.pulled >= self.pcm.len()
+    }
+
+    /// Replace the pulled samples with the next decoded piece, leaving the
+    /// track exhausted when the payload has none.
+    fn decode_next(&mut self) {
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
+        self.pcm.clear();
+        self.pulled = 0;
+        stream.piece.clear();
+        let payload = &stream.file[stream.payload.clone()];
+        if stream.cursor.decode_next(payload, &mut stream.piece) {
+            upmix_i16_to_f32_stereo(&mut self.pcm, &stream.piece, stream.channels);
+        } else {
+            self.stream = None;
+        }
+    }
+}
+
+impl Iterator for PreparedTrack {
+    type Item = f32;
+
+    /// Decodes the next piece as soon as the last decoded sample is pulled,
+    /// so [`PreparedTrack::exhausted`] holds only at the true end.
+    fn next(&mut self) -> Option<f32> {
+        let sample = *self.pcm.get(self.pulled)?;
+        self.pulled += 1;
+        if self.exhausted() {
+            self.decode_next();
+        }
+        Some(sample)
+    }
+}
+
+impl std::fmt::Debug for PreparedTrack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedTrack")
+            .field("stem", &self.stem)
+            .field("sample_rate", &self.sample_rate)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct ThemeAction {
     pub(crate) stop_output: bool,
     pub(crate) start: Option<PreparedTrack>,
-    pub(crate) theme_scale: Option<f64>,
+    /// `Audio__SetStreamPlayerVolumeTargetZero @ 0x004080C0`: glide the
+    /// stream's own interp to zero.
+    pub(crate) fade_out: bool,
 }
 
 impl ThemeAction {
@@ -156,9 +261,7 @@ impl ThemeAction {
         if next.start.is_some() {
             self.start = next.start;
         }
-        if next.theme_scale.is_some() {
-            self.theme_scale = next.theme_scale;
-        }
+        self.fade_out |= next.fade_out;
         self
     }
 }
@@ -179,17 +282,18 @@ pub(crate) struct ThemeAllowContext {
 /// fading and shuffle start false.
 #[derive(Debug)]
 pub(crate) struct ThemeRuntime {
-    catalog_loaded: bool,
-    entries: Vec<ThemeEntry>,
+    catalog: Option<ThemeCatalog>,
+    /// Derived Side indices for the immutable catalog, rebuilt on every scenario
+    /// bind. Unbound entries use -1; unknown explicit names cannot match a player.
+    resolved_sides: Vec<i32>,
     slots: ThemeSlots,
     /// Signed +0x0C gate; derived from Options' stored f32, independent of
     /// the physical stream's separate gain. Ctor72096F initializes 255.
     score_volume: i32,
     /// +0x10 `IsScoreRepeat`.
     global_repeat: bool,
-    /// +0x11 fading flag plus the interpolator start time.
+    /// +0x11 fading flag; the ramp itself is the stream's own interp.
     fading: bool,
-    fade_started_at_ms: Option<u64>,
     /// +0x12 `IsScoreShuffle`.
     shuffle: bool,
     /// Whether Start_Scenario owns the pending slot (scenario reset cancel).
@@ -200,13 +304,12 @@ pub(crate) struct ThemeRuntime {
 impl Default for ThemeRuntime {
     fn default() -> Self {
         Self {
-            catalog_loaded: false,
-            entries: Vec::new(),
+            catalog: None,
+            resolved_sides: Vec::new(),
             slots: ThemeSlots::default(),
             score_volume: 255,
             global_repeat: false,
             fading: false,
-            fade_started_at_ms: None,
             shuffle: false,
             scenario_owns_pending: false,
             allow_context: ThemeAllowContext::default(),
@@ -233,50 +336,36 @@ impl ThemeRuntime {
 
     /// Catalog load `0x00720590` + scan `0x007207F0`, once per process, with
     /// the requested RA2 gameplay playlist extension appended afterwards.
-    pub(crate) fn initialize_catalog(&mut self, assets: &AssetManager) {
-        if self.catalog_loaded {
-            return;
+    /// ReadINI, then Scan `0x007207F0` behind the gate every Theme entry
+    /// point shares (an output device and no `-X…Q`).
+    pub(crate) fn initialize_catalog(&mut self, assets: &AssetManager, gates: ThemeGates) {
+        if self.catalog.is_none() {
+            let catalog = ThemeCatalog::select(assets);
+            let catalog = if gates.launcher_audio_available && !gates.startup_suppressed {
+                catalog
+            } else {
+                catalog.without_scan()
+            };
+            self.resolved_sides = vec![-1; catalog.entries().len()];
+            self.catalog = Some(catalog);
         }
-        if let Some(bytes) = assets.get_ref(THEME_INI_NAME)
-            && let Ok(ini) = IniFile::from_bytes(bytes)
-        {
-            self.entries = catalog_from_ini(&ini);
-        }
-        scan_catalog_availability(&mut self.entries, assets);
+    }
 
-        // Read RA2 independently: merging INIs would let its INTRO, SCORE,
-        // LOADING and CREDITS sections replace the YR lifecycle themes.
-        if let Some(bytes) = assets.get_ref(RA2_THEME_INI_NAME)
-            && let Ok(ini) = IniFile::from_bytes(bytes)
-        {
-            let mut ra2_entries = catalog_from_ini(&ini);
-            scan_catalog_availability(&mut ra2_entries, assets);
-            for entry in ra2_entries {
-                if entry.normal
-                    && entry.available
-                    && !self
-                        .entries
-                        .iter()
-                        .any(|yr| yr.key.eq_ignore_ascii_case(&entry.key))
-                {
-                    self.entries.push(entry);
-                }
-            }
-        }
-        self.catalog_loaded = true;
+    pub(crate) fn catalog(&self) -> Option<&ThemeCatalog> {
+        self.catalog.as_ref()
     }
 
     #[cfg(test)]
     fn with_entries(entries: Vec<ThemeEntry>) -> Self {
         Self {
-            catalog_loaded: true,
-            entries,
+            resolved_sides: vec![-1; entries.len()],
+            catalog: Some(ThemeCatalog::from_entries_for_test(entries)),
             ..Default::default()
         }
     }
 
     pub(crate) fn entries(&self) -> &[ThemeEntry] {
-        &self.entries
+        self.catalog.as_ref().map_or(&[], ThemeCatalog::entries)
     }
 
     #[cfg(test)]
@@ -305,16 +394,15 @@ impl ThemeRuntime {
         assets: &AssetManager,
         gates: ThemeGates,
         physical: MusicOutputState,
-        wall_ms: u64,
         mut apply_output: impl FnMut(ThemeAction) -> MusicOutputState,
     ) {
         if !in_game_music {
             return;
         }
         let mut prepare = |stem: &str| prepare_track(stem, assets);
-        let played = self.play_song(saved[0], gates, physical, wall_ms, &mut prepare);
+        let played = self.play_song(saved[0], gates, physical, &mut prepare);
         let physical = apply_output(played);
-        let queued = self.queue_song(saved[1], gates, physical, wall_ms);
+        let queued = self.queue_song(saved[1], gates, physical);
         apply_output(queued);
     }
 
@@ -344,38 +432,30 @@ impl ThemeRuntime {
         resolve_side: impl Fn(&str) -> Option<i32>,
     ) {
         self.allow_context = context;
-        for entry in &mut self.entries {
-            entry.side = match entry.side_name.as_deref() {
+        self.resolved_sides = self
+            .entries()
+            .iter()
+            .map(|entry| match entry.side_name.as_deref() {
                 None => -1,
                 Some(name) => resolve_side(name).unwrap_or(i32::MAX),
-            };
-        }
+            })
+            .collect();
     }
 
     fn admitted(&self, gates: ThemeGates) -> bool {
-        self.catalog_loaded && gates.launcher_audio_available && !gates.startup_suppressed
+        self.catalog.is_some() && gates.launcher_audio_available && !gates.startup_suppressed
     }
 
-    /// `ThemeClass__From_Name @ 0x00721210`: case-insensitive section-key
-    /// match (`0x007C8D20`); -1 for null, empty, or unknown names.
-    #[expect(
-        clippy::wrong_self_convention,
-        reason = "named after the native ThemeClass::From_Name lookup"
-    )]
+    /// Delegate every caller to the shared ThemeClass::From_Name721210 owner.
+    #[expect(clippy::wrong_self_convention, reason = "native ThemeClass::From_Name")]
     pub(crate) fn from_name(&self, name: &str) -> i32 {
-        if name.is_empty() {
-            return THEME_NONE;
-        }
-        self.entries
-            .iter()
-            .position(|entry| entry.key.eq_ignore_ascii_case(name))
-            .map_or(THEME_NONE, |index| index as i32)
+        self.catalog
+            .as_ref()
+            .map_or(THEME_NONE, |catalog| catalog.from_name(name))
     }
 
     fn entry(&self, index: i32) -> Option<&ThemeEntry> {
-        usize::try_from(index)
-            .ok()
-            .and_then(|i| self.entries.get(i))
+        self.catalog.as_ref()?.entry(index)
     }
 
     fn entry_repeats(&self, index: i32) -> bool {
@@ -394,9 +474,12 @@ impl ThemeRuntime {
         if !entry.available || !entry.normal {
             return false;
         }
+        // entry() admitted a nonnegative index; this projection has the same
+        // length as its immutable catalog after initialization and every bind.
+        let side = self.resolved_sides[index as usize];
         if let Some(local_side) = self.allow_context.local_side
-            && entry.side != -1
-            && local_side != entry.side
+            && side != -1
+            && local_side != side
         {
             return false;
         }
@@ -412,7 +495,7 @@ impl ThemeRuntime {
     /// `[0, count - 1]` from Main `0x00886B88`. Borrow the caller's draw so
     /// Sound, Vox and Theme (`AudioSystem::Pump 0x00406F70`) share one cursor.
     fn next_song(&self, prev: i32, draw_main: &mut impl FnMut(i32, i32) -> i32) -> i32 {
-        let count = self.entries.len() as i32;
+        let count = self.entries().len() as i32;
         if prev >= 0 && (self.entry_repeats(prev) || self.global_repeat) {
             return prev;
         }
@@ -454,12 +537,41 @@ impl ThemeRuntime {
         assets: &AssetManager,
         gates: ThemeGates,
         physical: MusicOutputState,
-        wall_ms: u64,
     ) -> ThemeAction {
-        self.initialize_catalog(assets);
+        self.initialize_catalog(assets, gates);
         let index = self.from_name(track_name);
         let mut prepare = |stem: &str| prepare_track(stem, assets);
-        self.play_song(index, gates, physical, wall_ms, &mut prepare)
+        self.play_song(index, gates, physical, &mut prepare)
+    }
+
+    /// ReadTheme4758F0's name/default tail after the production ReadString128.
+    /// A nonempty unknown name becomes-1; only missing/empty keeps the default.
+    fn read_theme_name(&self, name: Option<&str>, default: i32) -> i32 {
+        name.filter(|name| !name.is_empty())
+            .map_or(default, |name| self.from_name(name))
+    }
+
+    /// Installed Ares1002FB80/1002FC20: ordered Side then Country, or one
+    /// campaign Basic name. Exactly-2 retains retail LOADING; unknown-1 must
+    /// reach the same Play_Song owner. Native: rules_oracle/ares_loading_themes.
+    pub(crate) fn play_ares_loading_theme<'a>(
+        &mut self,
+        names: impl IntoIterator<Item = Option<&'a str>>,
+        assets: &AssetManager,
+        gates: ThemeGates,
+        physical: MusicOutputState,
+    ) -> ThemeAction {
+        self.initialize_catalog(assets, gates);
+        let selected = names
+            .into_iter()
+            .fold(THEME_AUTO, |prior, name| self.read_theme_name(name, prior));
+        let selected = if selected == THEME_AUTO {
+            self.from_name("LOADING")
+        } else {
+            selected
+        };
+        let mut prepare = |stem: &str| prepare_track(stem, assets);
+        self.play_song(selected, gates, physical, &mut prepare)
     }
 
     /// `Main__PrepareSession @ 0x0052D9A0`: `Play(From_Name("INTRO"))`.
@@ -468,9 +580,8 @@ impl ThemeRuntime {
         assets: &AssetManager,
         gates: ThemeGates,
         physical: MusicOutputState,
-        wall_ms: u64,
     ) -> ThemeAction {
-        self.play_track(MENU_THEME_SECTION, assets, gates, physical, wall_ms)
+        self.play_track(MENU_THEME_SECTION, assets, gates, physical)
     }
 
     /// `ScenarioClass__Start_Scenario @ 0x00683AB0` after `Read_Scenario`:
@@ -483,17 +594,14 @@ impl ThemeRuntime {
         assets: &AssetManager,
         gates: ThemeGates,
         physical: MusicOutputState,
-        wall_ms: u64,
     ) -> ThemeAction {
-        self.initialize_catalog(assets);
-        let index = requested_section
-            .map(str::trim)
-            .map_or(THEME_NONE, |section| self.from_name(section));
+        self.initialize_catalog(assets, gates);
+        let index = self.read_theme_name(requested_section.map(str::trim), THEME_NONE);
         let admitted = self.admitted(gates);
         let action = if index == THEME_NONE {
-            self.stop(gates, true, physical, wall_ms)
+            self.stop(gates, true, physical)
         } else {
-            self.queue_song(index, gates, physical, wall_ms)
+            self.queue_song(index, gates, physical)
         };
         self.scenario_owns_pending = admitted;
         action
@@ -507,7 +615,6 @@ impl ThemeRuntime {
         in_game_music: bool,
         gates: ThemeGates,
         physical: MusicOutputState,
-        wall_ms: u64,
     ) -> ThemeAction {
         if !self.admitted(gates) || !physical.stream_exists() {
             return ThemeAction::default();
@@ -515,12 +622,13 @@ impl ThemeRuntime {
         let current = self.current_song();
         if !in_game_music {
             if current != THEME_HOLD {
-                let stopped = self.stop(gates, true, physical, wall_ms);
-                return stopped.then(self.queue_song(THEME_HOLD, gates, physical, wall_ms));
+                let stopped = self.stop(gates, true, physical);
+                let physical = physical.after(&stopped);
+                return stopped.then(self.queue_song(THEME_HOLD, gates, physical));
             }
             ThemeAction::default()
         } else if current == THEME_NONE {
-            self.queue_song(THEME_AUTO, gates, physical, wall_ms)
+            self.queue_song(THEME_AUTO, gates, physical)
         } else {
             ThemeAction::default()
         }
@@ -537,25 +645,47 @@ impl ThemeRuntime {
         lobby_music: bool,
         gates: ThemeGates,
         physical: MusicOutputState,
-        wall_ms: u64,
     ) -> (ThemeAction, bool) {
         let intro = self.from_name(MENU_THEME_SECTION);
         let mut action = ThemeAction::default();
+        let mut physical = physical;
         if self.current_song() == intro {
-            action = action.then(self.queue_song(THEME_HOLD, gates, physical, wall_ms));
+            let queued = self.queue_song(THEME_HOLD, gates, physical);
+            physical = physical.after(&queued);
+            action = action.then(queued);
         }
         let saved_shuffle = std::mem::replace(&mut self.shuffle, true);
+        action = action.then(self.wol_lobby_music_rule(lobby_music, gates, physical));
+        (action, saved_shuffle)
+    }
+
+    /// The music half of `0x0077E110`, also WOL Options' Play Music preview
+    /// (`0x0078EBC0` case `0x5F8`): with lobby music, `Stop(0)` and
+    /// `Queue(-2)` when no stream plays or INTRO (current, else pending) is
+    /// still the song; otherwise the current song stays. Without it,
+    /// `Queue(-3)`.
+    pub(crate) fn wol_lobby_music_rule(
+        &mut self,
+        lobby_music: bool,
+        gates: ThemeGates,
+        physical: MusicOutputState,
+    ) -> ThemeAction {
+        let mut action = ThemeAction::default();
         if lobby_music {
-            let (playing, settled) = self.still_playing(physical, wall_ms);
+            let intro = self.from_name(MENU_THEME_SECTION);
+            let (playing, settled) = self.still_playing(physical);
+            let physical = physical.after(&settled);
             action = action.then(settled);
             if !playing || self.current_song() == intro {
-                action = action.then(self.stop(gates, false, physical, wall_ms));
-                action = action.then(self.queue_song(THEME_AUTO, gates, physical, wall_ms));
+                let stopped = self.stop(gates, false, physical);
+                let physical = physical.after(&stopped);
+                action = action.then(stopped);
+                action = action.then(self.queue_song(THEME_AUTO, gates, physical));
             }
         } else {
-            action = action.then(self.queue_song(THEME_HOLD, gates, physical, wall_ms));
+            action = action.then(self.queue_song(THEME_HOLD, gates, physical));
         }
-        (action, saved_shuffle)
+        action
     }
 
     /// Every `WOL_Main` exit restores the saved shuffle flag
@@ -566,31 +696,30 @@ impl ThemeRuntime {
     }
 
     /// `Still_Playing @ 0x00720FD0..0x00721005`, also inlined in
-    /// Queue/Stop/Play/AI. A completed fade stops the stream before querying
-    /// playback; it does not clear Theme's fading flag. Play clears it later
-    /// at720C6D. Return the resulting observation with the deferred output
+    /// Queue/Stop/Play/AI. A fade is complete once the stream's own interp
+    /// stops moving (`0x00720FE1`); it stops the stream (`0x00720FED`) before
+    /// querying playback and does not clear Theme's fading flag. Play clears
+    /// it later at720C6D. Return the resulting observation with the deferred output
     /// action so callers cannot reuse a stale Playing observation after Stop.
-    fn still_playing(&self, physical: MusicOutputState, wall_ms: u64) -> (bool, ThemeAction) {
+    pub(crate) fn still_playing(&self, physical: MusicOutputState) -> (bool, ThemeAction) {
         let mut action = ThemeAction::default();
-        if physical.stream_exists()
-            && self.fading
-            && let Some(started) = self.fade_started_at_ms
-            && wall_ms.saturating_sub(started) >= THEME_FADE_MS
-        {
+        if physical.stream_exists() && self.fading && physical != MusicOutputState::Ramping {
             action.stop_output = true;
-            action.theme_scale = Some(1.0);
             return (false, action);
         }
-        (physical == MusicOutputState::Playing, action)
+        (physical.playing(), action)
     }
 
-    fn start_fade(&mut self, wall_ms: u64) {
+    fn start_fade(&mut self) -> ThemeAction {
         self.fading = true;
         // Queue720B20 / Stop720EA0 ->4080C0 ->407170 retargets the
-        // existing ramp; SetTarget only restamps an interpolator at rest.
-        // Repeated requests must not restart a fade already in flight.
+        // existing ramp; SetTarget only restamps an interpolator at rest, so
+        // repeated requests do not restart a fade already in flight.
         // Executed history: trigger_action_values --music-theme.
-        self.fade_started_at_ms.get_or_insert(wall_ms);
+        ThemeAction {
+            fade_out: true,
+            ..Default::default()
+        }
     }
 
     /// `ThemeClass__Queue_Song @ 0x00720B20`.
@@ -599,7 +728,6 @@ impl ThemeRuntime {
         index: i32,
         gates: ThemeGates,
         physical: MusicOutputState,
-        wall_ms: u64,
     ) -> ThemeAction {
         if !self.admitted(gates) {
             return ThemeAction::default();
@@ -613,9 +741,9 @@ impl ThemeRuntime {
             && physical.stream_exists()
         {
             let playing;
-            (playing, action) = self.still_playing(physical, wall_ms);
+            (playing, action) = self.still_playing(physical);
             if playing {
-                self.start_fade(wall_ms);
+                action = action.then(self.start_fade());
             }
         }
         action
@@ -627,14 +755,14 @@ impl ThemeRuntime {
         &mut self,
         gates: ThemeGates,
         physical: MusicOutputState,
-        wall_ms: u64,
     ) -> ThemeAction {
         if !self.admitted(gates) {
             return ThemeAction::default();
         }
         let request = self.current_song();
-        let queued = self.queue_song(request, gates, physical, wall_ms);
-        queued.then(self.stop(gates, false, physical, wall_ms))
+        let queued = self.queue_song(request, gates, physical);
+        let physical = physical.after(&queued);
+        queued.then(self.stop(gates, false, physical))
     }
 
     /// B8 Play `6B67B1..6B6828`: an admitted list identity different from
@@ -645,7 +773,6 @@ impl ThemeRuntime {
         index: i32,
         gates: ThemeGates,
         physical: MusicOutputState,
-        wall_ms: u64,
     ) -> ThemeAction {
         if !self.admitted(gates)
             || index < 0
@@ -654,8 +781,9 @@ impl ThemeRuntime {
         {
             return ThemeAction::default();
         }
-        let stopped = self.stop(gates, true, physical, wall_ms);
-        stopped.then(self.queue_song(index, gates, physical, wall_ms))
+        let stopped = self.stop(gates, true, physical);
+        let physical = physical.after(&stopped);
+        stopped.then(self.queue_song(index, gates, physical))
     }
 
     /// B8 Stop `6B69C8..6B69E5`: fade the stream, then queue the hold sentinel.
@@ -664,10 +792,10 @@ impl ThemeRuntime {
         &mut self,
         gates: ThemeGates,
         physical: MusicOutputState,
-        wall_ms: u64,
     ) -> ThemeAction {
-        let stopped = self.stop(gates, true, physical, wall_ms);
-        stopped.then(self.queue_song(THEME_HOLD, gates, physical, wall_ms))
+        let stopped = self.stop(gates, true, physical);
+        let physical = physical.after(&stopped);
+        stopped.then(self.queue_song(THEME_HOLD, gates, physical))
     }
 
     /// `ThemeClass__Stop @ 0x00720EA0`. `fade` while playing starts the
@@ -681,7 +809,6 @@ impl ThemeRuntime {
         gates: ThemeGates,
         fade: bool,
         physical: MusicOutputState,
-        wall_ms: u64,
     ) -> ThemeAction {
         if !self.admitted(gates) || self.slots.active == THEME_NONE {
             return ThemeAction::default();
@@ -689,9 +816,9 @@ impl ThemeRuntime {
         let mut action = ThemeAction::default();
         if fade && physical.stream_exists() {
             let playing;
-            (playing, action) = self.still_playing(physical, wall_ms);
+            (playing, action) = self.still_playing(physical);
             if playing {
-                self.start_fade(wall_ms);
+                action = action.then(self.start_fade());
                 self.slots = ThemeSlots::default();
                 self.scenario_owns_pending = false;
                 return action;
@@ -700,23 +827,18 @@ impl ThemeRuntime {
         self.slots = ThemeSlots::default();
         self.scenario_owns_pending = false;
         action.stop_output = true;
-        action.theme_scale = Some(1.0);
         action
     }
 
     /// Cancel only Start_Scenario's queued ownership during scenario reset.
-    /// Active and retained identities remain owned by Theme.
-    pub(crate) fn cancel_scenario_theme_request(&mut self) -> ThemeAction {
+    /// Active and retained identities remain owned by Theme. VERA-internal
+    /// (native has no cancel): a fade in flight runs on in the stream's own
+    /// interp and stops the stream when it ends, as it would natively.
+    pub(crate) fn cancel_scenario_theme_request(&mut self) {
         if self.scenario_owns_pending {
             self.slots.pending = THEME_NONE;
         }
         self.scenario_owns_pending = false;
-        self.fading = false;
-        self.fade_started_at_ms = None;
-        ThemeAction {
-            theme_scale: Some(1.0),
-            ..Default::default()
-        }
     }
 
     pub(crate) fn update(
@@ -724,12 +846,11 @@ impl ThemeRuntime {
         assets: &AssetManager,
         gates: ThemeGates,
         physical: MusicOutputState,
-        wall_ms: u64,
         draw_main: &mut impl FnMut(i32, i32) -> i32,
     ) -> ThemeAction {
-        self.initialize_catalog(assets);
+        self.initialize_catalog(assets, gates);
         let mut prepare = |stem: &str| prepare_track(stem, assets);
-        self.ai(gates, physical, wall_ms, &mut prepare, draw_main)
+        self.ai(gates, physical, &mut prepare, draw_main)
     }
 
     /// `ThemeClass__AI @ 0x007209D0`. Signed volume gate7209FF precedes
@@ -739,21 +860,14 @@ impl ThemeRuntime {
         &mut self,
         gates: ThemeGates,
         physical: MusicOutputState,
-        wall_ms: u64,
         prepare: &mut impl FnMut(&str) -> Option<PreparedTrack>,
         draw_main: &mut impl FnMut(i32, i32) -> i32,
     ) -> ThemeAction {
         if !self.admitted(gates) || self.score_volume <= 0 {
             return ThemeAction::default();
         }
-        let (playing, mut action) = self.still_playing(physical, wall_ms);
+        let (playing, mut action) = self.still_playing(physical);
         if playing {
-            if self.fading
-                && let Some(started) = self.fade_started_at_ms
-            {
-                let elapsed = wall_ms.saturating_sub(started);
-                action.theme_scale = Some(1.0 - elapsed as f64 / THEME_FADE_MS as f64);
-            }
             return action;
         }
 
@@ -767,28 +881,28 @@ impl ThemeRuntime {
         } else {
             pending
         };
-        // A released source is idle; an absent stream remains absent. Play's
-        // retained/pending writes still run without decoding physical audio.
-        let physical = if physical.stream_exists() {
-            MusicOutputState::Idle
-        } else {
-            MusicOutputState::Unavailable
+        // A released source is idle; an absent or held stream stays as it
+        // is. Play's retained/pending writes still run without decoding
+        // physical audio.
+        let physical = match physical {
+            MusicOutputState::Unavailable | MusicOutputState::Held => physical,
+            _ => MusicOutputState::Idle,
         };
-        action = action.then(self.play_song(index, gates, physical, wall_ms, prepare));
+        action = action.then(self.play_song(index, gates, physical, prepare));
         // AI unconditionally restores -2 after attempting Play.
         self.slots.pending = THEME_AUTO;
         action
     }
 
-    /// `ThemeClass__Play_Song @ 0x00720BB0`. The CD-check branch remains
-    /// outside this port; ordinary loaded-song controls execute the body in
-    /// tools/storage_oracle/sound_theme_metadata.
+    /// `ThemeClass__Play_Song @ 0x00720BB0`; ordinary loaded-song controls
+    /// execute the body in tools/storage_oracle/sound_theme_metadata. Its
+    /// no-disc branch (`0x00720CB7`) cannot run: the disc query `0x004790A0`
+    /// jumps to `0x004A80D0`, `MOV EAX,2; RET`, and `-CD` makes it 0.
     fn play_song(
         &mut self,
         index: i32,
         gates: ThemeGates,
         physical: MusicOutputState,
-        wall_ms: u64,
         prepare: &mut impl FnMut(&str) -> Option<PreparedTrack>,
     ) -> ThemeAction {
         if !self.admitted(gates) {
@@ -797,7 +911,7 @@ impl ThemeRuntime {
         let mut action = ThemeAction::default();
         if physical.stream_exists() {
             let playing;
-            (playing, action) = self.still_playing(physical, wall_ms);
+            (playing, action) = self.still_playing(physical);
             if playing && self.slots.retained == index {
                 return action;
             }
@@ -806,10 +920,8 @@ impl ThemeRuntime {
         if self.slots.active != THEME_NONE {
             self.slots = ThemeSlots::default();
             action.stop_output = true;
-            action.theme_scale = Some(1.0);
         }
         self.fading = false;
-        self.fade_started_at_ms = None;
         if index == THEME_NONE || index == THEME_HOLD {
             return action;
         }
@@ -817,19 +929,22 @@ impl ThemeRuntime {
         // Stop and sentinels. A muted request only replaces Pending.
         if index >= 0 && self.score_volume > 0 {
             self.slots.retained = index;
-            if physical.stream_exists() {
+            if physical == MusicOutputState::Held {
+                // PlayFile does nothing on a held stream; Play still writes
+                // active (`0x00720CF2`/`0x00720D07`), so Theme AI moves on
+                // through the list each pass while the paused song waits.
+                self.slots.active = index;
+            } else if physical.stream_exists() {
                 let stem = self.entry(index).map(|entry| entry.sound.clone());
                 match stem.as_deref().and_then(prepare) {
                     Some(prepared) => {
                         action.start = Some(prepared);
-                        action.theme_scale = Some(1.0);
                         self.slots.active = index;
                     }
                     None => {
-                        // PlayFile's failure is ignored natively (active :=
-                        // index while nothing streams); Rust leaves active -1
-                        // so AI's next poll consumes pending the same way.
-                        self.slots.active = THEME_NONE;
+                        // PlayFile's failure is ignored (`0x00720CF2`):
+                        // active is the index while nothing streams.
+                        self.slots.active = index;
                     }
                 }
             } else {
@@ -839,147 +954,71 @@ impl ThemeRuntime {
                 return action;
             }
         }
+        // This pending request is Play's own, whatever a scenario queued
+        // before it: a muted Play(LOADING) must outlive the scenario reset.
         self.slots.pending = index;
+        self.scenario_owns_pending = false;
         action
     }
 }
 
-/// Load and decode a track before optional physical submission.
+/// Resolve a track for optional physical submission; a WAV song decodes only
+/// its first piece here (see [`PreparedTrack`]).
 fn prepare_track(track_name: &str, assets: &AssetManager) -> Option<PreparedTrack> {
     for filename in [format!("{track_name}.wav"), format!("{track_name}.aud")] {
-        let Some(data) = assets.get_ref(&filename) else {
+        let Some(file) = assets.get_shared(&filename) else {
             continue;
         };
 
-        if data.len() >= 44
-            && &data[0..4] == b"RIFF"
-            && let Some(decoded) = decode_wav(data, &filename)
-            && decoded.sample_rate != 0
-            && !decoded.samples.is_empty()
-        {
-            return Some(PreparedTrack {
-                stem: track_name.to_string(),
-                samples: decoded.samples,
-                sample_rate: decoded.sample_rate,
-            });
+        if let Some(track) = PreparedTrack::streamed(track_name, &file) {
+            return Some(track);
         }
 
-        let Some((header, samples)) = aud_file::decode_aud(data) else {
+        let Some((header, samples)) = aud_file::decode_aud(&file) else {
             continue;
         };
         if samples.is_empty() || header.sample_rate == 0 {
             log::warn!("Track {track_name} decoded to 0 samples");
             return None;
         }
-        let stereo = if header.is_stereo() {
-            samples
-                .iter()
-                .map(|&sample| sample as f32 / 32768.0)
-                .collect()
-        } else {
-            samples
-                .iter()
-                .flat_map(|&sample| {
-                    let value = sample as f32 / 32768.0;
-                    [value, value]
-                })
-                .collect()
-        };
-        return Some(PreparedTrack {
-            stem: track_name.to_string(),
-            samples: stereo,
-            sample_rate: u32::from(header.sample_rate),
-        });
+        let mut stereo = Vec::new();
+        upmix_i16_to_f32_stereo(&mut stereo, &samples, header.channels());
+        return Some(PreparedTrack::decoded(
+            track_name.to_string(),
+            stereo,
+            u32::from(header.sample_rate),
+        ));
     }
-    log::warn!("Music track not found: resolved='{track_name}'");
+    if first_report_of_missing_track(track_name) {
+        log::warn!("Music track not found: resolved='{track_name}'");
+    }
     None
 }
 
-fn find_section<'a>(ini: &'a IniFile, name: &str) -> Option<&'a IniSection> {
-    ini.section(name).or_else(|| {
-        ini.section_names()
-            .into_iter()
-            .find(|candidate| candidate.eq_ignore_ascii_case(name))
-            .and_then(|candidate| ini.section(candidate))
-    })
-}
-
-/// Native catalog scan `0x007207F0`: WAV availability and declared metadata
-/// supply the playlist row; the shared player owns subsequent decoding.
-fn scan_catalog_availability(entries: &mut [ThemeEntry], assets: &AssetManager) {
-    for entry in entries {
-        let wav = (!entry.sound.is_empty())
-            .then(|| assets.get_ref(&format!("{}.wav", entry.sound)))
-            .flatten();
-        entry.available = wav.is_some();
-        entry.duration_seconds = wav
-            .and_then(crate::assets::wav_file::WavFile::parse)
-            .and_then(|wav| wav.native_duration_seconds())
-            .unwrap_or(0);
-    }
-}
-
-/// Catalog load `0x00720590`: every non-empty `[Themes]` value in source
-/// order becomes an entry keyed by that value (duplicates re-read the existing
-/// entry); `0x00720480` fills the section fields with the ctor defaults
-/// (Normal=1, Repeat=0, Scenario=0, Side=-1, Sound="").
-pub(crate) fn catalog_from_ini(ini: &IniFile) -> Vec<ThemeEntry> {
-    let mut entries: Vec<ThemeEntry> = Vec::new();
-    let Some(themes) = ini.section("Themes") else {
-        return entries;
-    };
-    // Each entry through ReadString(0x20) (`0x007205DE`).
-    for entry_name in themes.keys() {
-        let Some(key) = themes.read_name(entry_name, 0x20) else {
-            continue;
-        };
-        let existing = entries
-            .iter()
-            .position(|entry| entry.key.eq_ignore_ascii_case(key));
-        let index = match existing {
-            Some(index) => index,
-            None => {
-                entries.push(ThemeEntry {
-                    key: key.to_string(),
-                    sound: String::new(),
-                    name_key: String::new(),
-                    duration_seconds: 0,
-                    scenario: 0,
-                    normal: true,
-                    repeat: false,
-                    side_name: None,
-                    side: -1,
-                    available: false,
-                });
-                entries.len() - 1
-            }
-        };
-        let entry = &mut entries[index];
-        let Some(section) = find_section(ini, &entry.key) else {
-            continue;
-        };
-        // `0x00720480`: ReadString 0x100 over an empty default, then
-        // ReadInt/ReadBool over each field and the side-name read
-        // (`0x004756F0`, 0x80 bytes).
-        entry.sound = section
-            .read_string("Sound", "", 0x100)
-            .trim_start_matches(['$', '#'])
-            .to_string();
-        entry.scenario = section.read_int("Scenario", entry.scenario);
-        entry.normal = section.read_bool("Normal", entry.normal);
-        entry.repeat = section.read_bool("Repeat", entry.repeat);
-        if let Some(side) = section.read_name("Side", 0x80) {
-            entry.side_name = Some(side.to_string());
-        }
-        if entry.normal {
-            // The string-table label read `0x00529160` copies up to 0x3FF bytes.
-            entry.name_key = section.read_string("Name", "", 0x400);
-        }
-    }
-    entries
+/// Whether `track_name`'s absence is new to the log. A repeating theme whose
+/// file is missing retries every frame, as gamemd does (`0x00720CF2` ignores
+/// the failed play); one warning per track keeps that out of the log.
+fn first_report_of_missing_track(track_name: &str) -> bool {
+    static REPORTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    REPORTED
+        .lock()
+        .is_ok_and(|mut reported| reported.insert(track_name.to_ascii_lowercase()))
 }
 
 #[cfg(test)]
+mod missing_track_tests {
+    use super::first_report_of_missing_track;
+
+    #[test]
+    fn a_missing_track_is_reported_once() {
+        assert!(first_report_of_missing_track("vera_test_absent_track"));
+        assert!(!first_report_of_missing_track("vera_test_absent_track"));
+        assert!(!first_report_of_missing_track("VERA_TEST_ABSENT_TRACK"));
+    }
+}
+
+#[cfg(all(test, tests_audio))]
 mod tests {
     use super::*;
     use crate::sim::rng::SimRng;
@@ -1011,11 +1050,11 @@ mod tests {
     }
 
     fn prepared(stem: &str) -> Option<PreparedTrack> {
-        Some(PreparedTrack {
-            stem: stem.to_string(),
-            samples: vec![0.0, 0.0],
-            sample_rate: 22_050,
-        })
+        Some(PreparedTrack::decoded(
+            stem.to_string(),
+            vec![0.0, 0.0],
+            22_050,
+        ))
     }
 
     fn no_draw(_low: i32, _high: i32) -> i32 {
@@ -1026,10 +1065,9 @@ mod tests {
     fn entering_wol_cuts_intro_and_shuffles_until_leaving() {
         let mut theme = stock_runtime();
         let mut ok = |stem: &str| prepared(stem);
-        theme.play_song(0, gates(true), MusicOutputState::Idle, 0, &mut ok);
+        theme.play_song(0, gates(true), MusicOutputState::Idle, &mut ok);
         assert_eq!(theme.current_song(), 0, "INTRO plays");
-        let (action, saved) =
-            theme.enter_wol_lobby(true, gates(true), MusicOutputState::Playing, 100);
+        let (action, saved) = theme.enter_wol_lobby(true, gates(true), MusicOutputState::Playing);
         assert!(!saved, "stock IsScoreShuffle is off");
         // Queue(-3) started a fade on INTRO; Stop(0) then stops the stream
         // at once and, like native, leaves the fading flag for Play to clear.
@@ -1043,7 +1081,6 @@ mod tests {
         let started = theme.ai(
             gates(true),
             MusicOutputState::Idle,
-            200,
             &mut ok,
             &mut |low, high| main.next_range_i32_inclusive(low, high),
         );
@@ -1061,10 +1098,32 @@ mod tests {
     fn wol_without_lobby_music_holds_the_current_song() {
         let mut theme = stock_runtime();
         let mut ok = |stem: &str| prepared(stem);
-        theme.play_song(0, gates(true), MusicOutputState::Idle, 0, &mut ok);
-        let (action, _) = theme.enter_wol_lobby(false, gates(true), MusicOutputState::Playing, 100);
+        theme.play_song(0, gates(true), MusicOutputState::Idle, &mut ok);
+        let (action, _) = theme.enter_wol_lobby(false, gates(true), MusicOutputState::Playing);
         assert!(!action.stop_output);
         assert_eq!(theme.slots().pending, THEME_HOLD);
+    }
+
+    #[test]
+    fn wol_music_rule_keeps_a_playing_song_and_holds_without_lobby_music() {
+        // 0x0077E110 and WOL Options' Play Music preview (0x0078EBC0 0x5F8).
+        let mut theme = stock_runtime();
+        let mut ok = |stem: &str| prepared(stem);
+        theme.play_song(1, gates(true), MusicOutputState::Idle, &mut ok);
+        let action = theme.wol_lobby_music_rule(true, gates(true), MusicOutputState::Playing);
+        assert!(!action.stop_output, "a playing non-INTRO song stays");
+        assert_eq!(theme.current_song(), 1);
+        let action = theme.wol_lobby_music_rule(false, gates(true), MusicOutputState::Playing);
+        assert!(!action.stop_output);
+        assert_eq!(theme.slots().pending, THEME_HOLD, "Queue(-3)");
+        // Checked again while the song still plays and Queue(-3)'s fade is
+        // still moving: nothing changes.
+        theme.wol_lobby_music_rule(true, gates(true), MusicOutputState::Ramping);
+        assert_eq!(theme.current_song(), 1);
+        // No stream plays: Stop(0), then Queue(-2).
+        let action = theme.wol_lobby_music_rule(true, gates(true), MusicOutputState::Idle);
+        assert!(action.stop_output);
+        assert_eq!(theme.slots().pending, THEME_AUTO);
     }
 
     #[test]
@@ -1155,7 +1214,7 @@ mod tests {
         let assets = AssetManager::from_loose_root_for_test(&dir);
 
         let mut theme = ThemeRuntime::default();
-        theme.initialize_catalog(&assets);
+        theme.initialize_catalog(&assets, gates(true));
         let keys: Vec<&str> = theme.entries().iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, ["INTRO", "Drok", "Grinder"]);
         assert_eq!(theme.from_name("Grinder"), 2);
@@ -1167,6 +1226,21 @@ mod tests {
             "theme.ini's [Drok] Repeat=yes must not leak in"
         );
         assert!(theme.entries().iter().all(|entry| entry.available));
+        // `-X…Q` (or no device) skips Scan `0x007207F0`: same entries, none
+        // available, so the B8 list offers nothing.
+        let mut quiet = ThemeRuntime::default();
+        let suppressed = ThemeGates {
+            launcher_audio_available: true,
+            startup_suppressed: true,
+        };
+        quiet.initialize_catalog(&assets, suppressed);
+        assert_eq!(quiet.from_name("Grinder"), 2);
+        assert!(
+            quiet
+                .entries()
+                .iter()
+                .all(|entry| !entry.available && entry.duration_seconds == 0)
+        );
         assert_eq!(theme.entries()[1].name_key, "THEME:Drok");
         assert_eq!(
             theme.entries()[1].duration_seconds,
@@ -1186,15 +1260,66 @@ mod tests {
         std::fs::remove_file(dir.join("theme.ini")).expect("remove theme.ini");
         let assets = AssetManager::from_loose_root_for_test(&dir);
         let mut theme = ThemeRuntime::default();
-        theme.initialize_catalog(&assets);
+        theme.initialize_catalog(&assets, gates(true));
         assert_eq!(theme.entries().len(), 2);
 
         // Both optional inputs missing leave an empty catalog.
         std::fs::remove_file(dir.join("thememd.ini")).expect("remove thememd.ini");
         let assets = AssetManager::from_loose_root_for_test(&dir);
         let mut theme = ThemeRuntime::default();
-        theme.initialize_catalog(&assets);
+        theme.initialize_catalog(&assets, gates(true));
         assert!(theme.entries().is_empty());
+        std::fs::remove_dir_all(dir).expect("remove theme test assets");
+    }
+
+    /// `StreamPlayer__PlayFile @ 0x00407B60` streams: preparing a song decodes
+    /// only its first piece, and pulling it yields exactly the whole-file
+    /// decode across block boundaries, the flushed short tail, the stereo
+    /// interleave and upmixed PCM runs, ending only after the last sample.
+    #[test]
+    fn a_prepared_song_decodes_one_piece_and_streams_the_whole_decode() {
+        let dir = std::env::temp_dir().join(format!("vera20k-theme-stream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test asset dir");
+        let wav = |tag: u16, channels: u16, block_align: u16, bits: u16, data: &[u8]| {
+            let mut file = b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0".to_vec();
+            file.extend(tag.to_le_bytes());
+            file.extend(channels.to_le_bytes());
+            file.extend(22_050u32.to_le_bytes());
+            file.extend(0u32.to_le_bytes());
+            file.extend(block_align.to_le_bytes());
+            file.extend(bits.to_le_bytes());
+            file.extend(b"data");
+            file.extend((data.len() as u32).to_le_bytes());
+            file.extend(data);
+            file
+        };
+        // Stereo IMA: three 24-byte blocks (a valid preamble pair, then two
+        // 8-byte L/R groups: 17 frames) and a 12-byte tail flushed as a block.
+        let mut ima = Vec::new();
+        for block in 0..3u8 {
+            ima.extend([0x00, 0x10 * (block + 1), 10, 0, 0x00, 0xF0, 20, 0]);
+            ima.extend((0..16u8).map(|i| block.wrapping_mul(37).wrapping_add(i * 11)));
+        }
+        ima.extend([0x34, 0x12, 30, 0, 0xCD, 0xAB, 40, 0, 0x5A, 0xA5, 0x3C, 0xC3]);
+        // Mono 16-bit PCM past one 4096-byte run, with an odd trailing byte.
+        let pcm: Vec<u8> = (0..5_001u32).map(|i| (i * 7) as u8).collect();
+        for (name, file, first_piece, total) in [
+            ("Ima", wav(0x11, 2, 24, 4, &ima), 34, 4 * 34),
+            ("Pcm", wav(1, 1, 2, 16, &pcm), 2 * 2048, 2 * 2500),
+        ] {
+            std::fs::write(dir.join(format!("{name}.wav")), &file).expect("write wav");
+            let assets = AssetManager::from_loose_root_for_test(&dir);
+            let mut track = prepare_track(name, &assets).expect("song prepares");
+            assert_eq!(track.pcm.len(), first_piece, "{name} decodes one piece");
+            let whole = crate::audio::sfx::decode_wav(&file, name).unwrap().samples;
+            assert_eq!(whole.len(), total);
+            for (index, &want) in whole.iter().enumerate() {
+                assert!(!track.exhausted(), "{name} ended early at {index}");
+                assert_eq!(track.next(), Some(want), "{name} sample {index}");
+            }
+            assert!(track.exhausted());
+            assert_eq!(track.next(), None);
+        }
         std::fs::remove_dir_all(dir).expect("remove theme test assets");
     }
 
@@ -1205,7 +1330,7 @@ mod tests {
             return;
         };
         let mut theme = ThemeRuntime::default();
-        theme.initialize_catalog(&assets);
+        theme.initialize_catalog(&assets, gates(true));
         let yr_keys = [
             "INTRO",
             "SCORE",
@@ -1284,7 +1409,12 @@ mod tests {
             );
             let prepared = prepare_track(&entry.sound, &assets).expect("RA2 music decodes");
             assert_eq!(prepared.sample_rate, 22_050);
-            assert!(!prepared.samples.is_empty());
+            let file = assets.get_ref(&format!("{}.wav", entry.sound)).unwrap();
+            let whole = crate::audio::sfx::decode_wav(file, key).unwrap().samples;
+            assert!(
+                prepared.eq(whole.iter().copied()),
+                "{key} streams its whole decode"
+            );
         }
         let intro = assets
             .resolve_ref("Drok.wav")
@@ -1388,7 +1518,6 @@ mod tests {
                     normal: true,
                     repeat: false,
                     side_name: None,
-                    side: -1,
                     available: true,
                 })
                 .collect();
@@ -1479,7 +1608,6 @@ mod tests {
                     normal: entry["normal"].as_bool().unwrap(),
                     repeat: entry["repeat"].as_bool().unwrap(),
                     side_name: None,
-                    side: entry["side"].as_i64().unwrap() as i32,
                     available: entry["available"].as_bool().unwrap(),
                 })
                 .collect();
@@ -1489,6 +1617,12 @@ mod tests {
                 input["shuffle"].as_bool().unwrap(),
             );
             // The native fixture supplies already-resolved Side indices.
+            theme.resolved_sides = input["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["side"].as_i64().unwrap() as i32)
+                .collect();
             theme.allow_context = ThemeAllowContext {
                 local_side: Some(input["current_side"].as_i64().unwrap() as i32),
                 campaign_scenario: (input["game_mode"] == 0)
@@ -1572,7 +1706,7 @@ mod tests {
         let mut theme = stock_runtime();
         let mut ok = prepared;
         // Shell: INTRO playing (Play sets pending = INTRO because Repeat=yes).
-        let action = theme.play_song(0, gates(true), MusicOutputState::Idle, 0, &mut ok);
+        let action = theme.play_song(0, gates(true), MusicOutputState::Idle, &mut ok);
         assert_eq!(action.start.as_ref().map(|p| p.stem.as_str()), Some("Drok"));
         assert_eq!(
             theme.slots(),
@@ -1585,13 +1719,7 @@ mod tests {
 
         // Start_Scenario: Play(From_Name("LOADING")) hard-replaces INTRO.
         let loading = theme.from_name("LOADING");
-        let action = theme.play_song(
-            loading,
-            gates(true),
-            MusicOutputState::Playing,
-            100,
-            &mut ok,
-        );
+        let action = theme.play_song(loading, gates(true), MusicOutputState::Playing, &mut ok);
         assert!(action.stop_output);
         assert_eq!(
             action.start.as_ref().map(|p| p.stem.as_str()),
@@ -1607,31 +1735,28 @@ mod tests {
         );
 
         // Map without [Basic] Theme= -> Stop(fade=1): fading, slots cleared.
-        let action = theme.stop(gates(true), true, MusicOutputState::Playing, 200);
-        assert!(!action.stop_output);
+        let action = theme.stop(gates(true), true, MusicOutputState::Playing);
+        assert!(!action.stop_output && action.fade_out);
         assert!(theme.fading);
         assert_eq!(theme.slots(), ThemeSlots::default());
 
         // Main_Tick: nothing retained -> Queue(-2) (no fade for -2).
-        theme.main_tick(true, gates(true), MusicOutputState::Playing, 210);
+        theme.main_tick(true, gates(true), MusicOutputState::Playing);
         assert_eq!(theme.slots().pending, THEME_AUTO);
 
-        // AI during the fade reports the ramp and waits.
+        // AI waits while the stream's own interp is still moving.
         let action = theme.ai(
             gates(true),
-            MusicOutputState::Playing,
-            700,
+            MusicOutputState::Ramping,
             &mut ok,
             &mut no_draw,
         );
-        assert_eq!(action.theme_scale, Some(0.5));
-        assert!(action.start.is_none());
+        assert!(!action.stop_output && action.start.is_none());
 
         // Fade reached target: stop the stream, Next_Song(-1) = BrainFreeze.
         let action = theme.ai(
             gates(true),
             MusicOutputState::Playing,
-            1_200,
             &mut ok,
             &mut no_draw,
         );
@@ -1654,7 +1779,6 @@ mod tests {
         let action = theme.ai(
             gates(true),
             MusicOutputState::Finished,
-            5_000,
             &mut ok,
             &mut no_draw,
         );
@@ -1669,19 +1793,52 @@ mod tests {
         );
     }
 
+    /// A movie's hold pauses the song and refuses PlayFile (`0x00407B60`),
+    /// so Theme AI (`0x007209D0`) finds nothing playing and moves on through
+    /// the list without starting a track; the paused song plays on after.
+    #[test]
+    fn held_stream_moves_theme_on_without_starting_a_track() {
+        let mut theme = stock_runtime();
+        let mut ok = prepared;
+        theme.queue_song(5, gates(true), MusicOutputState::Idle);
+        theme.ai(gates(true), MusicOutputState::Idle, &mut ok, &mut no_draw);
+        let mut refused = |_: &str| -> Option<PreparedTrack> { panic!("held: nothing decodes") };
+        let action = theme.ai(
+            gates(true),
+            MusicOutputState::Held,
+            &mut refused,
+            &mut no_draw,
+        );
+        assert!(action.start.is_none());
+        assert_eq!(
+            theme.slots(),
+            ThemeSlots {
+                active: 6,
+                retained: 6,
+                pending: THEME_AUTO
+            }
+        );
+        let action = theme.ai(
+            gates(true),
+            MusicOutputState::Playing,
+            &mut ok,
+            &mut no_draw,
+        );
+        assert!(action.start.is_none() && !action.stop_output);
+    }
+
     #[test]
     fn scenario_with_basic_theme_queues_and_fades_the_loading_track() {
         let mut theme = stock_runtime();
         let mut ok = prepared;
-        theme.play_song(2, gates(true), MusicOutputState::Idle, 0, &mut ok);
-        let action = theme.queue_song(7, gates(true), MusicOutputState::Playing, 50);
+        theme.play_song(2, gates(true), MusicOutputState::Idle, &mut ok);
+        let action = theme.queue_song(7, gates(true), MusicOutputState::Playing);
         assert!(!action.stop_output);
         assert!(theme.fading);
         assert_eq!(theme.slots().pending, 7);
         let action = theme.ai(
             gates(true),
             MusicOutputState::Playing,
-            1_100,
             &mut ok,
             &mut no_draw,
         );
@@ -1700,8 +1857,8 @@ mod tests {
     fn main_tick_in_game_music_off_holds_with_fade_and_minus_three() {
         let mut theme = stock_runtime();
         let mut ok = prepared;
-        theme.play_song(5, gates(true), MusicOutputState::Idle, 0, &mut ok);
-        theme.main_tick(false, gates(true), MusicOutputState::Playing, 10);
+        theme.play_song(5, gates(true), MusicOutputState::Idle, &mut ok);
+        theme.main_tick(false, gates(true), MusicOutputState::Playing);
         assert!(theme.fading);
         assert_eq!(
             theme.slots(),
@@ -1712,12 +1869,11 @@ mod tests {
             }
         );
         let before = theme.slots();
-        theme.main_tick(false, gates(true), MusicOutputState::Playing, 20);
+        theme.main_tick(false, gates(true), MusicOutputState::Playing);
         assert_eq!(theme.slots(), before);
         let action = theme.ai(
             gates(true),
             MusicOutputState::Playing,
-            1_100,
             &mut ok,
             &mut no_draw,
         );
@@ -1734,33 +1890,32 @@ mod tests {
             pending: THEME_HOLD,
         };
         for request in [THEME_NONE, THEME_AUTO, 5] {
-            theme.queue_song(request, gates(true), MusicOutputState::Playing, 100);
+            theme.queue_song(request, gates(true), MusicOutputState::Playing);
             assert_eq!(theme.slots().pending, request);
             assert!(!theme.fading);
         }
-        theme.queue_song(THEME_HOLD, gates(true), MusicOutputState::Playing, 300);
-        assert!(theme.fading);
-        assert_eq!(theme.fade_started_at_ms, Some(300));
+        let action = theme.queue_song(THEME_HOLD, gates(true), MusicOutputState::Playing);
+        assert!(theme.fading && action.fade_out);
     }
 
     #[test]
     fn play_same_retained_while_playing_is_a_no_op_and_failed_gates_preserve_slots() {
         let mut theme = stock_runtime();
         let mut ok = prepared;
-        theme.play_song(5, gates(true), MusicOutputState::Idle, 0, &mut ok);
+        theme.play_song(5, gates(true), MusicOutputState::Idle, &mut ok);
         let before = theme.slots();
-        let action = theme.play_song(5, gates(true), MusicOutputState::Playing, 10, &mut ok);
+        let action = theme.play_song(5, gates(true), MusicOutputState::Playing, &mut ok);
         assert!(action.start.is_none() && !action.stop_output);
         assert_eq!(theme.slots(), before);
 
-        let action = theme.queue_song(7, gates(false), MusicOutputState::Playing, 10);
+        let action = theme.queue_song(7, gates(false), MusicOutputState::Playing);
         assert!(!action.stop_output && action.start.is_none());
         assert_eq!(theme.slots(), before);
         let suppressed = ThemeGates {
             launcher_audio_available: true,
             startup_suppressed: true,
         };
-        theme.stop(suppressed, false, MusicOutputState::Playing, 10);
+        theme.stop(suppressed, false, MusicOutputState::Playing);
         assert_eq!(theme.slots(), before);
     }
 
@@ -1768,24 +1923,12 @@ mod tests {
     fn play_sentinels_stop_and_auto_sets_pending() {
         let mut theme = stock_runtime();
         let mut ok = prepared;
-        theme.play_song(5, gates(true), MusicOutputState::Idle, 0, &mut ok);
-        let action = theme.play_song(
-            THEME_NONE,
-            gates(true),
-            MusicOutputState::Playing,
-            1,
-            &mut ok,
-        );
+        theme.play_song(5, gates(true), MusicOutputState::Idle, &mut ok);
+        let action = theme.play_song(THEME_NONE, gates(true), MusicOutputState::Playing, &mut ok);
         assert!(action.stop_output);
         assert_eq!(theme.slots(), ThemeSlots::default());
-        theme.play_song(5, gates(true), MusicOutputState::Idle, 2, &mut ok);
-        let action = theme.play_song(
-            THEME_AUTO,
-            gates(true),
-            MusicOutputState::Playing,
-            3,
-            &mut ok,
-        );
+        theme.play_song(5, gates(true), MusicOutputState::Idle, &mut ok);
+        let action = theme.play_song(THEME_AUTO, gates(true), MusicOutputState::Playing, &mut ok);
         assert!(action.stop_output);
         assert_eq!(
             theme.slots(),
@@ -1809,7 +1952,6 @@ mod tests {
         theme.ai(
             gates(true),
             MusicOutputState::Finished,
-            1,
             &mut ok,
             &mut no_draw,
         );
@@ -1825,7 +1967,6 @@ mod tests {
         theme.ai(
             gates(true),
             MusicOutputState::Finished,
-            2,
             &mut ok,
             &mut no_draw,
         );
@@ -1834,7 +1975,6 @@ mod tests {
         theme.ai(
             gates(false),
             MusicOutputState::Unavailable,
-            3,
             &mut ok,
             &mut no_draw,
         );
@@ -1851,14 +1991,14 @@ mod tests {
         theme.ai(
             gates(true),
             MusicOutputState::Finished,
-            4,
             &mut missing,
             &mut no_draw,
         );
+        // Play_Song ignores PlayFile's failure (`0x00720CF2`).
         assert_eq!(
             theme.slots(),
             ThemeSlots {
-                active: -1,
+                active: 6,
                 retained: 6,
                 pending: THEME_AUTO
             }
@@ -1873,7 +2013,7 @@ mod tests {
             retained: 6,
             pending: THEME_HOLD,
         };
-        let action = theme.queue_then_stop_score_zero(gates(true), MusicOutputState::Playing, 0);
+        let action = theme.queue_then_stop_score_zero(gates(true), MusicOutputState::Playing);
         assert!(action.stop_output);
         assert_eq!(theme.slots(), ThemeSlots::default());
 
@@ -1882,7 +2022,7 @@ mod tests {
             retained: 6,
             pending: THEME_HOLD,
         };
-        let action = theme.queue_then_stop_score_zero(gates(true), MusicOutputState::Idle, 0);
+        let action = theme.queue_then_stop_score_zero(gates(true), MusicOutputState::Idle);
         assert!(!action.stop_output);
         assert_eq!(
             theme.slots(),
@@ -1916,28 +2056,16 @@ mod tests {
     }
 
     #[test]
-    fn score_zero_preserves_pending_request_when_nothing_is_retained_or_active() {
-        let mut theme = stock_runtime();
-        theme.slots.pending = 7;
-        let action = theme.queue_then_stop_score_zero(gates(true), MusicOutputState::Idle, 0);
-        assert!(!action.stop_output);
-        assert_eq!(
-            theme.slots.pending, 7,
-            "native Stop has no active track to clear"
-        );
-    }
-
-    #[test]
     fn sound_play_and_stop_preserve_theme_queue_and_fade_authority() {
         let mut theme = stock_runtime();
         let mut prepare = prepared;
-        theme.play_song(5, gates(true), MusicOutputState::Idle, 0, &mut prepare);
-        let same = theme.play_selection(5, gates(true), MusicOutputState::Playing, 50);
+        theme.play_song(5, gates(true), MusicOutputState::Idle, &mut prepare);
+        let same = theme.play_selection(5, gates(true), MusicOutputState::Playing);
         assert!(same.start.is_none() && !same.stop_output && !theme.fading);
         assert_eq!(theme.slots.active, 5);
 
-        let next = theme.play_selection(6, gates(true), MusicOutputState::Playing, 100);
-        assert!(next.start.is_none() && !next.stop_output);
+        let next = theme.play_selection(6, gates(true), MusicOutputState::Playing);
+        assert!(next.start.is_none() && !next.stop_output && next.fade_out);
         assert!(theme.fading);
         assert_eq!(
             theme.slots,
@@ -1949,17 +2077,14 @@ mod tests {
         );
         let during = theme.ai(
             gates(true),
-            MusicOutputState::Playing,
-            600,
+            MusicOutputState::Ramping,
             &mut prepare,
             &mut no_draw,
         );
-        assert_eq!(during.theme_scale, Some(0.5));
-        assert!(during.start.is_none());
+        assert!(during.start.is_none() && !during.stop_output);
         let finished = theme.ai(
             gates(true),
             MusicOutputState::Playing,
-            1100,
             &mut prepare,
             &mut no_draw,
         );
@@ -1970,14 +2095,13 @@ mod tests {
         );
         assert_eq!(theme.current_song(), 6);
 
-        let stopped = theme.stop_selection(gates(true), MusicOutputState::Playing, 1200);
+        let stopped = theme.stop_selection(gates(true), MusicOutputState::Playing);
         assert!(!stopped.stop_output && stopped.start.is_none());
         assert_eq!(theme.current_song(), THEME_HOLD);
-        theme.main_tick(false, gates(true), MusicOutputState::Playing, 1300);
+        theme.main_tick(false, gates(true), MusicOutputState::Playing);
         let finished = theme.ai(
             gates(true),
             MusicOutputState::Playing,
-            2200,
             &mut prepare,
             &mut no_draw,
         );
@@ -1988,6 +2112,23 @@ mod tests {
         );
     }
 
+    /// `Play 0x00720C8E`: at score volume 0 a played song only replaces
+    /// Pending, and that request is Play's own. The loading screen's track
+    /// must outlive the scenario reset that follows it, so it plays once the
+    /// volume comes up, as in gamemd.
+    #[test]
+    fn a_muted_play_keeps_its_pending_song_through_the_scenario_reset() {
+        let mut theme = stock_runtime();
+        theme.score_volume = 0;
+        // Left by the previous scenario's request, never consumed while muted.
+        theme.scenario_owns_pending = true;
+        let action = theme.play_song(5, gates(true), MusicOutputState::Idle, &mut prepared);
+        assert!(action.start.is_none());
+        assert_eq!(theme.slots().pending, 5);
+        theme.cancel_scenario_theme_request();
+        assert_eq!(theme.slots().pending, 5);
+    }
+
     #[test]
     fn scenario_cancel_clears_only_scenario_owned_pending() {
         let mut theme = stock_runtime();
@@ -1995,7 +2136,7 @@ mod tests {
         theme.cancel_scenario_theme_request();
         assert_eq!(theme.slots().pending, THEME_AUTO);
 
-        theme.queue_song(7, gates(true), MusicOutputState::Playing, 10);
+        theme.queue_song(7, gates(true), MusicOutputState::Playing);
         theme.scenario_owns_pending = true;
         theme.cancel_scenario_theme_request();
         assert_eq!(theme.slots().pending, THEME_NONE);

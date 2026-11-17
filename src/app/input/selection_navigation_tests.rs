@@ -179,7 +179,6 @@ struct CommandStep {
     modes: Modes,
     placement: bool,
     selection_mode: u32,
-    selection_across_map: bool,
     center_coord: Option<[i32; 3]>,
     redraw: Vec<u32>,
     call_order: Vec<String>,
@@ -264,18 +263,18 @@ fn veterancy_navigation_keeps_shared_snapshot_without_pointer_expiry() {
         .type_select
         .finish_category_navigation(CategoryNavigationKind::Health, true);
     input.type_select.across_map = true;
-    sim.entities_mut()
+    sim.entities_mut_for_test()
         .get_mut(20)
         .unwrap()
         .lifecycle
         .set_object_alive_for_test(false);
-    sim.entities_mut()
+    sim.entities_mut_for_test()
         .get_mut(40)
         .unwrap()
         .selection
         .set_selected_for_test(false);
 
-    reconcile_selection_order_for_sim(&mut input, &sim, Some(&rules));
+    reconcile_selection_order_for_sim(&mut input, &sim, Some(&rules), &[]);
 
     assert_eq!(input.category_navigation.candidates, [20, 40, 50]);
     assert_eq!(input.type_select.selection_scope_view().0, "health");
@@ -292,9 +291,9 @@ fn native_last_category(value: &serde_json::Value) -> Option<u8> {
 
 fn assert_navigation_rng(sim: &Simulation, native: &serde_json::Value, label: &str) {
     for (name, state) in [
-        ("main", sim.main_rng.native_state_hex()),
-        ("scenario", sim.scenario_rng.native_state_hex()),
-        ("mapgen", sim.mapgen_rng.native_state_hex()),
+        ("main", sim.main_rng().native_state_hex()),
+        ("scenario", sim.scenario_rng().native_state_hex()),
+        ("mapgen", sim.mapgen_rng().native_state_hex()),
     ] {
         assert_eq!(
             state,
@@ -538,7 +537,7 @@ fn compare_category_feedback(
         .iter()
         .filter_map(|&id| sim.entities().get(id))
         .filter_map(|entity| {
-            sim.interner
+            sim.interner()
                 .object_type(entity.type_ref(), rules)
                 .map(|object| sim.cost_of(entity.owner(), object, rules))
         })
@@ -582,10 +581,13 @@ fn replay_category_history(
         health_category: native_last_category(&before["health_category"]),
         veterancy_category: native_last_category(&before["veterancy_category"]),
     };
-    let current_house = sim.session.current_house.unwrap();
-    sim.houses.get_mut(&current_house).unwrap().is_defeated = history.command_guard != 0;
+    let current_house = sim.session().current_house().unwrap();
+    sim.houses_mut_for_test()
+        .get_mut(&current_house)
+        .unwrap()
+        .set_is_defeated_for_test(history.command_guard != 0);
     // SelectionFixture supplies original A8ED84=1000 for these histories.
-    sim.session.binary_frame = 1000;
+    sim.session_mut_for_test().set_binary_frame_for_test(1000);
     let rank_cache: BTreeMap<_, _> = sim
         .entities()
         .values()
@@ -598,7 +600,7 @@ fn replay_category_history(
         .collect();
     let mut target_lines = crate::app::presentation::target_lines::TargetLineState::default();
     target_lines.start_timer(before["action_timer"][0].as_u64().unwrap() as u32);
-    let timer_before = target_lines.remaining_frames(sim.session.binary_frame);
+    let timer_before = target_lines.remaining_frames(sim.session().binary_frame());
     let mut category_steps = 0;
     // This records outputs returned by the real shared voice owner. It is an
     // observer of native queued-byte continuation, not a second admission or
@@ -693,7 +695,7 @@ fn replay_category_history(
                     );
                 } else {
                     assert!(
-                        sim.houses[&current_house].is_defeated,
+                        sim.houses()[&current_house].is_defeated(),
                         "{label}: authoritative early guard"
                     );
                     for key in [
@@ -712,11 +714,11 @@ fn replay_category_history(
                 }
                 super::super::apply_selection_action_line_policy_at_frame(
                     &mut target_lines,
-                    sim.session.binary_frame,
+                    sim.session().binary_frame(),
                     super::super::SelectionActionLinePolicy::Preserve,
                 );
                 assert_eq!(
-                    target_lines.remaining_frames(sim.session.binary_frame),
+                    target_lines.remaining_frames(sim.session().binary_frame()),
                     timer_before,
                     "{label}: actual Preserve timer owner"
                 );
@@ -796,7 +798,7 @@ fn replay_category_history(
                 .category_navigation
                 .pointer_expired(step["id"].as_u64().unwrap()),
             "supply_veterancy_raw_bits" => {
-                sim.entities_mut()
+                sim.entities_mut_for_test()
                     .get_mut(step["id"].as_u64().unwrap())
                     .unwrap()
                     .veterancy
@@ -806,7 +808,7 @@ fn replay_category_history(
             }
             "supply_actor_state" => {
                 let entity = sim
-                    .entities_mut()
+                    .entities_mut_for_test()
                     .get_mut(step["id"].as_u64().unwrap())
                     .unwrap();
                 for (field, value) in step["fields"].as_object().unwrap() {
@@ -828,8 +830,10 @@ fn replay_category_history(
             "supply_command_guard" => {
                 // This compares the bounded admission condition only; arbitrary
                 // writes to A8B538 do not establish the whole defeat lifecycle.
-                sim.houses.get_mut(&current_house).unwrap().is_defeated =
-                    step["value"].as_u64().unwrap() != 0;
+                sim.houses_mut_for_test()
+                    .get_mut(&current_house)
+                    .unwrap()
+                    .set_is_defeated_for_test(step["value"].as_u64().unwrap() != 0);
             }
             "free_slave_owner_writer" => {
                 // The fixture executes this original FreeSlaves writer only.
@@ -838,7 +842,7 @@ fn replay_category_history(
                 assert_eq!(step["entry"], "0x6b0b6d", "{label}: original writer");
                 assert_eq!(step["stop"], "0x6b0b98", "{label}: writer boundary");
                 let entity = sim
-                    .entities_mut()
+                    .entities_mut_for_test()
                     .get_mut(step["id"].as_u64().unwrap())
                     .unwrap();
                 entity.slave = crate::sim::slave_manager::SlaveLink::for_test(
@@ -865,7 +869,7 @@ fn replay_category_history(
                     step,
                     &label,
                 );
-                let entity = sim.entities_mut().get_mut(id).unwrap();
+                let entity = sim.entities_mut_for_test().get_mut(id).unwrap();
                 entity.lifecycle.set_object_alive_for_test(
                     step["actor_state"][id.to_string()]["alive"]
                         .as_bool()
@@ -881,7 +885,7 @@ fn replay_category_history(
                 let map: Vec<u64> = serde_json::from_value(step["map_order"].clone()).unwrap();
                 for actor in &history.inputs.actors {
                     if !map.contains(&actor.id) {
-                        sim.entities_mut().remove(actor.id);
+                        sim.entities_mut_for_test().remove(actor.id);
                     }
                 }
             }
@@ -893,7 +897,7 @@ fn replay_category_history(
                 input.follow_target = serde_json::from_value(step["follow"].clone()).unwrap();
                 input.type_select = boundary_mode(step);
                 for actor in &history.inputs.actors {
-                    sim.entities_mut()
+                    sim.entities_mut_for_test()
                         .get_mut(actor.id)
                         .unwrap()
                         .selection
@@ -905,7 +909,7 @@ fn replay_category_history(
                 }
                 for draw in step["main_draws"].as_array().unwrap() {
                     assert_eq!(
-                        u64::from(sim.main_rng.next_u32()),
+                        u64::from(sim.main_rng().next_u32()),
                         draw.as_u64().unwrap(),
                         "{label}: supplied TypeSelect continuation"
                     );
@@ -930,7 +934,7 @@ fn replay_category_history(
         }
         assert_navigation_boundary(&input, &sim, step, &label);
         assert_navigation_rng(&sim, &step["rng_after_hex"], &label);
-        let mut continuation = sim.main_rng.snapshot_for_test();
+        let mut continuation = sim.main_rng().snapshot_for_test();
         for draw in step["main_next_four"].as_array().unwrap() {
             assert_eq!(
                 u64::from(continuation.next_u32()),
@@ -948,26 +952,26 @@ fn replay_category_history(
         }
     }
     assert_eq!(
-        sim.main_rng.native_state_hex(),
+        sim.main_rng().native_state_hex(),
         history.rng_after_hex["main"],
         "{}: whole Main history",
         history.id
     );
     assert_eq!(
-        sim.scenario_rng.native_state_hex(),
+        sim.scenario_rng().native_state_hex(),
         history.rng_after_hex["scenario"],
         "{}: whole Scenario history",
         history.id
     );
     assert_eq!(
-        sim.mapgen_rng.native_state_hex(),
+        sim.mapgen_rng().native_state_hex(),
         history.rng_after_hex["mapgen"],
         "{}: whole MapGen history",
         history.id
     );
     for &draw in &history.main_next_four {
         assert_eq!(
-            sim.main_rng.next_u32(),
+            sim.main_rng().next_u32(),
             draw,
             "{}: final Main continuation",
             history.id
@@ -1072,7 +1076,7 @@ fn veterancy_navigation_samples_original_raw_rank_without_cached_rank_writes() {
     for row in &corpus.veterancy_rank_cases {
         let (mut sim, rules) = fixture(&history.inputs, &[]);
         let id = history.inputs.actors[0].id;
-        let entity = sim.entities_mut().get_mut(id).unwrap();
+        let entity = sim.entities_mut_for_test().get_mut(id).unwrap();
         entity
             .veterancy
             .set_raw_for_test(crate::util::native_x87::NativeF32Bits::from_bits(
@@ -1127,11 +1131,11 @@ fn combatant_native_cleanup_boundaries_reconcile_without_resetting_map_scope() {
                 serde_json::from_value(cleanup["map_order"].clone()).unwrap();
             for actor in &history.inputs.actors {
                 if !native_map.contains(&actor.id) {
-                    sim.entities_mut().remove(actor.id);
+                    sim.entities_mut_for_test().remove(actor.id);
                     continue;
                 }
                 let boundary = &cleanup["actor_state"][actor.id.to_string()];
-                let entity = sim.entities_mut().get_mut(actor.id).unwrap();
+                let entity = sim.entities_mut_for_test().get_mut(actor.id).unwrap();
                 entity
                     .lifecycle
                     .set_object_alive_for_test(boundary["alive"].as_bool().unwrap());
@@ -1146,7 +1150,7 @@ fn combatant_native_cleanup_boundaries_reconcile_without_resetting_map_scope() {
             // after lifecycle/refusal. Matching selected bits alone must not
             // keep that provisional ledger alive once its queue is empty.
             assert!(sim.pending_command_snapshot().is_empty());
-            reconcile_selection_order_for_sim(&mut input, &sim, Some(&rules));
+            reconcile_selection_order_for_sim(&mut input, &sim, Some(&rules), &[]);
             assert_eq!(
                 input.selection_order,
                 boundary_ids(cleanup),
@@ -1207,24 +1211,24 @@ fn combatant_native_cleanup_boundaries_reconcile_without_resetting_map_scope() {
                 assert!(sim.selection_voice_request(&rules, id, true).is_some());
             }
             assert_eq!(
-                sim.main_rng.native_state_hex(),
+                sim.main_rng().native_state_hex(),
                 history.rng_after_hex["main"],
                 "{label}: Main continuation"
             );
             for native_draw in &history.main_next_four {
                 assert_eq!(
-                    sim.main_rng.next_u32(),
+                    sim.main_rng().next_u32(),
                     *native_draw,
                     "{label}: next raw Main"
                 );
             }
             assert_eq!(
-                sim.scenario_rng.native_state_hex(),
+                sim.scenario_rng().native_state_hex(),
                 history.rng_after_hex["scenario"],
                 "{label}: Scenario unchanged"
             );
             assert_eq!(
-                sim.mapgen_rng.native_state_hex(),
+                sim.mapgen_rng().native_state_hex(),
                 history.rng_after_hex["mapgen"],
                 "{label}: MapGen unchanged"
             );
@@ -1249,9 +1253,9 @@ fn combatant_pending_transport_uses_selection_queue_and_keeps_native_cleanup_sco
         input.type_select = boundary_mode(&history.steps[0]["before"]);
         input.selection_order = history.selected.clone();
         input.selection_order_pending = true;
-        let actor = sim.entities_mut().get_mut(20).unwrap();
+        let actor = sim.entities_mut_for_test().get_mut(20).unwrap();
         actor.lifecycle.set_in_limbo_for_test(true);
-        let owner = sim.session.current_house.unwrap();
+        let owner = sim.session().current_house().unwrap();
         let command = if queued_selection {
             Command::Select {
                 entity_ids: vec![20],
@@ -1261,7 +1265,7 @@ fn combatant_pending_transport_uses_selection_queue_and_keeps_native_cleanup_sco
             Command::Stop { entity_id: 40 }
         };
         sim.queue_command(CommandEnvelope::new(owner, 2, command));
-        reconcile_selection_order_for_sim(&mut input, &sim, Some(&rules));
+        reconcile_selection_order_for_sim(&mut input, &sim, Some(&rules), &[]);
         assert_eq!(input.selection_order_pending, queued_selection);
         assert_eq!(
             input.selection_order,
@@ -1278,12 +1282,12 @@ fn combatant_pending_transport_uses_selection_queue_and_keeps_native_cleanup_sco
         // Future selection retains the provisional ledger until its existing
         // queue owner drains it. A refused Select after Conceal then closes
         // pending state instead of waiting for impossible bit equality.
-        sim.session.tick = 1;
+        sim.session_mut_for_test().set_tick_for_test(1);
         let due = sim.take_due_commands();
         for command in due {
             let _ = sim.apply_command("local", &command.payload, Some(&rules));
         }
-        reconcile_selection_order_for_sim(&mut input, &sim, Some(&rules));
+        reconcile_selection_order_for_sim(&mut input, &sim, Some(&rules), &[]);
         assert!(!input.selection_order_pending);
         assert!(input.selection_order.is_empty());
         assert_eq!(input.type_select.selection_scope_view().0, "combatant");
@@ -1315,12 +1319,12 @@ fn combatant_histories_match_native_membership_scope_follow_and_voice_continuati
         let mut follow: Option<u64> =
             serde_json::from_value(history.steps[0]["before"]["follow"].clone()).unwrap();
         assert_eq!(
-            sim.main_rng.native_state_hex(),
+            sim.main_rng().native_state_hex(),
             history.rng_before_hex["main"],
             "{label}"
         );
-        let scenario_before = sim.scenario_rng.logical_state();
-        let mapgen_before = sim.mapgen_rng.logical_state();
+        let scenario_before = sim.scenario_rng().logical_state();
+        let mapgen_before = sim.mapgen_rng().logical_state();
         for (index, step) in history.steps.iter().enumerate() {
             if step["command"] != "combatant" {
                 if step["command"] == "ordinary_deselect" {
@@ -1372,7 +1376,7 @@ fn combatant_histories_match_native_membership_scope_follow_and_voice_continuati
                 input = boundary_mode(step);
                 for draw in step["main_draws"].as_array().unwrap() {
                     assert_eq!(
-                        u64::from(sim.main_rng.next_u32()),
+                        u64::from(sim.main_rng().next_u32()),
                         draw.as_u64().unwrap(),
                         "{label} step {index}"
                     );
@@ -1496,12 +1500,12 @@ fn combatant_histories_match_native_membership_scope_follow_and_voice_continuati
                 "{label} step {index}: raw Main draws"
             );
             assert_eq!(
-                sim.scenario_rng.logical_state(),
+                sim.scenario_rng().logical_state(),
                 scenario_before,
                 "{label}: Scenario"
             );
             assert_eq!(
-                sim.mapgen_rng.logical_state(),
+                sim.mapgen_rng().logical_state(),
                 mapgen_before,
                 "{label}: MapGen"
             );
@@ -1555,23 +1559,23 @@ fn combatant_histories_match_native_membership_scope_follow_and_voice_continuati
             p_steps += 1;
         }
         assert_eq!(
-            sim.main_rng.native_state_hex(),
+            sim.main_rng().native_state_hex(),
             history.rng_after_hex["main"],
             "{label}: complete Main continuation"
         );
         assert_eq!(
-            sim.scenario_rng.native_state_hex(),
+            sim.scenario_rng().native_state_hex(),
             history.rng_after_hex["scenario"],
             "{label}"
         );
         assert_eq!(
-            sim.mapgen_rng.native_state_hex(),
+            sim.mapgen_rng().native_state_hex(),
             history.rng_after_hex["mapgen"],
             "{label}"
         );
         for &expected in &history.main_next_four {
             assert_eq!(
-                sim.main_rng.next_u32(),
+                sim.main_rng().next_u32(),
                 expected,
                 "{label}: following raw draw"
             );
@@ -1640,8 +1644,11 @@ fn combatant_defeat_admission_matches_original_early_guard() {
         .unwrap();
     let (mut sim, _) = fixture(&row.inputs, &row.selected);
     assert!(selection_navigation_allowed(&sim));
-    let local = sim.session.current_house.unwrap();
-    sim.houses.get_mut(&local).unwrap().is_defeated = true;
+    let local = sim.session().current_house().unwrap();
+    sim.houses_mut_for_test()
+        .get_mut(&local)
+        .unwrap()
+        .set_is_defeated_for_test(true);
     assert!(!selection_navigation_allowed(&sim));
     let step = &row.steps[0];
     for key in [
@@ -1791,17 +1798,19 @@ fn fixture(inputs: &Inputs, selected: &[u64]) -> (Simulation, RuleSet) {
         }
     }
     let mut sim = Simulation::with_seed(inputs.seed);
-    let local = sim.interner.intern("local");
-    let other = sim.interner.intern("other");
-    sim.session.current_house = Some(local);
-    sim.session.game_mode_nonzero = !inputs.house.campaign;
-    sim.session.house_order = vec![local, other];
-    sim.houses
-        .insert(local, HouseState::new(local, 0, None, true, 0, 10));
+    let local = sim.intern("local");
+    let other = sim.intern("other");
+    sim.session_mut_for_test()
+        .set_current_house_for_test(Some(local));
+    sim.session_mut_for_test().set_game_mode(
+        crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(!inputs.house.campaign),
+    );
+    sim.houses_mut_for_test()
+        .register(HouseState::new(local, 0, None, true, 0, 10));
     let mut other_house = HouseState::new(other, 1, None, inputs.house.other_human, 0, 10);
-    other_house.player_control = inputs.house.other_control;
-    other_house.multiplay_passive = inputs.house.other_passive;
-    sim.houses.insert(other, other_house);
+    other_house.set_player_control_for_test(inputs.house.other_control);
+    other_house.set_multiplay_passive_for_test(inputs.house.other_passive);
+    sim.houses_mut_for_test().register(other_house);
     for actor in &inputs.actors {
         assert!(!actor.robot_offline && actor.techno_cast);
         let category = match actor.kind.as_str() {
@@ -1815,7 +1824,7 @@ fn fixture(inputs: &Inputs, selected: &[u64]) -> (Simulation, RuleSet) {
             "other" => other,
             other => panic!("unexpected native owner {other}"),
         };
-        let type_ref = sim.interner.intern(&format!("ACTOR{}", actor.id));
+        let type_ref = sim.intern(&format!("ACTOR{}", actor.id));
         let mut entity = GameEntity::new_at_frame_zero_for_test(
             actor.id,
             0,
@@ -1867,7 +1876,7 @@ fn fixture(inputs: &Inputs, selected: &[u64]) -> (Simulation, RuleSet) {
         let [x, y, z] = actor.coord;
         entity.position.put_location(DriveCoord { x, y, z });
         if actor.cell_building {
-            let building_type = sim.interner.intern("DOCKBUILDING");
+            let building_type = sim.intern("DOCKBUILDING");
             let mut building = GameEntity::new_at_frame_zero_for_test(
                 1000 + actor.id,
                 entity.position.rx(),
@@ -1884,9 +1893,9 @@ fn fixture(inputs: &Inputs, selected: &[u64]) -> (Simulation, RuleSet) {
             );
             building.lifecycle.set_object_alive_for_test(true);
             building.lifecycle.set_in_limbo_for_test(false);
-            sim.entities_mut().insert(building);
+            sim.entities_mut_for_test().insert(building);
         }
-        sim.entities_mut().insert(entity);
+        sim.entities_mut_for_test().insert(entity);
     }
     // Retained layer state is an input, independent of storage ID order and
     // current sort keys. Use its existing persisted representation. Native
@@ -1905,7 +1914,7 @@ fn fixture(inputs: &Inputs, selected: &[u64]) -> (Simulation, RuleSet) {
     // pair owner. SelectionFixture177..182 also seeds MapGen identically;
     // that explicit input differs from production's fresh MapGen Seed(0).
     sim.initialize_random_number_system(inputs.seed as u32);
-    sim.mapgen_rng = crate::sim::rng::SimRng::new(inputs.seed);
+    *sim.mapgen_rng_mut_for_test() = crate::sim::rng::SimRng::new(inputs.seed);
     for (index, ids) in layers.iter().enumerate() {
         assert_eq!(
             sim.display_layers()
@@ -1950,8 +1959,8 @@ fn next_previous_search_and_candidate_gates_match_original_execution() {
                         entity,
                         sim.entities(),
                         Some(&rules),
-                        Some(&sim.interner),
-                    ) && sim.object_is_selectable(visit.id, Some(&rules))
+                        Some(sim.interner()),
+                    ) && sim.object_is_selectable(visit.id, &rules)
                 }
                 other => panic!("unexpected native gate {other}"),
             };
@@ -2003,7 +2012,8 @@ fn execute_histories_match_selection_follow_modes_placement_and_camera() {
             unrepresented_modes.insert(row.id.as_str());
         }
         // Native fixture input B0FE54=3, B0FE58=1. Reach that state through
-        // the existing mode owner, then use its ordinary-selection reset.
+        // the existing mode owner, then use its ordinary-selection reset:
+        // 731D00 writes mode B0FE54 and submode B0FE58 but keeps scope B0FE64.
         let mut type_select = TypeSelectInputState::default();
         type_select.finish_category_navigation(CategoryNavigationKind::Health, true);
         type_select.across_map = true;
@@ -2042,13 +2052,12 @@ fn execute_histories_match_selection_follow_modes_placement_and_camera() {
                 ordered = effects.ordered;
                 follow = effects.follow_target;
                 pending = true;
-                type_select.reset_scope();
+                type_select.note_successful_selection_mutation(false);
                 let coords: Vec<_> = ordered
                     .iter()
                     .map(|id| {
                         let entity = sim.entities().get(*id).unwrap();
-                        let coord =
-                            ground_pose::object_location(entity, sim.resolved_terrain.as_ref());
+                        let coord = ground_pose::object_location(entity, sim.resolved_terrain());
                         (coord.x, coord.y, coord.z)
                     })
                     .collect();
@@ -2095,8 +2104,10 @@ fn execute_histories_match_selection_follow_modes_placement_and_camera() {
                 "{} step {index}: selection mode",
                 row.id
             );
-            assert_eq!(
-                type_select.across_map, expected.selection_across_map,
+            // The fixture's `selection_across_map` is the B0FE58 submode, not
+            // the scope byte; Select leaves B0FE64 as it was.
+            assert!(
+                type_select.across_map,
                 "{} step {index}: selection scope",
                 row.id
             );
@@ -2209,12 +2220,13 @@ fn snapshot_restores_singleton_anchor_and_retained_layer_order_for_next_key() {
         .max()
         .unwrap()
     {
-        sim.allocate_stable_id();
+        sim.substrate_mut_for_test().allocate_stable_id();
     }
     for actor in &row.inputs.actors {
         sim.register_live_object(actor.id);
     }
-    sim.session.map_name = row.id.clone();
+    sim.session_mut_for_test()
+        .set_map_name_for_test(row.id.clone());
     let current = selected_stable_ids_in_order(Some(&sim), Some(&rules), &row.selected, false);
     let candidate = next_object(
         &sim,

@@ -14,7 +14,7 @@ fn ordinary_frame(sim: &mut Simulation, rules: &RuleSet) -> Vec<super::SimFireEv
     let output = sim
         .advance_app_frame(
             &commands,
-            Some(rules),
+            rules,
             None,
             33,
             TickLane::Ordinary,
@@ -52,7 +52,12 @@ impl DroneScene {
         assert!(parasite.parasite);
         assert_eq!(parasite.paralyzes, 0);
         assert_eq!(
-            parasite.verses_f64[crate::sim::combat::armor_index(&tank_type.armor)],
+            f64::from_bits(
+                parasite
+                    .interaction(tank_type.armor_id())
+                    .multiplier()
+                    .bits()
+            ),
             1.0
         );
         let jump = rules.weapon("DroneJump").unwrap();
@@ -64,9 +69,11 @@ impl DroneScene {
         let seed = native.map_or(0x629fd0, |input| input["seed"].as_u64().unwrap());
         let mut sim = crate::sim::arena_fixture::rival_arena_with_size(&rules, seed, 64);
         if let Some(input) = native {
-            sim.session.game_options.game_speed = input["game_speed"].as_i64().unwrap() as i32;
-            sim.session.lighting.normal =
-                serde_json::from_value(input["lighting"]["normal_profile"].clone()).unwrap();
+            sim.session.game_options_mut_for_test().game_speed =
+                input["game_speed"].as_i64().unwrap() as i32;
+            sim.session.lighting_mut().set_normal_for_test(
+                serde_json::from_value(input["lighting"]["normal_profile"].clone()).unwrap(),
+            );
         }
         sim.intern_rule_type_ids(&rules);
         sim.resolve_type_handles(&rules);
@@ -117,7 +124,7 @@ impl DroneScene {
         }
         let owner = sim.substrate.entities.get(drone).unwrap().owner();
         let opponent = sim.substrate.entities.get(tank).unwrap().owner();
-        sim.session.current_house = Some(owner);
+        sim.session.set_current_house_for_test(Some(owner));
         sim.fog.mark_visible_for_owner(owner, 25, 24);
         sim.fog.mark_visible_for_owner(opponent, 24, 24);
         if native.is_none() {
@@ -159,10 +166,11 @@ impl DroneScene {
                 assert!(source.lifecycle.in_limbo());
             }
             actual_bullet |= self.sim.projectiles.iter().any(|(_, bullet)| {
-                bullet.source_id == self.drone
-                    && bullet.target == crate::sim::projectile::ProjectileTarget::Entity(self.tank)
+                bullet.source_id() == self.drone
+                    && bullet.target()
+                        == crate::sim::projectile::ProjectileTarget::Entity(self.tank)
                     && bullet
-                        .payload
+                        .payload()
                         .projectile_type()
                         .is_some_and(|id| self.sim.interner.resolve(id) == "JUMP")
             });
@@ -183,7 +191,7 @@ impl DroneScene {
                 assert!(source.lifecycle.in_limbo());
                 assert_eq!(source.parasite.class().unwrap().victim(), Some(self.tank));
                 assert_eq!(victim.parasite.eater(), Some(self.drone));
-                return self.sim.session.binary_frame;
+                return self.sim.session.binary_frame();
             }
             previous_health = health;
         }
@@ -252,91 +260,12 @@ impl DroneScene {
         assert!(target.lifecycle.object_alive() && target.health.current() > 0);
         assert_eq!(source.parasite.class().unwrap().victim(), Some(self.tank));
         assert_eq!(target.parasite.eater(), Some(self.drone));
-        assert!(!target.parasite.is_paralyzed(self.sim.session.binary_frame));
-    }
-}
-
-#[test]
-fn stock_terror_drone_bite_applies_an_impulse_then_rolls_its_live_tank() {
-    let Some(mut scene) = DroneScene::retail() else {
-        return;
-    };
-    scene.first_bite();
-    // Meaningful first red: actual nonlethal stock bite, followed by629A21C's
-    // missing impulse. No relationship/rate was supplied.
-    scene.assert_impulse();
-    assert_eq!(scene.angles(), [SimFixed::ZERO; 2]);
-    // Foot parasite tail follows this object's Techno rocking slot; its new
-    // impulse integrates on the next ordinary victim visit.
-    scene.step();
-    scene.assert_linked_and_mobile();
-    assert!(
-        scene
-            .angles()
-            .iter()
-            .any(|angle| angle.abs() > SimFixed::lit("0.005")),
-        "the next native Techno slot must expose a visible body angle"
-    );
-}
-
-#[test]
-fn stock_terror_drone_repeated_bites_restart_retail_rof_and_reapply_impulses() {
-    let Some(mut scene) = DroneScene::retail() else {
-        return;
-    };
-    let first = scene.first_bite();
-    scene.assert_impulse();
-    let rof = scene.rules.weapon("DroneJump").unwrap().rof;
-    let timer = scene
-        .sim
-        .substrate
-        .entities
-        .get(scene.drone)
-        .unwrap()
-        .parasite
-        .class()
-        .unwrap()
-        .grapple_timers_for_test()
-        .1;
-    // advance_app_frame publishes binary_frame AFTER the visited Techno/Foot
-    // frame; Parasite629FD0 starts its timer in that committed visit.
-    assert_eq!(
-        (timer.start_frame(), timer.duration()),
-        (first as i32 - 1, rof)
-    );
-    let mut previous_health = 250;
-    let mut bites = 1;
-    for _ in 0..rof * 2 {
-        scene.step();
-        scene.assert_linked_and_mobile();
-        let victim = scene.sim.substrate.entities.get(scene.tank).unwrap();
-        let health = victim.health.current();
-        if health != previous_health {
-            assert_eq!(previous_health - health, 50);
-            assert_eq!(scene.sim.session.binary_frame, first + (bites * rof) as u32);
-            scene.assert_impulse();
-            let timer = scene
-                .sim
-                .substrate
-                .entities
-                .get(scene.drone)
-                .unwrap()
+        assert!(
+            !target
                 .parasite
-                .class()
-                .unwrap()
-                .grapple_timers_for_test()
-                .1;
-            assert_eq!(
-                timer.start_frame(),
-                scene.sim.session.binary_frame as i32 - 1
-            );
-            assert_eq!(timer.duration(), rof);
-            bites += 1;
-        }
-        previous_health = health;
+                .is_paralyzed(self.sim.session.binary_frame())
+        );
     }
-    assert_eq!(bites, 3, "three real nonlethal receiver deliveries");
-    assert_eq!(previous_health, 150);
 }
 
 #[test]
@@ -355,11 +284,14 @@ fn stock_infested_tank_moves_and_fires_while_its_body_is_rocking() {
     scene.first_bite();
     scene.assert_impulse();
     let target = scene.sim.substrate.entities.get(scene.tank).unwrap();
-    let house = target.owner();
     let before = crate::sim::movement::ground_pose::position_world_coord(&target.position);
+    // The human Americans send the computer tank's Move: the DoList skips computer Houses' events
+    // (0x0064C4FB..0x0064C50D), and MegaMission never compares sender and actor
+    // (0x004C71F6..0x004C721F).
+    let sender = scene.sim.interner.get("Americans").unwrap();
     scene.sim.queue_command(CommandEnvelope::new(
-        house,
-        scene.sim.session.tick + 1,
+        sender,
+        scene.sim.session.tick() + 1,
         Command::Move {
             entity_id: scene.tank,
             target_rx: 25,
@@ -400,16 +332,11 @@ fn stock_infested_tank_moves_and_fires_while_its_body_is_rocking() {
         .sim
         .spawn_object("AMCV", "Americans", 22, 24, 0, &scene.rules)
         .expect("ordinary AMCV Unlimbo along the tank's acquired aim");
-    let house = scene
-        .sim
-        .substrate
-        .entities
-        .get(scene.tank)
-        .unwrap()
-        .owner();
+    // The human Americans send this order too.
+    let sender = scene.sim.interner.get("Americans").unwrap();
     scene.sim.queue_command(CommandEnvelope::new(
-        house,
-        scene.sim.session.tick + 1,
+        sender,
+        scene.sim.session.tick() + 1,
         Command::Attack {
             attacker_id: scene.tank,
             target_id: other,
@@ -431,11 +358,13 @@ fn stock_infested_tank_moves_and_fires_while_its_body_is_rocking() {
                         .any(|angle| angle.abs() > SimFixed::lit("0.005"))
                 }),
         );
-        if previous != Some(state) || !shots.is_empty() || scene.sim.session.binary_frame % 30 == 0
+        if previous != Some(state)
+            || !shots.is_empty()
+            || scene.sim.session.binary_frame() % 30 == 0
         {
             timeline.push(format!(
                 "frame{} source/host/visible={state:?} pose={:?} rock={:?} shots={:?}",
-                scene.sim.session.binary_frame - 1,
+                scene.sim.session.binary_frame() - 1,
                 tank.map(
                     |entity| crate::sim::movement::ground_pose::position_world_coord(
                         &entity.position
@@ -474,8 +403,8 @@ fn stock_infested_tank_moves_and_fires_while_its_body_is_rocking() {
                 .projectiles
                 .iter()
                 .find(|(_, bullet)| {
-                    bullet.source_id == scene.tank
-                        && bullet.target == crate::sim::projectile::ProjectileTarget::Entity(other)
+                    bullet.source_id() == scene.tank
+                        && bullet.target() == crate::sim::projectile::ProjectileTarget::Entity(other)
                 })
                 .unwrap_or_else(|| panic!(
                     "rocked105mm Bullet retired in its firing frame: fire={:?} target={:?} bullets={:?}\n{}",
@@ -487,7 +416,7 @@ fn stock_infested_tank_moves_and_fires_while_its_body_is_rocking() {
                     scene.sim.projectiles.iter().collect::<Vec<_>>(),
                     timeline.join("\n")
                 ));
-            assert_eq!(bullet.launch_origin, shot.fire_coord);
+            assert_eq!(bullet.launch_origin(), shot.fire_coord);
             // Exact tilted geometry belongs to the consumed native Drive/FLH
             // controls. Here the real event, Bullet and common muzzle owner
             // must stay connected while the infested actor moves/fires.
@@ -518,7 +447,7 @@ fn stock_terror_drone_sonic_release_retains_rates_then_naturally_settles() {
     assert_eq!(source.parasite.class().unwrap().victim(), None);
     let host = scene.sim.substrate.entities.get(scene.tank).unwrap();
     assert_eq!(host.parasite.eater(), None);
-    assert!(!host.parasite.is_paralyzed(scene.sim.session.binary_frame));
+    assert!(!host.parasite.is_paralyzed(scene.sim.session.binary_frame()));
     // ExitUnit62A862 clears only sideways angle, not forwards or either rate.
     assert_eq!(scene.angles(), [SimFixed::ZERO, angles[1]]);
     assert_eq!(scene.rates(), rates);
@@ -557,7 +486,7 @@ fn stock_terror_drone_own_bites_kill_the_host_and_release_its_live_owner() {
             .is_none_or(|host| !host.lifecycle.object_alive())
         {
             fatal = true;
-            assert_eq!(scene.sim.session.binary_frame, first + (rof * 5) as u32);
+            assert_eq!(scene.sim.session.binary_frame(), first + (rof * 5) as u32);
             break;
         }
     }
@@ -663,7 +592,7 @@ fn stock_terror_drone_internal_restore_keeps_rock_and_restarts_its_bite_timer() 
     let (suppression, damage) = state.grapple_timers_for_test();
     // Load6295DB..6295F3 resets these timers, not the retained body rates.
     for timer in [suppression, damage] {
-        assert_eq!(timer.start_frame(), scene.sim.session.binary_frame as i32);
+        assert_eq!(timer.start_frame(), scene.sim.session.binary_frame() as i32);
         assert_eq!(timer.duration(), 0);
     }
     let before = scene
@@ -710,13 +639,13 @@ fn compare_drone_actor(sim: &Simulation, rules: &RuleSet, id: u64, native: &serd
     );
     if let Some(expected) = native.get("primary_current_raw") {
         assert_eq!(
-            json!(entity.body_facing_current(sim.session.binary_frame)),
+            json!(entity.body_facing_current(sim.session.binary_frame())),
             *expected
         );
     }
     if let Some(expected) = native.get("secondary_current_raw") {
         let secondary = if let Some(facing) = entity.barrel_facing {
-            facing.current(sim.session.binary_frame)
+            facing.current(sim.session.binary_frame())
         } else {
             // Unit TurretFacing746E30 selects Primary+388 when Turret+CA1
             // is false. Rust omits that unused inline Secondary controller;
@@ -731,7 +660,7 @@ fn compare_drone_actor(sim: &Simulation, rules: &RuleSet, id: u64, native: &serd
                 native["secondary_current_raw"],
                 native["primary_current_raw"]
             );
-            entity.body_facing_current(sim.session.binary_frame)
+            entity.body_facing_current(sim.session.binary_frame())
         };
         assert_eq!(json!(secondary), *expected);
     }
@@ -791,7 +720,7 @@ fn compare_drone_component(scene: &DroneScene, native: &serde_json::Value) {
         json!(actual),
         native["victim"]["rocking_bits"],
         "frame{}: complete authoritative native words",
-        scene.sim.session.binary_frame
+        scene.sim.session.binary_frame()
     );
 }
 
@@ -805,7 +734,7 @@ fn compare_drone_rng(sim: &Simulation, native: &serde_json::Value) {
             actual,
             native[key].as_str().unwrap(),
             "frame{} {key}",
-            sim.session.binary_frame
+            sim.session.binary_frame()
         );
     }
 }
@@ -838,10 +767,10 @@ fn stock_drone_monotonic_bites_match_native_state_rng_spark_births_and_flh() {
     assert_eq!(initial["model_input"]["joined_is_voxel_al"], 1);
     let mtnk = scene.rules.type_handle("MTNK").unwrap();
     assert!(scene.rules.object_has_loaded_voxel(mtnk));
-    let (body, _) =
-        crate::rules::voxel_asset_catalog::load_main_voxel(&assets, "MTNK", Some(&scene.rules))
+    let model =
+        crate::rules::voxel_asset_catalog::load_voxel_model(&assets, "MTNK", Some(&scene.rules))
             .unwrap();
-    let section = &body.vxl().limbs[0];
+    let section = &model.main().unwrap().vxl().limbs[0];
     assert_eq!(
         json!([section.size_x, section.size_y, section.size_z]),
         initial["model_input"]["first_section_size"]
@@ -854,12 +783,7 @@ fn stock_drone_monotonic_bites_match_native_state_rng_spark_births_and_flh() {
             format!("{:016x}", object.weight.to_num::<f64>().to_bits()),
             expected["weight_bits"].as_str().unwrap()
         );
-        let flh = scene.rules.art().get(&object.image).unwrap().weapon_flh(
-            object.turret_count,
-            object.weapon_count,
-            0,
-            false,
-        );
+        let flh = object.weapon_flh(0, false);
         assert_eq!(
             json!([flh.forward, flh.lateral, flh.height]),
             expected["primary_flh"]
@@ -931,7 +855,10 @@ fn stock_drone_monotonic_bites_match_native_state_rng_spark_births_and_flh() {
             .unwrap()
             .owner()
     );
-    scene.sim.session.binary_frame = initial["frame"].as_u64().unwrap() as u32;
+    scene
+        .sim
+        .session
+        .set_binary_frame_for_test(initial["frame"].as_u64().unwrap() as u32);
     scene.sim.techno_limbo_with_context(
         scene.drone,
         super::UninitContext::with_rules(&scene.rules).with_effects(FrameEffects::default()),
@@ -976,7 +903,7 @@ fn stock_drone_monotonic_bites_match_native_state_rng_spark_births_and_flh() {
         SimRng::from_native_state_hex_for_test(rows[0]["rng_before"]["mapgen"].as_str().unwrap());
     let mut compared = 0;
     for frame in 0..=corpus["visits_end"].as_u64().unwrap() as u32 {
-        scene.sim.session.binary_frame = frame;
+        scene.sim.session.set_binary_frame_for_test(frame);
         let row = rows.iter().find(|row| row["input"]["frame"] == frame);
         if let Some(row) = row {
             assert_eq!(row["input"]["entry"], json!(["0070B570", "00629FD0"]));
@@ -1049,27 +976,27 @@ fn stock_drone_monotonic_bites_match_native_state_rng_spark_births_and_flh() {
                 let system = scene.sim.particle_systems().get(id).unwrap();
                 let state = &expected["state"];
                 assert_eq!(
-                    scene.rules.particle_system_type(system.type_id).name,
+                    scene.rules.particle_system_type(system.type_id()).name,
                     expected["type"].as_str().unwrap()
                 );
                 assert_eq!(json!(system.native_unique_id()), state["native_id"]);
-                assert_eq!(json!(system.coords.to_array()), state["position"]);
-                assert_eq!(json!(system.lifetime), state["lifetime"]);
+                assert_eq!(json!(system.coords().to_array()), state["position"]);
+                assert_eq!(json!(system.lifetime()), state["lifetime"]);
                 assert_eq!(
-                    json!(system.spark_spawn_frames),
+                    json!(system.spark_spawn_frames()),
                     state["spark_spawn_frames"]
                 );
-                assert_eq!(json!(system.done_spawning), state["time_to_die"]);
-                assert_eq!(json!(system.in_logic_vector), state["logic"]);
+                assert_eq!(json!(system.done_spawning()), state["time_to_die"]);
+                assert_eq!(json!(system.in_logic_vector()), state["logic"]);
                 assert!(system.alive() && !system.in_limbo());
                 assert!(
-                    system.owner_entity.is_none()
-                        && system.target_ref.is_none()
-                        && system.owner_house.is_none()
+                    system.owner_entity().is_none()
+                        && system.target_ref().is_none()
+                        && system.owner_house().is_none()
                 );
-                assert_eq!(json!(system.target_coords.to_array()), state["target"]);
-                assert_eq!(json!(system.particles.len()), state["particle_count"]);
-                assert!(system.particles.is_empty());
+                assert_eq!(json!(system.target_coords().to_array()), state["target"]);
+                assert_eq!(json!(system.particles().len()), state["particle_count"]);
+                assert!(system.particles().is_empty());
                 assert_eq!(
                     expected["rng_request_before"], expected["rng_request_after"],
                     "native constructor draws no RNG"

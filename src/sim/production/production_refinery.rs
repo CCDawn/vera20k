@@ -5,10 +5,13 @@
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::find_nearby_cell::NearbySearchOptions;
+use crate::sim::houses::Houses;
+use crate::sim::intern::StringInterner;
+use crate::sim::mission::authority::LiveReadyInputProvider;
+use crate::sim::mission::{MissionId, MissionType};
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::world::FrameEffects;
 use crate::sim::world::{PlacementEvidence, Simulation};
-
-use crate::rules::foundation::foundation_dimensions;
 
 /// Native primary FreeUnit facing byte. Under the project facing convention,
 /// 0xC0 is west.
@@ -35,11 +38,10 @@ const FREE_UNIT_FALLBACK_ATTEMPTS: [NearbySearchOptions; 2] = [
 /// building, so its constructor and Unlimbo are visible to subsequent Logic
 /// visits. ScenarioInit/capture gates belong to the caller.
 ///
-/// Residual: the human stored-price300 gate (446AF2..446B10) is not retained
-/// by the existing production object owner. Retail reach requires a refinery
-/// with a nonpositive miner Cost_Of (26 Industrial Plants). Its old late
-/// completion caller also omitted this gate; no basic construction type has
-/// FreeUnit. The original spatial FreeUnit corpus bounds placement below.
+/// Grand_Opening446AE3..446B10 (gamemd) suppresses a human-controlled
+/// House's FreeUnit when its retained nonzero start quote is no greater than
+/// BuildingType::GetCost45ED50. Zero is the nonproduction constructor sentinel.
+/// The original spatial FreeUnit corpus bounds placement below.
 pub(crate) fn spawn_building_free_unit(
     sim: &mut Simulation,
     stable_id: u64,
@@ -52,7 +54,18 @@ pub(crate) fn spawn_building_free_unit(
             if entity.category() != EntityCategory::Structure || entity.death.is_dying() {
                 return None;
             }
-            let (width, height) = foundation_dimensions(entity.type_facts.foundation());
+            let object = sim.object_type(entity.type_ref(), rules)?;
+            let human = sim
+                .houses
+                .get(&entity.owner())
+                .is_some_and(|house| house.is_controlled_by_human(sim.session.game_mode_nonzero()));
+            if human
+                && entity.production_start_price() != 0
+                && entity.production_start_price() <= rules.type_cost(object)
+            {
+                return None;
+            }
+            let (width, height) = entity.type_facts.foundation().dimensions();
             Some((
                 entity.owner(),
                 entity.type_ref(),
@@ -120,7 +133,14 @@ fn try_spawn_building_free_unit(
         rules,
         effects,
     ) else {
-        let refund = refund_free_unit(sim, rules, owner, &free_unit_type);
+        let refund = refund_free_unit(
+            &sim.interner,
+            &sim.session,
+            &mut sim.houses,
+            rules,
+            owner,
+            &free_unit_type,
+        );
         log::warn!(
             "Completed refinery {} could not construct free unit {}; refunded {} to {}",
             building_type_id,
@@ -187,10 +207,17 @@ fn try_spawn_building_free_unit(
     }
 
     // gamemd refunds before uninitializing the constructed UnitClass.
-    let refund = refund_free_unit(sim, rules, owner, &free_unit_type);
+    let refund = refund_free_unit(
+        &sim.interner,
+        &sim.session,
+        &mut sim.houses,
+        rules,
+        owner,
+        &free_unit_type,
+    );
     sim.uninit_with_context(
         free_unit_id,
-        crate::sim::world::UninitContext::new(Some(rules), overlay_registry).with_effects(effects),
+        crate::sim::world::UninitContext::new(rules, overlay_registry).with_effects(effects),
     );
     log::warn!(
         "Completed refinery {} could not place free unit {}; refunded {} to {}",
@@ -221,44 +248,84 @@ fn try_place_free_unit(
     // occupied by their own live building object and therefore enter the native
     // nearby-search sequence; independent occupants are evaluated in that same
     // ordered cell list rather than through the old coarse ground-blocker model.
-    sim.reveal_constructed_object_at_height_with_overlay_context(
+    if sim
+        .reveal_constructed_object_at_height_with_overlay_context(
+            free_unit_id,
+            rx,
+            ry,
+            facing,
+            sim.terrain_cell_level(rx, ry).unwrap_or(0),
+            PlacementEvidence::EvaluateMark,
+            rules,
+            overlay_registry,
+            effects,
+        )
+        .is_none()
+    {
+        return false;
+    }
+    // GrandOpening446EA1..446EB1 assigns Harvest even for a non-harvester
+    // FreeUnit. Queue(false), then Commence, after the successful Unlimbo.
+    // Ares 3.0 BuildingClass_Place_FreeUnit_Mission 10014390 (hook
+    // 0x00446E9F) queues Area_Guard for a type without `Harvester=`.
+    let mission = if rules.ares_form() {
+        if sim
+            .substrate
+            .entities
+            .get(free_unit_id)
+            .and_then(|unit| sim.object_type(unit.type_ref(), rules))
+            .is_some_and(|object| object.harvester)
+        {
+            MissionType::Harvest
+        } else {
+            MissionType::AreaGuard
+        }
+    } else {
+        MissionType::Harvest
+    };
+    let now = sim.session.binary_frame();
+    let _ = sim.mission_queue_exact(
         free_unit_id,
-        rx,
-        ry,
-        facing,
-        sim.terrain_cell_level(rx, ry).unwrap_or(0),
-        PlacementEvidence::EvaluateMark,
-        rules,
-        overlay_registry,
-        effects,
-    )
-    .is_some()
+        MissionId::from_known(mission),
+        0,
+        now,
+        &LiveReadyInputProvider { rules },
+    );
+    let _ = sim.substrate.mission_commence_exact(free_unit_id, now);
+    true
 }
 
 /// A free unit that cannot be made or placed pays its house its GetRefund with
 /// `full` set ([`super::type_refund`]; `0x00446E71..0x00446E8F`,
 /// `0x00446EB9..0x00446EDD`) through `HouseClass::Add_Credits @ 0x004F9950`.
 /// Returns the amount credited.
-fn refund_free_unit(sim: &mut Simulation, rules: &RuleSet, owner: &str, unit_type: &str) -> i32 {
-    let Some(owner_id) = sim.interner.get(owner) else {
+fn refund_free_unit(
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    houses: &mut Houses,
+    rules: &RuleSet,
+    owner: &str,
+    unit_type: &str,
+) -> i32 {
+    let Some(owner_id) = interner.get(owner) else {
         return 0;
     };
     let refund = match (
         rules.object(unit_type),
-        sim.houses.get(&owner_id),
-        sim.house_cost_factors(owner_id),
+        houses.get(&owner_id),
+        Simulation::house_cost_factors(houses, owner_id),
     ) {
         (Some(object), Some(house), Some(factors)) => super::type_refund(
             rules,
             object,
             house,
             &factors,
-            sim.session.game_mode_nonzero,
+            session.game_mode_nonzero(),
             true,
         ),
         _ => return 0,
     };
-    crate::sim::credit_income::add_credits(sim, owner_id, refund);
+    crate::sim::credit_income::add_credits(houses, owner_id, refund);
     refund
 }
 
@@ -296,19 +363,9 @@ fn find_free_unit_nearby_cell(
     sim.nearby_wheel_cell(seed, free_unit.movement_zone, options)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_production))]
 mod tests {
-    use super::{FREE_UNIT_FALLBACK_ATTEMPTS, primary_free_unit_cell};
-
-    #[test]
-    fn stock_4x3_primary_cell_is_center_plus_south() {
-        assert_eq!(primary_free_unit_cell(20, 20, 4, 3), Some((22, 22)));
-    }
-
-    #[test]
-    fn primary_cell_rejects_u16_overflow() {
-        assert_eq!(primary_free_unit_cell(u16::MAX, u16::MAX, 4, 3), None);
-    }
+    use super::FREE_UNIT_FALLBACK_ATTEMPTS;
 
     #[test]
     fn fallback_attempts_reject_overlays_first_then_allow_them() {

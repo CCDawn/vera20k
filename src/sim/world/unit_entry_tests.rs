@@ -5,13 +5,17 @@ use crate::sim::movement::{DriveLocomotionRuntime, ShipLocomotionRuntime};
 use crate::sim::occupancy::CellListInsertion;
 use crate::util::fixed_math::SimFixed;
 
+/// The numeric results and repair projection, the playfield boundary
+/// permissions and the actual blocker movement state.
 #[test]
-fn unit_entry_preserves_original_numeric_results_and_repair_projection() {
-    compare_rows(
-        crate::test_fixture::text("tools/spatial_oracle/unit_entry.json"),
-        150,
-        true,
-    );
+fn unit_entry_matches_original_results_boundaries_and_blocker_motion() {
+    for (path, count) in [
+        ("tools/spatial_oracle/unit_entry.json", 150),
+        ("tools/spatial_oracle/unit_entry_boundary.json", 100),
+        ("tools/spatial_oracle/unit_entry_motion.json", 56),
+    ] {
+        compare_rows(crate::test_fixture::text(path), count, true);
+    }
 }
 
 #[test]
@@ -21,24 +25,6 @@ fn unit_entry_matches_original_height_bridge_and_tube_traversal() {
         crate::test_fixture::text("tools/spatial_oracle/unit_entry_traversal.json"),
         328,
         false,
-    );
-}
-
-#[test]
-fn unit_entry_matches_original_playfield_boundary_permissions() {
-    compare_rows(
-        crate::test_fixture::text("tools/spatial_oracle/unit_entry_boundary.json"),
-        100,
-        true,
-    );
-}
-
-#[test]
-fn unit_entry_reads_actual_blocker_movement_state() {
-    compare_rows(
-        crate::test_fixture::text("tools/spatial_oracle/unit_entry_motion.json"),
-        56,
-        true,
     );
 }
 
@@ -66,20 +52,21 @@ fn a_closed_gate_asks_its_own_house_about_the_mover() {
         "[VehicleTypes]\n0=MOVER\n[BuildingTypes]\n1=GATE\n\
          [MOVER]\nSpeedType=Track\n[GATE]\nFoundation=1x1\nGate=yes\n",
     );
-    sim.session.binary_frame = 100;
+    sim.session.set_binary_frame_for_test(100);
     let mut mover = GameEntity::test_default(90, "MOVER", "Americans", 10, 10);
     mover.set_owner_for_test(sim.intern("Americans"));
     mover.set_type_ref_for_test(sim.intern("MOVER"));
     mover.set_category_for_test(EntityCategory::Unit);
     mover.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
     sim.substrate.entities.insert(mover);
-    sim.mission_assign_exact(90, crate::sim::mission::MissionId::from_raw(5), 100)
+    sim.substrate
+        .mission_assign_exact(90, crate::sim::mission::MissionId::from_raw(5), 100)
         .unwrap();
     let mut gate = GameEntity::test_default(91, "GATE", "Russians", 11, 10);
     gate.set_owner_for_test(sim.intern("Russians"));
     gate.set_type_ref_for_test(sim.intern("GATE"));
     gate.set_category_for_test(EntityCategory::Structure);
-    gate.building_gate = Some(Default::default());
+    gate.building.building_gate = Some(Default::default());
     sim.substrate.entities.insert(gate);
     sim.substrate.occupancy.add(
         11,
@@ -151,7 +138,7 @@ fn unit_post_walk_tail_matches_original_crush_controls() {
                     "no"
                 }
             ));
-        sim.session.binary_frame = 100;
+        sim.session.set_binary_frame_for_test(100);
         let nodes = |layer: &str| input[layer].as_array().unwrap().clone();
         // The oracle's houses: the mover's allies the third, and a
         // `reverse_allied` target's House allies the mover's one way.
@@ -281,14 +268,15 @@ fn an_unarmed_train_answers_five_where_an_unarmed_unit_answers_seven() {
                 crate::sim::world::entry_test_fixture::fixture_with_rules(&format!(
                     "[VehicleTypes]\n0=MOVER\n[MOVER]\nSpeedType=Track\nIsTrain={train}\n"
                 ));
-            sim.session.binary_frame = 100;
+            sim.session.set_binary_frame_for_test(100);
             let mut mover = GameEntity::test_default(90, "MOVER", "Americans", 10, 10);
             mover.set_owner_for_test(sim.intern("Americans"));
             mover.set_type_ref_for_test(sim.intern("MOVER"));
             mover.set_category_for_test(EntityCategory::Unit);
             mover.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
             sim.substrate.entities.insert(mover);
-            sim.mission_assign_exact(90, crate::sim::mission::MissionId::from_raw(5), 100)
+            sim.substrate
+                .mission_assign_exact(90, crate::sim::mission::MissionId::from_raw(5), 100)
                 .unwrap();
             let enemy = sim.intern("Russians");
             if listed {
@@ -315,29 +303,35 @@ fn an_unarmed_train_answers_five_where_an_unarmed_unit_answers_seven() {
                 .as_ref()
                 .unwrap()
                 .native_cell_identity((11, 10));
-            let live = EntryReadContext {
-                sim: &sim,
-                rules: &rules,
-                registry: Some(&registry),
-                facts: None,
-            };
-            let args = InfantryEntryArgs {
-                direction: -1,
-                height: -1,
-                previous_cell: None,
-            };
-            assert_eq!(
-                classify_entry(&live, CellObjectMember::Entity(90), cell, args),
-                Ok(expected),
-                "IsTrain={train}, listed={listed}"
-            );
+            // A path batch's kept facts walk the infantryman's list too.
+            let kept = EntryFacts::fitted(&sim);
+            for facts in [None, Some(&kept)] {
+                let live = EntryReadContext {
+                    sim: &sim,
+                    rules: &rules,
+                    registry: Some(&registry),
+                    facts,
+                };
+                let args = InfantryEntryArgs {
+                    direction: -1,
+                    height: -1,
+                    previous_cell: None,
+                };
+                assert_eq!(
+                    classify_entry(&live, CellObjectMember::Entity(90), cell, args),
+                    Ok(expected),
+                    "IsTrain={train}, listed={listed}, kept={}",
+                    facts.is_some()
+                );
+            }
         }
     }
 }
 
 /// A Unit's walk meets a terrain object through the weapon it would fire at
 /// it (`0x0073FBAC`, `+0x2E4`): 5 for a `Wood=` warhead, else 7. A crusher is
-/// no exception, however the terrain's type spells `Crushable=`.
+/// no exception, however the terrain's type spells `Crushable=`. A path
+/// batch's kept facts meet it too.
 #[test]
 fn a_crusher_meets_a_terrain_object_with_its_weapon() {
     for (mover, expected) in [
@@ -352,37 +346,51 @@ fn a_crusher_meets_a_terrain_object_with_its_weapon() {
                  [SAW]\nDamage=10\nROF=20\nRange=5\nProjectile=SAWBULLET\nWarhead=CHOP\n\
                  [SAWBULLET]\nAG=yes\n[CHOP]\nWood=yes\n"
             ));
-        sim.session.binary_frame = 100;
+        sim.session.set_binary_frame_for_test(100);
         let mut unit = GameEntity::test_default(90, "MOVER", "Americans", 10, 10);
         unit.set_owner_for_test(sim.intern("Americans"));
         unit.set_type_ref_for_test(sim.intern("MOVER"));
         unit.set_category_for_test(EntityCategory::Unit);
         unit.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
         sim.substrate.entities.insert(unit);
-        sim.mission_assign_exact(90, crate::sim::mission::MissionId::from_raw(5), 100)
+        sim.substrate
+            .mission_assign_exact(90, crate::sim::mission::MissionId::from_raw(5), 100)
             .unwrap();
-        sim.production.terrain_object_cells.insert((11, 10), 900);
+        crate::sim::terrain_spawn::construct_terrain_objects(
+            &mut sim,
+            &[crate::map::overlay::TerrainObject {
+                rx: 11,
+                ry: 10,
+                name: "TREE01".into(),
+            }],
+            &rules,
+            false,
+        );
         let cell = sim
             .resolved_terrain
             .as_ref()
             .unwrap()
             .native_cell_identity((11, 10));
-        let live = EntryReadContext {
-            sim: &sim,
-            rules: &rules,
-            registry: Some(&registry),
-            facts: None,
-        };
-        let args = InfantryEntryArgs {
-            direction: -1,
-            height: -1,
-            previous_cell: None,
-        };
-        assert_eq!(
-            classify_entry(&live, CellObjectMember::Entity(90), cell, args),
-            Ok(expected),
-            "{mover}"
-        );
+        let kept = EntryFacts::fitted(&sim);
+        for facts in [None, Some(&kept)] {
+            let live = EntryReadContext {
+                sim: &sim,
+                rules: &rules,
+                registry: Some(&registry),
+                facts,
+            };
+            let args = InfantryEntryArgs {
+                direction: -1,
+                height: -1,
+                previous_cell: None,
+            };
+            assert_eq!(
+                classify_entry(&live, CellObjectMember::Entity(90), cell, args),
+                Ok(expected),
+                "{mover}, kept={}",
+                facts.is_some()
+            );
+        }
     }
 }
 
@@ -425,6 +433,18 @@ fn compare_rows(json: &str, expected_count: usize, repair_projection: bool) {
             input["ag"].as_bool().unwrap_or(true),
             flag("wall_weapon"),
         );
+        // The oracle installs each supplied blocker's concrete native class
+        // and type vtable. Keep its shared fields in that same registry.
+        let nodes = input["objects"].as_array().into_iter().flatten();
+        if nodes.clone().any(|node| {
+            node["motion"]["family"] == "walk"
+                || (node["motion"]["family"] == "jumpjet" && node["infantry"] == true)
+        }) {
+            extra.push_str("[InfantryTypes]\n2=BLOCKER\n");
+        }
+        if nodes.clone().any(|node| node["motion"]["family"] == "fly") {
+            extra.push_str("[AircraftTypes]\n1=BLOCKER\n");
+        }
         if input.get("wall").is_some() {
             extra.push_str(&format!("[O0]\nWall=yes\nCrushable={}\n", flag("wall")));
         }
@@ -469,7 +489,7 @@ fn compare_rows(json: &str, expected_count: usize, repair_projection: bool) {
                 .resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(x, y)
+                .cell_mut_for_test(x, y)
                 .unwrap();
             cell.level = input_cell[2].as_u64().unwrap() as u8;
             cell.bridge_facts.raw_flags = input_cell[3].as_u64().unwrap() as u32;
@@ -479,7 +499,7 @@ fn compare_rows(json: &str, expected_count: usize, repair_projection: bool) {
             sim.resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(x, y)
+                .cell_mut_for_test(x, y)
                 .unwrap()
                 .slope_type = slope[2].as_u64().unwrap() as u8;
         }
@@ -488,24 +508,22 @@ fn compare_rows(json: &str, expected_count: usize, repair_projection: bool) {
                 .resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(11, 10)
+                .cell_mut_for_test(11, 10)
                 .unwrap();
             cell.land_type = input["land"].as_u64().unwrap_or(0) as u8;
             cell.final_tile_index = 0;
             cell.final_sub_tile = input["subtile"].as_u64().unwrap_or(0) as u8;
         }
         if let Some(overlay) = input["overlay"].as_u64() {
-            sim.resolved_terrain
-                .as_mut()
-                .unwrap()
-                .cell_mut(11, 10)
-                .unwrap()
-                .bridge_facts
-                .overlay_id = Some(overlay as u8);
+            sim.overlay_cell_mut_for_test(11, 10).overlay_id = Some(overlay as u8);
         }
-        sim.session.binary_frame = 100;
+        sim.session.set_binary_frame_for_test(100);
         // The legacy corpus name seeds A8E7AC, not A8B238.
-        sim.session.game_mode_nonzero = flag("actual_game_mode");
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(flag(
+                "actual_game_mode",
+            )),
+        );
         if let Some(bounds) = input["bounds"].as_array() {
             sim.playfield_bounds = Some(crate::map::playfield::PlayfieldBounds {
                 base: bounds[0].as_i64().unwrap() as i32,
@@ -527,12 +545,15 @@ fn compare_rows(json: &str, expected_count: usize, repair_projection: bool) {
         }
         mover.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
         sim.substrate.entities.insert(mover);
-        sim.mission_assign_exact(
-            90,
-            crate::sim::mission::MissionId::from_raw(input["mission"].as_i64().unwrap_or(5) as i32),
-            100,
-        )
-        .unwrap();
+        sim.substrate
+            .mission_assign_exact(
+                90,
+                crate::sim::mission::MissionId::from_raw(
+                    input["mission"].as_i64().unwrap_or(5) as i32
+                ),
+                100,
+            )
+            .unwrap();
         if let Some(queued) = input["queued"].as_i64() {
             use crate::sim::mission::{MissionDispatchTimer, MissionId, state::MissionTestFixture};
             sim.substrate
@@ -660,8 +681,8 @@ fn compare_rows(json: &str, expected_count: usize, repair_projection: bool) {
                             else {
                                 unreachable!()
                             };
-                            walk.set_moving(state["moving"].as_bool().unwrap());
-                            walk.set_head(head);
+                            walk.set_moving_for_test(state["moving"].as_bool().unwrap());
+                            walk.set_head_for_test(head);
                             blocker.locomotor = Some(loco);
                         }
                         "fly" | "jumpjet" => {
@@ -690,7 +711,7 @@ fn compare_rows(json: &str, expected_count: usize, repair_projection: bool) {
                 }
                 if node["gate"].as_bool().unwrap_or(false) {
                     let opened = node["open"].as_bool().unwrap_or(false);
-                    blocker.building_gate = Some(Default::default());
+                    blocker.building.building_gate = Some(Default::default());
                     if opened {
                         crate::sim::mission::authority::queue_entity_mission_deferred(
                             &mut blocker,
@@ -706,7 +727,7 @@ fn compare_rows(json: &str, expected_count: usize, repair_projection: bool) {
                 if node["cloaked"].as_bool().unwrap_or(false) {
                     let mut cloak = crate::sim::cloak_disguise::CloakRuntime::new(100);
                     cloak.establish_unlimbo_fully_cloaked();
-                    blocker.cloak = Some(cloak);
+                    blocker.cloak = Some(Box::new(cloak));
                 }
                 sim.substrate.entities.insert(blocker);
                 id
@@ -743,7 +764,7 @@ fn compare_rows(json: &str, expected_count: usize, repair_projection: bool) {
             sim.resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(11, 10)
+                .cell_mut_for_test(11, 10)
                 .unwrap()
                 .bridge_facts
                 .raw_flags = 0x100;
@@ -862,8 +883,12 @@ fn row_entry_input(
     }
 }
 
+/// The live vehicle-building entry decision: a contacted mover skips the
+/// east columns but keeps the west, an empty bunker skips where an occupied
+/// one blocks, and the row skip needs the same candidate building and a rows
+/// value.
 #[test]
-fn contacted_vehicle_row_skip_opens_east_columns_but_keeps_west() {
+fn live_vehicle_building_entry_rows_contact_and_bunker_occupancy() {
     let contacted = VehicleBuildingEntryBranch::RadioContact {
         mover_has_contact: true,
     };
@@ -884,10 +909,7 @@ fn contacted_vehicle_row_skip_opens_east_columns_but_keeps_west() {
         )),
         BuildingOccupantEntryDecision::KeepBlocker
     );
-}
 
-#[test]
-fn empty_vs_occupied_bunker_uses_explicit_runtime_occupant_arg() {
     let mut empty = row_entry_input(VehicleBuildingEntryBranch::UnitRepairOrBunker, 10);
     empty.number_impassable_rows = 0;
     empty.is_bunker = true;
@@ -905,10 +927,7 @@ fn empty_vs_occupied_bunker_uses_explicit_runtime_occupant_arg() {
         decide_live_vehicle_building_entry(occupied),
         BuildingOccupantEntryDecision::KeepBlocker
     );
-}
 
-#[test]
-fn row_helper_requires_same_candidate_building_and_rows_value() {
     let mut other_building = row_entry_input(VehicleBuildingEntryBranch::UnitRepairOrBunker, 11);
     other_building.is_unit_repair = true;
     other_building.candidate_building_id = Some(200);

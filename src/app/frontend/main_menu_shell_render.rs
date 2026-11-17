@@ -1,16 +1,17 @@
 //! Initial main-menu shell render glue for dialog 0xE2.
 
+use crate::util::time::Instant;
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::app::AppState;
 use crate::app::frontend::shell_layout;
 use crate::app::frontend::shell_pass::{owner_draw_button_label_rect, resolve_csf};
 use crate::app::frontend::shell_transition::{
-    ColumnDraw, MainMenuEntryPaintFrame, MainMenuEntryPresentToken, ShellFrameWave,
+    ColumnDraw, ExternalMenuWait, MainMenuEntryPaintFrame, MainMenuEntryPresentToken,
+    ShellFrameWave, external_menu_wait,
 };
+use crate::app::{AppState, BUILD_STAMP};
 use crate::render::batch::SpriteInstance;
 use crate::render::main_menu_shell_chrome::{MainMenuShellChromeAtlas, MainMenuShellChromeEntry};
 use crate::render::shell_paint::{
@@ -20,14 +21,18 @@ use crate::render::shell_paint::{
 use crate::render::shell_text::ShellAlign;
 use crate::render::shell_text_reveal::PathAReveal;
 use crate::render::shell_transition_pass::ShellRenderTarget;
+use crate::render::shell_ui_style_assets::{
+    ShellUiAssetLocator, ShellUiAssetPair, ShellUiAssetResolver,
+};
 use crate::ui::main_menu_shell::{
     MainMenuControlId, MainMenuMovieBase, MainMenuShellLayout, csf_key_for_control,
     tooltip_csf_key_for_control,
 };
-use crate::ui::shell::geom::{SDBTNANM_CELL_H, SDBTNANM_CELL_W_NARROW, ShellScale};
+use crate::ui::shell::geom::RectPx;
+use crate::ui::shell::geom::{SDBTNANM_CELL_H, SDBTNANM_CELL_W_NARROW};
 use crate::ui::shell::static_reveal::{Kind1PaintWindow, Kind1RevealReceipt, Kind1RevealWindow};
 
-/// Archive holding the Red Alert 2 menu loop for VERA's RA2 Loading & Menu Movie option.
+/// Archive holding the Red Alert 2 menu loop used by the unchecked default.
 ///
 /// `ra2ts_l.bik` exists under the same name in this archive and in `langmd.mix`
 /// (Yuri's Revenge), whose copy normal priority resolves first. `ra2ts_s.bik`,
@@ -70,22 +75,26 @@ pub(crate) enum Ra2tsDialogOwner {
 /// Identity of the one RA2TS session installed for a movie-bearing dialog.
 ///
 /// Owner and asset base change atomically because neither alone is sufficient
-/// to make the decoder/texture reusable. VERA's RA2 Loading & Menu Movie option
-/// picks which game's copy of the movie the session plays, so it is part of the
+/// to make the decoder/texture reusable. VERA's Original YR Style option picks
+/// which game's copy of the movie the session plays, so it is part of the
 /// identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Ra2tsMovieSessionIdentity {
     owner: Ra2tsDialogOwner,
     base: MainMenuMovieBase,
-    ra2_look: bool,
+    yr_original_style: bool,
 }
 
 impl Ra2tsMovieSessionIdentity {
-    const fn new(owner: Ra2tsDialogOwner, base: MainMenuMovieBase, ra2_look: bool) -> Self {
+    const fn new(
+        owner: Ra2tsDialogOwner,
+        base: MainMenuMovieBase,
+        yr_original_style: bool,
+    ) -> Self {
         Self {
             owner,
             base,
-            ra2_look,
+            yr_original_style,
         }
     }
 
@@ -163,6 +172,43 @@ fn main_menu_status_csf_key(hovered_button: Option<MainMenuControlId>) -> Option
     hovered_button.map(tooltip_csf_key_for_control)
 }
 
+/// What 0xE2 shows in place of its live controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainMenuCover {
+    /// Buttons, statics and the hover status line.
+    Live,
+    /// The empty shell backdrop: shuttered column, no statics, no movie.
+    Backdrop,
+    /// VERA: the backdrop of an external network launch that is joining its
+    /// match (docs/spawn.md), with a connecting notice on the status line.
+    /// gamemd has no such launch; buttons that could not be pressed made the
+    /// wait look frozen.
+    Joining,
+}
+
+impl MainMenuCover {
+    fn new(modal: bool, external: Option<ExternalMenuWait>) -> Self {
+        match external {
+            _ if modal => Self::Backdrop,
+            Some(ExternalMenuWait::Joining) => Self::Joining,
+            Some(ExternalMenuWait::Reporting) => Self::Backdrop,
+            None => Self::Live,
+        }
+    }
+
+    fn of(state: &AppState) -> Self {
+        Self::new(
+            state
+                .frontend
+                .shell_message_box
+                .as_ref()
+                .is_some_and(|message_box| !message_box.keeps_page())
+                || state.frontend.quit_cascade.is_some(),
+            external_menu_wait(state),
+        )
+    }
+}
+
 /// Path-A tint for a right-panel kind-1 static (heading `0x694`, status line
 /// `0x695`): yellow text with a white highlight trail.
 pub(crate) fn shell_reveal_path_a(window: Kind1RevealWindow) -> PathAReveal {
@@ -188,7 +234,7 @@ fn main_menu_paint_labels<'a>(
 ) -> Vec<PaintLabel<'a>> {
     use crate::render::shell_text::ShellAlign;
     let mut out = Vec::new();
-    let button_align = ShellAlign::H_CENTER | ShellAlign::V_CENTER;
+    let button_align = ShellAlign::BUTTON_CAPTION;
     // The slide engine draws the button frames only (`0x006071E0`).
     for button in layout.buttons.iter().filter(|_| captions) {
         let pressed = pressed_button == Some(button.id);
@@ -205,18 +251,43 @@ fn main_menu_paint_labels<'a>(
         out.push(PaintLabel {
             text: main_menu_title_text(state),
             rect: layout.title,
-            align: ShellAlign::H_CENTER,
+            align: ShellAlign::PANEL_TITLE,
             rgb: SHELL_TEXT_RGB_ENABLED,
             path_a_reveal: Some(shell_reveal_path_a(window)),
         });
     }
+    // VERA difference: the release sits on the status line's baseline rather
+    // than gamemd's version-line top, so the two bottom texts line up.
+    let version_rect = RectPx {
+        y: layout.tooltip_line.y,
+        ..layout.version_line
+    };
     out.extend(version_text.map(|text| PaintLabel {
         text: text.into(),
-        rect: layout.version_line,
+        rect: version_rect,
         align: ShellAlign::H_CENTER,
         rgb: SHELL_TEXT_RGB_ENABLED,
         path_a_reveal: None,
     }));
+    // VERA: the mod in use (`app::mods`), on the same line, between the
+    // status help and the right panel. Retail 640x480 has no room there.
+    if version_text.is_some()
+        && let Some(active) = state.frontend.mods.active.as_ref()
+    {
+        // As far from the panel as the status help is from the strip's left.
+        let gap = layout.tooltip_line.x - layout.lower_strip.x;
+        let left = layout.tooltip_line.x + layout.tooltip_line.w;
+        let width = layout.right_panel.top.x - gap - left;
+        if width > 0 {
+            out.push(PaintLabel {
+                text: crate::i18n::tr_fill("VERA:MainMenuMod", &[("mod", &active.title)]).into(),
+                rect: RectPx::new(left, version_rect.y, width, version_rect.h),
+                align: ShellAlign::H_RIGHT,
+                rgb: SHELL_TEXT_RGB_ENABLED,
+                path_a_reveal: None,
+            });
+        }
+    }
     out
 }
 
@@ -292,9 +363,9 @@ pub(crate) fn ensure_movie_for_current_layout(
     requested_owner: Ra2tsDialogOwner,
 ) -> Result<()> {
     let layout = shell_layout::main_menu_layout(state);
-    let ra2_look = state.persistence.options_profile.ra2_look;
+    let yr_original_style = state.persistence.options_profile.yr_original_style;
     let requested_identity =
-        Ra2tsMovieSessionIdentity::new(requested_owner, layout.movie_base, ra2_look);
+        Ra2tsMovieSessionIdentity::new(requested_owner, layout.movie_base, yr_original_style);
     if ra2ts_movie_session_is_reusable(
         state.frontend.main_menu_movie.is_some(),
         state.frontend.main_menu_movie_identity,
@@ -308,14 +379,17 @@ pub(crate) fn ensure_movie_for_current_layout(
         state
             .frontend
             .main_menu_shell_error
-            .get_or_insert_with(|| "Game archives are unavailable.".to_owned());
+            .get_or_insert_with(|| crate::i18n::tr("VERA:GameArchivesUnavailable"));
         return Ok(());
     };
     let asset_name = layout.movie_base.asset_name();
 
-    let Some((bytes, source)) = menu_movie_bytes(assets, asset_name, ra2_look) else {
+    let Some((bytes, source)) = menu_movie_bytes(assets, asset_name, yr_original_style) else {
         log::warn!("Missing main-menu movie asset {asset_name}");
-        state.frontend.main_menu_shell_error = Some(format!("Missing menu movie: {asset_name}"));
+        state.frontend.main_menu_shell_error = Some(crate::i18n::tr_fill(
+            "VERA:MenuMovieMissing",
+            &[("movie", &asset_name)],
+        ));
         return Ok(());
     };
 
@@ -325,12 +399,18 @@ pub(crate) fn ensure_movie_for_current_layout(
         Arc::<[u8]>::from(bytes),
         source.to_string(),
         true,
+        wgpu::FilterMode::Nearest,
     ) {
         Ok(movie) => movie,
         Err(err) => {
             log::warn!("Failed to load main-menu movie {asset_name} from {source}: {err:#}");
-            state.frontend.main_menu_shell_error = Some(format!(
-                "Could not load {asset_name} from {source}: {err:#}"
+            state.frontend.main_menu_shell_error = Some(crate::i18n::tr_fill(
+                "VERA:MenuMovieUnreadable",
+                &[
+                    ("movie", &asset_name),
+                    ("source", &source),
+                    ("error", &format!("{err:#}")),
+                ],
             ));
             return Ok(());
         }
@@ -351,24 +431,26 @@ pub(crate) fn ensure_movie_for_current_layout(
 /// (MainMenuDialog0xE2__Run), selects Ra2ts_s at width 640 and Ra2ts_l
 /// otherwise, then gives that name to the movie control. Resolve through the
 /// shared first-match asset lookup, preserving loose-file and archive priority.
-/// VERA's RA2 Loading & Menu Movie option asks [`RA2_MOVIE_ARCHIVE`] for its
-/// copy instead and falls back to that lookup when the archive lacks it.
+/// VERA's Original YR Style option uses the ordinary first-match
+/// lookup. The unchecked default requires the named member from
+/// [`RA2_MOVIE_ARCHIVE`]; a missing RA2 copy is reported instead of silently
+/// resolving the YR member with the same name.
 fn menu_movie_bytes<'a>(
     assets: &'a crate::assets::asset_manager::AssetManager,
     asset_name: &str,
-    ra2_look: bool,
+    yr_original_style: bool,
 ) -> Option<(&'a [u8], &'a str)> {
-    let red_alert_2_copy = assets
-        .archive(RA2_MOVIE_ARCHIVE)
-        .filter(|_| ra2_look)
-        .and_then(|archive| archive.get_by_name(asset_name))
-        .map(|bytes| (bytes, RA2_MOVIE_ARCHIVE));
-    if ra2_look && red_alert_2_copy.is_none() {
-        log::warn!(
-            "{asset_name} is missing from {RA2_MOVIE_ARCHIVE}; RA2 Loading & Menu Movie plays the Yuri's Revenge loop instead"
-        );
-    }
-    red_alert_2_copy.or_else(|| assets.get_with_source_ref(asset_name))
+    let resolver = ShellUiAssetResolver::new(assets, yr_original_style);
+    resolver
+        .resolve(ShellUiAssetPair::new(
+            ShellUiAssetLocator::archive(asset_name, RA2_MOVIE_ARCHIVE),
+            ShellUiAssetLocator::active(asset_name),
+        ))
+        .map(|asset| (asset.bytes, asset.source))
+        .map_err(|err| {
+            log::warn!("Could not resolve {asset_name} for the selected shell style: {err:#}")
+        })
+        .ok()
 }
 
 /// Paint the normal 0xE2 route through its active-retail presentation boundary.
@@ -475,8 +557,8 @@ fn render_main_menu_shell_to_target_inner(
     // (`0x0052FEC0`). Retail leaves the destroyed box's last image on screen
     // through the quit fade (nothing repaints after OK); here the backdrop
     // shows alone (evidence note residual).
-    let backdrop =
-        state.frontend.exit_confirm_modal.is_some() || state.frontend.quit_cascade.is_some();
+    let cover = MainMenuCover::of(state);
+    let backdrop = cover != MainMenuCover::Live;
     if !backdrop {
         ensure_movie_for_current_layout(state, Ra2tsDialogOwner::MainMenu0xE2)?;
     }
@@ -486,7 +568,7 @@ fn render_main_menu_shell_to_target_inner(
         state
             .frontend
             .main_menu_shell_error
-            .get_or_insert_with(|| "Required game-menu artwork is unavailable.".to_owned());
+            .get_or_insert_with(|| crate::i18n::tr("VERA:MenuArtworkUnavailable"));
         return Ok(MainMenuShellRenderResult::Fallback);
     }
 
@@ -506,8 +588,10 @@ fn render_main_menu_shell_to_target_inner(
         state.frontend.main_menu_movie_last_step = now;
         if let Err(err) = movie.step(&state.renderer.gpu, elapsed) {
             log::warn!("Failed to step main-menu RA2TS movie: {err:#}");
-            state.frontend.main_menu_shell_error =
-                Some(format!("Could not play the menu movie: {err:#}"));
+            state.frontend.main_menu_shell_error = Some(crate::i18n::tr_fill(
+                "VERA:MenuMovieFailed",
+                &[("error", &format!("{err:#}"))],
+            ));
             return Ok(MainMenuShellRenderResult::Fallback);
         }
     }
@@ -522,16 +606,18 @@ fn render_main_menu_shell_to_target_inner(
     } else {
         crate::app::frontend::menu_page_render::paint_shell_monitor(state)
     };
-    let status_label = if leaving || backdrop {
+    let status_label = if leaving || cover == MainMenuCover::Backdrop {
         None
     } else {
-        let hovered = state
-            .frontend
-            .main_menu_shell_state
-            .hovered_owner_draw_button;
-        let status_text = main_menu_status_csf_key(hovered)
-            .map(|key| resolve_csf(state, key).into_owned())
-            .unwrap_or_default();
+        let status_text = if cover == MainMenuCover::Joining {
+            resolve_csf(state, "GUI:ConnectingToPlayers").into_owned()
+        } else {
+            let hovered =
+                crate::ui::main_menu_shell::hovered_control(&state.frontend.shell_controller);
+            main_menu_status_csf_key(hovered)
+                .map(|key| resolve_csf(state, key).into_owned())
+                .unwrap_or_default()
+        };
         crate::app::frontend::menu_page_render::paint_shell_status_line(
             state,
             status_text,
@@ -584,10 +670,7 @@ fn render_main_menu_shell_to_target_inner(
         }
         None => main_menu_paint_buttons(
             &layout,
-            state
-                .frontend
-                .main_menu_shell_state
-                .pressed_owner_draw_button,
+            crate::ui::main_menu_shell::pressed_control(&state.frontend.shell_controller),
         ),
     };
     // 0xE2 never flashes, so the hover clock is unused (None) — keep the call
@@ -599,15 +682,7 @@ fn render_main_menu_shell_to_target_inner(
         Instant::now(),
         None,
     );
-    let version_text = format!(
-        "{} {}",
-        resolve_csf(state, "GUI:Version"),
-        state.frontend.version_txt
-    );
-    let pressed = state
-        .frontend
-        .main_menu_shell_state
-        .pressed_owner_draw_button;
+    let pressed = crate::ui::main_menu_shell::pressed_control(&state.frontend.shell_controller);
     let mut labels = if backdrop {
         Vec::new()
     } else {
@@ -615,7 +690,10 @@ fn render_main_menu_shell_to_target_inner(
             state,
             &layout,
             pressed,
-            (!leaving).then_some(version_text.as_str()),
+            // VERA difference: gamemd prints "<GUI:Version> <VERSION.TXT>" here,
+            // a fixed "1.001TUC" in every build; this line names the VERA20K
+            // release instead, the version players report and updates compare.
+            (!leaving).then_some(BUILD_STAMP),
             title_window,
             !sliding,
         )
@@ -627,7 +705,7 @@ fn render_main_menu_shell_to_target_inner(
     // Quit-confirm SHP modal overlay (blocking; drawn over the menu, under the
     // cursor). `None` when the modal is closed or the skirmish atlas (which holds
     // PUDLGBGN/MNBTTN) is not loaded.
-    let modal_overlay = build_exit_confirm_modal_overlay(state);
+    let modal_overlay = build_shell_message_box_overlay(state);
     let skirmish_chrome = state.frontend.skirmish_shell_chrome.as_ref();
 
     state.renderer.batch_renderer.update_camera(
@@ -703,44 +781,6 @@ fn render_main_menu_shell_to_target_inner(
         .and_then(|sequence| sequence.frames.first())
         .map(|frame| &frame.texture);
 
-    // Quit-cascade fade-to-black: a full-screen black quad over EVERYTHING (incl.
-    // the cursor), alpha ramped 0→1 by the cascade. Reuses the 1×1 opaque
-    // white_pixel + the ALPHA_BLENDING passthrough pipeline; no new shader. Built
-    // here (like every other layer) so it outlives the render pass. Only present on
-    // the SHP path (the atlas is unavailable on the utility error card).
-    let fade_alpha = state
-        .frontend
-        .quit_cascade
-        .as_ref()
-        .map_or(0.0, |cascade| cascade.overlay_alpha());
-    let fade_buffer = if fade_alpha > 0.0 {
-        skirmish_chrome
-            .and_then(|sk| sk.white_pixel)
-            .and_then(|white| {
-                let quad = [crate::render::batch::SpriteInstance {
-                    position: [0.0, 0.0],
-                    size: [
-                        state.renderer.gpu.config.width as f32,
-                        state.renderer.gpu.config.height as f32,
-                    ],
-                    uv_origin: white.uv_origin,
-                    uv_size: white.uv_size,
-                    // Passthrough compares depth Always and this draws last, so any
-                    // depth sits on top; the frontmost value is used for clarity.
-                    depth: 0.0,
-                    tint: [0.0, 0.0, 0.0],
-                    alpha: fade_alpha,
-                    ..Default::default()
-                }];
-                state
-                    .renderer
-                    .batch_renderer
-                    .create_instance_buffer(&state.renderer.gpu, &quad)
-            })
-    } else {
-        None
-    };
-
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("Main Menu Shell"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -762,6 +802,7 @@ fn render_main_menu_shell_to_target_inner(
         }),
         timestamp_writes: None,
         occlusion_query_set: None,
+        multiview_mask: None,
     });
     if let Some((buffer, count)) = background_buffer.as_ref() {
         state.renderer.batch_renderer.draw_with_buffer_passthrough(
@@ -857,16 +898,6 @@ fn render_main_menu_shell_to_target_inner(
             .batch_renderer
             .draw_with_buffer_passthrough(&mut pass, texture, buffer, *count);
     }
-    // Quit-cascade fade-to-black overlay, drawn LAST so it blackens everything
-    // including the cursor (the original's palette fade affects the whole frame).
-    if let (Some((buffer, count)), Some(sk_chrome)) = (fade_buffer.as_ref(), skirmish_chrome) {
-        state.renderer.batch_renderer.draw_with_buffer_passthrough(
-            &mut pass,
-            &sk_chrome.texture,
-            buffer,
-            *count,
-        );
-    }
     drop(pass);
 
     Ok(MainMenuShellRenderResult::Rendered {
@@ -883,38 +914,92 @@ const EXIT_CONFIRM_MODAL_DEPTHS: shell_paint::ModalDepths = shell_paint::ModalDe
     text: 0.00040,
 };
 
-/// Build the quit-confirm (0x120) SHP modal overlay when it is open: the centered
-/// PUDLGBGN panel + MNBTTN OK/Cancel buttons + body/OK/Cancel labels, sourced from
+/// Paint the open message box over a page that keeps showing: the page has
+/// been composed on the shell surface, so the box and the cursor go on top
+/// and the surface is presented again.
+pub(crate) fn render_shell_message_box_over_page(
+    state: &AppState,
+    encoder: &mut wgpu::CommandEncoder,
+    destination: &wgpu::Texture,
+) {
+    let (Some(overlay), Some(chrome)) = (
+        build_shell_message_box_overlay(state),
+        state.frontend.skirmish_shell_chrome.as_ref(),
+    ) else {
+        return;
+    };
+    let draws = [crate::app::frontend::shell_pass::TexturedDraw {
+        texture: &chrome.texture,
+        instances: overlay.sprites,
+    }];
+    crate::app::frontend::shell_pass::encode_shell_pass_over_page(
+        state,
+        encoder,
+        destination,
+        "Shell message box over page",
+        crate::app::frontend::shell_pass::ShellComposition {
+            draws: &draws,
+            text: &overlay.text,
+            cursor: crate::app::frontend::shell_pass::top_software_cursor(state, CURSOR_DEPTH),
+            effects: None,
+            // Over the online client's pages the box matches the page.
+            smooth_art: state.smooth_online_menus()
+                && matches!(
+                    crate::app::input::precedence::presented(state).1,
+                    crate::app::input::precedence::ScreenPage::Wol
+                        | crate::app::input::precedence::ScreenPage::NetworkSetup
+                ),
+        },
+    );
+}
+
+/// Build the shell message box (0xCE/0x120/0x121) SHP modal overlay when it is open: the centered
+/// PUDLGBGN panel + populated MNBTTN buttons and labels, sourced from
 /// the skirmish chrome atlas (the only atlas that loads PUDLGBGN/MNBTTN). The
 /// pressed button is read from the shared shell controller (its top dialog is the
 /// modal while open). Returns `None` when the modal is closed or its art is absent.
-fn build_exit_confirm_modal_overlay(state: &AppState) -> Option<shell_paint::ModalDraw> {
+fn build_shell_message_box_overlay(state: &AppState) -> Option<shell_paint::ModalDraw> {
+    use crate::app::frontend::state::ShellMessageBoxPurpose;
     use crate::ui::shell::modal;
-    let modal_state = state.frontend.exit_confirm_modal.as_ref()?;
+    let message_box = state.frontend.shell_message_box.as_ref()?;
+    let modal_state = &message_box.labels;
     let atlas = state.frontend.skirmish_shell_chrome.as_ref()?;
-    let layout = modal::quit_confirm_layout(
-        state.renderer.gpu.config.width as i32,
-        state.renderer.gpu.config.height as i32,
-    );
+    // VERA's own boxes pick their art: the Esc menu the Allied eagle, the
+    // updater's Red Alert 2's. The others draw gamemd's.
+    let background = match message_box.purpose {
+        ShellMessageBoxPurpose::ShellMenu(_) => {
+            atlas.mode_two_dialog_background(Some(crate::ui::sidebar::SidebarTheme::Allied))
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        ShellMessageBoxPurpose::UpdateOffer(_)
+        | ShellMessageBoxPurpose::UpdateProgress
+        | ShellMessageBoxPurpose::UpdateCheck => atlas.ra2_dialog_background,
+        ShellMessageBoxPurpose::Notice
+        | ShellMessageBoxPurpose::ModRestart(_)
+        | ShellMessageBoxPurpose::ModFiles(_) => atlas.ra2_dialog_background,
+        _ => None,
+    }
+    .or_else(|| atlas.mode_two_dialog_background(None));
+    let layout = shell_layout::shell_message_box_layout(state, modal_state.kind());
+    // The updater's offer lists what changed (`app::updater::notes`).
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    let notes = match &message_box.purpose {
+        ShellMessageBoxPurpose::UpdateOffer(notes) => {
+            notes.geometry(&layout).map(|geometry| (notes, geometry))
+        }
+        _ => None,
+    };
     let pressed = state.frontend.shell_controller.pressed();
     let ok_pressed = pressed == Some(modal::control::OK);
-    let cancel_pressed = pressed == Some(modal::control::CANCEL);
     let frames = crate::app::frontend::skirmish_shell_render::type3_button_frames(atlas);
-    let buttons = [
-        shell_paint::ModalButton {
-            rect: layout.ok,
-            pressed: ok_pressed,
-            enabled: true,
-        },
-        shell_paint::ModalButton {
-            rect: layout.cancel,
-            pressed: cancel_pressed,
-            enabled: true,
-        },
-    ];
+    let mut buttons = vec![shell_paint::ModalButton {
+        rect: layout.ok,
+        pressed: ok_pressed,
+        enabled: true,
+    }];
     // Body left-top wrapped; OK/Cancel centered on their buttons with the MNBTTN
     // press sink — same conventions as the skirmish validation modal.
-    let labels = [
+    let mut labels = vec![
         PaintLabel {
             text: (&modal_state.title).into(),
             rect: layout.body,
@@ -924,81 +1009,125 @@ fn build_exit_confirm_modal_overlay(state: &AppState) -> Option<shell_paint::Mod
         },
         PaintLabel {
             text: (&modal_state.confirm).into(),
-            rect: owner_draw_button_label_rect(layout.ok, ok_pressed),
-            align: ShellAlign::H_CENTER | ShellAlign::V_CENTER,
-            rgb: SHELL_TEXT_RGB_ENABLED,
-            path_a_reveal: None,
-        },
-        PaintLabel {
-            text: (&modal_state.cancel).into(),
-            rect: owner_draw_button_label_rect(layout.cancel, cancel_pressed),
+            rect: layout.scale.derive_rect(layout.ok, |rect| {
+                owner_draw_button_label_rect(rect, ok_pressed)
+            }),
             align: ShellAlign::H_CENTER | ShellAlign::V_CENTER,
             rgb: SHELL_TEXT_RGB_ENABLED,
             path_a_reveal: None,
         },
     ];
-    Some(shell_paint::paint_modal_shp(
+    for (rect, text, control) in [
+        (layout.third, &modal_state.third, modal::control::THIRD),
+        (layout.cancel, &modal_state.cancel, modal::control::CANCEL),
+    ] {
+        let Some(rect) = rect else { continue };
+        let pressed = pressed == Some(control);
+        buttons.push(shell_paint::ModalButton {
+            rect,
+            pressed,
+            enabled: true,
+        });
+        labels.push(PaintLabel {
+            text: text.into(),
+            rect: layout
+                .scale
+                .derive_rect(rect, |rect| owner_draw_button_label_rect(rect, pressed)),
+            align: ShellAlign::H_CENTER | ShellAlign::V_CENTER,
+            rgb: SHELL_TEXT_RGB_ENABLED,
+            path_a_reveal: None,
+        });
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    if let Some((notes, geometry)) = &notes {
+        labels.extend(
+            notes
+                .texts(geometry, layout.scale.factor())
+                .into_iter()
+                .map(|(text, rect)| PaintLabel {
+                    text: text.into(),
+                    rect,
+                    align: ShellAlign::NONE,
+                    rgb: SHELL_TEXT_RGB_ENABLED,
+                    path_a_reveal: None,
+                }),
+        );
+    }
+    let mut draw = shell_paint::paint_modal_shp(
         &state.renderer.bit_font,
-        atlas.mode_two_dialog_background(None),
+        background,
         frames,
         layout.dialog,
         &buttons,
         &labels,
-        ShellScale::RETAIL,
+        layout.scale,
         EXIT_CONFIRM_MODAL_DEPTHS,
-    ))
+    );
+    if let Some(settings) = message_box.menu_settings() {
+        crate::app::frontend::skirmish_shell_render::paint_options_settings(
+            &mut draw,
+            &state.renderer.bit_font,
+            atlas,
+            &shell_layout::shell_menu_settings_layout(state),
+            settings,
+        );
+    }
+    // The list lies on the dialog's picture, which has no list backing.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    if let Some((notes, geometry)) = notes {
+        crate::app::frontend::skirmish_shell_render::paint_list(
+            &mut draw.sprites,
+            atlas,
+            geometry,
+            notes.top(),
+            None,
+            notes.pressed_part(),
+            true,
+            layout.scale,
+        );
+    }
+    Some(draw)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_frontend))]
 mod tests {
     use super::*;
 
     #[test]
-    fn a_changed_ra2_look_reloads_the_movie_session() {
-        let identity = |ra2_look| {
-            Ra2tsMovieSessionIdentity::new(
-                Ra2tsDialogOwner::MainMenu0xE2,
-                MainMenuMovieBase::Ra2tsL,
-                ra2_look,
-            )
-        };
-        assert!(ra2ts_movie_session_is_reusable(
-            true,
-            Some(identity(false)),
-            identity(false)
-        ));
-        assert!(!ra2ts_movie_session_is_reusable(
-            true,
-            Some(identity(false)),
-            identity(true)
-        ));
-        assert!(!ra2ts_movie_session_is_reusable(
-            true,
-            Some(identity(true)),
-            identity(false)
-        ));
+    fn external_launch_wait_covers_the_menu_controls() {
+        // docs/spawn.md: a joining network launch takes no shell input, so it
+        // must not paint the live buttons; it names what it waits for.
+        assert_eq!(
+            MainMenuCover::new(false, Some(ExternalMenuWait::Joining)),
+            MainMenuCover::Joining
+        );
+        assert_eq!(
+            MainMenuCover::new(false, Some(ExternalMenuWait::Reporting)),
+            MainMenuCover::Backdrop
+        );
+        assert_eq!(MainMenuCover::new(false, None), MainMenuCover::Live);
     }
 
     #[test]
     #[ignore = "requires RA2_DIR with installed retail RA2/YR assets"]
-    fn ra2_look_plays_the_red_alert_2_copy_of_the_menu_movie() {
+    fn default_style_plays_ra2_movie_and_option_selects_yuri_revenge_copy() {
         use crate::assets::asset_manager::{AssetManager, MediaArchiveMode};
         let retail_dir = std::path::PathBuf::from(
             std::env::var_os("RA2_DIR").expect("set RA2_DIR to the retail RA2/YR install"),
         );
         let assets = AssetManager::new(&retail_dir, MediaArchiveMode::STOCK_DIGITAL)
             .expect("load retail RA2/YR assets");
-        // The large loop ships in both games' archives: normal priority plays
-        // Yuri's Revenge's, the RA2 Loading & Menu Movie option the original's.
+        // The large loop ships in both games' archives: the default uses RA2,
+        // while the option uses the active Yuri's Revenge copy.
         let large = MainMenuMovieBase::Ra2tsL.asset_name();
-        let (yr, yr_source) = menu_movie_bytes(&assets, large, false).expect("YR large loop");
-        let (ra2, ra2_source) = menu_movie_bytes(&assets, large, true).expect("RA2 large loop");
-        assert_eq!((yr_source, ra2_source), ("langmd.mix", RA2_MOVIE_ARCHIVE));
-        assert!(yr != ra2, "both looks play the same large loop");
+        let (ra2, ra2_source) = menu_movie_bytes(&assets, large, false).expect("RA2 large loop");
+        let (yr, yr_source) = menu_movie_bytes(&assets, large, true).expect("YR large loop");
+        assert_eq!((ra2_source, yr_source), (RA2_MOVIE_ARCHIVE, "langmd.mix"));
+        assert!(ra2 != yr, "both looks play the same large loop");
         // The 640-wide loop ships only in language.mix, so both looks play it.
         let small = MainMenuMovieBase::Ra2tsS.asset_name();
-        let (yr, yr_source) = menu_movie_bytes(&assets, small, false).expect("small loop");
-        let (ra2, ra2_source) = menu_movie_bytes(&assets, small, true).expect("small loop");
+        let (ra2, ra2_source) = menu_movie_bytes(&assets, small, false).expect("small loop");
+        let (yr, yr_source) = menu_movie_bytes(&assets, small, true).expect("small loop");
         assert_eq!(
             (yr_source, ra2_source),
             (RA2_MOVIE_ARCHIVE, RA2_MOVIE_ARCHIVE)

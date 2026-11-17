@@ -19,12 +19,13 @@
 //!
 //! RESIDUAL: the spin (`0x004CE5A0`). Power_Off (`0x004CFD20`) starts it on
 //! a moving Fly, with two Scenario draws, and then the unpowered fall
-//! (`Simulation::fly_crash_fall`) drops it. Nothing in VERA powers off an
-//! aircraft (native: EMP), so both are dormant.
+//! (`Simulation::fly_crash_fall`) drops it. Both are unreachable natively:
+//! only an EMP powers off an aircraft, and EMPulseClass's constructor
+//! (`0x004C52B0`) has no caller or pointer in the executable (rulesmd's
+//! `[EMPuls]` says it is disabled in code).
 //!
-//! RESIDUAL: Horizontal_Step's deselect (`0x004CF55D..0x004CF5EC`): a
-//! selected aircraft of a house no human controls is deselected (vt+0x150)
-//! over shroud, or fog while fog is on. Selection is the client's.
+//! Horizontal_Step ends by deselecting another house's object over the
+//! player's shroud ([`Simulation::deselect_over_player_shroud`]).
 
 use super::Simulation;
 use crate::map::entities::EntityCategory;
@@ -35,28 +36,24 @@ use crate::sim::combat::TargetKind;
 use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::movement::air_movement::{self, AirMovementTickStats};
+use crate::sim::movement::fly_height::{ARRIVAL_STOP, ARRIVAL_THREE_QUARTERS};
 // The cell of a coordinate as `0x0041BEA0` (vt+0x1B8) and the Fly's cell
 // tests form it.
+use crate::map::resolved_terrain::ResolvedTerrainGrid;
+use crate::sim::intern::StringInterner;
 use crate::sim::movement::coord_cell;
 use crate::sim::movement::ground_pose;
 use crate::sim::rng::SimRng;
 use crate::sim::world::FrameEffects;
-use crate::util::fixed_math::{SIM_ZERO, SimFixed};
+use crate::sim::world::ObjectSubstrate;
+use crate::util::native_x87::NativeF64Bits;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_c_o))]
 #[path = "fly_process_tests.rs"]
 mod tests;
 
 /// `CoordStruct` empty (`0x008B3C78`), Fly's "no destination".
 const NULL_COORD: DriveCoord = DriveCoord { x: 0, y: 0, z: 0 };
-
-/// Horizontal_Step's arrival distances (`0x004CF4F1`, `0x004CF527`,
-/// `0x004CF543`) and the speeds they ask for.
-const ARRIVAL_STOP: i32 = 0x80;
-const ARRIVAL_HALF: i32 = 0x200;
-const ARRIVAL_THREE_QUARTERS: i32 = 0x300;
-const HALF_SPEED: SimFixed = SimFixed::lit("0.5");
-const THREE_QUARTER_SPEED: SimFixed = SimFixed::lit("0.75");
 
 /// Horizontal_Step's Secondary turns to land or to the Target within this
 /// distance (`0x004CF29A`).
@@ -126,6 +123,7 @@ pub(crate) fn fly_map_edge(
         return (pushed, true);
     }
     let (x, y) = crate::sim::combat::inviso_scatter::random_direction_coord(
+        crate::map::cell_index::CellGrid::for_map_size(edge.width, edge.height),
         rng,
         pushed.x,
         pushed.y,
@@ -139,9 +137,9 @@ pub(crate) fn fly_map_edge(
 impl Simulation {
     /// The type's FlightLevel of live object `id`
     /// ([`air_movement::type_flight_level`]).
-    fn fly_type_flight_level(&self, id: u64, rules: Option<&RuleSet>) -> i32 {
+    fn fly_type_flight_level(&self, id: u64, rules: &RuleSet) -> i32 {
         let entity = self.substrate.entities.get(id).expect("Fly owner");
-        air_movement::type_flight_level(entity, rules.map(|rules| (rules, &self.interner)))
+        air_movement::type_flight_level(entity, Some((rules, &self.interner)))
     }
 
     /// One Process visit of a Fly object on the map:
@@ -163,7 +161,7 @@ impl Simulation {
     pub(super) fn fly_process(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> AirMovementTickStats {
@@ -172,7 +170,7 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get_mut(id) else {
             return stats;
         };
-        air_movement::ensure_fly_secondary_facing(entity);
+        entity.ensure_fly_secondary_facing();
         let living = entity.health.current() > 0;
         let Some(state) = entity
             .locomotor
@@ -183,11 +181,25 @@ impl Simulation {
         };
         state.restore_flight_level(flight_level);
         let in_phase = state.has_phase_callback();
-        if living
-            && !in_phase
-            && rules.is_some_and(|rules| self.mission_ready_to_commence(id, rules))
+        // Ares 3.0 FlyLocomotionClass_ILocomotion_Process_HunterSeeker
+        // (1004D7A0, hook 0x4CCB84) runs first; a reacquired hunter stops
+        // landing.
+        let in_phase = if rules.ares()
+            && self.ares_hunter_seeker_process(id, rules, registry, frame_effects)
         {
-            let _ = self.mission_commence_exact(id, self.session.binary_frame);
+            self.substrate
+                .entities
+                .get(id)
+                .and_then(|entity| entity.locomotor.as_ref())
+                .and_then(|locomotor| locomotor.fly_runtime())
+                .is_some_and(|state| state.has_phase_callback())
+        } else {
+            in_phase
+        };
+        if living && !in_phase && self.mission_ready_to_commence(id, rules) {
+            let _ = self
+                .substrate
+                .mission_commence_exact(id, self.session.binary_frame());
         }
         if self.fly_update_flight_motion(id, rules, registry, frame_effects) {
             stats.impact = true;
@@ -241,7 +253,7 @@ impl Simulation {
     fn fly_update_flight_motion(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
@@ -258,7 +270,7 @@ impl Simulation {
             .and_then(|locomotor| locomotor.fly_runtime())
             .is_some_and(crate::sim::movement::fly_height::FlyRuntime::is_moving_now);
         if cell != entity.air_tracker_cell() && moving_now {
-            self.aircraft_tracker_update_cell(id, cell);
+            Self::aircraft_tracker_update_cell(&self.session, &mut self.substrate, id, cell);
         }
         let entity = self.substrate.entities.get_mut(id).unwrap();
         let mission = entity.mission.effective();
@@ -272,7 +284,12 @@ impl Simulation {
         if self.fly_crash_fall(id, rules, registry, frame_effects) {
             return true;
         }
-        self.fly_guard_to_move(id);
+        // Ares 3.0 FlyLocomotionClass_sub_4CD600_HunterSeeker_UpdateTarget
+        // (1004DA90, hook 0x4CD9C8).
+        if rules.ares() {
+            self.ares_hunter_seeker_update_target(id, rules);
+        }
+        self.substrate.fly_guard_to_move(id);
         let Some(entity) = self.substrate.entities.get(id) else {
             return false;
         };
@@ -281,32 +298,6 @@ impl Simulation {
         }
         self.fly_flight_step(id, rules, registry, frame_effects);
         false
-    }
-
-    /// `0x004CD9C8..0x004CDA02`: `Queue_Mission(Move, 0)` (vt+0x1E8) for a
-    /// living owner with a NavCom (`+0x5A4`) whose mission (vt+0x184) is
-    /// Guard with nothing queued (`+0xB4`), unless the Fly is AirportBound.
-    fn fly_guard_to_move(&mut self, id: u64) {
-        let Some(entity) = self.substrate.entities.get_mut(id) else {
-            return;
-        };
-        let airport_bound = entity
-            .locomotor
-            .as_ref()
-            .and_then(|locomotor| locomotor.fly_runtime())
-            .is_none_or(|state| state.airport_bound());
-        if entity.health.current() <= 0
-            || entity.navigation.nav_com().is_none()
-            || entity.mission.effective() != MissionId::from_known(MissionType::Guard)
-            || entity.mission.queued() != MissionId::NONE
-            || airport_bound
-        {
-            return;
-        }
-        crate::sim::mission::authority::queue_entity_mission_deferred(
-            entity,
-            MissionId::from_known(MissionType::Move),
-        );
     }
 
     /// UpdateFlightMotion past its Is_Moving gate (`0x004CDA16..0x004CE4A2`),
@@ -320,23 +311,23 @@ impl Simulation {
     ///   (`0x004CDD75..0x004CDDD3`);
     /// - the height step (`FlyRuntime::step_height`) and, after a descent,
     ///   the landing drift ([`Self::fly_landing_drift`]);
-    /// - the target speed (`air_movement::write_fly_target_speed`), the
+    /// - the target speed (`FlyRuntime::write_target_speed`), the
     ///   IsDropship approach attitude (`0x004CE2E5..0x004CE3BA`), the landing
     ///   trigger ([`Self::fly_landing_trigger`]) and the speed ramp
     ///   (`0x004CE441..0x004CE495`).
     fn fly_flight_step(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) {
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         self.foot_mark_remove(id, rules, registry, frame_effects);
         let Some(entity) = self.substrate.entities.get(id) else {
             return;
         };
-        let object = rules.and_then(|rules| self.interner.object_type(entity.type_ref(), rules));
+        let object = self.interner.object_type(entity.type_ref(), rules);
         let dropship = object.is_some_and(|object| object.is_dropship);
         let location = ground_pose::object_location(entity, self.resolved_terrain.as_ref());
         let speed = air_movement::current_fly_speed(
@@ -347,7 +338,7 @@ impl Simulation {
                 .locomotor
                 .as_ref()
                 .and_then(|locomotor| locomotor.fly_runtime())
-                .map_or(SIM_ZERO, |state| state.current_speed()),
+                .map_or(NativeF64Bits::POSITIVE_ZERO, |state| state.current_speed()),
         );
         let mut candidate = location;
         if speed > 0 {
@@ -379,20 +370,28 @@ impl Simulation {
             destination.x.wrapping_sub(placed.x),
             destination.y.wrapping_sub(placed.y),
         );
-        let height = air_movement::update_fly_height(
-            entity,
-            terrain,
-            rules.map(|rules| (rules, &self.interner)),
-        );
+        let height =
+            air_movement::update_fly_height(entity, terrain, Some((rules, &self.interner)));
         if height.descended() {
-            self.fly_landing_drift(id, rules);
+            Self::fly_landing_drift(
+                &self.interner,
+                &mut self.substrate,
+                &self.resolved_terrain,
+                self.playfield_bounds,
+                id,
+                rules,
+            );
         }
         let terrain = self.resolved_terrain.as_ref();
-        let rules_context = rules.map(|rules| (rules, &self.interner));
+        let rules_context = Some((rules, &self.interner));
         let entity = self.substrate.entities.get_mut(id).unwrap();
         let facts = air_movement::fly_speed_facts(entity, distance, terrain, rules_context);
-        if let Some(locomotor) = entity.locomotor.as_mut() {
-            air_movement::write_fly_target_speed(locomotor, &facts);
+        if let Some(state) = entity
+            .locomotor
+            .as_mut()
+            .and_then(|locomotor| locomotor.fly_runtime_mut())
+        {
+            state.write_target_speed(&facts);
         }
         if let Some(object) = object.filter(|_| dropship)
             && entity.health.current() > 0
@@ -400,7 +399,7 @@ impl Simulation {
                 .locomotor
                 .as_ref()
                 .and_then(|locomotor| locomotor.fly_runtime())
-                .is_some_and(|state| state.current_speed() > SIM_ZERO && !state.taking_off())
+                .is_some_and(|state| state.current_speed_is_positive() && !state.taking_off())
         {
             entity
                 .flight_attitude
@@ -416,7 +415,7 @@ impl Simulation {
                 .as_mut()
                 .and_then(|locomotor| locomotor.fly_runtime_mut())
         {
-            air_movement::ramp_fly_speed(state);
+            state.ramp_speed();
         }
         // Mark refuses an object in Limbo (`0x005F5854`).
         if self
@@ -462,13 +461,46 @@ impl Simulation {
             span,
         };
         let may_leave = aircraft && self.aircraft_may_leave_map(id);
+        let fly_by = aircraft && object.is_some_and(|object| object.fly_by);
         let (coord, placed) = fly_map_edge(
             candidate,
             &edge,
             may_leave,
-            aircraft && object.is_some_and(|object| object.fly_by),
+            fly_by,
             &mut self.scenario_rng,
         );
+        // Native's admission places an out-of-diamond candidate as it is
+        // for an owner that may not leave the map or a FlyBy Aircraft
+        // (`0x004CDB4C`), leaning on the engine's wrapping fixed point to
+        // keep the off-map walk representable; VERA's `SimFixed` panics
+        // once the walk leaves its domain (observed: a jet walked 128
+        // cells past the north-west corner before the position overflowed).
+        // An owner that may not operate outside the playfield is held at
+        // the edge instead: the step is refused, never placed. FlyBy
+        // Aircraft keep native behavior — they exit the map by design and
+        // `leave_map` removes them.
+        if placed
+            && !may_leave
+            && !fly_by
+            && !crate::map::playfield::size_diamond_contains(width, height, coord_cell(coord))
+        {
+            return None;
+        }
+        // The position's fixed-point domain is the last cliff.
+        // `put_world_xy` aliases a coordinate from `-32768` to
+        // `65535 * 256 + 32767` through its clamped cell word, and panics
+        // past that (native wraps its own words silently there). A flyer
+        // whose drive went rogue — observed: a spy plane whose mission
+        // stopped dispatching flew straight past the map and on toward the
+        // north-west corner — is refused the step at the cliff instead of
+        // overflowing the position, whatever class admitted it.
+        if coord.x < i32::from(i16::MIN) + 1
+            || coord.y < i32::from(i16::MIN) + 1
+            || coord.x > i32::from(u16::MAX) * 256 + 32767
+            || coord.y > i32::from(u16::MAX) * 256 + 32767
+        {
+            return None;
+        }
         placed.then_some(coord)
     }
 
@@ -477,8 +509,15 @@ impl Simulation {
     /// Location toward the centre of the destination's cell (facing
     /// `0x004CAE30`, step as the paid step's) through `FootClass::SetLocation`,
     /// unless it enters (vt+0x184 Enter) a Helipad building its NavCom names.
-    fn fly_landing_drift(&mut self, id: u64, rules: Option<&RuleSet>) {
-        let Some(entity) = self.substrate.entities.get(id) else {
+    fn fly_landing_drift(
+        interner: &StringInterner,
+        substrate: &mut ObjectSubstrate,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        playfield_bounds: Option<crate::sim::cell_rect::PlayfieldBounds>,
+        id: u64,
+        rules: &RuleSet,
+    ) {
+        let Some(entity) = substrate.entities.get(id) else {
             return;
         };
         let destination = entity
@@ -496,18 +535,35 @@ impl Simulation {
                 .nav_com()
                 .and_then(|nav_com| match nav_com {
                     NavTargetRef::Cell { .. } => None,
-                    NavTargetRef::Object { id } => self.substrate.entities.get(id),
+                    NavTargetRef::Object { id } => substrate.entities.get(id),
                 })
                 .filter(|building| building.category() == EntityCategory::Structure)
-                .and_then(|building| {
-                    rules.and_then(|rules| self.interner.object_type(building.type_ref(), rules))
-                })
+                .and_then(|building| interner.object_type(building.type_ref(), rules))
                 .is_some_and(|object| object.helipad);
         if entering_helipad {
             return;
         }
-        let location = ground_pose::object_location(entity, self.resolved_terrain.as_ref());
+        let location = ground_pose::object_location(entity, resolved_terrain.as_ref());
         let (cell_x, cell_y) = coord_cell(destination);
+        // The drift's SetLocation carries no map-edge admission (the paid
+        // step's placement runs through `fly_map_edge`), so a destination
+        // whose packed cell lies outside the playfield — a wrapped
+        // NavTargetRef cell, say — would walk the flyer off the map in
+        // landing-drift steps until the sub-cell offset left the
+        // fixed-point position's domain (observed: a jet walked to -32794
+        // leptons, 128 cells off the north-west corner, and panicked in
+        // `put_world_xy`). Without MapClass authority (headless fixtures)
+        // there is no map edge to leave: the drift keeps its prior
+        // behavior, like `fly_map_edge_admission`'s no-authority arm.
+        if let Some(bounds) = playfield_bounds
+            && !crate::sim::cell_rect::cell_is_in_playfield_height_aware(
+                (i32::from(cell_x), i32::from(cell_y)),
+                Some(bounds),
+                resolved_terrain.as_ref(),
+            )
+        {
+            return;
+        }
         let centre = [
             i32::from(cell_x).wrapping_mul(256).wrapping_add(0x80),
             i32::from(cell_y).wrapping_mul(256).wrapping_add(0x80),
@@ -520,11 +576,11 @@ impl Simulation {
             LANDING_DRIFT_STEP,
         );
         ground_pose::foot_set_location(
-            &mut self.substrate.entities,
+            &mut substrate.entities,
             id,
             DriveCoord { x, y, ..location },
             rules,
-            &self.interner,
+            interner,
         );
     }
 
@@ -547,7 +603,7 @@ impl Simulation {
             && entity.health.current() > 0
             && !state.has_phase_callback()
             && coord_cell(state.destination()) == coord_cell(location)
-            && state.target_speed() == SIM_ZERO
+            && state.target_speed_is_zero()
             && (entity.attack_target.target().is_none()
                 || entity.ammo().map_or(-1, |ammo| ammo.current()) == 0)
     }
@@ -589,18 +645,18 @@ impl Simulation {
         id: u64,
         coord: DriveCoord,
         may_slow: bool,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> i32 {
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         let Some(entity) = self.substrate.entities.get(id) else {
             return 0;
         };
-        let object = rules.and_then(|rules| self.interner.object_type(entity.type_ref(), rules));
+        let object = self.interner.object_type(entity.type_ref(), rules);
         let aircraft = entity.category() == EntityCategory::Aircraft;
         let strafe = aircraft
-            && rules.zip(object).is_some_and(|(rules, object)| {
+            && object.is_some_and(|object| {
                 crate::sim::combat::combat_weapon::aircraft_strafes(
                     rules,
                     object,
@@ -623,19 +679,17 @@ impl Simulation {
         let mut aim = coord;
         if !hunter_seeker && let Some(building) = self.fly_building_at(coord) {
             if entity.radio_contacts.contains(building) {
-                if let Some(dock) = rules.and_then(|rules| {
-                    crate::sim::movement::building_dock_coordinate(
-                        &self.substrate.entities,
-                        building,
-                        Some(id),
-                        self.resolved_terrain.as_ref(),
-                        rules,
-                        &self.interner,
-                    )
-                }) {
+                if let Some(dock) = crate::sim::movement::building_dock_coordinate(
+                    &self.substrate.entities,
+                    building,
+                    Some(id),
+                    self.resolved_terrain.as_ref(),
+                    rules,
+                    &self.interner,
+                ) {
                     aim = dock;
                 }
-            } else if aircraft && let Some(rules) = rules {
+            } else if aircraft {
                 aim = self
                     .aircraft_find_attack_cell(id, Some(NavTargetRef::object(building)), rules)
                     .and_then(|cell| {
@@ -686,7 +740,7 @@ impl Simulation {
                             entity,
                             &self.substrate.entities,
                             frame,
-                            rules.map_or(0, |rules| rules.general.pose_dir),
+                            rules.general.pose_dir,
                         )
                         .wrapping_shl(13)
                     } else {
@@ -699,6 +753,32 @@ impl Simulation {
             (!locked).then_some(toward)
         };
 
+        // Ares 3.0 FlyLocomotionClass_sub_4CEFB0_HunterSeeker (1004DC30,
+        // hook 0x4CF3D0) takes the height block of a hunter with a Target.
+        // Its detonation leaves the step (0x4CF5F2) with the facings the
+        // two blocks above have already set.
+        let ares_level = if rules.ares() {
+            match self.ares_hunter_seeker_height(id, rules) {
+                crate::sim::hunter_seeker::HunterSeekerHeight::Stock => None,
+                crate::sim::hunter_seeker::HunterSeekerHeight::Level(level) => Some(level),
+                crate::sim::hunter_seeker::HunterSeekerHeight::Detonate => {
+                    let entity = self.substrate.entities.get_mut(id).unwrap();
+                    if let Some(primary) = primary {
+                        entity.body_facing.set(primary, frame);
+                    }
+                    if let Some(secondary) = secondary {
+                        entity.ensure_fly_secondary_facing();
+                        if let Some(facing) = entity.barrel_facing.as_mut() {
+                            facing.set(secondary, frame);
+                        }
+                    }
+                    self.ares_hunter_seeker_detonate(id, rules, registry, frame_effects);
+                    return 0;
+                }
+            }
+        } else {
+            None
+        };
         let flight_level = self.fly_type_flight_level(id, rules);
         let entity = self.substrate.entities.get(id).unwrap();
         let state = entity
@@ -727,25 +807,26 @@ impl Simulation {
         } else {
             flight_level
         };
+        let level = ares_level.unwrap_or(level);
         let slow = air_movement::fly_speed_facts(
             entity,
             distance,
             self.resolved_terrain.as_ref(),
-            rules.map(|rules| (rules, &self.interner)),
+            Some((rules, &self.interner)),
         )
         .slow;
         let arrival = !hunter_seeker && air_movement::fly_may_slow(state.landing(), cruise, &slow);
         let land = arrival
             && distance < ARRIVAL_STOP
             && !cruise
-            && state.current_speed() < air_movement::MIN_CREEP_SPEED;
+            && state.current_speed_below_landing_threshold();
 
         let entity = self.substrate.entities.get_mut(id).unwrap();
         if let Some(primary) = primary {
             entity.body_facing.set(primary, frame);
         }
         if let Some(secondary) = secondary {
-            air_movement::ensure_fly_secondary_facing(entity);
+            entity.ensure_fly_secondary_facing();
             if let Some(facing) = entity.barrel_facing.as_mut() {
                 facing.set(secondary, frame);
             }
@@ -757,17 +838,13 @@ impl Simulation {
             .unwrap();
         state.set_flight_level(level);
         if arrival && may_slow {
-            if distance < ARRIVAL_STOP {
-                state.set_target_speed(SIM_ZERO);
-            } else if distance < ARRIVAL_HALF {
-                state.set_target_speed(HALF_SPEED);
-            } else if distance < ARRIVAL_THREE_QUARTERS {
-                state.set_target_speed(THREE_QUARTER_SPEED);
-            }
+            state.slow_for_arrival(distance);
         }
         if land {
             self.begin_fly_landing(id, rules, registry, frame_effects);
         }
+        // 0x004CF55D..0x004CF5EC: the owner test is 0x0050B6F0.
+        self.deselect_over_player_shroud(id, Self::house_is_human_player);
         distance
     }
 
@@ -780,12 +857,9 @@ impl Simulation {
     /// `FootClass::Stun @ 0x004D5660`) and UnInit (vt+0xF8). Without MapClass
     /// authority (headless fixtures) nothing happens.
     ///
-    /// RESIDUAL: a passenger infantry of a `Civilian=` type that is no
-    /// survivor (`0x00413CD0`: InfantryType `+0xEC1`, Infantry `+0x6D9`) sets
-    /// its house's CiviliansEvacuated (`+0x1F9`), which VERA does not
-    /// represent. Trigger: a retreating transport aircraft carrying
-    /// civilians off the map, in campaigns. Effect: the trigger event that
-    /// reads the flag does not fire.
+    /// Before Team/teardown, a qualifying Civilian passenger sets its own
+    /// House's CiviliansEvacuated byte (4CD580..4CD58F), later read by
+    /// event18. Source: original gamemd.exe instructions.
     ///
     /// RESIDUAL: each passenger is deleted at once (`0x004CD5AE`); VERA
     /// UnInits it, which announces the same expiry but removes the object at
@@ -794,7 +868,7 @@ impl Simulation {
     fn fly_playfield_latch(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) {
@@ -831,6 +905,12 @@ impl Simulation {
             .and_then(|owner| owner.passenger_role.cargo_mut())
             .and_then(|cargo| cargo.unload_first())
         {
+            if self.is_evacuation_civilian(passenger, rules) {
+                let owner = self.substrate.entities.get(passenger).unwrap().owner();
+                if let Some(house) = self.houses.get_mut(&owner) {
+                    house.mark_civilians_evacuated();
+                }
+            }
             self.team_script_vm.mark_member_team_leaving_map(passenger);
             // RemoveFirstPassenger leaves the passenger's own hold for its
             // teardown.
@@ -840,7 +920,35 @@ impl Simulation {
             self.uninit_with_context(passenger, context);
         }
         self.team_script_vm.mark_member_team_leaving_map(id);
-        self.techno_death_stun(id, context);
+        self.stun(id, context);
         self.uninit_with_context(id, context);
+    }
+}
+
+impl crate::sim::world::ObjectSubstrate {
+    /// `0x004CD9C8..0x004CDA02`: `Queue_Mission(Move, 0)` (vt+0x1E8) for a
+    /// living owner with a NavCom (`+0x5A4`) whose mission (vt+0x184) is
+    /// Guard with nothing queued (`+0xB4`), unless the Fly is AirportBound.
+    fn fly_guard_to_move(&mut self, id: u64) {
+        let Some(entity) = self.entities.get_mut(id) else {
+            return;
+        };
+        let airport_bound = entity
+            .locomotor
+            .as_ref()
+            .and_then(|locomotor| locomotor.fly_runtime())
+            .is_none_or(|state| state.airport_bound());
+        if entity.health.current() <= 0
+            || entity.navigation.nav_com().is_none()
+            || entity.mission.effective() != MissionId::from_known(MissionType::Guard)
+            || entity.mission.queued() != MissionId::NONE
+            || airport_bound
+        {
+            return;
+        }
+        crate::sim::mission::authority::queue_entity_mission_deferred(
+            entity,
+            MissionId::from_known(MissionType::Move),
+        );
     }
 }

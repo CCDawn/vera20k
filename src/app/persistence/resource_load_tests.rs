@@ -16,6 +16,153 @@ const LOAD_CLOCK_MS: u64 = 16_000;
 const SAVED_ELAPSED_BUCKETS: u32 = 180;
 const MISSING_FOLLOW_ID: u64 = 0xBAD_F011;
 
+#[test]
+fn packed_ice_bytes_survive_materialization_and_saved_resource_loading() {
+    use crate::map::map_file::MapFile;
+    use crate::util::{base64::base64_decode, ini_writer, lzo};
+    use ::base64::Engine;
+
+    let Some((root, mut assets)) = retail_assets() else {
+        return;
+    };
+    let original = assets.get_ref("XMP03T4.MAP").unwrap().to_vec();
+    let stock = MapFile::from_bytes(&original).unwrap();
+    let section = stock.ini.section("IsoMapPack5").unwrap();
+    let packed = base64_decode(&section.read_packed_text()).unwrap();
+    let mut records = lzo::decompress_chunks(&packed, 512 * 512 * 11 + 4).unwrap();
+    // Actual retail record744 crosses the 8192-byte decompression boundary.
+    assert_eq!(&records[8184..8195], &[68, 0, 28, 0, 140, 0, 0, 0, 0, 4, 0]);
+    let next: [u8; 11] = records[8195..8206].try_into().unwrap();
+    let next_cell = (
+        u16::from_le_bytes([next[0], next[1]]),
+        u16::from_le_bytes([next[2], next[3]]),
+    );
+    let end = records
+        .chunks(11)
+        .position(|record| record.len() >= 4 && record[..4] == [0; 4])
+        .map_or(records.len(), |index| index * 11);
+    records.truncate(end);
+    records[8194] = 0x80; // Authored derivative, not a stock/native numeric golden.
+    let mut duplicate = next;
+    let alias_x =
+        i16::try_from(i32::from(next_cell.0) + 512 * (i32::from(next_cell.1) + 1)).unwrap();
+    duplicate[..2].copy_from_slice(&alias_x.to_le_bytes());
+    duplicate[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+    duplicate[10] = 1;
+    records.extend_from_slice(&duplicate);
+    let mut missed = next;
+    missed[..2].copy_from_slice(&i16::MAX.to_le_bytes());
+    missed[2..4].copy_from_slice(&i16::MAX.to_le_bytes());
+    missed[10] = 0xff;
+    records.extend_from_slice(&missed);
+    records.extend_from_slice(&[0; 4]);
+    let encoded =
+        ::base64::engine::general_purpose::STANDARD.encode(lzo::compress_chunks(&records, 0x2000));
+    let values: Vec<_> = encoded
+        .as_bytes()
+        .chunks(70)
+        .enumerate()
+        .map(|(index, bytes)| {
+            (
+                index.to_string(),
+                std::str::from_utf8(bytes).unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let refs: Vec<_> = values
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let keys: Vec<_> = section.keys().collect();
+    let cleared = ini_writer::remove_ini_keys(&original, "IsoMapPack5", &keys);
+    let derivative = ini_writer::set_ini_values(&cleared, "IsoMapPack5", &refs);
+    let directory = TestDirectory::new("packed-ice-resource-load");
+    directory.write("authored.map", &derivative);
+    let path = directory.path().join("authored.map");
+    let name = path.to_str().unwrap();
+    let loaded =
+        crate::map::source::load_map_by_name_or_path_with_assets(&root, name, &assets).unwrap();
+    let mut owner = retail_rules_owner(&assets);
+    let mode = crate::rules::retail_sources::select_ini(&assets, "MPBattleMD.ini")
+        .unwrap()
+        .ini;
+    let mut cache = TileVariantSelectorCache::default();
+    let (mut runtime, metadata, _) =
+        bound_saved_world(loaded, name, &mut assets, &mut owner, &mode, &mut cache);
+    let ice = |grid: &ResolvedTerrainGrid, (x, y)| grid.cell(x, y).unwrap().legacy_ice_byte;
+    assert_eq!(
+        ice(runtime.simulation.resolved_terrain().unwrap(), (68, 28)),
+        0x80
+    );
+    assert_eq!(
+        ice(runtime.simulation.resolved_terrain().unwrap(), next_cell),
+        1
+    );
+    assert_eq!(
+        runtime
+            .simulation
+            .resolved_terrain()
+            .unwrap()
+            .iter()
+            .filter(|cell| cell.legacy_ice_byte != 0)
+            .count(),
+        2,
+        "the out-of-range record cannot alter an allocated cell"
+    );
+    assert!(
+        runtime
+            .simulation
+            .rebuild_dynamic_navigation(&runtime.resources.rules)
+    );
+    let hash = runtime.resources.rules.simulation_config_hash();
+    let bytes = snapshot_bytes(&runtime, &owner, &metadata, None, hash);
+    std::fs::remove_file(&path).unwrap();
+    let repository = SaveRepository::at(directory.path().join("saves"));
+    let frontend = frontend_main();
+    let clock = || LOAD_CLOCK_MS;
+    let view = SavedGamePreparationView {
+        repository: &repository,
+        current_simulation: None,
+        frontend_main: &frontend,
+        rules_owner: &owner,
+        tile_cache: &cache,
+        lighting: &crate::app::presentation::lighting::MatchLighting::default(),
+        load_clock: &clock,
+    };
+    let restored = assets
+        .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bytes, &view, assets))
+        .unwrap();
+    assert_eq!(
+        ice(
+            restored.world.simulation.resolved_terrain().unwrap(),
+            (68, 28)
+        ),
+        0x80
+    );
+    assert_eq!(
+        ice(
+            restored.world.simulation.resolved_terrain().unwrap(),
+            next_cell
+        ),
+        1
+    );
+    let stock =
+        crate::map::source::load_map_by_name_or_path_with_assets(&root, "XMP03T4.MAP", &assets)
+            .unwrap();
+    let (fresh, _, _) = bound_saved_world(
+        stock,
+        "XMP03T4.MAP",
+        &mut assets,
+        &mut owner,
+        &mode,
+        &mut cache,
+    );
+    assert_eq!(
+        ice(fresh.simulation.resolved_terrain().unwrap(), (68, 28)),
+        0
+    );
+}
+
 fn map_text(theater: &str, strength: i32, size: u32) -> String {
     // This Pack5 record is the existing map/source.rs one-cell fixture. The
     // map owner supplies the remaining native Size diamond from retail Clear.
@@ -42,7 +189,7 @@ fn bound_saved_world(
     let map = loaded.map;
     let theater =
         theater::load_theater(assets, &map.header.theater).expect("retail saved-world theater");
-    let (mut rules, processed, fixed_art, _) = owner
+    let (mut rules, _, fixed_art, _) = owner
         .load_scenario(
             crate::rules::process_owner::NativeScenarioRulesPrefix::NonCampaign(Some(mode)),
             &map.ini,
@@ -56,13 +203,17 @@ fn bound_saved_world(
         theater.extension,
         &map.header.theater,
     );
-    let overlay_registry =
-        crate::rules::overlay_types::OverlayTypeRegistry::from_ini(&processed, Some(&fixed_art));
+    let overlay_registry = rules.overlay_registry().clone();
     let mut simulation = super::super::tests::load_fixture_simulation(false);
     let terrain = {
-        let mut main_draw = || simulation.main_rng.next_u32();
+        let main_rng = simulation.main_rng().draws();
+        let mut main_draw = || main_rng.next_u32();
         let mut selector = cache.begin_load(&mut main_draw);
-        let mut fill_draw = |min, max| simulation.scenario_rng.next_range_u32_inclusive(min, max);
+        let mut fill_draw = |min, max| {
+            simulation
+                .scenario_rng_mut_for_test()
+                .next_range_u32_inclusive(min, max)
+        };
         ResolvedTerrainGrid::build_with_variant_selector(
             &map,
             Some(&theater),
@@ -76,9 +227,6 @@ fn bound_saved_world(
             &mut selector,
         )
     };
-    // Match the existing fresh-loader publication after its Fill pass. The
-    // saved-load candidate must later replace these retained theater values.
-    cache.complete_theater_registry_load(theater.rmg_tiles.clear_tile, theater.rmg_tiles.water_set);
     let roots = crate::map::resolved_terrain::scheduler_anim_roots(
         &rules,
         &overlay_registry,
@@ -86,22 +234,35 @@ fn bound_saved_world(
     );
     init_helpers::bind_rules_asset_closure(
         &mut rules,
-        &processed,
-        &fixed_art,
+        &overlay_registry,
         &roots,
+        &[],
         assets,
         theater.extension,
         &map.header.theater,
+        crate::rules::terrain_asset_catalog::TerrainAssetLoadPhase::Saved,
     )
     .expect("retail simulation asset closure");
     let roster =
         crate::map::houses::parse_house_roster(&map.ini, &rules.color_schemes, Some(&rules));
     let lighting = crate::map::lighting::parse_lighting(&map.ini);
-    let mut metadata = SavedMapMetadata::capture(
+    // A nonempty retained title makes both warm and cold resource restoration
+    // prove that saved names survive without consulting the current CSF.
+    let mut campaign_names = crate::rules::campaign_loading::CampaignScenarioNames::default();
+    campaign_names.apply_ini(
+        &IniFile::from_str("[saved.map]\nUIName=NAME:SAVED\n"),
+        "saved.map",
+        &crate::assets::csf_file::test_csf(&[
+            ("NAME:SAVED", "Retained mission name"),
+            ("NAME:SAVEDSav", "Retained save title"),
+        ]),
+    );
+    let metadata = SavedMapMetadata::capture(
         map.ini.content_hash(),
         &loaded.source,
         &map.basic,
         &map.ranking,
+        &campaign_names,
         &map.terrain_objects,
         &roster,
         &roster.color_map(),
@@ -109,23 +270,37 @@ fn bound_saved_world(
         SAVED_ELAPSED_BUCKETS,
         Some("Saved player"),
         [6, -2],
+        true,
     );
-    metadata.set_radar_pause_credit(true);
     // One video-owned and one ordinary trigger-owned untimed hold.
-    simulation.pause_scenario(0);
-    simulation.pause_scenario(0);
-    simulation.session.map_name = name.into();
-    simulation.session.install_waypoints(&map.waypoints);
-    simulation.session.theater = map.header.theater.clone();
-    simulation.session.map_width = terrain.width();
-    simulation.session.map_height = terrain.height();
-    simulation.session.tick = 91;
-    simulation.session.binary_frame = 92;
-    simulation.session.lighting = crate::sim::scenario_session::ScenarioLightingState::from_map(
-        &crate::map::lighting::parse_lighting_profiles(&map.ini),
+    simulation.pause_scenario_for_test(0);
+    simulation.pause_scenario_for_test(0);
+    simulation
+        .session_mut_for_test()
+        .set_map_name_for_test(name.into());
+    simulation
+        .session_mut_for_test()
+        .install_waypoints(&map.waypoints);
+    simulation
+        .session_mut_for_test()
+        .set_theater_for_test(map.header.theater.clone());
+    simulation
+        .session_mut_for_test()
+        .set_map_width_for_test(terrain.width());
+    simulation
+        .session_mut_for_test()
+        .set_map_height_for_test(terrain.height());
+    simulation.session_mut_for_test().set_tick_for_test(91);
+    simulation
+        .session_mut_for_test()
+        .set_binary_frame_for_test(92);
+    simulation.session_mut_for_test().set_lighting_for_test(
+        crate::sim::scenario_session::ScenarioLightingState::from_map(
+            &crate::map::lighting::parse_lighting_profiles(&map.ini),
+        ),
     );
     simulation.install_playfield_from_map_header(&map.header);
-    simulation.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(
+    *simulation.overlay_grid_mut_for_test() = Some(crate::sim::overlay_grid::OverlayGrid::new(
         terrain.width(),
         terrain.height(),
     ));
@@ -147,7 +322,8 @@ fn bound_saved_world(
                 rules,
                 terrain_template: Some(terrain),
                 overlay_registry,
-            },
+            }
+            .into(),
         },
         metadata,
         clear_file,
@@ -172,12 +348,36 @@ fn native_saved_power() -> SavedPowerBar {
     }
 }
 
+fn saved_radar_for_fixture() -> crate::sim::snapshot::saved_local_view::SavedRadarEvents {
+    let mut saved = crate::render::radar::saved_radar_fixture();
+    // Keep this resource fixture's distinct logical/native clocks (91/92).
+    // Shift the live alert fixture's timeline with the restored world.
+    let offset = saved.last_advanced_frame.unwrap() - 91;
+    saved.last_advanced_frame = Some(91);
+    for event in &mut saved.events {
+        event.created_frame -= offset;
+        event.phase_started_frame = event.phase_started_frame.map(|frame| frame - offset);
+    }
+    saved
+}
+
 fn snapshot_bytes(
     runtime: &SimRuntime,
     owner: &NativeRulesProcessOwner,
     map: &SavedMapMetadata,
     follow: Option<u64>,
     rules_hash: u64,
+) -> Vec<u8> {
+    snapshot_bytes_with_lighting(runtime, owner, map, follow, rules_hash, None)
+}
+
+fn snapshot_bytes_with_lighting(
+    runtime: &SimRuntime,
+    owner: &NativeRulesProcessOwner,
+    map: &SavedMapMetadata,
+    follow: Option<u64>,
+    rules_hash: u64,
+    saved_lighting: Option<(&crate::map::lighting::SavedCellLighting, &[(u64, i32)])>,
 ) -> Vec<u8> {
     let terrain = runtime
         .resources
@@ -186,23 +386,46 @@ fn snapshot_bytes(
         .unwrap()
         .capture_saved_template()
         .expect("fixture terrain authority");
-    let resources = SavedScenarioResourcesRef::capture(
+    let mut resources = SavedScenarioResourcesRef::capture(
         &runtime.resources,
         owner.saved_scenario_rules().unwrap(),
         owner.fixed_art().content_hash(),
         terrain,
         map.clone(),
     );
+    // The same late capture used by PreparedSave::write, after immutable
+    // resource preparation and immediately before simulation serialization.
+    resources
+        .capture_live_cell_land(runtime.simulation.resolved_terrain().unwrap())
+        .unwrap();
     let mut view = SavedLocalView::new(
         [[4, 5], [5, 4], [0, 0], [u16::MAX, 0]],
         Vec::new(),
         false,
-        std::array::from_fn(|_| Vec::new()),
         follow,
         Default::default(),
     )
     .unwrap();
     view.set_power_bar(native_saved_power());
+    // Authored signed display input: raw save/load must not clamp or seed it.
+    view.set_credits_counter(Some(-7));
+    view.set_radar_events(saved_radar_for_fixture());
+    let mut lighting = crate::app::presentation::lighting::MatchLighting::default();
+    lighting.install(
+        crate::map::lighting::CellLightGrid::new(),
+        map.lighting().clone(),
+        2,
+        Some((
+            runtime.simulation.resolved_terrain().unwrap(),
+            &runtime.simulation,
+        )),
+        None,
+    );
+    let (cells, anim_intensities) = saved_lighting.map_or_else(
+        || lighting.saved_at(&runtime.simulation),
+        |(cells, anims)| (cells.clone(), anims.to_vec()),
+    );
+    view.set_lighting(cells);
     GameSnapshot::save_validated_with_presentation(
         &runtime.simulation,
         map.map_hash(),
@@ -210,6 +433,7 @@ fn snapshot_bytes(
         "retail resources",
         123,
         &[],
+        &anim_intensities,
         None,
         None,
         Some(&view),
@@ -232,18 +456,27 @@ fn assert_incoming_resources(
     incoming: &SimRuntime,
     map: &SavedMapMetadata,
 ) {
+    assert_eq!(prepared.credits_counter, Some(-7));
     assert_eq!(
         prepared.power_bar_anim.saved(),
         native_saved_power(),
         "incoming retained Power wins on warm and cold preparation"
     );
-    let sim = &prepared.world.simulation;
-    assert_eq!(sim.session.map_name, incoming.simulation.session.map_name);
-    assert_eq!(sim.session.theater, "TEMPERATE");
-    assert_eq!(sim.session.tick, incoming.simulation.session.tick);
     assert_eq!(
-        sim.session.binary_frame,
-        incoming.simulation.session.binary_frame
+        prepared.radar_events.saved(),
+        saved_radar_for_fixture(),
+        "both warm and cold loads transport incoming live alerts"
+    );
+    let sim = &prepared.world.simulation;
+    assert_eq!(
+        sim.session().map_name(),
+        incoming.simulation.session().map_name()
+    );
+    assert_eq!(sim.session().theater(), "TEMPERATE");
+    assert_eq!(sim.session().tick(), incoming.simulation.session().tick());
+    assert_eq!(
+        sim.session().binary_frame(),
+        incoming.simulation.session().binary_frame()
     );
     assert_eq!(
         sim.map_size_diamond(),
@@ -253,10 +486,9 @@ fn assert_incoming_resources(
         prepared.resources.rules.object("MTNK").unwrap().strength,
         321
     );
-    assert_eq!(
-        prepared.resources.rules.simulation_config_hash(),
-        incoming.resources.rules.simulation_config_hash()
-    );
+    // TypeLoad can replace image-load attempts after the saved digest has
+    // passed. Compare the retained fields/assets below, not a pre-load digest
+    // with the post-load projection. The wrong-digest control still rejects.
     assert!(
         !prepared
             .resources
@@ -266,13 +498,17 @@ fn assert_incoming_resources(
             .is_empty()
     );
     assert_eq!(
-        sim.session.waypoint_cell(7),
-        incoming.simulation.session.waypoint_cell(7)
+        sim.session().waypoint_cell(7),
+        incoming.simulation.session().waypoint_cell(7)
     );
-    assert_ne!(sim.session.waypoint_cell(7), Some((0, 0)));
+    assert_ne!(sim.session().waypoint_cell(7), Some((0, 0)));
     assert_eq!(
         serde_json::to_value(&prepared.map).unwrap(),
         serde_json::to_value(map).unwrap()
+    );
+    assert_eq!(
+        prepared.map.campaign_names().save_title(),
+        "Retained save title"
     );
     assert_eq!(
         save_codec::serialize(
@@ -281,7 +517,7 @@ fn assert_incoming_resources(
                 .terrain_template
                 .as_ref()
                 .unwrap()
-                .capture_saved_template()
+                .capture_user_saved_template(prepared.resources.terrain_template.as_ref().unwrap())
                 .unwrap()
         )
         .unwrap(),
@@ -291,13 +527,62 @@ fn assert_incoming_resources(
                 .terrain_template
                 .as_ref()
                 .unwrap()
-                .capture_saved_template()
+                .capture_user_saved_template(incoming.simulation.resolved_terrain().unwrap())
                 .unwrap()
         )
         .unwrap(),
-        "asset rebinding preserves baseline terrain values",
+        "asset rebinding preserves baseline metadata plus saved effective Land",
     );
-    let live = sim.resolved_terrain.as_ref().unwrap();
+    let live = sim.resolved_terrain().unwrap();
+    // CellLoad4839F0 clears literal crates and+4C, keeping saved Land and the
+    // separate Map+68 plane. XMP25MW's WCRATE/Rough combination motivates this
+    // small materialized fixture; no native/full retail map load is simulated.
+    let cell = live.cell(8, 8).unwrap();
+    assert_eq!(
+        (cell.land_type, cell.base_land_type, cell.zone_type),
+        (2, 7, 0)
+    );
+    assert!(!cell.overlay_blocks);
+    assert_eq!(
+        cell.speed_costs.track,
+        Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO)
+    );
+    assert_eq!(
+        cell.speed_costs.wheel,
+        Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO)
+    );
+    assert_eq!(
+        cell.speed_costs.float,
+        Some(crate::util::native_x87::NativeF32Bits::ONE)
+    );
+    assert!(sim.path_grid().unwrap().is_walkable(8, 8));
+    assert_eq!(sim.overlay_grid().unwrap().cell(8, 8).overlay_id, None);
+    assert_eq!(sim.overlay_grid().unwrap().cell(7, 8).overlay_id, None);
+    assert_eq!(sim.overlay_grid().unwrap().cell(8, 8).overlay_data, 0);
+    assert!(
+        !prepared
+            .world
+            .map_restore
+            .occupied_overlays
+            .iter()
+            .any(|cell| (cell.rx, cell.ry) == (8, 8) || (cell.rx, cell.ry) == (7, 8))
+    );
+    assert_eq!(
+        serde_json::to_value(sim.zone_grid()).unwrap(),
+        serde_json::to_value(incoming.simulation.zone_grid()).unwrap()
+    );
+    for (loaded, saved) in sim
+        .crate_authority()
+        .slots()
+        .iter()
+        .zip(incoming.simulation.crate_authority().slots())
+    {
+        assert_eq!((loaded.cell_x, loaded.cell_y), (0, 0));
+        assert_eq!(
+            (loaded.start_frame, loaded.aux, loaded.duration),
+            (saved.start_frame, saved.aux, saved.duration)
+        );
+    }
     assert!(
         live.native_tmp_file_count(i32::from(prepared.theater.rmg_tiles.clear_tile.unwrap()))
             .is_some(),
@@ -305,14 +590,14 @@ fn assert_incoming_resources(
     );
     assert!(prepared.map.radar_pause_credit());
     let mut restored_session = Simulation::with_seed(0);
-    restored_session.session = sim.session.clone();
+    *restored_session.session_mut_for_test() = sim.session().clone();
     let release = crate::app::radar_movie::release_saved_scenario_hold(
         &mut restored_session,
         prepared.map.radar_pause_credit(),
     );
     assert!(release.is_empty());
     assert!(
-        restored_session.session.scenario_paused(),
+        restored_session.session().scenario_paused(),
         "unrelated trigger hold survives missing video retirement"
     );
     assert!(
@@ -320,7 +605,7 @@ fn assert_incoming_resources(
             .resume_scenario()
             .contains(&crate::sim::trigger_runtime::TriggerEffect::ScenarioResume)
     );
-    assert!(!restored_session.session.scenario_paused());
+    assert!(!restored_session.session().scenario_paused());
     assert_eq!(prepared.elapsed_clock.elapsed_seconds(LOAD_CLOCK_MS), 3);
     assert_eq!(
         prepared.elapsed_clock.elapsed_seconds(LOAD_CLOCK_MS + 960),
@@ -328,13 +613,14 @@ fn assert_incoming_resources(
     );
 }
 
-/// A later authored map's pre-pack Fill reads the process cache, even though
-/// loading the save itself does not run Fill. Exercise the same adoption and
-/// Fill owners with a zero range result to isolate the retail registry base.
-fn assert_next_fill_uses_saved_theater_registry(
+/// A later authored map's pre-pack Fill reads no process history: natively
+/// the save's theater registry would set its bases. Exercise the same
+/// adoption and Fill owners with a zero range result.
+fn assert_next_fill_reads_no_saved_theater(
     prepared: &PreparedSavedResources,
     process_cache: &TileVariantSelectorCache,
 ) {
+    assert_ne!(prepared.theater.rmg_tiles.water_set, Some(0));
     let mut adopted = process_cache.detached();
     adopted
         .adopt_prepared(prepared.tile_cache.detached())
@@ -342,15 +628,11 @@ fn assert_next_fill_uses_saved_theater_registry(
     let mut main = || panic!("Fill must not draw Main");
     let mut next_map = adopted.begin_load(&mut main);
     let mut first_variant = |_, _| 0;
-    assert_eq!(
-        next_map.draw_fill_tile_index(false, &mut first_variant),
-        i32::from(prepared.theater.rmg_tiles.clear_tile.unwrap()),
-        "next map Clear Fill must use the loaded theater registry",
-    );
+    assert_eq!(next_map.draw_fill_tile_index(false, &mut first_variant), 0);
     assert_eq!(
         next_map.draw_fill_tile_index(true, &mut first_variant),
-        i32::from(prepared.theater.rmg_tiles.water_set.unwrap()),
-        "next map Water Fill must use the loaded theater registry",
+        0,
+        "next map Water Fill must not read the loaded theater",
     );
 }
 
@@ -378,7 +660,7 @@ struct IncomingSave {
     repository: SaveRepository,
 }
 
-fn incoming_save() -> Option<IncomingSave> {
+fn incoming_save(theater: &str, extra_rules: &str) -> Option<IncomingSave> {
     let (root, mut assets) = retail_assets()?;
     let mut owner = retail_rules_owner(&assets);
     assets
@@ -390,7 +672,10 @@ fn incoming_save() -> Option<IncomingSave> {
         .expect("retail Battle INI")
         .ini;
     let directory = TestDirectory::new("saved-retail-resources");
-    directory.write("incoming.map", map_text("TEMPERATE", 321, 8).as_bytes());
+    directory.write(
+        "incoming.map",
+        format!("{}{extra_rules}", map_text(theater, 321, 8)).as_bytes(),
+    );
     directory.write("outgoing.map", map_text("SNOW", 654, 6).as_bytes());
     let source_path = directory.path().join("incoming.map");
     let source_name = source_path.to_str().unwrap();
@@ -398,13 +683,91 @@ fn incoming_save() -> Option<IncomingSave> {
         crate::map::source::load_map_by_name_or_path_with_assets(&root, source_name, &assets)
             .unwrap();
     let mut warm_cache = TileVariantSelectorCache::default();
-    let (incoming, map, incoming_file) = bound_saved_world(
+    let (mut incoming, map, incoming_file) = bound_saved_world(
         loaded,
         source_name,
         &mut assets,
         &mut owner,
         &mode,
         &mut warm_cache,
+    );
+    let rough = *incoming
+        .resources
+        .rules
+        .terrain_rules
+        .row(crate::rules::terrain_rules::LandType::Rough);
+    let template = std::sync::Arc::get_mut(&mut incoming.resources)
+        .expect("unshared resources")
+        .terrain_template
+        .as_mut()
+        .unwrap();
+    let cell = template.cell_mut_for_test(8, 8).unwrap();
+    cell.land_type = 7;
+    cell.base_land_type = 7;
+    cell.speed_costs = rough.speed_costs;
+    cell.base_speed_costs = rough.speed_costs;
+    incoming
+        .simulation
+        .install_resolved_terrain_for_new_map(template.clone());
+    assert_eq!(
+        incoming.resources.overlay_registry.id_for_name("CRATE"),
+        Some(179)
+    );
+    assert_eq!(
+        incoming.resources.overlay_registry.id_for_name("WCRATE"),
+        Some(242)
+    );
+    let overlays = incoming
+        .simulation
+        .overlay_grid_mut_for_test()
+        .as_mut()
+        .unwrap();
+    overlays.place_overlay(8, 8, 242, 10);
+    overlays.place_overlay(7, 8, 179, 255);
+    let terrain = incoming
+        .simulation
+        .resolved_terrain_mut_for_test()
+        .as_mut()
+        .unwrap();
+    // Split the test-only borrows through a short-lived owned grid.
+    let mut terrain = terrain.clone();
+    let overlays = incoming
+        .simulation
+        .overlay_grid_mut_for_test()
+        .as_mut()
+        .unwrap();
+    crate::sim::overlay_grid::recalc_overlay_passability(
+        overlays,
+        &mut terrain,
+        &incoming.resources.overlay_registry,
+        8,
+        8,
+    );
+    *incoming.simulation.resolved_terrain_mut_for_test() = Some(terrain);
+    *incoming
+        .simulation
+        .crate_authority_mut_for_test()
+        .slot_mut_for_test(0) = crate::sim::crates::CrateSlot {
+        start_frame: 73,
+        aux: 0x1234,
+        duration: 125,
+        cell_x: 8,
+        cell_y: 8,
+    };
+    *incoming
+        .simulation
+        .crate_authority_mut_for_test()
+        .slot_mut_for_test(255) = crate::sim::crates::CrateSlot {
+        start_frame: -1,
+        aux: u32::MAX,
+        duration: 321,
+        cell_x: -13,
+        cell_y: 0,
+    };
+    assert!(
+        incoming
+            .simulation
+            .rebuild_dynamic_navigation(&incoming.resources.rules)
     );
     let rules_hash = incoming.resources.rules.simulation_config_hash();
     let bytes = snapshot_bytes(&incoming, &owner, &map, None, rules_hash);
@@ -456,8 +819,309 @@ fn frontend_main() -> crate::sim::rng::MainRng {
 }
 
 #[test]
+fn saved_local_lighting_projects_pending_history_and_rejects_invalid_cells() {
+    use crate::app::presentation::lighting::{MatchLighting, rebuild_lighting_grid_from_sim};
+    use crate::map::lighting::CellLightGrid;
+    use crate::sim::components::AnimClassSpawnDescriptor;
+    use crate::sim::light_sources::{LightingEvent, PaletteUpdate};
+    let Some(mut save) = incoming_save("TEMPERATE", "") else {
+        return;
+    };
+    let sim = &mut save.incoming.simulation;
+    let kind = sim.intern("SQDG");
+    let anim = sim
+        .spawn_anim_object(
+            &save.incoming.resources.rules,
+            AnimClassSpawnDescriptor::new(
+                kind,
+                8,
+                8,
+                crate::util::fixed_math::SimFixed::ZERO,
+                crate::util::fixed_math::SimFixed::ZERO,
+                0,
+            ),
+        )
+        .expect("bound retail SQDG constructor");
+    let house = sim.intern("Americans");
+    sim.anims_mut_for_test().set_anim_house_remap(anim, house);
+    let mut lights = MatchLighting::default();
+    lights.install(
+        CellLightGrid::new(),
+        save.map.lighting().clone(),
+        2,
+        Some((sim.resolved_terrain().unwrap(), sim)),
+        None,
+    );
+    // Exercise the projection shared with PreparedSave's writer: pre-Logic
+    // publications must be replayed instead of reconstructing FC from final light.
+    // Zero ambient is a supplied boundary input; this is not a stock map claim.
+    let frame = sim.session().binary_frame() as i32;
+    sim.session_mut_for_test()
+        .lighting_mut()
+        .set_nuke_flash_for_test(1, frame, 30);
+    sim.session_mut_for_test()
+        .lighting_mut()
+        .select(crate::sim::scenario_session::ScenarioLightingProfile::Nuke);
+    sim.session_mut_for_test()
+        .lighting_mut()
+        .set_current_ambient_for_test(0);
+    sim.publish_global_lighting(PaletteUpdate::from_scenario(sim.session().lighting()));
+    sim.lighting_sources_mut_for_test()
+        .publish_for_test(LightingEvent::RetainAnimIntensity {
+            anim,
+            cell: Some((8, 8)),
+        });
+    sim.session_mut_for_test()
+        .lighting_mut()
+        .set_current_ambient_for_test(120);
+    sim.publish_global_lighting(PaletteUpdate::Preserve);
+    let before = (sim.state_hash(), sim.rng_state());
+    let (mut saved, saved_anims) = lights.clone().saved_at(sim);
+    assert_eq!(
+        saved_anims,
+        [(anim, 0)],
+        "an explicit zero is retained, not absent/default"
+    );
+    assert_eq!(
+        saved.cells.iter().find(|row| row.0 == (8, 8)).unwrap().3,
+        1100
+    );
+    assert_eq!(
+        lights.anim_intensities().get(&anim).copied(),
+        None,
+        "save projection is isolated"
+    );
+    assert_eq!((sim.state_hash(), sim.rng_state()), before);
+
+    // A supplied retained104/108/top history distinguishes the post-load
+    //484680 refresh from both exact top restoration and a fresh gather.
+    let retained = saved.cells.iter_mut().find(|row| row.0 == (8, 8)).unwrap();
+    *retained = ((8, 8), 32768, 25, 333);
+    let terrain = sim.resolved_terrain().unwrap();
+    let iterated: std::collections::BTreeSet<_> =
+        crate::map::lighting::native_lighting_cells(terrain, sim.map_size_diamond().unwrap().0)
+            .collect();
+    assert_eq!(
+        iterated.len(),
+        saved.cells.len(),
+        "this loaded-map fixture allocates exactly its native iterator domain"
+    );
+    assert_eq!(terrain.cell(8, 8).unwrap().level, 0);
+    assert!(
+        crate::map::lighting::native_lighting_cells(terrain, sim.map_size_diamond().unwrap().0)
+            .any(|cell| cell == (8, 8))
+    );
+    let retint = LightingEvent::Global {
+        state: *sim.session().lighting(),
+        cell_profile: sim.lighting_cell_profile(),
+        palette: PaletteUpdate::Normal([1200, 800, 600]),
+        constructor_rgb: sim.palette_constructor_rgb(),
+    };
+    sim.lighting_sources_mut_for_test().publish_for_test(retint);
+    // Loaded Scenario normal RGB differs from the surviving process cache.
+    let normal = sim
+        .session_mut_for_test()
+        .lighting_mut()
+        .normal_mut_for_test();
+    normal.red_percent = 140;
+    normal.green_percent = 130;
+    normal.blue_percent = 120;
+    // Post-load53C280 reselects from effects, not this supplied old selector.
+    sim.session_mut_for_test()
+        .lighting_mut()
+        .set_selected_profile_for_test(
+            crate::sim::scenario_session::ScenarioLightingProfile::Normal,
+        );
+    let before = (sim.state_hash(), sim.rng_state());
+
+    let bytes = snapshot_bytes_with_lighting(
+        &save.incoming,
+        &save.owner,
+        &save.map,
+        None,
+        save.rules_hash,
+        Some((&saved, &saved_anims)),
+    );
+    let outgoing_lighting = *save.incoming.simulation.session().lighting();
+    save.incoming
+        .simulation
+        .session_mut_for_test()
+        .lighting_mut()
+        .set_nuke_flash_for_test(0, -1, -1);
+    let normal_bytes = snapshot_bytes_with_lighting(
+        &save.incoming,
+        &save.owner,
+        &save.map,
+        None,
+        save.rules_hash,
+        Some((&saved, &saved_anims)),
+    );
+    save.incoming
+        .simulation
+        .session_mut_for_test()
+        .set_lighting_for_test(outgoing_lighting);
+    let frontend = frontend_main();
+    let cache = TileVariantSelectorCache::default();
+    let clock = || LOAD_CLOCK_MS;
+    let view = SavedGamePreparationView {
+        repository: &save.repository,
+        current_simulation: Some(&save.incoming.simulation),
+        frontend_main: &frontend,
+        rules_owner: &save.owner,
+        tile_cache: &cache,
+        lighting: &lights,
+        load_clock: &clock,
+    };
+    let prepared = save
+        .assets
+        .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bytes, &view, assets))
+        .unwrap();
+    assert_eq!(prepared.lighting, saved);
+    assert_eq!(prepared.scheme_normal_rgb, [1200, 800, 600]);
+    let incoming = &prepared.world.simulation;
+    assert_eq!(
+        incoming.session().lighting().selected_profile(),
+        crate::sim::scenario_session::ScenarioLightingProfile::Nuke
+    );
+    assert_eq!(incoming.session().lighting().target_ambient(), 200);
+    let terrain = incoming.resolved_terrain().unwrap();
+    let mut staged =
+        rebuild_lighting_grid_from_sim(terrain, save.map.lighting(), Some(incoming), 2);
+    staged.stage_saved_local_lighting(&prepared.lighting, prepared.scheme_normal_rgb);
+    let mut restored = MatchLighting::default();
+    restored.install(
+        staged,
+        save.map.lighting().clone(),
+        2,
+        Some((terrain, incoming)),
+        None,
+    );
+    restored.restore_anim_intensities(prepared.world.anim_intensities.clone());
+    assert_eq!(restored.anim_intensities().get(&anim).copied(), Some(0));
+    assert_eq!(
+        restored.grid().cell_light_at((8, 8)).unwrap().top_scalar,
+        1125
+    );
+    assert_eq!(
+        restored.grid().cell_light_at((8, 8)).unwrap().common_scalar,
+        562
+    );
+    assert_eq!(restored.grid().color_scheme_rgb(), [1750, 1500, 1250]);
+    assert_eq!(restored.grid().color_scheme_normal_rgb(), [1200, 800, 600]);
+
+    // A separate Normal file-load continuation restores that cache, rather than
+    // passing the saved Scenario RGB1400/1300/1200 to53AD00.
+    let mut normal_prepared = save
+        .assets
+        .prepare_saved_load(|assets| {
+            PreparedSavedGame::prepare_resources(&normal_bytes, &view, assets)
+        })
+        .unwrap();
+    let normal_world = &mut normal_prepared.world.simulation;
+    assert_eq!(
+        normal_world.session().lighting().selected_profile(),
+        crate::sim::scenario_session::ScenarioLightingProfile::Normal
+    );
+    assert_eq!(normal_world.session().lighting().target_ambient(), 70);
+    let normal_terrain = normal_world.resolved_terrain().unwrap();
+    let mut normal_grid =
+        rebuild_lighting_grid_from_sim(normal_terrain, save.map.lighting(), Some(normal_world), 2);
+    normal_grid.stage_saved_local_lighting(&saved, prepared.scheme_normal_rgb);
+    let mut normal_lights = MatchLighting::default();
+    normal_lights.install(
+        normal_grid,
+        save.map.lighting().clone(),
+        2,
+        Some((normal_terrain, normal_world)),
+        None,
+    );
+    assert_eq!(normal_lights.grid().color_scheme_rgb(), [1200, 800, 600]);
+    normal_lights.restore_anim_intensities(normal_prepared.world.anim_intensities.clone());
+    assert_eq!(
+        normal_lights.anim_intensities().get(&anim).copied(),
+        Some(0)
+    );
+    assert_eq!(
+        normal_lights
+            .grid()
+            .cell_light_at((8, 8))
+            .unwrap()
+            .top_scalar,
+        1100
+    );
+
+    let archives = save.assets.registered_archive_names();
+    let mut missing = saved.clone();
+    missing.cells.pop();
+    let mut wide = saved.clone();
+    wide.cells[0].2 = 32768;
+    let mut duplicate = saved.clone();
+    duplicate.cells.push(duplicate.cells[0]);
+    let mut extra = saved.clone();
+    extra.cells[0].0 = (u16::MAX, u16::MAX);
+    let mut bright = saved.clone();
+    bright.cells[0].3 = 2001;
+    let mut raw_scale = saved.clone();
+    raw_scale.cells[0].1 = i32::MIN;
+    assert!(
+        crate::app::presentation::lighting::validate_saved_lighting(
+            &raw_scale,
+            &save.incoming.simulation,
+        )
+        .is_ok(),
+        "Cell104 retains its raw dword width"
+    );
+    for (invalid, expected) in [
+        (missing, "Cell allocation"),
+        (wide, "Cell scalar"),
+        (duplicate, "Cell scalar"),
+        (extra, "Cell allocation"),
+        (bright, "Cell scalar"),
+    ] {
+        let bad = snapshot_bytes_with_lighting(
+            &save.incoming,
+            &save.owner,
+            &save.map,
+            None,
+            save.rules_hash,
+            Some((&invalid, &saved_anims)),
+        );
+        let rejected = save
+            .assets
+            .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bad, &view, assets));
+        assert!(matches!(rejected, Err(PreparedLoadError::LocalView(
+            SavedLocalViewError::InvalidLighting { field }
+        )) if field == expected));
+    }
+    assert_eq!(save.assets.registered_archive_names(), archives);
+    assert!(
+        !cache.is_initialized(),
+        "candidate cannot publish process caches"
+    );
+    assert_eq!(
+        (
+            save.incoming.simulation.state_hash(),
+            save.incoming.simulation.rng_state()
+        ),
+        before
+    );
+    assert_eq!(
+        restored.anim_intensities().get(&anim).copied(),
+        Some(0),
+        "failed candidate leaves local owner intact"
+    );
+    restored.refresh(terrain, incoming, 2);
+    assert_eq!(restored.anim_intensities().get(&anim).copied(), Some(0));
+    assert_eq!(
+        lights.grid().color_scheme_rgb(),
+        [1000; 3],
+        "pending retint is projected only on a clone during preparation"
+    );
+}
+
+#[test]
 fn retail_saved_resources_prepare_cold() {
-    let Some(save) = incoming_save() else {
+    let Some(save) = incoming_save("TEMPERATE", "") else {
         return;
     };
     let IncomingSave {
@@ -481,15 +1145,17 @@ fn retail_saved_resources_prepare_cold() {
         frontend_main: &frontend,
         rules_owner: &cold_owner,
         tile_cache: &cold_cache,
+        lighting: &crate::app::presentation::lighting::MatchLighting::default(),
         load_clock: &clock,
     };
     let cold = assets
         .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bytes, &view, assets))
         .unwrap();
+    assert_eq!(cold.scheme_normal_rgb, [1000; 3]);
     assert_incoming_resources(&cold, &incoming, &map);
-    assert_next_fill_uses_saved_theater_registry(&cold, &cold_cache);
+    assert_next_fill_reads_no_saved_theater(&cold, &cold_cache);
     assert_eq!(
-        cold.world.simulation.main_rng.logical_state(),
+        cold.world.simulation.main_rng().logical_state(),
         SimRng::from_native_state_hex_for_test(native["after"]["main"].as_str().unwrap())
             .logical_state()
     );
@@ -524,8 +1190,563 @@ fn retail_saved_resources_prepare_cold() {
 }
 
 #[test]
+fn saved_infantry_sequence_bank_survives_image_without_sequence() {
+    let Some(mut save) = incoming_save("TEMPERATE", "[SLAV]\nImage=MONEY\n") else {
+        return;
+    };
+    let clock = || LOAD_CLOCK_MS;
+    let frontend = frontend_main();
+    let cache = TileVariantSelectorCache::default();
+    let view = SavedGamePreparationView {
+        repository: &save.repository,
+        current_simulation: None,
+        frontend_main: &frontend,
+        rules_owner: &save.owner,
+        tile_cache: &cache,
+        lighting: &crate::app::presentation::lighting::MatchLighting::default(),
+        load_clock: &clock,
+    };
+    let prepared = save
+        .assets
+        .prepare_saved_load(|assets| {
+            PreparedSavedGame::prepare_resources(&save.bytes, &view, assets)
+        })
+        .expect("saved InfantryType bank survives resource preparation");
+    let rules = &prepared.resources.rules;
+    assert_eq!(rules.object("SLAV").unwrap().image, "MONEY");
+    assert!(rules.art().get("MONEY").unwrap().sequence.is_none());
+    // ReadSequenceData523D2D preserves the bank when this map image has no
+    // Sequence. InfantryTypeLoad524B10 restores that bank; the two resource
+    // binding passes above must not replace it with the final image's defaults.
+    // These are the retail [SlaveSequence] FireUp and FireUpSounds inputs.
+    let fire_up = rules
+        .animation_sequence("SLAV")
+        .unwrap()
+        .infantry_action(4)
+        .unwrap();
+    assert_eq!(
+        (
+            fire_up.start_frame,
+            fire_up.frames_per_facing,
+            fire_up.facings
+        ),
+        (164, 8, 8)
+    );
+    let sounds: Vec<_> = rules
+        .object("SLAV")
+        .unwrap()
+        .sequence_sounds(4)
+        .map(|sound| (sound.frame, sound.sound_id.as_str()))
+        .collect();
+    assert_eq!(sounds, [(2, "SlaveAttack")]);
+}
+
+#[test]
+fn unread_cell_anim_loads_its_own_retail_shape_without_replaying_construction() {
+    use crate::sim::components::AnimClassSpawnDescriptor;
+    use crate::sim::native_identity::NativeUniqueIdCursor;
+    use crate::util::fixed_math::SIM_ZERO;
+
+    let Some(mut save) = incoming_save(
+        "TEMPERATE",
+        "[Tiberiums]\n0=Riparius\n[Riparius]\nImage=2\n[GEM01]\nCellAnim=SEAL\n",
+    ) else {
+        return;
+    };
+    // A same-named Infantry type/ART section does not perform an Anim read.
+    let rules = &save.incoming.resources.rules;
+    let overlay = rules.overlay_registry();
+    // ReadINI721C49 retains the stock Image1 slope count when Image2 binds
+    // GEM01. Save7220D0/Load721E80 must preserve that history, rather than
+    // reconstructing a fresh Image2 descriptor from the last map text.
+    let image = rules.tiberium_types.types()[0].image();
+    assert_eq!(
+        (
+            image.base_overlay(),
+            image.primary_count(),
+            image.slope_count()
+        ),
+        (Some(27), 12, 8)
+    );
+    assert_eq!(
+        overlay
+            .flags(overlay.id_for_name("GEM01").unwrap())
+            .unwrap()
+            .cell_anim
+            .as_deref(),
+        Some("SEAL")
+    );
+    let config = rules.art().anim_runtime_config("SEAL").unwrap();
+    assert!(!config.art_body_read);
+    assert_eq!(config.raw_shp_frame_count, None);
+    let shape = save
+        .assets
+        .get_ref("SEAL.SHP")
+        .expect("real retail own-name SHP");
+    let count = i32::from(i16::from_le_bytes([shape[6], shape[7]]));
+    assert!(count > 0);
+    // This persistence fixture supplies an already born Anim through the
+    // common constructor. Ordinary Overlay Mark is covered by crates tests.
+    let sim = &mut save.incoming.simulation;
+    *sim.native_unique_ids_mut_for_test() = Some(NativeUniqueIdCursor::for_synthetic_simulation());
+    let kind = sim.intern("SEAL");
+    let mut descriptor = AnimClassSpawnDescriptor::new(kind, 5, 5, SIM_ZERO, SIM_ZERO, 0);
+    descriptor.loop_count = 1;
+    descriptor.draw_flags = 0x600;
+    let id = sim.spawn_anim_object(rules, descriptor).unwrap();
+    let native = sim.anim(id).unwrap().native_unique_id();
+    let runtime = sim.anim(id).unwrap().runtime().clone();
+    let cursor = sim.native_identity_cursor();
+    let hash = rules.simulation_config_hash();
+    let bytes = snapshot_bytes(&save.incoming, &save.owner, &save.map, None, hash);
+    let clock = || LOAD_CLOCK_MS;
+    let frontend = frontend_main();
+    let cache = TileVariantSelectorCache::default();
+    let view = SavedGamePreparationView {
+        repository: &save.repository,
+        current_simulation: None,
+        frontend_main: &frontend,
+        rules_owner: &save.owner,
+        tile_cache: &cache,
+        lighting: &crate::app::presentation::lighting::MatchLighting::default(),
+        load_clock: &clock,
+    };
+    let prepared = save
+        .assets
+        .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bytes, &view, assets))
+        .unwrap();
+    assert_eq!(
+        prepared.resources.rules.tiberium_types.types()[0].image(),
+        image
+    );
+    // AnimTypeLoad428855 supplies image residency without ReadINI427D00
+    // or LoadImageAndResolveFrameBounds427B50: all ctor bounds stay zero.
+    let config = prepared
+        .resources
+        .rules
+        .art()
+        .anim_runtime_config("SEAL")
+        .unwrap();
+    assert!(!config.art_body_read);
+    assert_eq!(config.raw_shp_frame_count, Some(count));
+    assert_eq!(
+        (config.end, config.loop_end, config.rate_logic_frames),
+        (0, 0, 1)
+    );
+    let anim = prepared.world.simulation.anim(id).unwrap();
+    assert_eq!(anim.native_unique_id(), native);
+    assert_eq!(anim.runtime(), &runtime);
+    assert_eq!(prepared.world.simulation.native_identity_cursor(), cursor);
+
+    let PreparedSavedResources {
+        world,
+        resources,
+        processed_rules,
+        map,
+        ..
+    } = prepared;
+    let (simulation, _) = world.into_committed(SharedCellDummy::fresh(), &frontend);
+    save.owner.install_saved_scenario_rules(processed_rules);
+    let loaded = SimRuntime {
+        simulation,
+        resources: resources.into(),
+    };
+    let loaded_hash = loaded.resources.rules.simulation_config_hash();
+    let bytes = snapshot_bytes(&loaded, &save.owner, &map, None, loaded_hash);
+    let view = SavedGamePreparationView {
+        repository: &save.repository,
+        current_simulation: None,
+        frontend_main: &frontend,
+        rules_owner: &save.owner,
+        tile_cache: &cache,
+        lighting: &crate::app::presentation::lighting::MatchLighting::default(),
+        load_clock: &clock,
+    };
+    let again = save
+        .assets
+        .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bytes, &view, assets))
+        .unwrap();
+    assert_eq!(again.resources.rules.simulation_config_hash(), loaded_hash);
+    assert_eq!(
+        again.resources.rules.tiberium_types.types()[0].image(),
+        image
+    );
+    assert_eq!(again.world.simulation.native_identity_cursor(), cursor);
+    assert_eq!(again.world.simulation.anim(id).unwrap().runtime(), &runtime);
+    let PreparedSavedResources {
+        world, resources, ..
+    } = again;
+    let (mut sim, _) = world.into_committed(SharedCellDummy::fresh(), &frontend);
+    for _ in 0..4 {
+        sim.advance_tick(
+            &[],
+            Some(&resources.rules),
+            None,
+            Some(&resources.overlay_registry),
+            33,
+        );
+    }
+    assert!(
+        sim.anim(id).is_none(),
+        "zero-End Anim uses normal AI and deferred cleanup"
+    );
+}
+
+#[test]
+fn unknown_terrain_type_load_validates_then_commits_and_resaves_its_same_owner() {
+    use crate::sim::terrain_spawn::{
+        TerrainConstructionMode, TerrainConstructionRules, construct_terrain_objects_with_rules,
+    };
+
+    let Some(mut save) = incoming_save(
+        "TEMPERATE",
+        "[Terrain]\n5005=SMOKEY\n05005=TREE01\n[SMOKEY]\nStrength=9000\n",
+    ) else {
+        return;
+    };
+    // This existing persistence fixture has a declared synthetic prefix; the
+    // headless retail regression covers the complete fresh Scenario prefix.
+    *save.incoming.simulation.native_unique_ids_mut_for_test() =
+        Some(crate::sim::native_identity::NativeUniqueIdCursor::for_synthetic_simulation());
+    let overlays = save.incoming.resources.overlay_registry.clone();
+    let rng = save.incoming.simulation.rng_state();
+    construct_terrain_objects_with_rules(
+        &mut save.incoming.simulation,
+        save.map.terrain_objects(),
+        &mut TerrainConstructionRules::Authored {
+            rules: &mut std::sync::Arc::get_mut(&mut save.incoming.resources)
+                .expect("unshared resources")
+                .rules,
+            owner: &mut save.owner,
+        },
+        false,
+        TerrainConstructionMode::Authored(&overlays),
+    )
+    .unwrap();
+    assert_eq!(save.incoming.simulation.rng_state(), rng);
+    let unknown = save
+        .incoming
+        .simulation
+        .terrain_objects()
+        .objects()
+        .values()
+        .find(|object| {
+            save.incoming
+                .simulation
+                .interner()
+                .resolve(object.type_ref())
+                == "SMOKEY"
+        })
+        .unwrap();
+    let unknown_id = unknown.stable_id();
+    let native_id = unknown.native_unique_id();
+    let known_id = save
+        .incoming
+        .simulation
+        .terrain_objects()
+        .id_at((5, 5))
+        .unwrap();
+    assert_ne!(known_id, unknown_id);
+    assert!(
+        !save
+            .incoming
+            .resources
+            .rules
+            .terrain_object_type_case_insensitive("SMOKEY")
+            .unwrap()
+            .has_occupy_list()
+    );
+    let cursor = save.incoming.simulation.native_identity_cursor();
+    let hash = save.incoming.resources.rules.simulation_config_hash();
+    let bytes = snapshot_bytes(&save.incoming, &save.owner, &save.map, None, hash);
+    let bad = snapshot_bytes(&save.incoming, &save.owner, &save.map, None, hash ^ 1);
+    let before = save_codec::serialize(save.owner.saved_scenario_rules().unwrap()).unwrap();
+    let clock = || LOAD_CLOCK_MS;
+    let frontend = frontend_main();
+    let cache = TileVariantSelectorCache::default();
+    let view = SavedGamePreparationView {
+        repository: &save.repository,
+        current_simulation: None,
+        frontend_main: &frontend,
+        rules_owner: &save.owner,
+        tile_cache: &cache,
+        lighting: &crate::app::presentation::lighting::MatchLighting::default(),
+        load_clock: &clock,
+    };
+    let rejected = save
+        .assets
+        .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bad, &view, assets));
+    assert!(matches!(
+        rejected,
+        Err(PreparedLoadError::Snapshot(
+            SnapshotError::RulesMismatch { .. }
+        ))
+    ));
+    let prepared = save
+        .assets
+        .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bytes, &view, assets))
+        .unwrap();
+    // TerrainTypeLoad71E22D binds index0 while CellLoad483B9F restores only
+    // the saved known member. The initial saved digest remains mandatory.
+    assert_ne!(prepared.resources.rules.simulation_config_hash(), hash);
+    assert!(
+        prepared
+            .resources
+            .rules
+            .terrain_object_type_case_insensitive("SMOKEY")
+            .unwrap()
+            .has_occupy_list()
+    );
+    assert_eq!(
+        prepared.resources.rules.terrain_shape_filename("SMOKEY"),
+        None
+    );
+    assert_eq!(
+        prepared
+            .world
+            .simulation
+            .terrain_objects()
+            .members_at((5, 5))
+            .collect::<Vec<_>>(),
+        [known_id]
+    );
+    assert_eq!(
+        prepared
+            .world
+            .simulation
+            .terrain_objects()
+            .get(unknown_id)
+            .unwrap()
+            .native_unique_id(),
+        native_id
+    );
+    assert_eq!(prepared.world.simulation.native_identity_cursor(), cursor);
+    assert_eq!(
+        save_codec::serialize(save.owner.saved_scenario_rules().unwrap()).unwrap(),
+        before
+    );
+
+    let PreparedSavedResources {
+        world,
+        resources,
+        processed_rules,
+        map,
+        ..
+    } = prepared;
+    let (simulation, _) = world.into_committed(SharedCellDummy::fresh(), &frontend);
+    save.owner.install_saved_scenario_rules(processed_rules);
+    let runtime = SimRuntime {
+        simulation,
+        resources: resources.into(),
+    };
+    let loaded_hash = runtime.resources.rules.simulation_config_hash();
+    let bytes = snapshot_bytes(&runtime, &save.owner, &map, None, loaded_hash);
+    let view = SavedGamePreparationView {
+        repository: &save.repository,
+        current_simulation: None,
+        frontend_main: &frontend,
+        rules_owner: &save.owner,
+        tile_cache: &cache,
+        lighting: &crate::app::presentation::lighting::MatchLighting::default(),
+        load_clock: &clock,
+    };
+    let again = save
+        .assets
+        .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bytes, &view, assets))
+        .unwrap();
+    assert_eq!(again.resources.rules.simulation_config_hash(), loaded_hash);
+    assert_eq!(again.world.simulation.native_identity_cursor(), cursor);
+    assert_eq!(
+        again
+            .world
+            .simulation
+            .terrain_objects()
+            .members_at((5, 5))
+            .collect::<Vec<_>>(),
+        [known_id]
+    );
+    assert_eq!(
+        again
+            .world
+            .simulation
+            .terrain_objects()
+            .get(unknown_id)
+            .unwrap()
+            .native_unique_id(),
+        native_id
+    );
+}
+
+#[test]
+fn arctic_type_load_validates_before_mutation_and_resaves_the_same_owner() {
+    let Some(mut save) = incoming_save(
+        "SNOW",
+        "[BlimpBombP]\nImage=ZBOMB\nInviso=yes\nAlternateArcticArt=yes\n\
+         [GAWALL]\nImage=SEAL\nAlternateArcticArt=yes\n",
+    ) else {
+        return;
+    };
+    let before = save_codec::serialize(save.owner.saved_scenario_rules().unwrap()).unwrap();
+    let bullet = save
+        .incoming
+        .resources
+        .rules
+        .projectile("BlimpBombP")
+        .unwrap();
+    assert!(bullet.voxel && bullet.inviso);
+    assert_eq!(bullet.image.as_deref(), Some("ZBOMB"));
+    let wall = save
+        .incoming
+        .resources
+        .overlay_registry
+        .id_for_name("GAWALL")
+        .unwrap();
+    assert_eq!(
+        save.incoming
+            .resources
+            .overlay_registry
+            .flags(wall)
+            .unwrap()
+            .damage_levels,
+        3
+    );
+    let clock = || LOAD_CLOCK_MS;
+    let frontend = frontend_main();
+    let cache = TileVariantSelectorCache::default();
+    let view = SavedGamePreparationView {
+        repository: &save.repository,
+        current_simulation: None,
+        frontend_main: &frontend,
+        rules_owner: &save.owner,
+        tile_cache: &cache,
+        lighting: &crate::app::presentation::lighting::MatchLighting::default(),
+        load_clock: &clock,
+    };
+    let rejected = save.assets.prepare_saved_load(|assets| {
+        PreparedSavedGame::prepare_resources(&save.bad_rules, &view, assets)
+    });
+    assert!(matches!(
+        rejected,
+        Err(PreparedLoadError::Snapshot(
+            SnapshotError::RulesMismatch { .. }
+        ))
+    ));
+    let rejected = save.assets.prepare_saved_load(|assets| {
+        PreparedSavedGame::prepare_resources(&save.bad_follow, &view, assets)
+    });
+    assert!(matches!(
+        rejected,
+        Err(PreparedLoadError::LocalView(
+            SavedLocalViewError::MissingEntityReference {
+                field: "Follow",
+                ..
+            }
+        ))
+    ));
+    assert_eq!(
+        save_codec::serialize(save.owner.saved_scenario_rules().unwrap()).unwrap(),
+        before
+    );
+
+    let prepared = save
+        .assets
+        .prepare_saved_load(|assets| {
+            PreparedSavedGame::prepare_resources(&save.bytes, &view, assets)
+        })
+        .unwrap();
+    // BulletLoad46C6E1/E8 always requests entry VXL before Arctic SHP,
+    // even for saved Voxel/Inviso. Missing ZBOMBA.SHP cannot undo the latch.
+    let bullet = prepared.resources.rules.projectile("BlimpBombP").unwrap();
+    assert_eq!(bullet.image.as_deref(), Some("ZBOMBA"));
+    assert_eq!(bullet.voxel_image_load(), Some("ZBOMB"));
+    assert_eq!(bullet.image_loads[0].image, "ZBOMBA");
+    assert_eq!(
+        prepared.resources.rules.object("GHOST").unwrap().image,
+        "SEALA"
+    );
+    // OverlayLoad5FEB45 followed by InitTheater5BE668 must project the
+    // updated image owner into both gameplay flags and physical binding.
+    assert_eq!(
+        prepared
+            .resources
+            .overlay_registry
+            .flags(wall)
+            .unwrap()
+            .damage_levels,
+        3
+    );
+    let (filename, _) = crate::rules::effect_asset_catalog::load_overlay_shape(
+        &save.assets,
+        &prepared.resources.overlay_registry,
+        "GAWALL",
+        "SNO",
+        "SNOW",
+    )
+    .unwrap();
+    assert_eq!(filename, "SEALA.SHP");
+    assert_eq!(
+        save_codec::serialize(save.owner.saved_scenario_rules().unwrap()).unwrap(),
+        before
+    );
+
+    let PreparedSavedResources {
+        world,
+        resources,
+        processed_rules,
+        map,
+        ..
+    } = prepared;
+    let (simulation, _) = world.into_committed(SharedCellDummy::fresh(), &frontend);
+    save.owner.install_saved_scenario_rules(processed_rules);
+    let runtime = SimRuntime {
+        simulation,
+        resources: resources.into(),
+    };
+    let bytes = snapshot_bytes(
+        &runtime,
+        &save.owner,
+        &map,
+        None,
+        runtime.resources.rules.simulation_config_hash(),
+    );
+    let view = SavedGamePreparationView {
+        rules_owner: &save.owner,
+        repository: &save.repository,
+        current_simulation: None,
+        frontend_main: &frontend,
+        tile_cache: &cache,
+        lighting: &crate::app::presentation::lighting::MatchLighting::default(),
+        load_clock: &clock,
+    };
+    let again = save
+        .assets
+        .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bytes, &view, assets))
+        .unwrap();
+    let bullet = again.resources.rules.projectile("BlimpBombP").unwrap();
+    assert_eq!(
+        bullet.image.as_deref(),
+        Some("ZBOMBA"),
+        "saved latch prevents AA"
+    );
+    assert_eq!(
+        bullet.voxel_image_load(),
+        Some("ZBOMBA"),
+        "next Load uses its new entry image"
+    );
+    let (filename, _) = crate::rules::effect_asset_catalog::load_overlay_shape(
+        &save.assets,
+        &again.resources.overlay_registry,
+        "GAWALL",
+        "SNO",
+        "SNOW",
+    )
+    .unwrap();
+    assert_eq!(filename, "SEALA.SHP", "Overlay's saved latch prevents AA");
+}
+
+#[test]
 fn retail_saved_resources_prepare_cross_map_and_roll_back_late_failure() {
-    let Some(save) = incoming_save() else {
+    let Some(save) = incoming_save("TEMPERATE", "") else {
         return;
     };
     let IncomingSave {
@@ -567,13 +1788,13 @@ fn retail_saved_resources_prepare_cross_map_and_roll_back_late_failure() {
         .simulation
         .initialize_random_number_system(0xA123_4567);
     for _ in 0..7 {
-        outgoing.simulation.main_rng.next_u32();
+        outgoing.simulation.main_rng().next_u32();
     }
     for _ in 0..11 {
-        outgoing.simulation.mapgen_rng.next_u32();
+        outgoing.simulation.mapgen_rng_mut_for_test().next_u32();
     }
     for _ in 0..13 {
-        outgoing.simulation.scenario_rng.next_u32();
+        outgoing.simulation.scenario_rng_mut_for_test().next_u32();
     }
     assert_eq!(
         outgoing.resources.rules.object("MTNK").unwrap().strength,
@@ -594,9 +1815,25 @@ fn retail_saved_resources_prepare_cross_map_and_roll_back_late_failure() {
         .selector()
         .initialized_table()
         .expect("fixture warmed process selector");
-    let retained_fill_bases = (
-        warm_cache.cached_clear_tile_base(),
-        warm_cache.cached_water_set_base(),
+    let mut outgoing_lights = crate::app::presentation::lighting::MatchLighting::default();
+    outgoing_lights.install(
+        crate::map::lighting::CellLightGrid::new(),
+        map.lighting().clone(),
+        2,
+        Some((
+            outgoing.simulation.resolved_terrain().unwrap(),
+            &outgoing.simulation,
+        )),
+        None,
+    );
+    outgoing_lights.apply_events(
+        outgoing.simulation.resolved_terrain().unwrap(),
+        &[crate::sim::light_sources::LightingEvent::Global {
+            state: *outgoing.simulation.session().lighting(),
+            cell_profile: outgoing.simulation.lighting_cell_profile(),
+            palette: crate::sim::light_sources::PaletteUpdate::Normal([1200, 800, 600]),
+            constructor_rgb: None,
+        }],
     );
     let view = SavedGamePreparationView {
         repository: &repository,
@@ -604,6 +1841,7 @@ fn retail_saved_resources_prepare_cross_map_and_roll_back_late_failure() {
         frontend_main: &frontend,
         rules_owner: &owner,
         tile_cache: &warm_cache,
+        lighting: &outgoing_lights,
         load_clock: &clock,
     };
 
@@ -658,16 +1896,6 @@ fn retail_saved_resources_prepare_cross_map_and_roll_back_late_failure() {
         warm_cache.selector().initialized_table(),
         Some(retained_table)
     );
-    assert_eq!(cold_cache.cached_clear_tile_base(), 0);
-    assert_eq!(cold_cache.cached_water_set_base(), 0);
-    assert_eq!(
-        (
-            warm_cache.cached_clear_tile_base(),
-            warm_cache.cached_water_set_base(),
-        ),
-        retained_fill_bases,
-        "rejected preparation cannot publish the incoming registry",
-    );
     assert_eq!(outgoing.simulation.state_hash(), outgoing_hash);
     assert_eq!(outgoing.simulation.rng_state(), outgoing_rng);
     assert_eq!(
@@ -682,8 +1910,12 @@ fn retail_saved_resources_prepare_cross_map_and_roll_back_late_failure() {
     let prepared = assets
         .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bytes, &view, assets))
         .unwrap();
+    assert_eq!(
+        prepared.scheme_normal_rgb, [1000; 3],
+        "a different theater recreates the outgoing nonneutral schemes"
+    );
     assert_incoming_resources(&prepared, &incoming, &map);
-    assert_next_fill_uses_saved_theater_registry(&prepared, &warm_cache);
+    assert_next_fill_reads_no_saved_theater(&prepared, &warm_cache);
     assert_eq!(
         prepared.world.simulation.rng_state().main,
         outgoing_rng.main
@@ -697,8 +1929,8 @@ fn retail_saved_resources_prepare_cross_map_and_roll_back_late_failure() {
         SimRng::new(0).logical_state()
     );
     assert_eq!(
-        prepared.world.simulation.session.seed,
-        outgoing.simulation.session.seed
+        prepared.world.simulation.session().seed(),
+        outgoing.simulation.session().seed()
     );
     assert_eq!(
         prepared.tile_cache.selector().initialized_table(),

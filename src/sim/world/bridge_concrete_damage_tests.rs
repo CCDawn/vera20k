@@ -18,7 +18,7 @@ fn export(scene: &HeadlessScenario, phase: &str) {
     };
     let sim = scene.sim();
     let result = json!({
-        "phase": phase, "frame": sim.session.binary_frame,
+        "phase": phase, "frame": sim.session.binary_frame(),
         "navigation": crate::sim::world::bridge_test_evidence::navigation_snapshot(
             sim, phase, (49..=59).flat_map(|y| (84..=90).map(move |x| (x,y))),
         ),
@@ -155,7 +155,7 @@ fn retail_concrete_hut_damage_matches_native_both_huts_and_three_states() {
         sim.scenario_rng =
             serde_json::from_value(expected["rng_before"]["scenario"].clone()).unwrap();
         sim.mapgen_rng = serde_json::from_value(expected["rng_before"]["mapgen"].clone()).unwrap();
-        sim.session.binary_frame = 1000;
+        sim.session.set_binary_frame_for_test(1000);
         let before_anims: std::collections::BTreeSet<_> =
             sim.substrate.anims.iter().map(|(id, _)| *id).collect();
         let hut = (
@@ -175,10 +175,11 @@ fn retail_concrete_hut_damage_matches_native_both_huts_and_three_states() {
             .flat_map(|y| (86..=88).map(move |x| (x, y)))
             .map(|(x, y)| {
                 let c = sim.resolved_terrain.as_ref().unwrap().cell(x, y).unwrap();
-                json!({"coord":[x,y],"overlay":c.bridge_facts.overlay_id,
+                let live = sim.overlay_grid.as_ref().unwrap().cell(x, y);
+                json!({"coord":[x,y],"overlay":live.overlay_id,
                     "land":c.land_type,"level":c.level,"slope":c.slope_type,
                     "zone_type":c.zone_type,"tile":c.final_tile_index,"subtile":c.final_sub_tile,
-                    "flags":c.bridge_facts.raw_flags,"state":c.bridge_facts.state_byte})
+                    "flags":c.bridge_facts.raw_flags,"state":live.overlay_data})
             })
             .collect();
         assert_eq!(
@@ -193,11 +194,11 @@ fn retail_concrete_hut_damage_matches_native_both_huts_and_three_states() {
             .iter()
             .filter(|(id, _)| !before_anims.contains(id))
             .map(|(_, anim)| {
-                json!({"type":sim.resolve(anim.type_id),
-                "position":[anim.world_coord.x,anim.world_coord.y,anim.world_coord.z],
-                "delay":anim.runtime.delay_remaining,"flags":anim.draw_flags,
-                "loops":anim.runtime.loop_remaining,"z_adjust":anim.z_adjust,
-                "reverse":u8::from(anim.runtime.constructor_reverse)})
+                json!({"type":sim.resolve(anim.type_id()),
+                "position":[anim.world_coord().x,anim.world_coord().y,anim.world_coord().z],
+                "delay":anim.runtime().delay_remaining,"flags":anim.draw_flags(),
+                "loops":anim.runtime().loop_remaining,"z_adjust":anim.z_adjust(),
+                "reverse":u8::from(anim.runtime().constructor_reverse)})
             })
             .collect();
         assert_eq!(
@@ -220,7 +221,7 @@ fn retail_concrete_collapse_rechecks_an_incoming_drive_head() {
     let runtime = &mut scene.runtime;
     let sim = &mut runtime.simulation;
     let rules = &runtime.resources.rules;
-    let owner = sim.session.current_house.unwrap();
+    let owner = sim.session.current_house().unwrap();
     let owner_name = sim.resolve(owner).to_owned();
     let tank = sim
         .spawn_object_with_overlay_registry(
@@ -272,13 +273,7 @@ fn retail_concrete_collapse_rechecks_an_incoming_drive_head() {
         300
     );
     assert_eq!(
-        sim.resolved_terrain
-            .as_ref()
-            .unwrap()
-            .cell(87, 54)
-            .unwrap()
-            .bridge_facts
-            .overlay_id,
+        sim.overlay_grid.as_ref().unwrap().cell(87, 54).overlay_id,
         Some(220)
     );
     assert!(
@@ -322,7 +317,7 @@ fn retail_concrete_collapse_rechecks_an_incoming_drive_head() {
 fn force_fire_scene() -> (HeadlessScenario, u64, String) {
     let mut scene = loaded();
     let runtime = &mut scene.runtime;
-    let owner = runtime.simulation.session.current_house.unwrap();
+    let owner = runtime.simulation.session.current_house().unwrap();
     let owner_name = runtime.simulation.resolve(owner).to_owned();
     let tank = runtime
         .simulation
@@ -339,7 +334,7 @@ fn force_fire_scene() -> (HeadlessScenario, u64, String) {
     export(&scene, "attack_before_command");
     let command = CommandEnvelope::new(
         owner,
-        scene.sim().session.tick + 1,
+        scene.sim().session.tick() + 1,
         Command::ForceAttackCell {
             attacker_id: tank,
             target_rx: 87,
@@ -391,7 +386,7 @@ fn retail_force_fire_emits_native_muzzle_from_real_command() {
         (shot.fire_coord.x, shot.fire_coord.y, shot.fire_coord.z),
         (22400, 13077, 516)
     );
-    assert_eq!(scene.sim().session.binary_frame, 2);
+    assert_eq!(scene.sim().session.binary_frame(), 2);
     assert_eq!(
         scene
             .sim()
@@ -405,7 +400,7 @@ fn retail_force_fire_emits_native_muzzle_from_real_command() {
     export(&scene, "attack_first_tick");
     let mut following = Vec::new();
     for _ in 0..10 {
-        let frame = scene.sim().session.binary_frame;
+        let frame = scene.sim().session.binary_frame();
         let before = json!({"main":scene.sim().main_rng,"scenario":scene.sim().scenario_rng,"mapgen":scene.sim().mapgen_rng});
         let (_, draws) = crate::sim::rng::trace_draws(|| {
             scene
@@ -435,7 +430,7 @@ fn retail_force_fire_collapses_concrete_then_engineer_rebuilds_it() {
     // allows the fixed loaded-world stream to reach both admitted hits; the
     // isolated MTNK native packet has a different global caller history.
     for _ in 0..18_000 {
-        let logic_frame = scene.sim().session.binary_frame;
+        let logic_frame = scene.sim().session.binary_frame();
         let output = scene
             .runtime
             .advance_frame(
@@ -458,12 +453,10 @@ fn retail_force_fire_collapses_concrete_then_engineer_rebuilds_it() {
         }
         let overlay = scene
             .sim()
-            .resolved_terrain
+            .overlay_grid
             .as_ref()
             .unwrap()
             .cell(87, 54)
-            .unwrap()
-            .bridge_facts
             .overlay_id;
         if overlay != prior {
             transitions.push(json!({"completed_logic_frame":logic_frame,"overlay":overlay}));

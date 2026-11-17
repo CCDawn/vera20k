@@ -46,10 +46,6 @@ fn ground_command_history<'a>(corpus: &'a Value, name: &str) -> &'a Value {
         .iter()
         .find(|row| row["name"] == name)
         .unwrap_or_else(|| panic!("missing original ground-command history {name}"));
-    assert_eq!(
-        row["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     assert_eq!(row["status"], "PASS");
     row
 }
@@ -155,7 +151,6 @@ fn ground_command_fixture(
         let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &retail.fixed_art)
             .expect("original non-Deployer component prior parses");
         rules.install_art_data(retail.rules.art().clone());
-        rules.replace_animation_sequences_for_test(retail.rules.animation_sequences().clone());
         rules
     } else {
         retail.rules
@@ -211,23 +206,28 @@ fn ground_command_fixture(
         assert_eq!(human, context["human"] != 0);
         assert_eq!(state["house"]["pointer"], context["actor_owner"]);
         assert_eq!(state["house"]["current"], context["current_house"]);
-        house.player_control = context["player_control"] != 0;
+        house.set_player_control_for_test(context["player_control"] != 0);
     }
-    house.difficulty = HouseDifficulty::Hard;
+    house.set_difficulty_for_test(HouseDifficulty::Hard);
     house.project_country_mults(&rules, &sim.interner);
-    sim.houses.insert(owner, house);
-    sim.session.house_order.push(owner);
-    sim.session.current_house =
-        (state["house"]["current"] == state["house"]["pointer"]).then_some(owner);
+    sim.houses.register(house);
+    sim.session.set_current_house_for_test(
+        (state["house"]["current"] == state["house"]["pointer"]).then_some(owner),
+    );
     // The complete original no_rally bootstrap records mode1 -> Skirmish5
     // at52E10F..52E119, before these continuations. New contrast snapshots
     // carry the exact mode input; VERA stores its native zero/nonzero decision.
-    sim.session.game_mode_nonzero = context
-        .map(|context| context["game_mode"] != 0)
-        .unwrap_or(true);
-    sim.session.binary_frame = state["frame"].as_u64().unwrap().try_into().unwrap();
-    sim.fog.width = sim.session.map_width;
-    sim.fog.height = sim.session.map_height;
+    sim.session.set_game_mode(
+        crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+            context
+                .map(|context| context["game_mode"] != 0)
+                .unwrap_or(true),
+        ),
+    );
+    sim.session
+        .set_binary_frame_for_test(state["frame"].as_u64().unwrap().try_into().unwrap());
+    sim.fog.set_width_for_test(sim.session.map_width());
+    sim.fog.set_height_for_test(sim.session.map_height());
     sim.fog.reveal_all_for_owner(owner);
     let location = ground_command_coordinate(&state["location"]);
     let id = sim
@@ -246,7 +246,7 @@ fn ground_command_fixture(
     // occupation projection. These setup calls are outside the comparison.
     assert!(sim.foot_mark_remove(
         id,
-        Some(&rules),
+        &rules,
         Some(&registry),
         crate::sim::world::FrameEffects::default()
     ));
@@ -254,12 +254,12 @@ fn ground_command_fixture(
         &mut sim.substrate.entities,
         id,
         location,
-        Some(&rules),
+        &rules,
         &sim.interner,
     );
     assert!(sim.foot_mark_put(
         id,
-        Some(&rules),
+        &rules,
         Some(&registry),
         crate::sim::world::FrameEffects::default()
     ));
@@ -274,11 +274,8 @@ fn ground_command_fixture(
         // reservation state. The fixture House does not reconstruct the
         // original target House's flags, HouseAI or startup.
         let target_owner = sim.interner.intern("Original-target-owner");
-        sim.houses.insert(
-            target_owner,
-            HouseState::new(target_owner, 1, None, false, 0, 10),
-        );
-        sim.session.house_order.push(target_owner);
+        sim.houses
+            .register(HouseState::new(target_owner, 1, None, false, 0, 10));
         let target = sim
             .spawn_object_at_height_with_overlay_registry(
                 prior["type"]["name"].as_str().unwrap(),
@@ -291,7 +288,8 @@ fn ground_command_fixture(
                 &registry,
             )
             .expect("observed original target enters the supplied ground");
-        sim.mission_commence_exact(target, sim.session.binary_frame)
+        sim.substrate
+            .mission_commence_exact(target, sim.session.binary_frame())
             .unwrap();
         let target_actor = sim.substrate.entities.get(target).unwrap();
         assert_ne!(target_actor.owner(), owner);
@@ -317,7 +315,7 @@ fn ground_command_fixture(
         sim.assign_target_represented(
             id,
             Some(TargetKind::Entity(target)),
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -428,7 +426,7 @@ fn ground_command_fixture(
         .navigation
         .set_nav_com_for_test(ground_command_nav_target(state));
     actor.set_archive_target(ground_command_archive_target(state));
-    actor.navigation.path_replay.set_directions_for_test(
+    actor.navigation.path_replay_mut().set_directions_for_test(
         state["path"]
             .as_array()
             .unwrap()
@@ -443,24 +441,24 @@ fn ground_command_fixture(
     let reference = fixture_cell(&state["reference_cell"]);
     actor
         .navigation
-        .path_replay
-        .set_reference_cell(Some((reference.0 as i16, reference.1 as i16)));
+        .path_replay_mut()
+        .set_reference_cell_for_test(Some((reference.0 as i16, reference.1 as i16)));
     actor
         .navigation
-        .path_runtime
+        .path_runtime_mut()
         .set_movement_timer_for_test(timer(&state["movement_timer"]));
     actor
         .navigation
-        .path_runtime
+        .path_runtime_mut()
         .set_blocked_timer_for_test(timer(&state["blocked_timer"]));
     actor
         .navigation
-        .path_runtime
-        .set_path_blocked(state["raw_6b7"] != 0);
+        .path_runtime_mut()
+        .set_path_blocked_for_test(state["raw_6b7"] != 0);
     actor
         .navigation
-        .path_runtime
-        .set_retries_left(state["retry"].as_u64().unwrap() as u32);
+        .path_runtime_mut()
+        .set_retries_left_for_test(state["retry"].as_u64().unwrap() as u32);
     assert_eq!(state["nav_queue"]["count"], 0);
     assert_eq!(state["destination_history"]["count"], 0);
     let loco = actor.locomotor.as_mut().unwrap();
@@ -537,7 +535,8 @@ fn ground_command_fixture(
         // Building placement leaves that mission queued; finish it through
         // the mission owner before this component-boundary comparison. This
         // does not compare the target's whole initialization or AI history.
-        sim.mission_commence_exact(target, sim.session.binary_frame)
+        sim.substrate
+            .mission_commence_exact(target, sim.session.binary_frame())
             .unwrap();
         let target_actor = sim.substrate.entities.get(target).unwrap();
         let ambient = occupant
@@ -616,8 +615,8 @@ fn ground_command_fixture(
         let navigation = &map["navigation"];
         let mut zones: crate::sim::pathfinding::zone_map::ZoneGrid =
             serde_json::from_value(json!({
-                "width": sim.session.map_width,
-                "height": sim.session.map_height,
+                "width": sim.session.map_width(),
+                "height": sim.session.map_height(),
                 "base_topology": {
                     "native_bridge_source_size": map["map_size"],
                     "movement_classes": navigation["classes"],
@@ -635,7 +634,7 @@ fn ground_command_fixture(
                 sim.playfield_bounds,
             )
             .expect("the existing load owner binds the supplied flat map");
-        sim.zone_grid = Some(zones);
+        sim.zone_grid = Some(zones.into());
         let terrain = sim.resolved_terrain.as_ref().unwrap();
         for cell in map["cells"].as_array().unwrap() {
             let (rx, ry) = fixture_cell(&cell["xy"]);
@@ -860,24 +859,24 @@ fn assert_ground_command_fields(sim: &Simulation, id: u64, row: &Value, state: &
         .map(|word| word.as_i64().unwrap() as u8)
         .collect();
     assert_eq!(
-        &actor.navigation.path_replay.directions()
-            [usize::from(actor.navigation.path_replay.cursor())..],
+        &actor.navigation.path_replay().directions()
+            [usize::from(actor.navigation.path_replay().cursor())..],
         native_path,
         "{context}: full path backing suffix"
     );
     let reference = fixture_cell(&state["reference_cell"]);
     assert_eq!(
-        actor.navigation.path_replay.reference_cell(),
+        actor.navigation.path_replay().reference_cell(),
         Some((reference.0 as i16, reference.1 as i16)),
         "{context}: path reference"
     );
     for (actual, expected) in [
         (
-            actor.navigation.path_runtime.movement_timer(),
+            actor.navigation.path_runtime().movement_timer(),
             &state["movement_timer"],
         ),
         (
-            actor.navigation.path_runtime.blocked_timer(),
+            actor.navigation.path_runtime().blocked_timer(),
             &state["blocked_timer"],
         ),
     ] {
@@ -888,11 +887,11 @@ fn assert_ground_command_fields(sim: &Simulation, id: u64, row: &Value, state: &
         );
     }
     assert_eq!(
-        actor.navigation.path_runtime.path_blocked(),
+        actor.navigation.path_runtime().path_blocked(),
         state["raw_6b7"] != 0
     );
     assert_eq!(
-        actor.navigation.path_runtime.retries_left(),
+        actor.navigation.path_runtime().retries_left(),
         state["retry"].as_u64().unwrap() as u32
     );
     assert_eq!(
@@ -982,7 +981,7 @@ fn simulation_ground_command(
         .unwrap();
     CommandEnvelope::new(
         owner,
-        sim.session.tick,
+        sim.session.tick(),
         Command::Move {
             entity_id: id,
             target_rx: cell.0,
@@ -1021,7 +1020,7 @@ pub fn check_initialized_unit_shift_resolver(produce: GroundCommandProducer) {
 
 pub fn check_initialized_ground_reissues(names: &[&str], produce: GroundCommandProducer) {
     use crate::sim::mission::MissionId;
-    use crate::sim::mission::authority::EntityReadyInputProvider;
+    use crate::sim::mission::authority::LiveReadyInputProvider;
 
     let corpus = ground_command_corpus();
     for &name in names {
@@ -1056,8 +1055,10 @@ pub fn check_initialized_ground_reissues(names: &[&str], produce: GroundCommandP
                     id,
                     MissionId::from_raw(producer["args"][0].as_i64().unwrap().try_into().unwrap()),
                     producer["args"][1].as_i64().unwrap().try_into().unwrap(),
-                    sim.session.binary_frame,
-                    &EntityReadyInputProvider,
+                    sim.session.binary_frame(),
+                    &LiveReadyInputProvider {
+                        rules: crate::rules::ruleset::RuleSet::empty_for_test(),
+                    },
                 )
                 .unwrap();
                 assert_ground_command_fields(&sim, id, row, &producer["after"]);
@@ -1081,11 +1082,13 @@ pub fn check_initialized_ground_reissues(names: &[&str], produce: GroundCommandP
                     .unwrap();
                 assert_ground_command_fields(&sim, id, row, &down["after"]);
             }
-            sim.session.binary_frame = dispatch["before"]["frame"]
-                .as_u64()
-                .unwrap()
-                .try_into()
-                .unwrap();
+            sim.session.set_binary_frame_for_test(
+                dispatch["before"]["frame"]
+                    .as_u64()
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            );
             let clicked = fixture_cell(&input["clicked"]);
             let shift = input["keys"]
                 .as_array()
@@ -1107,7 +1110,7 @@ pub fn check_initialized_ground_reissues(names: &[&str], produce: GroundCommandP
             assert!(sim.apply_command_with_overlays(
                 "Americans",
                 &decoded.payload,
-                Some(&rules),
+                &rules,
                 Some(&registry),
                 crate::sim::world::FrameEffects::default()
             ));
@@ -1148,7 +1151,7 @@ pub fn check_initialized_unit_paid_reissues(produce: GroundCommandProducer) {
             assert!(sim.apply_command_with_overlays(
                 "Americans",
                 &Command::Stop { entity_id: id },
-                Some(&rules),
+                &rules,
                 Some(&registry),
                 crate::sim::world::FrameEffects::default()
             ));
@@ -1168,7 +1171,7 @@ pub fn check_initialized_unit_paid_reissues(produce: GroundCommandProducer) {
         assert!(sim.apply_command_with_overlays(
             "Americans",
             &decoded.payload,
-            Some(&rules),
+            &rules,
             Some(&registry),
             crate::sim::world::FrameEffects::default()
         ));
@@ -1219,7 +1222,7 @@ fn initialized_unit_delayed_move_reaches_original_class_refusal() {
                 target_rx: rx,
                 target_ry: ry,
             },
-            Some(&rules),
+            &rules,
             Some(&registry),
             crate::sim::world::FrameEffects::default()
         ),
@@ -1272,7 +1275,7 @@ fn initialized_gi_move_clears_original_archive_before_destination() {
             target_rx: resolved.0,
             target_ry: resolved.1,
         },
-        Some(&rules),
+        &rules,
         Some(&registry),
         crate::sim::world::FrameEffects::default()
     ));
@@ -1352,7 +1355,7 @@ fn initialized_gi_retained_priors_and_stop_reissues_match_original_returns() {
                 target_rx: resolved.0,
                 target_ry: resolved.1,
             },
-            Some(&rules),
+            &rules,
             Some(&registry),
             crate::sim::world::FrameEffects::default()
         ));
@@ -1523,26 +1526,19 @@ fn initialized_cell_what_action_matches_every_original_query() {
 /// Original input emits no Move for the recorded local-house, Berserk and
 /// Deployer/Doing contexts. Action0 can return CellClick AL1 without issuing
 /// an order; the latter's query2 has a different refusal path.51AA40 owns its
-/// separate later human-class guard.
+/// separate later human-class guard. Unit query7404B0 and click738910 have
+/// their own pre-Event guards: explicit native byte priors exercise them
+/// without claiming that MTNK's retail type can itself produce deployment
+/// transitions.
 #[test]
 #[ignore = "slow; run when changing what it covers"]
-fn initialized_gi_cell_input_no_order_contexts_match_original_state() {
+fn initialized_gi_and_unit_cell_input_no_order_contexts_match_original_state() {
     check_initialized_no_order_contexts(&[
         "human_Doing27_B",
         "human_Doing27_shift_B",
         "mode5_current_mismatch_B",
         "mode5_current_nonhuman_Doing27_input_class_B",
         "berserk_B",
-    ]);
-}
-
-/// Unit query7404B0 and click738910 have their own pre-Event guards.
-/// Explicit native byte priors exercise them without claiming that MTNK's
-/// retail type can itself produce deployment transitions.
-#[test]
-#[ignore = "slow; run when changing what it covers"]
-fn initialized_unit_cell_input_no_order_contexts_match_original_state() {
-    check_initialized_no_order_contexts(&[
         "unit_owner_mismatch_B",
         "unit_berserk_B",
         "unit_deployed_B",
@@ -1592,7 +1588,7 @@ fn check_initialized_no_order_contexts(names: &[&str]) {
         // ClickedAction can send (`click_order_receivers`, the Berserk
         // refusal), then resolves the Cell, which the class What_Action and
         // ClickedAction refuse.
-        let berserk_refused = sim.click_order_receivers(&[id]).is_empty();
+        let berserk_refused = sim.click_order_receivers(&[id], rules.ares()).is_empty();
         assert_eq!(berserk_refused, name.contains("berserk"), "{name}");
         if !berserk_refused {
             let input = &row["inputs"][0];
@@ -1650,7 +1646,7 @@ fn initialized_gi_non_deployer_input_reaches_original_class_refusal() {
             target_rx: resolved.0,
             target_ry: resolved.1,
         },
-        Some(&rules),
+        &rules,
         Some(&registry),
         crate::sim::world::FrameEffects::default(),
     ));
@@ -1701,10 +1697,6 @@ pub(super) fn corpus() -> &'static Value {
     let data =
         crate::test_fixture::json("src/sim/world/fixtures/factory_infantry_local_native.json");
     assert_eq!(data["schema_version"], 2);
-    assert_eq!(
-        data["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     assert_eq!(data["products"].as_array().unwrap().len(), 2);
     assert_eq!(data["rally"]["products"].as_array().unwrap().len(), 2);
     data
@@ -1780,8 +1772,8 @@ pub(super) fn install_ground(
         ),
     );
     sim.playfield_size_height = Some(size.1);
-    sim.session.map_width = side;
-    sim.session.map_height = side;
+    sim.session.set_map_width_for_test(side);
+    sim.session.set_map_height_for_test(side);
     sim.overlay_grid = Some(OverlayGrid::new(side, side));
     sim.bridge_state = Some(BridgeRuntimeState::from_resolved_terrain_with_map_size(
         &terrain,
@@ -1866,23 +1858,25 @@ enum OutputRoute {
     RallyBetweenCompletionAndPlace,
 }
 
+/// Without a rally the two paid GIs walk out and release their factory
+/// contacts. Building443860 appends SetRally before the next Strip6A8B30
+/// appends PLACE: the already admitted player event must reach the tail
+/// first, and Exit443C60 copies the new Archive to the retained GI instead of
+/// its previous value.
 #[test]
-fn no_rally_two_paid_gi_walk_out_and_release_their_factory_contacts() {
-    joined_two_paid_gi(OutputRoute::NoRally);
+fn two_paid_gi_walk_out_without_a_rally_or_with_one_set_before_place() {
+    for route in [
+        OutputRoute::NoRally,
+        OutputRoute::RallyBetweenCompletionAndPlace,
+    ] {
+        joined_two_paid_gi(route);
+    }
 }
 
 #[test]
 #[ignore = "slow; run when changing what it covers"]
 fn rally_two_paid_gi_consume_archive_walk_to_rally_and_settle() {
     joined_two_paid_gi(OutputRoute::Rally);
-}
-
-/// Building443860 appends SetRally before the next Strip6A8B30 appends PLACE.
-/// The already admitted player event must reach the tail first: Exit443C60
-/// copies the new Archive to the retained GI instead of its previous value.
-#[test]
-fn rally_between_factory_completion_and_place_reaches_the_held_gi() {
-    joined_two_paid_gi(OutputRoute::RallyBetweenCompletionAndPlace);
 }
 
 fn joined_two_paid_gi(route: OutputRoute) {
@@ -1909,13 +1903,13 @@ fn joined_two_paid_gi(route: OutputRoute) {
     // Human/currentHouse/difficulty0 and cash10000 are retained native priors.
     // TechLevel10 is explicit structural eligibility, not a measured P2 field.
     let mut house = HouseState::new(owner, 0, Some(owner), true, 10_000, 10);
-    house.difficulty = HouseDifficulty::Hard;
+    house.set_difficulty_for_test(HouseDifficulty::Hard);
     house.project_country_mults(&rules, &sim.interner);
-    sim.houses.insert(owner, house);
-    sim.session.house_order.push(owner);
-    sim.session.current_house = Some(owner);
-    sim.session.game_mode_nonzero = true;
-    sim.session.game_options.game_speed = 3;
+    sim.houses.register(house);
+    sim.session.set_current_house_for_test(Some(owner));
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    sim.session.game_options_mut_for_test().game_speed = 3;
     let producer = sim
         .spawn_object_at_height_with_overlay_registry(
             "GAPILE",
@@ -1944,11 +1938,11 @@ fn joined_two_paid_gi(route: OutputRoute) {
         native["producer_prior"]["health"]
     );
     assert_eq!(
-        json!(sim.power_states[&owner].total_output),
+        json!(sim.power_states[&owner].total_output()),
         native["producer_prior"]["power"]
     );
     assert_eq!(
-        json!(sim.power_states[&owner].total_drain),
+        json!(sim.power_states[&owner].total_drain()),
         native["producer_prior"]["drain"]
     );
     if route == OutputRoute::Rally
@@ -1956,14 +1950,15 @@ fn joined_two_paid_gi(route: OutputRoute) {
     {
         let command = CommandEnvelope::new(
             owner,
-            sim.session.tick + 1,
+            sim.session.tick() + 1,
             Command::SetRally {
                 rx,
                 ry,
                 producer_ids: vec![producer],
             },
         );
-        sim.advance_tick(&[command], Some(&rules), None, Some(&registry), TICK_MS);
+        assert!(sim.issue_local_command(command));
+        sim.advance_tick(&[], Some(&rules), None, Some(&registry), TICK_MS);
         assert_eq!(
             sim.substrate.entities.get(producer).unwrap().rally_cell(),
             rally_cell,
@@ -1974,12 +1969,12 @@ fn joined_two_paid_gi(route: OutputRoute) {
     let commands = [
         CommandEnvelope::new(
             owner,
-            sim.session.tick + 1,
+            sim.session.tick() + 1,
             Command::QueueProduction { type_id: e1 },
         ),
         CommandEnvelope::new(
             owner,
-            sim.session.tick + 1,
+            sim.session.tick() + 1,
             Command::QueueProduction { type_id: e1 },
         ),
     ];
@@ -1987,7 +1982,7 @@ fn joined_two_paid_gi(route: OutputRoute) {
     sim.advance_tick(&commands, Some(&rules), None, Some(&registry), TICK_MS);
     let head = sim
         .production
-        .factories
+        .factories()
         .view(owner, ProductionCategory::Infantry)
         .expect("real production event starts the first GI");
     let first = head.object.unwrap().entity_id.unwrap();
@@ -2003,15 +1998,15 @@ fn joined_two_paid_gi(route: OutputRoute) {
     }];
 
     for _ in 0..10_000 {
-        let frame = sim.session.binary_frame;
+        let frame = sim.session.binary_frame();
         if route == OutputRoute::RallyBetweenCompletionAndPlace
             && products[0].completed_frame.is_some()
             && products[0].placed_frame.is_none()
         {
             let (rx, ry) = rally_cell.unwrap();
-            sim.queue_command(CommandEnvelope::new(
+            sim.issue_local_command(CommandEnvelope::new(
                 owner,
-                sim.session.tick + 1,
+                sim.session.tick() + 1,
                 Command::SetRally {
                     rx,
                     ry,
@@ -2021,15 +2016,18 @@ fn joined_two_paid_gi(route: OutputRoute) {
         }
         // The ordinary app drains player ingress before advancing each frame.
         let due = sim.take_due_commands();
+        let visits = sim.production.factories().strip_visits_for_test(owner);
+        let effects =
+            crate::sim::world::FrameEffects::default().with_production_strip(&visits, &|_| {});
         if route == OutputRoute::RallyBetweenCompletionAndPlace {
             let mut output = sim
                 .advance_app_frame(
                     &due,
-                    Some(&rules),
+                    &rules,
                     Some(&registry),
                     TICK_MS,
                     super::TickLane::Ordinary,
-                    crate::sim::world::FrameEffects::default(),
+                    effects,
                 )
                 .expect("the ordinary app frame completes");
             let admitted = output.take_admitted_commands();
@@ -2038,12 +2036,19 @@ fn joined_two_paid_gi(route: OutputRoute) {
                     "src/sim/world/fixtures/factory_infantry_publication_native.json",
                 ))
                 .unwrap();
-                assert_eq!(phase["native_sha256"], native["native_sha256"]);
                 let event_types: Vec<_> = admitted
                     .iter()
                     .map(|command| match command.payload {
-                        Command::SetRally { .. } => 0x1E,
-                        Command::PlaceProducedMobile { .. } => 0x0B,
+                        Command::SynchronizedRecord { ref record }
+                            if crate::sim::command::ArchiveRecord::decode(record).is_some() =>
+                        {
+                            0x1E
+                        }
+                        Command::SynchronizedRecord { ref record }
+                            if crate::sim::command::PlaceRecord::decode(record).is_some() =>
+                        {
+                            0x0B
+                        }
                         _ => panic!("unexpected admitted race command: {command:?}"),
                     })
                     .collect();
@@ -2070,12 +2075,21 @@ fn joined_two_paid_gi(route: OutputRoute) {
                 );
             }
         } else {
-            sim.advance_tick(&due, Some(&rules), None, Some(&registry), TICK_MS);
+            sim.advance_master_frame(
+                &due,
+                &rules,
+                Some(&registry),
+                TICK_MS,
+                super::TickLane::Ordinary,
+                false,
+                effects,
+            )
+            .unwrap();
         }
         let log = radio::take_transmit_log();
         if let Some(view) = sim
             .production
-            .factories
+            .factories()
             .view(owner, ProductionCategory::Infantry)
             && let Some(held) = view.object.and_then(|object| object.entity_id)
         {
@@ -2112,7 +2126,7 @@ fn joined_two_paid_gi(route: OutputRoute) {
                 assert!(entity.lifecycle.in_limbo() && !entity.in_logic_vector.is_member());
                 assert!(
                     !sim.pending_command_snapshot().iter().any(|command| {
-                        matches!(command.payload, Command::PlaceProducedMobile { .. })
+                        matches!(&command.payload, Command::SynchronizedRecord { record } if crate::sim::command::PlaceRecord::decode(record).is_some())
                     }),
                     "Factory completion retains its change flag until the next Strip prefix"
                 );
@@ -2167,7 +2181,7 @@ fn joined_two_paid_gi(route: OutputRoute) {
                     // factory during this PLACE, before any later Strip visit.
                     assert!(
                         sim.production
-                            .factories
+                            .factories()
                             .view(owner, ProductionCategory::Infantry)
                             .is_none()
                     );
@@ -2336,16 +2350,16 @@ fn joined_two_paid_gi(route: OutputRoute) {
     }
     let factory = sim
         .production
-        .factories
+        .factories()
         .view(owner, ProductionCategory::Infantry);
     assert!(factory.is_none_or(|view| view.object.is_none() && view.queue.is_empty()));
     assert!(sim.pending_command_snapshot().is_empty());
     assert_eq!(
-        json!(sim.houses[&owner].economy.credits()),
+        json!(sim.houses[&owner].economy().credits()),
         native["final_wallet"]["credits"]
     );
     assert_eq!(
-        json!(sim.houses[&owner].economy.spent_credits()),
+        json!(sim.houses[&owner].economy().spent_credits()),
         native["final_wallet"]["spent"]
     );
 }

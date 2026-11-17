@@ -25,7 +25,33 @@ use crate::util::native_x87::{
 #[path = "hover_process.rs"]
 mod process;
 
-pub(crate) use process::{hover_move_to, hover_stop_moving};
+pub(crate) use process::{HoverMoveTo, hover_is_powered, hover_move_to, hover_stop_moving};
+
+/// `HoverLocomotionClass::Draw_Matrix @ 0x00513F40` (vt+0x24) as the slope
+/// [`ground_locomotor_matrix`] builds it at, with the same angles. Either
+/// rocking angle at the gate (`0x00513F53..0x00513F7F`) takes the rocking arm,
+/// keyed -1 (`0x005140A2`): `(lift * F) * frame` (`0x00514262`,
+/// `0x00514270`), F being `LocomotionClass::Draw_Matrix @ 0x0055A730`, which
+/// is the owner's slope-0 tilt, since its extra identity product is exact.
+/// Otherwise Is_Powered (`0x00513F88`) returns F itself
+/// (`0x0051407F..0x00514092`), the owner's untilted slope 0. Only an
+/// unpowered Hover takes the slope of the cell under its Location
+/// (`0x00513F93..0x0051405C`: Map `0x00565730`, CellClass `+0x11C`), read
+/// through the caller's query. The voxel draw, GetFLH (`0x006F3B9B`) and the
+/// turret pivot (`0x006F3DB7`) all ask it.
+///
+/// [`ground_locomotor_matrix`]: crate::map::voxel_pose::ground_locomotor_matrix
+pub fn hover_draw_slope(
+    entity: &crate::sim::game_entity::GameEntity,
+    cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
+    angles: [f32; 2],
+) -> u8 {
+    if crate::map::voxel_pose::voxel_tilt_applies(angles) || hover_is_powered(entity, cells) {
+        return 0;
+    }
+    let [x, y] = super::ground_pose::position_world_xy(&entity.position);
+    cells.map_or(0, |cells| cells.ground_fields(cells.lookup_world(x, y)).1)
+}
 
 /// Double 0x007E27F8, the minute-to-frame factor of the Hover time keys.
 const FRAMES_PER_MINUTE: NativeF64Bits = NativeF64Bits::from_bits(0x408c_2000_0000_0000);
@@ -90,6 +116,11 @@ impl HoverRuntime {
 
     pub(crate) fn head(&self) -> Option<DriveCoord> {
         self.head
+    }
+
+    /// ILocomotion::Destination514CB0 reads +14, independently of the head.
+    pub(crate) fn destination(&self) -> Option<DriveCoord> {
+        self.destination
     }
 
     /// Test fixtures only: ProcessMovement (`hover_process`) is the writer.
@@ -211,29 +242,19 @@ impl HoverRuntime {
             target = one;
         }
         if X87Chop53::compare(target, load(self.speed_current)) == X87Ordering::Greater {
-            let raised = X87Chop53::add(
-                reciprocal_minutes(rules.general.hover_acceleration),
-                load(self.speed_current),
-            );
-            self.speed_current =
-                store(if X87Chop53::compare(raised, target) == X87Ordering::Less {
-                    raised
-                } else {
-                    target
-                });
+            // `HoverAcceleration=0` divides to +INF at 0x0051617F, which the
+            // compare sends to the target.
+            let raised = reciprocal_minutes(rules.general.hover_acceleration)
+                .map(|step| X87Chop53::add(step, load(self.speed_current)))
+                .filter(|&raised| X87Chop53::compare(raised, target) == X87Ordering::Less);
+            self.speed_current = store(raised.unwrap_or(target));
         }
         if X87Chop53::compare(target, load(self.speed_current)) == X87Ordering::Less {
-            let lowered = X87Chop53::sub(
-                load(self.speed_current),
-                reciprocal_minutes(rules.general.hover_brake),
-            );
-            self.speed_current = store(
-                if X87Chop53::compare(lowered, zero) == X87Ordering::Greater {
-                    lowered
-                } else {
-                    zero
-                },
-            );
+            // `HoverBrake=0` divides to +INF at 0x005161B7: a full stop.
+            let lowered = reciprocal_minutes(rules.general.hover_brake)
+                .map(|step| X87Chop53::sub(load(self.speed_current), step))
+                .filter(|&lowered| X87Chop53::compare(lowered, zero) == X87Ordering::Greater);
+            self.speed_current = store(lowered.unwrap_or(zero));
         }
     }
 
@@ -322,12 +343,13 @@ impl HoverRuntime {
 }
 
 /// `1 / (minutes * 900)`, FLD/FMUL/FDIVR at 0x0051617F and 0x005161B7.
-fn reciprocal_minutes(minutes: NativeF64Bits) -> X87Value {
+/// `None` for a zero key, where the masked divide gives infinity.
+fn reciprocal_minutes(minutes: NativeF64Bits) -> Option<X87Value> {
     X87Chop53::div(
         load(NativeF64Bits::ONE),
         X87Chop53::mul(load(minutes), load(FRAMES_PER_MINUTE)),
     )
-    .expect("the Hover time keys are nonzero")
+    .ok()
 }
 
 fn load(bits: NativeF64Bits) -> X87Value {
@@ -338,6 +360,6 @@ fn store(value: X87Value) -> NativeF64Bits {
     X87Chop53::store_f64(value).expect("Hover doubles stay finite")
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "hover_tests.rs"]
 mod tests;

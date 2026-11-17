@@ -4,6 +4,54 @@ use crate::sim::intern::InternedId;
 use crate::sim::rng::SimRng;
 use crate::sim::timer::CdTimer;
 
+/// Permanent instance stealth granted by CellClass::PickupCrate @0048294F.
+/// HasStealthAbility @0070C5A0 reads the same Techno+3D2 byte that the
+/// Unit/Infantry constructors seed from Cloakable= (@007355B4/@00517D86).
+/// Types are immutable for a scenario; retain only the permanent instance
+/// delta from that constructor seed. Keep it separate from cloak progress:
+/// receiving it starts no timer
+/// or transition, and leaving/re-entering the map cannot remove it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StealthAbility {
+    granted: bool,
+}
+
+/// Whether the constructor seeds `Techno+0x3D2` from the type's `Cloakable=`
+/// (`type_seed` of [`StealthAbility::active`]): the Unit and Infantry
+/// constructors copy it (`0x007355B4`, `0x00517D86`); Building and Aircraft
+/// Init do not. Ares 3.0 copies it there too: BuildingClass_Init_Cloakable
+/// (1005C4F0, hook 0x442CE0) and AircraftClass_Init_Cloakable (1005C2D0,
+/// hook 0x413FA3), when Ares plays (`ares`, [`RuleSet::ares`]).
+///
+/// [`RuleSet::ares`]: crate::rules::ruleset::RuleSet::ares
+pub(crate) fn type_seeds_stealth(
+    category: crate::map::entities::EntityCategory,
+    object: &crate::rules::object_type::ObjectType,
+    ares: bool,
+) -> bool {
+    use crate::map::entities::EntityCategory;
+    object.cloakable
+        && (matches!(category, EntityCategory::Unit | EntityCategory::Infantry) || ares)
+}
+
+impl StealthAbility {
+    /// The permanent capability: the type's seed or a crate's grant. An Ares
+    /// attached-effect cloak is held in the object's Ares part, so ask
+    /// [`GameEntity::cloak_ability_active`](crate::sim::game_entity::GameEntity::cloak_ability_active)
+    /// where the object is at hand.
+    pub(crate) fn active(self, type_seed: bool) -> bool {
+        type_seed || self.granted
+    }
+
+    pub(crate) fn grant(&mut self) {
+        self.granted = true;
+    }
+
+    pub(crate) fn granted(self) -> bool {
+        self.granted
+    }
+}
+
 /// The cloak progress stage's timer (`TechnoClass+0x22C`/`+0x234`) and its
 /// rate (`+0x238`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -36,7 +84,8 @@ impl CloakStepTimer {
 /// Active `TechnoClass` cloak fields consumed by radar and tactical draw.
 ///
 /// `CloakingTick @ 0x006FB740`, `StartCloaking @ 0x00703770`,
-/// `StartUncloaking @ 0x007036C0`, and `GetVisualState @ 0x00703860` establish
+/// `StartUncloaking @ 0x007036C0`, `NoInit @ 0x006F4300`, and
+/// `GetVisualState @ 0x00703860` establish
 /// every state/progress/timer write below. Stock YR exercises this continuously
 /// through DLPH/SUB/SQD/BSUB.
 pub struct CloakRuntime {
@@ -56,6 +105,20 @@ pub struct CloakRuntime {
     /// 900 frames — into `+0x248`. `CanAutoCloak @ 0x006FBDC0` reads it as its
     /// LAST timer gate (`param_1[0x90]`/`[0x92]`).
     recloak_delay: CdTimer,
+    /// A Building's fade stage, `BuildingClass+0x6ED`: 0 opaque to 15 faded
+    /// out. The constructor zeroes it (`0x0043B9A9`) and only
+    /// `BuildingClass::UpdateCloak @ 0x00454DB0` changes it
+    /// ([`Self::step_building_fade`]). Other objects leave it 0.
+    building_stage: u8,
+}
+
+/// The state edge one [`CloakRuntime::step_building_fade`] visit reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuildingFadeEdge {
+    /// Stage 15 in state 1: fully cloaked (`0x00454E72..0x00454E85`).
+    Cloaked,
+    /// Stage 0 in state 3: uncloaked (`0x00454F1B..0x00454F2F`).
+    Uncloaked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +159,12 @@ pub struct VisualCharacterQuery {
 }
 
 impl VisualCharacterQuery {
+    /// The call's first argument: the sensor queries pass true, the screen's
+    /// draw false.
+    pub(crate) const fn forced(&self) -> bool {
+        self.force_sensor
+    }
+
     /// Screen `(0, NULL)` call; alliances must be true in both directions.
     pub const fn screen(
         graphical_client: bool,
@@ -160,25 +229,7 @@ pub(crate) fn visual_character(
         return 0;
     }
     if state == 2 {
-        if query.force_sensor {
-            return if query.observer_present && query.observer_senses_cell {
-                3
-            } else {
-                5
-            };
-        }
-        if !query.graphical_client || owned_by_current_house || query.observer_senses_cell {
-            return 3;
-        }
-        return if !query.is_campaign
-            && owner_present
-            && query.observer_present
-            && query.mutually_allied
-        {
-            3
-        } else {
-            5
-        };
+        return hidden_unless_sensed(owned_by_current_house, owner_present, query);
     }
     if progress <= 0 {
         return 0;
@@ -206,7 +257,58 @@ pub(crate) fn visual_character(
     }
 }
 
+/// The fully cloaked answer of `TechnoClass::GetVisualState @ 0x00703860`
+/// (state 2), which `BuildingClass::GetVisualState @ 0x004544A0` repeats for
+/// a stage of 11 or more: 3 (seen as cloaked) or 5 (unseen). An explicit
+/// sensor query asks only the observer's sensors. A screen query sees it
+/// without a window, for its owner, or under the player's sensors; otherwise
+/// a skirmish player sees a mutual ally's.
+fn hidden_unless_sensed(
+    owned_by_current_house: bool,
+    owner_present: bool,
+    query: VisualCharacterQuery,
+) -> u8 {
+    if query.force_sensor {
+        return if query.observer_present && query.observer_senses_cell {
+            3
+        } else {
+            5
+        };
+    }
+    if !query.graphical_client || owned_by_current_house || query.observer_senses_cell {
+        return 3;
+    }
+    if !query.is_campaign && owner_present && query.observer_present && query.mutually_allied {
+        3
+    } else {
+        5
+    }
+}
+
+/// `BuildingClass::GetVisualState @ 0x004544A0` for a nonzero fade stage
+/// (`BuildingClass+0x6ED`): stages 1-5 are 1 and 6-10 are 2, then the fully
+/// cloaked answer. A stage of 0 is the Techno base, [`visual_character`].
+/// The stage is read before the type's `Invisible=`.
+pub(crate) fn building_stage_visual_character(
+    stage: u8,
+    owned_by_current_house: bool,
+    owner_present: bool,
+    query: VisualCharacterQuery,
+) -> u8 {
+    debug_assert!(stage != 0);
+    match stage {
+        ..=5 => 1,
+        6..=10 => 2,
+        _ => hidden_unless_sensed(owned_by_current_house, owner_present, query),
+    }
+}
+
 impl CloakTickFacts {
+    /// The object's progress stages (Ares per-type Cloakable.Stages).
+    pub(crate) fn cloaking_stages(&self) -> i32 {
+        self.cloaking_stages
+    }
+
     /// Capture live owner inputs once at the native AI visit.
     pub fn new(
         current_frame: i32,
@@ -296,6 +398,12 @@ impl CloakRuntime {
         self.depth = depth;
     }
 
+    /// Install a fixture Building's fade stage.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_building_stage_for_test(&mut self, stage: u8) {
+        self.building_stage = stage;
+    }
+
     pub fn new(current_frame: i32) -> Self {
         Self {
             state: 0,
@@ -303,7 +411,49 @@ impl CloakRuntime {
             step_delta: 0,
             step_timer: CloakStepTimer::started(current_frame, 0),
             recloak_delay: CdTimer::started(current_frame, 0),
+            building_stage: 0,
         }
+    }
+
+    /// `BuildingClass+0x6ED`, the fade stage (0 opaque, 15 faded out).
+    pub fn building_stage(&self) -> u8 {
+        self.building_stage
+    }
+
+    /// The fade arms of `BuildingClass::UpdateCloak @ 0x00454DB0`
+    /// (`0x00454E02..0x00455012`): one stage per AI visit, out in state 1 and
+    /// back in state 3. Stage 15 makes state 2 and stage 0 makes state 0. The
+    /// building never reads its CloakProgress clock, and neither edge starts
+    /// the ReCloak delay.
+    pub(crate) fn step_building_fade(&mut self) -> Option<BuildingFadeEdge> {
+        match self.state {
+            1 if self.building_stage < 15 => {
+                self.building_stage += 1;
+                if self.building_stage == 15 {
+                    self.state = 2;
+                    return Some(BuildingFadeEdge::Cloaked);
+                }
+            }
+            3 => {
+                // `0x00454EBA` skips a negative stage, which nothing writes.
+                self.building_stage = self.building_stage.saturating_sub(1);
+                if self.building_stage == 0 {
+                    self.state = 0;
+                    return Some(BuildingFadeEdge::Uncloaked);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Original gamemd.exe TechnoClass::Constructor_NoInit @006F4300,
+    /// 006F4335..006F4365: reset the progress and its clock after reading the
+    /// object, retaining the cloak state and the separate re-cloak delay.
+    pub(crate) fn restart_progress_after_player_load(&mut self, binary_frame: i32) {
+        self.depth = 0;
+        self.step_delta = 1;
+        self.step_timer = CloakStepTimer::started(binary_frame, 0);
     }
 
     /// UnitClass::Unlimbo @ 0x00737BA0 sets only state 2 when runtime cloak
@@ -315,19 +465,20 @@ impl CloakRuntime {
     /// The constructor's cloak state for an object with the Cloak ability
     /// (the constructor copy at `0x007355B6`/`0x00517D88`), fully cloaked
     /// when Unlimbo establishes state 2 ([`Self::establish_unlimbo_fully_cloaked`]).
-    pub(crate) fn install(slot: &mut Option<Self>, current_frame: i32, fully_cloaked: bool) {
-        let mut cloak = Self::new(current_frame);
+    pub(crate) fn install(slot: &mut Option<Box<Self>>, current_frame: i32, fully_cloaked: bool) {
+        // UnitClass::Unlimbo @00737BD7..00737BEB only writes state 2;
+        // it neither clears the retained ability nor restarts cloak timers.
+        let cloak = slot.get_or_insert_with(|| Box::new(Self::new(current_frame)));
         if fully_cloaked {
             cloak.establish_unlimbo_fully_cloaked();
         }
-        *slot = Some(cloak);
     }
 
     /// The cloak AI's install for an object that has the Cloak ability but no
     /// runtime yet (one that gained `Cloak` by rank after construction).
-    pub(crate) fn install_if_absent(slot: &mut Option<Self>, current_frame: i32) {
+    pub(crate) fn install_if_absent(slot: &mut Option<Box<Self>>, current_frame: i32) {
         if slot.is_none() {
-            *slot = Some(Self::new(current_frame));
+            *slot = Some(Box::new(Self::new(current_frame)));
         }
     }
 
@@ -526,12 +677,21 @@ impl crate::sim::game_entity::GameEntity {
         &self,
         observer: InternedId,
         fog: Option<&crate::sim::vision::FogState>,
-        alliances: Option<&crate::map::houses::HouseAllianceMap>,
+        alliances: Option<&crate::sim::house_diplomacy::HouseAlliances>,
         interner: &crate::sim::intern::StringInterner,
     ) -> bool {
         let Some(disguise) = self.disguise.as_ref() else {
             return false;
         };
+        // Building and Aircraft keep the Techno base (`0x0041C020`): the raw
+        // `+0x1D8` flag, whoever asks.
+        if matches!(
+            self.category(),
+            crate::map::entities::EntityCategory::Structure
+                | crate::map::entities::EntityCategory::Aircraft
+        ) {
+            return disguise.disguised;
+        }
         let allied = |asker: InternedId, other: InternedId| {
             crate::sim::combat::combat_weapon::is_ally_by_object(alliances, interner, asker, other)
         };
@@ -546,6 +706,51 @@ impl crate::sim::game_entity::GameEntity {
                 .is_some_and(|fake| allied(observer, fake)),
             disguise.disguised_as_house.is_some(),
         )
+    }
+
+    /// vtable `+0xD0` `GetDisguiseHouse(skip_own)`: the house an observer
+    /// reads off this object.
+    /// - Unit `0x007465F0` and Infantry `0x005226C0` answer the owner when it
+    ///   is allied with the current player (`0x004F9A50`) and `skip_own` is
+    ///   false; otherwise the worn house (`+0x51C`), which Infantry replaces
+    ///   with the current player's when NULL. So a Mirage worn as terrain
+    ///   has none, a Spy always has one.
+    /// - Building and Aircraft keep the Techno base (`0x0041BE70`): NULL.
+    pub fn disguise_house(
+        &self,
+        skip_own: bool,
+        current_player: Option<InternedId>,
+        owner_allied_with_player: bool,
+    ) -> Option<InternedId> {
+        use crate::map::entities::EntityCategory;
+        let worn = self.disguise.as_ref().and_then(DisguiseRuntime::house);
+        match self.category() {
+            EntityCategory::Unit | EntityCategory::Infantry
+                if owner_allied_with_player && !skip_own =>
+            {
+                Some(self.owner())
+            }
+            EntityCategory::Unit => worn,
+            EntityCategory::Infantry => worn.or(current_player),
+            EntityCategory::Structure | EntityCategory::Aircraft => None,
+        }
+    }
+
+    /// Whether `player` sees this object disguised with no house behind it:
+    /// `+0xC8` ([`Self::is_disguised_to`]) with `+0xD0(1)`
+    /// ([`Self::disguise_house`]) NULL, as for a Mirage worn as terrain to an
+    /// enemy that cannot see through it. DrawExtras then skips the hover
+    /// health bar (`0x006F5E4B..0x006F5E70`), Flash skips its write and
+    /// `ObjectClass::Is_Selectable` (`+0x138`, `0x005F6C30`) refuses.
+    pub fn disguise_hides_house_from(
+        &self,
+        player: InternedId,
+        fog: Option<&crate::sim::vision::FogState>,
+        alliances: Option<&crate::sim::house_diplomacy::HouseAlliances>,
+        interner: &crate::sim::intern::StringInterner,
+    ) -> bool {
+        self.disguise_house(true, Some(player), false).is_none()
+            && self.is_disguised_to(player, fog, alliances, interner)
     }
 }
 
@@ -579,7 +784,7 @@ pub fn disguise_rejects_candidate(
     if !is_disguised_to_attacker || attacker_detects_disguise {
         return DisguiseGateOutcome::Accept;
     }
-    if blink_frames_remaining <= 0 {
+    if blink_frames_remaining == 0 {
         return DisguiseGateOutcome::Reject;
     }
     if attacker_house_is_human {
@@ -596,10 +801,8 @@ pub enum DisguiseGateOutcome {
     /// Native rejects without drawing.
     Reject,
     /// Native reaches its one `RandomRanged(0, 99)` on the Scenario stream and
-    /// compares against `[General] DisabledDisguiseDetectionPercent`. Only an
-    /// AI-controlled attacking house gets here, and VERA has no AI opponent, so
-    /// no production caller can produce this variant yet — it is modelled, not
-    /// wired, and wiring it costs one Scenario draw per evaluated candidate.
+    /// compares against `[General] DisabledDisguiseDetectionPercent`. Only a
+    /// computer attacking house gets here, while the candidate blinks.
     AiDetectionRoll,
 }
 
@@ -608,8 +811,9 @@ pub(crate) mod transitions;
 #[cfg(any(test, feature = "test-support"))]
 use transitions::{StartCloakingResult, StartUncloakingResult};
 
-/// Retained Techno disguise identity and re-disguise timer. Original
-/// `6F2CBE..6F2CCA` starts +1E0/+1E8 at construction with duration zero.
+/// Retained Techno disguise identity, re-disguise timer and firing blink
+/// timer. Original `6F2CBE..6F2CDB` starts +1E0/+1E8 and +1EC/+1F4 at
+/// construction with duration zero.
 /// The intervening +1E4 word is uninitialized by that constructor and copied
 /// from different stack slots by the two reveal writers. It has no established
 /// behavioral meaning in this chain and is not deterministic cell state.
@@ -621,11 +825,26 @@ pub struct DisguiseRuntime {
     disguise_type: Option<InternedId>,
     disguised_as_house: Option<InternedId>,
     reveal_timer: CdTimer,
+    /// `+0x1EC`/`+0x1F4`: the frames a firing `DisguiseWhenStill=` Unit
+    /// blinks (`UnitClass::Fire_At @ 0x0074143E..0x00741471`).
+    blink_timer: CdTimer,
 }
 
 impl Default for DisguiseRuntime {
     fn default() -> Self {
         Self::new(0)
+    }
+}
+
+impl crate::sim::game_entity::GameEntity {
+    /// The disguise runtime, created at `frame` when the object has none yet.
+    /// Native keeps the disguise fields inline; sparse Rust storage creates
+    /// them on the first disguise write, stamped with that frame. A stored
+    /// object's writer that puts a disguise on also calls
+    /// `EntityStore::note_look`, which the atlas check reads.
+    pub(crate) fn disguise_mut(&mut self, frame: u32) -> &mut DisguiseRuntime {
+        self.disguise
+            .get_or_insert_with(|| DisguiseRuntime::new(frame))
     }
 }
 
@@ -637,6 +856,7 @@ impl DisguiseRuntime {
             disguise_type: None,
             disguised_as_house: None,
             reveal_timer: CdTimer::started(construction_frame as i32, 0),
+            blink_timer: CdTimer::started(construction_frame as i32, 0),
         }
     }
 
@@ -660,6 +880,10 @@ impl DisguiseRuntime {
         self.reveal_timer
     }
 
+    pub const fn blink_timer(&self) -> CdTimer {
+        self.blink_timer
+    }
+
     pub(crate) fn hash_state(&self, hasher: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
         self.disguised.hash(hasher);
@@ -667,6 +891,7 @@ impl DisguiseRuntime {
         self.disguise_type.hash(hasher);
         self.disguised_as_house.hash(hasher);
         self.reveal_timer.hash(hasher);
+        self.blink_timer.hash(hasher);
     }
 
     /// `InfantryClass::DisguiseAs` / `UnitClass::DisguiseAs`.
@@ -741,14 +966,28 @@ impl DisguiseRuntime {
     pub fn reveal_blocks(&self, current_frame: u32) -> bool {
         !self.reveal_timer.expired(current_frame as i32)
     }
+
+    /// `UnitClass::Fire_At @ 0x0074143E..0x00741471`: after a launched shot,
+    /// a `DisguiseWhenStill=` Unit starts the blink at the current frame for
+    /// the weapon's `DisguiseFakeBlinkTime=`. The intervening `+0x1F0` word
+    /// is copied from a stack slot no reader takes.
+    pub(crate) fn start_fire_blink(&mut self, current_frame: u32, duration: i32) {
+        self.blink_timer.start(current_frame as i32, duration);
+    }
+
+    /// The blink's remaining frames: IsClearlyVisibleTo (`0x0070EE39..0x0070EE5D`)
+    /// and Evaluate_Candidate (`0x006F84DE..0x006F8503`) read it alike.
+    pub fn blink_remaining(&self, current_frame: u32) -> i32 {
+        self.blink_timer.remaining(current_frame as i32)
+    }
 }
 
 impl crate::sim::world::Simulation {
     /// Forced GetDisguise(1): Infantry522640 and Unit7465B0, Steam
-    /// gamemd3e81a617..08600. It reads retained Techno+518 without testing
+    /// gamemd. It reads retained Techno+518 without testing
     /// Disguised+1D8. Infantry alone falls back to Rules+D58/D5C/D60 by
     /// PlayerPtr's planning side; NULL/other sides select the third slot.
-    pub(crate) fn forced_disguise_type(
+    pub fn forced_disguise_type(
         &self,
         actor: u64,
         rules: &crate::rules::ruleset::RuleSet,
@@ -767,14 +1006,30 @@ impl crate::sim::world::Simulation {
         if entity.category() != EntityCategory::Infantry {
             return None;
         }
+        // VERA network adaptation, as HasOccurred53's: PlayerPtr differs per
+        // client, so a network game answers the worn type alone. Dormant on
+        // retail, whose only Agent (SPY) is built wearing its side's type.
+        if self.session.game_mode().is_network() {
+            return None;
+        }
         let side = self
             .session
-            .current_house
+            .current_house()
             .and_then(|id| self.houses.get(&id))
-            .map_or(2, |house| usize::from(house.side_index).min(2));
-        rules.general.infantry_disguises[side]
-            .as_deref()
-            .and_then(|name| self.interner.get(name))
+            .map(|house| house.side_index());
+        let worn = match side {
+            Some(side) => match rules.side_disguise(side) {
+                Some(value) => value,
+                None => rules.general.infantry_disguises[match side {
+                    0 => 0,
+                    1 => 1,
+                    _ => 2,
+                }]
+                .as_deref(),
+            },
+            None => rules.general.infantry_disguises[2].as_deref(),
+        };
+        worn.and_then(|name| self.interner.get(name))
     }
 
     /// vt+0x46C `DisguiseAs(target)`: what the bullet's Owner does when a
@@ -825,7 +1080,7 @@ impl crate::sim::world::Simulation {
                     match target.disguise.as_ref().filter(|d| d.is_disguised()) {
                         Some(disguise) => (
                             self.forced_disguise_type(target.stable_id(), rules),
-                            disguise.house().or(self.session.current_house),
+                            disguise.house().or(self.session.current_house()),
                         ),
                         None => (Some(target.type_ref()), Some(target.owner())),
                     },
@@ -838,14 +1093,15 @@ impl crate::sim::world::Simulation {
                 return;
             }
         };
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
+        // A worn type and house are a new look for the atlas check.
+        self.substrate.entities.note_look(firer);
         let disguise = self
             .substrate
             .entities
             .get_mut(firer)
             .expect("present firer")
-            .disguise
-            .get_or_insert_with(|| DisguiseRuntime::new(frame));
+            .disguise_mut(frame);
         match worn {
             Some((kind, house)) => disguise.acquire(frame, kind, house),
             None => disguise.raise(frame),
@@ -877,7 +1133,7 @@ impl crate::sim::world::Simulation {
         {
             return Ok(());
         }
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         // Both original calls ask ILoco+10, not the queued Move/NavCom. The
         // predicate has no intervening simulation writer on this route.
         let moving = crate::sim::movement::motion_query::is_moving(entity)
@@ -957,8 +1213,7 @@ impl crate::sim::world::Simulation {
                     .entities
                     .get_mut(id)
                     .expect("live disguise owner")
-                    .disguise
-                    .get_or_insert_with(|| DisguiseRuntime::new(frame));
+                    .disguise_mut(frame);
                 state.block_reacquisition(frame, rules.general.infantry_blink_disguise_time);
                 state.clear_unit();
             } else if acquire
@@ -982,12 +1237,12 @@ impl crate::sim::world::Simulation {
                 let disguise_type = self
                     .interner
                     .intern(&rules.general.default_mirage_disguises[picked]);
+                self.substrate.entities.note_look(id);
                 self.substrate
                     .entities
                     .get_mut(id)
                     .expect("live disguise owner")
-                    .disguise
-                    .get_or_insert_with(|| DisguiseRuntime::new(frame))
+                    .disguise_mut(frame)
                     .acquire(frame, Some(disguise_type), None);
             }
         }
@@ -999,15 +1254,15 @@ impl crate::sim::world::Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 #[path = "cloak_sound_tests.rs"]
 mod sound_tests;
 
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_c_g, tests_sim_world_techno)))]
 #[path = "mirage_disguise_tests.rs"]
 pub(in crate::sim) mod mirage_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
 
@@ -1158,15 +1413,6 @@ mod tests {
         );
         assert!(result.transitioned && !result.consumed_scenario_rng);
         assert_eq!(rng.logical_state(), before);
-    }
-
-    #[test]
-    fn reveal_timer_blocks_until_expiry() {
-        let mut state = DisguiseRuntime::default();
-        assert!(!state.reveal_blocks(0));
-        state.block_reacquisition(100, 10);
-        assert!(state.reveal_blocks(109));
-        assert!(!state.reveal_blocks(110));
     }
 
     #[test]

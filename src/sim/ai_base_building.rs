@@ -34,8 +34,11 @@
 //! - Native reads VERA defines: the wall percent is read unchecked at the
 //!   House difficulty (VERA takes 0, no walls, past the vector's end, which
 //!   retail's three values never reach).
-//! - A `-3` node is removed without `0x005082C0`'s perimeter scan; only a map
-//!   plan can hold one.
+//! - Authored perimeter scans whose selected wall/gate type is null fault
+//!   natively (508720/5087DC/50892E/5089F9). VERA stops the scan before
+//!   appending or committing bounds. Stock GADUMY gates admit Allied owners;
+//!   a Soviet/Yuri authored -3 can reach this invalid native dereference.
+//!   All fourteen stock campaign plans were read without a -3 node.
 //! - Dormant in retail data: the `PowersUpBuilding=` arms of `0x0042E820` and
 //!   `AI_Choose_Building` (`0x004FE953..0x004FEA3A`); no retail type sets the
 //!   key and VERA reads no upgrade (as `production_sell` and
@@ -54,7 +57,12 @@
 //!   the BuildingType array or a negative control other than -1/-2/-3 reads
 //!   memory past the array (`0x004FE537`, `0x004FE6F6`); a null power plant
 //!   slot is dereferenced (`0x004FE8A9`, `0x00505368`). VERA makes no choice
-//!   for such a node and splices nothing for a missing plant.
+//!   for such a node and splices nothing for a missing plant. Read the Ares way, a
+//!   house whose country lists no plant and whose side has none (side 3 and
+//!   later, or unset `[General]` plants) stops the game (`0x1001DEF6`, "did
+//!   not find any powerplants it could construct"); VERA splices nothing.
+
+use std::hash::{Hash, Hasher};
 
 use crate::rules::object_type::{FactoryType, ObjectCategory, ObjectType};
 use crate::rules::overlay_types::OverlayTypeRegistry;
@@ -63,15 +71,21 @@ use crate::sim::ai_base_site::{SiteKey, find_base_building_site, reserved_near};
 use crate::sim::ai_unit_choice::{self, UnitChoiceKind};
 use crate::sim::base_plan::{BasePlanNode, pack_base_plan_cell, unpack_base_plan_cell};
 use crate::sim::build_site::{Flush, can_place_building_at, flush_for_placement};
+use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
+use crate::sim::intern::StringInterner;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::movement::locomotor::MovementLayer;
+use crate::sim::power_system::PowerStates;
 use crate::sim::production::find_factory;
+use crate::sim::rng::SimRng;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::world::FrameEffects;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::{PlacementEvidence, Simulation};
 
 /// The computer's production state on its House.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HouseAiProduction {
     /// `HouseClass+0x1E4`, the mode `EconomyStateMachine` steps and the
     /// chooser block dispatches on.
@@ -84,6 +98,18 @@ pub struct HouseAiProduction {
     /// nothing sets it again (the other clearing writer, `0x005048A0`, has no
     /// caller).
     naval_allowed: bool,
+    /// NPSE 2.0 House+160D4..160E4, zeroed at C31206..C3121E:
+    /// aircraft, land vehicle, naval vehicle, infantry, building. These
+    /// reservations survive failed starts and PointerExpired independently
+    /// of any Factory's lifetime; this House production owner retains them.
+    #[serde(default)]
+    parallel_reservations: [i32; 5],
+    /// Phobos HouseExt `Factory_BuildingType`/`Factory_InfantryType`/
+    /// `Factory_VehicleType`/`Factory_NavyType`/`Factory_AircraftType`:
+    /// the factory building the house currently uses for each category, in
+    /// `AiFactorySlot` order. None is Phobos' null pointer.
+    #[serde(default)]
+    parallel_factories: [Option<u64>; 5],
 }
 
 impl Default for HouseAiProduction {
@@ -94,11 +120,156 @@ impl Default for HouseAiProduction {
             mode: 0,
             building_choice: -1,
             naval_allowed: true,
+            parallel_reservations: [0; 5],
+            parallel_factories: [None; 5],
+        }
+    }
+}
+
+impl Hash for HouseAiProduction {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        // Preserve the previous hash when no extension reservation exists.
+        self.mode.hash(hasher);
+        self.building_choice.hash(hasher);
+        self.naval_allowed.hash(hasher);
+        if self.parallel_reservations != [0; 5] {
+            b"npse-parallel-reservations-v1".hash(hasher);
+            self.parallel_reservations.hash(hasher);
+        }
+        // Phobos extension state; keep the older hash while unset.
+        if self.parallel_factories != [None; 5] {
+            b"phobos-parallel-ai-factories-v1".hash(hasher);
+            self.parallel_factories.hash(hasher);
+        }
+    }
+}
+
+/// Phobos' per-house factory building pointers, one slot per producing
+/// building category (`HouseExt::Factory_*Type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AiFactorySlot {
+    Building,
+    Infantry,
+    Vehicle,
+    Navy,
+    Aircraft,
+}
+
+impl AiFactorySlot {
+    const fn index(self) -> usize {
+        match self {
+            Self::Building => 0,
+            Self::Infantry => 1,
+            Self::Vehicle => 2,
+            Self::Navy => 3,
+            Self::Aircraft => 4,
+        }
+    }
+
+    /// The slot a producing building's `Factory=` RTTI and `Naval=` select
+    /// (`pThis->Type->Factory`/`Naval` in `0x4502F4`).
+    pub(crate) const fn for_producer(factory_rtti: i32, naval: bool) -> Option<Self> {
+        match factory_rtti {
+            7 => Some(Self::Building),
+            16 => Some(Self::Infantry),
+            40 => Some(if naval { Self::Navy } else { Self::Vehicle }),
+            3 => Some(Self::Aircraft),
+            _ => None,
+        }
+    }
+
+    /// The slot a produced object's category and `Naval=` select.
+    pub(crate) const fn for_product(category: ObjectCategory, naval: bool) -> Self {
+        match category {
+            ObjectCategory::Building => Self::Building,
+            ObjectCategory::Infantry => Self::Infantry,
+            ObjectCategory::Vehicle => {
+                if naval {
+                    Self::Navy
+                } else {
+                    Self::Vehicle
+                }
+            }
+            ObjectCategory::Aircraft => Self::Aircraft,
         }
     }
 }
 
 impl HouseAiProduction {
+    #[cfg(feature = "npatch")]
+    fn parallel_slot_mut(&mut self, category: ObjectCategory, naval: bool) -> &mut i32 {
+        let index = match category {
+            ObjectCategory::Aircraft => 0,
+            ObjectCategory::Vehicle => {
+                if naval {
+                    2
+                } else {
+                    1
+                }
+            }
+            ObjectCategory::Infantry => 3,
+            ObjectCategory::Building => 4,
+        };
+        &mut self.parallel_reservations[index]
+    }
+
+    /// NPSE 2.0 Factory_AI C2F07C..C2F11F reserves before naval
+    /// compatibility, allocation and StartProduction. Only vehicles split
+    /// on Naval. Failure and PointerExpired do not compensate this write.
+    #[cfg(feature = "npatch")]
+    pub(crate) fn reserve_parallel(&mut self, category: ObjectCategory, naval: bool) -> bool {
+        let counter = self.parallel_slot_mut(category, naval);
+        if *counter > 0 {
+            return false;
+        }
+        *counter = counter.wrapping_add(1);
+        true
+    }
+
+    /// NPSE 2.0 Exit_Object C2EF95/C3395E/C3397F/C2F184/C2F1A9
+    /// and AbandonProduction C2EFB4..C2F06D decrement unconditionally,
+    /// then clamp signed negatives to zero. Callers own the admission phase
+    /// and House identity; no per-object reservation flag changes that rule.
+    #[cfg(feature = "npatch")]
+    pub(crate) fn release_parallel(&mut self, category: ObjectCategory, naval: bool) {
+        let counter = self.parallel_slot_mut(category, naval);
+        *counter = counter.wrapping_sub(1).max(0);
+    }
+    /// Phobos `BuildingClass_Update_Factory_Phobos @ 0x4502F4` remembers the
+    /// first factory building of a category; a second one consults it.
+    pub(crate) fn parallel_factory(&self, slot: AiFactorySlot) -> Option<u64> {
+        self.parallel_factories[slot.index()]
+    }
+
+    pub(crate) fn set_parallel_factory(&mut self, slot: AiFactorySlot, building: Option<u64>) {
+        self.parallel_factories[slot.index()] = building;
+    }
+
+    /// `BuildingClass_KickOutUnit_*` (`0x444119`, `0x444131`, `0x443CCA`,
+    /// `0x44531F`) clear the pointer only while it still names the same
+    /// factory building. `FactoryClass_AbandonProduction` (`0x4CA07A`) has no
+    /// such test and uses [`Self::set_parallel_factory`] instead.
+    pub(crate) fn clear_parallel_factory(&mut self, slot: AiFactorySlot, building: u64) {
+        let entry = &mut self.parallel_factories[slot.index()];
+        if *entry == Some(building) {
+            *entry = None;
+        }
+    }
+
+    /// Phobos `HouseExt::OnDetach`, which its `AnnounceInvalidPointer` hook
+    /// (`0x7258D0`) runs on every house for a removed building: each slot
+    /// that names the building is cleared. Answers whether one did.
+    pub(crate) fn forget_parallel_factory(&mut self, building: u64) -> bool {
+        let mut named = false;
+        for entry in &mut self.parallel_factories {
+            if *entry == Some(building) {
+                *entry = None;
+                named = true;
+            }
+        }
+        named
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) const fn mode(&self) -> i32 {
         self.mode
@@ -145,20 +316,27 @@ impl HouseAiProduction {
 /// 1 from `RandomRanged(0,1)` (`0x00509863`), else a non-building exit moves
 /// it to 1; at or above it, modes 1 and 2 return to 0, and mode 3 only above.
 pub(crate) fn economy_state_machine(
-    sim: &mut Simulation,
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    scenario_rng: &mut SimRng,
+    houses: &mut Houses,
+    power_states: &PowerStates,
     rules: &RuleSet,
     owner: InternedId,
     building_exit: bool,
 ) {
-    let game_mode_nonzero = sim.session.game_mode_nonzero;
-    let Some(house) = sim.houses.get(&owner) else {
+    let game_mode_nonzero = session.game_mode_nonzero();
+    let Some(house) = houses.get(&owner) else {
         return;
     };
-    if house.is_controlled_by_human(game_mode_nonzero) || !game_mode_nonzero {
+    if house.is_controlled_by_human(game_mode_nonzero)
+        || house.command_driven()
+        || !game_mode_nonzero
+    {
         return;
     }
-    let mode = house.ai_production.mode;
-    let money = crate::sim::credit_income::available_money(sim, owner);
+    let mode = house.ai_production().mode;
+    let money = crate::sim::credit_income::available_money(houses, owner);
     let cutoff = rules.general.ai_alternate_production_credit_cutoff;
     let next = match mode {
         0 => (money < cutoff).then_some(if building_exit { 2 } else { 1 }),
@@ -170,22 +348,21 @@ pub(crate) fn economy_state_machine(
             // from each list.
             let owns_any = |types: &[String]| {
                 types.iter().any(|name| {
-                    sim.interner.get(name).is_some_and(|id| {
+                    interner.get(name).is_some_and(|id| {
                         house
-                            .tracking
+                            .tracking()
                             .active_count(crate::map::entities::EntityCategory::Structure, id)
                             > 0
                     })
                 })
             };
-            let (output, drain) = sim
-                .power_states
+            let (output, drain) = power_states
                 .get(&owner)
-                .map_or((0, 0), |power| (power.total_output, power.total_drain));
+                .map_or((0, 0), |power| (power.total_output(), power.total_drain()));
             let may_stay = owns_any(&rules.build_barracks_types)
                 && owns_any(&rules.build_weapons_types)
                 && drain <= output;
-            if may_stay && sim.scenario_rng.next_range_i32_inclusive(0, 1) != 0 {
+            if may_stay && scenario_rng.next_range_i32_inclusive(0, 1) != 0 {
                 None
             } else {
                 (!building_exit).then_some(1)
@@ -196,9 +373,9 @@ pub(crate) fn economy_state_machine(
         _ => None,
     };
     if let Some(next) = next
-        && let Some(house) = sim.houses.get_mut(&owner)
+        && let Some(house) = houses.get_mut(&owner)
     {
-        house.ai_production.mode = next;
+        house.ai_production_mut().mode = next;
     }
 }
 
@@ -222,19 +399,28 @@ pub(crate) fn update_production_choices(
     owner: InternedId,
     registry: Option<&OverlayTypeRegistry>,
 ) {
-    let game_mode_nonzero = sim.session.game_mode_nonzero;
+    let game_mode_nonzero = sim.session.game_mode_nonzero();
     let Some(house) = sim.houses.get(&owner) else {
         return;
     };
-    if house.is_controlled_by_human(game_mode_nonzero) || house.multiplay_passive {
+    if house.is_controlled_by_human(game_mode_nonzero)
+        || house.multiplay_passive()
+        || house.command_driven()
+    {
         return;
     }
-    if (sim.session.binary_frame as i32) % 8 != 0 {
+    if (sim.session.binary_frame() as i32) % 8 != 0 {
         return;
     }
     let choose_units = |sim: &mut Simulation, kinds: &[UnitChoiceKind]| {
         for &kind in kinds {
             ai_unit_choice::choose(sim, rules, owner, kind);
+            // NPSE 2.0 House::Update's C33AB0 wrapper (4F90F2/4F9252)
+            // always asks land, then naval. Mode-2 admission below still
+            // reads the original three choices only.
+            if crate::rules::NPATCH_ENABLED && kind == UnitChoiceKind::Unit {
+                ai_unit_choice::choose(sim, rules, owner, UnitChoiceKind::NavalUnit);
+            }
         }
     };
     const ALL: [UnitChoiceKind; 3] = [
@@ -244,7 +430,7 @@ pub(crate) fn update_production_choices(
     ];
     // A campaign runs mode 0's choices (`0x004F9099..0x004F90A1`).
     let mode = if game_mode_nonzero {
-        house.ai_production.mode
+        house.ai_production().mode
     } else {
         0
     };
@@ -258,7 +444,7 @@ pub(crate) fn update_production_choices(
             let choice = sim
                 .houses
                 .get(&owner)
-                .map_or(-1, |house| house.ai_production.building_choice);
+                .map_or(-1, |house| house.ai_production().building_choice);
             let buildable = rules
                 .building_type_at(choice)
                 .is_some_and(|ty| find_factory(sim, rules, owner, ty, true, true, true).is_some());
@@ -271,7 +457,7 @@ pub(crate) fn update_production_choices(
             if !unit_choice_is_harvester(sim, rules, owner) {
                 choose_units(sim, &[UnitChoiceKind::Infantry, UnitChoiceKind::Aircraft]);
             }
-            let Some(choices) = sim.houses.get(&owner).map(|house| house.ai_unit_choices) else {
+            let Some(choices) = sim.houses.get(&owner).map(|house| house.ai_unit_choices()) else {
                 return;
             };
             let none_chosen = ALL.iter().all(|&kind| choices.get(kind) == -1);
@@ -299,13 +485,10 @@ fn unit_choice_is_harvester(sim: &Simulation, rules: &RuleSet, owner: InternedId
     let Some(house) = sim.houses.get(&owner) else {
         return false;
     };
-    let country_bit = crate::sim::ai_buildable::house_country_bit(
-        rules,
-        sim.interner.resolve(house.house_type_id()),
-    );
+    let country_bit = rules.country_owner_mask(sim.interner.resolve(house.house_type_id()));
     crate::sim::ai_buildable::first_owner_compatible_harvester(rules, country_bit)
         .and_then(|harvester| rules.type_array_index(ObjectCategory::Vehicle, &harvester.id))
-        .is_some_and(|index| index == house.ai_unit_choices.get(UnitChoiceKind::Unit))
+        .is_some_and(|index| index == house.ai_unit_choices().get(UnitChoiceKind::Unit))
 }
 
 /// `HouseClass::AI_Choose_Building @ 0x004FE3E0`.
@@ -320,28 +503,29 @@ pub(crate) fn choose_building(
     };
     // `0x004FE3E9..0x004FE416`: a choice already waits, the house has no
     // Construction Yard (`+0x60`, the ConYards count), or no node is open.
-    if house.ai_production.building_choice != -1 || house.build_const_order.is_empty() {
+    if house.ai_production().building_choice != -1 || house.build_const_order().is_empty() {
         return;
     }
-    let naval_allowed = house.ai_production.naval_allowed;
+    let naval_allowed = house.ai_production().naval_allowed;
     let Some(mut index) = find_node(sim, rules, owner, -1, registry) else {
         return;
     };
     // `0x004FE41C..0x004FE4A4`: a naval node while naval building is off is
     // removed, and the lookup runs once more.
-    let node_type = plan_node(sim, owner, index).type_or_control;
+    let node_type = plan_node(&sim.houses, owner, index).type_or_control;
     if !naval_allowed && rules.building_type_at(node_type).is_some_and(|ty| ty.naval) {
-        remove_node(sim, owner, index);
+        remove_node(&mut sim.houses, owner, index);
         let Some(next) = find_node(sim, rules, owner, -1, registry) else {
             return;
         };
         index = next;
     }
-    let mut node = plan_node(sim, owner, index);
-    // `0x004FE4B0..0x004FE518`: remove a perimeter node (its `0x005082C0`
-    // scan is a residual).
+    let mut node = plan_node(&sim.houses, owner, index);
+    // Original ChooseBuilding4FE4B0..4FE518 removes the control, calls
+    // ScanBasePerimeter5082C0 and returns. New nodes wait for a later choice.
     if node.type_or_control == -3 {
-        remove_node(sim, owner, index);
+        remove_node(&mut sim.houses, owner, index);
+        scan_base_perimeter(sim, rules, owner);
         return;
     }
     let wall_tower = rules.building_type_at(node.type_or_control).filter(|ty| {
@@ -360,9 +544,18 @@ pub(crate) fn choose_building(
         let percent = sim.houses.get(&owner).map_or(0, |house| {
             house.difficulty_value(&rules.general.ai_pick_wall_defense_percent)
         });
-        if draw < percent && build_walls(sim, rules, owner, index) {
+        if draw < percent
+            && build_walls(
+                &sim.interner,
+                &sim.substrate,
+                &mut sim.houses,
+                rules,
+                owner,
+                index,
+            )
+        {
             if let Some(house) = sim.houses.get_mut(&owner) {
-                house.base_plan.remove_equal(node);
+                house.base_plan_mut().remove_equal(node);
             }
             return;
         }
@@ -371,14 +564,14 @@ pub(crate) fn choose_building(
             // `0x004FE640..0x004FE6D2`: a WallTower node goes first, then
             // the node at its index.
             if wall_tower.is_some() {
-                remove_node(sim, owner, index);
+                remove_node(&mut sim.houses, owner, index);
             }
-            remove_node(sim, owner, index);
+            remove_node(&mut sim.houses, owner, index);
             return;
         }
         // `0x004FE6E1`: the node now holds the defense (or the WallTower its
         // cell) and takes the ordinary path.
-        node = plan_node(sim, owner, index);
+        node = plan_node(&sim.houses, owner, index);
     }
     if node.type_or_control == -2 {
         return;
@@ -390,7 +583,7 @@ pub(crate) fn choose_building(
         // `0x004FE893..0x004FE943`: the plant takes the node's index, the
         // node and the rest shift up.
         if let Some(house) = sim.houses.get_mut(&owner) {
-            house.base_plan.nodes.insert(
+            house.base_plan_mut().insert(
                 index,
                 BasePlanNode {
                     type_or_control: plant,
@@ -404,56 +597,323 @@ pub(crate) fn choose_building(
     }
     // `0x004FEA3C..0x004FEA42`.
     if let Some(house) = sim.houses.get_mut(&owner) {
-        house.ai_production.building_choice = node.type_or_control;
+        house.ai_production_mut().building_choice = node.type_or_control;
     }
 }
 
+/// Original gamemd.exe HouseClass::AI_ScanBasePerimeter5082C0. Grow the
+/// reservation rectangle, scan its four edges, then append all walls before
+/// all gates. No RNG draw, timer write or detach belongs to this helper.
+/// Native+5764 staging is raw-save-only (BaseSave42F070/Load42EE30); every
+/// call overwrites it before use. Only the committed+5754 bounds are needed
+/// after return, including for a later expansion after loading.
+fn scan_base_perimeter(sim: &mut Simulation, rules: &RuleSet, owner: InternedId) {
+    use crate::map::cell_index::NativeCellIdentity;
+    use crate::map::resolved_terrain::NativeCellQuery;
+
+    let (Some(house), Some(terrain)) = (sim.houses.get(&owner), sim.resolved_terrain.as_ref())
+    else {
+        // Mapless component fixtures have no native CellClass receiver.
+        return;
+    };
+    let country = sim.interner.resolve(house.house_type_id());
+    //5083EF..508443: ConcreteWalls, EWGates, NSGates. This is5051E0's
+    // country/side predicate, not the different50C340 wall_type lookup.
+    let [wall_type, ew_gate, ns_gate] = [
+        &rules.concrete_wall_types,
+        &rules.ew_gate_types,
+        &rules.ns_gate_types,
+    ]
+    .map(|types| {
+        crate::sim::ai_buildable::first_buildable_from_array(
+            rules,
+            types,
+            country,
+            house.side_index(),
+            sim.session.game_options().super_weapons,
+        )
+        .and_then(|ty| rules.building_type_index(&ty.id))
+    });
+    let (x, y, width, height) = house.base_reservation().bounds();
+    let grown = (
+        x.wrapping_sub(1),
+        y.wrapping_sub(1),
+        width.wrapping_add(2),
+        height.wrapping_add(2),
+    );
+    let left = grown.0 as i16;
+    let top = grown.1 as i16;
+    let right = grown.0.wrapping_add(grown.2) as i16;
+    let bottom = grown.1.wrapping_add(grown.3).wrapping_sub(1) as i16;
+    let cells = NativeCellQuery::canonical(terrain);
+    let center = house.base_plan_center();
+    let center = cells.lookup((center.0 as i16, center.1 as i16));
+    let center_level = i32::from(cells.ground_fields(center).0 as i8);
+    let mut nodes = (Vec::new(), Vec::new());
+    //508338..5083EB, tables7EA790/7EA7A0: corners occur on the horizontal
+    // edges only. Native word additions wrap at every coordinate step.
+    for (start, end, step, outside, gate_type) in [
+        ((left, top), (right, top), (1, 0), (0, -1), ew_gate),
+        ((left, bottom), (right, bottom), (1, 0), (0, 1), ew_gate),
+        (
+            (left, top.wrapping_add(1)),
+            (left, bottom),
+            (0, 1),
+            (-1, 0),
+            ns_gate,
+        ),
+        (
+            (right.wrapping_sub(1), top.wrapping_add(1)),
+            (right.wrapping_sub(1), bottom),
+            (0, 1),
+            (1, 0),
+            ns_gate,
+        ),
+    ] {
+        let mut cell = start;
+        let mut run_start = start;
+        let mut run_length = 0;
+        let mut soft_breaks = 0;
+        while cell != end {
+            //5084E7..50860A evaluates every query before classifying the
+            // break. Retain both identities across the shared-Dummy stamps.
+            let current = cells.lookup(cell);
+            let outer = cells.lookup((
+                cell.0.wrapping_add(outside.0),
+                cell.1.wrapping_add(outside.1),
+            ));
+            let height_clear =
+                (i32::from(cells.ground_fields(current).0 as i8) - center_level).abs() <= 2;
+            let lands = [cells.land_type(current), cells.land_type(outer)];
+            let land_clear = lands.into_iter().all(|land| !matches!(land, 2 | 3 | 8));
+            let overlay_clear = sim.cell_overlay(current).overlay_id.is_none();
+            let building_clear = [current, outer].into_iter().all(|identity| {
+                if let NativeCellIdentity::Real(_) = identity {
+                    let (x, y) = cells.coord(identity);
+                    sim.substrate
+                        .occupancy
+                        .first_building_on_layer(x as u16, y as u16, MovementLayer::Ground)
+                        .is_none()
+                } else {
+                    true
+                }
+            });
+            let terrain_clear = [current, outer].into_iter().all(|identity| {
+                if let NativeCellIdentity::Real(_) = identity {
+                    let (x, y) = cells.coord(identity);
+                    sim.terrain_objects.id_at((x as u16, y as u16)).is_none()
+                } else {
+                    true
+                }
+            });
+            let slope_clear = cells.ground_fields(current).1 == 0;
+            // Map578460 mode1 performs another lookup of the requested cell.
+            let in_playfield = crate::sim::cell_rect::cell_is_in_playfield_height_aware_in_query(
+                (i32::from(cell.0), i32::from(cell.1)),
+                sim.playfield_bounds(),
+                Some(terrain),
+                Some(&cells),
+            );
+            let hard_break =
+                !height_clear || !land_clear || !building_clear || !terrain_clear || !in_playfield;
+            if !hard_break && overlay_clear && slope_clear {
+                if run_length == 0 {
+                    run_start = cell;
+                }
+                run_length += 1;
+            } else {
+                //508672..5086E7: overlay/slope breaks flush short runs as
+                // walls and suppress a gate at the following hard break.
+                let gate_allowed = hard_break && soft_breaks == 0;
+                if hard_break {
+                    soft_breaks = 0;
+                } else {
+                    soft_breaks += 1;
+                }
+                if (run_length >= 5 || !gate_allowed)
+                    && !append_perimeter_run(
+                        &mut nodes,
+                        run_start,
+                        step,
+                        run_length,
+                        gate_allowed,
+                        (wall_type, gate_type),
+                    )
+                {
+                    return;
+                }
+                run_length = 0;
+            }
+            cell = (cell.0.wrapping_add(step.0), cell.1.wrapping_add(step.1));
+        }
+        //5088D8..508A96 always permits a gate in a long trailing run,
+        // independently of the edge's earlier soft-break counter.
+        if run_length >= 5
+            && !append_perimeter_run(
+                &mut nodes,
+                run_start,
+                step,
+                run_length,
+                true,
+                (wall_type, gate_type),
+            )
+        {
+            return;
+        }
+    }
+    let house = sim
+        .houses
+        .get_mut(&owner)
+        .expect("retained perimeter owner");
+    //508ABA..508BA0 appends after every preexisting node, walls then gates.
+    for node in nodes.0.into_iter().chain(nodes.1) {
+        let plan = house.base_plan_mut();
+        plan.insert(plan.nodes().len(), node);
+    }
+    house
+        .base_reservation_mut()
+        .commit_perimeter_expansion(grown);
+}
+
+/// Shared internal/trailing run emission of ScanBasePerimeter5086AD..508A90.
+/// A gate begins at length/2-1 and consumes three cells. Native null Type
+/// dereferences terminate execution; the caller drops the uncommitted scan.
+fn append_perimeter_run(
+    nodes: &mut (Vec<BasePlanNode>, Vec<BasePlanNode>),
+    mut cell: (i16, i16),
+    step: (i16, i16),
+    length: i32,
+    gate_allowed: bool,
+    (wall_type, gate_type): (Option<i32>, Option<i32>),
+) -> bool {
+    let mut index = 0;
+    while index < length {
+        let is_gate = gate_allowed && index == length / 2 - 1;
+        let Some(type_or_control) = (if is_gate { gate_type } else { wall_type }) else {
+            return false;
+        };
+        let node = BasePlanNode {
+            type_or_control,
+            packed_cell: pack_base_plan_cell(i32::from(cell.0), i32::from(cell.1)),
+            filled: false,
+            retry_count: 0,
+        };
+        let advance = if is_gate {
+            nodes.1.push(node);
+            3
+        } else {
+            nodes.0.push(node);
+            1
+        };
+        index += advance;
+        cell = (
+            cell.0.wrapping_add(step.0.wrapping_mul(advance as i16)),
+            cell.1.wrapping_add(step.1.wrapping_mul(advance as i16)),
+        );
+    }
+    true
+}
+
 /// The power splice gates of `AI_Choose_Building` (`0x004FE6F6..0x004FE8A6`):
-/// the building's drain would exceed the house's output (less `+0x160B4`,
-/// which only the constructor writes, zero), it is not a `BuildConst=` type,
+/// the building's drain would exceed the house's output less its spare power
+/// (`+0x160B4`, [`PowerState::power_surplus`]: zero unless Phobos'
+/// `EnablePowerSurplus` is on), it is not a `BuildConst=` type,
 /// it drains power, no blackout remains and no powered building is being
 /// drained (`+0x577B`). Returns the plant's BuildingType index: the side 0
 /// house's `GDIPowerPlant=`, the side 2 house's `ThirdPowerPlant=`, any other
 /// side's `NodAdvancedPower=` when `0x00505360` admits it, else
-/// `NodRegularPower=`.
+/// `NodRegularPower=`. In a game read the Ares way, [`ares_power_plant`]
+/// chooses instead.
+///
+/// [`PowerState::power_surplus`]: crate::sim::power_system::PowerState::power_surplus
 fn power_plant_to_splice(
-    sim: &Simulation,
+    sim: &mut Simulation,
     rules: &RuleSet,
     owner: InternedId,
     ty: &ObjectType,
 ) -> Option<i32> {
-    let house = sim.houses.get(&owner)?;
+    let side = sim.houses.get(&owner)?.side_index();
     let power = sim.power_states.get(&owner).cloned().unwrap_or_default();
     let drain = crate::sim::power_system::native_building_power_drain(ty.power);
-    let short = power.total_drain.wrapping_add(drain) > power.total_output;
+    // `0x004FE6FC..0x004FE71D`: dword SUB, ADD and a signed compare.
+    let output = power
+        .total_output()
+        .wrapping_sub(power.power_surplus(rules));
+    let short = power.total_drain().wrapping_add(drain) > output;
     if !short
         || ty.build_const_eligible
         || drain <= 0
-        || power.blackout_remaining(sim.session.binary_frame) > 0
-        || power.has_drained_power_source
+        || power.blackout_remaining(sim.session.binary_frame()) > 0
+        || power.has_drained_power_source()
     {
         return None;
     }
-    let plants = &rules.general.building_types;
-    let index = |name: Option<&str>| name.and_then(|name| rules.building_type_index(name));
-    // A missing plant is dereferenced natively (module residual): no splice.
-    match house.side_index {
-        0 => index(plants.gdi_power_plant.as_deref()),
-        2 => index(plants.third_power_plant.as_deref()),
-        // `0x004FE7A7..0x004FE85D`: the list handed to `0x00505360` holds the
-        // house's BuildingClass objects (`+0x6C`, reversed) where the helper
-        // compares BuildingTypes, so a prerequisite never matches and the
-        // advanced plant passes only when it has no prerequisite (`+0x648`,
-        // `0x00505368..0x00505379`). Retail NANRCT needs NATECH and NACNST,
-        // so every such house splices NAPOWR.
-        _ => index(plants.nod_advanced_power.as_deref())
-            .filter(|&advanced| {
-                rules
-                    .building_type_at(advanced)
-                    .is_some_and(|advanced| advanced.prerequisite.is_empty())
-            })
-            .or_else(|| index(plants.nod_regular_power.as_deref())),
+    if rules.ares_form() {
+        ares_power_plant(sim, rules, owner, side)
+    } else {
+        let plants = &rules.general.building_types;
+        let index = |name: Option<&str>| name.and_then(|name| rules.building_type_index(name));
+        // A missing plant is dereferenced natively (module residual): no splice.
+        match side {
+            0 => index(plants.gdi_power_plant.as_deref()),
+            2 => index(plants.third_power_plant.as_deref()),
+            // `0x004FE7A7..0x004FE85D`: the list handed to `0x00505360` holds
+            // the house's BuildingClass objects (`+0x6C`, reversed) where the
+            // helper compares BuildingTypes, so a prerequisite never matches
+            // and the advanced plant passes only when it has no prerequisite
+            // (`+0x648`, `0x00505368..0x00505379`). Retail NANRCT needs NATECH
+            // and NACNST, so every such house splices NAPOWR.
+            _ => index(plants.nod_advanced_power.as_deref())
+                .filter(|&advanced| {
+                    rules
+                        .building_type_at(advanced)
+                        .is_some_and(|advanced| advanced.prerequisite.is_empty())
+                })
+                .or_else(|| index(plants.nod_regular_power.as_deref())),
+        }
     }
+}
+
+/// Ares 3.0 replaces the stock choice (`0x004FE782`, six bytes, resuming at
+/// `0x004FE893` with the plant in EDI) for every house with its hook body
+/// `0x1001DDC0`. The candidates are `GetPowerplants @ 0x1001BD20`
+/// ([`RuleSet::ares_power_plants`]: the country's `AI.PowerPlants=`, else the
+/// side's `[General]` plants). It keeps those CanBuild `0x10021B00(house,
+/// type, 0, 1)` answers 1 and `0x10021CA0` admits (the house owns the type's
+/// prerequisites, [`owns_prerequisites`]), in list order, and draws
+/// `Randomizer(0, count-1)` on Scenario+0x218 (`0x1000AC70` ->
+/// `0x0065C7E0`, which draws nothing for one) to pick one. When none passes
+/// it takes the first candidate (`0x1001DEA2..0x1001DEC6`, logged "Fall back
+/// to the first one").
+///
+/// [`owns_prerequisites`]: crate::sim::production::owns_prerequisites
+fn ares_power_plant(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    side: i32,
+) -> Option<i32> {
+    use crate::sim::production::{CanBuild, can_build, owns_prerequisites};
+    let house = sim.houses.get(&owner)?;
+    let candidates = rules.ares_power_plants(sim.interner.resolve(house.house_type_id()), side);
+    let buildable: Vec<i32> = candidates
+        .iter()
+        .copied()
+        .filter(|&index| {
+            rules.building_type_at(index).is_some_and(|plant| {
+                can_build(sim, rules, owner, plant, false, true) == CanBuild::Yes
+                    && owns_prerequisites(sim, rules, house, plant)
+            })
+        })
+        .collect();
+    if buildable.is_empty() {
+        // No candidate at all is fatal natively (`0x1001DEF6`, a module
+        // residual); VERA splices nothing.
+        return candidates.first().copied();
+    }
+    let last = buildable.len() as i32 - 1;
+    let picked = sim.scenario_rng.next_range_i32_inclusive(0, last);
+    buildable.get(picked as usize).copied()
 }
 
 /// What the Construction Yard's exit answers `Factory_AI`
@@ -492,13 +952,13 @@ pub(crate) fn exit_building(
     let Some(owner) = sim.substrate.entities.get(factory).map(|yard| yard.owner()) else {
         return BuildingExit::Failed;
     };
-    let game_mode_nonzero = sim.session.game_mode_nonzero;
-    // `0x00444F19..0x00444F2A` (`0x0050B730`).
-    if sim
-        .houses
-        .get(&owner)
-        .is_none_or(|house| house.is_controlled_by_human(game_mode_nonzero))
-    {
+    let game_mode_nonzero = sim.session.game_mode_nonzero();
+    // `0x00444F19..0x00444F2A` (`0x0050B730`). Fork-only: a command-driven
+    // house's yard places nothing either (`docs/superai.md`); its finished
+    // buildings wait for the command layer's placement orders.
+    if sim.houses.get(&owner).is_none_or(|house| {
+        house.is_controlled_by_human(game_mode_nonzero) || house.command_driven()
+    }) {
         return BuildingExit::Failed;
     }
     let Some(ty) = sim
@@ -509,9 +969,18 @@ pub(crate) fn exit_building(
     else {
         return BuildingExit::Failed;
     };
-    economy_state_machine(sim, rules, owner, true);
+    economy_state_machine(
+        &sim.interner,
+        &sim.session,
+        &mut sim.scenario_rng,
+        &mut sim.houses,
+        &sim.power_states,
+        rules,
+        owner,
+        true,
+    );
     if let Some(house) = sim.houses.get_mut(&owner) {
-        house.ai_production.clear_building_choice();
+        house.ai_production_mut().clear_building_choice();
     }
     // `0x0042EB20` with the product type's index (`+0xDF8`): the node or none.
     let node = rules
@@ -524,7 +993,7 @@ pub(crate) fn exit_building(
             if let Some(index) = node
                 && let Some(house) = sim.houses.get_mut(&owner)
             {
-                house.base_plan.count_placement_failure(
+                house.base_plan_mut().count_placement_failure(
                     index,
                     game_mode_nonzero,
                     rules.general.maximum_building_placement_failures,
@@ -533,15 +1002,15 @@ pub(crate) fn exit_building(
             BuildingExit::TryLater
         }
         Flush::Blocked => {
-            forget_failed_site(sim, rules, owner, node, site);
+            forget_failed_site(&mut sim.houses, rules, owner, node, site);
             BuildingExit::Failed
         }
         Flush::Clear => {
             if !place_building(sim, rules, owner, ty, product, site, registry, effects) {
-                forget_failed_site(sim, rules, owner, node, site);
+                forget_failed_site(&mut sim.houses, rules, owner, node, site);
                 return BuildingExit::Failed;
             }
-            carry_wall_tower_site(sim, rules, owner, ty, node, site);
+            carry_wall_tower_site(&mut sim.houses, rules, owner, ty, node, site);
             log::info!(
                 "{} placed {} at ({}, {})",
                 sim.interner.resolve(owner),
@@ -570,7 +1039,7 @@ fn building_site(
     registry: Option<&OverlayTypeRegistry>,
 ) -> (i16, i16) {
     let node_cell = node
-        .map(|index| plan_node(sim, owner, index).packed_cell)
+        .map(|index| plan_node(&sim.houses, owner, index).packed_cell)
         .filter(|&packed| packed != 0);
     if let Some(packed) = node_cell {
         let cell = unpack_base_plan_cell(packed);
@@ -582,8 +1051,10 @@ fn building_site(
     if let Some(index) = node
         && let Some(house) = sim.houses.get_mut(&owner)
     {
-        house.base_plan.nodes[index].packed_cell =
-            pack_base_plan_cell(i32::from(site.0), i32::from(site.1));
+        house.base_plan_mut().assign_site(
+            index,
+            pack_base_plan_cell(i32::from(site.0), i32::from(site.1)),
+        );
     }
     site
 }
@@ -610,7 +1081,7 @@ fn place_building(
     registry: Option<&OverlayTypeRegistry>,
     effects: FrameEffects<'_>,
 ) -> bool {
-    if !can_place_building_at(sim, rules, registry, ty, site, Some(owner), None) {
+    if !can_place_building_at(sim, rules, registry, ty, site, Some(owner), None, None) {
         return false;
     }
     let (Ok(rx), Ok(ry)) = (u16::try_from(site.0), u16::try_from(site.1)) else {
@@ -638,6 +1109,14 @@ fn place_building(
         {
             return false;
         }
+        // NPSE 2.0 building Exit_Object C2F1A3 releases only after
+        // Unlimbo succeeds, including a wall that deleted its own object.
+        #[cfg(feature = "npatch")]
+        if let Some(house) = sim.houses.get_mut(&owner) {
+            house
+                .ai_production_mut()
+                .release_parallel(ObjectCategory::Building, false);
+        }
         crate::sim::production::autofill_walls(sim, rules, registry, ty, (rx, ry), owner, effects);
         return true;
     }
@@ -657,16 +1136,29 @@ fn place_building(
     {
         return false;
     }
-    sim.mission_spawned_entities = true;
+    // NPSE 2.0 building Exit_Object C2F1A3 precedes slave handoff and
+    // mission callbacks after successful Unlimbo; failed placement retains it.
+    #[cfg(feature = "npatch")]
+    if let Some(house) = sim.houses.get_mut(&owner) {
+        house
+            .ai_production_mut()
+            .release_parallel(ObjectCategory::Building, false);
+    }
+    sim.note_mission_spawned_entities();
     sim.slave_manager_hand_off(product, rules, effects);
     // The choice clear at `0x0044531F` compares the product with the choice
     // the exit cleared at its start; nothing in between sets it.
-    let now = sim.session.binary_frame;
+    let now = sim.session.binary_frame();
     if let Some(building) = sim.substrate.entities.get_mut(product)
         && building.mission.current() == MissionId::NONE
         && building.mission.queued() == MissionId::from_known(MissionType::Construction)
     {
         crate::sim::mission::authority::commence_entity_mission(building, now);
+    }
+    // Ares BuildingClass_KickOutUnit_Firewall (10014A50, hook 0x445355):
+    // a firestorm wall section fills the gaps to the sections it links to.
+    if rules.ares_form() {
+        sim.ares_build_lines(product, (rx, ry), owner, rules, registry, effects);
     }
     true
 }
@@ -675,7 +1167,7 @@ fn place_building(
 /// (`+0x1571`, `+0x16B7`) is removed; any other node's site is forgotten by
 /// every node that holds it. Without a node nothing changes.
 fn forget_failed_site(
-    sim: &mut Simulation,
+    houses: &mut Houses,
     rules: &RuleSet,
     owner: InternedId,
     node: Option<usize>,
@@ -684,15 +1176,15 @@ fn forget_failed_site(
     let Some(index) = node else {
         return;
     };
-    let node_type = plan_node(sim, owner, index).type_or_control;
+    let node_type = plan_node(houses, owner, index).type_or_control;
     if rules
         .building_type_at(node_type)
         .is_some_and(|ty| ty.wall || ty.gate)
     {
-        remove_node(sim, owner, index);
-    } else if let Some(house) = sim.houses.get_mut(&owner) {
+        remove_node(houses, owner, index);
+    } else if let Some(house) = houses.get_mut(&owner) {
         house
-            .base_plan
+            .base_plan_mut()
             .clear_failed_site(pack_base_plan_cell(i32::from(site.0), i32::from(site.1)));
     }
 }
@@ -700,7 +1192,7 @@ fn forget_failed_site(
 /// `0x0044540D..0x004454D4`: a placed `WallTower=` building hands its cell to
 /// the first base defense node (`+0x1706`) after its own.
 fn carry_wall_tower_site(
-    sim: &mut Simulation,
+    houses: &mut Houses,
     rules: &RuleSet,
     owner: InternedId,
     ty: &ObjectType,
@@ -719,21 +1211,26 @@ fn carry_wall_tower_site(
     let (true, Some(index)) = (wall_tower, node) else {
         return;
     };
-    let Some(house) = sim.houses.get_mut(&owner) else {
+    let Some(house) = houses.get_mut(&owner) else {
         return;
     };
     let defense = house
-        .base_plan
-        .nodes
-        .iter_mut()
+        .base_plan()
+        .nodes()
+        .iter()
+        .enumerate()
         .skip(index + 1)
-        .find(|next| {
+        .find(|(_, next)| {
             rules
                 .building_type_at(next.type_or_control)
                 .is_some_and(|ty| ty.is_base_defense)
-        });
+        })
+        .map(|(defense, _)| defense);
     if let Some(defense) = defense {
-        defense.packed_cell = pack_base_plan_cell(i32::from(site.0), i32::from(site.1));
+        house.base_plan_mut().assign_site(
+            defense,
+            pack_base_plan_cell(i32::from(site.0), i32::from(site.1)),
+        );
     }
 }
 
@@ -741,22 +1238,31 @@ fn carry_wall_tower_site(
 /// `factory_rtti`: the house's choice of that kind, unchecked: the building
 /// choice (`+0x564C`, `0x004FBDDC`) or a choice of `sim::ai_unit_choice`
 /// (`+0x5650`, `+0x5654`, `+0x5658`).
+///
+/// `producer_naval` is the producing building's `Naval=`. NPSE's hook for this
+/// read (`0x4FBDAF -> 0xC2F130`) takes the vehicle choice from `+0x16130`
+/// while the producer is naval and from `+0x5650` otherwise, so a shipyard
+/// stops reading a war factory's pick; an ordinary build has no naval slot and
+/// always reads `+0x5650`.
 pub(crate) fn suggest_new_object<'r>(
     sim: &Simulation,
     rules: &'r RuleSet,
     owner: InternedId,
     factory_rtti: i32,
+    producer_naval: bool,
 ) -> Option<&'r ObjectType> {
     let house = sim.houses.get(&owner)?;
     let unit_choice = |kind: UnitChoiceKind| {
-        rules.type_array_at(kind.category(), house.ai_unit_choices.get(kind))
+        rules.type_array_at(kind.category(), house.ai_unit_choices().get(kind))
     };
-    // Steam3e81a617..08600, two-level tables4FBE0C/4FBDF8. This one
+    // Steam gamemd, two-level tables4FBE0C/4FBDF8. This one
     // consumer and factory accounting accept object/type aliases, unlike
     // FindFactory's exact class comparison. Other RTTIs return null.
     match FactoryType::for_production_rtti(factory_rtti)? {
-        FactoryType::BuildingType => rules.building_type_at(house.ai_production.building_choice),
-        FactoryType::UnitType => unit_choice(UnitChoiceKind::Unit),
+        FactoryType::BuildingType => rules.building_type_at(house.ai_production().building_choice),
+        FactoryType::UnitType => {
+            unit_choice(UnitChoiceKind::of(ObjectCategory::Vehicle, producer_naval)?)
+        }
         FactoryType::InfantryType => unit_choice(UnitChoiceKind::Infantry),
         FactoryType::AircraftType => unit_choice(UnitChoiceKind::Aircraft),
     }
@@ -774,11 +1280,11 @@ pub(crate) fn find_node(
     wanted: i32,
     registry: Option<&OverlayTypeRegistry>,
 ) -> Option<usize> {
-    let game_mode_nonzero = sim.session.game_mode_nonzero;
+    let game_mode_nonzero = sim.session.game_mode_nonzero();
     let mut index = 0;
     // The count is re-read every step (`0x0042EBAE`).
-    while index < sim.houses.get(&owner)?.base_plan.nodes.len() {
-        let node = plan_node(sim, owner, index);
+    while index < sim.houses.get(&owner)?.base_plan().nodes().len() {
+        let node = plan_node(&sim.houses, owner, index);
         if wanted == -1 {
             if !node_satisfied(sim, rules, owner, &node, registry) {
                 if !game_mode_nonzero || !node.filled {
@@ -786,7 +1292,7 @@ pub(crate) fn find_node(
                 }
                 if node_may_replan(sim, rules, owner, &node) {
                     if let Some(house) = sim.houses.get_mut(&owner) {
-                        house.base_plan.nodes[index].packed_cell = 0;
+                        house.base_plan_mut().assign_site(index, 0);
                     }
                     return Some(index);
                 }
@@ -810,7 +1316,7 @@ pub(crate) fn node_satisfied(
     node: &BasePlanNode,
     registry: Option<&OverlayTypeRegistry>,
 ) -> bool {
-    if node_building(sim, owner, node).is_some() {
+    if node_building(&sim.substrate, owner, node).is_some() {
         return true;
     }
     let Some(ty) = rules.building_type_at(node.type_or_control) else {
@@ -843,7 +1349,7 @@ pub(crate) fn node_satisfied(
 /// top-left cell is the node's cell. The `PowersUpBuilding=` arm is dormant
 /// (module residual).
 pub(crate) fn node_building(
-    sim: &Simulation,
+    substrate: &ObjectSubstrate,
     owner: InternedId,
     node: &BasePlanNode,
 ) -> Option<u64> {
@@ -851,11 +1357,10 @@ pub(crate) fn node_building(
         return None;
     }
     let (rx, ry) = map_cell(node.packed_cell)?;
-    let id = sim
-        .substrate
+    let id = substrate
         .occupancy
         .first_building_on_layer(rx, ry, MovementLayer::Ground)?;
-    let building = sim.substrate.entities.get(id)?;
+    let building = substrate.entities.get(id)?;
     ((building.position.rx(), building.position.ry()) == (rx, ry)
         && building.owner() == owner
         && building.type_facts.base_plan_type_index() == node.type_or_control)
@@ -888,10 +1393,10 @@ fn node_may_replan(
         // The Recalc preflight validated this row before the plan existed.
         return rules
             .ai_slave_miner_number
-            .get(house.difficulty.table_index())
-            .is_some_and(|&allowed| house.tracking.resource_gatherers() < allowed);
+            .get(house.difficulty().table_index())
+            .is_some_and(|&allowed| house.tracking().resource_gatherers() < allowed);
     }
-    if !sim.session.game_mode_nonzero {
+    if !sim.session.game_mode_nonzero() {
         return true;
     }
     // `TechnoTypeClass::GetWeapon(0) @ 0x007177C0`: the Primary slot.
@@ -923,32 +1428,38 @@ fn node_may_replan(
         return true;
     }
     house
-        .strategy_emergency
-        .last_building_attack_frame
+        .strategy_emergency()
+        .last_building_attack_frame()
         .wrapping_add(rules.general.ai_restrict_replace_time)
-        <= sim.session.binary_frame as i32
+        <= sim.session.binary_frame() as i32
 }
 
-fn plan_node(sim: &Simulation, owner: InternedId, index: usize) -> BasePlanNode {
-    sim.houses[&owner].base_plan.nodes[index]
+fn plan_node(houses: &Houses, owner: InternedId, index: usize) -> BasePlanNode {
+    houses[&owner].base_plan().nodes()[index]
 }
 
 /// `HouseClass::AI_BuildWalls @ 0x0050C340` for house `owner`'s node at
 /// `index`: walls the nearest `ProtectWithWall=` building before it
 /// ([`wall_nodes`]) with the house's wall type. Whether it wrote any; it
 /// makes no draw.
-fn build_walls(sim: &mut Simulation, rules: &RuleSet, owner: InternedId, index: usize) -> bool {
-    let Some(house) = sim.houses.get(&owner) else {
+fn build_walls(
+    interner: &StringInterner,
+    substrate: &ObjectSubstrate,
+    houses: &mut Houses,
+    rules: &RuleSet,
+    owner: InternedId,
+    index: usize,
+) -> bool {
+    let Some(house) = houses.get(&owner) else {
         return false;
     };
-    let wall = wall_type(rules, house.side_index);
-    let nodes = &house.base_plan.nodes;
+    let wall = wall_type(rules, house.side_index());
+    let nodes = house.base_plan().nodes();
     let walls = wall_nodes(nodes, index, wall, |at| {
-        let building = sim
-            .substrate
+        let building = substrate
             .entities
-            .get(node_building(sim, owner, &nodes[at])?)?;
-        let ty = sim.object_type(building.type_ref(), rules)?;
+            .get(node_building(substrate, owner, &nodes[at])?)?;
+        let ty = interner.object_type(building.type_ref(), rules)?;
         ty.protect_with_wall.then(|| {
             (
                 (building.position.rx() as i16, building.position.ry() as i16),
@@ -959,9 +1470,9 @@ fn build_walls(sim: &mut Simulation, rules: &RuleSet, owner: InternedId, index: 
     let Some((at, walls)) = walls else {
         return false;
     };
-    if let Some(house) = sim.houses.get_mut(&owner) {
+    if let Some(house) = houses.get_mut(&owner) {
         for node in walls {
-            house.base_plan.insert_after(at, node);
+            house.base_plan_mut().insert_after(at, node);
         }
     }
     true
@@ -970,7 +1481,7 @@ fn build_walls(sim: &mut Simulation, rules: &RuleSet, owner: InternedId, index: 
 /// `0x0050C346..0x0050C39D`: the first `[AI] ConcreteWalls=` type planned
 /// for the side, as its array index; -1 without one, which then inserts `-1`
 /// nodes as native does.
-fn wall_type(rules: &RuleSet, side_index: u8) -> i32 {
+fn wall_type(rules: &RuleSet, side_index: i32) -> i32 {
     rules
         .concrete_wall_types
         .iter()
@@ -1027,9 +1538,9 @@ fn wall_nodes(
 
 /// Removes house `owner`'s node `index`
 /// ([`crate::sim::base_plan::BasePlanState::remove`]).
-fn remove_node(sim: &mut Simulation, owner: InternedId, index: usize) {
-    if let Some(house) = sim.houses.get_mut(&owner) {
-        house.base_plan.remove(index);
+fn remove_node(houses: &mut Houses, owner: InternedId, index: usize) {
+    if let Some(house) = houses.get_mut(&owner) {
+        house.base_plan_mut().remove(index);
     }
 }
 
@@ -1047,6 +1558,10 @@ fn map_cell_offset(rx: u16, ry: u16, dx: i32, dy: i32) -> Option<(u16, u16)> {
     Some((x, y))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "ai_base_building_tests.rs"]
 mod tests;
+
+#[cfg(all(test, tests_sim_a_b))]
+#[path = "ai_base_perimeter_tests.rs"]
+mod perimeter_tests;

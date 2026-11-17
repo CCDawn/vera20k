@@ -43,9 +43,6 @@ fn slice6_rules() -> RuleSet {
     let art = IniFile::from_str(crate::rules::retail_ini_fixture::GI_ART_EXCERPT);
     let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-    );
     rules
 }
 
@@ -77,7 +74,9 @@ fn unit(owner: &str, type_id: &str, cx: u16, cy: u16, cat: EntityCategory) -> Ma
         mission: None,
         recruitable_a: true,
         recruitable_b: true,
-        structure_upgrades: [None, None, None],
+        group: -1,
+        follows: None,
+        structure_columns: Default::default(),
         structure_ai_sellable: false,
         structure_ai_repairable: false,
         structure_online: true,
@@ -371,7 +370,81 @@ fn unit(owner: &str, type_id: &str, cx: u16, cy: u16, cat: EntityCategory) -> Ma
 // feeding the hasher that absent policy gave the previous value in the same
 // test binary, with every tripwire above green. Control removed.
 // Previous: 0x5788_A215_EFC5_0407.
-const SLICE6_BASELINE_HASH: u64 = 0x000C_DEC1_A4D5_BC42;
+// Snapshot 443 hashes the exact session mode, mode class, network MaxAhead
+// and map start header in place of the mode-nonzero bool. Hash composition
+// only: a temporary control hashing the bool gave the previous value in the
+// same test binary, with every tripwire above green. Control removed.
+// Previous: 0x000C_DEC1_A4D5_BC42.
+// Snapshot 449 hashes the Techno disguise firing blink timer (+1EC/+1F4,
+// #2183), which every entity carries. Hash composition only: a temporary
+// control on #2183's merge without that hash gave the previous value, with
+// every tripwire above green. Control removed.
+// Previous: 0xDE7B_17EE_FC74_D0AF.
+// Unit Is_Ready_To_Commence's moving defer (`0x007442C2..0x00744327`) now
+// reads GetHeight: the tank's Attack stays queued behind its Move while it
+// drives (pinned in the loop), so its MissionCom differs. All three RNG
+// streams and the per-frame replay are unchanged. Previous:
+// 0xF35B_3382_2DEF_1F00.
+// #2543 removed the entity hash's determines_waypoint_edge input with the
+// frozen type fact it read; every object here hashed it as false. Hash
+// composition only: a temporary control restoring that false gave the
+// previous value, with every tripwire above green. Control removed.
+// Previous: 0x51BE_2569_5006_2383.
+// 2026-10-24 shared ammo/reload: entity hashing now includes count
+// presence, signed unlimited ammo and the raw constructor reload clock.
+// Against raw c753af366, all 17 recorded non-hash observations, RNG
+// draws/caller sequences and the other 12 final hash domains matched
+// after the new zero clock; backtrace line shifts mapped to unchanged
+// source. This remains a Rust regression pin, not a native game golden.
+// Previous: 0x619E_E645_0B3E_881C.
+// Hash composition includes constructor planning registration and the shared ammo reload clock.
+// The native-speed migration (60da53f9c) hashes binary64 Foot/Drive fractions.
+// A temporary projection to the old fixed fields recovers the previous pin,
+// including Stop's rounded fixed0.3; gameplay and absolute RNG checks hold.
+// #3099 adds the permanent-stealth grant byte for every entity, false here.
+// Omitting only that hash fold recovers 0x5725_6E95_8F9E_04F8; the unchanged
+// replay, gameplay and absolute RNG assertions pass with either composition.
+// #3234 removed the entity hash's sensor deposit, a None byte for every object
+// here. It sat in the same run of zero bytes as that grant byte, so the pin
+// returns to the value above. Hash composition only: a temporary control
+// restoring the byte gave the previous value, with every tripwire above green.
+// Control removed. Previous: 0x00C5_304C_C361_38CE.
+// The dynamic terrain cells now fold without their presentation-only tile
+// variant, render offset and radar colours (tag v2): hash composition only.
+// A temporary control restoring the v1 fold gave the previous value, with
+// every tripwire above green. Control removed. Previous: 0x5725_6E95_8F9E_04F8.
+// #3710 folds the game options' room bans (all off here): hash composition
+// only. A temporary control omitting that fold gave the previous value, with
+// every tripwire above green. Control removed. Previous: 0xD3E2_D02E_809A_1CCD.
+// An Ares game also folds two retained Ares states for every actor here:
+// AttachEffectClass::Update10058E00 (TechnoClass_Update hook 0x6F9E50 ->
+// 1004B320) settles the type-effect state at Disabled on each actor's first
+// update, since no type sets AttachEffect.Duration, and RecalculateStats
+// 100460A0's attached-cloak byte folds even while false. Hash composition
+// only: a temporary control skipping just those two folds in an Ares game
+// gave the stock value, every per-frame replay diagnostic field matched
+// the stock game's, and every tripwire above stayed green. Control removed.
+// An Ares game now also folds each Unit's TechnoExt AltOccupation (hooks
+// 0x7441B6/0x744216): hash composition only. A temporary control skipping
+// that fold gave the previous value, with every tripwire above green.
+// Control removed. Previous: 0xF21F_9A9D_57BE_D7E7.
+// Both games now fold each entity's UpdateVisceroid direction (UnitClass+0x6D4,
+// `idle_wander`): hash composition only. A temporary control skipping that fold
+// gave the previous values in both games. Control removed. Previous:
+// 0x5171_FBD3_06C4_D828 (Ares), 0xD8C3_5827_8CA8_5375 (stock).
+// An Ares game no longer folds RecalculateStats100460A0's attached-cloak
+// byte while it is false: the byte moved into the object's Ares part, which a
+// game without Ares never writes, so the fold asks first. Hash composition
+// only, in an Ares game alone: the stock value above is unchanged, and the
+// tripwires below stayed green in both games.
+// Previous Ares: 0x7D9F_30F7_1CBF_1016.
+fn slice6_baseline_hash(ares: bool) -> u64 {
+    if ares {
+        0x949A_7C55_B2F8_4F0B
+    } else {
+        0xCBF9_C392_848C_13BA
+    }
+}
 
 #[test]
 fn replay_hash_stable_through_slice6() {
@@ -451,9 +524,9 @@ fn replay_hash_stable_through_slice6() {
 
     let mut log = ReplayLog::new(ReplayHeader {
         version: 1,
-        pixel_conversion_bounds: sim.session.pixel_conversion_bounds,
+        pixel_conversion_bounds: sim.session.pixel_conversion_bounds(),
         tick_hz: 15,
-        seed: sim.session.seed,
+        seed: sim.session.seed(),
         map_name: "slice6_retask".to_string(),
         rules_hash: rules.simulation_config_hash(),
     });
@@ -532,21 +605,26 @@ fn replay_hash_stable_through_slice6() {
                 "({rx}, {ry}) beyond the fixture's M60 Range=5"
             );
 
+            // Unit Is_Ready_To_Commence's moving defer (`0x007442C2..
+            // 0x00744327`): the ForceAttackCell (frame 5) and Attack (frame 7)
+            // orders queue Attack while the tank drives the segment it had
+            // committed toward its Move destination, on Move, with no `+0xB8`
+            // bypass. So Attack stays queued, behind the Move committed at
+            // frame 1, and Stop keeps it there.
             let tank = sim.substrate.entities.get(1).expect("retasked tank lives");
             assert_eq!(
                 tank.mission.current(),
+                MissionId::from_known(MissionType::Move)
+            );
+            assert_eq!(
+                tank.mission.queued(),
                 MissionId::from_known(MissionType::Attack)
             );
-            assert_eq!(tank.mission.queued(), MissionId::NONE);
-            assert_eq!(tank.mission.mission_start_frame(), 5);
-            assert_eq!(tank.mission.ai_counter(), tick as u32 - 4);
-            assert_eq!(
-                (
-                    tank.mission.dispatch_timer().start_frame(),
-                    tank.mission.dispatch_timer().delay()
-                ),
-                (5, 14),
-                "Stop retains Attack's dispatch timer and counter"
+            assert_eq!(tank.mission.mission_start_frame(), 1);
+            assert_eq!(tank.mission.movement_bypass_latch(), 0);
+            assert!(
+                !sim.mission_ready_to_commence(1, &rules),
+                "the queued Attack waits for the drive to stop"
             );
             let drive = tank
                 .locomotor
@@ -577,7 +655,7 @@ fn replay_hash_stable_through_slice6() {
             // 741C4F..741C78): the stale suffix behind it is never read.
             assert!(
                 tank.navigation
-                    .path_replay
+                    .path_replay()
                     .remaining_directions()
                     .is_empty(),
                 "Stop clears the live path head"
@@ -640,8 +718,8 @@ fn replay_hash_stable_through_slice6() {
     super::global_parity_harness_tests::print_replay_summary("slice6", &sim);
     assert_eq!(
         [1, 2, 3].map(|id| sim.substrate.entities.get(id).unwrap().mission.ai_counter()),
-        [11, 16, 7],
-        "Stop retains Attack; Unit/Infantry Commence precedes the Techno counter increment"
+        [15, 16, 7],
+        "the tank's Move counts every visit since frame 1; Unit/Infantry Commence precedes the Techno counter increment"
     );
     // Original Unit736473 / Infantry51BC51 Commence clears C4 before
     // Techno6FA64E increments it; the mission_counter corpus pins that owner.
@@ -669,7 +747,7 @@ fn replay_hash_stable_through_slice6() {
     );
     assert_eq!(
         sim.state_hash(),
-        SLICE6_BASELINE_HASH,
+        slice6_baseline_hash(rules.ares()),
         "scripted-retask state drifted: establish the changed behavior, RNG producer, or hash composition before updating"
     );
 }

@@ -1,7 +1,11 @@
 # Process audio catalog ownership
 
-`ProcessAssets` selects immutable `AudioDefinitions` and at most one sample
-index when it first acquires retail assets. `NativeRulesProcessOwner` binds sound
+`ProcessAssets` selects immutable `AudioDefinitions` and one sample lookup
+owner when it first acquires retail assets. A game without `ares.mix` selects one
+BAG pair; a game that ships `ares.mix` (`AssetManager::ships_ares`) admits the
+ordered multi-BAG catalog described in
+[the bounded Ares evidence](rules_oracle/ares_audio_bags.md).
+`NativeRulesProcessOwner` binds sound
 references through the exact same `Arc<SoundRegistry>` as app playback. Native
 Rules remains resident while the asset manager is leased. Map success, failure,
 cancellation and replacement retain the catalogs; `MatchAudioState` still owns
@@ -16,8 +20,6 @@ later map cannot replace it. A lost manager lease never resets live Rules.
 
 ## Native evidence and bounds
 
-Original binary SHA-256:
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
 These lifecycle/source decisions are established from original instructions,
 not from executing Windows startup or interpreting Ghidra labels:
 
@@ -37,7 +39,10 @@ not from executing Windows startup or interpreting Ghidra labels:
   `52F6DA`. Disabled/device-failure paths skip index construction but join
   `406CF8 -> 403ED0`, which sets the factory-ready flag `87E2A0` at `403F1B`.
   Definitions still exist; `4064A0` skips admitted sample slots if the
-  AudioIndex pointer `87E294` is null. Rust lexical names are not admitted slots.
+  AudioIndex pointer `87E294` is null. With an index, a name `4015C0` misses
+  clears the entry's `+0x0C` and `405190` refuses it (`4051B6`); Rust admits
+  names the same way only when the process selected an index, and keeps them
+  lexical otherwise.
 - `406C43` probes AUDIOMD.MIX and mounts either it (`406CAB`) or AUDIO.MIX
   (`406CCF`). It constructs **one** index (`4011C0`) at `406CE8` with basename
   `audio`. This is archive fallback, not per-sample fallback.

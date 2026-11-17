@@ -1,5 +1,5 @@
 //! House50D6D0, called by TAction128/6E1A40: all owned ground Foots to a
-//! waypoint's placement sweep. Original Steam gamemd SHA3e81a617..08600;
+//! waypoint's placement sweep. Original Steam gamemd;
 //! instruction bodies via tools.native_inspect. Existing cell/entry/sub-cell
 //! and Chrono owners retain their arithmetic, RNG, occupancy and cleanup.
 
@@ -39,12 +39,19 @@ impl Simulation {
             let Some(actor) = self.substrate.entities.get(id) else {
                 continue;
             };
+            // 0x50D75D..0x50D78B and 0x50D871..0x50D89D: owner, class, then
+            // a NULL Transporter (+0x11C). Garrison occupants and cargo that
+            // CargoClass::AddPassenger loaded (a building's, a reinforcement's
+            // or a paradrop plane's) are warped in Limbo unless an earlier
+            // transport left it set: neither WarpTo body (0x4DF7F0, 0x522FE0)
+            // tests InLimbo. A soldier an aircraft unloaded keeps it until
+            // that aircraft dies (`PassengerRole::transporter`).
             if actor.owner() != house
-                || actor.passenger_role.inside_transport().is_some()
                 || !matches!(
                     actor.category(),
                     EntityCategory::Unit | EntityCategory::Infantry
                 )
+                || actor.passenger_role.transporter().is_some()
             {
                 continue;
             }
@@ -82,9 +89,16 @@ impl Simulation {
                 //50D93B passes priority0/false/false to original481180.
                 //Its existing owner pays any sub-cell RNG, even if WarpTo
                 //subsequently refuses. A null result is the zero coordinate.
-                coord = self
-                    .place_infantry_spot_in_cell(rules, identity, coord)?
-                    .unwrap_or(DriveCoord { x: 0, y: 0, z: 0 });
+                coord = Self::place_infantry_spot_in_cell(
+                    &self.interner,
+                    &mut self.scenario_rng,
+                    &self.substrate,
+                    &self.resolved_terrain,
+                    rules,
+                    identity,
+                    coord,
+                )?
+                .unwrap_or(DriveCoord { x: 0, y: 0, z: 0 });
             }
             if self.foot_chrono_warp_to(id, coord, rules, registry, effects)? {
                 offset += 1;

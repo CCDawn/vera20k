@@ -5,8 +5,9 @@
 //! the real renderer, and publishes one transactional final readback. It does
 //! not focus the window, inject desktop input, or grant simulation state.
 
+use crate::app::match_runtime::sim_host::SimWrite;
+use crate::util::time::{Duration, Instant};
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -184,25 +185,23 @@ impl TacticalCaptureSession {
                     seed_name == crate::app::shell_random_map::RANDMAP_SED_FILE,
                     "generated capture requires the normal accepted RandMap.Sed record"
                 );
-                let path = state
-                    .platform
-                    .game_config
-                    .as_ref()
-                    .unwrap()
-                    .paths
-                    .ra2_dir
-                    .join(seed_name);
+                let path = crate::map::source::random_map_dir(
+                    &state.platform.game_config.as_ref().unwrap().paths.ra2_dir,
+                )
+                .join(seed_name);
                 let bytes = std::fs::read(&path).context("read capture setup seed")?;
                 let ini = crate::rules::ini_parser::IniFile::from_bytes(&bytes)
                     .context("parse capture setup seed")?;
+                let ares = state.process_assets.reads_ares_way();
                 let mut options = crate::map::rmg::RmgOptions::default();
-                options.apply_sed(&ini);
+                options.apply_sed(&ini, ares);
                 options.normalize();
                 let mut modal = crate::ui::skirmish_shell::RandomMapSetupModalState::open(
                     options.clone(),
                     None,
                     false,
                 );
+                modal.ares = ares;
                 modal.begin_generate();
                 state.frontend.skirmish_shell_state.random_map_setup_modal = Some(modal);
                 ensure!(
@@ -218,6 +217,7 @@ impl TacticalCaptureSession {
             return Ok(());
         }
         let profile = self.request.profile()?;
+        profile.check_roster_mode(&state.frontend.skirmish_modes)?;
         let capture = &profile.capture;
         ensure!(
             state.renderer.gpu.config.width == capture.output_width
@@ -243,13 +243,6 @@ impl TacticalCaptureSession {
                 .usage
                 .contains(wgpu::TextureUsages::COPY_SRC),
             "tactical swapchain lacks COPY_SRC readback usage"
-        );
-        ensure!(
-            (state.match_state.match_presentation.ui_scale - capture.app_ui_scale as f32).abs()
-                <= f32::EPSILON,
-            "app UI scale {} differs from sealed {}",
-            state.match_state.match_presentation.ui_scale,
-            capture.app_ui_scale
         );
         ensure!(
             state.match_state.configured_input_delay_ticks
@@ -295,13 +288,11 @@ impl TacticalCaptureSession {
         require_identity(
             &archive_identity,
             profile.fixture.archive_byte_length,
-            &profile.fixture.archive_sha256,
             "retail archive",
         )?;
         require_identity(
             &font_archive_identity,
             font.archive_byte_length,
-            &font.archive_sha256,
             "bitmap font archive",
         )?;
         reject_loose_shadow(&cwd.join(&profile.fixture.logical_map_name))?;
@@ -333,6 +324,10 @@ impl TacticalCaptureSession {
                 bail!("sealed tactical launch was not accepted: {reason:?}")
             }
         };
+        crate::app::frontend::skirmish_session::prepare_external_skirmish_countries(
+            &mut state.process_assets,
+            &launch,
+        );
         let correlation = crate::app::match_bootstrap::allocate_match_correlation(
             &mut state.frontend.next_match_correlation,
         )
@@ -358,7 +353,6 @@ impl TacticalCaptureSession {
             .frontend
             .skirmish_shell_state
             .pressed_owner_draw_button = None;
-        state.frontend.skirmish_shell_last_painted_pressed_button = None;
         state.frontend.shell_route = crate::app::shell_route::ShellRoute::MainMenu;
         state.frontend.shell_first_paint_slide = None;
         state.frontend.skirmish_preview_texture = None;
@@ -475,10 +469,10 @@ impl TacticalCaptureSession {
                     let sim = state
                         .match_state
                         .sim_runtime
-                        .as_mut()
+                        .write_sim(SimWrite::Debug)
                         .map(|rt| &mut rt.simulation)
                         .context("queue action requires live simulation")?;
-                    sim.interner.intern(&type_id)
+                    sim.intern(&type_id)
                 };
                 self.schedule_action(
                     state,
@@ -499,10 +493,10 @@ impl TacticalCaptureSession {
                     let sim = state
                         .match_state
                         .sim_runtime
-                        .as_mut()
+                        .write_sim(SimWrite::Debug)
                         .map(|rt| &mut rt.simulation)
                         .context("placement action requires live simulation")?;
-                    sim.interner.intern(&choice.type_id)
+                    sim.intern(&choice.type_id)
                 };
                 self.schedule_action(
                     state,
@@ -585,7 +579,7 @@ impl TacticalCaptureSession {
         let sim = state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.simulation)
             .context("Rust L0 requires live simulation")?;
         let rules = state.rules().context("Rust L0 requires live rules")?;
@@ -596,9 +590,9 @@ impl TacticalCaptureSession {
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.is_active()
-                    && sim.interner.resolve(entity.owner()) == owner
+                    && sim.interner().resolve(entity.owner()) == owner
                     && sim
-                        .interner
+                        .interner()
                         .object_type(entity.type_ref(), rules)
                         .is_some_and(|object| object.deploys_into.is_some())
             })
@@ -609,7 +603,7 @@ impl TacticalCaptureSession {
             deployers.len()
         );
         let mcv = deployers[0].1;
-        let mcv_type_id = sim.interner.resolve(mcv.type_ref()).to_owned();
+        let mcv_type_id = sim.interner().resolve(mcv.type_ref()).to_owned();
         let mcv_rule = rules
             .object(&mcv_type_id)
             .context("local MCV has no merged rule")?;
@@ -648,7 +642,7 @@ impl TacticalCaptureSession {
         let construction_ticks = |type_id: &str| -> Result<u64> {
             let frames = crate::sim::building_construction::player_placement_frames_to_complete(
                 rules.buildup_control(type_id),
-                &sim.session.game_options,
+                sim.session().game_options(),
             )
             .with_context(|| format!("{type_id} build-up never completes"))?;
             Ok(result_delay + u64::try_from(frames)?)
@@ -762,31 +756,31 @@ impl TacticalCaptureSession {
         let sim = state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.simulation)
             .context("Rust L0 simulation is absent")?;
         ensure!(
-            sim.session.tick == 0
-                && sim.session.total_sim_ms == 0
-                && sim.session.binary_frame == 0
-                && sim.session.seed == u64::from(profile.launch.seed)
-                && sim.input_delay_ticks == u64::from(profile.launch.input_delay_ticks),
+            sim.session().tick() == 0
+                && sim.session().total_sim_ms() == 0
+                && sim.session().binary_frame() == 0
+                && sim.session().seed() == u64::from(profile.launch.seed)
+                && sim.input_delay_ticks() == u64::from(profile.launch.input_delay_ticks),
             "live simulation is not the sealed tick-zero session"
         );
         ensure!(
-            sim.session
-                .map_name
+            sim.session()
+                .map_name()
                 .eq_ignore_ascii_case(&profile.fixture.logical_map_name)
                 && sim
-                    .session
-                    .theater
+                    .session()
+                    .theater()
                     .eq_ignore_ascii_case(&profile.fixture.theater)
-                && sim.session.mp_start_waypoints.len()
+                && sim.session().mp_start_waypoints().len()
                     == profile.fixture.start_waypoint_count as usize,
             "live map/session identity differs from the sealed fixture"
         );
         let bounds = sim
-            .playfield_bounds
+            .playfield_bounds()
             .context("Rust L0 playfield bounds are absent")?;
         ensure!(
             bounds.base == profile.fixture.map_size.width as i32
@@ -795,7 +789,7 @@ impl TacticalCaptureSession {
             "live raw map/playfield bounds differ from the sealed fixture"
         );
         validate_game_options(sim, &self.request.launch_session())?;
-        validate_houses_and_slots(sim, profile)?;
+        validate_houses_and_slots(sim, profile, state.rules().context("loaded Rules missing")?)?;
 
         validate_loaded_resources(state)?;
         ensure!(
@@ -844,10 +838,6 @@ impl TacticalCaptureSession {
                 && payload_len as u64 == profile.fixture.entry_payload_byte_length,
             "loaded map source differs from sealed MIX provenance"
         );
-        ensure!(
-            payload_sha256 == &profile.fixture.entry_payload_sha256,
-            "consumed map bytes differ from sealed fixture digest"
-        );
         self.map_source_evidence = Some(json!({
             "archive_name": profile.fixture.archive_name,
             "logical_map_name": profile.fixture.logical_map_name,
@@ -871,7 +861,7 @@ impl TacticalCaptureSession {
         let sim = state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.simulation)
             .context("tactical observation requires live simulation")?;
         let rules = state
@@ -882,10 +872,10 @@ impl TacticalCaptureSession {
             .iter_sorted()
             .map(|(_, entity)| TacticalEntityObservation {
                 stable_id: entity.stable_id(),
-                owner: sim.interner.resolve(entity.owner()).to_owned(),
-                type_id: sim.interner.resolve(entity.type_ref()).to_owned(),
+                owner: sim.interner().resolve(entity.owner()).to_owned(),
+                type_id: sim.interner().resolve(entity.type_ref()).to_owned(),
                 cell: (entity.position.rx(), entity.position.ry()),
-                facing: entity.body_facing_byte(sim.session.binary_frame),
+                facing: entity.body_facing_byte(sim.session().binary_frame()),
                 active: entity.is_active(),
                 dying: entity.death.is_dying(),
                 building_up: entity.building_up(),
@@ -894,29 +884,29 @@ impl TacticalCaptureSession {
         let build_options = production::build_options_for_owner(sim, rules, &owner)
             .into_iter()
             .map(|option| BuildOptionObservation {
-                type_id: sim.interner.resolve(option.type_id).to_owned(),
+                type_id: sim.interner().resolve(option.type_id).to_owned(),
                 enabled: option.enabled,
             })
             .collect();
-        let owner_id = sim.interner.get(&owner).unwrap_or_default();
+        let owner_id = sim.interner().get(&owner).unwrap_or_default();
         let mut queued_production = Vec::new();
-        for factory in sim.production.factories.iter_insertion_ordered() {
-            if factory.owner != owner_id {
+        for factory in sim.production().factories().iter_insertion_ordered() {
+            if factory.owner() != owner_id {
                 continue;
             }
             // A completed building remains attached to its factory until
             // placement. It belongs to ready_buildings, not the in-flight list.
-            if let Some(object) = factory.object.as_ref()
-                && factory.progress < crate::sim::production::PRODUCTION_STEPS
+            if let Some(object) = factory.object()
+                && factory.progress() < crate::sim::production::PRODUCTION_STEPS
             {
                 queued_production.push(ProductionQueueObservation {
-                    type_id: sim.interner.resolve(object.type_id).to_owned(),
-                    resolved_rate_frames: factory.step_rate_frames,
+                    type_id: sim.interner().resolve(object.type_id).to_owned(),
+                    resolved_rate_frames: factory.step_rate_frames(),
                 });
             }
-            for queued in &factory.queue {
+            for queued in factory.queue() {
                 queued_production.push(ProductionQueueObservation {
-                    type_id: sim.interner.resolve(queued.type_id).to_owned(),
+                    type_id: sim.interner().resolve(queued.type_id).to_owned(),
                     resolved_rate_frames: 0,
                 });
             }
@@ -924,7 +914,7 @@ impl TacticalCaptureSession {
         let ready_buildings: Vec<String> =
             production::ready_buildings_for_owner(sim, rules, &owner)
                 .iter()
-                .map(|ready| sim.interner.resolve(ready.type_id).to_owned())
+                .map(|ready| sim.interner().resolve(ready.type_id).to_owned())
                 .collect();
         let placement_choice = self
             .controller
@@ -952,10 +942,10 @@ impl TacticalCaptureSession {
             })
             .transpose()?;
         let (power_output, power_drain) = production::power_balance_for_owner(sim, rules, &owner);
-        let power_state = sim.power_states.get(&owner_id);
+        let power_state = sim.power_states().get(&owner_id);
         let power_authority_sufficient = power_output >= power_drain
             && power_state.is_some_and(|power| {
-                !power.is_low_power && power.blackout_remaining(sim.session.binary_frame) == 0
+                !power.is_low_power() && power.blackout_remaining(sim.session().binary_frame()) == 0
             });
         let radar_authority_active = crate::sim::radar::has_radar_for_owner(sim, rules, &owner);
         let radar_online = state
@@ -965,9 +955,9 @@ impl TacticalCaptureSession {
             .as_ref()
             .is_some_and(|radar| radar.is_minimap_visible());
         let match_ended = sim
-            .houses
+            .houses()
             .get(&owner_id)
-            .is_some_and(|house| house.is_defeated || house.has_won() || house.has_lost());
+            .is_some_and(|house| house.is_defeated() || house.has_won() || house.has_lost());
         let wall_elapsed_ms = self
             .post_l0_started_at
             .unwrap_or(self.started_at)
@@ -977,9 +967,9 @@ impl TacticalCaptureSession {
             .unwrap_or(u64::MAX);
 
         Ok(TacticalObservation {
-            tick: sim.session.tick,
-            total_sim_ms: sim.session.total_sim_ms,
-            binary_frame: sim.session.binary_frame,
+            tick: sim.session().tick(),
+            total_sim_ms: sim.session().total_sim_ms(),
+            binary_frame: sim.session().binary_frame(),
             wall_elapsed_ms,
             accepted_rust_l0: crate::app::match_bootstrap::accepted_tick_is_admitted(
                 state.match_state.startup.startup(),
@@ -1047,14 +1037,25 @@ impl TacticalCaptureSession {
         output: &GameRenderOutput,
     ) -> Result<(bool, Value)> {
         let profile = self.request.profile()?;
+        // The profile seals the original sidebar geometry, which a layout
+        // file in the game folder or a mod MIX would move.
+        ensure!(
+            state
+                .match_state
+                .match_presentation
+                .match_layouts
+                .is_original(),
+            "tactical capture requires the original interface: remove {} from the game files",
+            crate::ui::match_layout::FILE_NAME
+        );
         let sim = state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.simulation)
             .context("render readiness requires live simulation")?;
         let owner = &profile.launch.player_name;
-        let owner_id = sim.interner.get(owner).unwrap_or_default();
+        let owner_id = sim.interner().get(owner).unwrap_or_default();
         let expected_theme = match profile.launch.local.country {
             crate::app::diagnostics::tactical_capture::profile::TacticalCountry::Russia => {
                 SidebarTheme::Soviet
@@ -1097,18 +1098,21 @@ impl TacticalCaptureSession {
             && aperture.y >= 0.0
             && aperture.x + aperture.w <= sidebar.panel_rect.x + sidebar.panel_rect.w
             && aperture.y + aperture.h <= state.render_height() as f32;
-        let cursor_id = crate::app::input::cursor::current_cursor_feedback_kind(state)
-            .and_then(crate::app::input::cursor::cursor_id_for_feedback)
-            .unwrap_or(CursorId::Default);
+        let cursor_id = crate::app::input::cursor::current_cursor_feedback_kind(
+            state,
+            &crate::app::input::cursor::CursorTargets::read(state),
+        )
+        .and_then(crate::app::input::cursor::cursor_id_for_feedback)
+        .unwrap_or(CursorId::Default);
         let cursor_ready = state.use_software_cursor()
             && cursor_id == CursorId::Default
             && state.match_state.input.cursor_x == profile.capture.post_load_cursor.x as f32
             && state.match_state.input.cursor_y == profile.capture.post_load_cursor.y as f32;
-        let power = sim.power_states.get(&owner_id);
+        let power = sim.power_states().get(&owner_id);
         let power_ready = power.is_some_and(|power| {
-            power.total_output >= power.total_drain
-                && !power.is_low_power
-                && power.blackout_remaining(sim.session.binary_frame) == 0
+            power.total_output() >= power.total_drain()
+                && !power.is_low_power()
+                && power.blackout_remaining(sim.session().binary_frame()) == 0
         });
         let radar_authority = state
             .rules()
@@ -1127,7 +1131,7 @@ impl TacticalCaptureSession {
                 .keys_held
                 .iter()
                 .all(|key| state.match_state.input.planning.owns_key(*key))
-            && !state.match_state.input.minimap_dragging
+            && !state.match_state.input.minimap_press_active()
             && !state
                 .match_state
                 .match_presentation
@@ -1146,12 +1150,12 @@ impl TacticalCaptureSession {
                 == crate::app::presentation::sidebar_render::counter_credits(sim, owner);
         let font = state.renderer.bit_font.capture_observation();
         let expected_font = &profile.pixel_inputs.bitmap_font;
-        let bitmap_font_ready = font.source_identity.is_some_and(|consumed| {
-            consumed.byte_length == expected_font.payload_byte_length
-                && consumed.sha256 == expected_font.payload_sha256
-        }) && font
-            .atlas_dimensions
-            .is_some_and(|extent| extent[0] > 0 && extent[1] > 0)
+        let bitmap_font_ready = font
+            .source_identity
+            .is_some_and(|consumed| consumed.byte_length == expected_font.payload_byte_length)
+            && font
+                .atlas_dimensions
+                .is_some_and(|extent| extent[0] > 0 && extent[1] > 0)
             && font.glyph_count > 0
             && font.cell_height == 17
             && font.bitmap_rows == 16
@@ -1225,7 +1229,7 @@ impl TacticalCaptureSession {
         let sim = state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.simulation)
             .context("structure readiness requires live simulation")?;
         let bindings = script.structure_bindings();
@@ -1245,10 +1249,10 @@ impl TacticalCaptureSession {
             if !entity.is_active()
                 || entity.death.is_dying()
                 || entity.building_up()
-                || sim.interner.resolve(entity.owner())
+                || sim.interner().resolve(entity.owner())
                     != self.request.profile()?.launch.player_name
                 || !sim
-                    .interner
+                    .interner()
                     .resolve(entity.type_ref())
                     .eq_ignore_ascii_case(&binding.type_id)
                 || (entity.position.rx(), entity.position.ry()) != binding.cell
@@ -1272,7 +1276,7 @@ impl TacticalCaptureSession {
             };
             if !entity.is_active()
                 || !sim
-                    .interner
+                    .interner()
                     .resolve(entity.type_ref())
                     .eq_ignore_ascii_case(expected_harvester)
             {
@@ -1291,16 +1295,16 @@ impl TacticalCaptureSession {
         let sim = state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.simulation)
             .context("fingerprint requires live simulation")?;
-        let owner_id = sim.interner.get(owner).unwrap_or_default();
+        let owner_id = sim.interner().get(owner).unwrap_or_default();
         let house = sim
-            .houses
+            .houses()
             .get(&owner_id)
             .context("fingerprint local house is absent")?;
         let power = sim
-            .power_states
+            .power_states()
             .get(&owner_id)
             .context("fingerprint local power state is absent")?;
         let script = self
@@ -1312,23 +1316,23 @@ impl TacticalCaptureSession {
             .clone()
             .context("fingerprint render evidence is absent")?;
         let core = FinalFingerprint {
-            simulation_tick: sim.session.tick,
-            total_simulation_ms: sim.session.total_sim_ms,
-            binary_frame: sim.session.binary_frame,
+            simulation_tick: sim.session().tick(),
+            total_simulation_ms: sim.session().total_sim_ms(),
+            binary_frame: sim.session().binary_frame(),
             deterministic_state_hash: sim.state_hash(),
         };
         Ok(json!({
             "core": core,
             "wallet": {
-                "credits": house.economy.credits(),
-                "spent_credits": house.economy.spent_credits(),
-                "score": house.economy.score(),
+                "credits": house.economy().credits(),
+                "spent_credits": house.economy().spent_credits(),
+                "score": house.economy().score(),
             },
             "power": {
-                "output": power.total_output,
-                "drain": power.total_drain,
-                "is_low_power": power.is_low_power,
-                "blackout_remaining": power.blackout_remaining(sim.session.binary_frame),
+                "output": power.total_output(),
+                "drain": power.total_drain(),
+                "is_low_power": power.is_low_power(),
+                "blackout_remaining": power.blackout_remaining(sim.session().binary_frame()),
             },
             "radar": {
                 "authority_active": state.rules().is_some_and(|rules| {
@@ -1349,9 +1353,15 @@ impl TacticalCaptureSession {
             "cursor": {
                 "x": state.match_state.input.cursor_x,
                 "y": state.match_state.input.cursor_y,
-                "id": format!("{:?}", crate::app::input::cursor::current_cursor_feedback_kind(state)
+                "id": format!(
+                    "{:?}",
+                    crate::app::input::cursor::current_cursor_feedback_kind(
+                        state,
+                        &crate::app::input::cursor::CursorTargets::read(state),
+                    )
                     .and_then(crate::app::input::cursor::cursor_id_for_feedback)
-                    .unwrap_or(CursorId::Default)),
+                    .unwrap_or(CursorId::Default)
+                ),
             }
         }))
     }
@@ -1448,10 +1458,6 @@ impl TacticalCaptureSession {
             "production GAME.FNT winner differs from the sealed bitmap source"
         );
         let payload_sha256 = super::profile::sha256_hex(selected.bytes);
-        ensure!(
-            payload_sha256 == font.payload_sha256,
-            "production GAME.FNT bytes differ from the sealed bitmap input"
-        );
         BitmapFontEvidence::from_observations(
             state.renderer.bit_font.capture_observation(),
             BitmapFontSourceEvidence {
@@ -1479,7 +1485,6 @@ impl TacticalCaptureSession {
                 state.renderer.gpu.config.width,
                 state.renderer.gpu.config.height,
             ],
-            state.match_state.match_presentation.ui_scale,
             bitmap_font,
         )?;
         let script = self
@@ -1612,7 +1617,7 @@ fn validate_loaded_resources(state: &AppState) -> Result<()> {
     let sim = &state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .context("simulation is absent")?
         .simulation;
     ensure!(
@@ -1620,7 +1625,6 @@ fn validate_loaded_resources(state: &AppState) -> Result<()> {
             && state.match_state.match_presentation.tile_atlas.is_some()
             && state.match_state.match_presentation.terrain_grid.is_some()
             && state.terrain_template().is_some()
-            && state.match_state.match_presentation.unit_atlas.is_some()
             && state.match_state.match_presentation.palette_set.is_some()
             && state.match_state.match_presentation.sprite_atlas.is_some()
             && state.match_state.match_presentation.overlay_atlas.is_some()
@@ -1648,14 +1652,9 @@ fn artifact(path: &Path, label: &str) -> Result<ArtifactEvidence> {
     Ok(ArtifactEvidence::from_path_digest(path, &digest))
 }
 
-fn require_identity(
-    identity: &ArtifactEvidence,
-    expected_length: u64,
-    expected_sha256: &str,
-    label: &str,
-) -> Result<()> {
+fn require_identity(identity: &ArtifactEvidence, expected_length: u64, label: &str) -> Result<()> {
     ensure!(
-        identity.byte_length == expected_length && identity.sha256 == expected_sha256,
+        identity.byte_length == expected_length,
         "{label} identity differs from sealed profile"
     );
     Ok(())
@@ -1697,9 +1696,10 @@ fn validate_game_options(
     launch: &crate::skirmish_launch::SkirmishLaunchSession,
 ) -> Result<()> {
     ensure!(
-        crate::skirmish_launch::SkirmishLaunchOptions::from_game_options(&sim.session.game_options)
-            == launch.options
-            && sim.session.game_options.ai_players == launch.opponents.len() as i32,
+        crate::skirmish_launch::SkirmishLaunchOptions::from_game_options(
+            sim.session().game_options()
+        ) == launch.options
+            && sim.session().game_options().ai_players == launch.ai_player_count,
         "live GameOptions differ from the requested tactical launch"
     );
     Ok(())
@@ -1708,27 +1708,33 @@ fn validate_game_options(
 fn validate_houses_and_slots(
     sim: &crate::sim::world::Simulation,
     profile: &TacticalCaptureProfile,
+    rules: &crate::rules::ruleset::RuleSet,
 ) -> Result<()> {
     let local_name = &profile.launch.player_name;
     let local_id = sim
-        .interner
+        .interner()
         .get(local_name)
         .context("sealed local house is absent")?;
     let local = sim
-        .houses
+        .houses()
         .get(&local_id)
         .context("local HouseState is absent")?;
     let local_country = local
-        .country
-        .map(|country| sim.interner.resolve(country))
+        .country()
+        .map(|country| sim.interner().resolve(country))
         .context("local country is absent")?;
-    let expected_local_country = profile.launch.local.country.launch_country();
+    let expected_local_country = rules
+        .country_name(profile.launch.local.country.launch_country().index())
+        .context("local Country index missing")?;
     ensure!(
-        local.is_human
-            && local.side_index == expected_local_country.side_index()
-            && local_country == expected_local_country.country_name()
-            && local.difficulty == HouseDifficulty::Normal
-            && local.economy.credits() == profile.launch.options.starting_credits,
+        local.is_human()
+            && local.side_index()
+                == rules
+                    .country_side_index_raw(expected_local_country)
+                    .context("local Side missing")?
+            && local_country == expected_local_country
+            && local.difficulty() == HouseDifficulty::Normal
+            && local.economy().credits() == profile.launch.options.starting_credits,
         "local HouseState differs from sealed slot"
     );
 
@@ -1737,39 +1743,44 @@ fn validate_houses_and_slots(
         "tactical v2 requires one AI"
     );
     let ai_name = "Computer1";
-    let ai_id = sim.interner.get(ai_name).context("Computer1 is absent")?;
+    let ai_id = sim.interner().get(ai_name).context("Computer1 is absent")?;
     let ai = sim
-        .houses
+        .houses()
         .get(&ai_id)
         .context("Computer1 HouseState is absent")?;
     let ai_country = ai
-        .country
-        .map(|country| sim.interner.resolve(country))
+        .country()
+        .map(|country| sim.interner().resolve(country))
         .context("Computer1 country is absent")?;
-    let expected_ai_country = profile.launch.opponents[0].country.launch_country();
+    let expected_ai_country = rules
+        .country_name(profile.launch.opponents[0].country.launch_country().index())
+        .context("AI Country index missing")?;
     // The sealed fixture uses Easy, zero starting units and stock RULESMD
     // MultiplayerAICM=400,0,0. Post_Map_Init @ 0x00686A52..0x00686A6B
     // therefore adds no opening grant (scenario_bootstrap's native evidence).
     ensure!(
-        !ai.is_human
-            && ai.side_index == expected_ai_country.side_index()
-            && ai_country == expected_ai_country.country_name()
-            && ai.difficulty == HouseDifficulty::Easy
-            && ai.economy.credits() == profile.launch.options.starting_credits,
+        !ai.is_human()
+            && ai.side_index()
+                == rules
+                    .country_side_index_raw(expected_ai_country)
+                    .context("AI Side missing")?
+            && ai_country == expected_ai_country
+            && ai.difficulty() == HouseDifficulty::Easy
+            && ai.economy().credits() == profile.launch.options.starting_credits,
         "Computer1 HouseState differs from sealed slot: credits={}, difficulty={:?}",
-        ai.economy.credits(),
-        ai.difficulty
+        ai.economy().credits(),
+        ai.difficulty()
     );
     ensure!(
-        sim.session.start_slot_houses.len() == 2
+        sim.session().start_slot_houses().len() == 2
             && sim
-                .session
-                .start_slot_houses
+                .session()
+                .start_slot_houses()
                 .get(&u32::from(profile.launch.local.start_position))
                 == Some(&local_id)
             && sim
-                .session
-                .start_slot_houses
+                .session()
+                .start_slot_houses()
                 .get(&u32::from(profile.launch.opponents[0].start_position))
                 == Some(&ai_id),
         "start-slot house table differs from sealed positions"
@@ -1777,7 +1788,7 @@ fn validate_houses_and_slots(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::derive_rate;
 

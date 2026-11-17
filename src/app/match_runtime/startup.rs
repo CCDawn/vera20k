@@ -10,6 +10,7 @@ use crate::app::match_bootstrap::{
     RustL0Receipt,
 };
 use crate::sim::world::Simulation;
+use crate::skirmish_launch::SkirmishLaunchSession;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MatchStartup {
@@ -30,7 +31,11 @@ enum StartupPhase {
     /// the campaign index a won mission starts its next map with (`0x00685C47`).
     CampaignInstalled(Box<PreparedCampaignStartup>),
     /// A validated saved world replaced the outgoing one.
-    Restored,
+    Restored(Option<Box<PreparedCampaignStartup>>),
+    /// An offline skirmish the accepted route does not cover (an automatic
+    /// start position, a spawn file). It certifies nothing, as
+    /// `Noncertifying`; the launch is kept for the match's replay.
+    Legacy(Box<SkirmishLaunchSession>),
 }
 
 impl MatchStartup {
@@ -43,12 +48,29 @@ impl MatchStartup {
         self.phase = StartupPhase::Noncertifying;
     }
 
+    /// The launch of an installed offline skirmish outside the accepted
+    /// route. Loading has resolved its random countries and colours.
+    pub(crate) fn install_legacy(&mut self, launch: SkirmishLaunchSession) {
+        self.phase = StartupPhase::Legacy(Box::new(launch));
+    }
+
+    /// The launch the installed offline skirmish was loaded from, either
+    /// route's. `None` for a campaign, a saved world and a network match,
+    /// whose session owns its launch.
+    pub(crate) fn offline_launch(&self) -> Option<&SkirmishLaunchSession> {
+        match &self.phase {
+            StartupPhase::Accepted { startup, .. } => Some(startup.session.launch_session()),
+            StartupPhase::Legacy(launch) => Some(launch),
+            _ => None,
+        }
+    }
+
     /// Only the successful saved-world commit calls this, after resource and
     /// snapshot validation. A restored timeline is admitted without claiming
     /// the outgoing world's fresh-start receipt. Rejected preparation never
     /// reaches this transition, so it preserves the current admission.
-    pub(crate) fn acknowledge_saved_load(&mut self) {
-        self.phase = StartupPhase::Restored;
+    pub(crate) fn acknowledge_saved_load(&mut self, campaign: Option<PreparedCampaignStartup>) {
+        self.phase = StartupPhase::Restored(campaign.map(Box::new));
     }
 
     /// Publish the startup and its receipt together, only after the existing L0
@@ -89,17 +111,25 @@ impl MatchStartup {
     ) -> Result<(), String> {
         let simulation =
             simulation.ok_or_else(|| "campaign map load produced no Simulation".to_string())?;
-        let session = &simulation.session;
+        let session = &simulation.session();
         if !matches!(self.phase, StartupPhase::Noncertifying) || !screen_is_loading {
             return Err("campaign map load lost its loading admission".to_string());
         }
         if !session.started()
-            || session.game_mode_nonzero
-            || session.tick != 0
-            || session.binary_frame != 0
-            || session.seed != u64::from(startup.seed.value)
-            || !session.map_name.eq_ignore_ascii_case(startup.scenario())
+            || session.game_mode_nonzero()
+            || session.tick() != 0
+            || session.binary_frame() != 0
+            || session.seed() != u64::from(startup.seed.value)
+            || !session.map_name().eq_ignore_ascii_case(startup.scenario())
             || session.campaign_mission_counter() != Some(startup.mission_counter())
+            || session.campaign_index() != i32::try_from(startup.campaign_index()).ok()
+            || session.campaign_restart_carry_over()
+                != Some(
+                    startup
+                        .carry_over()
+                        .copied()
+                        .unwrap_or(crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED),
+                )
             || session
                 .campaign_house_difficulties()
                 .is_none_or(|(player, computer)| {
@@ -116,18 +146,20 @@ impl MatchStartup {
     }
 
     pub(crate) fn campaign_installed(&self) -> bool {
-        self.installed_campaign().is_some()
+        matches!(self.phase, StartupPhase::CampaignInstalled(_))
     }
 
     pub(crate) fn installed_campaign(&self) -> Option<&PreparedCampaignStartup> {
         match &self.phase {
-            StartupPhase::CampaignInstalled(startup) => Some(startup),
+            StartupPhase::CampaignInstalled(startup) | StartupPhase::Restored(Some(startup)) => {
+                Some(startup)
+            }
             _ => None,
         }
     }
 
     pub(crate) fn restored(&self) -> bool {
-        matches!(self.phase, StartupPhase::Restored)
+        matches!(self.phase, StartupPhase::Restored(_))
     }
 
     pub(crate) fn accepted(&self) -> Option<(&PreparedMatchStartup, &RustL0Receipt)> {
@@ -157,5 +189,31 @@ impl MatchStartup {
         self.restored()
             || ((self.accepted().is_some() || self.campaign_installed())
                 && self.admits_ordinary_tick())
+    }
+}
+
+#[cfg(all(test, tests_app_match))]
+mod tests {
+    use super::*;
+
+    /// An offline skirmish outside the accepted route keeps its launch for the
+    /// match's replay and certifies nothing; the next world drops it.
+    #[test]
+    fn a_legacy_skirmish_keeps_its_launch_until_the_next_world() {
+        let launch = crate::app::initialize::quickplay_launch_session(
+            "XMP03T4.MAP".to_string(),
+            &crate::skirmish_modes::stock_skirmish_modes(),
+        )
+        .unwrap();
+        let mut startup = MatchStartup::default();
+        assert_eq!(startup.offline_launch(), None);
+        startup.install_legacy(launch.clone());
+        assert_eq!(startup.offline_launch(), Some(&launch));
+        assert!(startup.accepted().is_none() && !startup.admits_exact_step());
+        startup.acknowledge_saved_load(None);
+        assert_eq!(startup.offline_launch(), None);
+        startup.install_legacy(launch);
+        startup.clear();
+        assert_eq!(startup.offline_launch(), None);
     }
 }

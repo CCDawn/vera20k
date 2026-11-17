@@ -46,7 +46,20 @@ def cell(x, y):
     return CELLS + (y * 32 + x) * 0x200
 
 
-def query(case):
+def install_zone_inputs(u, read32, far_zone=()):
+    """Supplied native level-zero connectivity, shared by composed Drive scenes."""
+    stride = read32(MAP + 0xF8) + 1 + read32(MAP + 0xF4)
+    count = stride * 33
+    records = bytearray(count * 4)
+    for x, y in far_zone:
+        struct.pack_into('<H', records, (stride * y + x) * 4 + 2, 1)
+    u.mem_write(ZONE_RECORDS, bytes(records))
+    u.mem_write(ZONE_TABLE, struct.pack('<HH', 1, 2))
+    u.mem_write(MAP + 0x68, dwords(ZONE_RECORDS, count))
+    u.mem_write(MAP + 0x18, dwords(ZONE_TABLE))
+
+
+def query(case, *, before_process=None):
     family = case['family']
     u, call, read32 = make_destination_fixture(dict(family=family, head=[0, 0, 0],
                                                     mission=case.get('mission', 5)))
@@ -59,15 +72,7 @@ def query(case):
     u.mem_write(RULES + 0x1760, struct.pack('<d', 0.01))
     # MovementZone 0 lookup (Map+18) over per-cell records (Map+68/+6C), index
     # (Map+F8 + 1 + Map+F4) * y + x as in GetZoneID 0x56D230.
-    stride = read32(MAP + 0xF8) + 1 + read32(MAP + 0xF4)
-    count = stride * 33
-    records = bytearray(count * 4)
-    for x, y in case.get('far_zone', []):
-        struct.pack_into('<H', records, (stride * y + x) * 4 + 2, 1)
-    u.mem_write(ZONE_RECORDS, bytes(records))
-    u.mem_write(ZONE_TABLE, struct.pack('<HH', 1, 2))
-    u.mem_write(MAP + 0x68, dwords(ZONE_RECORDS, count))
-    u.mem_write(MAP + 0x18, dwords(ZONE_TABLE))
+    install_zone_inputs(u, read32, case.get('far_zone', []))
     if case.get('post_warp'):
         # HouseClass::GetSpeedBonus 0x50C050 reads the country type's +0x12C.
         u.mem_write(HOUSE + 0x34, dwords(COUNTRY))
@@ -132,6 +137,10 @@ def query(case):
 
     u.hook_add(UC_HOOK_CODE, observe)
     u.mem_write(0xA8ED84, dwords(PROCESS_FRAME))
+    if before_process is not None:
+        # Additive composed observers may supply a declared prestate and watch
+        # the original wrapper. The default corpus has no callback.
+        before_process(u, read32)
     entry = read32(read32(LOCO + 4) + 0x40)
     assert entry == PROCESS[family]
     u.mem_write(SP, dwords(RET_MAGIC, LOCO + 4))

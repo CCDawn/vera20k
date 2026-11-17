@@ -16,16 +16,21 @@ use crate::rules::object_type::ObjectCategory;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat::veterancy;
 use crate::sim::components::DriveCoord;
+use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
+use crate::sim::intern::StringInterner;
 use crate::sim::movement::ground_pose::position_world_coord;
+use crate::sim::rng::SimRng;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::world::FrameEffects;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
 use crate::sim::world::display_layers::DisplayLayer;
 use crate::util::native_x87::{MaskedX87Chop53 as X87, NativeF64Bits, distance_3d_leptons};
 
 /// Which `Techno` double a multiplier crate raises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Multiplier {
+pub(crate) enum Multiplier {
     /// `Techno+0x158`, the Armor arm `0x00482E53..0x00482E79`.
     Armor,
     /// `Techno+0x160`, the Firepower arm `0x00483222..0x00483248`.
@@ -33,12 +38,15 @@ pub(super) enum Multiplier {
 }
 
 /// The object's crate multipliers, `Techno+0x158` (armor) and `Techno+0x160`
-/// (firepower). The constructor seeds both doubles to 1.0; the Armor and
-/// Firepower arms ([`apply_multiplier_crate`]) are their only writers, and an
-/// arm skips a multiplier that is not exactly 1.0, so each changes at most
-/// once per object. The receiver's damage build reads the armor multiplier;
-/// `FireAt`'s damage build folds in the firepower one
-/// (`0x006FE33D..0x006FE34D`).
+/// (firepower). Under Ares, Ext+88/+80 retain permanent armor/firepower baselines
+/// separately from derived Techno+158/+160. The constructor seeds both baselines
+/// to 1.0; only the Armor and Firepower arms ([`apply_multiplier_crate`]) write
+/// these permanent baselines. Each arm skips a baseline that is not exactly 1.0.
+/// The attachment owner separately recomputes effective values, which live in
+/// the object's Ares part. The receiver's damage build reads the effective
+/// armor multiplier (`GameEntity::armor_multiplier`); `FireAt`'s damage build
+/// folds in the firepower one (`GameEntity::firepower_multiplier`,
+/// `0x006FE33D..0x006FE34D`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CrateMultipliers {
     #[serde(default = "one")]
@@ -62,13 +70,15 @@ impl Default for CrateMultipliers {
 }
 
 impl CrateMultipliers {
-    /// `Techno+0x158`.
-    pub(crate) const fn armor(self) -> NativeF64Bits {
+    /// Permanent armor crate baseline (Ares Ext+88), never an AE product:
+    /// `Techno+0x158` itself in a game Ares doesn't play in.
+    pub(crate) const fn crate_armor(self) -> NativeF64Bits {
         self.armor
     }
 
-    /// `Techno+0x160`.
-    pub(crate) const fn firepower(self) -> NativeF64Bits {
+    /// Permanent firepower crate baseline (Ares Ext+80), never an AE product:
+    /// `Techno+0x160` itself in a game Ares doesn't play in.
+    pub(crate) const fn crate_firepower(self) -> NativeF64Bits {
         self.firepower
     }
 
@@ -87,14 +97,18 @@ impl CrateMultipliers {
 
 /// Ground-layer objects within `radius` of `center`, in layer order, with the
 /// native `Sqrt_Approx`/`ftol` distance and strict `<` (`0x00482E38..0x00482E51`).
-fn ground_members_in_radius(sim: &Simulation, center: DriveCoord, radius: i32) -> Vec<u64> {
-    sim.substrate
+fn ground_members_in_radius(
+    substrate: &ObjectSubstrate,
+    center: DriveCoord,
+    radius: i32,
+) -> Vec<u64> {
+    substrate
         .display
         .members(DisplayLayer::GROUND)
         .iter()
         .copied()
         .filter(|&id| {
-            sim.substrate.entities.get(id).is_some_and(|entity| {
+            substrate.entities.get(id).is_some_and(|entity| {
                 let position = position_world_coord(&entity.position);
                 distance_3d_leptons(
                     [center.x, center.y, center.z],
@@ -105,21 +119,46 @@ fn ground_members_in_radius(sim: &Simulation, center: DriveCoord, radius: i32) -
         .collect()
 }
 
+/// CellClass::PickupCrate @00482840..0048296D: every marked ground-layer
+/// Techno strictly inside CrateRadius receives the permanent +3D2 flag.
+/// This arm starts no cloak transition, plays no sound and spends no RNG.
+pub(crate) fn apply_cloak_crate(
+    substrate: &mut ObjectSubstrate,
+    rules: &RuleSet,
+    interner: &StringInterner,
+    center: DriveCoord,
+    radius: i32,
+) {
+    let ares = rules.ares_form();
+    for id in ground_members_in_radius(substrate, center, radius) {
+        if let Some(entity) = substrate.entities.get_mut(id) {
+            entity.stealth_ability.grant();
+            // Installed Cloak2@1005F920 writes permanent Ext+98 then aggregates.
+            if ares {
+                entity.recompute_ares_attached_stats(rules, interner);
+            }
+        }
+    }
+}
+
 /// The Armor and Firepower arms: every Techno within the radius whose
 /// multiplier is exactly 1.0 takes `multiplier * magnitude` (x87 double
 /// multiply, `0x00482E6D..0x00482E79`). Returns the owners of the changed
 /// objects, in native visit order; the arm announces when one of them is the
 /// local player (`vt+0x3C` then `0x0050B6F0`, `0x00482E7F..0x00482E8D`).
-pub(super) fn apply_multiplier_crate(
-    sim: &mut Simulation,
+pub(crate) fn apply_multiplier_crate(
+    substrate: &mut ObjectSubstrate,
+    rules: &RuleSet,
+    interner: &StringInterner,
     center: DriveCoord,
     radius: i32,
     magnitude: NativeF64Bits,
     which: Multiplier,
 ) -> Vec<InternedId> {
+    let ares = rules.ares_form();
     let mut changed_owners = Vec::new();
-    for id in ground_members_in_radius(sim, center, radius) {
-        let Some(entity) = sim.substrate.entities.get_mut(id) else {
+    for id in ground_members_in_radius(substrate, center, radius) {
+        let Some(entity) = substrate.entities.get_mut(id) else {
             continue;
         };
         let slot = match which {
@@ -131,6 +170,14 @@ pub(super) fn apply_multiplier_crate(
         }
         *slot =
             X87::store_f64_masked_chop(X87::mul(X87::load_f64(magnitude), X87::load_f64(*slot)));
+        // Ares Armor2@1005F870 writes Ext+88 then calls RecalculateStats
+        // @1005F89D; Firepower2 (1005F970, hook 0x483226) does the same for
+        // Ext+80 at 1005F997. Both store the magnitude into a 1.0 slot, the
+        // product above, and aggregate before the recipient callback/next
+        // actor (Ares Crates.cpp).
+        if ares {
+            entity.recompute_ares_attached_stats(rules, interner);
+        }
         let owner = entity.owner();
         if !changed_owners.contains(&owner) {
             changed_owners.push(owner);
@@ -153,7 +200,8 @@ fn ordered_less(a: f64, b: f64) -> bool {
 /// The promotion anim and EVA follow from the next `AI_Update` sample, as for
 /// a kill promotion.
 pub(super) fn apply_veteran_crate(
-    sim: &mut Simulation,
+    interner: &StringInterner,
+    substrate: &mut ObjectSubstrate,
     rules: &RuleSet,
     center: DriveCoord,
     radius: i32,
@@ -165,8 +213,8 @@ pub(super) fn apply_veteran_crate(
     if !ordered_less(0.0, magnitude) {
         return;
     }
-    for id in ground_members_in_radius(sim, center, radius) {
-        let Some(entity) = sim.substrate.entities.get(id) else {
+    for id in ground_members_in_radius(&*substrate, center, radius) {
+        let Some(entity) = substrate.entities.get(id) else {
             continue;
         };
         // `Object+0x74`: ObjectClass::Mark sets it on PUT and clears it on
@@ -175,13 +223,13 @@ pub(super) fn apply_veteran_crate(
         if !entity.lifecycle.cell_marked() {
             continue;
         }
-        if !sim
+        if !interner
             .object_type(entity.type_ref(), rules)
             .is_some_and(|object| object.trainable)
         {
             continue;
         }
-        let entity = sim.substrate.entities.get_mut(id).expect("checked above");
+        let entity = substrate.entities.get_mut(id).expect("checked above");
         let mut level = 0_i32;
         loop {
             if veterancy::raw_is_veteran(entity.veterancy.raw()) {
@@ -201,34 +249,36 @@ pub(super) fn apply_veteran_crate(
     }
 }
 
-/// The HealBase arm's building loop `0x00482C18..0x00482C9C`: every building
-/// of the actor's house receives `Health - Type.Strength` (zero or negative)
-/// through `ReceiveDamage(&amount, 0, C4Warhead=, NULL, 1, 1, NULL)`, in
-/// `BuildingClass::Array` order (construction order here).
+/// The HealBase arm's live Logic loop `0x00482C18..0x00482C9C`: each
+/// same-house Techno receives `Health - Type.Strength` through
+/// `ReceiveDamage(&amount, 0, C4Warhead=, NULL, 1, 1, NULL)`. Each receiver
+/// finishes before the next live slot, collector owner, type and health read.
 pub(super) fn apply_heal_base_crate(
     sim: &mut Simulation,
     rules: &RuleSet,
     registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-    owner: InternedId,
+    collector: u64,
     frame_effects: FrameEffects<'_>,
 ) {
-    let buildings: Vec<(u64, i32)> = sim
-        .substrate
-        .entities
-        .iter_sorted()
-        .filter(|(_, entity)| {
-            entity.category() == EntityCategory::Structure && entity.owner() == owner
-        })
-        .filter_map(|(id, entity)| {
-            let strength = sim.object_type(entity.type_ref(), rules)?.strength;
-            Some((id, entity.health.current().wrapping_sub(strength)))
-        })
-        .collect();
     let warhead = sim.interner.intern(&rules.bridge_warheads.c4_name);
-    for (id, amount) in buildings {
-        if !sim.substrate.entities.contains(id) {
+    let mut index = 0;
+    while let Some(&id) = sim.logic_order().get(index) {
+        index += 1;
+        // Non-Techno Logic members have their own stores. The native loop
+        // tests the collector's Techno bit, not the recipient's category.
+        let Some(entity) = sim.substrate.entities.get(id) else {
+            continue;
+        };
+        let Some(collector) = sim.substrate.entities.get(collector) else {
+            break;
+        };
+        if entity.owner() != collector.owner() {
             continue;
         }
+        let Some(object_type) = sim.object_type(entity.type_ref(), rules) else {
+            continue;
+        };
+        let amount = entity.health.current().wrapping_sub(object_type.strength);
         sim.commit_direct_damage_receiver(
             rules,
             registry,
@@ -253,17 +303,407 @@ pub(super) fn apply_heal_base_crate(
 /// set, otherwise `RandomRanged(ftol(magnitude), ftol(magnitude) + 900)` on
 /// the Scenario RNG. `HouseClass::Add_Credits @ 0x004F9950` then adds it.
 pub(super) fn money_crate_amount(
-    sim: &mut Simulation,
+    scenario_rng: &mut SimRng,
+    rules: &RuleSet,
     solo_money: i32,
     magnitude: NativeF64Bits,
 ) -> i32 {
     if solo_money != 0 {
         return solo_money;
     }
-    let base =
-        crate::util::native_x87::X87Chop53::ftol_f64_low_masked(f64::from_bits(magnitude.bits()));
-    sim.scenario_rng
-        .next_range_i32_inclusive(base, base.wrapping_add(900))
+    let base = magnitude_amount(magnitude);
+    // Ares 3.0 1002C8A0 (hook 0x48248D): `base + RandomRanged(0,
+    // [CrateRules] RandomCrateMoney)`; its default 900 draws the same span.
+    if rules.ares_form() {
+        return base.wrapping_add(
+            scenario_rng.next_range_i32_inclusive(0, rules.ares_random_crate_money()),
+        );
+    }
+    scenario_rng.next_range_i32_inclusive(base, base.wrapping_add(900))
+}
+
+/// `Math__ftol` of one `[Powerups]` magnitude double, the damage base the Gas
+/// (`fld` at `0x00481E08`), Napalm (`fld` at `0x004827E8`, `call` at
+/// `0x004827EC`) and Explosion (`fld` at `0x00482579`) arms convert out of the
+/// shared `local_170` magnitude load at `0x00481DC3`.
+fn magnitude_amount(magnitude: NativeF64Bits) -> i32 {
+    crate::util::native_x87::X87Chop53::ftol_f64_low_masked(f64::from_bits(magnitude.bits()))
+}
+
+/// The Gas arm `0x00481DE7..0x00481E99`: the named "GAS" warhead on the crate
+/// cell and each `0x0089F688` neighbour (centre first, then N, NE, E, SE, S,
+/// SW, W, NW), each one `Apply_area_damage(cellCentre, amount, 0, warhead, 0,
+/// 0)` whose arg3 source of 0 walks no per-cell spread. No RNG and no sound:
+/// the arm jumps to the shared anim tail past `0x004832F0`.
+pub(super) fn apply_gas_crate(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    cell: (i16, i16),
+    magnitude: NativeF64Bits,
+    frame_effects: FrameEffects<'_>,
+) {
+    // `0x00481DE7..0x00481E06` walks the 0x8874C4 WarheadType array for
+    // "GAS" through the `strcasecmp` finder 0x75E4A0; the WarheadType
+    // factory 0x75E3B0 (which reads `FlameDamage=`) scans and allocates into
+    // the same array. `rules.warhead` is the same case-insensitive name
+    // search over the parsed warheads.
+    let Some(warhead) = rules.warhead("GAS") else {
+        // 0x75E4A0 returns NULL for a missing name (0x75E4D3), and
+        // Apply_area_damage returns on a null warhead (0x004892D7), so all
+        // nine calls are inert; the anim tail still runs.
+        return;
+    };
+    let warhead_ref = sim.interner.intern(&warhead.id);
+    let amount = magnitude_amount(magnitude);
+    // The nine-cell centres go through the same retained-Cell centre owner as
+    // the dispatcher (`crate_center`); the direction adds are native WORD adds.
+    let mut targets = Vec::with_capacity(9);
+    targets.push(cell);
+    for (dx, dy) in crate::util::direction::DIRECTION_DELTAS {
+        targets.push((
+            cell.0.wrapping_add(dx as i16),
+            cell.1.wrapping_add(dy as i16),
+        ));
+    }
+    for target in targets {
+        let receiver = sim.resolved_terrain.as_ref().map(|terrain| {
+            crate::map::resolved_terrain::NativeCellQuery::canonical(terrain).lookup(target)
+        });
+        let centre = super::pickup::crate_center(sim, target, receiver);
+        // CellClass::PickupCrate481A00 passes affectsTiberium=false at
+        // 481E19/481E71 (original gamemd.exe); ordinary receivers still run.
+        crate::sim::combat::world_receiver::apply_area_damage(
+            sim,
+            rules,
+            registry,
+            crate::sim::projectile::ProjectileCoord::new(centre.x, centre.y, centre.z),
+            amount,
+            warhead,
+            false,
+            (crate::sim::combat::RAD_NO_ATTACKER, None, warhead_ref),
+            frame_effects,
+        );
+    }
+}
+
+/// The Tiberium arm `0x00481E99..0x00481F68`: one `IncreaseTiberium(type, 1)`
+/// on the crate cell, then `RandomRanged(10, 20)` further ones at coordinates
+/// the shared `0x0049F420` random-direction helper (snap 1) moves up to
+/// `RandomRanged(0, 0x300)` leptons away — two draws per loop pass, with no
+/// validity retry, so a refused cell still spends its pair.
+pub(super) fn apply_tiberium_crate(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    cell: (i16, i16),
+    base: DriveCoord,
+    frame_effects: FrameEffects<'_>,
+) -> Result<(), crate::sim::crates::RuntimeOverlayError> {
+    // `0x00481EAD..0x00481ED1`: `RandomRanged(0, Tiberiums.Count - 1)` picks
+    // the ore type, and a drawn 1 clamps it to 0 (`cmp edi,1`/`jne`/`xor
+    // edi,edi` at `0x00481ECC..0x00481ED1`) — both paths fall into the same
+    // `IncreaseTiberium(type, 1)` at `0x00481ED3..0x00481ED8`, so the arm
+    // never abandons on the draw.
+    let cell_grid = sim.cell_grid();
+    let tiberium_count = rules.tiberium_types.len();
+    if tiberium_count == 0 {
+        // Unpinned defensive edge: with no registered ore type native would
+        // draw `RandomRanged(0, -1)` and index an empty array; VERA leaves
+        // the arm (and its RNG) alone instead.
+        return Ok(());
+    }
+    let drawn = sim
+        .scenario_rng
+        .next_range_i32_inclusive(0, tiberium_count as i32 - 1);
+    // Unpinned: past 256 ore types `u8::try_from` fails where native keeps
+    // indexing the type array with the raw value; VERA drops the arm there.
+    let Ok(type_index) = u8::try_from(if drawn == 1 { 0 } else { drawn }) else {
+        return Ok(());
+    };
+    let type_id = crate::rules::tiberium_type::TiberiumTypeId(type_index);
+    let (Ok(pickup_x), Ok(pickup_y)) = (u16::try_from(cell.0), u16::try_from(cell.1)) else {
+        return Ok(());
+    };
+    // `CellClass::IncreaseTiberium @ 0x00487190` runs on the live map: the
+    // shared placement owner already consumes the exact native draw order —
+    // the twelve-image flat variant pick, the growth-queue priority draw and
+    // the spread feeds — so the arm drives it with the scenario RNG and never
+    // draws around it (see `place_tiberium`).
+    let mut placed_cells = Vec::new();
+    let result = (|| {
+        if let Some(placement) = crate::sim::tiberium::place_tiberium(
+            sim,
+            rules,
+            registry,
+            (pickup_x, pickup_y),
+            type_id,
+            1,
+            frame_effects,
+        )? {
+            placed_cells.push(placement.cell());
+        }
+        //481EDD..481F68 keeps every distance/direction draw on refused cells.
+        let count = sim.scenario_rng.next_range_i32_inclusive(10, 20);
+        for _ in 0..count.max(0) {
+            let distance = sim.scenario_rng.next_range_i32_inclusive(0, 0x300);
+            let (x, y) = crate::sim::combat::inviso_scatter::random_direction_coord(
+                cell_grid,
+                &mut sim.scenario_rng,
+                base.x,
+                base.y,
+                distance,
+                crate::sim::combat::inviso_scatter::RandomDirectionSnap::CellCenter,
+            );
+            let target = (
+                crate::util::lepton::lepton_to_cell(x)
+                    .try_into()
+                    .unwrap_or(u16::MAX),
+                crate::util::lepton::lepton_to_cell(y)
+                    .try_into()
+                    .unwrap_or(u16::MAX),
+            );
+            if let Some(placement) = crate::sim::tiberium::place_tiberium(
+                sim,
+                rules,
+                registry,
+                target,
+                type_id,
+                1,
+                frame_effects,
+            )? {
+                placed_cells.push(placement.cell());
+            }
+        }
+        Ok(())
+    })();
+    // Keep the existing batch publication even when malformed input stops a
+    // later selection. Completed constructor writes remain authoritative.
+    sim.publish_tiberium_cells(rules, registry, &placed_cells);
+    result
+}
+
+/// The Explosion arm `0x00482565..0x0048271E`: the picker first takes
+/// `ReceiveDamage(&amount, 0, C4Warhead, NULL, 1, 0, NULL)`, then five
+/// blasts — each `RandomRanged(0, 0x200)` plus the raw draw inside the
+/// unsnapped `0x0049F420`, `Apply_area_damage` at the scattered coordinate,
+/// the `SelectAnim @ 0x0048A4F0` animation (`AnimClass(type, &coord, 0, 1,
+/// 0x2600, -15, 0)`) and the `0x0048A620` flash.
+pub(super) fn apply_explosion_crate(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    actor_id: u64,
+    center: DriveCoord,
+    magnitude: NativeF64Bits,
+    frame_effects: FrameEffects<'_>,
+) {
+    // `0x00482572`: Rules+0xFA8. A null C4Warhead leaves ReceiveDamage
+    // (701BF6), SelectAnim (48A4FF), Flash (48A652) and Apply_area_damage
+    // (4892D7) each inert natively, but the five passes still spend their
+    // ten draws.
+    let c4 = rules
+        .warhead(&rules.bridge_warheads.c4_name)
+        .map(|warhead| (warhead, sim.interner.intern(&warhead.id)));
+    let amount = magnitude_amount(magnitude);
+    // `0x0048258D..0x004825A2`. The blasts read the pre-receive copy at
+    // `[esp+0x1C]` (`0x004825A1`, `0x0048263E`), never the receiver's
+    // in/out amount.
+    if let Some((_, warhead_ref)) = c4 {
+        sim.commit_direct_damage_receiver(
+            rules,
+            registry,
+            crate::sim::combat::EntityDamageEvent::direct_receiver(
+                actor_id,
+                amount,
+                0,
+                crate::sim::combat::RAD_NO_ATTACKER,
+                None,
+                warhead_ref,
+                crate::sim::combat::ReceiverCallFlags {
+                    ignore_defenses: true,
+                    arg6: false,
+                },
+            ),
+            frame_effects,
+        );
+    }
+    for _ in 0..5 {
+        // `0x004825AA..0x004825C2` and the 0x49F420 copy: one distance draw,
+        // one raw direction draw, no cell snap.
+        let distance = sim.scenario_rng.next_range_i32_inclusive(0, 0x200);
+        let (x, y) = crate::sim::combat::inviso_scatter::random_direction_coord(
+            sim.cell_grid(),
+            &mut sim.scenario_rng,
+            center.x,
+            center.y,
+            distance,
+            crate::sim::combat::inviso_scatter::RandomDirectionSnap::Preserve,
+        );
+        let Some((warhead, warhead_ref)) = c4 else {
+            continue;
+        };
+        let scattered = crate::sim::projectile::ProjectileCoord::new(x, y, center.z);
+        let receipt = crate::sim::combat::world_receiver::apply_area_damage(
+            sim,
+            rules,
+            registry,
+            scattered,
+            amount,
+            warhead,
+            true,
+            (crate::sim::combat::RAD_NO_ATTACKER, None, warhead_ref),
+            frame_effects,
+        );
+        // `0x0048A4F0` selection feeding the combat constructor shape
+        // `spawn_combat_explosion_anim` owns (`0x2600`/`-15`, Start at
+        // construction). The same owners serve TAction42's DoExplosionAt.
+        // `0x0048267D` passes the constant LandType 0 (Clear), so the
+        // water-splash branch never fires here.
+        if let Some(effect) = crate::sim::combat::detonation_anim::effect(
+            sim,
+            rules,
+            warhead,
+            amount,
+            0,
+            scattered,
+            scattered,
+            receipt.crit_active,
+        ) {
+            crate::sim::world::damage_consequences::admit_explosion_effect(sim, rules, effect);
+        }
+        sim.combat_light_requests
+            .emit(crate::sim::combat::CombatLightRequest::Impact {
+                target_id: None,
+                damage: amount,
+                warhead_ref,
+                coord: scattered,
+                force_create: false,
+                flags: 0,
+            });
+    }
+}
+
+/// The Napalm arm `0x0048271E..0x00482840`: `AnimTypeArray8B4154[0]` at the
+/// componentwise midpoint of the crate centre and the picker coordinate, the
+/// picker's `ReceiveDamage(&buf, 0, FlameDamage, NULL, 1, 0, NULL)`, then one
+/// `Apply_area_damage(mid, ftol(magnitude), 0, FlameDamage, 1, 0)`. No RNG
+/// and no sound.
+pub(super) fn apply_napalm_crate(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    actor_id: u64,
+    cell_center: DriveCoord,
+    magnitude: NativeF64Bits,
+    frame_effects: FrameEffects<'_>,
+) {
+    let mid = sim.substrate.entities.get(actor_id).map(|entity| {
+        let picker = position_world_coord(&entity.position);
+        DriveCoord {
+            x: cell_center.x.wrapping_add(picker.x) / 2,
+            y: cell_center.y.wrapping_add(picker.y) / 2,
+            z: cell_center.z.wrapping_add(picker.z) / 2,
+        }
+    });
+    let Some(mid) = mid else {
+        // A picker the synchronous crate trigger already deleted has no
+        // modeled coordinate; native would read its lingering object. Unpinned.
+        return;
+    };
+    if let Some(fire_anim) = rules.anim_type_runtime_key_by_index(0) {
+        // `0x004827C9..0x004827E3`: AnimClass(type, &mid, 0, 1, 0x600, 0, 0).
+        sim.spawn_named_anim(
+            rules,
+            &fire_anim,
+            crate::sim::anim_class::AnimWorldCoord {
+                x: mid.x,
+                y: mid.y,
+                z: mid.z,
+            },
+            0,
+            0x600,
+            0,
+        );
+    }
+    // `0x00482803`/`0x00482827`: Rules+0xF84. A null warhead drops the
+    // ReceiveDamage (701BF6) and returns from Apply_area_damage (4892D7).
+    let Some(warhead) = rules
+        .combat_damage
+        .flame_damage()
+        .and_then(|name| rules.warhead(name))
+    else {
+        return;
+    };
+    let warhead_ref = sim.interner.intern(&warhead.id);
+    let amount = magnitude_amount(magnitude);
+    sim.commit_direct_damage_receiver(
+        rules,
+        registry,
+        crate::sim::combat::EntityDamageEvent::direct_receiver(
+            actor_id,
+            amount,
+            0,
+            crate::sim::combat::RAD_NO_ATTACKER,
+            None,
+            warhead_ref,
+            crate::sim::combat::ReceiverCallFlags {
+                ignore_defenses: true,
+                arg6: false,
+            },
+        ),
+        frame_effects,
+    );
+    crate::sim::combat::world_receiver::apply_area_damage(
+        sim,
+        rules,
+        registry,
+        crate::sim::projectile::ProjectileCoord::new(mid.x, mid.y, mid.z),
+        amount,
+        warhead,
+        true,
+        (crate::sim::combat::RAD_NO_ATTACKER, None, warhead_ref),
+        frame_effects,
+    );
+}
+
+/// The ICBM arm `0x00482CA1..0x00482D56`. `FindFirstOfAction(20)` at
+/// `0x00482CB8` names the first type whose `Action=` is Nuke (retail
+/// `NukeSpecial`). A scan of the picker House's Supers for one whose type's
+/// `Type=` (`+0xB4`) is 0, MultiMissile, gates the grant
+/// (`0x00482CC9..0x00482D07`; the matched index is discarded), then
+/// `Grant(1, 0, 0)` runs on the found type's own Super (`+0x98`,
+/// `0x00482D0D..0x00482D20`). No RNG and no sound.
+pub(super) fn apply_icbm_crate(sim: &mut Simulation, rules: &RuleSet, owner: InternedId) {
+    // The House constructor holds one Super per registered type, so a
+    // registered MultiMissile type is the scan's admission.
+    if crate::sim::superweapon::super_types_with_type(rules, 0)
+        .next()
+        .is_none()
+    {
+        return;
+    }
+    let Some(type_name) = crate::sim::superweapon::first_super_type_with_action(rules, "Nuke")
+    else {
+        // Unpinned: native dereferences the null type here (`0x00482D0D`).
+        return;
+    };
+    let Some(type_id) = sim.interner.get(type_name) else {
+        return;
+    };
+    crate::sim::superweapon::trigger_grant_super(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &sim.houses,
+        &mut sim.super_weapons,
+        rules,
+        owner,
+        type_id,
+        true,
+    );
+    // `0x00482D2D..0x00482D4C`: a successful grant adds the current player's
+    // cameo (`AddCameo(0x1F, ..)`); the sidebar projects active Supers.
 }
 
 /// What the Unit arm `0x00482041..0x00482461` did.
@@ -284,9 +724,11 @@ pub(super) enum UnitCrateOutcome {
 /// MCV pre-empt flag; `bases` the lobby Bases byte (`0x00A8B258`).
 ///
 /// A pre-empted pickup asks for the first ownable `BaseUnit=`. Otherwise, a
-/// house with one of the first two `[AI] BuildConst=` types tracked and
-/// neither of the first two `HarvesterUnit=` types tracked gets its first
-/// ownable `HarvesterUnit=`. `[CrateRules] UnitCrateType=` overrides both.
+/// house with one of the first two `[AI] BuildRefinery=` types tracked
+/// (Rules `+0x8E4`, items `+0x8E8`, against House `+0x5500` at
+/// `0x0048208A..0x004820DD`) and neither of the first two `HarvesterUnit=`
+/// types tracked (`0x004820DF..0x00482131`) gets its first ownable
+/// `HarvesterUnit=`. `[CrateRules] UnitCrateType=` overrides both.
 /// With no type yet, draw `RandomRanged(0, UnitTypes.Count - 1)` until a
 /// `CrateGoodie=` type passes: with Bases on, a `BaseUnit=` type is accepted
 /// for a human house or a pre-empted pickup; with Bases off, never.
@@ -296,14 +738,17 @@ pub(super) enum UnitCrateOutcome {
 /// (a rules-data-only divergence), including when every goodie is a forbidden
 /// base unit. When a candidate exists, retain the original full-array draws.
 pub(super) fn choose_unit_crate_type<'r>(
-    sim: &mut Simulation,
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    scenario_rng: &mut SimRng,
+    houses: &Houses,
     rules: &'r RuleSet,
     owner: InternedId,
     preempted: bool,
 ) -> Option<&'r crate::rules::object_type::ObjectType> {
-    use crate::sim::ai_buildable::{first_owner_compatible, house_country_bit};
-    let house = sim.houses.get(&owner)?;
-    let country_bit = house_country_bit(rules, sim.interner.resolve(house.house_type_id()));
+    use crate::sim::ai_buildable::first_owner_compatible;
+    let house = houses.get(&owner)?;
+    let country_bit = rules.country_owner_mask(interner.resolve(house.house_type_id()));
     let mut chosen = None;
     if preempted {
         chosen = first_owner_compatible(
@@ -315,12 +760,12 @@ pub(super) fn choose_unit_crate_type<'r>(
     }
     if chosen.is_none() {
         let tracked = |category: EntityCategory, type_id: &str| -> i32 {
-            sim.interner
+            interner
                 .get(type_id)
-                .map_or(0, |type_id| house.tracking.owned_count(category, type_id))
+                .map_or(0, |type_id| house.tracking().owned_count(category, type_id))
         };
-        let has_conyard = rules
-            .build_const_types
+        let has_refinery = rules
+            .build_refinery_types
             .iter()
             .take(2)
             .any(|type_id| tracked(EntityCategory::Structure, type_id) > 0);
@@ -329,7 +774,7 @@ pub(super) fn choose_unit_crate_type<'r>(
             .iter()
             .take(2)
             .any(|type_id| tracked(EntityCategory::Unit, type_id) != 0);
-        if has_conyard && !has_harvester {
+        if has_refinery && !has_harvester {
             chosen = first_owner_compatible(
                 rules,
                 &rules.harvester_unit_types,
@@ -349,8 +794,8 @@ pub(super) fn choose_unit_crate_type<'r>(
     if chosen.is_some() {
         return chosen;
     }
-    let human = house.is_controlled_by_human(sim.session.game_mode_nonzero);
-    let bases = sim.session.game_options.bases;
+    let human = house.is_controlled_by_human(session.game_mode_nonzero());
+    let bases = session.game_options().bases;
     let ids = rules.type_array_ids(ObjectCategory::Vehicle);
     let eligible = |candidate: &crate::rules::object_type::ObjectType| {
         let is_base_unit = rules
@@ -370,9 +815,7 @@ pub(super) fn choose_unit_crate_type<'r>(
     }
     let count = i32::try_from(ids.len()).unwrap_or(i32::MAX);
     loop {
-        let index = sim
-            .scenario_rng
-            .next_range_i32_inclusive(0, count.wrapping_sub(1));
+        let index = scenario_rng.next_range_i32_inclusive(0, count.wrapping_sub(1));
         let Some(candidate) = usize::try_from(index)
             .ok()
             .and_then(|index| ids.get(index))
@@ -475,6 +918,6 @@ pub(super) fn place_unit_crate(
             return UnitCrateOutcome::Placed;
         }
     }
-    sim.discard_constructed_limbo(id, Some(rules), frame_effects);
+    sim.discard_constructed_limbo(id, rules, frame_effects);
     UnitCrateOutcome::FellBackToMoney
 }

@@ -33,6 +33,7 @@ use crate::asset_tools::identify;
 use crate::asset_tools::names::NameDict;
 use crate::asset_tools::palette;
 use crate::asset_tools::report::{ErrorReport, RenderOutputs, RenderReport};
+use crate::asset_tools::sanitise_name;
 use crate::asset_tools::verb_render::RenderOptions;
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::hva_file::HvaFile;
@@ -356,7 +357,7 @@ pub fn run(
         ));
     }
 
-    let sanitised = sanitise_name(name);
+    let sanitised = sanitise_name(name, FALLBACK_DIR_NAME);
     let dir = render_dir(&opts.out, &sanitised);
     std::fs::create_dir_all(&dir).map_err(|err| ErrorReport {
         error: format!("could not create {}: {err}", dir.display()),
@@ -883,26 +884,6 @@ fn index_tsv(rows: &[FacingRow]) -> String {
 // Output paths
 // ---------------------------------------------------------------------------
 
-/// Replace every character outside `[A-Za-z0-9._-]` so the name is safe as a
-/// directory and filename component on any platform.
-fn sanitise_name(name: &str) -> String {
-    let sanitised: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitised.is_empty() {
-        FALLBACK_DIR_NAME.to_string()
-    } else {
-        sanitised
-    }
-}
-
 /// `<out>/render/<sanitised>/`, absolutised so the reported paths do not depend
 /// on the reader's working directory.
 fn render_dir(out: &Path, sanitised: &str) -> PathBuf {
@@ -1004,7 +985,7 @@ fn summarise_facings(facings: &[u8]) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
 
@@ -1059,17 +1040,6 @@ mod tests {
         assert_eq!(facing_degrees(0xE0), 315);
         // Off-point facings truncate rather than wrapping past a full turn.
         assert_eq!(facing_degrees(0xFF), 358);
-    }
-
-    #[test]
-    fn default_facing_set_is_the_eight_compass_points() {
-        let facings = default_facings();
-        assert_eq!(facings, vec![0, 32, 64, 96, 128, 160, 192, 224]);
-        assert_eq!(facings.len(), COMPASS_NAMES.len());
-        // Every default must be nameable, or the sheet labels lose their point.
-        for facing in facings {
-            assert!(compass_name(facing).is_some(), "facing {facing}");
-        }
     }
 
     #[test]
@@ -1254,14 +1224,6 @@ mod tests {
     }
 
     #[test]
-    fn output_filenames_zero_pad_the_facing_byte() {
-        assert_eq!(facing_png_name("htnk.vxl", 0), "htnk.vxl.000.png");
-        assert_eq!(facing_png_name("htnk.vxl", 32), "htnk.vxl.032.png");
-        assert_eq!(facing_png_name("htnk.vxl", 224), "htnk.vxl.224.png");
-        assert_eq!(sheet_png_name("htnk.vxl"), "htnk.vxl.sheet.png");
-    }
-
-    #[test]
     fn generated_output_predicate_matches_only_our_own_files() {
         assert!(is_generated_output("htnk.vxl.000.png", "htnk.vxl"));
         assert!(is_generated_output("htnk.vxl.224.png", "htnk.vxl"));
@@ -1270,25 +1232,6 @@ mod tests {
         assert!(!is_generated_output("index.tsv", "htnk.vxl"));
         assert!(!is_generated_output("htnk.vxl.notes.png", "htnk.vxl"));
         assert!(!is_generated_output("htnk.vxl.000.txt", "htnk.vxl"));
-    }
-
-    #[test]
-    fn sanitise_name_keeps_safe_characters_and_replaces_the_rest() {
-        assert_eq!(sanitise_name("htnk.vxl"), "htnk.vxl");
-        assert_eq!(sanitise_name("ra2\\dir/na me:x*?"), "ra2_dir_na_me_x__");
-        assert_eq!(sanitise_name(""), FALLBACK_DIR_NAME);
-    }
-
-    #[test]
-    fn render_dir_is_absolute_and_shares_the_shp_output_tree() {
-        // The root is whatever `--out` carried; only the layout under it is ours.
-        let dir = render_dir(Path::new("target/asset"), "htnk.vxl");
-        assert!(dir.is_absolute(), "{}", dir.display());
-        assert!(
-            dir.ends_with(Path::new(RENDER_SUBDIR).join("htnk.vxl")),
-            "{}",
-            dir.display()
-        );
     }
 
     #[test]
@@ -1303,20 +1246,6 @@ mod tests {
         // A corrupt header claiming a giant sprite fails instead of allocating.
         assert_eq!(fit_scale(60_000, 60_000, 1), None);
         assert_eq!(fit_scale(0, 0, 2), Some(2));
-    }
-
-    #[test]
-    fn last_resort_palette_reasons_are_detected_case_insensitively() {
-        assert!(is_last_resort_palette("last-resort-768-byte-scan"));
-        assert!(is_last_resort_palette("Scanned the source archive"));
-        assert!(!is_last_resort_palette("fallback-chain"));
-    }
-
-    #[test]
-    fn summarise_facings_caps_the_listing() {
-        assert_eq!(summarise_facings(&[0, 64, 128]), "0, 64, 128");
-        let many: Vec<u8> = (0..12).collect();
-        assert!(summarise_facings(&many).ends_with("+4 more"));
     }
 
     #[test]

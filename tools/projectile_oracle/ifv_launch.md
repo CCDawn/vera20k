@@ -8,9 +8,7 @@ nor the wider whole-bridge goal is declared complete. Updated 2026-09-26.
 ## Launch corpus and boundary
 
 `ifv_launch.py/json/meta.json` preserve the five-case research payload without
-schema or semantic changes. Original binary SHA256 is
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`;
-metadata records physical file hashes, Unicorn version and explicit boundaries.
+schema or semantic changes. Metadata records physical file hashes, Unicorn version and explicit boundaries.
 The common preparation is imported from `guided_step.py`. No `/tmp` import is
 required.
 
@@ -58,8 +56,8 @@ be cited when claiming them.
 
 ## Current mechanism evidence
 
-All native corpora use the executable SHA above. A native comparison applies
-only to its declared inputs and boundary; supplied lifecycle, map and scene
+All native corpora use the configured original executable. A native comparison
+applies only to its declared inputs and boundary; supplied lifecycle, map and scene
 state does not establish the unexecuted producers.
 
 | Mechanism and authoritative owner | Native evidence | Current Rust evidence |

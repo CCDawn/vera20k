@@ -10,6 +10,7 @@ from unicorn import Uc, UC_ARCH_X86, UC_MODE_32, UC_HOOK_CODE, UC_HOOK_MEM_READ,
 from unicorn.x86_const import UC_X86_REG_EAX, UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDX, UC_X86_REG_EIP, UC_X86_REG_ESP, UC_X86_REG_EBP, UC_X86_REG_FPCW
 
 from tools import native_oracle as oracle
+from tools.native_oracle import require
 
 BASE, SIZE = 0x20000000, 0x01000000
 FILE, VTABLE, VXL, HVA_OBJECT = BASE + 0x100, BASE + 0x200, BASE + 0x300, BASE + 0x400
@@ -23,8 +24,12 @@ def pack(*values):
 
 def render_native(vxl_bytes, hva_bytes, vpl_bytes, draw_matrix=None, diffuse=False,
                   *, bullet_velocity_bits=None, bullet_surface=None, palette=None, ship_pose=None,
-                  drive_pose=None):
+                  drive_pose=None, use_buffer=False):
     """Unmirrored native Render core, preserving all submitted sections.
+
+    `use_buffer` sets 0xB43180 as 0x706ED0 does at 0x00706F12 for a
+    `UseBuffer=yes` TechnoType: 754510 rasterizes the sorted sections in
+    reverse and 756590 dispatches the depth-tested 757980/757BF0 leaves.
 
     `diffuse` lights the draw as VoxelAnimClass::DrawIt does, through 753C80
     with section zero and the world light (0x00749D97..0x00749DA3), instead of
@@ -53,6 +58,7 @@ def render_native(vxl_bytes, hva_bytes, vpl_bytes, draw_matrix=None, diffuse=Fal
     observing_bullet = False
     surface_draws, current_leaves = [], []
     writes, zero_writes, zero_erases = 0, 0, 0
+    depth_tests = {'pass': 0, 'reject': 0, 'tie': 0}
     visited, uninitialized = set(), set()
     initialized = bytearray(oracle.IMAGE_SIZE)
     for rva, raw, size, _vsz, _flags in oracle._sections(oracle.image_bytes()):
@@ -130,13 +136,25 @@ def render_native(vxl_bytes, hva_bytes, vpl_bytes, draw_matrix=None, diffuse=Fal
                     candidate_z=struct.unpack('<i', pack(args[3]))[0],
                     z_offset_words=(args[4] - Z) // 2, a_offset_words=(args[5] - A) // 2,
                     brightness=args[6], source_indices=list(u.mem_read(args[1], args[2]))))
-        if address in (0x7dfab6, 0x7dfbc8):
+        # Colour stores: ordinary leaves keep the colour in DL; UseBuffer's
+        # store BL at C[a] and again at C[a+1].
+        stores = {0x7dfab6: (UC_X86_REG_EDX, 0), 0x7dfbc8: (UC_X86_REG_EDX, 0),
+                  0x757b19: (UC_X86_REG_EBX, 0), 0x757b1f: (UC_X86_REG_EBX, 1),
+                  0x757d4d: (UC_X86_REG_EBX, 0), 0x757d53: (UC_X86_REG_EBX, 1)}
+        if address in stores:
+            register, extra = stores[address]
             writes += 1
-            if u.reg_read(UC_X86_REG_EDX) & 255 == 0:
+            if u.reg_read(register) & 255 == 0:
                 zero_writes += 1
-                destination = 0xb2ff78 + u.reg_read(UC_X86_REG_EAX)
+                destination = 0xb2ff78 + u.reg_read(UC_X86_REG_EAX) + extra
                 zero_erases += int(bytes(u.mem_read(destination, 1))[0] != 0)
-        if address in (0x7df9c0, 0x7dfae0):
+        # Depth compares: forward CMP DX,BX; backward CMP DX,BP.
+        if address in (0x757ac4, 0x757cfb):
+            candidate = u.reg_read(UC_X86_REG_EDX) & 0xffff
+            stored = u.reg_read(UC_X86_REG_EBX if address == 0x757ac4 else UC_X86_REG_EBP) & 0xffff
+            depth_tests['pass' if candidate > stored else 'reject'] += 1
+            depth_tests['tie'] += int(candidate == stored)
+        if address in (0x7df9c0, 0x7dfae0, 0x757980, 0x757bf0):
             raw = bytes(u.mem_read(read32(sp + 4), 0x34))
             params.append({
                 'entry': address,
@@ -145,6 +163,10 @@ def render_native(vxl_bytes, hva_bytes, vpl_bytes, draw_matrix=None, diffuse=Fal
                 'axis_xy': [list(struct.unpack_from('<2h', raw, offset)) for offset in (30, 36, 42)],
                 'sizes': list(raw[48:51]),
             })
+            if address in (0x757980, 0x757bf0):
+                # P+0x1C and the Z words 756590 adds under 0xB43180.
+                params[-1]['origin_z'] = struct.unpack_from('<H', raw, 28)[0]
+                params[-1]['axis_z'] = [struct.unpack_from('<h', raw, offset)[0] for offset in (34, 40, 46)]
         if bullet_surface is not None and address == 0x7c978a:
             substitutions.append(['CRT_atexit', read32(sp + 4)])
             finish(0, 0)
@@ -191,14 +213,14 @@ def render_native(vxl_bytes, hva_bytes, vpl_bytes, draw_matrix=None, diffuse=Fal
         return u.reg_read(UC_X86_REG_EAX)
 
     data = vpl_bytes
-    assert invoke(0x753b70, ecx=FILE, required=(0x758a30,)) == 0
+    require(invoke(0x753b70, ecx=FILE, required=(0x758a30,)) == 0, 'native 0x753B70 returned an unexpected result')
     data = vxl_bytes
-    assert invoke(0x755db0, ecx=VXL, args=(FILE, 0), required=(0x756035, 0x756144)) == 1
+    require(invoke(0x755db0, ecx=VXL, args=(FILE, 0), required=(0x756035, 0x756144)) == 1, 'native 0x755DB0 returned an unexpected result')
     section_count = read32(VXL + 4)
     hva_matrices = []
     if hva_bytes is not None:
         data = hva_bytes
-        assert invoke(0x5bd5c0, ecx=HVA_OBJECT, args=(FILE,), required=(0x5ae5e0,)) == 1
+        require(invoke(0x5bd5c0, ecx=HVA_OBJECT, args=(FILE,), required=(0x5ae5e0,)) == 1, 'native 0x5BD5C0 returned an unexpected result')
         assert read32(HVA_OBJECT + 4) == section_count
         scale_bits = read32(read32(VXL + 0x14) + 0x0c)
         invoke(0x5bd730, ecx=HVA_OBJECT, args=(scale_bits,))
@@ -208,6 +230,10 @@ def render_native(vxl_bytes, hva_bytes, vpl_bytes, draw_matrix=None, diffuse=Fal
     u.reg_write(UC_X86_REG_EBX, 0)
     u.reg_write(UC_X86_REG_ESP, oracle.STACK_BASE + oracle.STACK_SIZE - 0x1000)
     oracle.run_checked(u, 0x52bddd, 0x52be0a, required_addresses=(0x5ae860, 0x754c00))
+    if use_buffer:
+        if ship_pose is not None or drive_pose is not None or bullet_velocity_bits is not None:
+            raise ValueError('UseBuffer is a plain TechnoClass body draw')
+        write(0xb43180, pack(1))
     ship_observation = None
     ground_pose = ship_pose if ship_pose is not None else drive_pose
     if ground_pose is not None:
@@ -394,7 +420,8 @@ def render_native(vxl_bytes, hva_bytes, vpl_bytes, draw_matrix=None, diffuse=Fal
         })
     if bullet_velocity_bits is None:
         invoke(0x754510, ecx=RESULT, required=(0x756590,))
-    assert params and all(p['entry'] in (0x7df9c0, 0x7dfae0) for p in params)
+    leaves = (0x757980, 0x757bf0) if use_buffer else (0x7df9c0, 0x7dfae0)
+    assert params and all(p['entry'] in leaves for p in params)
     assert not uninitialized, sorted(uninitialized)[:10]
     pixels = bytes(u.mem_read(0xb2ff78, 65536))
     result = {
@@ -409,6 +436,10 @@ def render_native(vxl_bytes, hva_bytes, vpl_bytes, draw_matrix=None, diffuse=Fal
         'normal_pages': bytes(u.mem_read(0xb45990, 256)).hex(),
         'read_before_initialized': [], 'substitutions': substitutions,
     }
+    if use_buffer:
+        depth = bytes(u.mem_read(0xb1d5e0, 65536))
+        result['depth'] = [[i, value] for i, value in enumerate(depth) if value]
+        result['depth_tests'] = depth_tests
     if ship_observation is not None:
         result['ship' if ship_pose is not None else 'drive'] = ship_observation
     if bullet_velocity_bits is not None:

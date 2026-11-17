@@ -57,10 +57,19 @@ pub(crate) fn request_gate_open_for_cell(
     let Some(occ) = sim.substrate.occupancy.get(cell.0, cell.1) else {
         return true;
     };
-    let candidates: Vec<u64> = occ
-        .iter_layer(MovementLayer::Ground)
-        .filter_map(|occupant| (occupant.entity_id != mover_id).then_some(occupant.entity_id))
-        .collect();
+    let others = || {
+        occ.iter_layer(MovementLayer::Ground)
+            .filter_map(|occupant| (occupant.entity_id != mover_id).then_some(occupant.entity_id))
+    };
+    // Only a Structure can be a Gate. With none among the others the walk
+    // below skips every candidate, so its list is not built (VERA-only,
+    // results unchanged).
+    if !others().any(|id| {
+        sim.substrate.entities.category_of(id) == Some(EntityCategory::Structure)
+    }) {
+        return true;
+    }
+    let candidates: Vec<u64> = others().collect();
     for candidate_id in candidates {
         let Some(candidate) = sim.substrate.entities.get(candidate_id) else {
             continue;
@@ -73,11 +82,10 @@ pub(crate) fn request_gate_open_for_cell(
         {
             continue;
         }
-        if crate::map::houses::is_allied_with(
-            &sim.house_alliances,
-            sim.interner.resolve(candidate.owner()),
-            sim.interner.resolve(mover_owner),
-        ) {
+        if sim
+            .house_alliances
+            .is_allied(&sim.interner, candidate.owner(), mover_owner)
+        {
             //4525B8..4525D6: Assign(-1), Queue(Open,false), Commence.
             //Read actual MissionCom and Door, never a Gate-local latch.
             if candidate.mission.effective().known() != Some(MissionType::Open)
@@ -86,9 +94,11 @@ pub(crate) fn request_gate_open_for_cell(
                     DoorPhase::Closing | DoorPhase::ClosedStable
                 )
             {
-                let now = sim.session.binary_frame;
+                let now = sim.session.binary_frame();
                 let readiness = LiveReadyInputProvider { rules };
-                let _ = sim.mission_assign_exact(candidate_id, MissionId::NONE, now);
+                let _ = sim
+                    .substrate
+                    .mission_assign_exact(candidate_id, MissionId::NONE, now);
                 let _ = sim.mission_queue_exact(
                     candidate_id,
                     MissionId::from_known(MissionType::Open),
@@ -96,7 +106,7 @@ pub(crate) fn request_gate_open_for_cell(
                     now,
                     &readiness,
                 );
-                let _ = sim.mission_commence_exact(candidate_id, now);
+                let _ = sim.substrate.mission_commence_exact(candidate_id, now);
                 return false;
             }
             return candidate.is_open_gate();
@@ -108,9 +118,25 @@ pub(crate) fn request_gate_open_for_cell(
     true
 }
 
+/// Client-crate fixtures: `mover_id` asks the Gate on `cell` to open through
+/// [`request_gate_open_for_cell`].
+#[cfg(any(test, feature = "test-support"))]
+pub fn request_gate_open_for_test(
+    sim: &mut Simulation,
+    cell: (u16, u16),
+    mover_id: u64,
+    rules: &RuleSet,
+) -> bool {
+    request_gate_open_for_cell(sim, cell, mover_id, rules)
+}
+
 ///44E3A0: GetFoundation(false), then main Ground lists. Any pointer other
 ///than the Gate obstructs; bridge-layer occupants and Health are not queried.
-fn footprint_has_other_object(sim: &Simulation, id: u64, foundation: &str) -> bool {
+fn footprint_has_other_object(
+    sim: &Simulation,
+    id: u64,
+    foundation: &crate::rules::foundation::Foundation,
+) -> bool {
     let Some(gate) = sim.substrate.entities.get(id) else {
         return false;
     };
@@ -138,7 +164,8 @@ pub(crate) fn mission_open(sim: &mut Simulation, id: u64, rules: &RuleSet) -> i3
     let Some(object) = sim.interner.object_type(entity.type_ref(), rules) else {
         return 0;
     };
-    let now = sim.session.binary_frame;
+    let now = sim.session.binary_frame();
+    let ares = rules.ares_form();
     if !object.gate {
         //44E77C..44E794: non-Gate Open queues Guard without commencing.
         let readiness = LiveReadyInputProvider { rules };
@@ -163,23 +190,40 @@ pub(crate) fn mission_open(sim: &mut Simulation, id: u64, rules: &RuleSet) -> i3
             if phase == DoorPhase::OpenStable {
                 entity.mission.set_handler_state(2);
                 entity
+                    .building
                     .building_gate
                     .get_or_insert_with(Default::default)
                     .hold_timer
                     .arm(now, hold_ticks);
-                return sim.mission_rate_epilogue_for(rules, id, MissionType::Open);
+                return Simulation::mission_rate_epilogue_for(
+                    &mut sim.scenario_rng,
+                    &sim.substrate,
+                    rules,
+                    id,
+                    MissionType::Open,
+                );
             }
-            if phase == DoorPhase::Closing {
+            let opened = if phase == DoorPhase::Closing {
                 entity.reverse_door(now);
+                false
             } else if phase != DoorPhase::Opening {
                 entity.open_door(deploy_ticks, now);
-            }
+                true
+            } else {
+                false
+            };
             entity.mission.set_handler_state(1);
             entity
+                .building
                 .building_gate
                 .get_or_insert_with(Default::default)
                 .hold_timer
                 .arm(now, hold_ticks);
+            //44E550 plays GateDown after starting the door; a game without
+            // Ares leaves that stock sound and its redraw a residual.
+            if ares && opened {
+                play_gate_sound(sim, id, object, false, rules);
+            }
             0
         }
         1 | 4 => {
@@ -194,40 +238,84 @@ pub(crate) fn mission_open(sim: &mut Simulation, id: u64, rules: &RuleSet) -> i3
             if phase == DoorPhase::ClosedStable {
                 //44E70C: canonical Building44D6A0(0,1), then state5.
                 //Guard stays queued until the host's Ready check.
-                sim.building_enter_idle_mode(id, false, Some(rules));
+                sim.building_enter_idle_mode(id, false, rules);
                 if let Some(entity) = sim.substrate.entities.get_mut(id) {
                     entity.mission.set_handler_state(5);
                 }
             }
-            //GateStage+703, dirty+80, sound and repaint remain the existing
-            //presentation residual; there is no second Door state.
+            //GateStage+703, dirty+80 and sound remain presentation residuals;
+            //the drawn frame reads the Door (building_art::gate_open_body_frame).
             0
         }
         2 => {
             let obstructed = footprint_has_other_object(sim, id, &object.foundation);
             let entity = sim.substrate.entities.get_mut(id).unwrap();
-            let gate = entity.building_gate.get_or_insert_with(Default::default);
+            let gate = entity
+                .building
+                .building_gate
+                .get_or_insert_with(Default::default);
             if obstructed {
                 //44E69F: reseed; never decrement/reanchor on a read.
                 gate.hold_timer.arm(now, hold_ticks);
             } else if gate.hold_timer.due(now) {
                 entity.mission.set_handler_state(3);
             }
-            sim.mission_rate_epilogue_for(rules, id, MissionType::Open)
+            Simulation::mission_rate_epilogue_for(
+                &mut sim.scenario_rng,
+                &sim.substrate,
+                rules,
+                id,
+                MissionType::Open,
+            )
         }
         3 => {
-            //44E5DA: Close, state4, no cadence RNG.
+            //44E5DA: Close, state4, no cadence RNG; then44E61E's GateUp.
             let entity = sim.substrate.entities.get_mut(id).unwrap();
             entity.close_door(deploy_ticks, now);
             entity.mission.set_handler_state(4);
+            if ares {
+                play_gate_sound(sim, id, object, true, rules);
+            }
             0
         }
         //44E464: states above4 share the cadence exit44E4BA.
-        _ => sim.mission_rate_epilogue_for(rules, id, MissionType::Open),
+        _ => Simulation::mission_rate_epilogue_for(
+            &mut sim.scenario_rng,
+            &sim.substrate,
+            rules,
+            id,
+            MissionType::Open,
+        ),
     }
 }
 
-#[cfg(test)]
+/// Mission_Open's `VocClass::PlayAt` at the gate's Location of GateUp as it
+/// closes (`up`) or GateDown as it opens. Ares BuildingClass_Mi_Open_GateUp
+/// (100156B0, hook 0x44E61E) and _GateDown (10015670, hook 0x44E550) take
+/// the type's `GateUpSound`/`GateDownSound` before `[AudioVisual]`'s.
+fn play_gate_sound(
+    sim: &mut Simulation,
+    id: u64,
+    object: &crate::rules::object_type::ObjectType,
+    up: bool,
+    rules: &RuleSet,
+) {
+    let sound = object
+        .building_type_ext()
+        .gate_sound(up)
+        .unwrap_or(rules.general.gate_sound(up));
+    let (Some(sound), Some(entity)) = (sound, sim.substrate.entities.get(id)) else {
+        return;
+    };
+    let event = crate::sim::world::SimSoundEvent::voc_at_location(
+        sound.to_owned(),
+        entity,
+        sim.resolved_terrain.as_ref(),
+    );
+    sim.sound_events.emit(event);
+}
+
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
     use crate::map::resolved_terrain::test_flat_ground_grid;
@@ -282,7 +370,7 @@ mod tests {
         .unwrap();
         let mut sim = Simulation::with_seed(seed);
         sim.install_resolved_terrain_for_new_map(test_flat_ground_grid(24));
-        sim.session.binary_frame = frame;
+        sim.session.set_binary_frame_for_test(frame);
         let owner = sim.interner.intern("Americans");
         let ty = sim.interner.intern("GATE");
         let mut gate = GameEntity::new_at_frame_for_test(
@@ -314,7 +402,7 @@ mod tests {
             other => panic!("unknown native phase {other}"),
         }
         let hold = &row["initial"]["hold"];
-        gate.building_gate = Some(BuildingGateRuntime {
+        gate.building.building_gate = Some(BuildingGateRuntime {
             hold_timer: MissionTimer::armed(
                 hold[0].as_i64().unwrap() as u32,
                 hold[1].as_i64().unwrap() as u32,
@@ -335,7 +423,7 @@ mod tests {
         // The native fixture supplies an already admitted cell-list object;
         // class construction/reveal is outside this comparison boundary.
         gate.lifecycle.set_in_limbo_for_test(false);
-        gate.lifecycle.set_cell_marked(true);
+        gate.lifecycle.set_cell_marked_for_test(true);
         gate.set_in_playfield(true);
         sim.substrate.entities.insert(gate);
         let mover_type = sim.interner.intern("MTNK");
@@ -430,7 +518,7 @@ mod tests {
             native["door"],
             "{context}: Door timer"
         );
-        let hold = entity.building_gate.unwrap().hold_timer;
+        let hold = entity.building.building_gate.unwrap().hold_timer;
         // Native+610 is a separate nominal value, but every Gate writer
         // seeds it identically with60C and no retained read mutates either.
         assert_eq!(
@@ -516,8 +604,9 @@ mod tests {
         // The cadence's starting hold clock is the fixture's retained input.
         let setup = json!({"input": row["input"], "initial": {"hold": [100,180,180]}});
         let (mut sim, rules) = native_fixture(&setup);
-        sim.building_enter_idle_mode(GATE, false, Some(&rules));
-        sim.mission_assign_exact(GATE, MissionId::from_known(MissionType::Guard), 100)
+        sim.building_enter_idle_mode(GATE, false, &rules);
+        sim.substrate
+            .mission_assign_exact(GATE, MissionId::from_known(MissionType::Guard), 100)
             .unwrap();
         sim.substrate
             .entities
@@ -536,12 +625,16 @@ mod tests {
             row["admission"].as_u64().unwrap()
         );
         assert_native_rng(&sim, &row["rng_before"], "cadence admission");
-        sim.session.binary_frame = 101;
+        sim.session.set_binary_frame_for_test(101);
         let frames = row["frames"].as_array().unwrap();
         assert_eq!(frames.len(), 350);
         for native in frames {
             let frame = native["frame"].as_u64().unwrap() as u32;
-            assert_eq!(sim.session.binary_frame, frame, "frame owner before visit");
+            assert_eq!(
+                sim.session.binary_frame(),
+                frame,
+                "frame owner before visit"
+            );
             sim.advance_tick(&[], Some(&rules), None, None, 67);
             let context = format!("Gate object turn{frame}");
             assert_native_state(&sim, native, &context);
@@ -588,11 +681,14 @@ mod tests {
                 entity.door_timer_fields(),
                 "{name}: Door clock"
             );
-            assert_eq!(restored.building_gate, entity.building_gate, "{name}: hold");
-            let initial_hold = entity.building_gate;
+            assert_eq!(
+                restored.building.building_gate, entity.building.building_gate,
+                "{name}: hold"
+            );
+            let initial_hold = entity.building.building_gate;
             let serialized = serde_json::to_value(entity).unwrap();
             assert_eq!(
-                serialized["building_gate"]
+                serialized["building"]["building_gate"]
                     .as_object()
                     .unwrap()
                     .keys()
@@ -607,15 +703,21 @@ mod tests {
                 .entities
                 .get_mut(GATE)
                 .unwrap()
+                .building
                 .building_gate
                 .as_mut()
                 .unwrap()
                 .hold_timer;
             timer.set_start_frame_for_test(timer.start_frame().wrapping_add(1));
             assert_ne!(sim.state_hash(), hash, "{name}: hold anchor in world hash");
-            sim.substrate.entities.get_mut(GATE).unwrap().building_gate = initial_hold;
+            sim.substrate
+                .entities
+                .get_mut(GATE)
+                .unwrap()
+                .building
+                .building_gate = initial_hold;
             assert_eq!(sim.state_hash(), hash, "{name}: restored hold");
-            let frame = sim.session.binary_frame;
+            let frame = sim.session.binary_frame();
             sim.substrate
                 .entities
                 .get_mut(GATE)
@@ -644,7 +746,7 @@ mod tests {
             10,
             EntityCategory::Structure,
         );
-        gate.building_gate = Some(BuildingGateRuntime::default());
+        gate.building.building_gate = Some(BuildingGateRuntime::default());
         sim.substrate.entities.insert(gate);
         sim.interner = test_interner();
         sim.substrate.occupancy.add(
@@ -658,84 +760,47 @@ mod tests {
         (sim, rules)
     }
 
+    /// DrawBody's gate branch (`0x0043D546..0x0043D68F`) over the shared
+    /// Door: `ftol(progress * GateStages)` while opening, counted back while
+    /// closing, `GateStages - 1` once open and clamped there, plus
+    /// `GateStages + 1` at ConditionYellow or below; closed, or off Mission
+    /// Open, GetCurrentFrame draws instead.
     #[test]
-    fn allied_gate_request_uses_real_mission_and_read_only_passability() {
-        let (mut sim, rules) = fixture();
-        let rng = sim.scenario_rng.logical_state();
-        assert!(!request_gate_open_for_cell(&mut sim, (10, 10), 1, &rules));
-        let gate = sim.substrate.entities.get(100).unwrap();
-        assert_eq!(gate.mission.current().known(), Some(MissionType::Open));
-        assert_eq!(gate.mission.queued(), MissionId::NONE);
-        assert_eq!(gate.mission.handler_state(), 0);
-        assert_eq!(gate.door_phase(), DoorPhase::ClosedStable);
-        assert!(!gate.is_open_gate());
-        assert_eq!(sim.scenario_rng.logical_state(), rng);
-
-        assert_eq!(mission_open(&mut sim, 100, &rules), 0);
-        let gate = sim.substrate.entities.get(100).unwrap();
-        assert_eq!(gate.mission.handler_state(), 1);
-        assert_eq!(gate.door_phase(), DoorPhase::Opening);
-        assert_eq!(sim.scenario_rng.logical_state(), rng);
-        sim.session.binary_frame = 39;
+    fn a_gate_draws_its_door_progress_while_open() {
+        let (mut sim, _) = fixture();
+        let frame_at = |sim: &Simulation, frame: u32| {
+            crate::sim::building_art::gate_open_body_frame(
+                sim.substrate.entities.get(GATE).unwrap(),
+                9,
+                1000,
+                0.5,
+                frame,
+            )
+        };
+        let gate = sim.substrate.entities.get_mut(GATE).unwrap();
+        gate.health = Health::new(1000);
+        gate.open_door(10, 0);
+        assert_eq!(frame_at(&sim, 5), None, "not on Mission Open");
         sim.substrate
-            .entities
-            .get_mut(100)
-            .unwrap()
-            .advance_door(39);
-        assert!(request_gate_open_for_cell(&mut sim, (10, 10), 1, &rules));
-        assert_eq!(
-            sim.substrate
-                .entities
-                .get(100)
-                .unwrap()
-                .mission
-                .handler_state(),
-            1
-        );
-        assert_eq!(mission_open(&mut sim, 100, &rules), 0);
-        assert_eq!(
-            sim.substrate
-                .entities
-                .get(100)
-                .unwrap()
-                .mission
-                .handler_state(),
-            2
-        );
-    }
-
-    #[test]
-    fn hold_reads_only_ground_lists_and_preserves_its_anchor() {
-        let (mut sim, rules) = fixture();
-        request_gate_open_for_cell(&mut sim, (10, 10), 1, &rules);
-        let gate = sim.substrate.entities.get_mut(100).unwrap();
-        gate.open_door(0, 0);
-        gate.advance_door(0);
-        mission_open(&mut sim, 100, &rules);
-        sim.substrate.occupancy.add(
-            11,
-            10,
-            1,
-            MovementLayer::Bridge,
-            None,
-            CellListInsertion::PrependNonBuilding,
-        );
-        sim.session.binary_frame = 179;
-        mission_open(&mut sim, 100, &rules);
-        let gate = sim.substrate.entities.get(100).unwrap();
-        assert_eq!(gate.mission.handler_state(), 2);
-        assert_eq!(
-            gate.building_gate.unwrap().hold_timer,
-            MissionTimer::armed(0, 180)
-        );
-        sim.session.binary_frame = 180;
-        mission_open(&mut sim, 100, &rules);
-        let gate = sim.substrate.entities.get(100).unwrap();
-        assert_eq!(gate.mission.handler_state(), 3);
-        assert_eq!(
-            gate.building_gate.unwrap().hold_timer,
-            MissionTimer::armed(0, 180)
-        );
+            .mission_assign_exact(GATE, MissionId::from_known(MissionType::Open), 0)
+            .unwrap();
+        for (frame, stage) in [(0, 0), (1, 0), (5, 4), (9, 8), (10, 8)] {
+            assert_eq!(frame_at(&sim, frame), Some(stage), "opening at {frame}");
+        }
+        let gate = sim.substrate.entities.get_mut(GATE).unwrap();
+        gate.advance_door(10);
+        assert_eq!(frame_at(&sim, 12), Some(8), "open");
+        let gate = sim.substrate.entities.get_mut(GATE).unwrap();
+        gate.close_door(10, 20);
+        for (frame, stage) in [(20, 8), (21, 8), (25, 5), (29, 1), (30, 0)] {
+            assert_eq!(frame_at(&sim, frame), Some(stage), "closing at {frame}");
+        }
+        let gate = sim.substrate.entities.get_mut(GATE).unwrap();
+        gate.health = Health::new(500);
+        assert_eq!(frame_at(&sim, 25), Some(15), "yellow health");
+        let gate = sim.substrate.entities.get_mut(GATE).unwrap();
+        gate.advance_door(30);
+        assert_eq!(frame_at(&sim, 31), None, "closed");
     }
 
     /// PlaceInfantryInCell refuses a ground object bit unless its building
@@ -763,7 +828,7 @@ mod tests {
                 &sim.substrate.raw_cell_occupation,
                 &sim.substrate.occupancy,
                 &sim.substrate.entities,
-                Some(&rules),
+                &rules,
                 &sim.interner,
                 &mut sim.scenario_rng,
                 crate::sim::components::DriveCoord {
@@ -799,5 +864,75 @@ mod tests {
             rng,
             "an admitted centre request draws its row (0x0048138A)"
         );
+    }
+
+    /// Ares BuildingClass_Mi_Open_GateDown (10015670, hook 0x44E550) and
+    /// _GateUp (100156B0, hook 0x44E61E): starting to open plays the type's
+    /// GateDownSound, else `[AudioVisual] GateDown`; state 3's close plays
+    /// GateUpSound, else GateUp.
+    #[test]
+    fn ares_gate_sounds_take_the_type_sound_before_the_rules_one() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let ini = IniFile::from_str(
+            "[AudioVisual]\nGateDown=Rules\nGateUp=Rules\n[BuildingTypes]\n0=GATE\n\
+             [GATE]\nStrength=1000\nFoundation=2x2\nGate=yes\nDeployTime=.044\n\
+             GateDownSound=Down\n",
+        );
+        let mut rules = RuleSet::from_ini(&ini).unwrap();
+        let sounds = crate::rules::sound_ini::SoundRegistry::from_ini(&IniFile::from_str(
+            "[SoundList]\n0=Rules\n1=Down\n",
+        ));
+        rules.bind_type_sound_references(&ini, &sounds);
+        let mut sim = Simulation::with_seed(1);
+        sim.install_resolved_terrain_for_new_map(test_flat_ground_grid(24));
+        sim.session.set_binary_frame_for_test(100);
+        let owner = sim.interner.intern("Americans");
+        let ty = sim.interner.intern("GATE");
+        let mut gate = GameEntity::new_at_frame_for_test(
+            GATE,
+            12,
+            12,
+            0,
+            0,
+            owner,
+            Health::new(1000),
+            ty,
+            EntityCategory::Structure,
+            0,
+            0,
+            false,
+            100,
+        );
+        gate.mission.apply_test_fixture(MissionTestFixture {
+            current: MissionId::from_known(MissionType::Open),
+            suspended: MissionId::NONE,
+            queued: MissionId::NONE,
+            movement_bypass_latch: 0,
+            handler_state: 0,
+            mission_start_frame: 100,
+            ai_counter: 0,
+            dispatch_timer: MissionDispatchTimer::from_raw(100, 0),
+        });
+        sim.substrate.entities.insert(gate);
+        let played = |sim: &mut Simulation| {
+            sim.sound_events
+                .take_for_test()
+                .into_iter()
+                .filter_map(|event| match event {
+                    crate::sim::world::SimSoundEvent::VocAt { sound_id, .. } => Some(sound_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(mission_open(&mut sim, GATE, &rules), 0);
+        assert_eq!(played(&mut sim), ["Down"]);
+        sim.substrate
+            .entities
+            .get_mut(GATE)
+            .unwrap()
+            .mission
+            .set_handler_state(3);
+        mission_open(&mut sim, GATE, &rules);
+        assert_eq!(played(&mut sim), ["Rules"]);
     }
 }

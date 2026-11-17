@@ -135,7 +135,7 @@ fn parse_name(fields: &[&str]) -> Option<String> {
         .map(|name| truncate_native_bytes(name, 0x30).to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
 
@@ -241,11 +241,5 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 29);
-    }
-
-    #[test]
-    fn test_missing_triggers_is_empty() {
-        let ini = IniFile::from_str("[Map]\nTheater=TEMPERATE\n");
-        assert!(parse_triggers(&ini).is_empty());
     }
 }

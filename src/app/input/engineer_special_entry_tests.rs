@@ -31,19 +31,22 @@ fn scene_with_repair_step(
     let mut sim = Simulation::with_seed(2022);
     crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
     sim.resolve_type_handles(&rules);
-    let owner = sim.interner.intern("Americans");
-    sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 10_000, 10));
-    sim.session.current_house = Some(owner);
-    sim.session.game_mode_nonzero = true;
-    sim.input_delay_ticks = 0;
-    sim.session.game_options.short_game = false;
-    sim.session.house_order.push(owner);
+    let owner = sim.intern("Americans");
+    sim.houses_mut_for_test()
+        .register(HouseState::new(owner, 0, None, true, 10_000, 10));
+    sim.session_mut_for_test()
+        .set_current_house_for_test(Some(owner));
+    sim.session_mut_for_test()
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    sim.set_input_delay_ticks(0);
+    sim.session_mut_for_test()
+        .game_options_mut_for_test()
+        .short_game = false;
     let actor = sim
         .spawn_object("ENGINEER", "Americans", 10, 12, 0, &rules)
         .unwrap();
     if hospital {
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(actor)
             .unwrap()
             .health
@@ -67,7 +70,7 @@ fn step(sim: &mut Simulation, rules: &RuleSet) -> crate::sim::world::SimFrameOut
     let commands = sim.take_due_commands();
     sim.advance_app_frame(
         &commands,
-        Some(rules),
+        rules,
         None,
         33,
         crate::sim::world::TickLane::Ordinary,
@@ -88,19 +91,19 @@ fn click(
     let orders = engineer_capture_orders(sim, rules, &mut selected, hover).unwrap();
     assert_eq!(orders.len(), 1);
     let record = if planning {
-        sim.encode_planning_order_record(owner, &orders[0])
+        sim.encode_planning_order_record(owner, &orders[0], None)
     } else {
         sim.encode_megamission_record(owner, &orders[0])
     }
     .unwrap();
     let command = sim
-        .decode_native_command_record(&record, sim.session.tick)
+        .decode_native_command_record(&record, sim.session().tick())
         .unwrap();
     assert!(sim.apply_command("Americans", &command.payload, Some(rules)));
     if planning {
         let record = sim.encode_plan_commit_record(owner).unwrap();
         let command = sim
-            .decode_native_command_record(&record, sim.session.tick)
+            .decode_native_command_record(&record, sim.session().tick())
             .unwrap();
         assert!(sim.apply_command("Americans", &command.payload, Some(rules)));
     }
@@ -111,7 +114,7 @@ fn ordinary_and_planned_grinder_clicks_consume_engineers_and_refund_once() {
     for planning in [false, true] {
         let (mut sim, rules, actor, hover) = scene(false);
         let owner = sim.entities().get(actor).unwrap().owner();
-        let before = sim.houses[&owner].economy.credits();
+        let before = sim.houses()[&owner].economy().credits();
         click(&mut sim, &rules, actor, &hover, planning);
         for _ in 0..600 {
             step(&mut sim, &rules);
@@ -120,12 +123,12 @@ fn ordinary_and_planned_grinder_clicks_consume_engineers_and_refund_once() {
             }
         }
         assert!(sim.entities().get(actor).is_none(), "planning={planning}");
-        assert_eq!(sim.houses[&owner].economy.credits(), before + 500);
+        assert_eq!(sim.houses()[&owner].economy().credits(), before + 500);
         assert!(sim.planning_paths(owner).is_empty());
         for _ in 0..10 {
             step(&mut sim, &rules);
         }
-        assert_eq!(sim.houses[&owner].economy.credits(), before + 500);
+        assert_eq!(sim.houses()[&owner].economy().credits(), before + 500);
     }
 }
 
@@ -134,7 +137,7 @@ fn ordinary_and_planned_hospital_clicks_enter_heal_and_exit_after_save_load() {
     for planning in [false, true] {
         let (mut sim, rules, actor, hover) = scene(true);
         let owner = sim.entities().get(actor).unwrap().owner();
-        let before = sim.houses[&owner].economy.credits();
+        let before = sim.houses()[&owner].economy().credits();
         assert_eq!(rules.object("FACILITY").unwrap().passengers, 0);
         click(&mut sim, &rules, actor, &hover, planning);
         let mut entered = false;
@@ -149,7 +152,7 @@ fn ordinary_and_planned_hospital_clicks_enter_heal_and_exit_after_save_load() {
                 entered = true;
                 assert!(patient.in_limbo());
                 assert!(patient.has_live_contact_with(hover.stable_id));
-                let terrain = sim.resolved_terrain.as_ref().unwrap().clone();
+                let terrain = sim.resolved_terrain().unwrap().clone();
                 let bytes = crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "hospital", 0);
                 sim = crate::sim::snapshot::GameSnapshot::load(&bytes)
                     .unwrap()
@@ -158,7 +161,7 @@ fn ordinary_and_planned_hospital_clicks_enter_heal_and_exit_after_save_load() {
                 sim.resolve_type_handles(&rules);
                 // Restore the same external32x32 map, not supply_native_map's
                 // default64x64 map (the snapshot's overlay plane is32x32).
-                sim.resolved_terrain = Some(terrain);
+                *sim.resolved_terrain_mut_for_test() = Some(terrain);
                 crate::sim::arena_fixture::supply_native_map(&mut sim);
                 assert!(sim.rebuild_dynamic_navigation(&rules));
             } else if entered
@@ -175,7 +178,7 @@ fn ordinary_and_planned_hospital_clicks_enter_heal_and_exit_after_save_load() {
             "planning={planning}: entered={entered}, left={left}"
         );
         assert_eq!(
-            sim.houses[&owner].economy.credits(),
+            sim.houses()[&owner].economy().credits(),
             before,
             "infantry repair is free"
         );
@@ -194,7 +197,7 @@ fn ordinary_and_planned_hospital_clicks_enter_heal_and_exit_after_save_load() {
 #[test]
 fn damaged_grinders_keep_the_repair_action_and_healthy_patients_do_not_enter() {
     let (mut sim, rules, actor, hover) = scene(false);
-    sim.entities_mut()
+    sim.entities_mut_for_test()
         .get_mut(hover.stable_id)
         .unwrap()
         .health
@@ -208,7 +211,7 @@ fn damaged_grinders_keep_the_repair_action_and_healthy_patients_do_not_enter() {
         }]
     );
     let (mut sim, rules, actor, hover) = scene(true);
-    sim.entities_mut()
+    sim.entities_mut_for_test()
         .get_mut(actor)
         .unwrap()
         .health
@@ -226,7 +229,7 @@ fn hospital_can_load_preserves_native_ammo_admission() {
     //admit. This query is separate from the clicked Enter's CAN_DOCK0E.
     for ammo in [0, 1, -1] {
         let (mut sim, rules, actor, hover) = scene(true);
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(hover.stable_id)
             .unwrap()
             .install_ammo_for_test(Some(crate::sim::ammo::TechnoAmmo::new(ammo)));
@@ -237,7 +240,7 @@ fn hospital_can_load_preserves_native_ammo_admission() {
                 hover.stable_id,
                 RadioMessage::CanEnter,
                 RadioPayload::default(),
-                Some(&rules),
+                &rules,
                 Default::default()
             ),
             if ammo == 0 {
@@ -255,10 +258,14 @@ fn hospital_completion_uses_the_native_player_house_voice_gate() {
         let (mut sim, rules, actor, hover) = scene(true);
         click(&mut sim, &rules, actor, &hover, false);
         if !local {
-            let other = sim.interner.intern("OtherHuman");
-            sim.houses
-                .insert(other, HouseState::new(other, 0, None, true, 10_000, 10));
-            sim.session.current_house = Some(other);
+            let other = sim.intern("OtherHuman");
+            sim.houses_mut_for_test()
+                .register(HouseState::new(other, 0, None, true, 10_000, 10));
+            // A House holding nothing is defeated on its first House update.
+            sim.spawn_object("ENGINEER", "OtherHuman", 2, 2, 0, &rules)
+                .unwrap();
+            sim.session_mut_for_test()
+                .set_current_house_for_test(Some(other));
         }
         let mut heard_completion = false;
         for _ in 0..500 {
@@ -278,7 +285,10 @@ fn stopping_before_entry_does_not_grind_or_hide_the_engineer() {
         for planning in [false, true] {
             let (mut sim, rules, actor, hover) = scene(hospital);
             click(&mut sim, &rules, actor, &hover, planning);
-            for _ in 0..2 {
+            // A plan's order publishes at the frame-5 send boundary
+            // (PlanMgr 0x00637550) and runs even after a later Stop, so let
+            // it start first; the engineer is still cells from the door.
+            for _ in 0..10 {
                 step(&mut sim, &rules);
             }
             assert!(sim.apply_command(
@@ -337,7 +347,7 @@ fn infantry_repair_tick_clamps_nonpositive_steps_to_one() {
     for repair_step in [0, -3] {
         let (mut sim, rules, actor, hover) = scene_with_repair_step(true, repair_step);
         let owner = sim.entities().get(actor).unwrap().owner();
-        let before = sim.houses[&owner].economy.credits();
+        let before = sim.houses()[&owner].economy().credits();
         assert_eq!(rules.general.infantry_repair_step, repair_step);
         assert_eq!(
             transmit(
@@ -346,13 +356,13 @@ fn infantry_repair_tick_clamps_nonpositive_steps_to_one() {
                 actor,
                 RadioMessage::RepairTick,
                 RadioPayload::default(),
-                Some(&rules),
+                &rules,
                 Default::default(),
             ),
             RadioResponse::Roger
         );
         assert_eq!(sim.entities().get(actor).unwrap().health.current(), 31);
-        assert_eq!(sim.houses[&owner].economy.credits(), before);
+        assert_eq!(sim.houses()[&owner].economy().credits(), before);
     }
 }
 
@@ -440,14 +450,18 @@ fn retail_engineer_grinder_clicks_reach_yagrnd_in_both_input_modes() {
         let mut sim = Simulation::with_seed(2022);
         crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
         sim.resolve_type_handles(&rules);
-        let owner = sim.interner.intern("Americans");
-        sim.houses
-            .insert(owner, HouseState::new(owner, 0, None, true, 10_000, 10));
-        sim.session.current_house = Some(owner);
-        sim.session.house_order.push(owner);
-        sim.session.game_mode_nonzero = true;
-        sim.session.game_options.short_game = false;
-        sim.input_delay_ticks = 0;
+        let owner = sim.intern("Americans");
+        sim.houses_mut_for_test()
+            .register(HouseState::new(owner, 0, None, true, 10_000, 10));
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        sim.session_mut_for_test()
+            .game_options_mut_for_test()
+            .short_game = false;
+        sim.set_input_delay_ticks(0);
         let actor = sim
             .spawn_object("ENGINEER", "Americans", 10, 12, 0, &rules)
             .unwrap();
@@ -467,7 +481,7 @@ fn retail_engineer_grinder_clicks_reach_yagrnd_in_both_input_modes() {
         }
         assert!(sim.entities().get(actor).is_none(), "planning={planning}");
         assert_eq!(
-            sim.houses[&owner].economy.credits(),
+            sim.houses()[&owner].economy().credits(),
             10_000 + rules.object("ENGINEER").unwrap().soylent
         );
     }

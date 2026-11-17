@@ -18,17 +18,23 @@ fn native_click_shroud_controls_match_cursor_and_both_object_pickers() {
         for row in rows {
             let input = &row["input"];
             let mut sim = Simulation::new();
-            let player = sim.interner.intern("Player");
-            let enemy = sim.interner.intern("Enemy");
-            let typ = sim.interner.intern("GAPILL");
+            let player = sim.intern("Player");
+            let enemy = sim.intern("Enemy");
+            let typ = sim.intern("GAPILL");
             let level = input["level"].as_u64().unwrap() as u8;
+            let flags = input["flags"].as_u64().unwrap() as u32;
+            let on_bridge = flags & crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL != 0;
             let mut terrain_cells = Vec::new();
             for y in 0..32 {
                 for x in 0..32 {
                     let mut cell = ResolvedTerrainCell::clear_for_test(x, y);
                     cell.level = level;
-                    if (x, y) == (20, 20) {
-                        cell.bridge_facts.raw_flags = input["flags"].as_u64().unwrap() as u32;
+                    // The native suffix supplies an already-resolved Cell.
+                    // Its bridge controls therefore need a coherent upstream
+                    // span and a deck-height object, rather than disabling
+                    // bridge picking to force that Cell at a ground pixel.
+                    if (x, y) == (20, 20) || on_bridge && y == 20 && (18..=21).contains(&x) {
+                        cell.bridge_facts.raw_flags = flags;
                     }
                     terrain_cells.push(cell);
                 }
@@ -38,8 +44,8 @@ fn native_click_shroud_controls_match_cursor_and_both_object_pickers() {
                 32,
                 terrain_cells,
             ));
-            sim.fog.width = 32;
-            sim.fog.height = 32;
+            sim.fog_mut_for_test().set_width_for_test(32);
+            sim.fog_mut_for_test().set_height_for_test(32);
             let mapped: Vec<_> = input["mapped_cells"]
                 .as_array()
                 .unwrap()
@@ -51,12 +57,13 @@ fn native_click_shroud_controls_match_cursor_and_both_object_pickers() {
                     )
                 })
                 .collect();
-            sim.fog.reveal_cells_for_owner(player, mapped);
+            sim.fog_mut_for_test()
+                .reveal_cells_for_owner(player, mapped);
             let mut entity = GameEntity::new_at_frame_zero_for_test(
                 1,
                 20,
                 20,
-                level,
+                if on_bridge { level + 4 } else { level },
                 0,
                 enemy,
                 Health::new(100),
@@ -66,12 +73,13 @@ fn native_click_shroud_controls_match_cursor_and_both_object_pickers() {
                 5,
                 false,
             );
+            entity.set_on_bridge(on_bridge);
             entity.lifecycle.set_object_alive_for_test(true);
             entity.lifecycle.set_in_limbo_for_test(false);
             assert!(!entity.discovery.discovered_by_current_house());
             let (sx, sy) =
                 crate::render::locomotor_visual::ground_screen_position(&entity.position);
-            sim.entities_mut().insert(entity);
+            sim.entities_mut_for_test().insert(entity);
             sim.resubmit_entity_display_for_test(1);
             // Use the same retained Display owner as the production Click arm.
             // The bounded ScreenSelection list wrongly removes projected-only
@@ -79,16 +87,36 @@ fn native_click_shroud_controls_match_cursor_and_both_object_pickers() {
             let encounter_order =
                 crate::app::presentation::instances::tactical_entity_encounter_order(&sim);
             assert_eq!(encounter_order, [1]);
-            let terrain = sim.resolved_terrain.as_ref().unwrap();
-            let heights = terrain.build_height_map();
-            assert_eq!(
-                crate::app::match_runtime::sim_tick::world_point_to_cell(sx, sy, &heights, None),
+            let terrain = sim.resolved_terrain().unwrap();
+
+            let expected_cell = if on_bridge {
+                let native =
+                    crate::test_fixture::json("tools/bridge_click_state_oracle/vectors.json");
+                let upstream = native["shroud_upstream_rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|case| {
+                        case["base_height"] == level
+                            && case["world_input"][0].as_f64() == Some(f64::from(sx))
+                            && case["world_input"][1].as_f64() == Some(f64::from(sy))
+                    })
+                    .unwrap();
+                (
+                    upstream["expected_cell"][0].as_u64().unwrap() as u16,
+                    upstream["expected_cell"][1].as_u64().unwrap() as u16,
+                )
+            } else {
                 (20, 20)
+            };
+            assert_eq!(
+                crate::app::match_runtime::sim_tick::world_point_to_cell(sx, sy, Some(terrain)),
+                expected_cell
             );
             let expected = row["picked_target"].as_bool().unwrap().then_some(1);
             let visible = crate::app::presentation::instances::cell_visibility_for_local_owner(
                 Some(player),
-                Some(&sim.fog),
+                Some(sim.fog()),
                 20,
                 20,
                 false,
@@ -101,7 +129,7 @@ fn native_click_shroud_controls_match_cursor_and_both_object_pickers() {
                 row["name"]
             );
             assert_eq!(
-                hover_target_at_point(&sim, sx, sy, "Player", false, None, &heights, None)
+                hover_target_at_point(&sim, sx, sy, "Player", false)
                     .filter(|hover| {
                         matches!(
                             hover.kind,
@@ -117,17 +145,12 @@ fn native_click_shroud_controls_match_cursor_and_both_object_pickers() {
                 pick_entity_at_point(
                     sim.entities(),
                     &encounter_order,
-                    Some(&sim.fog),
+                    Some(sim.fog()),
                     Some("Player"),
                     sx,
                     sy,
-                    30.0,
-                    None,
-                    None,
-                    &heights,
-                    None,
-                    Some(&sim.interner),
-                    Some(terrain)
+                    Some(sim.interner()),
+                    Some(terrain),
                 ),
                 expected,
                 "{}: direct selection target {category:?}",
@@ -138,17 +161,13 @@ fn native_click_shroud_controls_match_cursor_and_both_object_pickers() {
                     sim.entities(),
                     &encounter_order,
                     &[],
-                    Some(&sim.fog),
+                    Some(sim.fog()),
                     Some("Player"),
                     sx,
                     sy,
-                    30.0,
                     additive,
                     None,
-                    None,
-                    &heights,
-                    None,
-                    Some(&sim.interner),
+                    Some(sim.interner()),
                     false,
                     Some(terrain),
                 );
@@ -196,7 +215,7 @@ fn sov01_trigger_revealed_hill_bunkers_can_be_targeted_without_tank_sight() {
             .expect("authored bunker cell"),
         );
     }
-    let viewer = sim.session.current_house.unwrap();
+    let viewer = sim.session().current_house().unwrap();
     let viewer_name = sim.resolve(viewer).to_owned();
     // SP4.4b_Reveal Allied, 0885994C: the actual eight Action17 waypoints.
     for waypoint in [63, 66, 71, 99, 100, 114, 437, 647] {
@@ -205,33 +224,24 @@ fn sov01_trigger_revealed_hill_bunkers_can_be_targeted_without_tank_sight() {
             crate::sim::world::UninitContext::with_rules(rules),
         ));
     }
-    let terrain = sim.resolved_terrain.as_ref().unwrap();
-    let heights = terrain.build_height_map();
+    let terrain = sim.resolved_terrain().unwrap();
+
     let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
     let mut mismatches = Vec::new();
     let mut checked = 0;
     for id in targets {
         let target = sim.entities().get(id).unwrap();
         let point = crate::sim::movement::ground_pose::position_world_coord(&target.position);
-        let shrouded = crate::sim::vision::point_is_shrouded(&sim.fog, &cells, viewer, point);
+        let shrouded = crate::sim::vision::point_is_shrouded(sim.fog(), &cells, viewer, point);
         let (sx, sy) = crate::render::locomotor_visual::ground_screen_position(&target.position);
-        let hover = hover_target_at_point(
-            sim,
-            sx,
-            sy,
-            &viewer_name,
-            false,
-            Some(rules),
-            &heights,
-            None,
-        );
+        let hover = hover_target_at_point(&*sim, sx, sy, &viewer_name, false);
         println!(
             "target={} cell=({}, {}) z={} raw_mapped={} native_shrouded={shrouded} hover={hover:?}",
             target.stable_id(),
             target.position.rx(),
             target.position.ry(),
             point.z,
-            sim.fog
+            sim.fog()
                 .is_cell_revealed(viewer, target.position.rx(), target.position.ry())
         );
         if !shrouded {

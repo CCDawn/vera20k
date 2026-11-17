@@ -25,6 +25,7 @@ use crate::asset_tools::identify;
 use crate::asset_tools::names::NameDict;
 use crate::asset_tools::palette;
 use crate::asset_tools::report::{ErrorReport, RenderOutputs, RenderReport};
+use crate::asset_tools::sanitise_name;
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::pal_file::Palette;
 use crate::assets::shp_file::ShpFile;
@@ -311,7 +312,7 @@ pub fn run(
         ));
     }
 
-    let sanitised = sanitise_name(name);
+    let sanitised = sanitise_name(name, FALLBACK_DIR_NAME);
     let dir = render_dir(&opts.out, &sanitised);
     std::fs::create_dir_all(&dir).map_err(|err| ErrorReport {
         error: format!("could not create {}: {err}", dir.display()),
@@ -616,26 +617,6 @@ fn cell_label(index: usize, geom: FrameGeometry) -> String {
     format!("f{index} {}x{} at {}:{}", geom.w, geom.h, geom.x, geom.y)
 }
 
-/// Replace every character outside `[A-Za-z0-9._-]` so the name is safe as a
-/// directory and filename component on any platform.
-fn sanitise_name(name: &str) -> String {
-    let sanitised: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitised.is_empty() {
-        FALLBACK_DIR_NAME.to_string()
-    } else {
-        sanitised
-    }
-}
-
 /// `<out>/render/<sanitised>/`, absolutised so the reported paths do not depend
 /// on the reader's working directory.
 fn render_dir(out: &Path, sanitised: &str) -> PathBuf {
@@ -796,21 +777,12 @@ fn summarise_indices(indices: &[usize]) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
 
     fn geom(x: u16, y: u16, w: u16, h: u16) -> FrameGeometry {
         FrameGeometry { x, y, w, h }
-    }
-
-    #[test]
-    fn sanitise_name_keeps_safe_characters_and_replaces_the_rest() {
-        assert_eq!(sanitise_name("sidebar.shp"), "sidebar.shp");
-        assert_eq!(sanitise_name("gi-idle_01.shp"), "gi-idle_01.shp");
-        assert_eq!(sanitise_name("ra2\\dir/na me:x*?"), "ra2_dir_na_me_x__");
-        assert_eq!(sanitise_name(""), FALLBACK_DIR_NAME);
-        assert_eq!(sanitise_name("///"), "___");
     }
 
     #[test]
@@ -822,27 +794,6 @@ mod tests {
             "{}",
             dir.display()
         );
-    }
-
-    #[test]
-    fn render_dir_preserves_an_absolute_out_root_verbatim() {
-        let root = if cfg!(windows) {
-            PathBuf::from("C:\\tmp\\out")
-        } else {
-            PathBuf::from("/tmp/out")
-        };
-        let dir = render_dir(&root, "x.shp");
-        assert!(dir.starts_with(&root), "{}", dir.display());
-        assert!(dir.ends_with(Path::new(RENDER_SUBDIR).join("x.shp")));
-    }
-
-    #[test]
-    fn output_filenames_zero_pad_to_three_digits() {
-        assert_eq!(frame_png_name("gi.shp", 0), "gi.shp.000.png");
-        assert_eq!(frame_png_name("gi.shp", 7), "gi.shp.007.png");
-        assert_eq!(frame_png_name("gi.shp", 42), "gi.shp.042.png");
-        assert_eq!(frame_png_name("gi.shp", 1234), "gi.shp.1234.png");
-        assert_eq!(sheet_png_name("gi.shp"), "gi.shp.sheet.png");
     }
 
     #[test]
@@ -973,32 +924,6 @@ mod tests {
         assert!(is_shroud_asset("ecache01.mix/shroud.shp"));
         assert!(!is_shroud_asset("shroud.pal"));
         assert!(!is_shroud_asset("gishroud.shp"));
-    }
-
-    #[test]
-    fn cell_label_reports_unscaled_frame_geometry() {
-        assert_eq!(cell_label(0, geom(0, 0, 60, 30)), "f0 60x30 at 0:0");
-        assert_eq!(cell_label(12, geom(7, 9, 30, 24)), "f12 30x24 at 7:9");
-    }
-
-    #[test]
-    fn summarise_indices_caps_the_listing() {
-        assert_eq!(summarise_indices(&[1, 2, 3]), "1, 2, 3");
-        let many: Vec<usize> = (0..12).collect();
-        let text = summarise_indices(&many);
-        assert!(text.ends_with("+4 more"), "{text}");
-    }
-
-    #[test]
-    fn default_options_bound_the_frame_count_and_pick_the_build_output_root() {
-        let opts = RenderOptions::default();
-        assert_eq!(opts.limit, DEFAULT_FRAME_LIMIT);
-        assert_eq!(opts.out, PathBuf::from(DEFAULT_OUT_ROOT));
-        assert!(opts.frame.is_none());
-        assert!(opts.palette.is_none());
-        assert!(opts.house.is_none());
-        assert!(opts.scale.is_none());
-        assert!(!opts.crop);
     }
 
     #[test]

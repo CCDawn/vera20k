@@ -11,7 +11,7 @@ fn frame(sim: &mut Simulation, rules: &RuleSet) -> SimFrameOutput {
     let due = sim.take_due_commands();
     sim.advance_app_frame(
         &due,
-        Some(rules),
+        rules,
         None,
         67,
         TickLane::Ordinary,
@@ -21,7 +21,11 @@ fn frame(sim: &mut Simulation, rules: &RuleSet) -> SimFrameOutput {
 }
 
 fn command(sim: &mut Simulation, owner: InternedId, payload: Command) {
-    sim.queue_command(CommandEnvelope::new(owner, sim.session.tick + 1, payload));
+    sim.queue_command(CommandEnvelope::new(
+        owner,
+        sim.session().tick() + 1,
+        payload,
+    ));
 }
 
 fn click(
@@ -85,21 +89,23 @@ fn retail_supers_recheck_live_admission_after_power_loss_and_recovery() {
         let mut sim = Simulation::with_seed(0x6CC3_6000);
         sim.intern_rule_type_ids(&rules);
         sim.resolve_type_handles(&rules);
-        sim.session.game_mode_nonzero = false;
-        sim.input_delay_ticks = 0;
-        let owner = sim.interner.intern("Americans");
-        let id = sim.interner.intern(name);
-        sim.houses
-            .insert(owner, HouseState::new(owner, 0, Some(owner), true, 0, 10));
-        sim.session.house_order.push(owner);
-        sim.session.current_house = Some(owner);
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false),
+        );
+        sim.set_input_delay_ticks(0);
+        let owner = sim.intern("Americans");
+        let id = sim.intern(name);
+        sim.houses_mut_for_test()
+            .register(HouseState::new(owner, 0, Some(owner), true, 0, 10));
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
         crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
-        sim.fog = crate::sim::vision::FogState::new(32, 32);
-        sim.fog.reveal_all_for_owner(owner);
+        *sim.fog_mut_for_test() = crate::sim::vision::FogState::new(32, 32);
+        sim.fog_mut_for_test().reveal_all_for_owner(owner);
         // Supplied House-constructor registry, before any grant or charge.
         for entry in &rules.super_weapon_order {
-            let type_id = sim.interner.intern(entry);
-            sim.super_weapons
+            let type_id = sim.intern(entry);
+            sim.super_weapons_mut_for_test()
                 .entry(owner)
                 .or_default()
                 .insert(type_id, SuperWeaponInstance::new(type_id, owner, 0));
@@ -118,14 +124,17 @@ fn retail_supers_recheck_live_admission_after_power_loss_and_recovery() {
             frame(&mut sim, &rules);
         }
         assert!(
-            sim.super_weapons[&owner][&id].is_active,
+            sim.super_weapons()[&owner][&id].is_active(),
             "{name}: provider grant"
         );
         assert!(
-            !sim.power_states[&owner].is_low_power,
+            !sim.power_states()[&owner].is_low_power(),
             "{name}: initial power"
         );
-        assert!(!sim.super_weapons[&owner][&id].is_ready, "{name}: charging");
+        assert!(
+            !sim.super_weapons()[&owner][&id].is_ready(),
+            "{name}: charging"
+        );
         let mut input = MatchInputState::new(Default::default());
         let mut gadgets = SidebarGadgetState::default();
         input.begin_building_placement("GAPILE", 0, owner);
@@ -155,12 +164,13 @@ fn retail_supers_recheck_live_admission_after_power_loss_and_recovery() {
         assert!(gadgets.repair_mode_on);
         // Advance the supplied frame clock past the real recharge deadline;
         // the production Super AI, rather than a fixture flag, makes it ready.
-        let instance = &sim.super_weapons[&owner][&id];
-        sim.session.binary_frame =
-            (instance.charge_start_tick + instance.charge_duration + 1) as u32;
+        let instance = &sim.super_weapons()[&owner][&id];
+        let ready_frame = (instance.charge_start_tick() + instance.charge_duration() + 1) as u32;
+        sim.session_mut_for_test()
+            .set_binary_frame_for_test(ready_frame);
         frame(&mut sim, &rules);
         assert!(
-            sim.super_weapons[&owner][&id].is_ready,
+            sim.super_weapons()[&owner][&id].is_ready(),
             "{name}: real ready transition"
         );
         let cached_online_item = sidebar_item(&sim, &rules, owner, name);
@@ -172,26 +182,26 @@ fn retail_supers_recheck_live_admission_after_power_loss_and_recovery() {
         );
         for _ in 0..64 {
             frame(&mut sim, &rules);
-            if sim.power_states[&owner].is_low_power {
+            if sim.power_states()[&owner].is_low_power() {
                 break;
             }
         }
         assert!(
-            sim.power_states[&owner].is_low_power,
+            sim.power_states()[&owner].is_low_power(),
             "{name}: actual reactor loss"
         );
-        let instance = &sim.super_weapons[&owner][&id];
-        assert!(instance.is_ready, "{name}: hold retains charge");
+        let instance = &sim.super_weapons()[&owner][&id];
+        assert!(instance.is_ready(), "{name}: hold retains charge");
         assert_eq!(
-            instance.is_suspended, sw.is_powered,
+            instance.is_suspended(),
+            sw.is_powered,
             "{name}: retail IsPowered"
         );
         let offline_item = sidebar_item(&sim, &rules, owner, name);
         assert!(offline_item.is_ready);
-        assert_eq!(
-            offline_item.enabled, !sw.is_powered,
-            "{name}: draw availability"
-        );
+        // StripDraw clears the darken flag for a Super (6A99B5); held, it
+        // cannot fire, so Ares's hook (10034EF0) leaves it clear too.
+        assert!(offline_item.enabled, "{name}: draw availability");
         for item in [&cached_online_item, &offline_item] {
             let outcome = click(&sim, &rules, owner, item, &mut input, &mut gadgets, false);
             if sw.is_powered {
@@ -232,7 +242,7 @@ fn retail_supers_recheck_live_admission_after_power_loss_and_recovery() {
             let output = frame(&mut sim, &rules);
             assert!(!output.sound_events.iter().any(|event| matches!(event,
                 SimSoundEvent::SuperWeaponLaunched { sw_type, .. } if *sw_type == id)));
-            assert!(sim.super_weapons[&owner][&id].is_ready);
+            assert!(sim.super_weapons()[&owner][&id].is_ready());
         }
         sim.spawn_object("NANRCT", "Americans", 5, 20, 0, &rules)
             .unwrap();
@@ -240,11 +250,11 @@ fn retail_supers_recheck_live_admission_after_power_loss_and_recovery() {
             frame(&mut sim, &rules);
         }
         assert!(
-            !sim.power_states[&owner].is_low_power,
+            !sim.power_states()[&owner].is_low_power(),
             "{name}: restored power"
         );
-        assert!(sim.super_weapons[&owner][&id].is_ready);
-        assert!(!sim.super_weapons[&owner][&id].is_suspended);
+        assert!(sim.super_weapons()[&owner][&id].is_ready());
+        assert!(!sim.super_weapons()[&owner][&id].is_suspended());
         let restored_item = sidebar_item(&sim, &rules, owner, name);
         assert_eq!(
             click(
@@ -293,7 +303,7 @@ fn retail_supers_recheck_live_admission_after_power_loss_and_recovery() {
             let output = frame(&mut sim, &rules);
             assert!(output.sound_events.iter().any(|event| matches!(event,
                 SimSoundEvent::SuperWeaponLaunched { sw_type, .. } if *sw_type == id)));
-            assert!(!sim.super_weapons[&owner][&id].is_ready);
+            assert!(!sim.super_weapons()[&owner][&id].is_ready());
             command(
                 &mut sim,
                 owner,
@@ -303,12 +313,12 @@ fn retail_supers_recheck_live_admission_after_power_loss_and_recovery() {
             );
             for _ in 0..64 {
                 frame(&mut sim, &rules);
-                if !sim.super_weapons[&owner][&id].is_active {
+                if !sim.super_weapons()[&owner][&id].is_active() {
                     break;
                 }
             }
             assert!(
-                !sim.super_weapons[&owner][&id].is_active,
+                !sim.super_weapons()[&owner][&id].is_active(),
                 "silo loss revokes Super"
             );
             assert_eq!(
@@ -334,4 +344,92 @@ fn retail_supers_recheck_live_admission_after_power_loss_and_recovery() {
         "unpowered controls: {covered:?}"
     );
     eprintln!("retail Super click/power controls: {covered:?}");
+}
+
+/// Retail root plus authored mode/map reads; readiness is supplied at the
+/// client boundary. This covers Nuke/None selection, not all Action cursors.
+#[test]
+fn authored_stock_action_case_and_unknown_layer_drive_cursor_and_press() {
+    use crate::app::types::CursorId;
+    use crate::rules::native_processing::{RulesLayerKind, RulesLayerStack};
+    let Some((root, art)) = crate::rules::retail_ini_fixture::retail_rules_and_art() else {
+        return;
+    };
+    let mut layers = RulesLayerStack::new(root);
+    let mut sim = Simulation::new();
+    let owner = sim.intern("Americans");
+    let id = sim.intern("NukeSpecial");
+    sim.houses_mut_for_test()
+        .register(HouseState::new(owner, 0, Some(owner), true, 0, 10));
+    let mut instance = SuperWeaponInstance::new(id, owner, 0);
+    instance.set_is_active_for_test(true);
+    instance.set_is_ready_for_test(true);
+    sim.super_weapons_mut_for_test()
+        .entry(owner)
+        .or_default()
+        .insert(id, instance);
+    for (kind, raw, stock_way, ares_way) in [
+        (
+            RulesLayerKind::GameMode,
+            "nUkE",
+            ("Nuke", SuperWeaponClick::Target, Some(CursorId::Nuke)),
+            ("Nuke", SuperWeaponClick::Target, Some(CursorId::Nuke)),
+        ),
+        // When the Rules were read the Ares way (`RuleSet::ares_form`), Ares
+        // gives the redirected MultiMissile its custom action whatever
+        // Action= says (SW_NuclearMissile::Initialize 10073360).
+        (
+            RulesLayerKind::Scenario,
+            "UnknownAction",
+            ("None", SuperWeaponClick::Launch(id), None),
+            ("Nuke", SuperWeaponClick::Target, Some(CursorId::Nuke)),
+        ),
+    ] {
+        layers.push(
+            kind,
+            IniFile::from_str(&format!("[NukeSpecial]\nAction={raw}\n")),
+        );
+        let processed = layers.process_with_fixed_art(&art).unwrap();
+        let rules = RuleSet::from_processed_rules(&processed).unwrap();
+        let (canonical, expected, cursor) = if rules.ares_form() {
+            ares_way
+        } else {
+            stock_way
+        };
+        let action = rules.super_weapon("NukeSpecial").unwrap().action.as_deref();
+        assert_eq!(action, Some(canonical));
+        assert_eq!(
+            super::super::super::cursor::super_weapon_cursor_id(action.unwrap()),
+            cursor
+        );
+        let views = superweapon_views_for_owner(&sim, &rules, &owner);
+        let live = views.iter().find(|view| view.type_id == id).unwrap();
+        let mut input = MatchInputState::new(Default::default());
+        input.begin_building_placement("GAPILE", 0, owner);
+        let mut gadgets = SidebarGadgetState::default();
+        gadgets.repair_mode_on = true;
+        // SelectAction6AAEEA..6AAF9D: canonical Action0 directly launches
+        // without clearing the prior modes; targeted actions replace them.
+        assert_eq!(
+            press(&mut input, &mut gadgets, Some(live), action, false),
+            expected
+        );
+        if expected == SuperWeaponClick::Target {
+            assert_eq!(
+                input.targeting_mode.as_ref().unwrap().as_super_weapon(),
+                Some("NukeSpecial")
+            );
+            assert!(!gadgets.repair_mode_on);
+        } else {
+            assert_eq!(
+                input
+                    .targeting_mode
+                    .as_ref()
+                    .unwrap()
+                    .as_building_placement(),
+                Some("GAPILE")
+            );
+            assert!(gadgets.repair_mode_on);
+        }
+    }
 }

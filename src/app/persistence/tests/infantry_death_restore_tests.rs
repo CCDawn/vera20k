@@ -7,7 +7,7 @@ fn infantry_fatal_frame_exit_preserves_delivered_cleanup_through_load() {
     use crate::sim::command::{Command, CommandEnvelope};
     use crate::sim::house_state::HouseState;
     use crate::sim::world::{LifecycleTestEvent, SimSoundEvent, TickLane};
-    let mut rules = RuleSet::from_ini(&IniFile::from_str(
+    let ini = IniFile::from_str(
         "[InfantryTypes]\n0=E1\n[VehicleTypes]\n0=SHOOTER\n[AircraftTypes]\n[BuildingTypes]\n\
          [E1]\nStrength=100\nSpeed=4\n\
          [SHOOTER]\nStrength=300\nSpeed=6\nSight=8\nPrimary=Gun\n\
@@ -15,19 +15,21 @@ fn infantry_fatal_frame_exit_preserves_delivered_cleanup_through_load() {
          [INVIS]\nInviso=yes\n[Warheads]\n0=KILL\n\
          [KILL]\nInfDeath=3\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
          [General]\nInfantryExplode=DEATHTEST\n",
-    )).unwrap();
-    let mut art = crate::rules::art_data::ArtRegistry::from_ini(&IniFile::from_str(
-        "[DEATHTEST]\nReport=DeathReport\nEnd=80\n",
-    ));
+    );
+    let fixed_art = IniFile::from_str("[DEATHTEST]\nReport=DeathReport\nEnd=80\n");
+    let mut rules =
+        RuleSet::from_ini_with_fixed_art_and_sounds_for_test(&ini, &fixed_art, &["DeathReport"])
+            .unwrap();
+    let mut art = crate::rules::art_data::ArtRegistry::from_ini(&fixed_art);
     art.bind_anim_frame_count_for_test("DEATHTEST", 80);
+    art.set_anim_sounds_for_test("DEATHTEST", Some("DeathReport"), None);
     rules.replace_art_registry_for_test(art);
     let (mut saved, terrain) = death_load_world(&rules);
-    saved.input_delay_ticks = 0;
-    let owner = saved.interner.intern("Americans");
+    saved.set_input_delay_ticks(0);
+    let owner = saved.intern("Americans");
     saved
-        .houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 1000, 10));
-    saved.session.house_order.push(owner);
+        .houses_mut_for_test()
+        .register(HouseState::new(owner, 0, None, true, 1000, 10));
     let shooter = saved
         .spawn_object_at_height(
             "SHOOTER",
@@ -43,7 +45,7 @@ fn infantry_fatal_frame_exit_preserves_delivered_cleanup_through_load() {
         .spawn_object_at_height("E1", "Russians", 2, 1, 0, 0, &rules)
         .unwrap();
     assert!(crate::sim::combat::install_entity_attack_target_for_test(
-        &mut saved.substrate.entities,
+        saved.entities_mut_for_test(),
         shooter,
         victim
     ));
@@ -52,7 +54,7 @@ fn infantry_fatal_frame_exit_preserves_delivered_cleanup_through_load() {
     let output = saved
         .advance_app_frame(
             &[CommandEnvelope::new(owner, 1, Command::ExitMatch)],
-            Some(&rules),
+            &rules,
             Some(&registry),
             67,
             TickLane::Ordinary,
@@ -60,16 +62,15 @@ fn infantry_fatal_frame_exit_preserves_delivered_cleanup_through_load() {
         )
         .expect("fixture frame must complete");
     assert!(!output.tick.frame_committed);
-    let object = saved.substrate.entities.get(victim).unwrap();
+    let object = saved.entities().get(victim).unwrap();
     assert!(
         object.death.is_dying() && object.lifecycle.in_limbo() && !object.lifecycle.object_alive()
     );
     assert!(!object.in_logic_vector.is_member());
-    assert!(!saved.substrate.occupancy.contains_entity(2, 1, victim));
+    assert!(!saved.occupancy().contains_entity(2, 1, victim));
     assert_eq!(
         saved
-            .substrate
-            .pending_delete
+            .pending_delete()
             .object_tickets()
             .filter(|&id| id == victim)
             .count(),
@@ -84,7 +85,7 @@ fn infantry_fatal_frame_exit_preserves_delivered_cleanup_through_load() {
     );
     let death_ids = |sim: &Simulation| {
         sim.anims()
-            .filter(|(_, anim)| sim.interner.resolve(anim.type_id) == "DEATHTEST")
+            .filter(|(_, anim)| sim.interner().resolve(anim.type_id()) == "DEATHTEST")
             .map(|(id, _)| *id)
             .collect::<Vec<_>>()
     };
@@ -103,7 +104,10 @@ fn infantry_fatal_frame_exit_preserves_delivered_cleanup_through_load() {
             .count(),
         1
     );
-    saved.scenario_rng = crate::sim::rng::SimRng::new(0);
+    *saved.scenario_rng_mut_for_test() = crate::sim::rng::SimRng::new(0);
+    // Whole-state comparison must share both native load-time resets. This
+    // fixture has no future plans; even empty constructor tokens are unsaved.
+    saved.reset_planning_after_player_load_for_test();
     let bytes = snapshot_bytes(&saved, &rules);
     let mut restored = PreparedLoad::prepare_candidate(
         &bytes,
@@ -115,16 +119,13 @@ fn infantry_fatal_frame_exit_preserves_delivered_cleanup_through_load() {
     )
     .unwrap()
     .simulation;
-    assert_eq!(
-        restored.substrate.pending_delete,
-        saved.substrate.pending_delete
-    );
+    assert_eq!(restored.pending_delete(), saved.pending_delete());
     assert_eq!(death_ids(&restored), effects);
     assert_eq!(restored.state_hash(), saved.state_hash());
     let next = restored
         .advance_app_frame(
             &[],
-            Some(&rules),
+            &rules,
             Some(&registry),
             67,
             TickLane::Ordinary,
@@ -134,8 +135,8 @@ fn infantry_fatal_frame_exit_preserves_delivered_cleanup_through_load() {
     // Exit requests are transient: production load resumes the match and the
     // first committed frame drains the already-delivered victim normally.
     assert!(next.tick.frame_committed);
-    assert!(!restored.substrate.entities.contains(victim));
-    assert!(!restored.substrate.pending_delete.contains_object(&victim));
+    assert!(!restored.entities().contains(victim));
+    assert!(!restored.pending_delete().contains_object(&victim));
     assert_eq!(death_ids(&restored), effects);
     assert!(!next.sound_events.iter().any(|event| matches!(event,
         SimSoundEvent::AnimationStarted { sound_id, .. } if sound_id == "DEATHREPORT")));
@@ -162,16 +163,12 @@ fn infantry_prepared_load_preserves_death_sequence_progress_and_cleanup_visit() 
         )
         .unwrap();
         rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-        rules.bind_animation_sequences(
-            &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-        );
         let (mut saved, terrain) = death_load_world(&rules);
         let victim = saved
             .spawn_object_at_height("E1", "Americans", 1, 1, 0, 0, &rules)
             .unwrap();
         saved
-            .substrate
-            .entities
+            .entities_mut_for_test()
             .get_mut(victim)
             .unwrap()
             .health
@@ -186,22 +183,17 @@ fn infantry_prepared_load_preserves_death_sequence_progress_and_cleanup_visit() 
         // Its frame0 Logic visit holds; frame1 performs the first step.
         saved.advance_tick(&[], Some(&rules), None, None, 100);
         assert_eq!(
-            saved
-                .substrate
-                .entities
-                .get(victim)
-                .unwrap()
-                .native_stage()
-                .value(),
+            saved.entities().get(victim).unwrap().native_stage().value(),
             0
         );
         saved.advance_tick(&[], Some(&rules), None, None, 100);
-        let corpse = saved.substrate.entities.get(victim).unwrap();
+        let corpse = saved.entities().get(victim).unwrap();
         assert_eq!(corpse.native_stage().value(), 1);
         let doing = corpse.mission_leaf.as_infantry().unwrap().doing();
         // Native in-scenario load restarts Scenario RNG at zero. Compare the
         // death's continuation from that same cursor rather than hide reset.
-        saved.scenario_rng = crate::sim::rng::SimRng::new(0);
+        *saved.scenario_rng_mut_for_test() = crate::sim::rng::SimRng::new(0);
+        saved.reset_planning_after_player_load_for_test();
         let bytes = snapshot_bytes(&saved, &rules);
         let registry = OverlayTypeRegistry::empty();
         let mut restored = PreparedLoad::prepare_candidate(
@@ -214,7 +206,7 @@ fn infantry_prepared_load_preserves_death_sequence_progress_and_cleanup_visit() 
         )
         .expect("actual validate/deserialize/restore/rebuild preparation")
         .simulation;
-        let corpse = restored.substrate.entities.get(victim).unwrap();
+        let corpse = restored.entities().get(victim).unwrap();
         assert_eq!(corpse.mission_leaf.as_infantry().unwrap().doing(), doing);
         assert_eq!(corpse.native_stage().value(), 1);
         assert_eq!(corpse.health.current(), 0);
@@ -223,27 +215,30 @@ fn infantry_prepared_load_preserves_death_sequence_progress_and_cleanup_visit() 
             saved.advance_tick(&[], Some(&rules), None, None, 100);
             restored.advance_tick(&[], Some(&rules), None, None, 100);
             assert_eq!(
-                restored.substrate.entities.contains(victim),
+                restored.entities().contains(victim),
                 visit < 2,
                 "{sequence:?}, visit {visit}"
             );
             assert_eq!(
-                saved.substrate.entities.contains(victim),
-                restored.substrate.entities.contains(victim)
+                saved.entities().contains(victim),
+                restored.entities().contains(victim)
             );
-            assert_eq!(saved.scenario_rng.state(), restored.scenario_rng.state());
+            assert_eq!(
+                saved.scenario_rng().state(),
+                restored.scenario_rng().state()
+            );
             assert_eq!(
                 saved.state_hash(),
                 restored.state_hash(),
                 "{sequence:?}, visit {visit}"
             );
         }
-        assert!(!restored.substrate.occupancy.contains_entity(1, 1, victim));
+        assert!(!restored.occupancy().contains_entity(1, 1, victim));
         assert!(!restored.live_object_order_snapshot().contains(&victim));
     }
 }
 
-fn death_load_world(rules: &RuleSet) -> (Simulation, ResolvedTerrainGrid) {
+pub(super) fn death_load_world(rules: &RuleSet) -> (Simulation, ResolvedTerrainGrid) {
     let terrain = ResolvedTerrainGrid::from_cells(
         4,
         4,
@@ -254,11 +249,12 @@ fn death_load_world(rules: &RuleSet) -> (Simulation, ResolvedTerrainGrid) {
                     cell.rx = rx;
                     cell.ry = ry;
                     let clear = SpeedCostProfile {
-                        foot: Some(100),
-                        track: Some(100),
-                        wheel: Some(100),
-                        hover: Some(100),
-                        amphibious: Some(100),
+                        foot: Some(crate::util::native_x87::NativeF32Bits::ONE),
+                        track: Some(crate::util::native_x87::NativeF32Bits::ONE),
+                        wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+                        hover: Some(crate::util::native_x87::NativeF32Bits::ONE),
+                        amphibious: Some(crate::util::native_x87::NativeF32Bits::ONE),
+                        winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
                         ..SpeedCostProfile::default()
                     };
                     cell.speed_costs = clear;
@@ -269,9 +265,9 @@ fn death_load_world(rules: &RuleSet) -> (Simulation, ResolvedTerrainGrid) {
             .collect(),
     );
     let mut saved = load_fixture_simulation(true);
-    saved.overlay_grid = Some(OverlayGrid::new(4, 4));
+    *saved.overlay_grid_mut_for_test() = Some(OverlayGrid::new(4, 4));
     saved.install_resolved_terrain_for_new_map(terrain.clone());
-    saved.playfield_bounds = Some(crate::sim::cell_rect::PlayfieldBounds {
+    *saved.playfield_bounds_mut_for_test() = Some(crate::sim::cell_rect::PlayfieldBounds {
         base: 0,
         off_fc: -100,
         off_100: -100,

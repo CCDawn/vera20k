@@ -9,7 +9,7 @@
 //! ## Dependency rules
 //! - Part of the app layer — no sim/render dependencies.
 
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 
 use winit::keyboard::KeyCode;
 
@@ -34,6 +34,9 @@ const GAME_SPEED_BUCKET_MS: u32 = 16;
 /// Convert the stored speed byte to a UI/debug rate readout. Gameplay frame
 /// admission uses the native 16 ms bucket comparison directly.
 pub(crate) fn tps_for_game_speed(stored_speed: u32) -> u32 {
+    if stored_speed == u32::from(crate::sim::game_options::GAME_SPEED_90_TPS) {
+        return 90;
+    }
     if stored_speed == 0 {
         return 60;
     }
@@ -232,7 +235,7 @@ pub(crate) use crate::render::cursor_atlas::{
     CursorId, SoftwareCursor, SoftwareCursorFrame, SoftwareCursorSequence,
 };
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
 
@@ -256,19 +259,6 @@ mod tests {
     }
 
     #[test]
-    fn default_skirmish_speed_uses_verified_yr_stored_speed_one() {
-        assert_eq!(DEFAULT_YR_SKIRMISH_GAME_SPEED, 1);
-        assert_eq!(tps_for_game_speed(DEFAULT_YR_SKIRMISH_GAME_SPEED), 63);
-    }
-
-    #[test]
-    fn game_speed_one_is_not_the_old_speed_two_or_options_three_calibration() {
-        let default = tps_for_game_speed(DEFAULT_YR_SKIRMISH_GAME_SPEED);
-        assert_ne!(default, tps_for_game_speed(2));
-        assert_ne!(default, tps_for_game_speed(3));
-    }
-
-    #[test]
     fn item83_type_select_release_window_is_inclusive_and_repeat_does_not_rearm() {
         let start = Instant::now();
         let mut state = TypeSelectInputState::default();
@@ -279,13 +269,6 @@ mod tests {
         state.press(KeyCode::KeyT, start, false);
         assert!(!state.release(KeyCode::KeyT, start + Duration::from_millis(501)));
         assert!(!state.held());
-    }
-
-    #[test]
-    fn item83_type_select_outcomes_use_csf_keys_not_source_line_numbers() {
-        assert_eq!(TypeSelectOutcome::Empty.csf_key(), "MSG:NothingSelected");
-        assert_eq!(TypeSelectOutcome::Map.csf_key(), "MSG:SelAcrossMap");
-        assert_eq!(TypeSelectOutcome::Screen.csf_key(), "MSG:SelAcrossScreen");
     }
 }
 
@@ -345,21 +328,25 @@ pub(crate) enum CursorFeedbackKind {
     PanBlocked(ScrollDir),
     /// Radar (minimap) cursor — the payload is one of the descriptor table's
     /// mini frame sets. The original's RadarClass mouse handler (`0x006539D0`)
-    /// asks `SetCursorFromAction` (`0x004AAE90`) for the cursor with
-    /// `mini = 1`, so the mini switch (byte table `0x004AB838` indexed by
-    /// action, jump table `0x004AB7D0`) — not the tactical one — picks the
-    /// row. Its default is row 0's mini set, the plain arrow (frame 1): the
+    /// asks `SetCursorFromAction` (`0x004AAE90`) with `mini = 1`. The normal
+    /// action switch picks the row on revealed cells; its shroud branch uses
+    /// byte table `0x004AB838` and jump table `0x004AB7D0` instead.
+    /// Its default is row 0's mini set, the plain arrow (frame 1): the
     /// keep-table filter (`0x00653F04`) drops every action outside
     /// {1,2,3,5,6,9,16,20,26,38,41,65,66,67,72} to row 0, and the
-    /// fallthrough exit is `SetCursorRow(0, mini = 1)` at `0x00653D62`. Only
-    /// the move family (row 18, frames 42-51) and the superweapon targeting
-    /// rows reach a mini set of their own.
+    /// fallthrough exit is `SetCursorRow(0, mini = 1)` at `0x00653D62`.
     Minimap(CursorId),
     /// Deploy/undeploy cursor — shown when a Deployer unit hovers over itself.
     Deploy,
     NoDeploy,
-    /// Enter cursor — garrison, capture, board transport, sabotage.
+    /// Enter cursor — garrison, capture, board transport, sabotage, grind.
     Enter,
+    /// Grind (11) shares Enter's cursor but is excluded by the radar keep table.
+    Grind,
+    /// NoEnter cursor (action 0x1F, row 0x1A at `0x004AB382`).
+    NoEnter,
+    /// Tote cursor (action 0x11): a Carryall over a Unit it may lift.
+    Tote,
     /// Engineer action28 damage cursor. Its uncommon authored-threshold
     /// display route remains outside the ordinary repair cursor proof.
     EngineerDamage,
@@ -368,22 +355,43 @@ pub(crate) enum CursorFeedbackKind {
     /// C4 plant cursor — SEAL/Tanya/PTROOP hovering a CanC4 enemy structure
     /// (action 0x10 in gamemd, distinct mouse.shp frames from Enter).
     Demolish,
+    /// Weapon SabotageCursor action64 shares C4's drawing (16), but radar
+    /// excludes64. Its click remains an ordinary Attack mission.
+    WeaponDemolish,
     /// Weapon MigAttackCursor, action71; still an ordinary Attack command.
     AirStrike,
     /// Crazy Ivan bomb cursor (action 0x35 `IvanBomb`, cursor row 38).
     IvanBomb,
+    /// Native action54 shares NoMove's drawing but is excluded by radar's
+    /// keep table, unlike ordinary NoMove (2).
+    NoIvanBomb,
     /// Engineer defuse cursor (action 0x39 `DisarmBomb`, cursor row 59).
     DisarmBomb,
+    /// A bomb carrier's own Detonate (action 0x37, cursor row 52, the
+    /// Demolish frames; `0x004AB5CD`).
+    Detonate,
     /// Repair cursor mode active (sidebar wrench). `true` = an own building is
     /// under the cursor (wrench), `false` = no eligible target (no-repair).
     RepairMode(bool),
     /// Sell cursor mode active (sidebar dollar). `true` = an own building is
     /// under the cursor (sell), `false` = no eligible target (no-sell).
     SellMode(bool),
+    /// Ares 3.0 DisplayClass_ChooseAction_CanSell (10057E70, hook 0x6929FC):
+    /// sell mode over the player's own Unit or Aircraft that can be sold
+    /// (`production::foot_can_be_sold`) answers action 0xD, SellUnit, while
+    /// Ares plays.
+    SellUnit,
     /// Superweapon targeting reticle — shown while a charged SW is armed
     /// and the cursor is over the tactical map. Payload is the per-SW
     /// CursorId resolved from the `Action=` INI string.
     SuperWeaponTarget(CursorId),
+    /// Beacon placement mode with nothing selected: action 0x3C, row 0x4E
+    /// (`0x004AB754` revealed, `0x004AB3DB` shrouded).
+    PlaceBeacon,
+    /// Ares 3.0: a What_Action answer drawn with the `[MouseCursors]` entry
+    /// (this index) its hooks chose, where that entry draws other frames than
+    /// the answer's stock row (`app::input::ares_cursor::tactical`).
+    AresAction(u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -22,15 +22,15 @@ fn body(case: &Value) -> BounceState {
             NativeF32Bits::from_bits((case[name][i].as_f64().unwrap() as f32).to_bits())
         })
     };
-    BounceState {
-        elasticity: NativeF64Bits::from_bits(case["elasticity"].as_f64().unwrap().to_bits()),
-        gravity: NativeF64Bits::from_bits(case["gravity"].as_f64().unwrap().to_bits()),
-        angular_velocity_magnitude: NativeF64Bits::POSITIVE_ZERO,
-        position: floats("position"),
-        velocity: floats("velocity"),
-        orientation: IDENTITY,
-        rotation: IDENTITY,
-    }
+    BounceState::from_native_for_test(
+        NativeF64Bits::from_bits(case["elasticity"].as_f64().unwrap().to_bits()),
+        NativeF64Bits::from_bits(case["gravity"].as_f64().unwrap().to_bits()),
+        NativeF64Bits::POSITIVE_ZERO,
+        floats("position"),
+        floats("velocity"),
+        IDENTITY,
+        IDENTITY,
+    )
 }
 
 /// A zero-spin quaternion: these comparisons read position and velocity only.
@@ -69,7 +69,7 @@ fn fixture(case: &Value) -> Simulation {
         cell.has_bridge_deck =
             cell.bridge_facts.raw_flags & 256 != 0 || row[5].as_i64() == Some(237);
         let overlay = row[5].as_i64().unwrap();
-        overlays.cell_mut(x, y).overlay_id = (overlay >= 0).then_some(overlay as u8);
+        overlays.cell_mut_for_test(x, y).overlay_id = (overlay >= 0).then_some(overlay as u8);
         cells[usize::from(y) * usize::from(width) + usize::from(x)] = cell;
         allocated.push((x, y));
     }
@@ -88,7 +88,7 @@ fn fixture(case: &Value) -> Simulation {
     if let Some(objects) = case["objects"].as_array() {
         for kind in objects {
             let name = kind.as_str().unwrap();
-            let id = sim.allocate_stable_id();
+            let id = sim.substrate.allocate_stable_id();
             let owner = sim.interner.intern("Neutral");
             let type_ref = sim.interner.intern(name);
             let category = if name == "nonbuilding" {
@@ -110,7 +110,7 @@ fn fixture(case: &Value) -> Simulation {
                 0,
                 false,
             );
-            sim.entities_mut().insert(entity);
+            sim.substrate.entities.insert(entity);
             sim.occupancy_mut().add(
                 0,
                 0,
@@ -131,6 +131,14 @@ fn native_bounce_ground_deck_contacts_match_original_update() {
     .unwrap();
     assert_eq!(cases.as_array().unwrap().len(), 48);
     let rules = fixture_rules();
+    let native_case = |name: &str| {
+        cases
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == name)
+            .unwrap()
+    };
     let mut issues = Vec::new();
     macro_rules! check_eq {
         ($actual:expr,$expected:expr,$($message:tt)*) => {{
@@ -142,7 +150,7 @@ fn native_bounce_ground_deck_contacts_match_original_update() {
         let sim = fixture(case);
         let terrain = ResolvedBounceTerrain {
             sim: &sim,
-            rules: Some(&rules),
+            rules: &rules,
         };
         let mut state = body(case);
         // The ground observation is compared on a separate fixture so it cannot
@@ -150,7 +158,7 @@ fn native_bounce_ground_deck_contacts_match_original_update() {
         let ground_sim = fixture(case);
         let ground_terrain = ResolvedBounceTerrain {
             sim: &ground_sim,
-            rules: Some(&rules),
+            rules: &rules,
         };
         let query = &case["events"][0];
         check_eq!(
@@ -168,9 +176,18 @@ fn native_bounce_ground_deck_contacts_match_original_update() {
             events: Default::default(),
         };
         let outcome = state.update(&terrain).unwrap();
+        // Ares 3.0 CellClass_AttachesToNeighbourOverlay 10015740 (hook
+        // 0x480534) answers the any-wall query by `Wall=`, which the retail
+        // GASAND has: the sandbag cell then takes the update the native wall
+        // case (same cell, GAWALL) records.
+        let expected = if rules.ares() && case["name"] == "sandbag" {
+            native_case("wall")
+        } else {
+            case
+        };
         check_eq!(
             serde_json::Value::Array(terrain.events.into_inner()),
-            case["events"],
+            expected["events"],
             "{} lookup order",
             case["name"]
         );
@@ -181,29 +198,29 @@ fn native_bounce_ground_deck_contacts_match_original_update() {
         };
         check_eq!(
             native_outcome,
-            case["outcome"].as_u64().unwrap(),
+            expected["outcome"].as_u64().unwrap(),
             "{} outcome",
             case["name"]
         );
         for (key, values) in [
-            ("position_bits", state.position),
-            ("velocity_bits", state.velocity),
+            ("position_bits", state.position()),
+            ("velocity_bits", state.velocity()),
         ] {
             for i in 0..3 {
                 let actual = values[i].bits();
-                let expected = case[key][i].as_u64().unwrap() as u32;
+                let native_bits = expected[key][i].as_u64().unwrap() as u32;
                 if key == "velocity_bits" {
                     // Existing flat reflection collapses identity matrices and
                     // loses native signed zero. Physics-bit parity is excluded;
                     // require exact finite numeric equality, no tolerance.
                     check_eq!(
                         f32::from_bits(actual),
-                        f32::from_bits(expected),
+                        f32::from_bits(native_bits),
                         "{} {key}[{i}] (signed zero excluded)",
                         case["name"]
                     );
                 } else {
-                    check_eq!(actual, expected, "{} {key}[{i}]", case["name"]);
+                    check_eq!(actual, native_bits, "{} {key}[{i}]", case["name"]);
                 }
             }
         }
@@ -215,8 +232,8 @@ fn native_bounce_ground_deck_contacts_match_original_update() {
         check_eq!(
             actual,
             (
-                case["dummy_coord"][0].as_i64().unwrap() as i32,
-                case["dummy_coord"][1].as_i64().unwrap() as i32
+                expected["dummy_coord"][0].as_i64().unwrap() as i32,
+                expected["dummy_coord"][1].as_i64().unwrap() as i32
             ),
             "{} dummy",
             case["name"]
@@ -225,9 +242,32 @@ fn native_bounce_ground_deck_contacts_match_original_update() {
     assert!(issues.is_empty(), "{}", issues.join("\n"));
 }
 
+/// The oracle's overlay indices in the retail `[OverlayTypes]` declaration
+/// order: GASAND 0, GAWALL 2, NAWALL 26 and GAFWLL 243 are `Wall=yes`,
+/// BRIDGEB1 237 is not. The stock any-wall query tests the raw indices; the
+/// Ares one (hook 0x480534) reads these flags.
+fn fixture_overlay_types() -> String {
+    let name = |index: usize| match index {
+        0 => "GASAND".to_owned(),
+        2 => "GAWALL".to_owned(),
+        26 => "NAWALL".to_owned(),
+        237 => "BRIDGEB1".to_owned(),
+        243 => "GAFWLL".to_owned(),
+        _ => format!("OVERLAY{index}"),
+    };
+    let mut text = String::from("[OverlayTypes]\n");
+    for index in 0..=243 {
+        text.push_str(&format!("{index}={}\n", name(index)));
+    }
+    for wall in ["GASAND", "GAWALL", "NAWALL", "GAFWLL"] {
+        text.push_str(&format!("[{wall}]\nWall=yes\n"));
+    }
+    text
+}
+
 fn fixture_rules() -> RuleSet {
-    RuleSet::from_ini_with_fixed_art_for_test(&crate::rules::ini_parser::IniFile::from_str(
-        "[BuildingTypes]\n0=building\n1=undeploy\n2=large_undeploy\n[VehicleTypes]\n0=nonbuilding\n[building]\nName=Building\n[undeploy]\nUndeploysInto=nonbuilding\n[large_undeploy]\nUndeploysInto=nonbuilding\n[nonbuilding]\nSpeed=5\n"), &crate::rules::ini_parser::IniFile::from_str("[building]\nFoundation=1x1\n[undeploy]\nFoundation=1x1\n[large_undeploy]\nFoundation=2x2\n")).unwrap()
+    RuleSet::from_ini_with_fixed_art_for_test(&crate::rules::ini_parser::IniFile::from_str(&format!(
+        "{}[BuildingTypes]\n0=building\n1=undeploy\n2=large_undeploy\n[VehicleTypes]\n0=nonbuilding\n[building]\nName=Building\n[undeploy]\nUndeploysInto=nonbuilding\n[large_undeploy]\nUndeploysInto=nonbuilding\n[nonbuilding]\nSpeed=5\n[VoxelAnims]\n0=TIRE\n[TIRE]\nElasticity=0.8\nMinZVel=28\nMaxZVel=32\nMaxXYVel=10\nDuration=150\n", fixture_overlay_types())), &crate::rules::ini_parser::IniFile::from_str("[building]\nFoundation=1x1\n[undeploy]\nFoundation=1x1\n[large_undeploy]\nFoundation=2x2\n")).unwrap()
 }
 struct RecordingTerrain<'a> {
     inner: ResolvedBounceTerrain<'a>,
@@ -303,13 +343,8 @@ fn voxel_anim_logic_visit_delivers_native_deck_height_and_low_bridge_selection()
     ))
     .unwrap();
     let rules = fixture_rules();
-    let ini = crate::rules::ini_parser::IniFile::from_str(
-        "[TIRE]\nElasticity=0.8\nMinZVel=28\nMaxZVel=32\nMaxXYVel=10\nDuration=150\n",
-    );
-    let kind = crate::rules::voxel_anim_type::VoxelAnimType::from_ini_section(
-        "TIRE",
-        ini.section("TIRE").unwrap(),
-    );
+    let type_id = rules.voxel_anim_type_id_by_name("TIRE").unwrap();
+    let kind = rules.voxel_anim_type(type_id);
     for name in [
         "deck_fall",
         "deck_rest",
@@ -325,24 +360,37 @@ fn voxel_anim_logic_visit_delivers_native_deck_height_and_low_bridge_selection()
             .unwrap();
         let mut sim = fixture(case);
         sim.emit_debris_voxel(
-            crate::rules::voxel_anim_type::VoxelAnimTypeId(0),
-            &kind,
+            type_id,
+            kind,
             None,
             IVec3::ZERO,
             true,
             &mut Vec::new(),
+            &rules,
         )
         .unwrap();
         let id = sim.substrate.voxel_anims.ids()[0];
         // This terrain-consumer fixture supplies the independently captured
         // Bounce body after the ordinary constructor has admitted the object.
-        sim.substrate.voxel_anims.get_mut(id).unwrap().bounce = body(case);
+        sim.substrate
+            .voxel_anims
+            .get_mut(id)
+            .unwrap()
+            .set_bounce_for_test(body(case));
         assert!(sim.live_object_order_snapshot().contains(&id));
         let before = sim.state_hash();
-        sim.visit_voxel_anim(id, Some(&rules));
+        sim.visit_voxel_anim(id, &rules, crate::sim::world::FrameEffects::default())
+            .unwrap();
+        sim.process_pending_delete_with(
+            &rules,
+            Some(rules.overlay_registry()),
+            crate::sim::world::FrameEffects::default(),
+            1,
+            sim.session().started(),
+        );
         let actual = sim.substrate.voxel_anims.get(id).unwrap();
         assert_eq!(
-            actual.duration,
+            actual.duration(),
             if case["outcome"].as_u64() == Some(2) {
                 0
             } else {
@@ -352,7 +400,7 @@ fn voxel_anim_logic_visit_delivers_native_deck_height_and_low_bridge_selection()
         );
         for i in 0..3 {
             assert_eq!(
-                actual.bounce.position[i].bits(),
+                actual.bounce().position()[i].bits(),
                 case["position_bits"][i].as_u64().unwrap() as u32,
                 "{name} position"
             );
@@ -413,15 +461,15 @@ fn native_body(bytes: &[u8]) -> BounceState {
     let f32_at = |at: usize| {
         NativeF32Bits::from_bits(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()))
     };
-    BounceState {
-        elasticity: f64_at(0),
-        gravity: f64_at(8),
-        angular_velocity_magnitude: f64_at(0x10),
-        position: std::array::from_fn(|axis| f32_at(0x18 + axis * 4)),
-        velocity: std::array::from_fn(|axis| f32_at(0x24 + axis * 4)),
-        orientation: std::array::from_fn(|i| f32_at(0x30 + i * 4)),
-        rotation: std::array::from_fn(|i| f32_at(0x40 + i * 4)),
-    }
+    BounceState::from_native_for_test(
+        f64_at(0),
+        f64_at(8),
+        f64_at(0x10),
+        std::array::from_fn(|axis| f32_at(0x18 + axis * 4)),
+        std::array::from_fn(|axis| f32_at(0x24 + axis * 4)),
+        std::array::from_fn(|i| f32_at(0x30 + i * 4)),
+        std::array::from_fn(|i| f32_at(0x40 + i * 4)),
+    )
 }
 
 fn outcome_code(outcome: BounceOutcome) -> i64 {
@@ -455,7 +503,7 @@ fn a_debris_chunk_flight_matches_original_update() {
         let sim = flight_sim(input["terrain"].as_str().unwrap(), FLIGHT_CENTER);
         let terrain = ResolvedBounceTerrain {
             sim: &sim,
-            rules: None,
+            rules: crate::rules::ruleset::RuleSet::empty_for_test(),
         };
         let mut state = native_body(&hex_bytes(row["launch_body_hex"].as_str().unwrap()));
         let native_ticks = row["ticks"].as_array().unwrap();
@@ -476,8 +524,8 @@ fn a_debris_chunk_flight_matches_original_update() {
                 break;
             }
             for axis in 0..3 {
-                let position = state.position[axis].bits();
-                let velocity = f32::from_bits(state.velocity[axis].bits());
+                let position = state.position()[axis].bits();
+                let velocity = f32::from_bits(state.velocity()[axis].bits());
                 if position != at(4 + axis) as u32
                     || velocity != f32::from_bits(at(7 + axis) as u32)
                 {
@@ -491,7 +539,8 @@ fn a_debris_chunk_flight_matches_original_update() {
         if ran == native_ticks.len() {
             quaternion_rows += 1;
             let native = native_body(&hex_bytes(row["final_body_hex"].as_str().unwrap()));
-            if (state.orientation, state.rotation) != (native.orientation, native.rotation) {
+            if (state.orientation(), state.rotation()) != (native.orientation(), native.rotation())
+            {
                 issues.push(format!("{input} final quaternions"));
             }
         }
@@ -514,7 +563,7 @@ fn a_spinning_piece_tumbles_like_the_original() {
     let sim = flight_sim("flat0", FLIGHT_CENTER);
     let terrain = ResolvedBounceTerrain {
         sim: &sim,
-        rules: None,
+        rules: crate::rules::ruleset::RuleSet::empty_for_test(),
     };
     let mut bounces = 0;
     for row in golden["flight"].as_array().unwrap() {
@@ -533,19 +582,19 @@ fn a_spinning_piece_tumbles_like_the_original() {
             let context = format!("{input} tick {}", tick + 1);
             assert_eq!(outcome, i64::from(native[0]), "{context}");
             assert_eq!(
-                state.orientation.map(NativeF32Bits::bits),
+                state.orientation().map(NativeF32Bits::bits),
                 native[1..5],
                 "{context}"
             );
             assert_eq!(
-                state.rotation.map(NativeF32Bits::bits),
+                state.rotation().map(NativeF32Bits::bits),
                 native[5..9],
                 "{context}"
             );
             assert_eq!(matrix, native[9..21], "{context}");
         }
         let native = native_body(&hex_bytes(row["final_body_hex"].as_str().unwrap()));
-        assert_eq!(state.position, native.position, "{input}");
+        assert_eq!(state.position(), native.position(), "{input}");
     }
     assert!(
         bounces > 32,

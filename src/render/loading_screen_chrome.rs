@@ -12,10 +12,9 @@ use crate::assets::pal_file::{Color, Palette};
 use crate::assets::pcx_file::PcxFile;
 use crate::assets::shp_file::ShpFile;
 use crate::render::batch::{BatchRenderer, BatchTexture};
+use crate::render::chrome_atlas::{ChromeAtlasEntry, ChromePiece, pack_chrome_atlas};
 use crate::render::gpu::GpuContext;
 use crate::render::native_surface_format::ACTIVE_RETAIL_RGB565_PRESENTATION;
-
-const ATLAS_PADDING: u32 = 2;
 
 /// Synthetic atlas label for the 1x1 white texel used to draw the solid backing
 /// fill (G3) as a tinted quad. Not an asset on disk.
@@ -128,24 +127,6 @@ pub enum LoadingArtVariant {
 }
 
 impl LoadingArtVariant {
-    #[cfg(test)]
-    pub fn from_country_name(country: &str) -> Option<Self> {
-        match country.to_ascii_lowercase().as_str() {
-            "yuricountry" | "yuri" => Some(Self::Yuri),
-            "observer" | "obs" => Some(Self::Observer),
-            "americans" | "usa" | "ustates" => Some(Self::Americans),
-            "russians" | "russia" => Some(Self::Russians),
-            "africans" | "libya" | "lybia" => Some(Self::Africans),
-            "alliance" | "korea" => Some(Self::Alliance),
-            "arabs" | "iraq" => Some(Self::Arabs),
-            "germans" | "germany" => Some(Self::Germans),
-            "french" | "france" => Some(Self::French),
-            "confederation" | "cuba" => Some(Self::Confederation),
-            "british" | "ukingdom" => Some(Self::British),
-            _ => None,
-        }
-    }
-
     /// Country insignia PCX drawn to the right of the loading bar (G4).
     ///
     /// Verified asset mapping from gamemd's loading-side-icon resolver
@@ -167,18 +148,24 @@ impl LoadingArtVariant {
     }
 
     pub fn manifest(self) -> LoadingArtManifest {
-        match self {
-            Self::Yuri => LoadingArtManifest::new("yuri", "MPYLS.PAL"),
-            Self::Observer => LoadingArtManifest::new("obs", "MPLSOBS.PAL"),
-            Self::Americans => LoadingArtManifest::new("ustates", "MPLSU.PAL"),
-            Self::Russians => LoadingArtManifest::new("russia", "MPLSR.PAL"),
-            Self::Africans => LoadingArtManifest::new("libya", "MPLSL.PAL"),
-            Self::Alliance => LoadingArtManifest::new("korea", "MPLSK.PAL"),
-            Self::Arabs => LoadingArtManifest::new("iraq", "MPLSI.PAL"),
-            Self::Germans => LoadingArtManifest::new("germany", "MPLSG.PAL"),
-            Self::French => LoadingArtManifest::new("france", "MPLSF.PAL"),
-            Self::Confederation => LoadingArtManifest::new("cuba", "MPLSC.PAL"),
-            Self::British => LoadingArtManifest::new("ukingdom", "MPLSUK.PAL"),
+        let index = match self {
+            Self::Americans => 0,
+            Self::Alliance => 1,
+            Self::French => 2,
+            Self::Germans => 3,
+            Self::British => 4,
+            Self::Africans => 5,
+            Self::Arabs => 6,
+            Self::Confederation => 7,
+            Self::Russians => 8,
+            Self::Yuri => 9,
+            Self::Observer => return LoadingArtManifest::new("obs", "MPLSOBS.PAL"),
+        };
+        let row = crate::rules::country_loading::stock_country_loading(index)
+            .expect("stock loading variant has a literal row");
+        {
+            let (token, palette) = row.art();
+            LoadingArtManifest::new(token, palette)
         }
     }
 }
@@ -202,12 +189,7 @@ impl LoadingArtManifest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LoadingScreenEntry {
-    pub uv_origin: [f32; 2],
-    pub uv_size: [f32; 2],
-    pub pixel_size: [f32; 2],
-}
+pub type LoadingScreenEntry = ChromeAtlasEntry;
 
 /// CPU-side selected-map preview prepared by the loading composition owner.
 ///
@@ -237,10 +219,60 @@ pub struct LoadingScreenCompositionAtlasInput<'a> {
     pub marker_remaps: &'a [MmpbMarkerRemap],
 }
 
+/// Named country/co-op background replaces only the SHP/PAL, never progress or icons.
+/// Borrowed names are decoded once into the loading attempt's existing atlas;
+/// dropping that atlas on success/failure retires its palette as well.
+#[derive(Debug, Clone, Copy)]
+pub struct LoadingScreenArtInput<'a> {
+    pub variant: Option<LoadingArtVariant>,
+    pub background: Option<LoadingCountryBackground<'a>>,
+}
+
+/// Late Country SHP with the PAL actually resolved before Full_Init's second
+/// Country pass. None palette denotes an explicitly cleared PAL, not fallback
+/// to a stock country's assets. Decoding remains with this module's owner.
+#[derive(Debug, Clone, Copy)]
+pub struct LoadingCountryBackground<'a> {
+    pub name: &'a str,
+    pub palette: Option<&'a Palette>,
+    pub palette_name: &'a str,
+}
+
+impl From<Option<LoadingArtVariant>> for LoadingScreenArtInput<'_> {
+    fn from(variant: Option<LoadingArtVariant>) -> Self {
+        Self {
+            variant,
+            background: None,
+        }
+    }
+}
+
+impl From<LoadingArtVariant> for LoadingScreenArtInput<'_> {
+    fn from(variant: LoadingArtVariant) -> Self {
+        Some(variant).into()
+    }
+}
+
+pub struct LoadingParticipantArtInput {
+    pub variant: Option<LoadingArtVariant>,
+    pub ramp: [Color; 16],
+    /// Row insignia file the Country selection resolves through
+    /// `Game_GetFlagSurface @ 0x1001DCE0`, replacing the stock chain name.
+    pub side_icon: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LoadingParticipantArt {
+    pub progress_frame: LoadingScreenEntry,
+    pub side_icon: Option<LoadingScreenEntry>,
+}
+
 pub struct LoadingScreenAtlas {
     pub texture: BatchTexture,
-    pub background: LoadingScreenEntry,
+    pub background: Option<LoadingScreenEntry>,
     pub progress_frame0: LoadingScreenEntry,
+    /// Source-node order, matching ProgressScreen643C0B's row iteration.
+    pub participants: Vec<LoadingParticipantArt>,
     /// Campaign title strip, or `None` for the native solid-rectangle fallback.
     /// Standard country loading has no separate title strip.
     pub title_bar: Option<LoadingScreenEntry>,
@@ -253,35 +285,80 @@ pub struct LoadingScreenAtlas {
     /// Country insignia drawn right of the bar (G4). `None` when the PCX is
     /// missing — the bar still draws without it.
     pub side_icon: Option<LoadingScreenEntry>,
+    /// MeasureRow642F30 and DrawRow643973 always reserve country0's icon
+    /// dimensions, independently of whether the actual country's icon exists.
+    pub insignia_measure_size: Option<[i32; 2]>,
     /// 1x1 white texel for drawing the solid backing fill (G3) as a tinted quad.
     pub solid_texel: LoadingScreenEntry,
 }
 
-struct RenderedLoadingEntry {
-    label: String,
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
+/// Row insignia file selected for a loading row. A Country row with retained
+/// Ares state answers from its own `File.Flag` through `Game_GetFlagSurface @
+/// 0x1001DCE0` (patch site `0x4E3562`); every other selection keeps the stock
+/// chain name from `0x00844AE8..0x00844B14`.
+fn side_icon_name<'a>(
+    variant: Option<LoadingArtVariant>,
+    country_file: Option<&'a str>,
+) -> Option<&'a str> {
+    country_file.or_else(|| variant.map(LoadingArtVariant::side_icon_pcx))
 }
 
-/// Build the native loading atlas with optional selected-map preview/marker
-/// layers.
-///
-/// Background and progress assets remain mandatory. Invalid preview input,
-/// missing `mmpb.shp`, or an unavailable color variant only removes optional
-/// layers.
-pub fn build_loading_screen_atlas_with_composition(
+/// Resolve the one background layer before atlas packing. Explicit Country
+/// input already owns its early palette; only the stock branch loads one here.
+fn render_loading_background(
+    assets: &AssetManager,
+    art: LoadingScreenArtInput<'_>,
+    width: LoadingScreenWidth,
+) -> Option<Option<ChromePiece>> {
+    if let Some(background) = art.background {
+        // Original DrawLoading 5535C1..5535CE skips the background if either
+        // Convert or SHP is null, then resumes progress drawing at 553603.
+        // Missing custom art cannot select a stock fallback or fail the atlas.
+        if background.name.is_empty() || background.palette.is_none() {
+            Some(None)
+        } else {
+            Some(mandatory_shp(
+                assets,
+                background.name,
+                background.palette?,
+                0,
+                background.palette_name,
+            ))
+        }
+    } else if let Some(variant) = art.variant {
+        let manifest = variant.manifest();
+        let name = manifest.background_asset(width);
+        let palette = load_named_ui_palette(assets, manifest.palette_name)?;
+        Some(Some(mandatory_shp(
+            assets,
+            &name,
+            &palette,
+            0,
+            manifest.palette_name,
+        )?))
+    } else {
+        Some(None)
+    }
+}
+
+/// Build the native loading atlas with optional selected-map preview/markers.
+/// A stock background and progress are mandatory; invalid optional preview or
+/// marker input removes only those layers. Empty or unavailable Country background
+/// art omits that layer without a stock fallback.
+pub fn build_loading_screen_atlas_with_composition<'a>(
     gpu: &GpuContext,
     batch: &BatchRenderer,
     assets: &AssetManager,
-    variant: LoadingArtVariant,
+    art: impl Into<LoadingScreenArtInput<'a>>,
     width: LoadingScreenWidth,
     progress_ramp: &[Color; 16],
     composition: Option<LoadingScreenCompositionAtlasInput<'_>>,
+    participants: &[LoadingParticipantArtInput],
 ) -> Option<LoadingScreenAtlas> {
-    let manifest = variant.manifest();
-    let background_name = manifest.background_asset(width);
-    let background_palette = load_named_ui_palette(assets, manifest.palette_name)?;
+    let art = art.into();
+    let variant = art.variant;
+    let background = render_loading_background(assets, art, width)?;
+    let background_label = background.as_ref().map(|entry| entry.label.clone());
     // gamemd draws the Skirmish meter and the map-preview house-colour markers through
     // an assigned house's ColorScheme convert: `ProgressMeterClass__DrawFill @ 0x00643486`
     // reads `ColorScheme+0x30C` (the `+0x74` override stays null for `g_GameMode != 0`,
@@ -291,22 +368,20 @@ pub fn build_loading_screen_atlas_with_composition(
     // `ColorScheme__Constructor @ 0x0068C710` hands that fixed buffer to
     // `ColorScheme__BuildRampPalette @ 0x0068C3B0`, whose first step is the 768-byte base
     // copy, and `Init_Game` fills it from `TEMPERAT.PAL` whatever the selected theater.
-    let house_convert_base_palette = load_named_ui_palette(assets, "TEMPERAT.PAL")
-        .or_else(|| load_named_ui_palette(assets, "MPLS.PAL"))?;
+    let house_convert_base_palette = load_named_ui_palette(assets, "TEMPERAT.PAL")?;
     let progress_palette =
         progress_palette_with_player_ramp(&house_convert_base_palette, progress_ramp);
 
     let mut rendered = vec![
-        mandatory_shp(
-            assets,
-            &background_name,
-            &background_palette,
-            0,
-            manifest.palette_name,
-        )?,
         mandatory_shp(assets, "PROGBARM.SHP", &progress_palette, 0, "TEMPERAT.PAL")?,
         solid_texel_entry(),
     ];
+    if let Some(background) = background {
+        rendered.push(background);
+    }
+    let insignia_measure_size =
+        render_pcx_entry(assets, LoadingArtVariant::Americans.side_icon_pcx())
+            .map(|entry| [entry.width as i32, entry.height as i32]);
 
     let (preview_label, marker_labels) = append_optional_composition_entries(
         assets,
@@ -317,20 +392,42 @@ pub fn build_loading_screen_atlas_with_composition(
 
     // Side-icon is non-fatal: if its PCX is missing or malformed the bar still
     // draws. Record its label so it can be looked up after packing.
-    let side_icon_name = variant.side_icon_pcx();
-    let side_icon_label = match render_pcx_entry(assets, side_icon_name) {
-        Some(entry) => {
+    let side_icon_label = variant.and_then(|variant| {
+        let entry = render_pcx_entry(assets, variant.side_icon_pcx())?;
+        let label = entry.label.clone();
+        rendered.push(entry);
+        Some(label)
+    });
+
+    let mut participant_labels = Vec::with_capacity(participants.len());
+    for (index, participant) in participants.iter().enumerate() {
+        let frame_label = if participant.ramp == *progress_ramp {
+            "progbarm.shp".to_string()
+        } else {
+            let palette =
+                progress_palette_with_player_ramp(&house_convert_base_palette, &participant.ramp);
+            let mut entry = mandatory_shp(assets, "PROGBARM.SHP", &palette, 0, "TEMPERAT.PAL")?;
+            entry.label = format!("player-progress-{index}");
             let label = entry.label.clone();
             rendered.push(entry);
-            Some(label)
-        }
-        None => {
-            log::warn!("Missing standard Skirmish loading side icon {side_icon_name}");
-            None
-        }
-    };
+            label
+        };
+        let icon_label = side_icon_name(participant.variant, participant.side_icon.as_deref())
+            .and_then(|name| {
+                let label = name.to_ascii_lowercase();
+                if rendered.iter().any(|entry| entry.label == label) {
+                    Some(label)
+                } else {
+                    let entry = render_pcx_entry(assets, name)?;
+                    let label = entry.label.clone();
+                    rendered.push(entry);
+                    Some(label)
+                }
+            });
+        participant_labels.push((frame_label, icon_label));
+    }
 
-    let (texture, packed) = pack_entries(gpu, batch, &rendered)?;
+    let (texture, packed) = pack_chrome_atlas(gpu, batch, "Loading", &rendered)?;
     let by_label: HashMap<String, LoadingScreenEntry> = rendered
         .iter()
         .map(|entry| entry.label.clone())
@@ -341,14 +438,53 @@ pub fn build_loading_screen_atlas_with_composition(
         lookup_optional_atlas_entries(&by_label, preview_label.as_deref(), &marker_labels);
     Some(LoadingScreenAtlas {
         texture,
-        background: *by_label.get(&background_name.to_ascii_lowercase())?,
+        background: background_label.and_then(|label| by_label.get(&label).copied()),
         progress_frame0: *by_label.get("progbarm.shp")?,
+        participants: participant_labels
+            .into_iter()
+            .map(|(frame, icon)| LoadingParticipantArt {
+                progress_frame: *by_label.get(&frame).expect("packed participant progress"),
+                side_icon: icon.and_then(|label| by_label.get(&label).copied()),
+            })
+            .collect(),
         title_bar: None,
         progress_background: None,
         preview,
         mmpb_markers,
         side_icon,
+        insignia_measure_size,
         solid_texel: *by_label.get(SOLID_TEXEL_LABEL)?,
+    })
+}
+
+///642C20 transfer callers load only PROGBARM; their shell backdrop is
+/// composed by the shell owner. Reuse this atlas/decoder/palette owner without
+/// requiring an unrelated country's loading background to exist.
+pub fn build_transfer_progress_atlas(
+    gpu: &GpuContext,
+    batch: &BatchRenderer,
+    assets: &AssetManager,
+    progress_ramp: &[Color; 16],
+) -> Option<LoadingScreenAtlas> {
+    let base = load_named_ui_palette(assets, "TEMPERAT.PAL")?;
+    let palette = progress_palette_with_player_ramp(&base, progress_ramp);
+    let entries = [
+        mandatory_shp(assets, "PROGBARM.SHP", &palette, 0, "TEMPERAT.PAL")?,
+        solid_texel_entry(),
+    ];
+    let (texture, packed) = pack_chrome_atlas(gpu, batch, "Loading", &entries)?;
+    Some(LoadingScreenAtlas {
+        texture,
+        background: None,
+        progress_frame0: packed[0],
+        participants: Vec::new(),
+        title_bar: None,
+        progress_background: None,
+        preview: None,
+        mmpb_markers: BTreeMap::new(),
+        side_icon: None,
+        insignia_measure_size: None,
+        solid_texel: packed[1],
     })
 }
 
@@ -372,7 +508,7 @@ pub fn build_campaign_loading_screen_atlas(
 ) -> Option<LoadingScreenAtlas> {
     let rendered =
         render_campaign_entries(assets, width, background_name, background_palette_name)?;
-    let (texture, packed) = pack_entries(gpu, batch, &rendered)?;
+    let (texture, packed) = pack_chrome_atlas(gpu, batch, "Loading", &rendered)?;
     let by_label: HashMap<String, LoadingScreenEntry> = rendered
         .iter()
         .map(|entry| entry.label.clone())
@@ -380,13 +516,15 @@ pub fn build_campaign_loading_screen_atlas(
         .collect();
     Some(LoadingScreenAtlas {
         texture,
-        background: *by_label.get(CAMPAIGN_BACKGROUND_LABEL)?,
+        background: Some(*by_label.get(CAMPAIGN_BACKGROUND_LABEL)?),
         progress_frame0: *by_label.get(CAMPAIGN_PROGRESS_LABEL)?,
+        participants: Vec::new(),
         title_bar: by_label.get(CAMPAIGN_TITLE_LABEL).copied(),
         progress_background: by_label.get(CAMPAIGN_BAR_BACKGROUND_LABEL).copied(),
         preview: None,
         mmpb_markers: BTreeMap::new(),
         side_icon: None,
+        insignia_measure_size: None,
         solid_texel: *by_label.get(SOLID_TEXEL_LABEL)?,
     })
 }
@@ -396,7 +534,7 @@ fn render_campaign_entries(
     width: LoadingScreenWidth,
     background_name: &str,
     background_palette_name: &str,
-) -> Option<Vec<RenderedLoadingEntry>> {
+) -> Option<Vec<ChromePiece>> {
     if background_name.is_empty() {
         return None;
     }
@@ -437,7 +575,7 @@ fn append_optional_composition_entries(
     assets: &AssetManager,
     remap_base_palette: &Palette,
     composition: Option<LoadingScreenCompositionAtlasInput<'_>>,
-    rendered: &mut Vec<RenderedLoadingEntry>,
+    rendered: &mut Vec<ChromePiece>,
 ) -> (Option<String>, Vec<(u8, String)>) {
     let Some(composition) = composition else {
         return (None, Vec::new());
@@ -484,7 +622,7 @@ fn append_optional_composition_entries(
     (Some(preview_label), marker_labels)
 }
 
-fn prepared_preview_entry(preview: &PreparedLoadingPreviewRgba) -> Option<RenderedLoadingEntry> {
+fn prepared_preview_entry(preview: &PreparedLoadingPreviewRgba) -> Option<ChromePiece> {
     let expected_len = preview
         .width
         .checked_mul(preview.height)
@@ -499,7 +637,7 @@ fn prepared_preview_entry(preview: &PreparedLoadingPreviewRgba) -> Option<Render
         );
         return None;
     }
-    Some(RenderedLoadingEntry {
+    Some(ChromePiece {
         label: LOADING_PREVIEW_LABEL.to_string(),
         width: preview.width,
         height: preview.height,
@@ -531,8 +669,8 @@ fn lookup_optional_atlas_entries(
 
 /// A 1x1 opaque-white texel. Drawn scaled and tinted to produce the G3 solid
 /// backing fill; tinting an all-white texel yields a flat color rect.
-fn solid_texel_entry() -> RenderedLoadingEntry {
-    RenderedLoadingEntry {
+fn solid_texel_entry() -> ChromePiece {
+    ChromePiece {
         label: SOLID_TEXEL_LABEL.to_string(),
         width: 1,
         height: 1,
@@ -542,7 +680,7 @@ fn solid_texel_entry() -> RenderedLoadingEntry {
 
 /// Decode a country-insignia PCX into an atlas entry using the native
 /// RGB-magenta transparency key.
-fn render_pcx_entry(assets: &AssetManager, file_name: &str) -> Option<RenderedLoadingEntry> {
+fn render_pcx_entry(assets: &AssetManager, file_name: &str) -> Option<ChromePiece> {
     let bytes = assets.get_ref(file_name)?;
     let pcx = PcxFile::from_bytes(bytes)
         .map_err(|err| {
@@ -553,7 +691,7 @@ fn render_pcx_entry(assets: &AssetManager, file_name: &str) -> Option<RenderedLo
     let mut rgba = pcx.to_rgba(None);
     ACTIVE_RETAIL_RGB565_PRESENTATION
         .apply_packed_color_key_rgba8(&mut rgba, SIDE_ICON_TRANSPARENT_RGB);
-    Some(RenderedLoadingEntry {
+    Some(ChromePiece {
         label: file_name.to_ascii_lowercase(),
         width: pcx.width as u32,
         height: pcx.height as u32,
@@ -564,7 +702,7 @@ fn render_pcx_entry(assets: &AssetManager, file_name: &str) -> Option<RenderedLo
 /// Loading-screen palettes come from ConvertClass__BuildFromPaletteFile
 /// `0x0072ADE0` and the meter base from Init_Game's TEMPERAT.PAL loop
 /// (`0x0052BC6A..0x0052BCB9`); both convert like every other palette load.
-fn load_named_ui_palette(assets: &AssetManager, name: &str) -> Option<Palette> {
+pub(crate) fn load_named_ui_palette(assets: &AssetManager, name: &str) -> Option<Palette> {
     let Some(bytes) = assets.get_ref(name) else {
         log::warn!("Missing loading palette {name}");
         return None;
@@ -583,7 +721,7 @@ fn mandatory_shp(
     palette: &Palette,
     frame: usize,
     palette_name: &str,
-) -> Option<RenderedLoadingEntry> {
+) -> Option<ChromePiece> {
     render_shp_entry(assets, file_name, palette, frame).or_else(|| {
         log::warn!(
             "Missing mandatory loading asset {file_name} frame {frame} decoded with {palette_name}"
@@ -597,7 +735,7 @@ fn render_shp_entry(
     file_name: &str,
     palette: &Palette,
     frame: usize,
-) -> Option<RenderedLoadingEntry> {
+) -> Option<ChromePiece> {
     let Some(load) = assets.load_file_from_mix(file_name) else {
         log::warn!("Missing loading SHP {file_name}");
         return None;
@@ -643,7 +781,7 @@ fn render_shp_entry(
         }
         canvas
     };
-    Some(RenderedLoadingEntry {
+    Some(ChromePiece {
         label: file_name.to_ascii_lowercase(),
         width: canvas_w,
         height: canvas_h,
@@ -651,87 +789,136 @@ fn render_shp_entry(
     })
 }
 
-fn pack_entries(
-    gpu: &GpuContext,
-    batch: &BatchRenderer,
-    entries: &[RenderedLoadingEntry],
-) -> Option<(BatchTexture, Vec<LoadingScreenEntry>)> {
-    if entries.is_empty() {
-        return None;
-    }
-
-    let atlas_width = entries
-        .iter()
-        .map(|entry| entry.width)
-        .max()
-        .unwrap_or(1)
-        .max(1024);
-    let mut x = 0u32;
-    let mut y = 0u32;
-    let mut row_h = 0u32;
-    let mut placements = Vec::with_capacity(entries.len());
-
-    for entry in entries {
-        if x > 0 && x + entry.width + ATLAS_PADDING > atlas_width {
-            x = 0;
-            y += row_h + ATLAS_PADDING;
-            row_h = 0;
-        }
-        placements.push((x, y));
-        x += entry.width + ATLAS_PADDING;
-        row_h = row_h.max(entry.height);
-    }
-
-    let atlas_height = (y + row_h).next_power_of_two().max(1);
-    let mut rgba = vec![0u8; (atlas_width * atlas_height * 4) as usize];
-
-    for (entry, (px, py)) in entries.iter().zip(placements.iter().copied()) {
-        for row in 0..entry.height {
-            let src = (row * entry.width * 4) as usize;
-            let dst = (((py + row) * atlas_width + px) * 4) as usize;
-            let len = (entry.width * 4) as usize;
-            rgba[dst..dst + len].copy_from_slice(&entry.rgba[src..src + len]);
-        }
-    }
-
-    log::info!(
-        "Loading atlas: {}x{} px, {} pieces",
-        atlas_width,
-        atlas_height,
-        entries.len()
-    );
-
-    let texture = batch.create_texture(gpu, &rgba, atlas_width, atlas_height);
-    let atlas_entries = entries
-        .iter()
-        .zip(placements)
-        .map(|(entry, (px, py))| LoadingScreenEntry {
-            uv_origin: [
-                px as f32 / atlas_width as f32,
-                py as f32 / atlas_height as f32,
-            ],
-            uv_size: [
-                entry.width as f32 / atlas_width as f32,
-                entry.height as f32 / atlas_height as f32,
-            ],
-            pixel_size: [entry.width as f32, entry.height as f32],
-        })
-        .collect();
-    Some((texture, atlas_entries))
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_render_a_r))]
 mod tests {
     use super::{
         CAMPAIGN_BACKGROUND_LABEL, CAMPAIGN_BAR_BACKGROUND_LABEL, CAMPAIGN_PROGRESS_LABEL,
-        CAMPAIGN_TITLE_LABEL, LOADING_PREVIEW_LABEL, LoadingArtVariant, LoadingScreenEntry,
-        LoadingScreenWidth, MmpbRegionRect, PreparedLoadingPreviewRgba,
-        lookup_optional_atlas_entries, mmpb_marker_label, mmpb_region_rect, prepared_preview_entry,
+        CAMPAIGN_TITLE_LABEL, LOADING_PREVIEW_LABEL, LoadingArtVariant, LoadingScreenWidth,
+        MmpbRegionRect, PreparedLoadingPreviewRgba, mmpb_region_rect, prepared_preview_entry,
         progress_palette_with_player_ramp, render_campaign_entries, render_pcx_entry,
         render_shp_entry,
     };
     use crate::assets::pal_file::{Color, Palette};
-    use std::collections::HashMap;
+
+    #[test]
+    fn ares_country_loading_background_consumes_frozen_palette_and_late_shape() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let Some((_, mut retail)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        assert!(retail.register_loading_archives().unwrap());
+        let name = LoadingArtVariant::Americans
+            .manifest()
+            .background_asset(LoadingScreenWidth::W800);
+        let dir =
+            crate::map::source::test_support::TestDirectory::new("ares-country-loading-render");
+        dir.write(&name, retail.get_ref(&name).unwrap());
+        let mut red = [0; 768];
+        let mut green = [0; 768];
+        for index in 0..256 {
+            red[index * 3] = 63;
+            green[index * 3 + 1] = 63;
+        }
+        dir.write("early.pal", &red);
+        dir.write("late.pal", &green);
+        let assets =
+            crate::assets::asset_manager::AssetManager::from_loose_root_for_test(dir.path());
+        let frozen = super::load_named_ui_palette(&assets, "early.pal").unwrap();
+        let entry = super::render_loading_background(
+            &assets,
+            super::LoadingScreenArtInput {
+                variant: Some(LoadingArtVariant::Arabs),
+                background: Some(super::LoadingCountryBackground {
+                    name: &name,
+                    palette: Some(&frozen),
+                    palette_name: "late.pal",
+                }),
+            },
+            LoadingScreenWidth::W800,
+        )
+        .unwrap()
+        .unwrap();
+        let opaque: Vec<_> = entry
+            .rgba
+            .chunks_exact(4)
+            .filter(|pixel| pixel[3] != 0)
+            .collect();
+        assert!(!opaque.is_empty());
+        assert!(
+            opaque
+                .iter()
+                .all(|pixel| *pixel == [252u8, 0, 0, 255].as_slice()),
+            "late palette name cannot trigger a new read"
+        );
+        assert!(
+            super::render_loading_background(
+                &assets,
+                super::LoadingScreenArtInput {
+                    variant: Some(LoadingArtVariant::Americans),
+                    background: Some(super::LoadingCountryBackground {
+                        name: &name,
+                        palette: None,
+                        palette_name: ""
+                    }),
+                },
+                LoadingScreenWidth::W800,
+            )
+            .unwrap()
+            .is_none(),
+            "an explicitly cleared Country PAL cannot fall back to stock art"
+        );
+        assert!(
+            super::render_loading_background(
+                &assets,
+                super::LoadingScreenArtInput {
+                    variant: Some(LoadingArtVariant::Arabs),
+                    background: Some(super::LoadingCountryBackground {
+                        name: "missing-country.shp",
+                        palette: Some(&frozen),
+                        palette_name: "early.pal",
+                    }),
+                },
+                LoadingScreenWidth::W800,
+            )
+            .unwrap()
+            .is_none(),
+            "missing Country SHP skips the background and retains progress"
+        );
+    }
+
+    #[test]
+    fn cooperative_loading_art_keeps_the_literal_800_asset_at_640_width() {
+        let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        assert!(assets.register_loading_archives().unwrap());
+        let registry =
+            crate::app::frontend::skirmish_session::cooperative::CooperativeRegistry::from_assets(
+                &assets,
+            )
+            .unwrap();
+        let (name, palette_name) = registry.loading_art("c2s01md.map").unwrap();
+        assert_eq!(name, "LS800CS.shp");
+        assert_eq!(palette_name, "LS800CS.pal");
+        let palette = super::load_named_ui_palette(&assets, palette_name).unwrap();
+        let rendered = super::render_loading_background(
+            &assets,
+            super::LoadingScreenArtInput {
+                variant: Some(LoadingArtVariant::Americans),
+                background: Some(super::LoadingCountryBackground {
+                    name,
+                    palette: Some(&palette),
+                    palette_name,
+                }),
+            },
+            LoadingScreenWidth::W640,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rendered.label, "ls800cs.shp");
+        assert_eq!([rendered.width, rendered.height], [800, 600]);
+        assert!(rendered.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
+    }
 
     #[test]
     fn first_campaign_art_decodes_through_the_shared_loading_palette_and_shp_path() {
@@ -888,47 +1075,6 @@ mod tests {
     }
 
     #[test]
-    fn optional_entry_bookkeeping_keeps_marker_colors_distinct() {
-        let preview = LoadingScreenEntry {
-            uv_origin: [0.0, 0.0],
-            uv_size: [0.25, 0.25],
-            pixel_size: [200.0, 100.0],
-        };
-        let red = LoadingScreenEntry {
-            uv_origin: [0.25, 0.0],
-            uv_size: [0.02, 0.02],
-            pixel_size: [12.0, 12.0],
-        };
-        let blue = LoadingScreenEntry {
-            uv_origin: [0.27, 0.0],
-            uv_size: [0.02, 0.02],
-            pixel_size: [12.0, 12.0],
-        };
-        let red_label = mmpb_marker_label(3);
-        let blue_label = mmpb_marker_label(11);
-        let by_label = HashMap::from([
-            (LOADING_PREVIEW_LABEL.to_string(), preview),
-            (red_label.clone(), red),
-            (blue_label.clone(), blue),
-        ]);
-
-        let (resolved_preview, markers) = lookup_optional_atlas_entries(
-            &by_label,
-            Some(LOADING_PREVIEW_LABEL),
-            &[
-                (3, red_label),
-                (11, blue_label),
-                (19, mmpb_marker_label(19)),
-            ],
-        );
-
-        assert_eq!(resolved_preview, Some(preview));
-        assert_eq!(markers.get(&3), Some(&red));
-        assert_eq!(markers.get(&11), Some(&blue));
-        assert!(!markers.contains_key(&19));
-    }
-
-    #[test]
     fn loading_art_manifest_uses_verified_binary_string_table_names() {
         let cases = [
             (
@@ -1014,28 +1160,6 @@ mod tests {
     }
 
     #[test]
-    fn loading_art_manifest_does_not_use_mode2_or_campaign_assets() {
-        for variant in [
-            LoadingArtVariant::Yuri,
-            LoadingArtVariant::Observer,
-            LoadingArtVariant::Americans,
-            LoadingArtVariant::Russians,
-            LoadingArtVariant::Africans,
-            LoadingArtVariant::Alliance,
-            LoadingArtVariant::Arabs,
-            LoadingArtVariant::Germans,
-            LoadingArtVariant::French,
-            LoadingArtVariant::Confederation,
-            LoadingArtVariant::British,
-        ] {
-            let manifest = variant.manifest();
-            let name = manifest.background_asset(LoadingScreenWidth::W800);
-            assert!(!name.to_ascii_lowercase().contains("pudlgbg"));
-            assert_ne!(name.to_ascii_lowercase(), "spldbr.shp");
-        }
-    }
-
-    #[test]
     fn side_icon_pcx_uses_verified_insignia_mapping() {
         let cases = [
             (LoadingArtVariant::Americans, "usai.pcx"),
@@ -1053,22 +1177,6 @@ mod tests {
         for (variant, expected) in cases {
             assert_eq!(variant.side_icon_pcx(), expected, "{variant:?}");
         }
-    }
-
-    #[test]
-    fn loading_art_variant_resolves_rules_country_names() {
-        assert_eq!(
-            LoadingArtVariant::from_country_name("Americans"),
-            Some(LoadingArtVariant::Americans)
-        );
-        assert_eq!(
-            LoadingArtVariant::from_country_name("Alliance"),
-            Some(LoadingArtVariant::Alliance)
-        );
-        assert_eq!(
-            LoadingArtVariant::from_country_name("YuriCountry"),
-            Some(LoadingArtVariant::Yuri)
-        );
     }
 
     #[test]

@@ -1,66 +1,10 @@
-//! App-owned weapon fire presentation: positioned weapon report sounds and
-//! persistent wave geometry.
+//! App-owned persistent weapon wave geometry.
 //!
 //! The sim owns the fire coordinate (`sim::combat::fire_coord`) and constructs
-//! the muzzle animations itself as `AnimClass` objects; this module only
-//! projects that coordinate for audio and lowers waves to render geometry.
+//! muzzle animations and positioned sound requests; this module lowers waves
+//! to render geometry.
 
-use crate::app::AppState;
-use crate::audio::events::{GameSoundEvent, SoundSource};
-use crate::sim::world::{SimFireEvent, Simulation};
-
-/// One persistent WaveClass draw resolved from simulation-owned registration state.
-#[derive(Debug, Clone)]
-pub(crate) struct WeaponWaveVisual {
-    pub polygon: [[i32; 2]; 6],
-    pub tint: [f32; 3],
-}
-
-/// The weapon `Report=` cues of a batch of shots, each positioned at its
-/// shot's fire coordinate.
-///
-/// gamemd-derived: `TechnoClass::Fire_At` plays the report at the same local
-/// it hands the muzzle animation (`0x006FF372..0x006FF38F`).
-fn weapon_report_sounds(sim: &Simulation, events: &[SimFireEvent]) -> Vec<GameSoundEvent> {
-    events
-        .iter()
-        .filter_map(|event| {
-            let report_id = event.report_sound_id?;
-            let coord = event.fire_coord;
-            let screen = crate::util::lepton::absolute_leptons_to_screen(coord.x, coord.y, coord.z);
-            let cell = (
-                coord.x.div_euclid(256).clamp(0, i32::from(u16::MAX)) as u16,
-                coord.y.div_euclid(256).clamp(0, i32::from(u16::MAX)) as u16,
-            );
-            Some(GameSoundEvent::WeaponFired {
-                sound_id: sim.interner.resolve(report_id).to_string(),
-                source: Some(SoundSource::new(screen, cell)),
-            })
-        })
-        .collect()
-}
-
-pub(crate) fn build_weapon_wave_visuals(
-    sim: &Simulation,
-    observer: Option<crate::sim::intern::InternedId>,
-) -> Vec<WeaponWaveVisual> {
-    sim.waves
-        .iter()
-        .filter_map(|(_, wave)| {
-            let polygon = wave.sonic_draw_polygon([0, 0])?;
-            if !weapon_wave_visible(sim, observer, wave) {
-                return None;
-            }
-            Some(WeaponWaveVisual {
-                polygon,
-                // Sonic samples the destination framebuffer;
-                // they never select a house remap. The current sprite batch
-                // has no framebuffer-distortion input, so it remains neutral.
-                tint: [1.0, 1.0, 1.0],
-            })
-        })
-        .collect()
-}
+use crate::sim::world::Simulation;
 
 /// DrawIt75F9F0's shared endpoint fog admission. Each raster consumes the
 /// same simulation coordinates and the same native gate.
@@ -78,95 +22,117 @@ fn weapon_wave_visible(
             u16::try_from(point.y.div_euclid(256)).ok()?,
         ))
     };
-    let (Some((sx, sy)), Some((tx, ty))) = (cell(wave.source), cell(wave.target)) else {
+    let (Some((sx, sy)), Some((tx, ty))) = (cell(wave.source()), cell(wave.target())) else {
         return false;
     };
     wave.visible_through_fog(
-        sim.session.game_options.fog_of_war,
-        !sim.fog.is_cell_revealed(observer, sx, sy),
-        !sim.fog.is_cell_revealed(observer, tx, ty),
+        sim.session().game_options().fog_of_war,
+        !sim.fog().is_cell_revealed(observer, sx, sy),
+        !sim.fog().is_cell_revealed(observer, tx, ty),
     )
 }
 
-/// Native type3 geometry is owned by WaveClass, including the Unit endpoint
-/// reversal and projected fade. Rendering translates it once and supplies the
+/// Ares GetWaveColorData (Ares.dll 10055270), which WaveClass_Draw_Colors
+/// (10057080, hook 0x75FA29) computes once per DrawIt: the colours of the
+/// weapon CreateWave registered, with `Wave.IsHouseColor` taking the
+/// owner's House+56F9 through the shared colour-map lookup.
+pub(crate) fn ares_wave_blend(
+    sim: &Simulation,
+    frame: &crate::app::presentation::frame::PresentationFrame,
+    rules: &crate::rules::ruleset::RuleSet,
+    house_colors: &crate::map::houses::HouseColorMap,
+    wave: &crate::sim::wave::Wave,
+) -> crate::render::wave_geometry::WaveBlend {
+    use crate::render::wave_geometry::{WaveBlend, WaveColor};
+    let Some(weapon) = sim.ares_wave_weapon(wave, rules) else {
+        return WaveBlend::Native;
+    };
+    let owner_rgb = wave
+        .owner_id()
+        .and_then(|owner| frame.object(owner))
+        .map(|owner| {
+            let index = house_colors
+                .get(sim.interner().resolve(owner.owner()))
+                .copied()
+                .unwrap_or(crate::rules::house_colors::NO_REMAP);
+            crate::render::palette_light::house_color_rgb(&rules.house_color_ramps, index)
+        });
+    match weapon
+        .ares_visuals
+        .wave_color_data(weapon.is_mag_beam, weapon.is_sonic, owner_rgb)
+    {
+        Some((intensity, color)) => WaveBlend::Ares(WaveColor { intensity, color }),
+        None => WaveBlend::AresDisabled,
+    }
+}
+
+/// Native type0..3 geometry is owned by WaveClass, including projected fade
+/// and the type3 Unit endpoint reversal. Rendering translates it once and supplies the
 /// current packed destination; it never rebuilds a quad from world endpoints.
-pub(crate) fn build_magnetic_wave_draws(
+/// `blend` answers each wave's pixel colouring; `ares`, whether Ares plays.
+pub(crate) fn build_weapon_wave_draws(
     sim: &Simulation,
     observer: Option<crate::sim::intern::InternedId>,
     camera: [i32; 2],
-) -> Vec<(u64, crate::render::wave_geometry::MagneticWaveDraw)> {
-    use crate::render::wave_geometry::{MagneticClipPath, MagneticWaveDraw};
+    ares: bool,
+    blend: impl Fn(&crate::sim::wave::Wave) -> crate::render::wave_geometry::WaveBlend,
+) -> Vec<(u64, crate::render::wave_geometry::WaveDraw)> {
+    use crate::render::wave_geometry::{WaveClipPath, WaveDraw, WavePolygon};
 
-    sim.waves
+    sim.waves()
         .iter()
         .filter_map(|(&id, wave)| {
-            let geometry = wave.magnetic_draw_geometry(camera)?;
+            let (polygon, source_point) = match wave.wave_type() {
+                0 => {
+                    let geometry = wave.sonic_draw_geometry(camera)?;
+                    (WavePolygon::Sonic(geometry.polygon), geometry.source_point)
+                }
+                // DrawIt75F9F0's Draw_Laser arm for the TS laser types. Its
+                // detail-level-2 gate always passes: Ares
+                // WaveClass_Draw_NodLaser_Details (10057120, hook 0x7609E3)
+                // reads the level as 2, and only Ares creates lasers.
+                1 | 2 => {
+                    let geometry = wave.sonic_draw_geometry(camera)?;
+                    (WavePolygon::Laser(geometry.polygon), geometry.source_point)
+                }
+                3 => {
+                    let geometry = wave.magnetic_draw_geometry(camera)?;
+                    (
+                        WavePolygon::Magnetic(geometry.polygon),
+                        geometry.source_point,
+                    )
+                }
+                _ => return None,
+            };
             if !weapon_wave_visible(sim, observer, wave) {
                 return None;
             }
             Some((
                 id,
-                MagneticWaveDraw {
-                    polygon: geometry.polygon,
-                    source_point: geometry.source_point,
-                    source_z: wave.source.z,
-                    phase: wave.lifetime,
-                    direction: u8::try_from(wave.direction_octant).ok()?,
+                WaveDraw {
+                    polygon,
+                    source_point,
+                    source_z: wave.source().z,
+                    phase: match polygon {
+                        WavePolygon::Laser(_) => wave.intensity(),
+                        _ => wave.lifetime(),
+                    },
+                    direction: u8::try_from(wave.direction_octant()).ok()?,
                     // VERA's existing scene Z is contiguous. Native ring
                     // fallback can differ by one clipping-edge pixel; C32's
                     // production footprints remain inside both margins.
-                    clip_path: MagneticClipPath::Fast,
+                    clip_path: WaveClipPath::Fast,
+                    blend: blend(wave),
+                    ares,
                 },
             ))
         })
         .collect()
 }
 
-pub(crate) fn queue_weapon_report_sounds(state: &mut AppState, events: &[SimFireEvent]) {
-    let sounds = {
-        let Some(sim) = state
-            .match_state
-            .sim_runtime
-            .as_ref()
-            .map(|rt| &rt.simulation)
-        else {
-            return;
-        };
-        weapon_report_sounds(sim, events)
-    };
-    for sound in sounds {
-        state.match_state.match_audio.sound_events.push(sound);
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn report_sound_is_positioned_at_the_sim_fire_coordinate() {
-        let mut sim = Simulation::new();
-        let report = sim.interner.intern("GIAttack");
-        let mut event = crate::sim::world::SimFireEvent::for_test(1);
-        event.report_sound_id = Some(report);
-        event.fire_coord =
-            crate::sim::projectile::ProjectileCoord::new(10 * 256 + 200, 11 * 256 + 40, 105);
-
-        let sounds = weapon_report_sounds(&sim, &[event.clone()]);
-        let expected =
-            crate::util::lepton::absolute_leptons_to_screen(10 * 256 + 200, 11 * 256 + 40, 105);
-        match sounds.as_slice() {
-            [GameSoundEvent::WeaponFired { sound_id, source }] => {
-                assert_eq!(sound_id, "GIAttack");
-                assert_eq!(*source, Some(SoundSource::new(expected, (10, 11))));
-            }
-            other => panic!("unexpected sound events: {other:?}"),
-        }
-
-        event.report_sound_id = None;
-        assert!(weapon_report_sounds(&sim, &[event]).is_empty());
-    }
 
     /// Dustbowl/Battle's production RULESMD/LANGRULE/mode/map reader, then
     /// the actual object visit through bullet, AnimClass and positioned audio.
@@ -230,9 +196,7 @@ mod tests {
             assert!(!flashes.is_empty() && !weapon.report.is_empty());
             // Bind the real SHP bytes so absence of an animation cannot pass.
             for flash in flashes {
-                rules
-                    .bind_authored_load_anim(&flash, &assets, "tem", "TEMPERATE")
-                    .unwrap();
+                rules.bind_authored_load_anim(&flash, &assets, "tem", "TEMPERATE");
             }
             let mut sim = Simulation::new();
             crate::sim::arena_fixture::flat_ground(&mut sim, rules);
@@ -248,26 +212,29 @@ mod tests {
             let facing = fire_coord::building_direction_to(
                 &sim,
                 rules,
-                sim.substrate.entities.get(gun).unwrap(),
+                sim.entities().get(gun).unwrap(),
                 TargetKind::Entity(target),
             )
             .unwrap();
-            sim.substrate.entities.get_mut(gun).unwrap().body_facing = FacingClass::new(facing, 0);
+            sim.entities_mut_for_test()
+                .get_mut(gun)
+                .unwrap()
+                .body_facing = FacingClass::new(facing, 0);
             sim.assign_target_represented(
                 gun,
                 Some(TargetKind::Entity(target)),
-                Some(rules),
+                rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
             for _ in 0..300 {
-                sim.fire_events.clear();
+                sim.clear_fire_events_for_test();
                 let before: std::collections::BTreeSet<_> =
-                    sim.projectiles.iter().map(|(&id, _)| id).collect();
+                    sim.projectiles().iter().map(|(&id, _)| id).collect();
                 sim.advance_tick(&[], Some(rules), None, None, 67);
                 let Some(event) = sim
-                    .fire_events
+                    .fire_events()
                     .iter()
                     .find(|event| event.attacker_id == gun)
                 else {
@@ -275,23 +242,21 @@ mod tests {
                 };
                 let event = event.clone();
                 let shell = sim
-                    .projectiles
+                    .projectiles()
                     .iter()
-                    .find(|(id, projectile)| projectile.source_id == gun && !before.contains(id))
+                    .find(|(id, projectile)| projectile.source_id() == gun && !before.contains(id))
                     .unwrap_or_else(|| panic!(
                         "a real Grand Cannon shell: frame={} shot={event:?} live_bullets={:?} target_health={:?}",
-                        sim.session.binary_frame,
-                        sim.projectiles.iter().collect::<Vec<_>>(),
-                        sim.substrate.entities.get(target).map(|entity| entity.health)
+                        sim.session().binary_frame(),
+                        sim.projectiles().iter().collect::<Vec<_>>(),
+                        sim.entities().get(target).map(|entity| entity.health)
                     ))
                     .1;
-                assert_eq!(shell.launch_origin, event.fire_coord);
+                assert_eq!(shell.launch_origin(), event.fire_coord);
                 let flash_type = event.muzzle_anim.expect("stock weapon selects a flash");
                 let (flash_id, flash) = sim
-                    .substrate
-                    .anims
-                    .iter()
-                    .find(|(_, anim)| anim.type_id == flash_type)
+                    .anims()
+                    .find(|(_, anim)| anim.type_id() == flash_type)
                     .expect("the real muzzle AnimClass exists");
                 assert_eq!(
                     sim.anim_absolute_coord(*flash_id),
@@ -302,26 +267,42 @@ mod tests {
                     })
                 );
                 assert!(
-                    flash.owner_entity.is_none(),
+                    flash.owner_entity().is_none(),
                     "a building flash stays at its birth"
                 );
                 assert_eq!(
-                    flash.z_adjust,
+                    flash.z_adjust(),
                     fire_coord::building_muzzle_z_adjust(event.fire_offset_y, false)
                 );
-                let sounds = weapon_report_sounds(&sim, std::slice::from_ref(&event));
                 let coord = event.fire_coord;
-                let expected_source = SoundSource::new(
-                    crate::util::lepton::absolute_leptons_to_screen(coord.x, coord.y, coord.z),
-                    ((coord.x / 256) as u16, (coord.y / 256) as u16),
-                );
-                match sounds.as_slice() {
-                    [GameSoundEvent::WeaponFired { sound_id, source }] => {
+                let reports: Vec<_> = sim.sound_events().iter().filter(|sound| matches!(sound,
+                    crate::sim::world::SimSoundEvent::VocAt { sound_id, .. }
+                        if sound_id == sim.interner().resolve(event.report_sound_id.unwrap())
+                )).collect();
+                match reports.as_slice() {
+                    [
+                        crate::sim::world::SimSoundEvent::VocAt {
+                            sound_id,
+                            rx,
+                            ry,
+                            sub_x,
+                            sub_y,
+                            world_z_leptons,
+                            ..
+                        },
+                    ] => {
                         assert_eq!(
                             sound_id,
-                            sim.interner.resolve(event.report_sound_id.unwrap())
+                            sim.interner().resolve(event.report_sound_id.unwrap())
                         );
-                        assert_eq!(*source, Some(expected_source));
+                        assert_eq!(
+                            (
+                                i32::from(*rx) * 256 + sub_x.to_num::<i32>(),
+                                i32::from(*ry) * 256 + sub_y.to_num::<i32>(),
+                                *world_z_leptons
+                            ),
+                            (coord.x, coord.y, coord.z)
+                        );
                     }
                     other => panic!("unexpected stock shot audio: {other:?}"),
                 }
@@ -341,23 +322,5 @@ mod tests {
         );
         assert_eq!(shot.fire_coord.z, bare.fire_coord.z);
         assert_eq!(shot.fire_offset_y - bare.fire_offset_y, displacement.1);
-    }
-
-    #[test]
-    fn persistent_sonic_wave_produces_geometry() {
-        let mut sim = Simulation::new();
-        let wave_id = sim.allocate_stable_id();
-        sim.admit_wave(
-            wave_id,
-            crate::sim::wave::Wave::new(
-                0,
-                crate::sim::projectile::ProjectileCoord::new(10 * 256, 10 * 256, 0),
-                crate::sim::projectile::ProjectileCoord::new(14 * 256, 11 * 256, 0),
-            ),
-        );
-
-        let waves = build_weapon_wave_visuals(&sim, None);
-        assert_eq!(waves.len(), 1);
-        assert_eq!(waves[0].polygon.len(), 6);
     }
 }

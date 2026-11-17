@@ -27,6 +27,13 @@ use crate::sim::game_entity::GameEntity;
 ///
 /// The Teleporter arm is skipped while a Magnetron holds the object
 /// (`0x007423E1..0x00742405`), so the END here is never a lift's.
+///
+/// `BuildingClass::Mission_Unload` state 2 (`0x0044DFAD..0x0044E163`) runs the
+/// same install for a product whose active locomotor is Teleport, before its
+/// bay track. Its END asks only Is_Piggybacking (IPiggyback vt+0x1C,
+/// `0x0044DFE1`), where the setter also asks Is_Ok_To_End (vt+0x14,
+/// `0x0074264E`); a product fresh from ExitObject carries no piggyback, so
+/// both skip it. An active Teleport is never a lift's Jumpjet.
 pub(crate) fn begin_drive_for_teleporter(entity: &mut GameEntity, binary_frame: u32) -> bool {
     let Some(locomotor) = entity.locomotor.as_ref() else {
         return false;
@@ -139,7 +146,7 @@ fn end_piggyback(entity: &mut GameEntity) -> PiggybackEnd {
     let restored = entity
         .locomotor
         .as_mut()
-        .is_some_and(|locomotor| locomotor.end_piggyback());
+        .is_some_and(|locomotor| locomotor.end_piggyback().is_some());
     if restored {
         // END transfers the controller without moving Object+9C.
         entity.position.put_z(physical.z);
@@ -158,7 +165,7 @@ impl crate::sim::world::Simulation {
     /// (`0x004D9309..0x004D937C`) and the Unit setter's pad arm
     /// (`0x0074250E..0x0074258A`, which asks `Is_Piggybacking` first; the
     /// gates include the stash).
-    pub(crate) fn try_end_piggyback(&mut self, id: u64, rules: Option<&RuleSet>) -> bool {
+    pub(crate) fn try_end_piggyback(&mut self, id: u64, rules: &RuleSet) -> bool {
         self.substrate
             .entities
             .get(id)
@@ -172,7 +179,7 @@ impl crate::sim::world::Simulation {
     /// 0x0054DABB`, `Queue_Mission(Harvest, 0)`), before the transfer
     /// natively; the two touch separate state. Returns whether the stash
     /// became active.
-    pub(crate) fn end_admitted_piggyback(&mut self, id: u64, rules: Option<&RuleSet>) -> bool {
+    pub(crate) fn end_admitted_piggyback(&mut self, id: u64, rules: &RuleSet) -> bool {
         let Some(entity) = self.substrate.entities.get_mut(id) else {
             return false;
         };
@@ -183,12 +190,12 @@ impl crate::sim::world::Simulation {
             let computer = self
                 .houses
                 .get(&entity.owner())
-                .is_some_and(|house| !house.is_human);
-            let gatherer = rules
-                .and_then(|rules| self.object_type(entity.type_ref(), rules))
+                .is_some_and(|house| !house.is_human());
+            let gatherer = self
+                .object_type(entity.type_ref(), rules)
                 .is_some_and(|object| object.resource_gatherer);
             if computer && gatherer {
-                let now = self.session.binary_frame;
+                let now = self.session.binary_frame();
                 let _ = self.mission_queue_exact(
                     id,
                     crate::sim::mission::MissionId::from_known(
@@ -196,7 +203,7 @@ impl crate::sim::world::Simulation {
                     ),
                     0,
                     now,
-                    &crate::sim::mission::authority::EntityReadyInputProvider,
+                    &crate::sim::mission::authority::LiveReadyInputProvider { rules },
                 );
             }
         }
@@ -219,7 +226,9 @@ impl crate::sim::world::Simulation {
     /// miss that class's head claim before its ordinary Foot Mark(DOWN).
     /// Hover5171C0 delegates to the shared Head_To getter514D10, which
     /// substitutes Location for a null head and has no power/limbo gate.
-    pub(crate) fn locomotor_mark_all_occupation_bits(&mut self, id: u64, put: bool) {
+    /// `ares` is the game's `RuleSet::ares_form`, for the Unit's raw mark
+    /// (`Self::track_raw_mark_at`).
+    pub(crate) fn locomotor_mark_all_occupation_bits(&mut self, id: u64, put: bool, ares: bool) {
         let kind = self
             .substrate
             .entities
@@ -227,13 +236,36 @@ impl crate::sim::world::Simulation {
             .and_then(|entity| entity.locomotor.as_ref().map(|loco| loco.active_kind()));
         match kind {
             Some(crate::rules::locomotor_type::LocomotorKind::Drive) => {
-                self.track_apply_occupation(id, super::track_process::TrackFamily::Drive, put);
+                Self::track_apply_occupation(
+                    &mut self.substrate,
+                    &self.path_grid,
+                    &self.resolved_terrain,
+                    id,
+                    super::track_process::TrackFamily::Drive,
+                    put,
+                    ares,
+                );
             }
             Some(crate::rules::locomotor_type::LocomotorKind::Ship) => {
-                self.track_apply_occupation(id, super::track_process::TrackFamily::Ship, put);
+                Self::track_apply_occupation(
+                    &mut self.substrate,
+                    &self.path_grid,
+                    &self.resolved_terrain,
+                    id,
+                    super::track_process::TrackFamily::Ship,
+                    put,
+                    ares,
+                );
             }
             Some(crate::rules::locomotor_type::LocomotorKind::Hover) => {
-                self.hover_mark_all_occupation_bits(id, put);
+                Self::hover_mark_all_occupation_bits(
+                    &mut self.substrate,
+                    &self.path_grid,
+                    &self.resolved_terrain,
+                    id,
+                    put,
+                    ares,
+                );
             }
             Some(
                 crate::rules::locomotor_type::LocomotorKind::Fly
@@ -241,13 +273,48 @@ impl crate::sim::world::Simulation {
             ) => {}
             _ if !put => {
                 self.release_walk_occupation_before_foot_limbo(id);
-                self.release_teleport_occupation_before_foot_limbo(id);
-                self.release_jumpjet_occupation_before_foot_limbo(id);
+                Self::release_teleport_occupation_before_foot_limbo(
+                    &mut self.substrate,
+                    &self.path_grid,
+                    &self.resolved_terrain,
+                    id,
+                    ares,
+                );
+                self.release_jumpjet_occupation_before_foot_limbo(id, ares);
             }
             Some(kind) => {
                 log::debug!("unported {kind:?} Mark_All_Occupation_Bits(1) for {id}");
             }
             None => {}
+        }
+    }
+
+    /// The raw (Cell, plane) pairs whose vehicle bit
+    /// [`Self::locomotor_mark_all_occupation_bits`]`(id, false)` clears, read
+    /// without clearing them. Drive and Ship answer their track's own cells;
+    /// other locomotors answer none.
+    ///
+    /// RESIDUAL: Hover, Walk, Teleport and Jumpjet clear the owner's bit at
+    /// their head, which this does not read. Its one caller lifts a
+    /// `DeploysInto=` unit, and every retail one (AMCV, SMCV, PCV, SMIN) is
+    /// `Locomotor=` Drive.
+    pub(crate) fn locomotor_occupation_cleared(
+        &self,
+        id: u64,
+    ) -> Vec<((u16, u16), super::locomotor::MovementLayer)> {
+        let kind = self
+            .substrate
+            .entities
+            .get(id)
+            .and_then(|entity| entity.locomotor.as_ref().map(|loco| loco.active_kind()));
+        match kind {
+            Some(crate::rules::locomotor_type::LocomotorKind::Drive) => {
+                self.track_occupation_cleared(id, super::track_process::TrackFamily::Drive)
+            }
+            Some(crate::rules::locomotor_type::LocomotorKind::Ship) => {
+                self.track_occupation_cleared(id, super::track_process::TrackFamily::Ship)
+            }
+            _ => Vec::new(),
         }
     }
 }
@@ -258,6 +325,6 @@ pub(crate) fn owner_is_warping(entity: &GameEntity) -> bool {
     entity.is_warping_in() || entity.is_warped_out()
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "locomotor_owner_tests.rs"]
 mod tests;

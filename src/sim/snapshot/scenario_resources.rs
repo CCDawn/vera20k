@@ -38,8 +38,21 @@ pub struct SavedScenarioResourcesRef<'a> {
 }
 
 impl<'a> SavedScenarioResourcesRef<'a> {
+    /// Native Cell Save483C10 sees the current Cell body, including after the
+    /// frame's Ground phase. Resource preparation may precede that boundary.
+    pub fn capture_live_cell_land(
+        &mut self,
+        live: &crate::map::resolved_terrain::ResolvedTerrainGrid,
+    ) -> Result<(), SavedTerrainError> {
+        self.terrain.capture_live_cell_land(live)
+    }
+
+    pub(crate) fn compatibility(&self) -> crate::rules::compatibility::RulesCompatibility {
+        self.processed_rules.compatibility()
+    }
+
     pub fn capture(
-        resources: &'a SimResources,
+        resources: &SimResources,
         processed_rules: &'a ProcessedRulesLayers,
         fixed_art_hash: u64,
         terrain: SavedTerrainTemplate,
@@ -59,11 +72,26 @@ impl<'a> SavedScenarioResourcesRef<'a> {
             map,
         }
     }
+
+    /// ScenarioSave stops/accumulates its source clock at the actual save
+    /// boundary, after these immutable resource inputs have been gathered.
+    pub fn set_elapsed_buckets(&mut self, elapsed_buckets: u32) {
+        self.map.elapsed_buckets = elapsed_buckets;
+    }
 }
 
 impl SavedScenarioResources {
     pub fn processed_rules(&self) -> &ProcessedRulesLayers {
         &self.processed_rules
+    }
+
+    /// Native type Load calls mutate only this incoming, move-owned registry.
+    /// The app admits the saved digest before reaching this resource phase.
+    pub fn restore_object_image_loads(
+        &mut self,
+        theater: &str,
+    ) -> Result<(), crate::rules::error::RulesError> {
+        self.processed_rules.restore_object_image_loads(theater)
     }
 
     pub fn fixed_art_hash(&self) -> u64 {
@@ -114,6 +142,8 @@ pub struct SavedMapMetadata {
     source: crate::map::source::LoadedMapSource,
     basic: crate::map::basic::BasicSection,
     ranking: crate::map::ranking::RankingSection,
+    /// ScenarioSave689310 retains Full_Init's resolved +1360/+13DA names.
+    campaign_names: crate::rules::campaign_loading::CampaignScenarioNames,
     terrain_objects: Vec<crate::map::overlay::TerrainObject>,
     house_roster: crate::map::houses::HouseRoster,
     house_colors: crate::map::houses::HouseColorMap,
@@ -128,6 +158,18 @@ pub struct SavedMapMetadata {
     /// Rust media reconstruction policy: release this credit because the
     /// physical Radar video queue is not restored. Other pause holds persist.
     radar_pause_credit: bool,
+    /// VocSave751620's static-sound nodes. The live list remains in audio.
+    static_sounds: Vec<SavedStaticSound>,
+}
+
+/// One node of `VocClass::SaveStaticSounds @ 0x00751620`: the sound and the
+/// Coord of a retained `VocClass::PlayAtCoord @ 0x00750E20` request. Native
+/// writes the sound's vector index; VERA carries its canonical name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedStaticSound {
+    pub sound_id: String,
+    /// Signed native XYZ in leptons (node `+0x20..+0x28`).
+    pub coordinate: [i32; 3],
 }
 
 impl SavedMapMetadata {
@@ -140,6 +182,7 @@ impl SavedMapMetadata {
         source: &crate::map::source::LoadedMapSource,
         basic: &crate::map::basic::BasicSection,
         ranking: &crate::map::ranking::RankingSection,
+        campaign_names: &crate::rules::campaign_loading::CampaignScenarioNames,
         terrain_objects: &[crate::map::overlay::TerrainObject],
         house_roster: &crate::map::houses::HouseRoster,
         house_colors: &crate::map::houses::HouseColorMap,
@@ -147,12 +190,14 @@ impl SavedMapMetadata {
         elapsed_buckets: u32,
         local_player_name: Option<&str>,
         theme_slots: [i32; 2],
+        radar_pause_credit: bool,
     ) -> Self {
         Self {
             map_hash,
             source: source.clone(),
             basic: basic.clone(),
             ranking: ranking.clone(),
+            campaign_names: campaign_names.clone(),
             terrain_objects: terrain_objects.to_vec(),
             house_roster: house_roster.clone(),
             house_colors: house_colors.clone(),
@@ -160,8 +205,15 @@ impl SavedMapMetadata {
             elapsed_buckets,
             local_player_name: local_player_name.map(str::to_owned),
             theme_slots,
-            radar_pause_credit: false,
+            radar_pause_credit,
+            static_sounds: Vec::new(),
         }
+    }
+
+    /// The audio owner's static-sound nodes at the save boundary.
+    pub fn with_static_sounds(mut self, static_sounds: Vec<SavedStaticSound>) -> Self {
+        self.static_sounds = static_sounds;
+        self
     }
 
     pub fn map_hash(&self) -> u64 {
@@ -175,6 +227,9 @@ impl SavedMapMetadata {
     }
     pub fn ranking(&self) -> &crate::map::ranking::RankingSection {
         &self.ranking
+    }
+    pub fn campaign_names(&self) -> &crate::rules::campaign_loading::CampaignScenarioNames {
+        &self.campaign_names
     }
     pub fn terrain_objects(&self) -> &[crate::map::overlay::TerrainObject] {
         &self.terrain_objects
@@ -198,11 +253,11 @@ impl SavedMapMetadata {
     pub fn radar_pause_credit(&self) -> bool {
         self.radar_pause_credit
     }
-    pub fn set_radar_pause_credit(&mut self, held: bool) {
-        self.radar_pause_credit = held;
-    }
     pub fn theme_slots(&self) -> [i32; 2] {
         self.theme_slots
+    }
+    pub fn static_sounds(&self) -> &[SavedStaticSound] {
+        &self.static_sounds
     }
 }
 
@@ -225,11 +280,16 @@ mod source_identity {
         deserializer: D,
     ) -> Result<crate::map::source::LoadedMapSource, D::Error> {
         let json = String::deserialize(deserializer)?;
+        // The JSON inside is outside the traced save layout; a schema change
+        // fails here as a decode error rather than as another layout.
+        if crate::util::save_codec::layout::describing() {
+            return Ok(crate::map::source::LoadedMapSource::LegacyFallback { label: json });
+        }
         serde_json::from_str(&json).map_err(serde::de::Error::custom)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -257,9 +317,15 @@ mod tests {
         resources.rules = rules;
         resources.terrain_template = Some(crate::map::resolved_terrain::test_flat_ground_grid(3));
         let source = crate::map::source::LoadedMapSource::Loose {
+            cache_lease: Default::default(),
             path: "/nonexistent/saved-only-map.map".into(),
             payload_len: 27,
             source_sha256: "saved-source-identity".into(),
+        };
+        // VocSave751620: one static-sound node, sound and Coord.
+        let ambient = SavedStaticSound {
+            sound_id: "OILDERRICKLOOP".into(),
+            coordinate: [5 * 256 + 128, 7 * 256 + 128, -104],
         };
         let saved = SavedScenarioResourcesRef::capture(
             &resources,
@@ -276,6 +342,7 @@ mod tests {
                 &source,
                 &Default::default(),
                 &Default::default(),
+                &Default::default(),
                 &[],
                 &Default::default(),
                 &Default::default(),
@@ -283,7 +350,9 @@ mod tests {
                 0,
                 None,
                 [-1, -1],
-            ),
+                false,
+            )
+            .with_static_sounds(vec![ambient.clone()]),
         );
         // Exercise the production borrowed writer against the owning reader.
         // JSON round trips would miss tagged-enum/bincode incompatibilities.
@@ -292,6 +361,7 @@ mod tests {
             crate::util::save_codec::deserialize(&bytes).unwrap();
         assert_eq!(restored.map().source(), &source);
         assert_eq!(restored.map().map_hash(), 123);
+        assert_eq!(restored.map().static_sounds(), [ambient]);
         assert_eq!(restored.terrain().dimensions(), (3, 3));
         let rules = owner
             .project_saved_scenario_rules(restored.processed_rules())

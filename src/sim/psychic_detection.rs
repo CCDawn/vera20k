@@ -23,12 +23,13 @@ impl Simulation {
         rules: &'a RuleSet,
     ) -> impl Iterator<Item = (DriveCoord, i32)> + 'a {
         let terrain = self.resolved_terrain.as_ref();
-        self.substrate.entities.values().filter_map(move |entity| {
-            if entity.owner() != viewer
-                || entity.category() != crate::map::entities::EntityCategory::Structure
-                || !entity.lifecycle.object_alive()
-                || entity.lifecycle.in_limbo()
-            {
+        // The viewer's own buildings, in the store's order: the draw asks
+        // this every frame, so no other object is read.
+        let entities = &self.substrate.entities;
+        let owned = entities.owned_ids(viewer, crate::map::entities::EntityCategory::Structure);
+        owned.iter().filter_map(move |&id| {
+            let entity = entities.get(id)?;
+            if !entity.lifecycle.object_alive() || entity.lifecycle.in_limbo() {
                 return None;
             }
             let radius = self
@@ -126,11 +127,10 @@ pub fn psychic_sensor_watch_fixture(rules: &RuleSet) -> (Simulation, u64, Intern
     let americans = sim.interner.intern("Americans");
     let russians = sim.interner.intern("Russians");
     for (id, side, human) in [(americans, 0, true), (russians, 1, false)] {
-        sim.houses.insert(
-            id,
-            crate::sim::house_state::HouseState::new(id, side, None, human, 0, 10),
-        );
-        sim.session.house_order.push(id);
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                id, side, None, human, 0, 10,
+            ));
     }
     crate::sim::arena_fixture::flat_ground(&mut sim, rules);
     sim.spawn_object_at_height("NAPOWR", "Americans", 10, 10, 0, 0, rules)
@@ -148,10 +148,10 @@ pub fn psychic_sensor_watch_fixture(rules: &RuleSet) -> (Simulation, u64, Intern
         .unwrap()
         .attack_target
         .set_for_test(Some(TargetKind::Cell(18, 18)));
-    sim.session.current_house = Some(americans);
+    sim.session.set_current_house_for_test(Some(americans));
     (sim, tank, americans)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 #[path = "psychic_detection_tests.rs"]
 mod tests;

@@ -8,11 +8,12 @@ native comparator or a gameplay/pixel parity certification.
 ## Accepted random maps
 
 A profile selecting the exact normal `RandMap.Sed` record can observe a generated
-match. Place the desired `.SED` in a real isolated retail directory and point the
-capture's `config.toml` there. The capture runs the existing setup generator and
-acceptance before normal launch regeneration. Setup writes `RandMap.Sed` and
-`RandMap.img` in that directory; retain original retail files separately. The
-`.SED` seed controls MapGen, while the profile seed controls match startup.
+match. Place the desired seed as `RandMap.Sed` in the `Maps` folder of the
+capture's `[paths] settings_dir`, a private profile, never the player's. The
+capture runs the existing setup generator and acceptance before normal launch
+regeneration. Setup rewrites `RandMap.Sed` and writes `RandMap.img` in that
+folder; the game folder is not written. The `.SED` seed controls MapGen, while
+the profile seed controls match startup.
 
 The generated `map_source` receipt retains `seed_name` and nested `seed_source`
 (`path`, `payload_len`, `source_sha256`) from the exact seed buffer consumed by
@@ -20,6 +21,18 @@ launch loading. Setup may normalize the record and stamp its localized descripti
 before that read. Legacy name-only sources and empty seed files cannot certify a
 capture. Other selected `.SED` names are not supported by this setup adapter.
 This demonstrates the recorded production path, not native full-generation parity.
+
+## Zoom and sidebar size
+
+Optional v2/v3 `presentation: {"zoom": 0, "sidebar": 100}` runs the battle at those
+`[VERA]` Options values: `zoom` 0 is Auto, otherwise a 50-step percent from 100;
+`sidebar` is 100, 150 or 200; an optional `"hd_radar": true` turns on the HD radar,
+and `"smooth_sidebar": true` the smooth sidebar. The match frame is then the window
+over the zoom (`render.internal_extent`), and `frame.bgra` stays the full window, so
+a 3840×2160 profile shows what a 4K player sees. Gestures and `cursor_position` use
+frame pixels at zoom 100% and cannot be combined with it. The cursor then rests at
+the middle of the tactical view; when a unit stands there its cursor animates and the
+capture refuses, so move the view with `camera_cell`.
 
 ## Named commands and outcome inspection
 
@@ -31,7 +44,8 @@ receipt shapes are unchanged. In a v3 command payload:
 - `sw_type_id` accepts the SuperWeapon section, such as `"IronCurtainSpecial"`.
 - Actor ID fields accept `{"type_id":"HTNK","owner":"VERA-OBSERVER"}`,
   optionally with `"cell":[44,54]` to disambiguate. `Select.entity_ids` and
-  `SetRally.producer_ids` can mix numeric IDs and selectors.
+  `SetRally.producer_ids` can mix numeric IDs and selectors, and a
+  `MegaMission` destination takes one as `{"Entity": <selector>}`.
 
 Names are case sensitive, nonempty, and at most 256 UTF-8 bytes. Actor selectors
 resolve **at the command's `issue_after_step` boundary**, using the current living,
@@ -75,7 +89,9 @@ those retained outcomes, marked tank occupancy and 6,000 credits spent. The pad
 is the radio producer's building origin plus `(3,1)`, distinct from the ART
 queueing offset `(4,1)`. Actor selectors bind after normal production. Exact steps
 are this Rust integration witness, not native timing goldens or direct query-PC
-observations; native Unit-query/caller controls remain separate evidence.
+observations; native Unit-query/caller controls remain separate evidence. The dock
+contact is checked as present and the unload within a window, because stable IDs
+and the unload's steps shift with unrelated changes.
 
 Inspect a completed capture without restarting the game:
 
@@ -201,6 +217,16 @@ capture demonstrate building pixels crossing a frontier while its anchor is
 still unexplored, without changing sight or substituting a diagnostic reveal.
 Older receipts may omit the field; their absence supplies no visibility evidence.
 
+Requested terrain rows additionally retain nullable `render`. It stays `null`
+for committed steps that were not drawn. After the matching ordinary draw,
+`phase: "after_draw"` records the live TMP variant/pavement choice, exact atlas
+key and nullable UV, palette-light words, camera and elevated cell center, and
+the shared CPU A-buffer's nullable center sample (`a_bound` names whether that
+buffer was bound). Missing cells/assets/light state or out-of-view samples stay
+explicitly null. These are passive post-draw inputs, not GPU fragment or pixel
+readbacks; they do not certify that a selected tile reached the final surface.
+Historical receipts may omit `render` and supply no evidence for those inputs.
+
 Actor `cloak`, when present, reads the existing raw signed state/progress,
 live signed Rules `CloakingStages`, actual VXL/SHP route, and original type's
 `NoShadow` flag. `null` means no cloak runtime. Reading this projection sends
@@ -242,8 +268,10 @@ about that state. An explicit `null` means no installed track state was observed
 The explicit profile schema belongs to
 `src/app/diagnostics/tactical_capture/map_observation.rs`. Start from
 [`map_observation.example.json`](map_observation.example.json), whose launch is the
-existing Rust `SkirmishLaunchSession` DTO. Change `launch.selected_map_file` to the
-chosen retail map. Keep explicit countries, colors and distinct start slots, and
+existing Rust `SkirmishLaunchSession` DTO. Its v2 `cursor_position` parks the cursor
+over the sidebar: the post-load centre of the tactical view can rest on the local
+MCV, whose Select cursor fails the static-cursor check. Change
+`launch.selected_map_file` to the chosen retail map. Keep explicit countries, colors and distinct start slots, and
 keep `pre_fill_house_roster` consistent with the opponents. Rust validates launch
 admission; Python does not maintain a second launch parser or synthesize defaults.
 
@@ -566,7 +594,7 @@ clock. Frame observations are post-commit state: the step 1/frame 1 row contains
 the result of executing native frame 0. A literal load also refreshes the
 context's loaded frame/tick while `completed_steps` remains monotonic.
 
-Limits are 1..16 distinct ASCII sound IDs (128 bytes each), 1..16 submissions,
+Limits are 1..16 distinct ASCII sound IDs (128 bytes each), 1..32 submissions,
 1..262144 samples per submission, 64 action/format rows and 128 resolved sample
 names per submission. After the requested exact steps, the existing frame/audio
 service continues without simulation ticks for at most the requested 1..10000 ms
@@ -628,6 +656,7 @@ absence of a submission alone cannot establish the exact rejected value.
 
 The [movement-voice profile](map_observation.move-voice.example.json) selects
 one full-health stock MTNK and issues an ordinary command click on clear ground.
+
 Generate its map with:
 
 ```sh
@@ -643,19 +672,64 @@ queued/head voice actions, physical sample/finite PCM and event/channel
 retirement. Loading and service can advance Main before the order, so a launch
 seed alone does not determine which entry a multi-entry list chooses.
 
-The [building power-status profile](map_observation.building-power-status.example.json)
-selects an ordinary full-health owned GAPOWR in the existing clear-ground scene:
+The [magnetic Wave profile](map_observation.magnetic-wave.example.json) uses
+stock sleeping TELE/MTNK actors at `(44,48)` and `(50,48)` plus a distant enemy
+survivor. Generate the flat scene with the existing fixture owner:
 
 ```sh
-python tools/render_depth_fixture.py target/building-power-status.map --building-brackets
+python tools/render_depth_fixture.py /absolute/ordinary-tele-magnetic.map --magnetic-wave
 ```
 
-Copy the profile and set the generated map's absolute path. Its three owned
-plants keep their retail Power, health and rules. Inspect the selected building's
-localized House power/drain text, then the same scene after an ordinary right-click
-deselect. The text reads the House's retained totals; it does not sum buildings or
-assess power during drawing. The existing Building-array text pass draws after
-Ground2, with the same physical GAME.FNT and House color as PRIMARY labels.
+Copy the profile and set its selected map to that absolute path. Use the capture
+command below with an isolated settings directory and `input_delay_ticks = 2`
+in its `config.toml`. Attack at step 12 and Stop at step 24 exercise firing,
+lifting, interrupted fade and Wave cleanup through ordinary commands. For a
+shot-in-progress image, copy the profile with `ticks = 20` and remove commands
+at or after step 20. Run the same map/profile/config bytes before and after the
+change, then use `tools.map_observation compare` on the completed captures.
+
+The [Dolphin Sonic profile](map_observation.sonic-wave.example.json) uses a
+stock DLPH, enemy CARRIER and a distant enemy survivor. Extract the physical
+`multimd.mix/XMP03T4.MAP` with the existing asset tools, then generate the scene:
+
+```sh
+python tools/render_depth_fixture.py /absolute/ordinary-dolphin-sonic.map \
+  --sonic-wave /absolute/XMP03T4.MAP
+```
+
+This copies the supplied map's terrain/scenery/lighting/waypoints and authors
+only the scene actors/Houses. It changes no unit, weapon or Wave fields. The
+fixed naval cells `(106,118)` and `(108,118)` must be admitted by the production
+loader; copied pack bytes alone are not proof of water or a successful shot.
+The optional `observe_waves` reads the existing Wave owner and its derived Sonic
+polygon, without advancing lifetime or RNG. `observe_projectiles` and the existing
+`observe_bombs` fire-state view retain the real shot and rearm timer.
+Set the profile's selected map to the result. The example waits before ordinary
+Attack so the stock DLPH completes its initial cloaking transition, then issues
+Stop while a shot can still be live. That initial transition's existing
+`Detach_All(false)` can otherwise interrupt a wave by clearing its owner. No
+cloaking or weapon field is overridden. Inspect the actual firing, persistent
+body, interrupted fade and cleanup, and retain endpoints at the observed steps. The real GPU readbacks exercise the
+shared retained Display destination pass, while the original pixel controls
+are the separate bounded comparison in `magnetic_wave.py --sonic`. Neither
+establishes original full-match/pixel equivalence for the retail scene.
+
+The [Terror Drone firing profile](map_observation.drone-fire.example.json)
+orders a retail DRON to jump a sleeping enemy tank, then a local tank to fire
+SonicZap at the host, then issues Stop to the released DRON. Generate its scene with
+`python tools/render_depth_fixture.py /absolute/drone-fire.map --drone-fire`.
+Optional `--terrain-template /absolute/extracted/Hills.map` retains that physical
+map's terrain packs, scenery, lighting and waypoints; the template must admit
+the fixed scene around `(48,48)`. Set the profile's selected map to the result.
+DRON, DroneJump and its ART keep their retail fields. The fixture explicitly
+overrides MTNK's primary to SonicZap and SonicZap's damage to 4 so a normal shot
+can exercise the production parasite-release receiver while both actors survive.
+`observe_disguise_inputs` retains the existing read-only SHP-frame projection. Exact
+release/idle steps must be inspected from the run. The example Stop at step 49 is based
+on the retained Hills scene: change it if a different terrain template shifts the
+hit, since a type selector cannot bind a still-limboed DRON. The profile does not
+prescribe a successful hit or native timing and is not an original scene/pixel
+comparison.
 
 The [Ivan bomb-clock profile](map_observation.bomb-clock.example.json) uses an
 ordinary Crazy Ivan planting order on a friendly stock tank:
@@ -812,9 +886,10 @@ presentation pacing. It is cadence metadata, not GPU duration or ordinary play
 FPS, and does not participate in deterministic comparisons.
 
 Build through the shared Cargo owner, then run from the checkout with an existing
-`config.toml` pointing at retail assets; the capture always renders at native
-resolution. All supplied paths must be absolute without symlink
-ancestors; use canonical temporary paths on macOS. The output parent must exist,
+`config.toml` pointing at retail assets; the capture renders at zoom 100% with the
+Normal sidebar unless the profile's `presentation` says otherwise. All supplied paths
+must be absolute without symlink ancestors; use canonical temporary paths on macOS.
+The output parent must exist,
 and the output directory itself must not exist.
 
 ```sh
@@ -856,6 +931,10 @@ variable in its denylist must be absent, even if set to an empty string. The
 wrapper reports denied variables and does not silently change the environment.
 After sourcing the native development environment, explicitly remove `RA2_DIR`
 for this command as above; asset loading uses the working directory's config.
+
+On Linux, winit's text-free `Ime::Disabled` startup notification is recognized
+as lifecycle state while the capture window is observably hidden and unfocused.
+Keyboard, pointer and other IME events still reach the input guards.
 
 The [factory tank exit profile](map_observation.factory-tank-exit.example.json)
 exercises the ordinary human GAWEAP → MTNK production path on retail AnyTown
@@ -1013,7 +1092,7 @@ The v4 `render.presentation_clock` records actual consumed presentation times:
 
 For a positive budget N, exactly N game draws occur at completed steps 1 through
 N. A zero-step observation has one draw at step 0, with all three times zero.
-Every row must contain the exact radar tick, tooltip poll and adjusted message
+Every row must contain the exact radar tick, tooltip poll and wall-clock message
 management times consumed by that draw; each must equal its completed step × 22.
 The budget is bounded at 100000 steps. Unknown fields/policies, missing or extra
 rows, reordered/repeated steps, wrong integer types and any time discrepancy fail
@@ -1033,6 +1112,11 @@ without assuming presentation state resets with the simulation clock. The
 projection shares the100000-draw budget and does not add simulation observation
 samples.
 
+Comparison requires matching clock policies and consumed draw times. Tooltip
+projections are observed output: changes at any draw are reported as `MISMATCH`
+under `presentation_clock.draws[index].tooltip`, even when the final frame is
+unchanged. Malformed transcripts or different clock schedules remain `INVALID`.
+
 The required v4 `render.neutral_input` has exactly
 `{"static_default_cursor":true,"camera_input_idle":true}`. Rust verifies these
 prerequisites and render readiness on every draw before publishing the final
@@ -1050,9 +1134,10 @@ remains exact: no radar masks, channel tolerances or skipped pixels are applied.
 
 The [retail opening profile](map_observation.sidebar-opening.example.json)
 uses stock AnyTown and ordinary MCV deployment/production before clicking the GI.
-Numeric command handles belong to that seeded launch; rediscover them with a
-zero-step observation after population changes. Pass absolute profile/contract
-paths to the wrapper.
+Its commands name the MCV and the building types (profile v3), so they do not
+depend on that launch's numeric handles, and its cursor rests over the sidebar,
+where no unit can pass under it. Pass absolute profile/contract paths to the
+wrapper.
 
 A v2 profile may opt in to `observe_sidebar_steps: [0, 1, 100]`. Each listed
 capture completed step records the local retained sidebar view: tabs, ordered
@@ -1121,9 +1206,46 @@ geometry; it does not infer cancellation or command admission from the button.
 Right is admitted only on tactical clicks and cameo targets. Right tabs,
 chrome controls, command-bar buttons and drags are rejected. Right dragging
 requires the ordinary camera's per-frame polling; the complete between-step
-gesture driver does not advance that poll. Mouse modifiers and held gestures
-across steps are also outside this profile contract. Null, unknown and wrong-case
-button values are rejected before launch.
+gesture driver does not advance that poll. Held gestures across steps are also
+outside this profile contract. Null, unknown and wrong-case button values are
+rejected before launch.
+
+A tactical `click` may also carry a unique `modifiers` list of `Ctrl`, `Shift`,
+`Alt` and/or `Super`, as a key gesture does. The driver presses them through the
+shared modifier-key owner before the cursor move, so the hover cursor and the
+click see them, and releases them in reverse order after the button release;
+`neutral_input_restored` requires every modifier released. A nonempty list opts
+the profile in to the `local_input` projection and `keyboard_bindings` table,
+like a key gesture, and the receipt echoes the list. Drags, minimap, sidebar and
+command-bar gestures reject it. For example, a Ctrl+Alt click on a unit:
+
+```json
+{"issue_after_step": 30,
+ "gesture": {"kind":"click","position":[316,254],"modifiers":["Ctrl","Alt"]}}
+```
+
+The [guard click profile](map_observation.guard-click.example.json) starts the
+[planning mode profile](map_observation.planning-mode.example.json)'s launch on XMP03T4
+with its six opening units, selects the AMCV (1371) and the three MTNK (1374, 1375,
+1376) through the ordinary Select command, then Ctrl+Alt-clicks MTNK 1375 after step
+10 and Alt-clicks MTNK 1376 after step 30. The first receipt queues `Guard` on 1375 for
+1375 itself, 1374 and 1376, and nothing for the unarmed AMCV, which stays in Guard while
+the tanks enter Area Guard: the guard rung
+(`TechnoClass::What_Action @ 0x00700191..0x007001DD`) has no identity test, and Foot
+`ClickedAction_Object` case 0x1A (`0x004D7543`) orders nothing without IsActive
+(`0x007010D0`). The second queues `MoveToObject` 1376 for all four (Alt's Move rung,
+`0x007001E9`). These are Rust production observations; the numeric IDs come from a
+run of the same launch without gestures, and no timing or pixel equivalence with
+gamemd is claimed.
+
+## Held cursor during a drag
+
+Each `drag` receipt adds `held_cursor`: the cursor the production draw picks
+(`ui_overlays::shown_cursor_id`) at the press point and at `to` before
+release, as `CursorId` names (`null` when no software cursor is loaded). A
+drag that ends over the sidebar shows whether a held left button keeps the
+last cursor there, as `SBGadget::Action` (`0x006ABA40`) resets it only on
+LEFTUP. Captures made before this field omit it and still validate.
 
 ## Minimap presses
 
@@ -1145,6 +1267,16 @@ The existing local-key gesture policy carries that projection even without a key
 A moving tracker hit follows its object's virtual+4C navigation coordinate before
 the radar's signed clamp, Cell ground center and immediate camera update.
 
+[`map_observation.radar-orders.example.json`](map_observation.radar-orders.example.json)
+builds a Soviet radar and conscript on stock XMP03T4 through ordinary production.
+It clicks the minimap before selection, selects the conscript, clicks a different
+minimap position, then holds Z for two more clicks and releases it. Inspect the
+gesture receipts for the camera-only first click, the selected unit's Move command
+with an unchanged camera, and two PlanningRecord commands followed by the release
+commit. The final planning path should retain two nodes with editing disabled.
+These are Rust production-input observations; they do not establish whole-run
+native equivalence.
+
 ## Literal keyboard gestures
 
 A v2 profile can send a literal key press and release through the same in-game
@@ -1161,8 +1293,11 @@ Keys are one ASCII letter or digit, or `Escape`. They are not command names.
 An optional unique `modifiers` list contains literal `Ctrl`, `Shift`, `Alt`,
 and/or `Super` edges, for example `{"kind":"key","key":"P","modifiers":["Shift"]}`.
 The shared modifier owner presses them before the key and releases them in
-reverse order before rendering. The loaded `KEYBOARDMD.INI` bindings and registered
-startup defaults resolve them in production. Each keyboard receipt reports the
+reverse order before rendering. The production keyboard owner loads `[Hotkey]`
+from `VERA.INI` in the configured settings directory, or the retail `KEYBOARDMD.INI`
+archive when that section is absent, and installs its startup defaults. Check the
+recorded `keyboard_bindings` before reusing literal-key profiles with personal settings.
+Each keyboard receipt reports the
 production `encoded_key`, resolved registered `binding_command` (or `null`),
 and observed held-key press/release state. The capture never dispatches a
 semantic hotkey command directly. An input, including `Escape`, that opens a
@@ -1441,13 +1576,13 @@ parts; the resident and last-build sprite counts stay at 2,400 throughout these
 captures. These measurements exclude other caches and driver allocations.
 
 The [building comparison](voxel_oracle/building_barrel.md) executes original
-loader and draw instructions; the [recoil comparison](voxel_oracle/recoil.md)
-executes readers, firing gates and complete update histories. These bounded
-component comparisons and production captures do not establish native pixel
-parity. Native cache-pool lifetime, custom barrel overrides, upgrade-provided
-turrets and EMP cannon missions remain separate mechanisms. The retained
-three-pixel drawing anchor and measured subpixel float rounding remain visual
-residuals.
+loader and draw instructions and the stock guns' rasters; the
+[recoil comparison](voxel_oracle/recoil.md) executes readers, firing gates and
+complete update histories. These bounded component comparisons and production
+captures do not establish native pixel parity. Native cache-pool lifetime, custom
+barrel overrides, upgrade-provided turrets and EMP cannon missions remain separate
+mechanisms. Measured subpixel float rounding of a translated gun remains a visual
+residual.
 
 ## V3 rocket pitch observation
 
@@ -1512,8 +1647,9 @@ starts America/Battle against a Yuri computer opponent (`Computer1`, Easy) with 
 rules and assets on an [authored map](map_observation/examples/ai_psychic_dominator.map):
 the Psychic Dominator fixture's terrain with the computer's pre-placed YAPPET at (46,42)
 and two GAPOWR, observer MTNK at (43,53), (44,54) and (45,55) and a fourth at (52,62),
-and no commands. The observer's starting MCV stays undeployed at its start (59,33). A
-deploy on its own would empty the observer's base cell, as gamemd's does (see the
+and no commands; a drag after step 9040 selects all four tanks. The observer's starting
+MCV stays undeployed at its start (59,33). A deploy on its own would empty the
+observer's base cell, as gamemd's does (see the
 [Spy Plane observation](#computer-spy-plane-observation)), but AI_Fire_PsyDom
 (`0x0050A150`) aims at Foot units and reads no base cell. MTNK is the only observed
 type, and the profile observes no Super rows, for the sample budget. The loader looks a
@@ -1523,7 +1659,10 @@ relative map name up in the retail root: run a profile copy whose
 Each grouped tank counts all three in its 38 cells, and the last-to-first scan keeps the
 last of them, (45,55): at step 9074 the tanks at (44,54) and (45,55) in the 3x3 block
 (`DominatorCaptureRange=1`) become Computer1's and hunt the tank at (43,53), which stays
-the observer's, outside the block, as does the one at (52,62). These are Rust production
+the observer's, outside the block, as does the one at (52,62). The same step's
+`input.selected_ids` drops the two captured tanks and keeps the other two:
+`TechnoClass::ChangeOwner @ 0x007014A0` deselects a local player's object before it
+changes owner (`0x007014B9..0x007014CF`). These are Rust production
 observations: the chain's native comparisons are the `tools.superweapon_oracle`
 `ai_psydom` rows and the `tools.ai_strategy_oracle` `all_to_hunt` rows. The run never
 reaches All_To_Hunt, and no whole-run timing or pixel equivalence with gamemd is claimed.
@@ -1950,9 +2089,9 @@ lifetime, audio playback and raster parity are also unclaimed.
 uses the same stock Russia/Battle/AnyTown launch and first five ordinary deployment
 and production commands as the Attack profile. It issues no combat order and
 advances 7200 steps so the free War Miner can fill, dock, deposit and harvest again.
-The profile requests no terrain rows to stay within the existing retained-sample
-budget. Its numeric command handles belong to that exact launch and must be
-rechecked when launch inputs change.
+The v3 profile names its command types (SMCV, NAPOWR, NAREFN), observes only
+HARV and NAREFN actors and requests no terrain rows, to stay within the
+retained-sample budget. It seals a static cursor at (720, 556), off every object.
 
 Child/run v6 adds actor `miner` and `radio` projections and frame `houses` rows.
 It preserves the existing optional `unit` deployment projection alongside them.
@@ -1973,18 +2112,19 @@ The map observer and transactional publisher use the same encoder for the
 refinery observation exceed that limit. Readers also accept historical indented
 receipts.
 
-Use the existing runner with that profile:
+Build and select the normal `fast` binary for this profile:
 
 ```sh
+python -m tools.cargo_run -- build -p vera20k --profile fast --bin vera20k
 env -u RA2_DIR python -m tools.map_observation \
-  --build-label refinery-docking-reviewed-20261002 \
+  --build-profile fast \
   --profile /absolute/checkout/tools/map_observation.refinery-docking.example.json \
   --contract /absolute/checkout/src/app/diagnostics/tactical_capture/contract.v2.json \
   --cwd /absolute/checkout \
   --output /absolute/evidence/refinery-docking
 ```
 
-The release observation can show cargo draining alongside the actual House payout,
+The observation can show cargo draining alongside the actual House payout,
 contact release and resumed harvesting. It is production integration evidence;
 native scheduler, movement, audio and pixels require separate comparisons. Native
 coverage is recorded in [`spatial_oracle/refinery_dock.md`](spatial_oracle/refinery_dock.md).
@@ -1999,7 +2139,7 @@ while spent credits stayed at 2,600. Both complete compact receipts are about
 
 [The depot profile](map_observation.depot-repair.example.json) uses stock
 Russia/Battle/AnyTown and ordinary Deploy, Build, Attack, Stop,
-RepairAtDepot and SellBuilding commands. It damages one starting HTNK, spends
+MegaMission Enter and SellBuilding commands. It damages one starting HTNK, spends
 the initial 5900 credits on prerequisites, stops the produced HARV before it
 harvests, orders repair, then sells the barracks to fund the retained occupant.
 No administrative health, wallet or contact edits are used.
@@ -2134,6 +2274,16 @@ receipt before choosing orders. A high-deck response needs a separate map site.
 Its disabled shroud is an explicit launch option for this diagnostic observation.
 No actor IDs or gameplay state are granted by the profile.
 
+For a unit falling from a high deck, use
+[`map_observation.bridge-fall.example.json`](map_observation.bridge-fall.example.json).
+It loads Hills with the observer on start 1, sends MTNK938 onto the high deck at
+`(87,74)` and the other two MTNKs onto the span, and from step 2400 has those two
+force-fire the deck Cell `(86,74)`. At step 4483 MTNK938 moves onto that Cell. The deck
+there goes at step 4491 (`has_deck` false), MTNK938 leaves the bridge layer and falls
+from Z624, and it is gone at step 4521, on landing. These are observed production
+steps of this build, not native goldens; the collapse roll depends on every earlier
+draw, so changing any command before step 4491 can move or prevent it.
+
 For a long production run, `observe_types` can narrow actor discovery to 1..256
 unique, nonempty names from the loaded rule registry, for example `["CLEG"]`.
 Names are literal and case sensitive. Discovery requires both a requested owner
@@ -2168,9 +2318,10 @@ probes. Command payloads are the existing Rust serde `Command`, with no separate
 order translator. Supported orders are Move, Stop, Attack, Guard,
 DeployMcv, ForceAttackCell, QueueProduction, PlaceReadyBuilding and
 CaptureBuilding (the resolved Engineer repair/capture mission), ToggleRepair,
-EnterTransport, UnloadPassengers, RepairAtDepot and SellBuilding. RepairAtDepot
-uses the ordinary damaged-vehicle order with `entity_id` and `depot_id` stable
-handles. SellBuilding uses `entity_id` and the production sale lifecycle; it can
+MegaMission Enter, UnloadPassengers and SellBuilding. MegaMission Enter is the
+event a click into a depot, refinery, bunker or transport sends:
+`{"MegaMission": {"entity_id": 1375, "mission": "Enter", "target": null,
+"destination": {"Entity": 1811}}}`. SellBuilding uses `entity_id` and the production sale lifecycle; it can
 restore funds for a repair experiment without writing a House wallet.
 Rust rejects
 ignored payload fields or argument
@@ -2202,8 +2353,10 @@ placement admission. Recording an enqueued command does not imply the House
 could build it, had sufficient credits, had a ready object, or accepted the cell.
 
 Rows must be nondecreasing by `issue_after_step`, retaining input order for ties,
-and occur before the final step. An issue at step N calls the ordinary
-`try_schedule_command` producer at simulation tick N, before advancing frame N+1.
+and occur before the final completed step. At completed step N, the ordinary
+`try_schedule_command` producer stamps the command with the simulation's current
+tick before the next step. Completed steps stay monotonic across quickload; the
+simulation tick follows the restored clock.
 The producer owns encoding and queuing; the diagnostic adds no input-delay offset.
 Move carries an already resolved semantic destination, as synchronized/replay
 orders do; it does not claim to reproduce the preceding cell-click resolver.
@@ -2223,6 +2376,17 @@ coordinate is explicit; observation does not invent one or initialize gameplay.
 Foot fields are null for structures. Terrain rows read only allocated real cells,
 report current tile/subtile, presentation tile, level/slope and bridge fields, and
 report unallocated cells explicitly without stamping the shared Dummy.
+Terrain member rows also retain nullable signed `native_id`, independently of
+their stable `id`. Older receipts may omit it; omission stays unobserved rather
+than implying zero or a missing native identity. Reading it allocates no ID.
+New member rows also report signed `health` and `max_health` from that same
+Terrain owner. Older receipts may omit both; observation does not apply damage.
+`terrain_instances` reports all retained Terrain instances anchored at the requested
+cell, in stable ID order, with those same fields plus `lifecycle`, `cell_member`,
+nullable `display_layer` and `in_logic_vector`. A live, invisible object can be absent
+from Cell content while remaining in Display. The observer reads these independent
+owners without inferring membership from health or the current type footprint.
+Older receipts may omit the array; omission leaves instance presence unobserved.
 
 V5 actor rows add `building`, null for Foot objects. Structures read their sole
 body state, queued body request, construction control, complete serialized
@@ -2235,6 +2399,13 @@ and complete retained runtime/timer. A stale occupied slot retains its ID with
 `animation: null`; it is never silently omitted or replaced. These rows allow
 construction completion and the following operational visit's allocation,
 replacement and cleanup to be inspected through the normal match path.
+
+Current animation runtime receipts include `temporal_paused` (Anim +11A),
+separate from `paused` (Anim +19E), for both building slots and effect animations.
+This additive v8 projection is optional when reading older sealed receipts:
+omission stays unobserved and is never converted to `false`. When present, the
+field must be a boolean, is retained unchanged and participates in comparison.
+Other unknown runtime fields remain invalid.
 
 The camera calls the existing presentation centering/clamp owner once at L0.
 `render.camera` records its requested cell and actual final top-left/zoom. The
@@ -2327,7 +2498,11 @@ statistics, surface format and actual BGRA bytes. Clock policies must match; a
 legacy wall-clock observation and a diagnostic-clock observation are `INVALID`
 together even when their pixels match.
 Differences name precise field paths and before/after values. There are no pixel
-tolerances or omitted atlas fields.
+tolerances or omitted atlas fields. Process Main RNG reads (`rng.main` and every
+`main_rng_cursor`) are listed in `main_rng_differences` instead and do not decide
+`MATCH`: Main (`0x886B88`) is outside the state hash and saves, and the audio
+service draws it for SFX and Theme on wall time, so two runs of the same inputs
+can legitimately differ there. Scenario and Mapgen streams stay compared.
 Current v8 pairs also compare the complete command, rule-handle inventory,
 actor/building/animation/unit/miner/radio/House/terrain transcript and camera,
 including the delayed-shot and color/fade observations when requested. Historical
@@ -2451,15 +2626,18 @@ and native/GPU checks do not replace that production coverage.
 The final rendered frame records `render.unit_atlas` in the v6 child manifest;
 the validated wrapper retains it as `capture.unit_atlas` in `run.json`. The
 `UnitAtlas` owner reads actual wgpu texture descriptors and resident entries.
-It reports resident sprite count, the last actual build's rasterized sprite count,
-and each page's extent, format, dimensions, mip/sample counts and texel payload
-bytes, plus their total. Page count is the length of `pages`.
+It reports resident sprite count, the count of sprites rasterized since the atlas
+was made (`last_build_rasterized_sprite_count`), and each page's extent, format,
+dimensions, mip/sample counts and texel payload bytes, plus their total. Page
+count is the length of `pages`. Pictures are drawn the first time a frame asks for
+them, so both counts cover what the captured frames drew, not every picture the
+map's voxel models could draw.
 
 Pages are currently single-layer, single-mip, single-sample D2 `R8Uint`, so the
 payload is width × height bytes, including unused page space. Unsupported
 descriptors fail observation rather than retaining stale byte arithmetic. The
-last-build count includes rasterized shadow sprites, can differ from admitted
-resident entries, and stays unchanged on a no-op refresh.
+rasterized count includes shadow sprites and can differ from resident entries,
+since a sprite too large for a page is counted but not kept.
 
 This is resident UnitAtlas texture payload for the captured scenario. It excludes
 CPU caches, `VxlPoseFrameCache`, other atlases, palettes,

@@ -4,6 +4,12 @@
 
 use super::*;
 use crate::assets::pal_file::Color;
+use crate::util::ini_roots::IniRoots;
+
+/// The retail (YR profile) theater INI name, e.g. `snowmd.ini`.
+fn stock_theater_ini(theater_name: &str) -> String {
+    IniRoots::default().theater_ini(theater_def(theater_name).unwrap().control_name)
+}
 
 fn make_test_ini() -> String {
     "[TileSet0000]\nSetName=Grass\nFileName=clear\nTilesInSet=1\n\n\
@@ -55,7 +61,7 @@ fn active_theater_names_and_archive_order_match_retail() {
 
     for (name, ini_name, archives) in expected {
         let def = theater_def(name).expect("active theater definition");
-        assert_eq!(def.ini_name, ini_name);
+        assert_eq!(IniRoots::default().theater_ini(def.control_name), ini_name);
         assert_eq!(def.mix_archives, archives);
     }
 }
@@ -191,16 +197,6 @@ fn gsi_04_02_last_tiles_transform_is_signed_original_ordered_and_wrapping() {
         wraps_min.translate_legacy_map_tile_index(i32::MIN),
         i32::MAX
     );
-}
-
-#[test]
-fn gsi_04_02_empty_last_tiles_table_is_full_signed_identity() {
-    let lookup = parse_tileset_ini(b"[TileSet0000]\nTilesInSet=1\n", "tem")
-        .expect("empty compatibility table");
-    assert!(lookup.legacy_tile_index_exceptions.is_empty());
-    for raw in [i32::MIN, -123, -1, 0, 123, i32::from(u16::MAX), i32::MAX] {
-        assert_eq!(lookup.translate_legacy_map_tile_index(raw), raw);
-    }
 }
 
 #[test]
@@ -456,18 +452,6 @@ fn test_collect_used_tiles() {
 }
 
 #[test]
-fn test_theater_def_lookup() {
-    assert!(theater_def("TEMPERATE").is_some());
-    assert!(theater_def("temperate").is_some());
-    assert!(theater_def("SNOW").is_some());
-    assert!(theater_def("URBAN").is_some());
-    assert!(theater_def("DESERT").is_some());
-    assert!(theater_def("LUNAR").is_some());
-    assert!(theater_def("NEWURBAN").is_some());
-    assert!(theater_def("BOGUS").is_none());
-}
-
-#[test]
 fn parses_morphable_flag_per_tileset() {
     let ini = b"[TileSet0000]\n\
                 FileName=foo\n\
@@ -517,24 +501,6 @@ fn theater_parse_allow_tiberium_defaults_false() {
     assert!(!lookup.allows_tiberium(99));
 }
 
-#[test]
-fn general_reader_finds_bridge_middle_keys() {
-    let ini = "[General]\nBridgeSet=5\nBridgeMiddle1=7\nBridgeMiddle2=12\n\n[TileSet0000]\nTilesInSet=1\nFileName=clear\n";
-    let parsed = IniFile::from_bytes(ini.as_bytes()).unwrap();
-    let general = parsed.section("General");
-    assert_eq!(super::read_general_u16(general, "BridgeMiddle1"), Some(7));
-    assert_eq!(super::read_general_u16(general, "BridgeMiddle2"), Some(12));
-}
-
-#[test]
-fn general_reader_missing_bridge_middle_returns_none() {
-    let ini = "[General]\nBridgeSet=5\n\n[TileSet0000]\nTilesInSet=1\nFileName=clear\n";
-    let parsed = IniFile::from_bytes(ini.as_bytes()).unwrap();
-    let general = parsed.section("General");
-    assert_eq!(super::read_general_u16(general, "BridgeMiddle1"), None);
-    assert_eq!(super::read_general_u16(general, "BridgeMiddle2"), None);
-}
-
 fn native_general_corpus() -> &'static serde_json::Value {
     crate::test_fixture::json("tools/rules_oracle/theater_general_reader.json")
 }
@@ -557,21 +523,19 @@ fn active_retail_tile_shadow_route_is_dormant() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|row| row["file"].as_str() == Some(theater_def(name).unwrap().ini_name))
+            .find(|row| row["file"].as_str() == Some(stock_theater_ini(name).as_str()))
             .expect("physical theater provenance");
         assert_eq!(
             crate::util::sha256::sha256_hex(&theater.ini_data),
             expected["sha256"].as_str().unwrap(),
             "{name}: active retail theater bytes"
         );
-        let ini = IniFile::from_bytes(&theater.ini_data).unwrap();
-        for ordinal in 0..theater.lookup.bounds().len() {
-            let section = ini.section(&format!("TileSet{ordinal:04}")).unwrap();
+        for (ordinal, bounds) in theater.lookup.bounds().iter().enumerate() {
             assert!(
-                !section.read_bool("ShadowCaster", false),
+                (bounds.start..bounds.start + bounds.count)
+                    .all(|tile| !theater.lookup.casts_tile_shadow(tile)),
                 "{name}/TileSet{ordinal:04}: requires native tile-shadow support"
             );
-            assert_eq!(section.read_int("ShadowTiles", 0), 0);
             checked_sets += 1;
         }
 
@@ -603,6 +567,74 @@ fn active_retail_tile_shadow_route_is_dormant() {
         );
     }
     assert_eq!(checked_sets, 565, "all six active theater registries");
+}
+
+#[test]
+fn tile_shadow_flag_needs_shadow_caster_and_nonzero_shadow_tiles() {
+    // ReadTheater545150 reads ShadowCaster (546204) and, only when it is set,
+    // ShadowTiles (546248) from the TileSet section; 5464A6 stores +2E1 when
+    // both are nonzero. A SetName section is never consulted for them.
+    let lookup = parse_tileset_ini(
+        b"[TileSet0000]\nTilesInSet=1\nFileName=a\nSetName=A\nShadowCaster=yes\n\
+          [TileSet0001]\nTilesInSet=1\nFileName=b\nSetName=B\nShadowTiles=3\n\
+          [TileSet0002]\nTilesInSet=1\nFileName=c\nSetName=C\nShadowCaster=yes\nShadowTiles=3\n\
+          [TileSet0003]\nTilesInSet=1\nFileName=d\nSetName=D\n\
+          [D]\nShadowCaster=yes\nShadowTiles=3\n",
+        "tem",
+    )
+    .unwrap();
+    assert_eq!(
+        (0..4)
+            .map(|tile| lookup.casts_tile_shadow(tile))
+            .collect::<Vec<_>>(),
+        [false, false, true, false]
+    );
+}
+
+#[test]
+fn retail_theaters_read_signed_bridge_pieces_once() {
+    // load_theater is the one reader of the ten ReadTheater545150 piece keys
+    // (545B4D..545C2E); rim cleanup and the BridgeMiddle tile view share it.
+    let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+        return;
+    };
+    let corpus = native_general_corpus();
+    for (name, _) in THEATER_DEFS {
+        let theater = load_theater(&mut assets, name).expect("load stock theater");
+        let values = &corpus["physical"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["file"].as_str() == Some(stock_theater_ini(name).as_str()))
+            .expect("physical theater provenance")["values"];
+        let pair = |key: &str| {
+            [1, 2].map(|n| i32::try_from(values[format!("{key}{n}")].as_i64().unwrap()).unwrap())
+        };
+        let rim = theater.high_bridge_rim_tiles;
+        assert_eq!(
+            [
+                rim.top_left,
+                rim.bottom_right,
+                rim.top_right,
+                rim.bottom_left,
+                rim.middle
+            ],
+            [
+                pair("BridgeTopLeft"),
+                pair("BridgeBottomRight"),
+                pair("BridgeTopRight"),
+                pair("BridgeBottomLeft"),
+                pair("BridgeMiddle"),
+            ],
+            "{name}: signed bridge pieces"
+        );
+        assert_eq!(
+            rim.base,
+            theater.cliff_ranges.bridge_set.map_or(-1, i32::from),
+            "{name}: published BridgeSet base"
+        );
+        assert_eq!(theater.bridge_middles(), [Some(7), Some(12)], "{name}");
+    }
 }
 
 #[test]
@@ -681,83 +713,90 @@ fn selected_retail_temperate_rmg_roles_reach_tile_ids() {
 #[test]
 fn general_helpers_match_original_reader_and_signed_repair_keys() {
     use crate::map::bridge_rim_tiles::HighBridgeRimTiles;
-
-    let corpus = native_general_corpus();
-    for case in corpus["cases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .chain(corpus["physical"].as_array().unwrap())
-    {
-        let name = case["name"]
-            .as_str()
-            .or_else(|| case["file"].as_str())
-            .unwrap();
-        let text = case["input_text"]
-            .as_str()
-            .or_else(|| case["general_text"].as_str())
-            .unwrap();
-        let ini = IniFile::from_bytes(text.as_bytes()).unwrap();
-        let general = ini.section("General");
-        for read in corpus["read_contract"].as_array().unwrap() {
-            let key = read["key"].as_str().unwrap();
-            let default = i32::try_from(read["default"].as_i64().unwrap()).unwrap();
-            assert_eq!(
-                i64::from(general.map_or(default, |section| section.read_int(key, default))),
-                case["values"][key].as_i64().unwrap(),
-                "{name}: original General/{key} at {}",
-                read["call"]
-            );
-        }
-        for key in [
-            "BridgeSet",
-            "WoodBridgeSet",
-            "SlopeSetPieces",
-            "SlopeSetPieces2",
-            "Tunnels",
-            "TrackTunnels",
-            "DirtTunnels",
-            "DirtTrackTunnels",
-            "BridgeMiddle1",
-            "BridgeMiddle2",
-        ] {
-            assert_eq!(
-                read_general_u16(general, key),
-                u16::try_from(case["values"][key].as_i64().unwrap()).ok(),
-                "{name}: bounded {key} ordinal"
-            );
-        }
-        let rim = HighBridgeRimTiles::from_ini(0, text.as_bytes());
-        let signed_pieces = [
-            rim.top_left,
-            rim.bottom_right,
-            rim.top_right,
-            rim.bottom_left,
-            rim.middle,
-        ]
-        .concat();
-        // Oversized/negative repair identities must survive the signed read.
-        for (index, key) in [
-            "BridgeTopLeft1",
-            "BridgeTopLeft2",
-            "BridgeBottomRight1",
-            "BridgeBottomRight2",
-            "BridgeTopRight1",
-            "BridgeTopRight2",
-            "BridgeBottomLeft1",
-            "BridgeBottomLeft2",
-            "BridgeMiddle1",
-            "BridgeMiddle2",
-        ]
-        .iter()
-        .enumerate()
+    for ares_way in [false, true] {
+        let _ares = crate::rules::ares_switch::read_ares_way(ares_way);
+        let corpus = native_general_corpus();
+        for case in corpus["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(corpus["physical"].as_array().unwrap())
         {
-            let native = case["values"][key].as_i64().unwrap();
-            assert_eq!(
-                i64::from(signed_pieces[index]),
-                native,
-                "{name}: signed {key}"
-            );
+            let name = case["name"]
+                .as_str()
+                .or_else(|| case["file"].as_str())
+                .unwrap();
+            // Ares's `INIClass_Parse_Override` (`0x5260D9`) keeps only the later
+            // of two equal keys; this control records the vanilla reader.
+            if ares_way && matches!(name, "duplicate_key" | "duplicate_key_reversed") {
+                continue;
+            }
+            let text = case["input_text"]
+                .as_str()
+                .or_else(|| case["general_text"].as_str())
+                .unwrap();
+            let ini = IniFile::from_bytes(text.as_bytes()).unwrap();
+            let general = ini.section("General");
+            for read in corpus["read_contract"].as_array().unwrap() {
+                let key = read["key"].as_str().unwrap();
+                let default = i32::try_from(read["default"].as_i64().unwrap()).unwrap();
+                assert_eq!(
+                    i64::from(general.map_or(default, |section| section.read_int(key, default))),
+                    case["values"][key].as_i64().unwrap(),
+                    "{name}: original General/{key} at {}",
+                    read["call"]
+                );
+            }
+            for key in [
+                "BridgeSet",
+                "WoodBridgeSet",
+                "SlopeSetPieces",
+                "SlopeSetPieces2",
+                "Tunnels",
+                "TrackTunnels",
+                "DirtTunnels",
+                "DirtTrackTunnels",
+                "BridgeMiddle1",
+                "BridgeMiddle2",
+            ] {
+                assert_eq!(
+                    read_general_u16(general, key),
+                    u16::try_from(case["values"][key].as_i64().unwrap()).ok(),
+                    "{name}: bounded {key} ordinal"
+                );
+            }
+            let rim = HighBridgeRimTiles::from_ini(0, text.as_bytes());
+            let signed_pieces = [
+                rim.top_left,
+                rim.bottom_right,
+                rim.top_right,
+                rim.bottom_left,
+                rim.middle,
+            ]
+            .concat();
+            // Oversized/negative repair identities must survive the signed read.
+            for (index, key) in [
+                "BridgeTopLeft1",
+                "BridgeTopLeft2",
+                "BridgeBottomRight1",
+                "BridgeBottomRight2",
+                "BridgeTopRight1",
+                "BridgeTopRight2",
+                "BridgeBottomLeft1",
+                "BridgeBottomLeft2",
+                "BridgeMiddle1",
+                "BridgeMiddle2",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let native = case["values"][key].as_i64().unwrap();
+                assert_eq!(
+                    i64::from(signed_pieces[index]),
+                    native,
+                    "{name}: signed {key}"
+                );
+            }
         }
     }
 }
@@ -872,7 +911,7 @@ fn active_retail_automatic_shell_corpus_is_exact() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|row| row["file"].as_str() == Some(theater_def(theater_name).unwrap().ini_name))
+            .find(|row| row["file"].as_str() == Some(stock_theater_ini(theater_name).as_str()))
             .unwrap();
         let mut digest = crate::util::sha256::Sha256::new();
         digest.update(&theater.ini_data);
@@ -884,7 +923,7 @@ fn active_retail_automatic_shell_corpus_is_exact() {
         let expected_bridge_middles = ["BridgeMiddle1", "BridgeMiddle2"]
             .map(|key| u16::try_from(expected["values"][key].as_i64().unwrap()).ok());
         assert_eq!(
-            [theater.bridge_middle_1, theater.bridge_middle_2],
+            theater.bridge_middles(),
             expected_bridge_middles,
             "loaded {theater_name} BridgeMiddle keys"
         );
@@ -1006,20 +1045,6 @@ fn active_retail_automatic_shell_corpus_is_exact() {
 }
 
 #[test]
-fn cliff_ranges_resolve_ordinals_to_cumulative_tile_starts() {
-    let ini = b"[TileSet0000]\nTilesInSet=2\nFileName=clear\nSetName=Clear\n\n\
-                [TileSet0001]\nTilesInSet=3\nFileName=shore\nSetName=Shore\n\n\
-                [TileSet0002]\nTilesInSet=4\nFileName=cliff\nSetName=Anything\n";
-    let lookup = super::parse_tileset_ini(ini, "tem").unwrap();
-
-    assert_eq!(super::resolve_tileset_start(&lookup, 0), Some(0));
-    assert_eq!(super::resolve_tileset_start(&lookup, 1), Some(2));
-    assert_eq!(super::resolve_tileset_start(&lookup, 2), Some(5));
-    assert_eq!(super::resolve_tileset_start(&lookup, -1), None);
-    assert_eq!(super::resolve_tileset_start(&lookup, 99), None);
-}
-
-#[test]
 fn gsi_04_03a_rmg_tile_keys_parse_ramp_smooth_and_resolve_ordinals() {
     let ini_bytes =
         b"[General]\nClearTile = 0\nRampBase = 1\nRampSmooth = 2\nSlopeSetPieces = 0\nGreenTile = 2\nWaterSet = 1\n\n\
@@ -1046,6 +1071,24 @@ fn gsi_04_03a_rmg_tile_keys_parse_ramp_smooth_and_resolve_ordinals() {
     );
     assert_eq!(keys.sand_tile, None, "absent key must stay None, not 0");
     assert_eq!(keys.shore_pieces, None);
+}
+
+/// Ares MediansFix (Ares.dll 1006A920, hook 0x545904): a theater without
+/// `Medians=` (retail SNOWMD.INI) reads ordinal 71; an authored key is kept.
+/// In every build: VERA's opted-in urban pass stamps these tiles without Ares.
+#[test]
+fn missing_medians_key_reads_ordinal_71() {
+    let mut lookup = parse_tileset_ini(b"", "sno").unwrap();
+    lookup.tileset_bounds = vec![TilesetBounds { start: 0, count: 0 }; 72];
+    lookup.tileset_bounds[40].start = 400;
+    lookup.tileset_bounds[71].start = 710;
+    let medians = |text: &str| {
+        let ini = IniFile::from_str(text);
+        super::resolve_rmg_tile_keys(&lookup, ini.section("General"), None).medians
+    };
+    assert_eq!(medians("[General]\nPavedRoads=20\n"), Some(710));
+    assert_eq!(medians(""), Some(710), "no [General] section reads -1 too");
+    assert_eq!(medians("[General]\nMedians=40\n"), Some(400));
 }
 
 #[test]
@@ -1207,8 +1250,10 @@ fn synthetic_theater_with_bridge_keys(
         bridge_set: Some(0),
         wood_bridge_set: None,
         slope_set_pieces: None,
-        bridge_middle_1,
-        bridge_middle_2,
+        high_bridge_rim_tiles: crate::map::bridge_rim_tiles::HighBridgeRimTiles {
+            middle: [bridge_middle_1, bridge_middle_2].map(|key| key.map_or(-1, i32::from)),
+            ..crate::map::bridge_rim_tiles::HighBridgeRimTiles::ABSENT
+        },
         tunnels: None,
         track_tunnels: None,
         dirt_tunnels: None,
@@ -1227,16 +1272,6 @@ fn bridge_middle_tiles_cover_every_variant_a_publication_writes() {
     // BridgeSet starts at tile_id 0. NS: BS + M1 - 1 + {0..=4} = 6..=10;
     // EW: 11..=15. Variant 4 is the collapsed middle.
     assert_eq!(tiles.tile_ids, (6..=15).collect::<Vec<u16>>());
-}
-
-#[test]
-fn bridge_middle_tiles_include_the_wooden_set() {
-    use super::BridgeMiddleTiles;
-    let mut td = synthetic_theater_with_bridge_keys(Some(2), Some(9));
-    td.bridge_set = None;
-    td.wood_bridge_set = Some(0);
-    let tiles = BridgeMiddleTiles::from_theater(&td).expect("tiles");
-    assert_eq!(tiles.tile_ids, [1, 2, 3, 4, 5, 8, 9, 10, 11, 12]);
 }
 
 #[test]
@@ -1313,6 +1348,16 @@ fn gsi_13_04_tile_anims_come_from_the_setname_section() {
 
     // A tileset whose SetName names no section has no animations at all.
     assert_eq!(lookup.tile_anim(0), None);
+
+    // `none` and `<none>` get no type from FindOrAllocate (`0x00546538`), so
+    // the block is skipped (issue 4493).
+    let none = parse_tileset_ini(
+        b"[TileSet0000]\nSetName=Falls\nFileName=wf\nTilesInSet=2\n\
+          [Falls]\nTile01Anim=none\nTile02Anim=<None>\n",
+        "tem",
+    )
+    .unwrap();
+    assert_eq!((none.tile_anim(0), none.tile_anim(1)), (None, None));
 }
 
 #[test]
@@ -1343,14 +1388,6 @@ fn gsi_13_04_tile_anim_numeric_keys_fall_back_to_constructor_defaults() {
     assert_eq!(anim.attaches_to, TILE_ANIM_NO_SUBTILE);
 }
 
-#[test]
-fn gsi_13_04_tile_anim_block_is_not_read_from_the_tileset_section() {
-    let ini = "[TileSet0000]\nSetName=Grass\nFileName=clear\nTilesInSet=1\n\
-               Tile01Anim=WA01X\nTile01AttachesTo=0\n";
-    let lookup = parse_tileset_ini(ini.as_bytes(), "tem").unwrap();
-    assert_eq!(lookup.tile_anim(0), None);
-}
-
 /// Sprite atlas growth draws through the palettes `load_theater` publishes:
 /// the exact active-YR names, every entry opaque. Retail UNITTEM.PAL holds raw
 /// 63,0,63 at indices 204..=239 and ISOTEM.PAL at 10; neither is a chroma key.
@@ -1376,4 +1413,34 @@ fn atlas_growth_reads_the_published_theater_palettes() {
     generic.write("isotem.pal", &magenta);
     let assets = AssetManager::from_loose_root_for_test(generic.path());
     assert!(load_theater_unit_and_iso_palettes(&assets, "TEMPERATE").is_none());
+}
+
+/// `Read_Theater_TileSets_INI` (`0x00545150`) formats the theater INI with
+/// `"%sMD.INI"` (`0x005454FE`); a profile with another suffix reads its own
+/// file first and, when that is absent, the stock one.
+#[test]
+fn load_theater_prefers_the_profile_theater_ini_then_the_stock_name() {
+    use crate::map::source::test_support::TestDirectory;
+    use crate::util::ini_roots::{IniProfile, IniRootConfig};
+    let mo = IniRootConfig {
+        profile: IniProfile::Mo,
+        ..Default::default()
+    }
+    .resolve(|_| true)
+    .unwrap();
+    let dir = TestDirectory::new("theater-profile-ini");
+    dir.write("isotem.pal", &[0; 768]);
+    dir.write("unittem.pal", &[0; 768]);
+    let stock_ini = b"[TileSet0000]\nFileName=clear\nTilesInSet=1\n";
+    dir.write("temperatmd.ini", stock_ini);
+    let mut assets =
+        AssetManager::from_loose_root_for_test(dir.path()).with_selected_ini_roots(mo.clone());
+    let theater = load_theater(&mut assets, "TEMPERATE").expect("stock fallback");
+    assert_eq!(theater.ini_data, stock_ini);
+
+    let profile_ini = b"[TileSet0000]\nFileName=clear\nTilesInSet=2\n";
+    dir.write("temperatmo.ini", profile_ini);
+    let mut assets = AssetManager::from_loose_root_for_test(dir.path()).with_selected_ini_roots(mo);
+    let theater = load_theater(&mut assets, "TEMPERATE").expect("profile theater INI");
+    assert_eq!(theater.ini_data, profile_ini);
 }

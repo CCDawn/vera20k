@@ -5,12 +5,21 @@
 //! describe exactly the consumed buffer, including loose-file winners.
 use std::sync::Arc;
 
-use crate::assets::asset_manager::AssetManager;
+use crate::assets::asset_manager::{AssetManager, AssetResolutionRef};
+use crate::assets::error::AssetError;
+use crate::assets::mix_archive::MixArchive;
 use crate::rules::ini_parser::IniFile;
-use crate::rules::process_owner::NativeRulesProcessOwner;
+use crate::rules::ini_parser::directives::{
+    DirectiveDiagnostic, DirectiveOptions, include_identity, process_directives,
+};
+use crate::rules::personal_rules::PersonalRules;
+use crate::rules::process_owner::{NativeLangRuleSource, NativeRulesProcessOwner};
 use crate::rules::ruleset::RuleSet;
 use crate::rules::sound_ini::{EvaRegistry, SoundRegistry};
 use crate::util::sha256::sha256_hex;
+
+const MAX_INCLUDED_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+const INCLUDE_BYTES_EXCEEDED: &str = "INI included sources exceed the 32 MiB expansion budget";
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct IniSourceIdentity {
@@ -21,16 +30,123 @@ pub struct IniSourceIdentity {
     pub(crate) source_sha256: String,
 }
 
+#[derive(Debug)]
 #[cfg_attr(any(test, feature = "test-support"), derive(Clone))]
 pub struct SelectedIni {
     pub ini: IniFile,
+    /// Root bytes parsed before optional Ares include expansion. LANGRULE's
+    /// native Digest covers this physical file, not the composed reader layer.
+    pub(crate) physical_ini: IniFile,
     pub source: IniSourceIdentity,
+    /// Physical child snapshots in traversal order (including repeated DAG
+    /// references). Root identity still describes the original root bytes.
+    pub included_sources: Vec<IniSourceIdentity>,
+    pub directive_diagnostics: Vec<DirectiveDiagnostic>,
+}
+
+enum OptionalIniSelection {
+    Absent,
+    Selected(SelectedIni),
+    SelectionFailed(String),
 }
 
 pub fn select_ini(assets: &AssetManager, name: &str) -> Result<SelectedIni, String> {
+    // A game that ships `ares.mix` loads its INIs with Ares' syntax and
+    // `[#include]` (`ares_switch::ares_way`), as its launch does.
+    let _ares_way = crate::rules::ares_switch::read_ares_way(
+        crate::rules::ares_switch::game_ships_ares(assets.ships_ares()),
+    );
+    if crate::rules::ares_switch::ares_way() || crate::rules::PHOBOS_ENABLED {
+        select_ini_with_options(assets, name, DirectiveOptions::production())
+    } else {
+        select_physical_ini(assets, name)
+    }
+}
+
+/// Explicit file-composition probe. Tool callers may inspect extension syntax
+/// independently of the gameplay capability selected at compile time.
+pub fn select_ini_with_options(
+    assets: &AssetManager,
+    name: &str,
+    options: DirectiveOptions,
+) -> Result<SelectedIni, String> {
+    let mut selected = select_physical_ini(assets, name)?;
+    let (expanded, included_sources) = expand_ini_with_assets(assets, selected.ini, name, options)?;
+    selected.ini = expanded.ini;
+    selected.included_sources = included_sources;
+    selected.directive_diagnostics = expanded.diagnostics;
+    Ok(selected)
+}
+
+/// Maps already own their decoded physical INI (including MMX wrappers).
+/// They enter the same traversal/provider instead of selecting a second root.
+pub(crate) fn expand_ini_with_assets(
+    assets: &AssetManager,
+    ini: IniFile,
+    name: &str,
+    options: DirectiveOptions,
+) -> Result<
+    (
+        crate::rules::ini_parser::directives::ExpandedIni,
+        Vec<IniSourceIdentity>,
+    ),
+    String,
+> {
+    let mut included_sources = Vec::new();
+    let mut included_bytes = 0usize;
+    let mut exceeded_budget = false;
+    let expanded = process_directives(
+        ini,
+        name,
+        |reference| {
+            // All references share the production VFS root; do not rebase on the
+            // including document's host directory or open arbitrary host paths.
+            let logical = include_identity(reference);
+            let remaining = MAX_INCLUDED_SOURCE_BYTES - included_bytes;
+            let resolved = match assets.resolve_ref_bounded(&logical, remaining) {
+                Ok(Some(resolved)) => resolved,
+                Ok(None) => return Ok(None),
+                Err(AssetError::ReadLimitExceeded { .. }) => {
+                    exceeded_budget = true;
+                    return Err(INCLUDE_BYTES_EXCEEDED.into());
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            // An existing zero-byte file is present, not missing: Phobos loads
+            // it through `CCFileClass`/`ReadCCFile` and Ares also keeps the
+            // read. Only an unresolved reference answers `None`.
+            // Charge every physical read, including repeated DAG references,
+            // before parsing. Resolution enforces the remaining budget before
+            // reading or retaining the first loose snapshot, not afterwards.
+            included_bytes += resolved.bytes.len();
+            log::info!(
+                "Including {logical} ({} bytes) from {}",
+                resolved.bytes.len(),
+                resolved.source_archive
+            );
+            included_sources.push(source_identity(&logical, &resolved));
+            Ok(Some(resolved.bytes.to_vec()))
+        },
+        options,
+    );
+    if exceeded_budget {
+        return Err(INCLUDE_BYTES_EXCEEDED.into());
+    }
+    let expanded = expanded.map_err(|error| error.to_string())?;
+    for diagnostic in &expanded.diagnostics {
+        log::warn!("INI directive: {diagnostic}");
+    }
+    Ok((expanded, included_sources))
+}
+
+fn select_physical_ini(assets: &AssetManager, name: &str) -> Result<SelectedIni, String> {
     let selected = assets
         .resolve_ref(name)
         .ok_or_else(|| format!("retail INI {name} is unavailable"))?;
+    parse_physical_ini(name, selected)
+}
+
+fn parse_physical_ini(name: &str, selected: AssetResolutionRef<'_>) -> Result<SelectedIni, String> {
     log::info!(
         "Loading {name} ({} bytes) from {}",
         selected.bytes.len(),
@@ -39,15 +155,22 @@ pub fn select_ini(assets: &AssetManager, name: &str) -> Result<SelectedIni, Stri
     let ini = IniFile::from_bytes(selected.bytes)
         .map_err(|error| format!("parse {name} from {}: {error}", selected.source_archive))?;
     Ok(SelectedIni {
-        ini,
-        source: IniSourceIdentity {
-            logical_name: name.to_owned(),
-            source_archive: selected.source_archive.to_owned(),
-            entry_id: selected.entry_id,
-            payload_len: selected.bytes.len(),
-            source_sha256: sha256_hex(selected.bytes),
-        },
+        ini: ini.clone(),
+        physical_ini: ini,
+        included_sources: Vec::new(),
+        directive_diagnostics: Vec::new(),
+        source: source_identity(name, &selected),
     })
+}
+
+fn source_identity(name: &str, selected: &AssetResolutionRef<'_>) -> IniSourceIdentity {
+    IniSourceIdentity {
+        logical_name: name.to_owned(),
+        source_archive: selected.source_archive.to_owned(),
+        entry_id: selected.entry_id,
+        payload_len: selected.bytes.len(),
+        source_sha256: sha256_hex(selected.bytes),
+    }
 }
 
 /// Select the native mode object's INI, if there is a mode object.
@@ -76,26 +199,61 @@ pub fn select_mode_ini(
 }
 
 /// Transient selected inputs, consumed when the process authority is constructed.
-/// Optional LANGRULE retains the existing production missing/parse-failure
-/// policy. ART is fixed and never enters the scenario layer stack. Audio
-/// definitions are separately selected and injected before Rules construction.
+/// `langrule` contains a selected mod's optional source; with no mod selected,
+/// VERA ignores it so localized installations share the original rules.
+/// A physical absence and a selection/expansion failure are recorded separately.
+/// Present empty and unverified files retain their physical byte count and parsed root
+/// for the process owner's native Digest gate. ART is fixed and never enters
+/// the scenario layer stack. Audio definitions are separately selected and
+/// injected before Rules construction.
 #[cfg_attr(any(test, feature = "test-support"), derive(Clone))]
 pub struct RetailRulesSources {
     pub rulesmd: SelectedIni,
     pub langrule: Option<SelectedIni>,
+    langrule_selection_failure: Option<String>,
     pub artmd: SelectedIni,
+    personal_rules: PersonalRules,
+    /// The game is an Ares game (`AssetManager::ships_ares`): it mounted
+    /// `ares.mix`, or the player's Ares setting is On.
+    ships_ares: bool,
+    /// The player's Ares setting is Off: no Ares key turns Ares on.
+    ares_keys_off: bool,
 }
 
 impl RetailRulesSources {
     pub fn select(assets: &AssetManager) -> Result<Self, String> {
-        let rulesmd = select_ini(assets, "rulesmd.ini")?;
-        let langrule = select_ini(assets, "langrule.ini").ok();
-        let artmd = select_ini(assets, "artmd.ini")?;
+        let rulesmd = select_ini(assets, assets.ini_roots().rules())?;
+        // VERA's Original mode deliberately omits the optional LANGRULE pass
+        // of Load_Game_Rules (0x0052CD70) and Reset (0x00668B05). A selected
+        // mod keeps it, including its native Digest validation and layering.
+        let langrule = if assets.mod_selected() {
+            select_optional_ini(assets, "langrule.ini")
+        } else {
+            OptionalIniSelection::Absent
+        };
+        let (langrule, langrule_selection_failure) = match langrule {
+            OptionalIniSelection::Absent => (None, None),
+            OptionalIniSelection::Selected(selected) => (Some(selected), None),
+            OptionalIniSelection::SelectionFailed(error) => (None, Some(error)),
+        };
+        let artmd = select_ini(assets, assets.ini_roots().art())?;
         Ok(Self {
             rulesmd,
             langrule,
+            langrule_selection_failure,
             artmd,
+            personal_rules: PersonalRules::default(),
+            ships_ares: crate::rules::ares_switch::game_ships_ares(assets.ships_ares()),
+            ares_keys_off: assets.ares_setting() == crate::util::ares_launch::AresSetting::Off,
         })
+    }
+
+    /// VERA-only source composition; physical source identities remain intact.
+    /// No extra native Rules pass is introduced by a personal override: the
+    /// owner composes it over each scenario's root and LANGRULE.
+    pub fn with_personal_rules(mut self, personal_rules: PersonalRules) -> Self {
+        self.personal_rules = personal_rules;
+        self
     }
 
     /// The cold-started native Rules authority alone, without the shell
@@ -105,14 +263,27 @@ impl RetailRulesSources {
         sounds: Arc<SoundRegistry>,
         eva: Arc<EvaRegistry>,
     ) -> Result<NativeRulesProcessOwner, String> {
-        NativeRulesProcessOwner::from_cold_start_sources(
+        let langrule = match (self.langrule, self.langrule_selection_failure) {
+            (Some(source), _) => Some(NativeLangRuleSource::Selected(source)),
+            (None, Some(error)) => Some(NativeLangRuleSource::SelectionFailed(error)),
+            (None, None) => None,
+        };
+        let owner = NativeRulesProcessOwner::from_named_cold_start_sources(
             self.rulesmd.ini,
-            self.langrule.map(|source| source.ini),
+            langrule,
             self.artmd.ini,
             sounds,
             eva,
+            [
+                self.rulesmd.source.logical_name,
+                self.artmd.source.logical_name,
+            ],
+            self.personal_rules,
+            self.ships_ares,
+            self.ares_keys_off,
         )
-        .map_err(|error| format!("Native rules cold startup failed: {error}"))
+        .map_err(|error| format!("Native rules cold startup failed: {error}"))?;
+        Ok(owner)
     }
 
     pub fn into_startup(
@@ -150,6 +321,133 @@ impl RetailRulesSources {
     }
 }
 
+/// Optional LANGRULE selection uses the same physical parser and Ares include
+/// expansion as the original selector. Probe availability first to retain a
+/// physical absence separately from a selected file whose expansion fails.
+fn select_optional_ini(assets: &AssetManager, name: &str) -> OptionalIniSelection {
+    if assets.resolve_ref(name).is_none() {
+        return OptionalIniSelection::Absent;
+    }
+    match select_ini(assets, name) {
+        Ok(selected) => OptionalIniSelection::Selected(selected),
+        Err(error) => OptionalIniSelection::SelectionFailed(error),
+    }
+}
+
+/// The archives a retail install ships, by outermost name and in lookup
+/// order: the language archives (mounted ahead of the expansions), the
+/// YR 1.001 patch `expandmd01.mix` (retail `rulesmd.ini` comes from it) and
+/// the masters. Retail installs ship no other expansion.
+const SHIPPED_ARCHIVES: [&str; 5] = [
+    "langmd.mix",
+    "language.mix",
+    "expandmd01.mix",
+    "ra2md.mix",
+    "ra2.mix",
+];
+/// The master archive whose nested `localmd.mix` ships most INIs.
+const SHIPPED_MASTER: &str = "ra2md.mix";
+const SHIPPED_LOCAL: &str = "localmd.mix";
+
+/// Whether a source (`AssetResolutionRef::source_archive`, an archive's name)
+/// is a shipped archive or nested in one. A loose file never is.
+pub(crate) fn shipped_source(source: &str) -> bool {
+    !source.starts_with("loose:")
+        && SHIPPED_ARCHIVES
+            .iter()
+            .any(|shipped| outermost_archive(source).eq_ignore_ascii_case(shipped))
+}
+
+/// The game-folder file a source comes from: a loose file's name, else the
+/// archive's outermost name (`expandmd99.mix`).
+pub(crate) fn game_folder_file(source: &str) -> String {
+    match source.strip_prefix("loose:") {
+        Some(path) => std::path::Path::new(path).file_name().map_or_else(
+            || path.to_owned(),
+            |file| file.to_string_lossy().into_owned(),
+        ),
+        None => outermost_archive(source).to_owned(),
+    }
+}
+
+fn outermost_archive(source: &str) -> &str {
+    source.split(" -> ").next().unwrap_or(source).trim()
+}
+
+/// The shipped copy of the nested archive `name` (`isosnomd.mix`): the
+/// first shipped archive, in lookup order, that holds one.
+pub(crate) fn shipped_nested_archive(assets: &AssetManager, name: &str) -> Option<MixArchive> {
+    let id = crate::assets::mix_hash::mix_hash(name);
+    SHIPPED_ARCHIVES.iter().find_map(|archive| {
+        assets
+            .archive_with_source(archive)?
+            .1
+            .nested_archive_by_id(id)
+            .ok()
+            .flatten()
+    })
+}
+
+/// VERA: the game-folder files that change any of `names` from the copy the
+/// retail game ships, for Quick Match, which plays the original game. Each
+/// is a loose file's name or an archive's outermost name (`expandmd99.mix`),
+/// once. A copy from a shipped archive is the original (a replaced retail
+/// archive is not caught, and is never named). Any other copy is compared
+/// with the shipped one: a shipped archive's own entry, else the one in
+/// `ra2md.mix`'s own `localmd.mix`, read there because a mod's archive can
+/// mount another `localmd.mix` first. The same entries
+/// (`IniFile::multiplayer_digest`) are unchanged, and so is a name nothing
+/// supplies.
+pub fn files_changing_shipped_inis(assets: &AssetManager, names: &[&str]) -> Vec<String> {
+    let mut local = None;
+    let mut files = Vec::new();
+    for name in names.iter().map(|name| name.trim()) {
+        let Some(used) = (!name.is_empty())
+            .then(|| assets.resolve_ref(name))
+            .flatten()
+        else {
+            continue;
+        };
+        if shipped_source(used.source_archive) {
+            continue;
+        }
+        let local = local.get_or_insert_with(|| {
+            assets
+                .archive_with_source(SHIPPED_MASTER)
+                .and_then(|(_, master)| {
+                    master
+                        .nested_archive_by_id(crate::assets::mix_hash::mix_hash(SHIPPED_LOCAL))
+                        .ok()
+                        .flatten()
+                })
+        });
+        let shipped = SHIPPED_ARCHIVES
+            .iter()
+            .find_map(|archive| {
+                assets
+                    .archive_with_source(archive)
+                    .and_then(|(_, archive)| archive.get_by_name(name))
+            })
+            .or_else(|| local.as_ref().and_then(|archive| archive.get_by_name(name)));
+        if shipped.is_some_and(|shipped| same_entries(shipped, used.bytes)) {
+            continue;
+        }
+        let file = game_folder_file(used.source_archive);
+        if !files.contains(&file) {
+            files.push(file);
+        }
+    }
+    files
+}
+
+fn same_entries(shipped: &[u8], used: &[u8]) -> bool {
+    shipped == used
+        || match (IniFile::from_bytes(shipped), IniFile::from_bytes(used)) {
+            (Ok(shipped), Ok(used)) => shipped.multiplayer_digest() == used.multiplayer_digest(),
+            _ => false,
+        }
+}
+
 /// Cold-start native Rules authority plus the one shell compatibility
 /// projection derived from the same selected INI snapshots.
 pub struct StartupRulesLoad {
@@ -181,10 +479,49 @@ pub fn load_startup_rules(
         .ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_o_z))]
+#[path = "ini_root_tests.rs"]
+mod ini_root_tests;
+
+#[cfg(all(test, tests_rules_o_z))]
 mod tests {
     use super::*;
     use crate::map::source::test_support::TestDirectory;
+
+    #[test]
+    fn include_byte_limit_refuses_sparse_source_before_retaining_a_snapshot() {
+        let directory = TestDirectory::new("include-sparse-limit");
+        directory.write("root.ini", b"[#include]\n0=child.ini\n");
+        let child = directory.path().join("child.ini");
+        let sparse = std::fs::File::create(&child).unwrap();
+        sparse.set_len(32 * 1024 * 1024 + 1).unwrap();
+        drop(sparse);
+        let assets = AssetManager::from_loose_root_for_test(directory.path());
+        let error = select_ini_with_options(&assets, "root.ini", DirectiveOptions::default())
+            .err()
+            .expect("even non-strict traversal must refuse an over-budget source");
+        assert!(error.contains("32 MiB expansion budget"));
+
+        // Refusal must leave the lazy source untouched. Retrying through the
+        // same manager after shrinking the physical file consumes its new bytes.
+        let bytes = b"[Unit]\nValue=bounded\n";
+        std::fs::write(child, bytes).unwrap();
+        let selected =
+            select_ini_with_options(&assets, "root.ini", DirectiveOptions::default()).unwrap();
+        assert_eq!(selected.included_sources.len(), 1);
+        assert_eq!(selected.included_sources[0].payload_len, bytes.len());
+        assert_eq!(
+            selected.included_sources[0].source_sha256,
+            sha256_hex(bytes)
+        );
+        assert_eq!(
+            selected
+                .ini
+                .section_or_empty("Unit")
+                .read_string("Value", "", 32),
+            "bounded"
+        );
+    }
 
     #[test]
     fn selected_sources_hash_consumed_bytes_and_survive_disk_changes() {
@@ -233,6 +570,149 @@ mod tests {
                 .get_for_test("FlightLevel"),
             Some("1500")
         );
+    }
+
+    #[test]
+    fn optional_langrule_selection_preserves_absent_empty_and_bad_digest_sources() {
+        use crate::assets::asset_manager::{MediaArchiveMode, test_support::audio_test_install};
+
+        let install = audio_test_install("langrule-mod-install");
+        let directory = TestDirectory::new("optional-langrule-physical-source");
+        directory.write("rulesmd.ini", b"[General]\nBuildSpeed=.7\n");
+        directory.write("artmd.ini", b"[TECH]\nFoundation=2x3\n");
+
+        let open = || {
+            AssetManager::with_mod(
+                install.path(),
+                Some(directory.path()),
+                MediaArchiveMode::STOCK_DIGITAL,
+            )
+            .unwrap()
+        };
+        let absent_assets = open();
+        assert!(
+            RetailRulesSources::select(&absent_assets)
+                .expect("required sources")
+                .langrule
+                .is_none(),
+            "a missing physical source has no retained parsed layer"
+        );
+
+        directory.write("langrule.ini", b"");
+        let empty_assets = open();
+        let empty = RetailRulesSources::select(&empty_assets)
+            .expect("required sources")
+            .langrule
+            .expect("present empty LANGRULE remains selected");
+        assert_eq!(empty.source.payload_len, 0);
+        assert!(empty.ini.is_empty());
+
+        let invalid = b"[General]\nBuildSpeed=.58\n[Digest]\n1=AAAAAAAAAAAAAAAAAAAAAAAAAAA=\n";
+        directory.write("langrule.ini", invalid);
+        let invalid_assets = open();
+        let selected = RetailRulesSources::select(&invalid_assets)
+            .expect("required sources")
+            .langrule
+            .expect("a rejected digest is still a present physical source");
+        assert_eq!(selected.source.payload_len, invalid.len());
+        assert!(selected.ini.section("Digest").is_some());
+    }
+
+    /// A selected mod that mounts `ares.mix` (Load_Bootstrap_AresMIX, hook
+    /// `0x0053029E`) selects its INIs with Ares' syntax. No mod ignores the
+    /// installed archive and keeps gamemd's syntax, unless the thread already
+    /// reads the Ares way.
+    #[test]
+    fn a_game_with_ares_mix_selects_its_rules_with_ares_syntax() {
+        use crate::assets::asset_manager::MediaArchiveMode;
+        for ares_way in [false, true] {
+            let _ares = crate::rules::ares_switch::read_ares_way(ares_way);
+            let directory = crate::assets::asset_manager::test_support::audio_test_install(
+                "ares-mix-rules-syntax",
+            );
+            std::fs::write(
+                directory.path().join("rulesmd.ini"),
+                b"[BuildingTypes]\n+=GAPOWR\n",
+            )
+            .unwrap();
+            std::fs::write(
+                directory.path().join("artmd.ini"),
+                b"[GAPOWR]\nFoundation=2x2\n",
+            )
+            .unwrap();
+            let mod_dir = TestDirectory::new("ares-rules-mod");
+            let keys = |selected_mod: bool| {
+                let assets = AssetManager::with_mod(
+                    directory.path(),
+                    selected_mod.then_some(mod_dir.path()),
+                    MediaArchiveMode::STOCK_DIGITAL,
+                )
+                .unwrap();
+                let sources = RetailRulesSources::select(&assets).unwrap();
+                let keys: Vec<String> = sources
+                    .rulesmd
+                    .ini
+                    .section_or_empty("BuildingTypes")
+                    .keys()
+                    .map(str::to_owned)
+                    .collect();
+                (assets.ships_ares(), sources.ships_ares, keys)
+            };
+            // A thread read the Ares way reads every game the Ares way.
+            let stock_key = if ares_way { "var_0" } else { "+" };
+            assert_eq!(keys(false), (false, ares_way, vec![stock_key.to_owned()]));
+            directory.write_mix("ares.mix", "ares.txt", b"ares");
+            assert_eq!(keys(false), (false, ares_way, vec![stock_key.to_owned()]));
+            assert_eq!(keys(true), (true, true, vec!["var_0".to_owned()]));
+        }
+    }
+
+    #[test]
+    fn langrule_selection_expands_ares_includes_and_keeps_physical_root_for_digest() {
+        use crate::assets::asset_manager::{MediaArchiveMode, test_support::audio_test_install};
+
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let install = audio_test_install("langrule-include-install");
+        let directory = TestDirectory::new("langrule-ares-include");
+        directory.write("rulesmd.ini", b"[General]\nBuildSpeed=.7\n");
+        directory.write("artmd.ini", b"[TECH]\nFoundation=2x3\n");
+        directory.write(
+            "langrule.ini",
+            b"[#include]\n0=lang-extra.ini\n[General]\nBuildSpeed=.58\n",
+        );
+        directory.write(
+            "lang-extra.ini",
+            b"[General]\nBuildSpeed=.4\n[ColorAdd]\nLANG0=7,8,9\n",
+        );
+        let assets = AssetManager::with_mod(
+            install.path(),
+            Some(directory.path()),
+            MediaArchiveMode::STOCK_DIGITAL,
+        )
+        .unwrap();
+        let selected = RetailRulesSources::select(&assets)
+            .expect("required sources")
+            .langrule
+            .expect("physical LANGRULE");
+
+        assert_eq!(selected.included_sources.len(), 1);
+        assert_eq!(
+            selected
+                .ini
+                .section_or_empty("General")
+                .read_string("BuildSpeed", "", 16),
+            ".4",
+            "the Ares include wins in the composed LANGRULE layer"
+        );
+        assert_eq!(
+            selected
+                .physical_ini
+                .section_or_empty("General")
+                .read_string("BuildSpeed", "", 16),
+            ".58",
+            "Digest sees the selected physical root before include expansion"
+        );
+        assert!(selected.physical_ini.section("#include").is_some());
     }
 
     #[test]
@@ -385,15 +865,36 @@ mod tests {
 
     #[test]
     fn random_map_catalog_uses_retained_root_langrule_and_fixed_art() {
+        use crate::assets::asset_manager::{MediaArchiveMode, test_support::audio_test_install};
+
+        let install = audio_test_install("rmg-langrule-install");
         let directory = TestDirectory::new("rmg-retained-rules");
-        directory.write("rulesmd.ini", b"[AI]\nNeutralTechBuildings=TECH1\n");
-        directory.write("langrule.ini", b"[AI]\nNeutralTechBuildings=TECH2\n");
+        // TECH2 is registered so that Ares's Find-only list read (Buf_AI
+        // 1005B830, hook 0x672B0E) resolves the langrule list too.
+        directory.write(
+            "rulesmd.ini",
+            b"[BuildingTypes]\n0=TECH2\n[AI]\nNeutralTechBuildings=TECH1\n",
+        );
+        // The original Reset's ReadCCFile4741F0 accepted this Digest for the
+        // exact physical body through the existing RawFile/INI owners.
+        directory.write(
+            "langrule.ini",
+            b"[AI]\nNeutralTechBuildings=TECH2\n[Digest]\n1=CGLFHoNX2UiC0RYwRTmgBnJVpec=\n",
+        );
         directory.write("artmd.ini", b"[TECH2]\nFoundation=2x3\n");
-        let assets = AssetManager::from_loose_root_for_test(directory.path());
+        let assets = AssetManager::with_mod(
+            install.path(),
+            Some(directory.path()),
+            MediaArchiveMode::STOCK_DIGITAL,
+        )
+        .unwrap();
         let (_, _, owner) = load_startup_rules(&assets, Arc::default(), Default::default())
             .expect("startup")
             .into_parts();
-        directory.write("langrule.ini", b"[AI]\nNeutralTechBuildings=WRONG\n");
+        directory.write(
+            "langrule.ini",
+            b"[AI]\nNeutralTechBuildings=WRONG\n[Digest]\n1=CGLFHoNX2UiC0RYwRTmgBnJVpec=\n",
+        );
         directory.write("artmd.ini", b"[TECH2]\nFoundation=1x1\n");
         let projected = owner
             .startup_compatibility_projection()
@@ -486,5 +987,39 @@ mod tests {
         assert_eq!(napowr.strength, 750);
         assert!(napowr.can_c4);
         assert_eq!(rules.c4_delay_frames(), 26);
+    }
+
+    #[test]
+    fn game_folder_files_that_change_shipped_inis_are_named() {
+        use crate::assets::asset_manager::MediaArchiveMode;
+        use crate::assets::asset_manager::test_support::audio_test_install;
+        use crate::map::source::test_support::make_new_format_mix_bytes;
+        let dir = audio_test_install("shipped-inis");
+        let local = make_new_format_mix_bytes(&[("aimd.ini", b"[AI]\nValue=1\n")]);
+        std::fs::remove_file(dir.path().join("localmd.mix")).unwrap();
+        std::fs::write(
+            dir.path().join("ra2md.mix"),
+            make_new_format_mix_bytes(&[("localmd.mix", &local)]),
+        )
+        .unwrap();
+        dir.write_mix(
+            "expandmd01.mix",
+            "rulesmd.ini",
+            b"[General]\nBuildSpeed=.7\n",
+        );
+        let changed = || {
+            let assets = AssetManager::new(dir.path(), MediaArchiveMode::STOCK_DIGITAL).unwrap();
+            files_changing_shipped_inis(&assets, &["rulesmd.ini", "aimd.ini", "langrule.ini"])
+        };
+        assert!(changed().is_empty());
+        // A localized edition's own archive is the original too.
+        dir.write_mix("langmd.mix", "langrule.ini", b"[General]\nName=x\n");
+        assert!(changed().is_empty());
+        let rules = dir.path().join("rulesmd.ini");
+        std::fs::write(&rules, b"; same entries\r\n[General]\r\nBuildSpeed=.7\r\n").unwrap();
+        assert!(changed().is_empty());
+        std::fs::write(&rules, b"[General]\nBuildSpeed=.5\n").unwrap();
+        dir.write_mix("expandmd99.mix", "aimd.ini", b"[AI]\nValue=2\n");
+        assert_eq!(changed(), ["rulesmd.ini", "expandmd99.mix"]);
     }
 }

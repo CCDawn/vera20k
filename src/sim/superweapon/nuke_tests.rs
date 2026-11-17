@@ -155,7 +155,10 @@ fn impact_matches_native() {
                 None,
             ),
         );
-        store.get_mut(id).unwrap().on_bridge = row["on_bridge"].as_bool().unwrap();
+        store
+            .get_mut(id)
+            .unwrap()
+            .set_on_bridge_for_test(row["on_bridge"].as_bool().unwrap());
         let nuke_ball = || super::nuke::nuke_ball_type(&rules);
         let context = NukeImpactContext::new(&interner, &nuke_ball);
 
@@ -178,12 +181,12 @@ fn impact_matches_native() {
         assert_eq!(bullet.awaiting_anim(), waits, "{row}");
         assert_eq!(bullet.awaited_anim(), None);
         if location.x >= 0 && location.y >= 0 {
-            assert_eq!(bullet.position, coord(&row["location_after"]), "{row}");
+            assert_eq!(bullet.position(), coord(&row["location_after"]), "{row}");
         }
         if waits {
             let cell = ints(&row["cell"]);
             assert_eq!(
-                bullet.previous_cell,
+                bullet.previous_cell(),
                 (cell[0] as i16, cell[1] as i16),
                 "{row}"
             );
@@ -211,7 +214,7 @@ fn impact_effects_match_native() {
         }
         compared += 1;
         let location = coord(&row["location_after"]);
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         let spawn = nuke_spawn(
             &mut sim.interner,
             "NUKE",
@@ -219,10 +222,11 @@ fn impact_effects_match_native() {
             rules.weapon("NukePayload"),
         );
         sim.projectiles.spawn(id, spawn);
-        sim.session.binary_frame = 4000;
-        sim.session.lighting = ScenarioLightingState::default();
-        sim.lighting_sources.pending.clear();
-        sim.sound_events.clear();
+        sim.session.set_binary_frame_for_test(4000);
+        sim.session
+            .set_lighting_for_test(ScenarioLightingState::default());
+        sim.lighting_sources.take_pending();
+        sim.sound_events.clear_for_test();
         let anims_before: Vec<AnimId> = sim.substrate.anims.iter().map(|(&id, _)| id).collect();
         let waits = int(&row["waits"]) != 0;
         // The bullet's side of the block (on its clamped Location, which
@@ -236,16 +240,16 @@ fn impact_effects_match_native() {
             .unwrap()
             .nuke_impact(&context, None, &dummy, location)
             .unwrap();
-        assert_eq!(sim.projectiles.get(id).unwrap().position, location);
+        assert_eq!(sim.projectiles.get(id).unwrap().position(), location);
 
         super::nuke::impact(&mut sim, &rules, impact);
 
-        let lighting = sim.session.lighting;
+        let lighting = sim.session.lighting();
         assert_eq!(flash_state(&lighting), vec![1, 4000, 30]);
-        assert_eq!(lighting.selected_profile, ScenarioLightingProfile::Nuke);
+        assert_eq!(lighting.selected_profile(), ScenarioLightingProfile::Nuke);
         assert!(
             sim.lighting_sources
-                .pending
+                .pending()
                 .iter()
                 .any(|event| matches!(event, LightingEvent::Global { .. }))
         );
@@ -302,17 +306,17 @@ fn impact_effects_match_native() {
         let anim = sim.anim(new_anims[0]).unwrap();
         assert!(
             sim.interner
-                .resolve(anim.type_id)
+                .resolve(anim.type_id())
                 .eq_ignore_ascii_case(event[1].as_str().unwrap())
         );
-        let at = anim.world_coord;
+        let at = anim.world_coord();
         assert_eq!(vec![at.x, at.y, at.z], ints(&event[2]), "{row}");
         // (delay, loopCount, drawFlags, zAdjust, reverse)
         assert_eq!(
             (
-                i32::from(anim.runtime.loop_remaining),
-                anim.draw_flags,
-                anim.z_adjust
+                i32::from(anim.runtime().loop_remaining),
+                anim.draw_flags(),
+                anim.z_adjust()
             ),
             (int(&event[4]), int(&event[5]) as u32, int(&event[6])),
             "{row}"
@@ -368,6 +372,7 @@ fn wait_matches_native() {
                 false,
                 false,
                 0,
+                false,
                 |_, _, _| None,
                 Some(&context),
             )
@@ -378,7 +383,7 @@ fn wait_matches_native() {
             "returns" => {
                 assert!(result.detonations.is_empty(), "{row}");
                 assert!(bullet.awaiting_anim());
-                assert_eq!(bullet.position, at);
+                assert_eq!(bullet.position(), at);
             }
             "detonated" => {
                 assert!(has_event(row, "uninit"));
@@ -394,7 +399,7 @@ fn wait_matches_native() {
             "flies" => {
                 assert!(result.detonations.is_empty(), "{row}");
                 assert!(result.nuke_impacts().is_empty(), "{row}");
-                assert_ne!(bullet.position, at, "the flight ran");
+                assert_ne!(bullet.position(), at, "the flight ran");
             }
             other => panic!("{other}"),
         }
@@ -418,19 +423,19 @@ fn flash_matches_native() {
         let frame = int(&run["frame"]);
         let mut lighting = ScenarioLightingState::default();
         let timer = ints(&run["timer"]);
-        lighting.transition_timer = CdTimer::from_raw(timer[0], timer[1]);
-        lighting.target_ambient = int(&run["target_before"]);
+        lighting.set_transition_timer_for_test(CdTimer::from_raw(timer[0], timer[1]));
+        lighting.set_target_ambient_for_test(int(&run["target_before"]));
 
         lighting.start_nuke_flash(frame);
 
         let start = &run["start"];
         assert_eq!(flash_state(&lighting), ints(&start["flash"]));
-        let timer = lighting.transition_timer;
+        let timer = lighting.transition_timer();
         assert_eq!(
             vec![timer.start_frame(), timer.duration()],
             ints(&start["timer"])
         );
-        assert_eq!(lighting.target_ambient, int(&start["target"]));
+        assert_eq!(lighting.target_ambient(), int(&start["target"]));
         let recalc = &start["events"][0];
         assert_eq!(recalc[0], "recalc");
         assert_eq!(int(&recalc[4]), 1);
@@ -474,6 +479,17 @@ fn flash_matches_native() {
         assert_eq!(flash_state(&lighting), ints(&row["after"]), "{row}");
         assert_eq!(relit, has_event(row, "update_lighting"), "{row}");
     }
+}
+
+/// Installed Ares's Process head (`10037330`, hook `0x53A6CF`) steps only a
+/// nonnegative flash duration: one below -1, which only Ares stores, never
+/// fades out there (stock's `!= -1` test would fade it at once).
+#[test]
+fn ares_flash_with_a_negative_duration_never_steps() {
+    let mut lighting = ScenarioLightingState::default();
+    lighting.set_nuke_flash_for_test(1, 100, -5);
+    assert!(!lighting.step_nuke_flash(5000));
+    assert_eq!(flash_state(&lighting), [1, 100, -5]);
 }
 
 /// The map's `NukeAmbientChangeRate=` against the native rows: Set_Defaults'
@@ -542,8 +558,9 @@ fn launch_rules(types: &[(bool, i32, i32)]) -> RuleSet {
 /// - the type scan: only the building of the type native asks for fires;
 /// - the Missile mission queued and commenced on it, the house's
 ///   NukeTarget (`+0x5784`) and the silo's firing type (`+0x5F8`);
-/// - the launch event at the cell of PlayAtCoord's coordinate, for the
-///   app's sound and line (`sound_dispatch::launch_lines_match_native`).
+/// - the launch event at PlayAtCoord's coordinate, the target's floor
+///   included, for the app's sound and line
+///   (`sound_dispatch::launch_lines_match_native`).
 ///
 /// Also compared: the common-tail recheck flag `+0x1FC`. Not compared:
 /// the player's tail (the app's, `super_selection`) and the mute row.
@@ -559,7 +576,10 @@ fn the_launch_matches_native() {
             .iter()
             .map(|entry| (entry[0] == true, int(&entry[1]), int(&entry[2])))
             .collect();
-        let (rules, mut sim, owner) = world_with(launch_rules(&types), 128, &[]);
+        let target = (int(&row["target"][0]) as u16, int(&row["target"][1]) as u16);
+        // The row's floor (Map578080) under the target, in levels.
+        let floor = [(target, (int(&row["floor"]) / 104) as u8)];
+        let (rules, mut sim, owner) = world_with(launch_rules(&types), 128, &floor);
         let events = row["events"].as_array().unwrap();
         let asked = events
             .iter()
@@ -586,12 +606,12 @@ fn the_launch_matches_native() {
         };
         let sw_type = super::chronosphere_tests::charge_super(&mut sim, owner, "NukeSpecial");
         sim.super_weapons
+            .map_mut_for_test()
             .get_mut(&owner)
             .unwrap()
             .get_mut(&sw_type)
             .unwrap()
             .is_ready = row["charged"] == true;
-        let target = (int(&row["target"][0]) as u16, int(&row["target"][1]) as u16);
         let sw = rules.super_weapon("NukeSpecial").unwrap().clone();
         // The native harness begins with a cleared House+1FC, independently
         // of provider fixture construction and its ordinary Unlimbo request.
@@ -627,24 +647,20 @@ fn the_launch_matches_native() {
             (nuke_target[0] as u16, nuke_target[1] as u16),
             "{row}"
         );
-        let native: Vec<(u16, u16)> = events
+        let native: Vec<Vec<i32>> = events
             .iter()
             .filter(|event| event[0] == "play_at")
-            .map(|event| {
-                let xyz = ints(&event[2]);
-                ((xyz[0] / 256) as u16, (xyz[1] / 256) as u16)
-            })
+            .map(|event| ints(&event[2]))
             .collect();
-        let pushed: Vec<(u16, u16)> = sim
+        let pushed: Vec<Vec<i32>> = sim
             .sound_events
             .iter()
             .filter_map(|event| match *event {
                 SimSoundEvent::SuperWeaponLaunched {
                     owner: by,
                     sw_type: kind,
-                    rx,
-                    ry,
-                } if by == owner && kind == sw_type => Some((rx, ry)),
+                    world,
+                } if by == owner && kind == sw_type => Some(vec![world.x, world.y, world.z]),
                 _ => None,
             })
             .collect();
@@ -678,7 +694,7 @@ fn bullets_of<'a>(sim: &'a Simulation, weapon: &str) -> Vec<(u64, &'a Projectile
         .iter()
         .filter(|(_, bullet)| {
             bullet
-                .payload
+                .payload()
                 .installed_weapon()
                 .is_some_and(|id| sim.interner.resolve(id) == weapon)
         })
@@ -690,7 +706,7 @@ fn psi_warnings(sim: &Simulation) -> Vec<Option<u64>> {
     sim.substrate
         .anims
         .iter()
-        .filter(|(_, anim)| sim.interner.resolve(anim.type_id) == "PSIWARN")
+        .filter(|(_, anim)| sim.interner.resolve(anim.type_id()) == "PSIWARN")
         .map(|(_, anim)| anim.attached_bullet())
         .collect()
 }
@@ -757,22 +773,21 @@ fn retail_nuclear_missile_rises_falls_and_strikes_its_target() {
     let americans = sim.interner.intern("Americans");
     for (id, side, human) in [(russians, 1, true), (americans, 0, false)] {
         sim.houses
-            .insert(id, HouseState::new(id, side, None, human, 0, 10));
-        sim.session.house_order.push(id);
+            .register(HouseState::new(id, side, None, human, 0, 10));
     }
     {
         // A hard computer house takes up the defence 90 times in 100.
         let house = sim.houses.get_mut(&americans).unwrap();
-        house.base_center = Some((42, 42));
-        house.difficulty = crate::sim::house_state::HouseDifficulty::Hard;
+        house.set_base_center_for_test(Some((42, 42)));
+        house.set_difficulty_for_test(crate::sim::house_state::HouseDifficulty::Hard);
     }
-    sim.session.game_options.super_weapons = true;
+    sim.session.game_options_mut_for_test().super_weapons = true;
     sim.resolved_terrain = Some(test_grid(
         64,
         64,
         super::cell_receiver_tests::test_terrain_cell,
     ));
-    sim.playfield_bounds = Some(super::cell_receiver_tests::test_playfield_bounds());
+    sim.set_playfield_bounds_for_test(Some(super::cell_receiver_tests::test_playfield_bounds()));
     let silo = sim
         .spawn_object_at_height("NAMISL", "Russians", 10, 10, 0, 0, &rules)
         .expect("the silo stands");
@@ -787,24 +802,25 @@ fn retail_nuclear_missile_rises_falls_and_strikes_its_target() {
     let sw_type: InternedId = sim.interner.intern("NukeSpecial");
     let mut instance = SuperWeaponInstance::new(sw_type, russians, 0);
     instance.is_active = true;
-    instance.charge_start_tick = (sim.session.binary_frame) as i32;
+    instance.charge_start_tick = (sim.session.binary_frame()) as i32;
     instance.charge_duration = 9000;
     instance.is_ready = true;
     sim.super_weapons
+        .map_mut_for_test()
         .entry(russians)
         .or_default()
         .insert(sw_type, instance);
 
     sim.queue_command(CommandEnvelope::new(
         russians,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::LaunchSuperWeapon {
             sw_type_id: sw_type,
             target_rx: TARGET.0,
             target_ry: TARGET.1,
         },
     ));
-    let launch_frame = sim.session.binary_frame as i32;
+    let launch_frame = sim.session.binary_frame() as i32;
     run_until(&mut sim, &rules, 3, |sim| {
         !bullets_of(sim, "NukeCarrier").is_empty()
     });
@@ -816,12 +832,13 @@ fn retail_nuclear_missile_rises_falls_and_strikes_its_target() {
     assert_eq!(sim.houses[&russians].nuke_target(), TARGET);
     assert!(sim.sound_events.iter().any(|event| matches!(
         event,
-        SimSoundEvent::SuperWeaponLaunched { owner, rx: 40, ry: 40, .. } if *owner == russians
+        SimSoundEvent::SuperWeaponLaunched { owner, world, .. }
+            if *owner == russians && world.to_cell_sub_z().0 == 40 && world.to_cell_sub_z().1 == 40
     )));
     // The computer house near the target took up the defence of its base.
     assert_eq!(sim.houses[&americans].super_weapon_defense().0, (42, 42));
     let (missile, _) = bullets_of(&sim, "NukeCarrier")[0];
-    assert_eq!(sim.projectiles.get(missile).unwrap().source_id, silo);
+    assert_eq!(sim.projectiles.get(missile).unwrap().source_id(), silo);
     // `FirersPalette=yes` (GiantNukeUp): Construct kept the silo's House for
     // the draw's colour scheme (Bullet+0x114).
     assert_eq!(
@@ -837,7 +854,7 @@ fn retail_nuclear_missile_rises_falls_and_strikes_its_target() {
         sim.substrate
             .anims
             .iter()
-            .filter(|(_, anim)| sim.interner.resolve(anim.type_id) == "PSIWARN")
+            .filter(|(_, anim)| sim.interner.resolve(anim.type_id()) == "PSIWARN")
             .any(|(_, anim)| sim.psi_warning_detected_by(viewer, anim, &rules))
     };
     let place = |sim: &mut Simulation, kind, owner, at: (u16, u16)| {
@@ -854,6 +871,36 @@ fn retail_nuclear_missile_rises_falls_and_strikes_its_target() {
     // sqrt(3712² + 128²) = 3714 leptons, within 15 × 256.
     place(&mut sim, "NAPSIS", "Americans", (54, 40));
     assert!(detected(&sim, americans));
+    // The presentation asks this every frame. Moved off the map, the
+    // warning's lookup stamp stays private to the query.
+    let warning = sim
+        .substrate
+        .anims
+        .iter()
+        .find(|(_, anim)| sim.interner.resolve(anim.type_id()) == "PSIWARN")
+        .map(|(&id, _)| id)
+        .unwrap();
+    let on_map = std::mem::replace(
+        sim.substrate
+            .anims
+            .get_mut(warning)
+            .unwrap()
+            .world_coord_mut_for_test(),
+        crate::sim::anim_class::AnimWorldCoord {
+            x: -2000,
+            y: -2000,
+            z: 0,
+        },
+    );
+    let dummy = sim.effective_shared_cell_dummy().snapshot();
+    assert_ne!(dummy.coord, (-7, -7));
+    detected(&sim, americans);
+    assert_eq!(sim.effective_shared_cell_dummy().snapshot(), dummy);
+    *sim.substrate
+        .anims
+        .get_mut(warning)
+        .unwrap()
+        .world_coord_mut_for_test() = on_map;
     assert_eq!(psi_warnings(&sim), vec![Some(missile)]);
 
     // The missile rises out of sight; its warning goes with it and the
@@ -866,19 +913,19 @@ fn retail_nuclear_missile_rises_falls_and_strikes_its_target() {
     assert_eq!(falling.len(), 1);
     let (warhead, bullet) = falling[0];
     assert_eq!(
-        bullet.target,
+        bullet.target(),
         ProjectileTarget::Cell {
             rx: TARGET.0,
             ry: TARGET.1
         }
     );
-    assert_eq!(bullet.source_id, silo);
+    assert_eq!(bullet.source_id(), silo);
     assert_eq!(bullet.firer_house(), Some(russians), "GiantNukeDown");
     assert_eq!(
         [
-            bullet.launch_origin.x,
-            bullet.launch_origin.y,
-            bullet.launch_origin.z
+            bullet.launch_origin().x,
+            bullet.launch_origin().y,
+            bullet.launch_origin().z
         ],
         [40 * 256 + 128, 40 * 256 + 128, 20000]
     );
@@ -887,14 +934,14 @@ fn retail_nuclear_missile_rises_falls_and_strikes_its_target() {
     // marks the cell, and the warhead waits on NUKEBALL before it
     // detonates.
     let tank_health = sim.substrate.entities.get(tank).unwrap().health.current();
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     run_until(&mut sim, &rules, 3000, |sim| {
         sim.projectiles
             .get(warhead)
             .is_some_and(|bullet| bullet.awaiting_anim())
     });
     // The tick's AI ran at the frame before the one it advanced to.
-    let impact_frame = sim.session.binary_frame as i32 - 1;
+    let impact_frame = sim.session.binary_frame() as i32 - 1;
     let ball = sim
         .projectiles
         .get(warhead)
@@ -902,14 +949,14 @@ fn retail_nuclear_missile_rises_falls_and_strikes_its_target() {
         .awaited_anim()
         .expect("NUKEBALL stands");
     assert_eq!(
-        sim.interner.resolve(sim.anim(ball).unwrap().type_id),
+        sim.interner.resolve(sim.anim(ball).unwrap().type_id()),
         "NUKEBALL"
     );
-    let lighting = sim.session.lighting;
+    let lighting = sim.session.lighting();
     assert!(lighting.nuke_flash_fading_in());
     assert_eq!(lighting.nuke_flash_for_test(), (1, impact_frame, 30));
-    assert_eq!(lighting.selected_profile, ScenarioLightingProfile::Nuke);
-    assert_eq!(lighting.target_ambient, 200, "the nuke's ambient");
+    assert_eq!(lighting.selected_profile(), ScenarioLightingProfile::Nuke);
+    assert_eq!(lighting.target_ambient(), 200, "the nuke's ambient");
     assert!(sim.sound_events.iter().any(|event| matches!(
         event,
         SimSoundEvent::RadarEvent { radar }
@@ -935,7 +982,7 @@ fn retail_nuclear_missile_rises_falls_and_strikes_its_target() {
     let (mut ball_ended_after, mut detonated_after) = (None, None);
     for frames in 1..=600 {
         step(&mut sim, &rules);
-        let status = sim.session.lighting.nuke_flash_for_test().0;
+        let status = sim.session.lighting().nuke_flash_for_test().0;
         if status != last {
             flash_changes.push((frames, status));
             last = status;
@@ -973,7 +1020,7 @@ fn retail_nuclear_missile_rises_falls_and_strikes_its_target() {
     }
     assert_eq!(flash_changes, vec![(31, 2), (47, 0)]);
     assert_eq!(
-        sim.session.lighting.selected_profile,
+        sim.session.lighting().selected_profile(),
         ScenarioLightingProfile::Normal
     );
     assert_eq!((ball_ended_after, detonated_after), (Some(20), Some(21)));
@@ -994,7 +1041,7 @@ fn retail_nuclear_missile_rises_falls_and_strikes_its_target() {
 /// the production creator. The image bound remains a lib fixture input.
 fn impact_waiting_nuke(sim: &mut Simulation, rules: &RuleSet) -> (u64, AnimId) {
     let at = ProjectileCoord::new(8 * 256 + 128, 8 * 256 + 128, 0);
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     let mut spawn = nuke_spawn(&mut sim.interner, "NUKE", at, rules.weapon("NukePayload"));
     // The shared head fixture aims ten cells east. This local impact must
     // instead retain its own target/reference: the real post-wait ladder
@@ -1005,9 +1052,9 @@ fn impact_waiting_nuke(sim: &mut Simulation, rules: &RuleSet) -> (u64, AnimId) {
     // Fire's placement owner (BulletType46C4F0) may raise the original
     // coordinate above the floor. Preserve its admitted Location; FireCoord
     // and the proximity reference remain the supplied ground coordinate.
-    let admitted = sim.projectiles.get(id).unwrap().position;
+    let admitted = sim.projectiles.get(id).unwrap().position();
     assert_eq!((admitted.x, admitted.y), (at.x, at.y));
-    assert_eq!(sim.projectiles.get(id).unwrap().launch_origin, at);
+    assert_eq!(sim.projectiles.get(id).unwrap().launch_origin(), at);
     let context = NukeImpactContext::new(&sim.interner, &|| true);
     let impact = sim
         .projectiles
@@ -1022,13 +1069,15 @@ fn impact_waiting_nuke(sim: &mut Simulation, rules: &RuleSet) -> (u64, AnimId) {
         .unwrap();
     super::nuke::impact(sim, rules, impact);
     let bullet = sim.projectiles.get(id).unwrap();
-    assert_eq!(bullet.target, ProjectileTarget::Cell { rx: 8, ry: 8 });
+    assert_eq!(bullet.target(), ProjectileTarget::Cell { rx: 8, ry: 8 });
     assert_eq!(
-        bullet.proximity_reference, at,
+        bullet.proximity_reference(),
+        at,
         "the continuation's strike input"
     );
     assert_eq!(
-        bullet.position, admitted,
+        bullet.position(),
+        admitted,
         "the impact retains its admitted Location"
     );
     assert!(bullet.awaiting_anim());
@@ -1036,7 +1085,7 @@ fn impact_waiting_nuke(sim: &mut Simulation, rules: &RuleSet) -> (u64, AnimId) {
         .awaited_anim()
         .expect("the real impact constructed NUKEBALL");
     assert_eq!(
-        sim.interner.resolve(sim.anim(ball).unwrap().type_id),
+        sim.interner.resolve(sim.anim(ball).unwrap().type_id()),
         "NUKEBALL"
     );
     (id, ball)
@@ -1127,7 +1176,7 @@ fn nuke_awaited_anim_retirement_routes_release_before_next_bullet_visit() {
             .set_for_test(Some(crate::sim::combat::TargetKind::Entity(ball)));
         let rng = serde_json::to_value(&sim.scenario_rng).unwrap();
         let before = sim.projectiles.get(id).unwrap().clone();
-        sim.sound_events.clear();
+        sim.sound_events.clear_for_test();
         match route {
             "Destroy" => {
                 sim.destroy_anim(ball, &rules);
@@ -1142,7 +1191,11 @@ fn nuke_awaited_anim_retirement_routes_release_before_next_bullet_visit() {
             }
             "building scalar" => sim.scalar_delete_anim(ball),
             "terrain scalar" => {
-                sim.substrate.anims.get_mut(ball).unwrap().terrain_attached = true;
+                sim.substrate
+                    .anims
+                    .get_mut(ball)
+                    .unwrap()
+                    .set_terrain_attached_for_test(true);
                 assert_eq!(sim.scalar_delete_load_terrain_anims(), 1);
             }
             "deferred finalizer" => {
@@ -1160,8 +1213,8 @@ fn nuke_awaited_anim_retirement_routes_release_before_next_bullet_visit() {
             .expect("expiry alone never detonates");
         assert!(bullet.awaiting_anim(), "{route}");
         assert_eq!(bullet.awaited_anim(), None, "{route}");
-        assert_eq!(bullet.position, before.position);
-        assert_eq!(bullet.arm_timer, before.arm_timer);
+        assert_eq!(bullet.position(), before.position());
+        assert_eq!(bullet.arm_timer(), before.arm_timer());
         assert_eq!(
             sim.substrate
                 .entities
@@ -1213,7 +1266,7 @@ fn nuke_awaited_anim_retirement_routes_release_before_next_bullet_visit() {
             !sim.substrate
                 .anims
                 .iter()
-                .any(|(_, anim)| sim.interner.resolve(anim.type_id) == "NUKEBALL")
+                .any(|(_, anim)| sim.interner.resolve(anim.type_id()) == "NUKEBALL")
         );
         assert!(
             !sim.sound_events
@@ -1246,7 +1299,7 @@ fn nuke_awaited_anim_expiry_after_waiter_retirement_is_safe() {
     );
     let unrelated = sim
         .anims()
-        .find(|(other, anim)| **other != ball && sim.interner.resolve(anim.type_id) == "NUKEBALL")
+        .find(|(other, anim)| **other != ball && sim.interner.resolve(anim.type_id()) == "NUKEBALL")
         .map(|(&id, _)| id)
         .unwrap();
     sim.notify_anim_pointer_expired(unrelated);
@@ -1316,7 +1369,7 @@ fn nuke_shared_anim_waiters_keep_live_cursor_compaction() {
         run_until(&mut sim, &rules, 3, |sim| sim.projectiles.is_empty());
         assert!(
             !sim.anims()
-                .any(|(_, anim)| sim.interner.resolve(anim.type_id) == "NUKEBALL")
+                .any(|(_, anim)| sim.interner.resolve(anim.type_id()) == "NUKEBALL")
         );
     }
 }
@@ -1328,7 +1381,7 @@ fn nuke_awaited_anim_reference_restore_validates_without_wait_flag() {
     };
     let (rules, mut sim, _) = world_with(rules, 64, &[]);
     // A non-waiting Bullet holding +154 remains a strong native load reference.
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     let at = ProjectileCoord::new(8 * 256 + 128, 8 * 256 + 128, 0);
     let spawn = nuke_spawn(&mut sim.interner, "NUKE", at, rules.weapon("NukePayload"));
     sim.admit_projectile(id, spawn);
@@ -1419,10 +1472,8 @@ fn nuke_natural_retirement_boundary_snapshot_continues_once() {
     crate::sim::arena_fixture::flat_ground(&mut restored, &rules);
     // Same native load normalization as the live-wait save test below.
     sim.scenario_rng = crate::sim::rng::SimRng::new(0);
-    let frame = sim.session.binary_frame as i32;
-    for (_, bullet) in sim.projectiles.iter_mut() {
-        bullet.arm_timer.start(frame, 0);
-    }
+    let frame = sim.session.binary_frame() as i32;
+    sim.projectiles.restart_arm_timers_after_load(frame);
     assert_eq!(restored.state_hash(), sim.state_hash());
     for _ in 0..3 {
         step(&mut sim, &rules);
@@ -1449,7 +1500,7 @@ fn retail_nuke_wait_and_flash_survive_save_and_load() {
     sim.resolve_type_handles(&rules);
     crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
     let at = ProjectileCoord::new(8 * 256 + 128, 8 * 256 + 128, 0);
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     let spawn = nuke_spawn(&mut sim.interner, "NUKE", at, rules.weapon("NukePayload"));
     sim.admit_projectile(id, spawn);
     // The impact as `BulletClass::AI` takes it, then five frames of the wait.
@@ -1465,7 +1516,7 @@ fn retail_nuke_wait_and_flash_survive_save_and_load() {
         step(&mut sim, &rules);
     }
     assert!(sim.projectiles.get(id).unwrap().awaiting_anim());
-    assert!(sim.session.lighting.nuke_flash_fading_in());
+    assert!(sim.session.lighting().nuke_flash_fading_in());
 
     let bytes = crate::sim::snapshot::GameSnapshot::save_validated(&sim, 1, 2, "nuke wait", 0);
     let mut restored = crate::sim::snapshot::GameSnapshot::load(&bytes)
@@ -1478,20 +1529,18 @@ fn retail_nuke_wait_and_flash_survive_save_and_load() {
     // reinitializes the Scenario RNG, and Bullet Load restarts each bullet's
     // arm timer at the load frame (`0x0046AE9C..0x0046AEB0`).
     sim.scenario_rng = crate::sim::rng::SimRng::new(0);
-    let frame = sim.session.binary_frame as i32;
-    for (_, bullet) in sim.projectiles.iter_mut() {
-        bullet.arm_timer.start(frame, 0);
-    }
+    let frame = sim.session.binary_frame() as i32;
+    sim.projectiles.restart_arm_timers_after_load(frame);
     let wait = |sim: &Simulation| {
         let bullet = sim.projectiles.get(id).unwrap();
         (
             bullet.awaiting_anim(),
             bullet.awaited_anim(),
-            bullet.position,
+            bullet.position(),
         )
     };
     assert_eq!(wait(&restored), wait(&sim));
-    assert_eq!(restored.session.lighting, sim.session.lighting);
+    assert_eq!(restored.session.lighting(), sim.session.lighting());
     assert_eq!(restored.state_hash(), sim.state_hash());
     for frame in 1..=60 {
         step(&mut sim, &rules);
@@ -1499,5 +1548,5 @@ fn retail_nuke_wait_and_flash_survive_save_and_load() {
         assert_eq!(restored.state_hash(), sim.state_hash(), "frame {frame}");
     }
     assert!(sim.projectiles.get(id).is_none(), "detonated");
-    assert_eq!(sim.session.lighting.nuke_flash_for_test().0, 0);
+    assert_eq!(sim.session.lighting().nuke_flash_for_test().0, 0);
 }

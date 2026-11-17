@@ -22,7 +22,9 @@ use crate::sim::lifecycle_request::{LifecycleRequest, UninitReason};
 use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::radio::{self, RadioMessage, RadioPayload};
-use crate::sim::world::{FrameAdvanceError, FrameEffects, Simulation, UninitContext};
+use crate::sim::world::{
+    FrameAdvanceError, FrameEffects, SimSoundEvent, Simulation, UninitContext,
+};
 
 /// NavCom (`+0x5A4`) compared by pointer with `object`.
 fn nav_com_is(entity: &crate::sim::game_entity::GameEntity, object: u64) -> bool {
@@ -40,13 +42,48 @@ pub(crate) enum PerCellReason {
 }
 
 impl Simulation {
+    /// FootClass::IsLeavingMap at 0x004DC790..4DC803 in retail gamemd.exe.
+    /// Stored membership precedes the Team6EC300 gate; an IsTrain type
+    /// still heading to an on-playfield NavCom must remain. The existing Map
+    /// query owner retains its Dummy writes; the predicate draws nothing.
+    fn foot_is_leaving_map(&self, id: u64, rules: &RuleSet) -> bool {
+        let Some(entity) = self.substrate.entities.get(id) else {
+            return false;
+        };
+        if !entity.in_playfield()
+            || self.team_script_vm.team_for_member(id).is_some()
+                && !self.member_team_is_moving_outside_playfield(id)
+        {
+            return false;
+        }
+        let is_train = self
+            .object_type(entity.type_ref(), rules)
+            .is_some_and(|object| object.is_train);
+        let Some(destination) = entity.navigation.nav_com().filter(|_| is_train) else {
+            return true;
+        };
+        let cells = self
+            .resolved_terrain
+            .as_ref()
+            .map(crate::map::resolved_terrain::NativeCellQuery::canonical);
+        super::ground_pose::target_get_coords(destination.into(), self, cells.as_ref()).is_none_or(
+            |coord| {
+                !crate::sim::cell_rect::cell_is_in_playfield_leptons(
+                    (coord.x, coord.y, coord.z),
+                    self.playfield_bounds(),
+                    self.resolved_terrain.as_ref(),
+                )
+            },
+        )
+    }
+
     /// The virtual call: the Unit or Infantry override, else the Foot body.
     /// Returns whether the Infantry override changed a bridge.
     pub(crate) fn per_cell_process(
         &mut self,
         id: u64,
         reason: PerCellReason,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> Result<bool, FrameAdvanceError> {
@@ -111,16 +148,21 @@ impl Simulation {
                 unit.navigation
                     .store_nav_com(Some(crate::sim::components::NavTargetRef::object(contact)));
             }
-            self.foot_per_cell_process(id, PerCellReason::Arrival, Some(rules), registry, effects);
+            self.foot_per_cell_process(id, PerCellReason::Arrival, rules, registry, effects);
             crate::sim::radio::transmit_to_contact(
                 self,
                 id,
                 crate::sim::radio::RadioMessage::DockNow,
-                Some(rules),
+                rules,
                 effects,
             );
             // `0x0073A52B`: ILoco+0x5C, Hover's override included.
-            self.locomotor_power_off(id);
+            Self::locomotor_power_off(
+                &mut self.scenario_rng,
+                &mut self.substrate,
+                &self.resolved_terrain,
+                id,
+            );
             return true;
         }
         let Some(entity) = self.substrate.entities.get(id) else {
@@ -150,13 +192,149 @@ impl Simulation {
             contact,
             RadioMessage::DockNow,
             RadioPayload::default(),
-            Some(rules),
+            rules,
             effects,
         );
-        // 0x0073A5CE..0x0073A5E4: an answer other than 1 or 5 scatters the unit
-        // (a refinery being sold) — RESIDUAL, module doc.
-        let _ = reply;
+        // 0x0073A5CE..0x0073A5E4: an answer other than 1 or 5 Scatters the
+        // Unit, vt+0x174(&0xB1CFE8, 1, 0). Only a Building gets DOCK_NOW
+        // here, and no Building answers 5: any Building in its Selling
+        // mission answers NEGATORY (`0x0043C6F6`, ahead of the dock cases)
+        // and one that is no dock answers 0 (the Techno fallback). This
+        // Scatter does nothing while the unit still has a NavCom
+        // (`0x00743B1D..0x00743B2D`), as it does after a Drive arrival.
+        if reply != crate::sim::radio::RadioResponse::Roger {
+            let _ = self.scatter(
+                id,
+                None,
+                super::scatter::ScatterFlags::new(true, false),
+                rules,
+                registry,
+                effects,
+            );
+        }
         false
+    }
+
+    /// `UnitClass::Per_Cell_Process`'s own-cell arm (`0x0073AE1B..0x0073AFD3`),
+    /// reason 2 only, after the rearm timer. It takes the cell at the unit's
+    /// Location (`0x0073AE3B`, `0x00565730`) and acts when the locomotor is
+    /// not moving (Is_Moving, `0x0073AE65`), the unit's own Can_Enter_Cell
+    /// refuses that cell with 7 (`0x0073AE7E`, called with (cell, -1, -1,
+    /// NULL, 1)), it is not on a bridge over a cell with flag 0x100
+    /// (`0x0073AE8D..0x0073AEA0`) and it is not sinking (`+0x3CD`).
+    /// - On Enter (`+0xAC` is 7) it Scatters, vt+0x174(&0xB1CFE8, 1, 1)
+    ///   (`0x0073AFC0..0x0073AFCE`), and the crush and Foot tail follow.
+    /// - Otherwise it blows itself up with C4Warhead (Rules `+0xFA8`) for its
+    ///   strength (`+0x6C`): the `SelectAnim @ 0x0048A4F0` animation for the
+    ///   cell's LandType (`+0xEC`) at its Location (`0x0073AEC1..0x0073AF47`),
+    ///   the `0x0048A620` flash at its GetCoords (`0x0073AF4C..0x0073AF8B`),
+    ///   then ReceiveDamage(&strength, 0, C4Warhead, NULL, 1, 0, NULL)
+    ///   (`0x0073AF90..0x0073AFB0`), and returns true: the call ends before
+    ///   the crush and the Foot body. A null C4Warhead leaves the flash and
+    ///   the damage inert, and the call still ends.
+    ///
+    /// Residual: native allocates the anim before SelectAnim (`0x0073AEC1`),
+    /// so a null pick (0 strength, or no C4Warhead) still runs AnimClass's
+    /// constructor (`0x00421EA0`) on a null type; VERA constructs nothing.
+    /// Retail C4Warhead is Super, which lists `AnimList=`, so only a unit at 0
+    /// strength gets there. Rare; the constructor's own writes are the risk.
+    ///
+    /// A miner on its refinery's pad never gets here: the pad is the east
+    /// column of a `Bib=` foundation, which Can_Enter_Cell admits whatever
+    /// the radio contact (`0x0073F7D3..0x0073F821`). Nor does a warp
+    /// arrival: Teleport Process calls this Per_Cell_Process (`0x0071971C`)
+    /// before its own Stop_Moving (`0x00719725`), so Is_Moving is still set.
+    fn unit_per_cell_own_cell_refusal(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        effects: FrameEffects<'_>,
+    ) -> bool {
+        let Some(terrain) = self.resolved_terrain.as_ref() else {
+            return false;
+        };
+        let Some(entity) = self.substrate.entities.get(id) else {
+            return false;
+        };
+        let location = super::ground_pose::object_location(entity, Some(terrain));
+        if super::motion_query::is_moving(entity) != Some(false) {
+            return false;
+        }
+        let cell = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain)
+            .lookup_world(location.x, location.y);
+        let refused = self.foot_can_enter(
+            id,
+            cell,
+            crate::sim::movement::infantry_entry::InfantryEntryArgs::REPAIR,
+            rules,
+            registry,
+        ) == Ok(7);
+        if !refused
+            || entity.on_bridge()
+                && crate::sim::cell_rect::get_cellclass_fallback_leptons(
+                    Some(terrain),
+                    location.x,
+                    location.y,
+                )
+                .bridge_flags_0x1180()
+                    & crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL
+                    != 0
+            || entity.sinking.is_active()
+        {
+            return false;
+        }
+        if entity.mission.current() == MissionId::from_known(MissionType::Enter) {
+            let _ = self.scatter(
+                id,
+                None,
+                super::scatter::ScatterFlags::new(true, true),
+                rules,
+                registry,
+                effects,
+            );
+            return false;
+        }
+        let strength = entity.health.current();
+        let center = super::ground_pose::object_get_coords(entity, Some(terrain));
+        let Some(warhead) = rules.warhead(&rules.bridge_warheads.c4_name) else {
+            return true;
+        };
+        let warhead_ref = self.interner.intern(&warhead.id);
+        let at = crate::sim::projectile::ProjectileCoord::new(location.x, location.y, location.z);
+        let land = crate::sim::combat::detonation_anim::land_at(self, at);
+        if let Some(effect) = crate::sim::combat::detonation_anim::effect(
+            self, rules, warhead, strength, land, at, at, false,
+        ) {
+            crate::sim::world::damage_consequences::admit_explosion_effect(self, rules, effect);
+        }
+        self.combat_light_requests
+            .emit(crate::sim::combat::CombatLightRequest::Impact {
+                target_id: None,
+                damage: strength,
+                warhead_ref,
+                coord: crate::sim::projectile::ProjectileCoord::new(center.x, center.y, center.z),
+                force_create: false,
+                flags: 0,
+            });
+        self.commit_direct_damage_receiver(
+            rules,
+            registry,
+            crate::sim::combat::EntityDamageEvent::direct_receiver(
+                id,
+                strength,
+                0,
+                crate::sim::combat::RAD_NO_ATTACKER,
+                None,
+                warhead_ref,
+                crate::sim::combat::ReceiverCallFlags {
+                    ignore_defenses: true,
+                    arg6: false,
+                },
+            ),
+            effects,
+        );
+        true
     }
 
     /// `UnitClass::Per_Cell_Process @ 0x00739EC0`: the Unit's own arrival
@@ -165,7 +343,7 @@ impl Simulation {
         &mut self,
         id: u64,
         reason: PerCellReason,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) {
@@ -177,17 +355,19 @@ impl Simulation {
             .get(id)
             .map(|entity| super::foot_path::coord_cell(position_world_coord(&entity.position)));
         // Unit739EC0 invokes the MCV receiver before normal crush/Foot tail.
-        if let Some(rules) = rules {
-            crate::sim::mcv_deploy::per_cell_process(self, id, rules, registry, effects);
-        }
+        crate::sim::mcv_deploy::per_cell_process(self, id, rules, registry, effects);
         if !self.track_survives(id) {
             return;
         }
+        let ares = rules.ares_form();
         // 0x0073A31F..0x0073A5EA, before the Ready/Commence below: a tethered
         // unit on Enter arriving north-adjacent to its dock sends DOCK_NOW.
-        if let Some(rules) = rules
-            && reason == PerCellReason::Arrival
-        {
+        if reason == PerCellReason::Arrival {
+            // Ares 3.0 1004C530 (hook 0x739F21): a small visceroid arriving
+            // on the one it seeks merges into it and ends here.
+            if ares && self.ares_visceroid_merge(id, rules, registry, effects) {
+                return;
+            }
             // 0x00739F21..0x00739F59 come first: a `PoweredUnit=` type whose
             // house has no powered center goes offline off a building.
             self.powered_unit_arrival(id, rules, effects);
@@ -215,13 +395,14 @@ impl Simulation {
         // 0x0073AC52..0x0073ACAE: ReReveal then UpdateReveal and the
         // current-XYZ/cached-radius+3 Map567DA0 border, after clearance and
         // before Ready/Commence. Evidence: shroud_frontier_moving.json.
-        // RESIDUAL: native returns
-        // before them from Guard's map exit (`0x0073AC0E..0x0073AC4F`), which
-        // VERA runs elsewhere. Trigger: a unit arriving to leave the map.
-        // Effect: VERA reveals one more footprint at that cell, which stays
-        // revealed.
+        // Not ported: Guard's map exit (`0x0073ABD6..0x0073AC4F`) returns
+        // before them for a unit on Guard whose coordinates fail
+        // `0x00568350` with +0x3D5 set (Team+0x82 latch, vt+0x3A0, UnInit).
+        // UNREACHABLE: `0x00568350` tests the Size diamond (+0xF4/+0xF8)
+        // that `MapClass::Resize` (`0x00565C10`) allocates cells over, so no
+        // arrival in a real cell fails it.
         if reason == PerCellReason::Arrival && self.per_cell_owner_alive(id) {
-            self.refresh_object_sight(id, rules, 0);
+            self.refresh_object_sight(id, rules, 0, effects);
             self.refresh_object_sight_border(id, UninitContext::new(rules, registry));
         }
         // Unit PerCell2 739EC0: after MCV retry, +6D1==0 admits
@@ -238,25 +419,38 @@ impl Simulation {
                     .as_ref()
                     .is_some_and(|miner| miner.unload_active())
             });
-        if let Some(rules) = rules.filter(|_| promote) {
-            self.mission_host_promote(id, self.session.binary_frame, rules);
+        if promote {
+            self.mission_host_promote(id, self.session.binary_frame(), rules);
         }
         // 0x0073ACD7..0x0073ADC4: a harvester (or weeder) off Enter/Unload
         // drops a refinery (weeder) contact at every track end.
-        if let Some(rules) = rules
-            && reason == PerCellReason::Arrival
-        {
+        if reason == PerCellReason::Arrival {
             crate::sim::miner::per_cell_release_dock_contact(self, rules, id, effects);
+        }
+        // `0x0073AE1B..0x0073AFD3`: a stopped unit its own cell refuses
+        // scatters on Enter; otherwise it blows itself up and returns before
+        // the crush and the Foot body.
+        if reason == PerCellReason::Arrival
+            && self.unit_per_cell_own_cell_refusal(id, rules, registry, effects)
+        {
+            return;
         }
         // 73AFD4..73B06E is common to reasons0/2 and precedes the fresh
         // +1B8/full-cell crush query73B074 and the Foot continuation.
-        if let (Some(cell), Some(rules), Some(registry)) = (entry_cell, rules, registry) {
+        if let (Some(cell), Some(registry)) = (entry_cell, registry) {
             self.unit_per_cell_overlay_crush(id, cell, rules, registry, effects);
         }
         let Some(entity) = self.substrate.entities.get(id) else {
             return;
         };
         let at = (entity.position.rx(), entity.position.ry());
+        // Crush_Or_Prescatter_Cell 0x7416A0(own cell, 0) (0x73B077..0x73B089)
+        // reads the deck list when the cell has flag 0x100 and the Unit is
+        // OnBridge (0x7416C1..0x741733; its four-levels-above test cannot hold
+        // for the own cell). RESIDUAL: this follows OnBridge alone. Trigger: an
+        // OnBridge Unit whose own cell lacks 0x100, which every bridge deck
+        // cell carries; effect: deck occupants are crushed instead of ground
+        // ones. No path that leaves OnBridge set off a deck cell is known.
         let layer = if entity.on_bridge() {
             MovementLayer::Bridge
         } else {
@@ -267,6 +461,7 @@ impl Simulation {
             .occupancy
             .get(at.0, at.1)
             .and_then(|list| list.first_on_layer(layer));
+        let mut crushed_unit = false;
         while let Some(victim) = cursor {
             // Save successor BEFORE lifecycle can remove the current object.
             cursor = self
@@ -281,6 +476,10 @@ impl Simulation {
                 return;
             };
             let coord = position_world_coord(&crusher.position);
+            // `0x007418AA..0x007418DC`: the CrushSound plays at the
+            // crusher's Location `[EDI+0x9C..0xA4]`.
+            let crusher_location =
+                super::ground_pose::object_location(crusher, self.resolved_terrain.as_ref());
             let capability = super::bump_crush::CrushCapability::new(
                 crusher.mover_facts.regular_crusher(),
                 crusher.mover_facts.omni_crusher(),
@@ -293,51 +492,115 @@ impl Simulation {
                 &self.interner,
                 (coord.x, coord.y),
                 capability,
-                self.session.binary_frame,
+                self.session.binary_frame(),
             );
             if !kills.contains(&victim) {
                 continue;
             }
-            if let Some(rules) = rules {
-                if let Some(entity) = self.substrate.entities.get(victim) {
-                    super::bump_crush::emit_crush_kill_sounds_at(
-                        entity,
-                        (i32::from(at.0), i32::from(at.1)),
-                        rules,
-                        &mut self.interner,
-                        &mut self.sound_events,
-                    );
-                }
-                // `UnitClass::Crush_Or_Prescatter_Cell @ 0x007416A0`: the
-                // victim records its kill by the crusher (vtable `+0xE0`,
-                // `0x007418F0`) and is UnInit (vtable `+0xF8`, `0x00741910`),
-                // with no Health store.
-                self.record_the_kill(
-                    victim,
-                    crate::sim::combat::KillSource::Techno(Some(id)),
-                    crate::sim::combat::KillCallback::Terminal,
-                    UninitContext::new(Some(rules), registry).with_effects(effects),
-                );
-                self.apply_lifecycle_request_with_rules(
-                    LifecycleRequest::Uninit {
-                        stable_id: victim,
-                        reason: UninitReason::Crush,
-                    },
+            if ares {
+                self.ares_crush_damage(id, victim, rules, registry, effects);
+            }
+            if let Some(entity) = self.substrate.entities.get(victim) {
+                super::bump_crush::emit_crush_kill_sounds_at(
+                    entity,
+                    crusher_location,
                     rules,
-                    registry,
-                    effects,
+                    &mut self.interner,
+                    &mut self.sound_events,
                 );
-            } else {
-                self.apply_lifecycle_request(LifecycleRequest::Uninit {
+            }
+            // The victim's vtable `+0x170` (`0x007418E5`): a Unit's
+            // `0x00746D60` runs Death_Explosion (`0x00738680`), then
+            // FreeAllMindControlCaptures (`0x00710460`), which is all the
+            // other classes run. Releases finish before RecordKill can
+            // dispatch the victim's Tags; later Foot UnInit finds no nodes.
+            if self
+                .substrate
+                .entities
+                .get(victim)
+                .is_some_and(|entity| entity.category() == EntityCategory::Unit)
+            {
+                crushed_unit = true;
+                self.unit_death_explosion(rules, victim, &mut Vec::new(), registry, effects);
+            }
+            self.free_all_captures(victim, rules, registry, effects);
+            // `UnitClass::Crush_Or_Prescatter_Cell @ 0x007416A0`: the
+            // victim records its kill by the crusher (vtable `+0xE0`,
+            // `0x007418F0`) and is UnInit (vtable `+0xF8`, `0x00741910`),
+            // with no Health store.
+            self.record_the_kill(
+                victim,
+                crate::sim::combat::KillSource::Techno(Some(id)),
+                crate::sim::combat::KillCallback::Terminal,
+                UninitContext::new(rules, registry).with_effects(effects),
+            );
+            self.apply_lifecycle_request(
+                LifecycleRequest::Uninit {
                     stable_id: victim,
                     reason: UninitReason::Crush,
-                });
-            }
+                },
+                rules,
+                registry,
+                effects,
+            );
+        }
+        // The loop's tail (`0x00741925..0x00741954`): any crush uncloaks the
+        // crusher (vtable `+0x45C`, argument 0; no stock crusher cloaks),
+        // and crushing a Unit tilts a level crusher forwards.
+        if crushed_unit && let Some(crusher) = self.substrate.entities.get_mut(id) {
+            crusher.rocking_mut().tilt_after_unit_crush();
         }
         // 0x0073B08F tests only IsAlive (`+0x90`) before the Foot body.
         if self.per_cell_owner_alive(id) {
             self.foot_per_cell_process(id, reason, rules, registry, effects);
         }
+    }
+
+    /// Ares UnitClass_CrushCell_CrushDamage (Ares.dll 1004BCE0, hook
+    /// 0x7418AA), ahead of the CrushSound: the crusher receives the victim
+    /// type's `CrushDamage` for the victim's rank with its
+    /// `CrushDamage.Warhead`, else `[CombatDamage] C4Warhead`, as
+    /// `ReceiveDamage(&damage, 0, warhead, null, false, false, null)`. A zero
+    /// damage or a null warhead deals none.
+    fn ares_crush_damage(
+        &mut self,
+        crusher: u64,
+        victim: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        effects: FrameEffects<'_>,
+    ) {
+        use crate::sim::combat::veterancy::VeterancyRank;
+        let Some(entity) = self.substrate.entities.get(victim) else {
+            return;
+        };
+        let Some(object) = self.interner.object_type(entity.type_ref(), rules) else {
+            return;
+        };
+        let rank = match entity.veterancy.rank_kind() {
+            VeterancyRank::Rookie => 0,
+            VeterancyRank::Veteran => 1,
+            VeterancyRank::Elite => 2,
+        };
+        let (damage, warhead) = object.techno_combat().combat().crush_damage(rank);
+        let warhead = warhead.unwrap_or(Some(rules.bridge_warheads.c4_name.as_str()));
+        let Some(warhead) = warhead.filter(|name| !name.is_empty() && damage != 0) else {
+            return;
+        };
+        let warhead_ref = self.interner.intern(warhead);
+        let receiver = crate::sim::combat::EntityDamageEvent::direct_receiver(
+            crusher,
+            damage,
+            0,
+            crate::sim::combat::RAD_NO_ATTACKER,
+            None,
+            warhead_ref,
+            crate::sim::combat::ReceiverCallFlags {
+                ignore_defenses: false,
+                arg6: false,
+            },
+        );
+        self.commit_direct_damage_receiver(rules, registry, receiver, effects);
     }
 
     /// Unit73AFD4..73B06E. The Cell is selected from the entry sample;
@@ -353,8 +616,6 @@ impl Simulation {
     ) {
         use crate::map::cell_index::NativeCellIdentity;
         use crate::rules::locomotor_type::MovementZone;
-        use crate::rules::object_type::Ability;
-        use crate::sim::combat::veterancy::has_weapon_ability;
         use crate::sim::overlay_grid::WallPointerTarget;
 
         let Some(terrain) = self.resolved_terrain.as_ref() else {
@@ -367,9 +628,7 @@ impl Simulation {
         let Some(object) = self.object_type(actor.type_ref(), rules) else {
             return;
         };
-        if !(object.crusher
-            || has_weapon_ability(actor.veterancy.rank_kind(), object, Ability::Crusher))
-        {
+        if !crate::sim::combat::veterancy::is_crusher(actor.veterancy.rank_kind(), object) {
             return;
         }
         let Some(flags) = self
@@ -391,24 +650,21 @@ impl Simulation {
         };
         if let Some(sound) = flags.crush_sound.as_ref() {
             self.sound_events
-                .push(crate::sim::world::SimSoundEvent::wall_crushed(
+                .emit(crate::sim::world::SimSoundEvent::wall_crushed(
                     sound.clone(),
                     &actor.position,
                 ));
             //7509E0 completes before480CB0. The existing process owner may
             //draw Main RNG during cue admission/playback; queuing alone would
             //defer it across this native boundary.
-            effects.flush_sound(self, Some(rules));
+            effects.flush_sound(self, rules);
         }
         self.apply_wall_damage(target, -1, registry);
         if let Some(actor) = self.substrate.entities.get_mut(id) {
-            actor
-                .rocking
-                .get_or_insert_with(Default::default)
-                .recoil_after_overlay_crush();
-            // 73B067 clears Foot+6B5. For selected normal MTNK its ctor0
-            // persists: Drive4B1A2F's only positive writer requires Zone12.
-            // CrusherAll building-crush state/consumers remain a separate chain.
+            actor.rocking_mut().recoil_after_overlay_crush();
+            //73B067 clears Foot+6B5 after the damage call, even when the
+            //Cell refuses a non-Wall overlay. TiltsWhenCrushes is not a gate.
+            actor.foot_speed.clear_crush_slowdown();
         }
     }
 
@@ -484,25 +740,59 @@ impl Simulation {
             self,
             id,
             crate::sim::radio::RadioMessage::RequestClearance,
-            Some(rules),
+            rules,
             effects,
         );
         if reply != crate::sim::radio::RadioResponse::Queued {
-            // RESIDUAL: `0x0073AAF7..0x0073AB66` is not ported. These are the
-            // replies other than Queued (0x17) from a tethered dock (a
-            // refinery, service depot or bunker; a war factory answers 0x17).
-            // - A Harvester or Weeder with an archive queues Harvest (0) and is
-            //   sent to the archive, which then clears. Without an archive and
-            //   NavCom it Scatters (NULL, 1, 0).
-            // - Reply 0xA and every other Unit go straight to the building
-            //   Scatter tail (`Self::unit_per_cell_building_scatter`), which
-            //   every one of these arms reaches.
-            // VERA returns here, leaving the departure to the dock owners.
-            // Trigger: a tethered Unit's arrival in a Cell away from its dock.
-            // Effect: none of this arm's Harvest, archive send or Scatter.
-            // Frequency: harvester and service-depot departures; not measured.
-            // Risk: a Unit left standing on a building with no orders stays
-            // put where native would scatter it.
+            // `0x0073AAF7..0x0073AB66` takes every other reply, including 0
+            // with no contact. Only a refinery and a non-naval war factory
+            // tether a Unit (radio 0x18, `0x0043CACE`, `0x004445E3`); the war
+            // factory answers 0x17, the refinery 1 (`0x0043CE18`'s
+            // fallthrough, after Techno `0x006F4C29` untethered the miner).
+            // Reply 0xA and every other Unit reach only the building tail.
+            // Type, archive (+0x218) and NavCom are re-read after radio 8.
+            if reply != crate::sim::radio::RadioResponse::Negatory
+                && let Some(unit) = self.substrate.entities.get(id)
+                && self
+                    .object_type(unit.type_ref(), rules)
+                    .is_some_and(|object| object.harvester || object.weeder)
+            {
+                if let Some(archive) = unit.archive_target() {
+                    // The ore Cell archived when the miner filled up
+                    // (`0x0073E9E4..0x0073EA7B`): Queue_Mission(Harvest, 0)
+                    // (vt+0x1E8, `0x0073AB29`), Set_Destination(archive, 1)
+                    // (vt+0x480, `0x0073AB3D`), Set_ArchiveTarget(NULL)
+                    // (`0x0070C610`, `0x0073AB47`).
+                    let _ = self.mission_queue_exact(
+                        id,
+                        MissionId::from_known(MissionType::Harvest),
+                        0,
+                        self.session.binary_frame(),
+                        &LiveReadyInputProvider { rules },
+                    );
+                    self.set_unit_destination(
+                        id,
+                        NavTargetRef::from(archive),
+                        rules,
+                        true,
+                        effects,
+                    );
+                    if let Some(unit) = self.substrate.entities.get_mut(id) {
+                        unit.set_archive_target(None);
+                    }
+                } else if unit.navigation.nav_com().is_none() {
+                    // `0x0073AB4E..0x0073AB66`: vt+0x174(&0xB1CFE8, 1, 0).
+                    let _ = self.scatter(
+                        id,
+                        None,
+                        super::scatter::ScatterFlags::new(true, false),
+                        rules,
+                        registry,
+                        effects,
+                    );
+                }
+            }
+            self.unit_per_cell_building_scatter(id, rules, registry, effects);
             return;
         }
         let Some(unit) = self.substrate.entities.get(id) else {
@@ -510,9 +800,23 @@ impl Simulation {
         };
         let nav_com = unit.navigation.nav_com();
         if nav_com.is_some() && nav_com != Some(NavTargetRef::cell(cell.0, cell.1)) {
-            // RESIDUAL:73A96F tests Abstract+14 bit1 before directed opcode
-            //0xE at73A981. This distinct non-current-object receiver requires
-            // that validity state; it is not the null/current-Cell human arm.
+            //73A94C..73A987 re-reads NavCom after synchronous clearance.
+            // Abstract+14 mask1 is Techno: ask that object to dock, ignore
+            // its reply, then reach the shared building Scatter tail.
+            if let Some(NavTargetRef::Object { id: target }) = nav_com
+                && let Some(target) = crate::sim::radio::as_techno(self, target)
+            {
+                crate::sim::radio::transmit(
+                    self,
+                    id,
+                    target,
+                    crate::sim::radio::RadioMessage::CanDock,
+                    crate::sim::radio::RadioPayload::default(),
+                    rules,
+                    effects,
+                );
+            }
+            self.unit_per_cell_building_scatter(id, rules, registry, effects);
             return;
         }
         let Some(object) = self.object_type(unit.type_ref(), rules) else {
@@ -528,7 +832,7 @@ impl Simulation {
                 id,
                 MissionId::from_known(MissionType::Harvest),
                 1,
-                self.session.binary_frame,
+                self.session.binary_frame(),
                 &LiveReadyInputProvider { rules },
             );
         } else if unit.slave_manager.is_some() {
@@ -540,7 +844,7 @@ impl Simulation {
             let Some(human) = self
                 .houses
                 .get(&unit.owner())
-                .map(|house| house.is_controlled_by_human(self.session.game_mode_nonzero))
+                .map(|house| house.is_controlled_by_human(self.session.game_mode_nonzero()))
             else {
                 return;
             };
@@ -637,8 +941,8 @@ impl Simulation {
     /// not moving (native trace: `spatial_oracle/anytown_damage/
     /// unit_unlimbo.json`, `factory_unload_rows[0]`, Ready 1 at `0x0073ACC2`).
     /// Whether a Hover or Jumpjet product is moving at its arrival call is
-    /// not established; if it is, `ready_to_commence_answer`'s moving-defer
-    /// residual applies.
+    /// not established; if it is, Is_Ready_To_Commence's moving defer
+    /// (`0x007442C2..0x00744327`) holds the AreaGuard until it stops.
     fn unit_factory_post(
         &mut self,
         id: u64,
@@ -652,7 +956,7 @@ impl Simulation {
             }
             return;
         };
-        let now = self.session.binary_frame;
+        let now = self.session.binary_frame();
         let readiness = LiveReadyInputProvider { rules };
         let _ = self.mission_queue_exact(
             id,
@@ -663,7 +967,7 @@ impl Simulation {
         );
         let _ =
             self.set_unit_destination(id, NavTargetRef::cell(post.0, post.1), rules, true, effects);
-        let _ = self.mission_commence_exact(id, now);
+        let _ = self.substrate.mission_commence_exact(id, now);
         if let Some(unit) = self.substrate.entities.get_mut(id) {
             unit.set_archive_target(Some(crate::sim::combat::TargetKind::Cell(post.0, post.1)));
         }
@@ -681,62 +985,127 @@ impl Simulation {
     /// [`Self::infantry_per_cell_occupy`]), building receiver (an Engineer's,
     /// or a spy's infiltration, `0x00519948..0x0051A06E`), Enter arm
     /// (`0x0051A0D4..0x0051A4BF`, [`Self::infantry_per_cell_enter`]), C4 plant
-    /// (`0x0051A4BF..0x0051A664`, [`Self::infantry_per_cell_c4`]), tethered
-    /// radio8 release (`0x0051A7F8..0x0051A812`), then the Foot body for a
+    /// (`0x0051A4BF..0x0051A664`, [`Self::infantry_per_cell_c4`]) or C4 cell
+    /// arm (`0x0051A667..0x0051A7F2`), tethered
+    /// radio8 release and full-cell scatter (`0x0051A7F8..0x0051A886`), the
+    /// idle entry and Commence (`0x0051A88B..0x0051A8C5`,
+    /// [`Self::infantry_per_cell_idle_commence`]), then the Foot body for a
     /// live owner (`0x0051A9EB` tests only IsAlive, `+0x90`). Each arm asks
     /// for its own missions, so their order among themselves is native.
     ///
     /// The Enter arm runs before C4 and the Teleport caller's NULL
     /// destination, despite warp-in.
     /// Eaten51973C runs after the occupier arm and before ordinary Capture.
-    /// RESIDUAL: other Capture branches and the C4 cell
-    /// arm (`0x0051973C..0x0051A9E8`) are not dispatched from here. Some have
-    /// ports with their own owners (`capture_manager`, `passenger`); native
-    /// runs them before the Foot body, with some early returns, which also
-    /// skip the reveal (`0x0051A8D7`). Trigger: an infantry arriving on a
-    /// mission cell. Risk: same-frame receiver ordering, and one more
-    /// revealed footprint for an infantryman such an arm takes in.
+    /// RESIDUALS:
+    /// - the NavCom arm of Capture, Area Guard and Patrol (`0x00519979..
+    ///   0x00519B14`) is not dispatched from here. It admits only a NavCom
+    ///   Building whose vt+0x80 (`0x00457620`) answers
+    ///   `BuildingTypeClass::Is1x1WithUndeploy` (`0x00465D40`:
+    ///   `UndeploysInto=` and a 1x1 foundation). DORMANT: retail sets
+    ///   `UndeploysInto=` only on the 4x4 Construction Yards and the 2x2
+    ///   YAREFN, so the arm falls through to the building receiver. With such
+    ///   a type, an infantryman in its cell would take it over (tag event,
+    ///   Detach_All, ChangeOwner `0x00519A27` with announce=1, so
+    ///   `announce_building_capture`, Techno `+0x338`, GotHijacked)
+    ///   and one stopped short would re-issue Set_Destination(NavCom)
+    ///   (`0x00519AFA`), with early returns that skip the reveal
+    ///   (`0x0051A8D7`).
     fn infantry_per_cell_process(
         &mut self,
         id: u64,
         reason: PerCellReason,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> Result<bool, FrameAdvanceError> {
+        // 0x0051965F: the cell of Location at entry, which the full-cell
+        // scatter below reads after every earlier arm.
+        let entry_cell = self.substrate.entities.get(id).map(|entity| {
+            let at = position_world_coord(&entity.position);
+            ((at.x / 256) as i16 as u16, (at.y / 256) as i16 as u16)
+        });
+        if rules.ares_form() && reason == PerCellReason::Arrival {
+            //519675 ->10049820: Capture only; exact NavCom equality with
+            //the first Unit, then Aircraft, then vehicle-like Building.
+            let capture_target = self.substrate.entities.get(id).and_then(|actor| {
+                if actor.mission.current().known() != Some(MissionType::Capture) {
+                    return None;
+                }
+                let NavTargetRef::Object { id: target } = actor.navigation.nav_com()? else {
+                    return None;
+                };
+                let layer = if actor.on_bridge() {
+                    MovementLayer::Bridge
+                } else {
+                    MovementLayer::Ground
+                };
+                let candidate = self.enter_candidate(entry_cell?, layer, true)?;
+                if candidate != target {
+                    return None;
+                }
+                let entity = self.substrate.entities.get(candidate)?;
+                if entity.category() == EntityCategory::Structure
+                    && !self
+                        .entity_object_type(entity, rules)
+                        .is_some_and(|ty| ty.is_1x1_with_undeploy())
+                {
+                    return None;
+                }
+                Some(target)
+            });
+            if let Some(target) = capture_target {
+                let outcome = self
+                    .ares_capture_vehicle(id, target, rules, registry, effects)
+                    .map_err(|cause| {
+                        FrameAdvanceError::new(
+                            self.session.tick(),
+                            self.session.binary_frame(),
+                            id,
+                            cause,
+                        )
+                    })?;
+                if outcome.consumed {
+                    //True joins ORIGINAL51A010: the actor's own event48 then
+                    //UnInit. The separate AI hook raises no actor event48.
+                    let context = UninitContext::new(rules, registry).with_effects(effects);
+                    self.dispatch_object_tag_event(id, 48, Some(id), None, context);
+                    self.uninit_with_context(id, context);
+                }
+                return Ok(outcome.bridge_state_changed);
+            }
+        }
         if reason == PerCellReason::Arrival
-            && let Some(rules) = rules
             && self.infantry_per_cell_occupy(id, rules, registry, effects)?
         {
             return Ok(false);
         }
         if reason == PerCellReason::Arrival
-            && let Some(rules) = rules
             && self.foot_per_cell_eaten(id, rules, registry, effects)
         {
             return Ok(false);
         }
-        let entry = match rules {
-            Some(rules) if reason == PerCellReason::Arrival => {
-                self.infantry_per_cell_building_entry(id, rules, registry, effects)?
-            }
-            _ => Default::default(),
+        let entry = if reason == PerCellReason::Arrival {
+            self.infantry_per_cell_building_entry(id, rules, registry, effects)?
+        } else {
+            Default::default()
         };
         if !entry.return_before_foot {
             // Teleport71971C calls here after setting warp-in, before its
             // NULL destination.
             if reason == PerCellReason::Arrival
-                && let Some(rules) = rules
                 && let Some(changed) = self.infantry_per_cell_enter(id, rules, registry, effects)?
             {
                 return Ok(entry.bridge_state_changed || changed);
             }
             //51A4BF follows the Enter arm and precedes radio8 release.
-            if reason == PerCellReason::Arrival
-                && let Some(rules) = rules
-                && self.infantry_per_cell_c4(id, rules, registry, effects)?
-            {
-                return Ok(false);
+            let c4 = if reason == PerCellReason::Arrival {
+                self.infantry_per_cell_c4(id, rules, registry, effects)?
+            } else {
+                Default::default()
+            };
+            let mut bridge_state_changed = entry.bridge_state_changed || c4.bridge_state_changed;
+            if c4.returns {
+                return Ok(bridge_state_changed);
             }
             //51A7F8 reads the live Techno+418 after earlier arrival receivers;
             //51A80C sends literal8 through Contacts[0], not DOCK_NOW0x15.
@@ -757,17 +1126,132 @@ impl Simulation {
                     rules,
                     effects,
                 );
+                // 0x0051A812..0x0051A84A: a type with two or more
+                // VoiceComment sounds plays the second at the arrival's
+                // Location (PlayAt7509E0, no owner gate or draw).
+                if let Some(event) = self.substrate.entities.get(id).and_then(|actor| {
+                    let object = self.object_type(actor.type_ref(), rules)?;
+                    Some(SimSoundEvent::voc_at_location(
+                        object.voice_comment.get(1)?.clone(),
+                        actor,
+                        self.resolved_terrain.as_ref(),
+                    ))
+                }) {
+                    self.sound_events.emit(event);
+                    effects.flush_sound(self, rules);
+                }
+                if let Some(cell) = entry_cell {
+                    bridge_state_changed |=
+                        self.infantry_full_cell_scatter(id, cell, rules, registry, effects)?;
+                }
             }
-            // 0x0051A8CB..0x0051A8EB: ReReveal then UpdateReveal, before the
-            // water and rock check.
+            if reason == PerCellReason::Arrival {
+                self.infantry_per_cell_idle_commence(id, rules, registry, effects);
+            }
+            // 0x0051A8CB..0x0051A925: ReReveal, UpdateReveal and the
+            // current-XYZ/cached-radius+3 Map567DA0 border, before the water
+            // and rock check.
             if reason == PerCellReason::Arrival && self.per_cell_owner_alive(id) {
-                self.refresh_object_sight(id, rules, 0);
+                self.refresh_object_sight(id, rules, 0, effects);
+                self.refresh_object_sight_border(id, UninitContext::new(rules, registry));
+            }
+            if reason == PerCellReason::Arrival
+                && self.infantry_arrival_drowns(id, rules, registry, effects)
+            {
+                return Ok(bridge_state_changed);
             }
             if self.per_cell_owner_alive(id) {
                 self.foot_per_cell_process(id, reason, rules, registry, effects);
             }
+            return Ok(bridge_state_changed);
         }
         Ok(entry.bridge_state_changed)
+    }
+
+    /// `0x0051A84F..0x0051A886`, inside the tether gate after radio 8: when
+    /// all three infantry spots of the entry `cell` are taken (the deck byte
+    /// `+0x128` on a bridge, else the ground byte `+0x124`; `& 0x1C ==
+    /// 0x1C`), `CellClass::Scatter_Objects(null, 1, 1, OnBridge)`
+    /// (`0x00481670`, [`Self::scatter_cell_objects`]) scatters that list. A
+    /// Walk arriver's raw spot counts (FindSubCellDest re-marks it,
+    /// `0x0075BE18`), but he is lifted from the list until his Mark after
+    /// this call, so only the men already there scatter. A barracks product
+    /// is tethered until its first arrival, so the third man reaching a door
+    /// cell clears it. Each admitted infantryman takes his own Scenario draw
+    /// in Scatter's null arm.
+    /// Answers whether a Scatter's immediate Process changed bridge state.
+    fn infantry_full_cell_scatter(
+        &mut self,
+        id: u64,
+        cell: (u16, u16),
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        effects: FrameEffects<'_>,
+    ) -> Result<bool, FrameAdvanceError> {
+        let Some(entity) = self.substrate.entities.get(id) else {
+            return Ok(false);
+        };
+        let layer = if entity.on_bridge() {
+            MovementLayer::Bridge
+        } else {
+            MovementLayer::Ground
+        };
+        let key = self.resolved_terrain.as_ref().map_or(
+            crate::sim::occupancy::RawCellKey::Real(cell.0, cell.1),
+            |terrain| {
+                crate::sim::occupancy::RawCellKey::from_native(
+                    terrain,
+                    terrain.native_cell_identity((cell.0 as i16, cell.1 as i16)),
+                )
+            },
+        );
+        if self.substrate.raw_cell_occupation.bits_at(key, layer) & 0x1C != 0x1C {
+            return Ok(false);
+        }
+        self.scatter_cell_objects(
+            cell,
+            layer,
+            None,
+            super::ScatterFlags::new(true, true),
+            rules,
+            registry,
+            effects,
+        )
+        .map_err(|cause| FrameAdvanceError {
+            tick: self.session.tick(),
+            binary_frame: self.session.binary_frame(),
+            entity_id: id,
+            cause,
+        })
+    }
+
+    /// `0x0051A88B..0x0051A8C5`, for every arrival that reaches it: with no
+    /// queued mission (`+0xB4`), NavCom, Target or radio contact
+    /// (`RadioClass::In_Radio_Contact @ 0x0065AE30`), `Enter_Idle_Mode(0, 1)`
+    /// ([`Self::infantry_enter_idle_mode`], whose second argument only gates
+    /// the Formation arm); then `MissionClass::Commence @ 0x005B3570`
+    /// (vt+0x1EC) with no Ready_To_Commence, so whatever is queued becomes
+    /// current at the arrival, before the next AI's Ready check
+    /// (`0x0051BC51`).
+    fn infantry_per_cell_idle_commence(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        effects: FrameEffects<'_>,
+    ) {
+        let Some(entity) = self.substrate.entities.get(id) else {
+            return;
+        };
+        let idle = entity.mission.queued() == MissionId::NONE
+            && entity.navigation.nav_com().is_none()
+            && entity.attack_target.target().is_none()
+            && entity.radio_contacts.is_empty();
+        if idle {
+            self.infantry_enter_idle_mode(id, rules, registry, effects);
+        }
+        let now = self.session.binary_frame();
+        let _ = self.substrate.mission_commence_exact(id, now);
     }
 
     /// What an Enter arrival finds in a cell: the first Building of its
@@ -857,7 +1341,7 @@ impl Simulation {
         {
             return Ok(None);
         }
-        let context = UninitContext::new(Some(rules), registry).with_effects(effects);
+        let context = UninitContext::new(rules, registry).with_effects(effects);
         self.dispatch_object_tag_event(candidate, 1, Some(id), None, context);
         let (Some(infantry), Some(carrier)) = (
             self.substrate.entities.get(id),
@@ -872,10 +1356,31 @@ impl Simulation {
                 cell.1,
                 MovementLayer::Ground,
             ) != Some(candidate)
-                || radio::transmit_to_contact(self, id, RadioMessage::DockNow, Some(rules), effects)
+                || radio::transmit_to_contact(self, id, RadioMessage::DockNow, rules, effects)
                     != RadioResponse::Roger
             {
                 return Ok(None);
+            }
+            // Ares 3.0 10017760 (hook 0x51A2AD): a `Tunnel=` building takes
+            // him into its owner's network (`sim::ares_tunnel`) instead,
+            // through CAN_LOAD; a refusal takes the transport arm's refusal
+            // (`0x0051A488`).
+            if rules.ares_form()
+                && let Some(tunnel) = self.ares_tunnel_type(candidate, rules)
+            {
+                let house = self
+                    .substrate
+                    .entities
+                    .get(candidate)
+                    .map(|building| building.owner());
+                if let Some(house) = house
+                    && self.ares_can_enter_tunnel(
+                        id, candidate, house, tunnel, rules, registry, effects,
+                    )
+                {
+                    return Ok(Some(false));
+                }
+                return self.infantry_per_cell_enter_refused(id, rules, registry, effects);
             }
             board_passenger(
                 self,
@@ -899,7 +1404,7 @@ impl Simulation {
             candidate,
             RadioMessage::CanEnter,
             RadioPayload::default(),
-            Some(rules),
+            rules,
             effects,
         ) == RadioResponse::Roger
         {
@@ -914,7 +1419,19 @@ impl Simulation {
             );
             return Ok(Some(false));
         }
-        self.assign_null_destination(id, Some(rules), registry, effects);
+        self.infantry_per_cell_enter_refused(id, rules, registry, effects)
+    }
+
+    /// The Infantry Enter arm's refusal (`0x0051A488..0x0051A4BC`): the NULL
+    /// destination, Guard queued and a Scatter from no coordinate.
+    fn infantry_per_cell_enter_refused(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        effects: FrameEffects<'_>,
+    ) -> Result<Option<bool>, FrameAdvanceError> {
+        self.assign_null_destination(id, rules, registry, effects);
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             crate::sim::mission::authority::queue_entity_mission_deferred(
                 entity,
@@ -930,8 +1447,8 @@ impl Simulation {
                 effects,
             )
             .map_err(|cause| FrameAdvanceError {
-                tick: self.session.tick,
-                binary_frame: self.session.binary_frame,
+                tick: self.session.tick(),
+                binary_frame: self.session.binary_frame(),
                 entity_id: id,
                 cause,
             })?;
@@ -961,6 +1478,21 @@ impl Simulation {
         ) else {
             return false;
         };
+        // Ares 3.0 10017870 (hook 0x73A23F), before the `UnitAbsorb=` test:
+        // on Enter with a `Tunnel=` building as its NavCom, the unit asks it
+        // CAN_LOAD and enters its own House's network (`sim::ares_tunnel`);
+        // a refusal takes the refusal below (`0x0073A796`).
+        if rules.ares_form()
+            && let Some(tunnel) = self.ares_tunnel_type(building, rules)
+            && unit.mission.effective() == MissionId::from_known(MissionType::Enter)
+            && nav_com_is(unit, building)
+        {
+            let house = unit.owner();
+            if !self.ares_can_enter_tunnel(id, building, house, tunnel, rules, registry, effects) {
+                self.unit_per_cell_enter_refused(id, rules, registry, effects);
+            }
+            return true;
+        }
         if !self
             .substrate
             .entities
@@ -1063,7 +1595,7 @@ impl Simulation {
             carrier,
             RadioMessage::CanEnter,
             RadioPayload::default(),
-            Some(rules),
+            rules,
             effects,
         ) == crate::sim::radio::RadioResponse::Roger
         {
@@ -1085,7 +1617,7 @@ impl Simulation {
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) {
-        self.assign_null_destination(id, Some(rules), registry, effects);
+        self.assign_null_destination(id, rules, registry, effects);
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             crate::sim::mission::authority::queue_entity_mission_deferred(
                 entity,
@@ -1107,16 +1639,12 @@ impl Simulation {
     /// first ground building of the cell it reached (`0x0047C520`) asks
     /// that building `CanBeOccupiedBy`. Refused, it drops its destination
     /// (vt+0x480(0, 1)) and scatters from the building's coordinate
-    /// (vt+0x174(coord, 1, 1)); admitted, it goes in
-    /// ([`crate::sim::passenger::add_garrison_occupant`]). Either way the
-    /// call returns before the Foot body. Answers whether the arm ran.
-    ///
-    /// RESIDUAL: the building's attached Tag is told it was entered
-    /// (`TagClass::Raise_Event(1, ...)`, `0x00519710..0x00519725`) before
-    /// the infantryman goes in; this garrison ingress does not raise event 1 yet.
-    /// Trigger: a
-    /// map building with a Tag garrisoned this way. Effect: its "entered by"
-    /// trigger does not spring. A building a house builds has no Tag.
+    /// (vt+0x174(coord, 1, 1)); admitted, the building's Tag hears event 1
+    /// ("entered by", `0x00519710..0x00519725`) with him as the actor, and
+    /// he goes in, or an assaulter clears it
+    /// ([`crate::sim::passenger::add_garrison_occupant`], `0x0051972D`), with
+    /// no recheck. Either way the call returns before the
+    /// Foot body. Answers whether the arm ran.
     fn infantry_per_cell_occupy(
         &mut self,
         id: u64,
@@ -1157,13 +1685,83 @@ impl Simulation {
             return Ok(false);
         }
         if crate::sim::passenger::building_can_be_occupied_by(self, rules, building, id) {
+            let context = UninitContext::new(rules, registry).with_effects(effects);
+            self.dispatch_object_tag_event(building, 1, Some(id), None, context);
             crate::sim::passenger::add_garrison_occupant(
                 self, rules, id, building, registry, effects,
-            );
+            )?;
             return Ok(true);
         }
         self.turn_away_from_building(id, building, rules, registry, effects)?;
         Ok(true)
+    }
+
+    /// Infantry Per_Cell_Process's last check (`0x0051A92A..0x0051A9E8`): a
+    /// stationary infantryman (Is_Moving) who holds no C4, on Water or Rock
+    /// (`CellClass+0xEC`) and not on a bridge over it, takes his current
+    /// Health as `C4Warhead=` damage, ignoring defenses, and the visit ends
+    /// before the Foot body. A Walk or Teleport arrival is still moving; the
+    /// routes here are a DropAsBomb faller from a lost deck (`0x005F402B`)
+    /// and a Rocketeer on an Enter mission touching down on Water or Rock
+    /// (`0x0054C8F0`). No draw or timer of its own.
+    fn infantry_arrival_drowns(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        effects: FrameEffects<'_>,
+    ) -> bool {
+        use crate::map::resolved_terrain::NativeCellQuery;
+        use crate::rules::terrain_rules::LandType;
+
+        // A dead owner's ReceiveDamage has nothing left to do.
+        if !self.per_cell_owner_alive(id) {
+            return false;
+        }
+        let Some(entity) = self.substrate.entities.get(id) else {
+            return false;
+        };
+        if super::motion_query::is_moving(entity) == Some(true)
+            || self
+                .object_type(entity.type_ref(), rules)
+                .is_none_or(|object| {
+                    crate::sim::combat::veterancy::holds_c4(entity.veterancy.rank_kind(), object)
+                })
+        {
+            return false;
+        }
+        let Some(terrain) = self.resolved_terrain.as_ref() else {
+            return false;
+        };
+        let cells = NativeCellQuery::canonical(terrain);
+        let at = position_world_coord(&entity.position);
+        let cell = cells.lookup_world(at.x, at.y);
+        let land = cells.land_type(cell);
+        if (land != LandType::Water as i32 && land != LandType::Rock as i32)
+            || (entity.on_bridge() && cells.flags(cell) & 0x100 != 0)
+        {
+            return false;
+        }
+        let damage = entity.health.current();
+        let warhead = self.interner.intern(&rules.bridge_warheads.c4_name);
+        self.commit_direct_damage_receiver(
+            rules,
+            registry,
+            crate::sim::combat::EntityDamageEvent::direct_receiver(
+                id,
+                damage,
+                0,
+                crate::sim::combat::RAD_NO_ATTACKER,
+                None,
+                warhead,
+                crate::sim::combat::ReceiverCallFlags {
+                    ignore_defenses: true,
+                    arg6: false,
+                },
+            ),
+            effects,
+        );
+        true
     }
 
     fn per_cell_owner_alive(&self, id: u64) -> bool {
@@ -1185,18 +1783,15 @@ impl Simulation {
     /// Cell-attached 1/59 run in their original `0x004D8978..0x004D8A14`
     /// slot, followed by Map line 25/26 at `0x004D8A70..0x004D8B66`.
     /// Ordinary Fly ingress remains unproven.
-    /// Agent Infantry54 follows1/59 at4D8A14..4D8A6B;53 is explicitly
-    /// deferred. RESIDUAL: Map zone24 (`0x004D8B66..0x004D8D99`), the
-    /// `+0x83` / `0x00586360` step (`0x004D8DA7..0x004D8DF5`), the
-    /// planning-waypoint upkeep (`0x004D8DFF..0x004D8F1D`) are not ported.
-    /// Trigger: every arrival. Effect: zone triggers and planning waypoints
-    /// do not fire from movement. Risk: maps with those trigger families.
+    /// Agent Infantry53 then54 follow1/59 at4D8A14..4D8A6B. Map zone24
+    /// follows line25/26 at4D8B66..4D8CA5 through the
+    /// same Tag funnel. Planning-waypoint upkeep (`0x004D8DFF..0x004D8F1D`) is
+    /// skipped while Foot+0x520 is -1, which a fresh YR game never changes
+    /// (`world::planning`).
     ///
-    /// RESIDUAL: the off-playfield exit (`0x004D8D67..0x004D8DA4`): a live
-    /// object whose Cell fails `0x00578460(cell, 1)` and whose vt+0x4DC
-    /// (`0x004DC790`, needs `+0x3D5`) answers true is UnInit (vt+0xF8) and
-    /// skips the tail. Trigger: a promoted object leaving the playfield.
-    /// Effect: VERA keeps it. Frequency: rare (teams exiting the map).
+    /// The off-playfield exit at 0x004D8D67..0x004D8DA4 asks the class IsLeavingMap
+    /// after Map578460(cell,1), then UnInit and returns before the tail.
+    /// Foot uses 0x004DC790; Aircraft retains its separate 0x0041B890 override.
     ///
     /// The Techno tail ends with the open-ground discovery
     /// ([`Self::discover_on_open_ground_after_cell_entry`]) and the Cell's
@@ -1206,28 +1801,33 @@ impl Simulation {
         &mut self,
         id: u64,
         reason: PerCellReason,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) {
         if reason != PerCellReason::Arrival {
             return;
         }
-        if let Some(rules) = rules {
-            self.refresh_unit_sensor_at_per_cell(id, rules, registry);
+        // Ares 3.0 10049280 (hook 0x4D85E4): tiberium damage first; a Foot it
+        // kills leaves the whole call (0x4D8F29), Techno tail included.
+        let ares = rules.ares_form();
+        if ares && self.ares_foot_tiberium_damage(id, rules, registry, effects) {
+            return;
         }
+        self.refresh_unit_sensor_at_per_cell(id, rules, registry);
         //4D8657..4D868D compares the two coarse threat buckets and migrates
         //the cached contribution BEFORE4D870E replaces retained Foot+55C.
-        if let Some(rules) = rules {
-            self.spatial_threat_at_per_cell(id, rules);
-        }
-        self.foot_neighbors_at_per_cell(id);
-        if let Some(rules) = rules {
-            crate::sim::world::techno_ai_cloak::uncloak_on_sensor_neighbour_after_cell_entry(
-                self, id, rules,
-            );
-            self.per_cell_range_stop(id, rules, registry, effects);
-        }
+        self.spatial_threat_at_per_cell(id, rules);
+        Self::foot_neighbors_at_per_cell(
+            &mut self.substrate,
+            &self.resolved_terrain,
+            &mut self.overlay_grid,
+            id,
+        );
+        crate::sim::world::techno_ai_cloak::uncloak_on_sensor_neighbour_after_cell_entry(
+            self, id, rules,
+        );
+        self.per_cell_range_stop(id, rules, registry, effects);
         self.dispatch_foot_cell_tag_events(
             id,
             crate::sim::world::UninitContext::new(rules, registry).with_effects(effects),
@@ -1253,22 +1853,66 @@ impl Simulation {
         if !self.per_cell_owner_alive(id) {
             return;
         }
+        // Retail Foot4D8D67..4D8DA4: physical packed Cell, mode1 Map
+        // lookup, virtual IsLeavingMap, then the shared UnInit owner.
+        let cell = self
+            .substrate
+            .entities
+            .get(id)
+            .map(|entity| super::foot_path::coord_cell(position_world_coord(&entity.position)));
+        // Partial worlds without a configured Map cannot admit an exit.
+        if let (Some((x, y)), Some(bounds)) = (cell, self.playfield_bounds())
+            && !crate::sim::cell_rect::cell_is_in_playfield_height_aware(
+                (i32::from(x), i32::from(y)),
+                Some(bounds),
+                self.resolved_terrain.as_ref(),
+            )
+            && self
+                .substrate
+                .entities
+                .get(id)
+                .is_some_and(|entity| match entity.category() {
+                    EntityCategory::Aircraft => self.aircraft_may_leave_map(id),
+                    EntityCategory::Unit | EntityCategory::Infantry => {
+                        self.foot_is_leaving_map(id, rules)
+                    }
+                    EntityCategory::Structure => false,
+                })
+        {
+            // Ares 3.0 FootClass_UpdatePosition_HunterSeeker (1004E050, hook
+            // 0x4D8D95): a hunter leaving the map hits its Target first.
+            if ares {
+                self.ares_hunter_seeker_parting_strike(id, rules, registry, effects);
+            }
+            self.uninit_with_context(
+                id,
+                UninitContext::new(rules, registry).with_effects(effects),
+            );
+            return;
+        }
+        // 0x004D8DA7..0x004D8DF5: another house's object arriving over the
+        // player's shroud leaves the selection.
+        self.deselect_over_player_shroud(id, Self::house_is_human_player);
         // `0x006F5090`'s head lets a held Temporal target go, then caches the
         // Cell of its GetCoords (`0x006F50B9..0x006F50F6`) for the tail.
-        self.temporal_release_if_warping(id);
+        Self::temporal_release_if_warping(
+            &mut self.substrate,
+            &mut self.houses,
+            &mut self.power_states,
+            id,
+            rules.ares_form(),
+        );
         let cell = self
             .substrate
             .entities
             .get(id)
             .map(|entity| (entity.position.rx(), entity.position.ry()));
-        //6F50FA calls the existing cloak/sensor owner before Tag34. The
-        //ordinary stock arm is dormant without a CloakGenerator field;
-        //custom fields retain the owner's StartCloaking/targeter response.
-        if let Some(rules) = rules {
-            crate::sim::world::techno_ai_cloak::sensor_reevaluate_stock_cloak(
-                self, id, rules, registry,
-            );
-        }
+        //6F50FA calls the existing cloak/sensor owner before Tag34: its
+        //Deselect arm is live, its cloak-field arm dormant without a
+        //CloakGenerator field.
+        crate::sim::world::techno_ai_cloak::sensor_reevaluate_stock_cloak(
+            self, id, rules, registry,
+        );
         //6F5100..6F5115: attached Tag, actor=this, zero cell/source. This
         //follows earlier cell/line callbacks and precedes playfield promotion.
         self.dispatch_object_tag_event(
@@ -1300,18 +1944,16 @@ impl Simulation {
         (rx, ry): (u16, u16),
         context: UninitContext<'_>,
     ) {
-        let Some(viewer) = self.session.current_house else {
-            return;
-        };
-        let Some(entity) = self.substrate.entities.get(id) else {
-            return;
-        };
-        if entity.discovery.discovered_by_current_house()
-            || !self.fog.is_ground_open(viewer, rx, ry)
-        {
-            return;
+        //6F5140..6F516C runs for PlayerPtr on every native client. Use
+        //each represented human's retained admission and own ground plane.
+        for viewer in self.represented_player_maps() {
+            if self.techno_discovered_by_viewer(id, viewer)
+                || !self.fog.is_ground_open(viewer, rx, ry)
+            {
+                continue;
+            }
+            self.discover_techno(id, viewer, context);
         }
-        self.discover_techno(id, viewer, context);
     }
 
     /// The range stop (`0x004D882F..0x004D896E`): the class
@@ -1342,23 +1984,35 @@ impl Simulation {
         }
         match category {
             EntityCategory::Unit => {
-                self.set_unit_null_destination(id, Some(rules), registry, effects);
+                self.set_unit_null_destination(id, rules, registry, effects);
             }
             EntityCategory::Infantry => {
                 // With no head and no destination left, the next Walk
                 // Process takes its idle tail.
-                self.set_infantry_null_destination(id, Some(rules), registry, effects);
+                self.set_infantry_null_destination(id, rules, registry, effects);
             }
             _ => {}
         }
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             // Keep the backing suffix/cursor/reference; this is one DWORD.
-            entity.navigation.path_replay.clear_live_head();
+            entity.navigation.path_replay_mut().clear_live_head();
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
+#[path = "per_cell_exit_tests.rs"]
+mod exit_tests;
+
+#[cfg(all(test, tests_sim_movement))]
+#[path = "per_cell_crush_tests.rs"]
+mod crush_tests;
+
+#[cfg(all(test, tests_sim_movement))]
+#[path = "per_cell_infantry_tail_tests.rs"]
+mod infantry_tail_tests;
+
+#[cfg(all(test, tests_sim_movement))]
 mod discovery_tests {
     use super::*;
     use crate::sim::combat::Health;
@@ -1375,9 +2029,9 @@ mod discovery_tests {
         let player = sim.interner.intern("Americans");
         let enemy = sim.interner.intern("Russians");
         sim.houses
-            .insert(player, HouseState::new(player, 0, None, true, 0, 10));
+            .register(HouseState::new(player, 0, None, true, 0, 10));
         sim.houses
-            .insert(enemy, HouseState::new(enemy, 1, None, false, 0, 10));
+            .register(HouseState::new(enemy, 1, None, false, 0, 10));
         sim.fog = crate::sim::vision::FogState::new(32, 32);
         let type_ref = sim.interner.intern("TEST");
         sim.substrate
@@ -1400,7 +2054,7 @@ mod discovery_tests {
             sim.foot_per_cell_process(
                 1,
                 PerCellReason::Arrival,
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
                 None,
                 FrameEffects::default(),
             );
@@ -1413,7 +2067,7 @@ mod discovery_tests {
         };
         sim.fog.set_ground_bits_for_test(player, 5, 5, 0x18);
         assert!(!arrive(&mut sim), "no current house");
-        sim.session.current_house = Some(player);
+        sim.session.set_current_house_for_test(Some(player));
         sim.fog.set_ground_bits_for_test(player, 5, 5, 0x08);
         assert!(!arrive(&mut sim), "visible but not open");
         sim.fog.set_ground_bits_for_test(player, 5, 5, 0x18);

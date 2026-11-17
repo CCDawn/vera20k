@@ -16,16 +16,19 @@ use crate::map::entities::EntityCategory;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat::TargetKind;
+use crate::sim::intern::StringInterner;
 use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::movement::ground_pose;
 use crate::sim::movement::locomotor::MovementLayer;
+use crate::sim::power_system::PowerStates;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::{FrameEffects, Simulation};
 use crate::util::direction::DIRECTION_DELTAS;
 use crate::util::native_x87::{MaskedX87Chop53 as X87, MaskedX87Ordering, NativeF64Bits};
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_t_z))]
 #[path = "tesla_charging_tests.rs"]
 mod tests;
 
@@ -92,92 +95,92 @@ impl BuildingCharge {
 }
 
 impl Simulation {
-    /// Bullet::Detonate46937A..4693CE. Only the two concrete object classes
-    /// are checked here; alliance, range and Overpowerable are not impact gates.
-    pub(crate) fn electric_assault_detonation(&mut self, source: u64, target: Option<u64>) {
-        if !self
-            .substrate
-            .entities
-            .get(source)
-            .is_some_and(|entity| entity.category() == EntityCategory::Infantry)
-        {
-            return;
-        }
-        let Some(target) = target.filter(|&id| {
-            self.substrate
-                .entities
-                .get(id)
-                .is_some_and(|entity| entity.category() == EntityCategory::Structure)
-        }) else {
-            return;
-        };
-        self.substrate
-            .entities
-            .get_mut(target)
-            .expect("the admitted building remains present")
-            .tesla_charge
-            .refresh(source);
-    }
-
     /// Building4400F9..440196, after delayed fire and before repair/power.
     /// A changed TarCom can remain in the list until this visit, and +661
     /// remains stale even after pointer expiry until this visit samples it.
-    pub(crate) fn update_tesla_charge(&mut self, id: u64, rules: &RuleSet) {
-        let Some(building) = self.substrate.entities.get(id) else {
+    pub(crate) fn update_tesla_charge(
+        interner: &StringInterner,
+        substrate: &mut ObjectSubstrate,
+        power_states: &PowerStates,
+        id: u64,
+        rules: &RuleSet,
+    ) {
+        let Some(building) = substrate.entities.get(id) else {
             return;
         };
-        if !self
-            .object_type(building.type_ref(), rules)
-            .is_some_and(|object| object.overpowerable)
-        {
+        let Some(object) = interner.object_type(building.type_ref(), rules) else {
             return;
+        };
+        // Ares BuildingClass_Update_Battery10014690 (hook 44019D), after the
+        // stock sample below and for every building: a `Battery.Overpower`
+        // type of an active battery is overpowered. Nothing clears it again
+        // for a type that is not Overpowerable.
+        let battery = rules.ares_form()
+            && power_states
+                .get(&building.owner())
+                .is_some_and(|state| state.overpowers(&object.id));
+        if object.overpowerable {
+            Self::sample_tesla_charge(substrate, power_states, id);
         }
-        let count = building.tesla_charge.chargers.len();
+        if battery {
+            substrate
+                .entities
+                .get_mut(id)
+                .unwrap()
+                .building
+                .tesla_charge
+                .overpowered = true;
+        }
+    }
+
+    /// The stock Overpowerable block (4400F9..440196): prune changed
+    /// chargers, then sample +661.
+    fn sample_tesla_charge(substrate: &mut ObjectSubstrate, power_states: &PowerStates, id: u64) {
+        let building = substrate.entities.get(id).unwrap();
+        let count = building.building.tesla_charge.chargers.len();
         // Reverse stable removal is native's order; no temporary list or
         // unconditional mutable store access is needed for unchanged chargers.
         for index in (0..count).rev() {
-            let charger = self
-                .substrate
+            let charger = substrate
                 .entities
                 .get(id)
                 .unwrap()
+                .building
                 .tesla_charge
                 .chargers[index];
-            if !self
-                .substrate
+            if !substrate
                 .entities
                 .get(charger)
                 .is_some_and(|entity| entity.attack_target.target() == Some(TargetKind::Entity(id)))
             {
-                self.substrate
+                substrate
                     .entities
                     .get_mut(id)
                     .unwrap()
+                    .building
                     .tesla_charge
                     .chargers
                     .remove(index);
             }
         }
-        let building = self.substrate.entities.get(id).unwrap();
-        let count = building.tesla_charge.chargers.len();
+        let building = substrate.entities.get(id).unwrap();
+        let count = building.building.tesla_charge.chargers.len();
         let overpowered = count >= 3
             || (count >= 1
                 && building.building_online()
-                && self
-                    .power_states
-                    .get(&building.owner())
-                    .is_none_or(|power| {
-                        let (output, drain) = power.effective_totals();
-                        X87::compare(
-                            crate::sim::power_system::native_power_ratio(output, drain),
-                            X87::load_f64(NativeF64Bits::ONE),
-                        ) == MaskedX87Ordering::Equal
-                    }));
-        if building.tesla_charge.overpowered != overpowered {
-            self.substrate
+                && power_states.get(&building.owner()).is_none_or(|power| {
+                    let (output, drain) = power.effective_totals();
+                    X87::compare(
+                        crate::sim::power_system::native_power_ratio(output, drain),
+                        X87::load_f64(NativeF64Bits::ONE),
+                    ) == MaskedX87Ordering::Equal
+                }));
+        if building.building.tesla_charge.overpowered != overpowered {
+            substrate
                 .entities
                 .get_mut(id)
                 .unwrap()
+                .building
                 .tesla_charge
                 .overpowered = overpowered;
         }
@@ -198,8 +201,7 @@ impl Simulation {
         };
         if entity.attack_target.target().is_some()
             || !crate::sim::world::weapon_at_index(self, rules, id, 1)
-                .and_then(|weapon| weapon.warhead.as_deref())
-                .and_then(|name| rules.warhead(name))
+                .and_then(|weapon| rules.weapon_warhead(weapon))
                 .is_some_and(|warhead| warhead.electric_assault)
         {
             return false;
@@ -244,7 +246,7 @@ impl Simulation {
             let _ = self.assign_target_represented(
                 id,
                 Some(TargetKind::Entity(building)),
-                Some(rules),
+                rules,
                 registry,
                 effects,
             );
@@ -258,11 +260,45 @@ impl Simulation {
                 id,
                 MissionId::from_known(MissionType::Attack),
                 0,
-                self.session.binary_frame,
+                self.session.binary_frame(),
                 &LiveReadyInputProvider { rules },
             );
             return true;
         }
         false
+    }
+}
+
+impl crate::sim::world::ObjectSubstrate {
+    /// Bullet::Detonate46937A..4693CE. Only the two concrete object classes
+    /// are checked here; alliance, range and Overpowerable are not impact gates.
+    /// `ares` is [`RuleSet::ares`](crate::rules::ruleset::RuleSet::ares).
+    pub(crate) fn electric_assault_detonation(
+        &mut self,
+        source: u64,
+        target: Option<u64>,
+        ares: bool,
+    ) {
+        // Ares 3.0 BulletClass_Fire_Overpower (1005C650, hook 0x4693B0): a
+        // Unit owner charges the building too.
+        if !self.entities.get(source).is_some_and(|entity| {
+            entity.category() == EntityCategory::Infantry
+                || ares && entity.category() == EntityCategory::Unit
+        }) {
+            return;
+        }
+        let Some(target) = target.filter(|&id| {
+            self.entities
+                .get(id)
+                .is_some_and(|entity| entity.category() == EntityCategory::Structure)
+        }) else {
+            return;
+        };
+        self.entities
+            .get_mut(target)
+            .expect("the admitted building remains present")
+            .building
+            .tesla_charge
+            .refresh(source);
     }
 }

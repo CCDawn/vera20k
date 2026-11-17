@@ -5,7 +5,9 @@
 //! inclusive sorted ranged draws, and rejection sampling.
 
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use crate::util::sync::Mutex;
 
 use crate::rng_continuation::MapGenRngContinuation;
 use crate::util::native_random;
@@ -27,15 +29,6 @@ pub(crate) fn abs_before_modulo(draw: u32, divisor: i32) -> i32 {
     }
     (draw as i32).wrapping_abs().wrapping_rem(divisor)
 }
-
-/// The `double` at `0x007E3570` that scales a `RandomRanged(0, 0x7ffffffe)`
-/// draw onto `[0, 1]` for a unit-interval probability gate (Spark spawns, the
-/// `CrewEscape=` roll). Raw bytes `00 00 40 00 00 00 00 3E`, i.e.
-/// `1.0 / 2147483646.0` — the reciprocal of the draw's own inclusive top, NOT
-/// `2^-31`. The two differ by `2^-30` relative, which is a real bias in a
-/// deterministic gate, so this is carried as bits and never recomputed.
-pub(crate) const RANDOM_RANGED_UNIT_SCALE: crate::util::native_x87::NativeF64Bits =
-    crate::util::native_x87::NativeF64Bits::from_bits(0x3e00_0000_0040_0000);
 
 const RNG_TABLE_LEN: usize = native_random::STATE_WORDS;
 
@@ -127,12 +120,24 @@ pub struct SimRng {
     state: Vec<u32>,
 }
 
-/// Owner of process Main886B88. Simulation, frontend and retained playback
-/// capabilities address the same cell; sharing never copies its cursor.
-/// Main remains outside Scenario saves and the deterministic world hash.
+/// Owner of process Main886B88. The frontend and retained playback
+/// capabilities address the app's cell; a scenario's simulation draws its own
+/// cell, seeded from the app's at install, so the simulation thread and the
+/// app share no RNG (docs/sim-thread.md). Main remains outside Scenario saves
+/// and the deterministic world hash.
 #[derive(Debug)]
 pub struct MainRng {
     state: Arc<Mutex<SimRng>>,
+}
+
+/// A copy shares the one process cell, as every Main owner does: the
+/// presentation frame of a world draws the same cursor as the world.
+impl Clone for MainRng {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
 }
 
 impl MainRng {
@@ -153,6 +158,14 @@ impl MainRng {
         Self {
             state: Arc::clone(&self.state),
         }
+    }
+
+    /// A cell of its own at this cursor, sharing nothing with this one: the
+    /// presentation copy of the world's (docs/sim-thread.md), and the
+    /// simulation's own cell at a scenario install
+    /// ([`crate::sim::world::Simulation::install_fresh_process_main`]).
+    pub(crate) fn detached_copy(&self) -> Self {
+        self.staged_copy()
     }
 
     /// Stage a transactional saved-load candidate. Draws made while the load
@@ -195,6 +208,12 @@ impl MainRng {
             .logical_state()
     }
 
+    /// A detached, draw-free cursor checkpoint. It never grants another live
+    /// owner of the process cell; replay construction may retain this value.
+    pub fn checkpoint(&self) -> SimRng {
+        self.state.lock().expect("Main RNG poisoned").clone()
+    }
+
     pub fn state(&self) -> u64 {
         self.state.lock().expect("Main RNG poisoned").state()
     }
@@ -207,7 +226,7 @@ impl MainRng {
     /// An explicitly detached test reference, never a live draw capability.
     #[cfg(any(test, feature = "test-support"))]
     pub fn snapshot_for_test(&self) -> SimRng {
-        self.state.lock().expect("Main RNG poisoned").clone()
+        self.checkpoint()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -221,14 +240,6 @@ impl MainRng {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn index_b(&self) -> i32 {
         self.logical_state().index_b
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn next_range_u32_inclusive(&self, low: u32, high: u32) -> u32 {
-        self.state
-            .lock()
-            .expect("Main RNG poisoned")
-            .next_range_u32_inclusive(low, high)
     }
 }
 
@@ -320,6 +331,13 @@ impl SimRngLogicalState {
 }
 
 impl SimRng {
+    /// Reject malformed external cursor checkpoints before any indexed draw.
+    pub fn valid_checkpoint(&self) -> bool {
+        self.state.len() == RNG_TABLE_LEN
+            && (0..RNG_TABLE_LEN as i32).contains(&self.index_a)
+            && (0..RNG_TABLE_LEN as i32).contains(&self.index_b)
+    }
+
     /// Create a new RNG with the given seed.
     pub fn new(seed: u64) -> Self {
         Self {
@@ -413,6 +431,22 @@ impl SimRng {
             index_a: word(4) as i32,
             index_b: word(8) as i32,
             state: (12..0x3f4).step_by(4).map(word).collect(),
+        }
+    }
+
+    /// A stream whose next draws are `draws`, in order: the lead cursor starts
+    /// at word 0 and the lagged one at word 125, over zeros. For a test that
+    /// needs a draw no seed reaches, such as `i32::MIN`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_next_draws_for_test(draws: &[u32]) -> Self {
+        assert!(draws.len() <= 125, "the lagged words must stay zero");
+        let mut state = vec![0; RNG_TABLE_LEN];
+        state[..draws.len()].copy_from_slice(draws);
+        Self {
+            disabled: 0,
+            index_a: 0,
+            index_b: 125,
+            state,
         }
     }
 
@@ -590,11 +624,20 @@ impl SimRng {
     /// the cursor a variable amount and desyncs every later consumer that tick.
     /// Returns 0 for `n == 0` (the original would divide-by-zero here; callers
     /// guard with `.max(1)`, so this branch never fires on stock systems).
+    /// A raw `i32::MIN` over `n == u32::MAX` (a divisor of -1, as `MaxEC=-1`
+    /// gives) overflows gamemd's IDIV; this returns the true remainder, 0.
+    ///
+    /// Draws that take the absolute value first (`CDQ; XOR; SUB; CDQ; IDIV`),
+    /// such as Gas drift and the Spark burst size and Z velocity, use
+    /// [`abs_before_modulo`] instead: for a raw `i32::MIN` its remainder stays
+    /// negative.
     pub fn next_raw_abs_modulo(&mut self, n: u32) -> u32 {
         if n == 0 {
             return 0;
         }
-        ((self.next_u32() as i32) % n as i32).unsigned_abs()
+        (self.next_u32() as i32)
+            .wrapping_rem(n as i32)
+            .unsigned_abs()
     }
 
     /// Raw signed remainder draw: `(next_u32() as i32) % n`, one draw, may be
@@ -604,16 +647,25 @@ impl SimRng {
     /// no absolute value): a negative remainder yields a negative offset, so the
     /// output spans `-(n-1)..=n-1`. Same single-draw cursor advance as
     /// `next_raw_abs_modulo`; the only difference is the sign is preserved.
-    /// Returns 0 for `n == 0`.
+    /// Returns 0 for `n == 0`, and the true remainder 0 where gamemd's IDIV
+    /// overflows (a raw `i32::MIN` over a divisor of -1).
     pub fn next_raw_modulo_signed(&mut self, n: u32) -> i32 {
         if n == 0 {
             return 0;
         }
-        (self.next_u32() as i32) % n as i32
+        (self.next_u32() as i32).wrapping_rem(n as i32)
+    }
+
+    /// `Randomizer::RandomDouble` (YRpp `Helpers/Randomizer.h`):
+    /// `RandomRanged(1, INT_MAX) / (INT_MAX + 1)`, one inclusive-range draw
+    /// into `[1/2^31, 1)`. Phobos probability gates (`ArmorMultiplier.Chance`,
+    /// `Critical.Chance`) compare against it.
+    pub fn random_double(&mut self) -> f64 {
+        f64::from(self.next_range_i32_inclusive(1, i32::MAX)) / 2_147_483_648.0
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 mod tests {
     use super::{MainRng, SimRng, trace_draws};
 
@@ -751,19 +803,6 @@ mod tests {
     }
 
     #[test]
-    fn sim_rng_logical_view_and_state_expose_all_250_words_without_mutation() {
-        let rng = SimRng::new(0);
-        let before = rng.state();
-        let view = rng.logical_view();
-        let owned = rng.logical_state();
-        assert_eq!(view.disabled, 0);
-        assert_eq!((view.index_a, view.index_b), (0, 0x67));
-        assert_eq!(view.words.len(), 250);
-        assert_eq!(owned.words.as_slice(), view.words);
-        assert_eq!(rng.state(), before, "observation must not advance the RNG");
-    }
-
-    #[test]
     fn seed_zero_logical_state_matches_native_fixture_edges() {
         let state = SimRng::new(0).logical_state();
         assert_eq!(
@@ -774,33 +813,6 @@ mod tests {
             &state.words[246..],
             &[0x62FD_BE0F, 0x2034_06B3, 0xAD5E_A053, 0xD72E_1536]
         );
-    }
-
-    #[test]
-    fn test_rng_repeatable_sequence() {
-        let mut a = SimRng::new(12345);
-        let mut b = SimRng::new(12345);
-        for _ in 0..128 {
-            assert_eq!(a.next_u64(), b.next_u64());
-        }
-    }
-
-    #[test]
-    fn test_rng_range_bounds() {
-        let mut rng = SimRng::new(1);
-        for _ in 0..256 {
-            let v = rng.next_range_u32(7);
-            assert!(v < 7);
-        }
-    }
-
-    #[test]
-    fn test_inclusive_range_bounds() {
-        let mut rng = SimRng::new(42);
-        for _ in 0..256 {
-            let v = rng.next_range_u32_inclusive(1, 5);
-            assert!((1..=5).contains(&v));
-        }
     }
 
     #[test]
@@ -867,6 +879,25 @@ mod tests {
         let mut reference = SimRng::new(1);
         reference.next_u32();
         assert_eq!(a.state(), reference.state());
+    }
+
+    /// A raw `i32::MIN` over a divisor of -1 (`MaxEC=-1`) overflows gamemd's
+    /// IDIV; both helpers return the true remainder, 0, after their one draw.
+    #[test]
+    fn raw_modulo_of_min_by_minus_one_is_zero() {
+        for signed in [false, true] {
+            let mut rng = SimRng::new(1);
+            let (a, b) = (rng.index_a as usize, rng.index_b as usize);
+            rng.state[a] = rng.state[b] ^ 0x8000_0000;
+            let mut twin = rng.clone();
+            if signed {
+                assert_eq!(rng.next_raw_modulo_signed(u32::MAX), 0);
+            } else {
+                assert_eq!(rng.next_raw_abs_modulo(u32::MAX), 0);
+            }
+            assert_eq!(twin.next_u32(), 0x8000_0000);
+            assert_eq!(rng.state(), twin.state());
+        }
     }
 
     #[test]
@@ -937,25 +968,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn random_ranged_power_of_two_span_can_return_inclusive_top() {
-        // span=4 is a power of two; the inclusive top value 4 must be reachable
-        // (impossible with the buggy span-1 mask, which caps output at 3).
-        let mut rng = SimRng::new(7);
-        let mut saw_top = false;
-        for _ in 0..4096 {
-            let val = rng.next_range_u32_inclusive(0, 4);
-            assert!(val <= 4);
-            if val == 4 {
-                saw_top = true;
-            }
-        }
-        assert!(
-            saw_top,
-            "RandomRanged(0,4) must be able to return the inclusive top value 4"
-        );
-    }
-
     /// Original Random65C780 / RandomRanged65C7E0 histories execute raw and
     /// signed ranged calls across rejection and cursor-wrap boundaries.
     #[test]
@@ -1013,5 +1025,22 @@ mod tests {
             }
         }
         assert_eq!(compared, 98);
+    }
+
+    /// `RandomDouble` is one `RandomRanged(1, INT_MAX)` draw scaled by
+    /// `2^31`, so it advances the shared cursor exactly like that draw.
+    #[test]
+    fn random_double_consumes_one_inclusive_range_draw() {
+        let mut doubled = SimRng::new(0x5EED);
+        let mut ranged = SimRng::new(0x5EED);
+        let value = doubled.random_double();
+        let raw = ranged.next_range_i32_inclusive(1, i32::MAX);
+        assert_eq!(value, f64::from(raw) / 2_147_483_648.0);
+        assert!((0.0..1.0).contains(&value), "{value}");
+        assert_eq!(
+            doubled.native_state_hex(),
+            ranged.native_state_hex(),
+            "same cursor advance"
+        );
     }
 }

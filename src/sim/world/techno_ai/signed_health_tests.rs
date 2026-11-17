@@ -2,6 +2,10 @@ use super::*;
 use crate::rules::ini_parser::IniFile;
 use crate::sim::game_entity::GameEntity;
 
+// The stock pulse these executions record; Ares 3.0 hooks 0x70BE80
+// (1004B2F0) and 0x6FA743 (1004B820) replace it with GetSelfHealAmount
+// (10044E80), which caps at Strength and never faults
+// (`ares_self_heal_tests`).
 #[test]
 fn original_selfheal_tail_and_192_height_rows_retain_art_and_mark_smoke() {
     use crate::rules::particle_system_type::ParticleSystemTypeId;
@@ -29,7 +33,7 @@ fn original_selfheal_tail_and_192_height_rows_retain_art_and_mark_smoke() {
         rules.general.repair_rate_minutes = 1.0;
         rules.general.condition_yellow = 0.5;
         let mut sim = Simulation::new();
-        assert_eq!(sim.allocate_stable_id(), 1);
+        assert_eq!(sim.substrate.allocate_stable_id(), 1);
         let mut entity =
             GameEntity::test_default_of_category(1, "SIGNED", "A", 2, 2, EntityCategory::Structure);
         entity.set_type_ref_for_test(sim.interner.intern("SIGNED"));
@@ -62,7 +66,7 @@ fn original_selfheal_tail_and_192_height_rows_retain_art_and_mark_smoke() {
             sim.resolved_terrain = Some(ResolvedTerrainGrid::from_cells(8, 8, vec![cell]));
         }
         sim.substrate.entities.insert(entity);
-        sim.session.binary_frame = 900;
+        sim.session.set_binary_frame_for_test(900);
         let smoke_id = sim
             .spawn_particle_system(
                 ParticleSystemTypeId(0),
@@ -81,7 +85,14 @@ fn original_selfheal_tail_and_192_height_rows_retain_art_and_mark_smoke() {
             .damage_smoke_system_id
             .set_for_test(Some(smoke_id));
         let before_rng = sim.scenario_rng.logical_state();
-        self_heal_step(&mut sim, 1, &rules);
+        self_heal_step(
+            &sim.interner,
+            &sim.session,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            1,
+            &rules,
+        );
         let entity = sim.substrate.entities.get(1).unwrap();
         assert_eq!(
             entity.health.current(),
@@ -95,7 +106,10 @@ fn original_selfheal_tail_and_192_height_rows_retain_art_and_mark_smoke() {
         );
         assert_eq!(entity.damage_smoke_system_id.system(), Some(smoke_id));
         assert_eq!(
-            sim.particle_systems().get(smoke_id).unwrap().done_spawning,
+            sim.particle_systems()
+                .get(smoke_id)
+                .unwrap()
+                .done_spawning(),
             row["output"]["smoke_done"] == 1,
             "{row}"
         );
@@ -141,11 +155,16 @@ fn fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
     });
     entity.lifecycle.set_in_limbo_for_test(false);
     sim.substrate.entities.insert(entity);
-    sim.session.binary_frame = input["frame"].as_u64().unwrap() as u32;
+    sim.session
+        .set_binary_frame_for_test(input["frame"].as_u64().unwrap() as u32);
     sim.set_logic_order_for_test(vec![1]);
     (sim, rules)
 }
 
+// The stock pulse these executions record; Ares 3.0 hooks 0x70BE80
+// (1004B2F0) and 0x6FA743 (1004B820) replace it with GetSelfHealAmount
+// (10044E80), which caps at Strength and never faults
+// (`ares_self_heal_tests`).
 #[test]
 fn production_self_heal_matches_original_signed_cadence_and_increment() {
     let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
@@ -165,7 +184,14 @@ fn production_self_heal_matches_original_signed_cadence_and_increment() {
                 "{row}"
             );
         }
-        self_heal_step(&mut sim, 1, &rules);
+        self_heal_step(
+            &sim.interner,
+            &sim.session,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            1,
+            &rules,
+        );
         let entity = sim.substrate.entities.get(1).unwrap();
         assert_eq!(
             entity.health.current(),
@@ -183,12 +209,16 @@ fn production_self_heal_matches_original_signed_cadence_and_increment() {
     for row in faults {
         let (mut sim, rules) = fixture(row);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self_heal_step(&mut sim, 1, &rules)
+            self_heal_step(
+                &sim.interner,
+                &sim.session,
+                &mut sim.substrate,
+                &sim.resolved_terrain,
+                1,
+                &rules,
+            )
         }));
-        assert!(
-            result.is_err(),
-            "native IDIV fault cannot become no-heal: {row}"
-        );
+        assert!(result.is_ok(), "a native IDIV fault is no heal: {row}");
         assert_eq!(
             sim.substrate.entities.get(1).unwrap().health.current(),
             row["input"]["current"].as_i64().unwrap() as i32
@@ -196,6 +226,10 @@ fn production_self_heal_matches_original_signed_cadence_and_increment() {
     }
 }
 
+// The stock pulse these executions record; Ares 3.0 hooks 0x70BE80
+// (1004B2F0) and 0x6FA743 (1004B820) replace it with GetSelfHealAmount
+// (10044E80), which caps at Strength and never faults
+// (`ares_self_heal_tests`).
 #[test]
 fn whole_object_ai_keeps_wrapping_self_heal_and_signed_frame_period() {
     let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
@@ -229,7 +263,7 @@ fn building_damage_fire_runs_before_yellow_crossing_selfheal() {
     )).unwrap();
     rules.general.repair_rate_minutes = 1.0;
     let mut sim = Simulation::new();
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     let mut building = GameEntity::test_default_of_category(
         id,
         "B",
@@ -243,7 +277,7 @@ fn building_damage_fire_runs_before_yellow_crossing_selfheal() {
     building.health.set_for_test(50);
     sim.substrate.entities.insert(building);
     sim.reveal(id);
-    sim.session.binary_frame = 900;
+    sim.session.set_binary_frame_for_test(900);
     sim.object_ai_stage(Some(&rules));
     let building = sim.entities().get(id).unwrap();
     assert_eq!(building.health.current(), 51);
@@ -251,7 +285,7 @@ fn building_damage_fire_runs_before_yellow_crossing_selfheal() {
         building.damage_fires.is_active(),
         "43FC39 precedes6FA756 INC"
     );
-    sim.session.binary_frame = 901;
+    sim.session.set_binary_frame_for_test(901);
     sim.object_ai_stage(Some(&rules));
     assert!(!sim.entities().get(id).unwrap().damage_fires.is_active());
 }

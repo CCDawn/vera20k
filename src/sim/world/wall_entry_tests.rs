@@ -98,13 +98,7 @@ fn map_wall(sim: &mut Simulation, overlay: u8, data: u8) {
         .as_mut()
         .unwrap()
         .place_overlay(16, 15, overlay, data);
-    sim.resolved_terrain
-        .as_mut()
-        .unwrap()
-        .cell_mut(16, 15)
-        .unwrap()
-        .bridge_facts
-        .overlay_id = Some(overlay);
+    sim.overlay_cell_mut_for_test(16, 15).overlay_id = Some(overlay);
 }
 
 /// The class `Can_Enter_Cell` code of mover `id` for the wall cell (16, 15).
@@ -192,14 +186,14 @@ fn a_mover_that_can_shoot_a_wall_prices_it_by_its_owner() {
         .as_mut()
         .unwrap()
         .set_wall_owner(16, 15, other);
-    sim.house_alliances
+    sim.house_alliances_mut_for_test()
         .entry("RUSSIANS".into())
         .or_default()
         .insert("AMERICANS".into());
     for id in [WALLI, WALLV] {
         assert_eq!(entry(&sim, &rules, &registry, id), Ok(5), "{id}");
     }
-    sim.house_alliances
+    sim.house_alliances_mut_for_test()
         .entry("AMERICANS".into())
         .or_default()
         .insert("RUSSIANS".into());
@@ -244,10 +238,10 @@ fn the_land_row_refuses_after_the_wall_arm() {
     sim.resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(16, 15)
+        .cell_mut_for_test(16, 15)
         .unwrap()
         .speed_costs
-        .foot = Some(0);
+        .foot = Some(crate::rules::terrain_rules::test_speed_percent(0));
     assert_eq!(entry(&sim, &rules, &registry, WALLI), Ok(7));
 }
 
@@ -311,15 +305,16 @@ fn assert_retail_wall_fire_profile(
     // first Logic turn. Headless load deliberately defaults to serial mode.
     scene.runtime.simulation.batch_path_searches();
     scene.runtime.simulation.batch_target_scans();
-    // Normal play's frame loop hashes every PLAY_HASH_INTERVAL frames; a
-    // headless launch would hash every frame, which nothing here reads.
+    // Periodic frame hashes feed replay and sync checks, which nothing here
+    // reads; an interval no tick reaches skips them (11-12% of each frame in
+    // this unoptimized test build).
     scene
         .runtime
         .simulation
-        .hash_state_every(crate::sim::replay::PLAY_HASH_INTERVAL);
+        .hash_state_every(std::num::NonZeroU64::MAX);
     let initial_hash = scene.sim().state_hash();
-    let owner = scene.sim().session.current_house.unwrap();
-    let mut orders: Vec<_> = profile["commands"]
+    let owner = scene.sim().session.current_house().unwrap();
+    let orders: Vec<_> = profile["commands"]
         .as_array()
         .unwrap()
         .iter()
@@ -332,16 +327,6 @@ fn assert_retail_wall_fire_profile(
             )
         })
         .collect();
-    if wall_name == "GAWALL" {
-        // Target the paid endpoint using an ordinary attack order. Filler
-        // constructor draws change the later damage history; retain this
-        // witness's pristine-child branch without seeding RNG or wall state.
-        for order in &mut orders {
-            if let Command::ForceAttackCell { target_ry, .. } = &mut order.payload {
-                *target_ry = 87;
-            }
-        }
-    }
     let (attacker_id, source) = orders
         .iter()
         .find_map(|order| match order.payload {
@@ -369,12 +354,12 @@ fn assert_retail_wall_fire_profile(
     assert!(flags.wall);
     assert_eq!(flags.armor_is_wood, native_type["armor"] == 6);
     assert_eq!(
-        u64::from(flags.strength),
-        native_type["strength"].as_u64().unwrap()
+        i64::from(flags.strength),
+        native_type["strength"].as_i64().unwrap()
     );
     assert_eq!(
-        u64::from(flags.damage_levels),
-        native_type["damage_levels"].as_u64().unwrap()
+        i64::from(flags.damage_levels),
+        native_type["damage_levels"].as_i64().unwrap()
     );
     let damage_levels = flags.damage_levels;
     if wall_name == "GAWALL" {
@@ -394,7 +379,7 @@ fn assert_retail_wall_fire_profile(
             )]
         );
         assert!(building.prerequisite_override.is_empty());
-        let foundation = crate::rules::foundation::foundation_def(&building.foundation);
+        let foundation = crate::rules::foundation::foundation_def(building.foundation.name());
         assert_eq!((foundation.width, foundation.height), (1, 1));
         assert_eq!(building.to_overlay.as_deref(), Some("GAWALL"));
         assert_eq!(
@@ -454,13 +439,16 @@ fn assert_retail_wall_fire_profile(
         })
         .collect();
     // Wall damage (Cell480CB0) and that jitter draw the Scenario RNG, so other
-    // Houses' play moves the removal by whole shots. Observe at least the
-    // profile's frames, and one full rearm past the removal.
+    // Houses' play moves the removal by whole shots. Run one full rearm past
+    // the removal, where a further shot at the expired Cell would land; four
+    // profiles' frames bound a run that never removes the wall. The stream
+    // also decides which spread visit removes the source: 4896B2..4896BA
+    // tests only the visited cell, so a source cleared by a neighbour's
+    // PostDestructionWallCleanup (0x00480630) keeps the tank's Cell target.
+    // A change to earlier draws can move this profile onto that branch.
     let profile_ticks = profile["ticks"].as_u64().unwrap();
     let mut step = 0;
-    while step < 4 * profile_ticks
-        && (step < profile_ticks || removed_at.is_none_or(|at| step < at + rearm))
-    {
+    while step < 4 * profile_ticks && removed_at.is_none_or(|at| step < at + rearm) {
         step += 1;
         let before: Vec<_> = patch
             .iter()
@@ -555,10 +543,10 @@ fn assert_retail_wall_fire_profile(
                     .attack_target
                     .target()
                     .is_none(),
-                "Cell7258D0 target expiry is synchronous with removal"
+                "AreaDamage4896BA restores targets synchronously after wall cleanup"
             );
-            assert!(sim.radar_terrain_dirty_cells.contains(&source));
-            assert!(sim.tactical_dirty_cells.contains(&source));
+            assert!(sim.dirty_cells.radar().contains(&source));
+            assert!(sim.dirty_cells.tactical_for_test().contains(&source));
             removed_at = Some(step);
             shots_at_removal = Some(shots);
         }
@@ -568,13 +556,20 @@ fn assert_retail_wall_fire_profile(
     );
     assert!(removed_at.is_some(), "ordinary AP fire opens the fence");
     if paid_wall {
-        assert!(
-            inline_child_admission_seen,
-            "ordinary AP reaches stage two beside a pristine same-type child"
-        );
+        // The stage-two branch depends on which damage roll meets the
+        // pristine child. Ares' AI unit choice draws `RandomRanged(0, 99)`
+        // (HouseExt::GetTypeToProduce 100216A0, hooks 0x4FEA60/0x4FEEE0/
+        // 0x4FF210) where stock draws `RandomRanged(0, 0x7FFFFFFE)`, so the
+        // other Houses' Scenario draws move it; only the stock stream pins it.
+        if !scene.runtime.resources.rules.ares() {
+            assert!(
+                inline_child_admission_seen,
+                "ordinary AP reaches stage two beside a pristine same-type child"
+            );
+        }
         let house = scene.sim().houses.get(&owner).unwrap();
-        assert_eq!(house.economy.credits(), 8500);
-        assert_eq!(house.economy.spent_credits(), 1500);
+        assert_eq!(house.economy().credits(), 8500);
+        assert_eq!(house.economy().spent_credits(), 1500);
     }
     assert!(shots >= 2, "the real weapon reaches repeated impacts");
     assert_eq!(
@@ -647,13 +642,23 @@ fn retail_unit_per_cell_removes_authored_fence_before_returning() {
         delivered: std::cell::Cell::new(0),
         crushed: std::cell::Cell::new(0),
     };
-    let Some((root, _assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+    let Some((root, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
         return;
     };
     let profile = crate::test_fixture::json("tools/map_observation.authored-fence.example.json");
-    let launch: crate::skirmish_launch::SkirmishLaunchSession =
+    let mut launch: crate::skirmish_launch::SkirmishLaunchSession =
         serde_json::from_value(profile["launch"].clone()).unwrap();
     let map = launch.selected_map_file.as_deref().unwrap().to_owned();
+    let mut bytes = assets.get_ref(&map).unwrap().to_vec();
+    bytes.extend_from_slice(b"\n[CAFNCB]\nCrushSound=Unknown\n");
+    let directory = crate::map::source::test_support::TestDirectory::new("retained-fence-sound");
+    directory.write("fence.map", &bytes);
+    let map = directory
+        .path()
+        .join("fence.map")
+        .to_string_lossy()
+        .into_owned();
+    launch.selected_map_file = Some(map.clone());
     let mut scene = crate::headless_scenario::load_session(
         &root,
         &map,
@@ -681,13 +686,7 @@ fn retail_unit_per_cell_removes_authored_fence_before_returning() {
         );
         crate::sim::movement::target_cell_coord(at.0, at.1, Some(&cells))
     };
-    sim.foot_set_location_marked(
-        id,
-        position,
-        Some(rules),
-        Some(registry),
-        FrameEffects::default(),
-    );
+    sim.foot_set_location_marked(id, position, rules, Some(registry), FrameEffects::default());
     assert_eq!(
         sim.overlay_grid
             .as_ref()
@@ -699,7 +698,7 @@ fn retail_unit_per_cell_removes_authored_fence_before_returning() {
     sim.per_cell_process(
         id,
         crate::sim::movement::PerCellReason::Arrival,
-        Some(rules),
+        rules,
         Some(registry),
         FrameEffects::for_sound(&cue),
     )
@@ -934,7 +933,7 @@ fn assert_retail_wall_history(native_path: &'static str, wall_name: &str, direct
             // The original component starts before the later Building/Foot
             // population. Run its wall Mark material through the shared owner;
             // do not copy its resulting data/122/zone fields from the packet.
-            sim.acknowledge_radar_terrain_dirty(sim.radar_terrain_dirty_generation);
+            sim.dirty_cells.take_radar();
             for placement in construction["placements"].as_array().unwrap() {
                 let coordinate = (
                     placement["cell"][0].as_u64().unwrap() as u16,
@@ -979,7 +978,7 @@ fn assert_retail_wall_history(native_path: &'static str, wall_name: &str, direct
             .entities
             .values()
             .filter_map(|entity| {
-                let source = entity.navigation.neighbor_state.cell();
+                let source = entity.navigation.neighbor_state().cell();
                 ((45..=47).contains(&source.0)
                     && (79..=81).contains(&source.1)
                     && source != (46, 80))
@@ -1020,13 +1019,7 @@ fn assert_retail_wall_history(native_path: &'static str, wall_name: &str, direct
         );
         // Original native controls reseed all three streams after setup. These
         // explicit component inputs do not claim native whole-load RNG parity.
-        sim.process_pending_delete_with(
-            Some(rules),
-            Some(registry),
-            FrameEffects::default(),
-            0,
-            true,
-        );
+        sim.process_pending_delete_with(rules, Some(registry), FrameEffects::default(), 0, true);
         for expected in case["initial_patch"].as_array().unwrap() {
             assert_cell(sim, expected, &neighbor_domain);
         }
@@ -1036,10 +1029,10 @@ fn assert_retail_wall_history(native_path: &'static str, wall_name: &str, direct
         sim.mapgen_rng = SimRng::new(seed);
         assert_eq!(rng(sim), case["initial"]["rng"]);
         if case.get("construction").is_none() {
-            sim.acknowledge_radar_terrain_dirty(sim.radar_terrain_dirty_generation);
+            sim.dirty_cells.take_radar();
         }
         assert_eq!(
-            json!(sim.radar_terrain_dirty_cells),
+            json!(sim.dirty_cells.radar()),
             case["initial"]["radar"]["cells"]
         );
         let cursor = sim.native_identity_cursor();
@@ -1063,7 +1056,7 @@ fn assert_retail_wall_history(native_path: &'static str, wall_name: &str, direct
                 .iter()
                 .map(|cell| (cell.overlay_id, cell.wall_owner))
                 .collect::<Vec<_>>();
-            let tactical_start = sim.tactical_dirty_cells.len();
+            let tactical_start = sim.dirty_cells.tactical_for_test().len();
             let (_, draws) = crate::sim::rng::trace_draws(|| {
                 if direct {
                     let at = at(&step["source"]);
@@ -1080,6 +1073,7 @@ fn assert_retail_wall_history(native_path: &'static str, wall_name: &str, direct
                         ProjectileCoord::new(center.x, center.y, center.z),
                         weapon.damage,
                         warhead,
+                        true,
                         (crate::sim::combat::RAD_NO_ATTACKER, None, ap),
                         FrameEffects::default(),
                     );
@@ -1170,10 +1164,11 @@ fn assert_retail_wall_history(native_path: &'static str, wall_name: &str, direct
                     .cell(coordinate.0, coordinate.1)
                     .unwrap();
                 assert!(
-                    sim.path_grid
-                        .as_ref()
-                        .unwrap()
-                        .resolved_cell_is_current(ground, false),
+                    sim.path_grid.as_ref().unwrap().resolved_cell_is_current(
+                        ground,
+                        sim.overlay_grid.as_ref(),
+                        false
+                    ),
                     "wall navigation publication at {coordinate:?}"
                 );
                 if expected_patch.contains_key(&at(&change["after"])) {
@@ -1185,7 +1180,7 @@ fn assert_retail_wall_history(native_path: &'static str, wall_name: &str, direct
             }
             assert_cell(sim, &step["source"], &neighbor_domain);
             assert_eq!(
-                json!(sim.radar_terrain_dirty_cells),
+                json!(sim.dirty_cells.radar()),
                 step["before_drain"]["radar"]["cells"]
             );
             assert_eq!(
@@ -1221,11 +1216,11 @@ fn assert_retail_wall_history(native_path: &'static str, wall_name: &str, direct
                 }
             }
             assert_eq!(
-                &sim.tactical_dirty_cells[tactical_start..],
+                &sim.dirty_cells.tactical_for_test()[tactical_start..],
                 expected_tactical
             );
             sim.process_pending_delete_with(
-                Some(rules),
+                rules,
                 Some(registry),
                 FrameEffects::default(),
                 0,
@@ -1268,11 +1263,14 @@ fn retail_mtnk_move_crushes_fences_through_per_cell_with_body_rocking() {
     .unwrap();
     scene.runtime.simulation.batch_path_searches();
     scene.runtime.simulation.batch_target_scans();
+    // Periodic frame hashes feed replay and sync checks, which nothing here
+    // reads; an interval no tick reaches skips them (11-12% of each frame in
+    // this unoptimized test build).
     scene
         .runtime
         .simulation
-        .hash_state_every(crate::sim::replay::PLAY_HASH_INTERVAL);
-    let owner = scene.sim().session.current_house.unwrap();
+        .hash_state_every(std::num::NonZeroU64::MAX);
+    let owner = scene.sim().session.current_house().unwrap();
     let command: Command =
         serde_json::from_value(profile["commands"][0]["payload"].clone()).unwrap();
     let order = CommandEnvelope::new(owner, 0, command);
@@ -1309,8 +1307,8 @@ fn retail_mtnk_move_crushes_fences_through_per_cell_with_body_rocking() {
         for (index, &(x, y)) in cells.iter().enumerate() {
             if clears[index].is_none() && grid.cell(x, y).overlay_id.is_none() {
                 clears[index] = Some(step);
-                assert!(sim.radar_terrain_dirty_cells.contains(&(x, y)));
-                assert!(sim.tactical_dirty_cells.contains(&(x, y)));
+                assert!(sim.dirty_cells.radar().contains(&(x, y)));
+                assert!(sim.dirty_cells.tactical_for_test().contains(&(x, y)));
             }
         }
         sounds += output

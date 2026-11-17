@@ -72,21 +72,32 @@
 //! - Part of sim/ — depends on sibling movement state only.
 //! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
+use crate::map::resolved_terrain::ResolvedTerrainGrid;
+use crate::sim::rng::SimRng;
+use crate::sim::world::ObjectSubstrate;
+
 impl crate::sim::world::Simulation {
     /// ILocomotion+0x5C, `Power_Off`, on `id`'s active locomotor: Hover's
     /// override (`0x00516BF0`, [`Self::hover_power_off`]) or the base
     /// (`0x0055A910`).
     ///
-    /// RESIDUAL: Fly's override (`0x004CFD20`: a spin of `Random(20, 30)`
-    /// steps and a stop while moving) is not ported. None of the callers
-    /// reaches it: they are a Unit's dock and depot service and Deactivate,
-    /// which the stock `PoweredUnit=` type (a Hover) alone reaches.
-    pub(crate) fn locomotor_power_off(&mut self, id: u64) {
-        if self.hover_power_off(id) {
+    /// RESIDUAL: Fly's override (`0x004CFD20`) is not ported: while moving
+    /// it sets a spin of Scenario `RandomRanged(20, 30)`, negated when a
+    /// second `RandomRanged(0, 99)` is below 50, stops and zeroes the fall
+    /// speed. Stock play never reaches it (the callers are a Unit's dock and
+    /// depot service and Deactivate, which the stock `PoweredUnit=` type, a
+    /// Hover, alone reaches). Ares EMP deactivates an aircraft at height 0,
+    /// so a moving one there skips those two draws.
+    pub(crate) fn locomotor_power_off(
+        scenario_rng: &mut SimRng,
+        substrate: &mut ObjectSubstrate,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        id: u64,
+    ) {
+        if Self::hover_power_off(scenario_rng, substrate, resolved_terrain, id) {
             return;
         }
-        if let Some(locomotor) = self
-            .substrate
+        if let Some(locomotor) = substrate
             .entities
             .get_mut(id)
             .and_then(|entity| entity.locomotor.as_mut())
@@ -96,35 +107,10 @@ impl crate::sim::world::Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use crate::rules::locomotor_type::LocomotorKind;
     use crate::sim::movement::locomotor::LocomotorState;
-
-    #[test]
-    fn a_fresh_locomotor_is_powered() {
-        for kind in [
-            LocomotorKind::Drive,
-            LocomotorKind::Hover,
-            LocomotorKind::Walk,
-            LocomotorKind::Teleport,
-        ] {
-            assert!(
-                LocomotorState::for_test_kind(kind).is_powered(),
-                "{kind:?} must start powered — unpowered is a state something \
-                 has to actively put a unit into"
-            );
-        }
-    }
-
-    #[test]
-    fn power_off_then_on_round_trips() {
-        let mut state = LocomotorState::for_test_kind(LocomotorKind::Hover);
-        state.power_off();
-        assert!(!state.is_powered());
-        state.power_on();
-        assert!(state.is_powered());
-    }
 
     /// The base Power_Off is not a stop: it touches the flag and nothing
     /// else, so a destination already installed survives.

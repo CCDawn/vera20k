@@ -3,21 +3,32 @@
 //! Shared types used across production sub-modules: queue items, build options,
 //! placement previews, and the central `ProductionState` struct.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::rules::object_type::ObjectCategory;
+use crate::rules::object_type::{FactoryType, ObjectCategory, ObjectType};
+use crate::rules::ruleset::RuleSet;
 use crate::sim::intern::InternedId;
-use crate::sim::ore_growth::{OreGrowthConfig, OreGrowthState};
 use crate::sim::production::factory::FactoryRegistry;
 
 /// A test house's opening balance.
 #[cfg(any(test, feature = "test-support"))]
 pub const STARTING_CREDITS: i32 = 5000;
 
+/// A borrowed local strip entry's foreign Factory identity. Sidebar LinkFactory
+/// 6A6140 retains this association independently of the Factory's current head;
+/// Strip AI6A8DC6 visits entries in their retained order. The registry remains
+/// the sole owner of the referenced Factory and validates its lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductionFactoryVisit {
+    pub type_id: InternedId,
+    pub category: ProductionCategory,
+    pub construction_order: u64,
+}
+
 /// One queued item formatted for UI rendering.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QueueItemView {
     pub type_id: InternedId,
     pub display_name: String,
@@ -30,17 +41,11 @@ pub struct QueueItemView {
 }
 
 /// One completed building waiting for placement.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReadyBuildingView {
     pub type_id: InternedId,
     pub display_name: String,
     pub queue_category: ProductionCategory,
-}
-
-/// Active producer/facility focus for one queue category.
-#[derive(Debug, Clone)]
-pub struct ProducerFocusView {
-    pub category: ProductionCategory,
 }
 
 /// Placement preview/evaluation for a ready building.
@@ -105,8 +110,87 @@ pub enum BuildingPlacementError {
 /// current complete Factory head, including a head replaced before dispatch.
 #[derive(Debug, Clone, Copy)]
 pub enum ProductionPlacement<'a> {
-    Building { type_id: &'a str, cell: (u16, u16) },
-    Mobile { category: ProductionCategory },
+    Building {
+        type_id: &'a str,
+        cell: (u16, u16),
+    },
+    Mobile {
+        category: ProductionCategory,
+    },
+    /// Event4C70E1 passes the three selector fields independently of Cell.
+    Selected {
+        selection: ProductionSelection,
+        cell: (u16, u16),
+    },
+}
+
+/// Ephemeral House production selection, never a second Factory identity.
+/// House4FA350/4FA910/4FAA10/4FB0E0 select their slot from raw RTTI,
+/// requested Building BuildCat, and the independent Naval argument. Positive
+/// indices resolve through48DCD0; a negative index skips the BuildCat read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductionSelection {
+    pub rtti: i32,
+    pub type_index: i32,
+    pub naval: bool,
+}
+
+impl ProductionSelection {
+    /// Cameo Add7/16/40/3 and type::GetArrayIndex supply the native fields;
+    /// the registered family array is distinct from the string interner.
+    pub fn for_type(rules: &RuleSet, object: &ObjectType) -> Option<Self> {
+        let rtti = match object.category {
+            ObjectCategory::Building => 7,
+            ObjectCategory::Infantry => 16,
+            ObjectCategory::Vehicle => 40,
+            ObjectCategory::Aircraft => 3,
+        };
+        Some(Self {
+            rtti,
+            type_index: rules.type_array_index(object.category, &object.id)?,
+            naval: object.naval,
+        })
+    }
+
+    /// Completed object WhatAmI, as used by4ABB41 and6A8EB6.
+    pub(crate) fn object_rtti(self) -> i32 {
+        match self.rtti {
+            7 => 6,
+            16 => 15,
+            40 => 1,
+            3 => 2,
+            other => other,
+        }
+    }
+
+    pub(crate) fn object_type(self, rules: &RuleSet) -> Option<&ObjectType> {
+        let category = match FactoryType::for_production_rtti(self.rtti)? {
+            FactoryType::BuildingType => ObjectCategory::Building,
+            FactoryType::InfantryType => ObjectCategory::Infantry,
+            FactoryType::UnitType => ObjectCategory::Vehicle,
+            FactoryType::AircraftType => ObjectCategory::Aircraft,
+        };
+        rules.type_array_at(category, self.type_index)
+    }
+
+    pub(crate) fn category(self, rules: &RuleSet) -> Option<ProductionCategory> {
+        Some(match FactoryType::for_production_rtti(self.rtti)? {
+            FactoryType::BuildingType => {
+                let combat = self.type_index >= 0
+                    && self.object_type(rules)?.build_cat
+                        == Some(crate::rules::object_type::BuildCategory::Combat);
+                if combat {
+                    ProductionCategory::Defense
+                } else {
+                    ProductionCategory::Building
+                }
+            }
+            FactoryType::InfantryType => ProductionCategory::Infantry,
+            FactoryType::UnitType if self.naval => ProductionCategory::Ship,
+            FactoryType::UnitType => ProductionCategory::Vehicle,
+            FactoryType::AircraftType => ProductionCategory::Aircraft,
+        })
+    }
 }
 
 impl BuildingPlacementError {
@@ -149,6 +233,17 @@ pub enum BuildQueueState {
 }
 
 impl ProductionCategory {
+    /// The type family retained by this Factory slot. Naval and BuildCat
+    /// still select independent slots within that family (House4FA350).
+    pub(crate) fn object_category(self) -> ObjectCategory {
+        match self {
+            Self::Building | Self::Defense => ObjectCategory::Building,
+            Self::Infantry => ObjectCategory::Infantry,
+            Self::Vehicle | Self::Ship => ObjectCategory::Vehicle,
+            Self::Aircraft => ObjectCategory::Aircraft,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Building => "Building",
@@ -162,10 +257,9 @@ impl ProductionCategory {
 }
 
 /// One build option exposed to UI.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BuildOption {
     pub type_id: InternedId,
-    pub display_name: String,
     /// The type's Cost_Of for the owner (TechnoType virtual `+0x84`).
     pub cost: i32,
     pub object_category: ObjectCategory,
@@ -194,149 +288,95 @@ impl BuildOption {
 /// Player production state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductionState {
-    // Building+3D3 belongs to each retained building. Manual selection448160
-    // clears matching non-limbo peers, so a limbo peer can retain its flag
-    // alongside the chosen on-map factory. This is the sole primary-state
+    // Building+3D3, one byte per retained building. Building448070/448160
+    // group peers by the raw Factory value and Naval, not by sidebar queue,
+    // and clear only matching non-limbo peers, so a limbo peer can keep its
+    // flag beside the chosen on-map factory. This is the sole primary-state
     // owner; the House FactoryClass queue slots remain in `factories`.
-    active_producer_by_owner: BTreeMap<InternedId, BTreeMap<ProductionCategory, BTreeSet<u64>>>,
-    pub next_enqueue_order: u64,
-    /// Ore growth/spread configuration resolved from merged INI sources.
-    pub ore_growth_config: OreGrowthConfig,
-    /// Per-TiberiumClass growth and spread queues, bitmaps and timers.
-    pub ore_growth_state: OreGrowthState,
-    /// Retained animations for all IsAnimated terrain, keyed by map cell.
-    /// Derived from live `terrain_objects`; removal/limbo must remove this index.
-    pub terrain_animations: BTreeMap<(u16, u16), crate::sim::terrain_spawn::TerrainAnimationState>,
-    /// Live `TerrainClass`-style map objects, keyed by deterministic stable id.
-    pub terrain_objects: BTreeMap<u64, crate::sim::terrain_object::TerrainObjectState>,
-    /// Live terrain object cell index, cell -> stable id.
-    pub terrain_object_cells: BTreeMap<(u16, u16), u64>,
-    /// Cells occupied by terrain objects whose type has `SpawnsTiberium=yes`.
-    ///
-    /// This has a different gate from `terrain_animations`: a non-animated
-    /// spawner rejects new ore, while an animated non-spawner still draws RNG.
-    pub tiberium_spawning_terrain_cells: BTreeSet<(u16, u16)>,
+    primary_factories: BTreeSet<u64>,
+    /// The monotonic temporal stamp the next accepted enqueue takes.
+    next_enqueue_order: u64,
     /// Per-(house, category) factory registry — the authoritative production state
     /// machine AND (as of P5d) the queue-of-record: the active build is the `Factory` head
     /// fields, the FIFO tail is `Factory.queue` of `QueueEntry`. Mutated directly by
     /// enqueue/cancel/delivery (no `queues_by_owner` mirror); serialized + hashed. Its
     /// per-step charge runs against the real wallet via
     /// `step_all` at the Phase-7 head, before the house tail (C1).
-    pub factories: FactoryRegistry,
+    factories: FactoryRegistry,
 }
 
 impl ProductionState {
-    // Native primary is per Factory RTTI/Naval, so both building sidebar tabs
-    // use the same BuildingType primary. No second primary on the Defense tab.
-    fn primary_category(category: ProductionCategory) -> ProductionCategory {
-        if category == ProductionCategory::Defense {
-            ProductionCategory::Building
-        } else {
-            category
-        }
+    /// The stamp the next enqueue takes; it is spent only once the enqueue
+    /// is accepted ([`Self::spend_enqueue_order`]).
+    pub fn next_enqueue_order(&self) -> u64 {
+        self.next_enqueue_order
     }
+
+    /// An accepted enqueue (or a computer factory's construction) spends the
+    /// stamp it read.
+    pub(crate) fn spend_enqueue_order(&mut self) {
+        self.next_enqueue_order = self.next_enqueue_order.saturating_add(1);
+    }
+
+    pub fn factories(&self) -> &FactoryRegistry {
+        &self.factories
+    }
+
+    /// The registry's own operations carry the factory rules.
+    pub(crate) fn factories_mut(&mut self) -> &mut FactoryRegistry {
+        &mut self.factories
+    }
+
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn primary_factory_ids(
-        &self,
-        owner: InternedId,
-        category: ProductionCategory,
-    ) -> impl Iterator<Item = u64> + '_ {
-        self.active_producer_by_owner
-            .get(&owner)
-            .and_then(|categories| categories.get(&Self::primary_category(category)))
-            .into_iter()
-            .flat_map(|ids| ids.iter().copied())
+    pub fn set_next_enqueue_order_for_test(&mut self, value: u64) {
+        self.next_enqueue_order = value;
     }
-    pub(super) fn set_primary_factory(
-        &mut self,
-        owner: InternedId,
-        category: ProductionCategory,
-        id: u64,
-    ) {
-        self.active_producer_by_owner
-            .entry(owner)
-            .or_default()
-            .entry(Self::primary_category(category))
-            .or_default()
-            .insert(id);
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn factories_mut_for_test(&mut self) -> &mut FactoryRegistry {
+        &mut self.factories
+    }
+
+    /// Set the native primary byte. Building448070/448160 own which peers
+    /// clear first; this store keeps no group of its own.
+    pub(super) fn set_primary_factory(&mut self, id: u64) {
+        self.primary_factories.insert(id);
     }
     /// Clear the native primary byte without choosing a replacement. Unlimbo
     /// and ChangeOwner write it; destruction removes its retained identity.
     /// Limbo preserves the byte, while FindFactory filters the limbo object.
     pub(crate) fn clear_primary_factory(&mut self, id: u64) {
-        for categories in self.active_producer_by_owner.values_mut() {
-            categories.retain(|_, ids| {
-                ids.remove(&id);
-                !ids.is_empty()
-            });
-        }
-        self.active_producer_by_owner
-            .retain(|_, categories| !categories.is_empty());
+        self.primary_factories.remove(&id);
     }
     /// Whether this retained building has its native primary flag
     /// (`TechnoClass+0x3D3`). Limbo preserves that flag; production eligibility
     /// and display admission remain with their respective consumers.
     pub fn is_primary_factory(&self, id: u64) -> bool {
-        self.active_producer_by_owner
-            .values()
-            .any(|categories| categories.values().any(|ids| ids.contains(&id)))
+        self.primary_factories.contains(&id)
     }
-    pub(crate) fn retain_primary_factory_links(&mut self, live: &std::collections::BTreeSet<u64>) {
-        for categories in self.active_producer_by_owner.values_mut() {
-            categories.retain(|_, ids| {
-                ids.retain(|id| live.contains(id));
-                !ids.is_empty()
-            });
-        }
-        self.active_producer_by_owner
-            .retain(|_, categories| !categories.is_empty());
+    pub(crate) fn retain_primary_factory_links(&mut self, live: &BTreeSet<u64>) {
+        self.primary_factories.retain(|id| live.contains(id));
     }
-    /// Keep the established singleton hash while retaining every primary
-    /// flag in the native limbo-peer case. Neither field storage nor the
-    /// category index is exposed to the simulation hash consumer.
+    /// Every retained primary flag, in id order; no flag folds nothing.
     pub(crate) fn hash_primary_factories(&self, hasher: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
-        for (owner, categories) in &self.active_producer_by_owner {
-            owner.hash(hasher);
-            for (category, ids) in categories {
-                category.hash(hasher);
-                if ids.len() != 1 {
-                    b"retained-primary-factory-set-v1".hash(hasher);
-                    (ids.len() as u64).hash(hasher);
-                }
-                for id in ids {
-                    id.hash(hasher);
-                }
-            }
+        for id in &self.primary_factories {
+            id.hash(hasher);
         }
     }
+    /// Fixtures outside this module set one byte; they clear any other
+    /// flag they placed themselves.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn set_primary_factory_for_test(
-        &mut self,
-        owner: InternedId,
-        category: ProductionCategory,
-        id: u64,
-    ) {
-        // Existing fixtures install one chosen primary. Native histories
-        // inside production tests use the owner's additive setter instead.
-        if let Some(categories) = self.active_producer_by_owner.get_mut(&owner) {
-            categories.remove(&Self::primary_category(category));
-        }
-        self.set_primary_factory(owner, category, id);
+    pub(crate) fn set_primary_factory_for_test(&mut self, id: u64) {
+        self.set_primary_factory(id);
     }
 }
 
 impl Default for ProductionState {
     fn default() -> Self {
         Self {
-            active_producer_by_owner: BTreeMap::new(),
+            primary_factories: BTreeSet::new(),
             next_enqueue_order: 1,
-            ore_growth_config: OreGrowthConfig::disabled(),
-            ore_growth_state: OreGrowthState::new(0, 0),
-            terrain_animations: BTreeMap::new(),
-            terrain_objects: BTreeMap::new(),
-            terrain_object_cells: BTreeMap::new(),
-            tiberium_spawning_terrain_cells: BTreeSet::new(),
             factories: FactoryRegistry::default(),
         }
     }

@@ -14,12 +14,8 @@ PYTHONDONTWRITEBYTECODE=1 python -m tools.control_group_text_oracle --font /abso
 
 Its11 cases execute font loading434AD0→433880→433990→434700, measurement and
 70A6FD clipping. Fill/outline and4A66D0 are submission terminals in that legacy
-mode; those cases do not establish glyph pixels. The payload identifies the
-Steam3e81… executable. A historical1cdd… run therefore fails its strict file
-identity comparison even when every behavior field agrees. Keep both execution
-identities literal; the existing [shared-loader compatibility evidence](native_oracle.md#steam-compatibility-and-evidence-identity)
-establishes equal file-backed sections/layouts, not identical whole files or
-permission to relabel old evidence.
+mode; those cases do not establish glyph pixels. The payload records no executable identity, so any
+`gamemd.exe` copy replays it. See [evidence identity](native_oracle.md#evidence-identity).
 
 The additive full status comparison is:
 

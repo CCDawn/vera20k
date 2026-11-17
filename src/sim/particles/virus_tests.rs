@@ -90,7 +90,8 @@ fn retail_gas_harms_both_houses_but_respects_virus_poison_immunity() {
         // Advance only production particle dispatch: the bystander remains
         // in the cloud and cannot acquire damage from ordinary combat AI.
         for _ in 0..30 {
-            sim.session.binary_frame += 1;
+            sim.session
+                .set_binary_frame_for_test(sim.session.binary_frame() + 1);
             super::system_ai::tick_particle_systems(&mut sim, &rules);
         }
         let after = sim.entities().get(bystander).unwrap().health.current();
@@ -113,7 +114,8 @@ fn gas_damage_can_append_animal_death_particle_to_the_ticking_system() {
         .unwrap();
     // Explicit wounded-victim prior; the lethal pulse still traverses the
     // ordinary poison receiver and the NotHuman temporary-animation branch.
-    sim.entities_mut()
+    sim.substrate
+        .entities
         .get_mut(victim)
         .unwrap()
         .health
@@ -125,12 +127,13 @@ fn gas_damage_can_append_animal_death_particle_to_the_ticking_system() {
     sim.spawn_gas_particle(kind, glam::IVec3::new(c.x, c.y, c.z), &rules)
         .unwrap();
     let system = sim.particle_systems().gas_cloud_system().unwrap();
-    sim.particle_systems_mut()
+    sim.substrate
+        .particle_systems
         .get_mut(system)
         .unwrap()
         .particles[0]
         .damage_counter = 1;
-    sim.session.binary_frame = 1;
+    sim.session.set_binary_frame_for_test(1);
     super::system_ai::tick_particle_systems(&mut sim, &rules);
     let particles = &sim.particle_systems().get(system).unwrap().particles;
     assert_eq!(
@@ -163,22 +166,24 @@ fn retail_gas_snapshot_retains_global_owner_motion_and_child_cleanup() {
     let system = sim.particle_systems().gas_cloud_system().unwrap();
     // Explicit near-expiry boundary exercises both authored particle types
     // without a thousand-frame save test. Native expiry controls pin ordering.
-    sim.particle_systems_mut()
+    sim.substrate
+        .particle_systems
         .get_mut(system)
         .unwrap()
         .particles[0]
         .lifetime_remaining = 2;
-    sim.session.binary_frame = 36;
+    sim.session.set_binary_frame_for_test(36);
     super::system_ai::tick_particle_systems(&mut sim, &rules);
     let hash_with_owner = sim.state_hash();
-    sim.particle_systems_mut().gas_cloud_system = None;
+    sim.substrate.particle_systems.gas_cloud_system = None;
     assert_ne!(
         sim.state_hash(),
         hash_with_owner,
         "global reference reaches the state hash"
     );
-    sim.particle_systems_mut().gas_cloud_system = Some(system);
-    sim.session.map_name = "virus-cloud-continuation".into();
+    sim.substrate.particle_systems.gas_cloud_system = Some(system);
+    sim.session
+        .set_map_name_for_test("virus-cloud-continuation".into());
     let bytes = GameSnapshot::save_validated(&sim, 17, 23, "Virus continuation", 0);
     let mut restored = GameSnapshot::load_validated(&bytes, 17, 23, "virus-cloud-continuation")
         .unwrap()
@@ -204,10 +209,10 @@ fn retail_gas_snapshot_retains_global_owner_motion_and_child_cleanup() {
     );
     for frame in 37..=180 {
         for world in [&mut sim, &mut restored] {
-            world.session.binary_frame = frame;
+            world.session.set_binary_frame_for_test(frame);
             super::system_ai::tick_particle_systems(world, &rules);
             world.process_pending_delete_with(
-                Some(&rules),
+                &rules,
                 None,
                 FrameEffects::default(),
                 1,

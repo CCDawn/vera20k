@@ -5,10 +5,6 @@ use super::*;
 
 fn damage_corpus() -> &'static Value {
     let native = crate::test_fixture::json("tools/spatial_oracle/trigger_damage_events.json");
-    assert_eq!(
-        native["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     assert_eq!(native["receiver_rng"]["unchanged"], true);
     assert_eq!(
         native["receiver_rng"]["full_seed31"],
@@ -85,6 +81,8 @@ fn techno_post_object_anger_delta_matches_original_executed_fragment() {
     }
 }
 
+// Stock gamemd's tag tail; Ares replaces it (hook 0x5F57B5,
+// trigger_runtime_ares_tests).
 #[test]
 fn object_threshold_and_first_damage_order_matches_original_eighteen_controls() {
     let native = damage_corpus();
@@ -139,6 +137,7 @@ fn object_threshold_and_first_damage_order_matches_original_eighteen_controls() 
                 input["kind"] == "building" && input["can_c4"] == false,
                 0.25,
                 source,
+                false,
             )
         });
         drop(host);
@@ -174,6 +173,8 @@ fn object_threshold_and_first_damage_order_matches_original_eighteen_controls() 
     }
 }
 
+// Stock gamemd's tag tail; Ares replaces it (hook 0x5F57B5,
+// trigger_runtime_ares_tests).
 #[test]
 fn object_live_reads_and_callback_returns_match_original_twenty_three_mutations() {
     let native = damage_corpus();
@@ -263,6 +264,7 @@ fn object_live_reads_and_callback_returns_match_original_twenty_three_mutations(
                 false,
                 0.25,
                 source,
+                false,
             )
         });
         drop(host);

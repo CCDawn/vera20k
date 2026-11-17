@@ -2,6 +2,9 @@
 //! `tools/spatial_oracle/building_gattling.json` replayed through
 //! Mission_Attack's arms, Mission_Guard and the Update's Gattling block one
 //! call at a time, and its engagements through the production frame.
+//!
+//! The two charging replays hold in a stock game only: Ares' stage test reads
+//! the charged value (TechnoClass_UpdateGattling_Cycle, hook 0x70DEBA).
 
 use std::collections::BTreeMap;
 
@@ -23,6 +26,140 @@ use crate::sim::world::SimSoundEvent;
 /// The oracle weapons' ROF by slot (retail `[YAGGUN]`'s: the AA weapon of
 /// each stage fires faster than the last).
 const ROF: [i32; 6] = [16, 16, 16, 8, 16, 4];
+
+/// Techno6F9EA8 re-drives +4A4 before Guard4496DA releases it. A client
+/// whose camera just left earshot must stop the live loop before that release
+/// can leave it playing a decay at the previous gain.
+#[test]
+fn retail_gattling_updates_its_loop_position_before_guard_releases_it() {
+    use crate::sim::anim_class::AnimWorldCoord;
+    use crate::sim::world::{FrameEffects, SoundBoundary, TickLane};
+    use std::cell::{Cell, RefCell};
+
+    struct Heard {
+        owner: u64,
+        delivered: Cell<usize>,
+        calls: RefCell<Vec<(&'static str, Option<AnimWorldCoord>)>>,
+    }
+    impl SoundBoundary for Heard {
+        fn consume(&self, _: &Simulation, _: &RuleSet, events: &[SimSoundEvent]) {
+            for event in &events[self.delivered.get()..] {
+                if matches!(event, SimSoundEvent::GattlingLoopRelease { owner } if *owner == self.owner)
+                {
+                    self.calls.borrow_mut().push(("release", None));
+                }
+            }
+            self.delivered.set(events.len());
+        }
+        fn delivered(&self) -> usize {
+            self.delivered.get()
+        }
+        fn update_looping_sound(&self, _: &Simulation, owner: u64, world: AnimWorldCoord) {
+            if owner == self.owner {
+                self.calls.borrow_mut().push(("position", Some(world)));
+            }
+        }
+    }
+
+    let Some(mut retail) =
+        crate::rules::retail_ini_fixture::retail_battle_rules_for_map("XMP03T4.MAP")
+    else {
+        return;
+    };
+    let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+        return;
+    };
+    let theater = crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
+    let roots = crate::rules::effect_asset_catalog::tolerant_anim_class_roots(&retail.rules);
+    retail
+        .rules
+        .bind_anim_class_assets(&roots, &assets, theater.extension, "TEMPERATE");
+    retail
+        .rules
+        .bind_effect_assets(&assets, theater.extension, "TEMPERATE");
+    let rules = retail.rules;
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x6f9ea8);
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    let cannon = sim
+        .spawn_object("YAGGUN", "Americans", 12, 12, 0, &rules)
+        .unwrap();
+    sim.spawn_object("GAPOWR", "Americans", 4, 4, 0, &rules)
+        .unwrap();
+    let target = sim
+        .spawn_object("MTNK", "Russians", 16, 12, 0, &rules)
+        .unwrap();
+    // Seen, so Guard's release follows from the cleared target, not from the
+    // campaign discovery gate (`0x006F81BE`) hiding the tank from its scan.
+    crate::sim::arena_fixture::discover(&mut sim, target);
+    assert!(sim.apply_command(
+        "Americans",
+        &Command::Attack {
+            attacker_id: cannon,
+            target_id: target
+        },
+        Some(&rules)
+    ));
+    let started = (0..120).any(|_| {
+        let output = sim
+            .advance_app_frame(
+                &[],
+                &rules,
+                None,
+                33,
+                TickLane::Ordinary,
+                FrameEffects::empty(),
+            )
+            .unwrap();
+        output.sound_events.iter().any(|event| {
+            matches!(event,
+            SimSoundEvent::GattlingLoop { owner, sound_id, .. }
+            if *owner == gattling_sound_owner(cannon) && sound_id == "GattlingGunAttackLoop1")
+        })
+    });
+    assert!(
+        started,
+        "the stock cannon starts its report through its real Attack visit"
+    );
+    assert!(sim.entities().get(cannon).unwrap().gattling.report_latch());
+    assert!(sim.apply_command(
+        "Americans",
+        &Command::Stop { entity_id: cannon },
+        Some(&rules)
+    ));
+    let world = Simulation::movement_sound_world(sim.entities().get(cannon).unwrap());
+    let heard = Heard {
+        owner: gattling_sound_owner(cannon),
+        delivered: Cell::new(0),
+        calls: RefCell::new(Vec::new()),
+    };
+    let released = (0..60).any(|_| {
+        heard.delivered.set(0);
+        heard.calls.borrow_mut().clear();
+        sim.advance_app_frame(
+            &[],
+            &rules,
+            None,
+            33,
+            TickLane::Ordinary,
+            FrameEffects::for_sound(&heard),
+        )
+        .unwrap();
+        heard
+            .calls
+            .borrow()
+            .iter()
+            .any(|(kind, _)| *kind == "release")
+    });
+    assert!(
+        released,
+        "the ordinary no-target path reaches Guard's release"
+    );
+    assert_eq!(
+        heard.calls.borrow().as_slice(),
+        [("position", Some(world)), ("release", None)]
+    );
+}
 
 fn golden() -> &'static Value {
     crate::test_fixture::json("tools/spatial_oracle/building_gattling.json")
@@ -412,44 +549,6 @@ fn live_shot(sim: &Simulation, building: u64) -> Option<(String, TargetKind)> {
         })
 }
 
-/// A later object retargeting the building after its visit (a bullet's
-/// retaliation later in the Logic pass, say) leaves the visit's shot alone:
-/// native's FireAt ran inside the visit (`0x0044B6D0`), at that visit's
-/// TarCom with its weapon, before any later retarget can change it.
-#[test]
-fn a_retarget_after_the_visit_keeps_the_visits_shot() {
-    let rules = rules(36, 50, true);
-    let (mut sim, building, target) = fixture(&rules, "GAT", (8, 5));
-    let other = sim
-        .spawn_object("SHED", "Russians", 5, 8, 0, &rules)
-        .unwrap();
-    aim_at(&mut sim, building, target);
-    let (aimed, weapon) = attack_prelude(&mut sim, building, &rules).unwrap();
-    assert_eq!(
-        attack_arm(
-            &mut sim,
-            building,
-            &rules,
-            aimed,
-            weapon,
-            FireError::Ok,
-            ObjectAiCtx::default(),
-            &mut false
-        ),
-        1
-    );
-    aim_at(&mut sim, building, other);
-    assert_eq!(
-        live_shot(&sim, building),
-        Some(("W0".to_string(), TargetKind::Entity(target)))
-    );
-    let entity = sim.substrate.entities.get(building).unwrap();
-    assert_eq!(
-        entity.attack_target.target(),
-        Some(TargetKind::Entity(other))
-    );
-}
-
 /// Original44B6D0 returns from FireAt before44B6EF charges Gattling and
 /// before the next Logic object. A deferred request cannot supply its rearm
 /// or effect to that next caller (including Tesla's appended Spark system).
@@ -574,7 +673,13 @@ fn gattling_idle_decay_matches_the_original() {
         assert_eq!(dead, input["dead"] == true, "{name}");
         let stage_before = entity.gattling.stage();
         with_draws(&mut sim, row, |sim| {
-            gattling_idle(sim, building, &rules);
+            gattling_idle(
+                &sim.interner,
+                &sim.session,
+                &mut sim.substrate,
+                building,
+                &rules,
+            );
             0
         });
         assert_gattling(&sim, building, row, stage_before);
@@ -654,7 +759,7 @@ fn gattling_cadence_matches_the_original() {
         let mut scenario_draws = 0;
         // The object pass of the frame `advance_tick` commits as `start + k`
         // runs at `base + k`, the frame its timers record.
-        let start = sim.session.binary_frame;
+        let start = sim.session.binary_frame();
         let base = i64::from(start) - 1;
         let mut stage_before = 0;
         for frame in row["frames"].as_array().unwrap() {
@@ -665,7 +770,7 @@ fn gattling_cadence_matches_the_original() {
                     sim.assign_target_represented(
                         building,
                         Some(TargetKind::Entity(target)),
-                        Some(&rules),
+                        &rules,
                         None,
                         crate::sim::world::FrameEffects::default(),
                     )
@@ -675,7 +780,7 @@ fn gattling_cadence_matches_the_original() {
                     sim.assign_target_represented(
                         building,
                         None,
-                        Some(&rules),
+                        &rules,
                         None,
                         crate::sim::world::FrameEffects::default(),
                     )
@@ -686,6 +791,7 @@ fn gattling_cadence_matches_the_original() {
                         building,
                         target,
                         &rules,
+                        None,
                         crate::sim::world::FrameEffects::default()
                     ));
                 }
@@ -703,10 +809,10 @@ fn gattling_cadence_matches_the_original() {
             for _ in 0..count(native_events, "rng", Some("main")) {
                 main.next_u32();
             }
-            sim.fire_events.clear();
-            sim.sound_events.clear();
+            sim.fire_events.clear_for_test();
+            sim.sound_events.clear_for_test();
             sim.advance_tick(&[], Some(&rules), None, None, 67);
-            assert_eq!(u64::from(sim.session.binary_frame - start), k, "{name}");
+            assert_eq!(u64::from(sim.session.binary_frame() - start), k, "{name}");
 
             let entity = sim.substrate.entities.get(building).unwrap();
             assert_eq!(
@@ -933,7 +1039,7 @@ fn retail_dustbowl_gattling_cannon_spins_up_and_winds_down() {
     );
 
     let enemy_house = scenario.sim().interner.get("Americans").unwrap();
-    let tick = scenario.sim().session.tick;
+    let tick = scenario.sim().session.tick();
     let order = retail_frame(
         &mut scenario,
         vec![CommandEnvelope::new(

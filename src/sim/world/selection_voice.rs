@@ -20,11 +20,11 @@
 use super::Simulation;
 use crate::rules::ruleset::RuleSet;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_p_s))]
 #[path = "selection_voice_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_p_s))]
 #[path = "order_voice_tests.rs"]
 mod order_tests;
 
@@ -64,7 +64,7 @@ impl Simulation {
     /// The returned registered sound name is a presentation request; this
     /// operation changes only the existing process Main cursor.
     pub fn selection_voice_request<'a>(
-        &mut self,
+        &self,
         rules: &'a RuleSet,
         entity_id: u64,
         voices_enabled: bool,
@@ -74,7 +74,7 @@ impl Simulation {
         let passive = self
             .houses
             .get(&entity.owner())
-            .is_some_and(|house| house.multiplay_passive);
+            .is_some_and(|house| house.multiplay_passive());
         if !voices_enabled || (!human_player && !passive) {
             return None;
         }
@@ -100,7 +100,7 @@ impl Simulation {
     /// VoiceMove708FC0 consumes the full fixed-catalog list retained by the
     /// existing type-processing owner, including Enter/Capture/Harvest fallback.
     pub fn order_voice_request<'a>(
-        &mut self,
+        &self,
         rules: &'a RuleSet,
         entity_id: u64,
         voice_field: &str,
@@ -148,7 +148,7 @@ impl Simulation {
     /// A reached list still draws before QueueVoice rejects disabled/nonhuman
     /// requests; QueueMegaMission's earlier enable gate is owned above.
     fn attack_voice_request<'a>(
-        &mut self,
+        &self,
         rules: &'a RuleSet,
         entity_id: u64,
         target: Option<crate::sim::combat::TargetKind>,
@@ -177,9 +177,13 @@ impl Simulation {
             Some(&self.house_alliances),
         )?;
         // GetWeapon(-1) returns a NULL slot, which7090C0 dereferences before
-        // any voice or draw. A valid slot containing a NULL weapon is distinct
-        // and continues to the ordinary override/list logic.
-        assert_ne!(index, -1, "VoiceAttack7090C0 dereferences GetWeapon(-1)");
+        // any voice or draw (`DeployFireWeapon=-1` on a deployed unit reaches
+        // it). VERA plays no attack voice there. A valid slot containing a
+        // NULL weapon is distinct and continues to the ordinary override/list
+        // logic.
+        if index == -1 {
+            return None;
+        }
         let weapon = combat_weapon::get_weapon(
             entity,
             object,
@@ -188,6 +192,45 @@ impl Simulation {
             rules,
             &self.interner,
         );
+        // Ares 3.0 TechnoClass_SelectFiringVoice (1004B1D0, hook 0x7090A8):
+        // a repairing weapon takes `VoiceRepair`, else the case-sensitive
+        // `FV` VoiceIFVRepair; then the rank's slot override, an elite one
+        // falling back to the rookie one; then a `RandomRanged(0, n - 1)`
+        // Main draw over VoiceAttack. Each unset tier falls through.
+        if rules.ares() {
+            let set = |voice: Option<&'a str>| voice.filter(|voice| !voice.is_empty());
+            let repair = weapon.is_some_and(|weapon| weapon.damage < 0);
+            let voice = repair
+                .then(|| {
+                    set(object.ares_voice_repair()).or_else(|| {
+                        (object.id == "FV")
+                            .then(|| set(rules.general.voice_ifv_repair()))
+                            .flatten()
+                    })
+                })
+                .flatten()
+                .or_else(|| {
+                    veterancy::raw_is_elite(entity.veterancy.raw())
+                        .then(|| set(object.voice_attack_override(index, true)))
+                        .flatten()
+                })
+                .or_else(|| set(object.voice_attack_override(index, false)));
+            if let Some(sound) = voice {
+                return Self::queue_voice_request(Some(sound), voices_enabled, human_player);
+            }
+            let voices = object.voice_attack();
+            if voices.is_empty() {
+                return None;
+            }
+            let index = self
+                .main_rng
+                .next_range_i32_inclusive(0, voices.len() as i32 - 1);
+            return Self::queue_voice_request(
+                voices.get(index as usize).map(String::as_str),
+                voices_enabled,
+                human_player,
+            );
+        }
         let scalar = if weapon.is_some_and(|weapon| weapon.damage < 0)
             && object.id.eq_ignore_ascii_case("FV")
         {
@@ -220,7 +263,7 @@ impl Simulation {
     /// test/clear. Common infantry522510 deployment chooses +594 instead of
     /// +590; a missing slot stays silent, with no fallback or Main draw.
     /// Source: tools/input_oracle/slave_miner_pack_voice.{json,meta.json};
-    /// original1cdd1180.
+    /// original gamemd.
     pub fn deploy_voice_request<'a>(
         &mut self,
         rules: &'a RuleSet,
@@ -252,7 +295,8 @@ impl Simulation {
             };
             Self::queue_voice_request(sound, voices_enabled, human_player)
         };
-        self.entities_mut()
+        self.substrate
+            .entities
             .get_mut(entity_id)?
             .suppress_deploy_voice
             .clear();
@@ -266,7 +310,7 @@ impl Simulation {
     /// Native ReadSoundList binding skips unresolved names, so its selected-ID
     /// -1 rejection is represented only by deliberately unbound test inputs.
     fn voice_request_from_list<'a>(
-        &mut self,
+        &self,
         voices: &'a [String],
         voices_enabled: bool,
         human_player: bool,

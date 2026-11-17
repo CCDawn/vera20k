@@ -22,6 +22,7 @@ from tools.projectile_oracle.bridge_render_inputs import BulletReader, assets_ro
 from tools.rules_oracle.bridge_anim_inputs import Reader
 from tools.spatial_oracle import building_prism as prism
 from tools.spatial_oracle.building_body_rules import INI, RULES, SP
+from tools.native_oracle import require
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -448,7 +449,7 @@ class PhysicalBirth(BulletReader):
             art[self.type_name]['PrimaryFireFLH'] = case['art_flh_control']
         self.make_ini(art)
         self.rules_cache({self.type_name: dict(self.latest_type)})
-        assert self.invoke(0x5240A0, self.type, (RULES,)) & 255
+        require(self.invoke(0x5240A0, self.type, (RULES,)) & 255, 'native 0x5240A0 returned an unexpected result')
         u = self.u
         for p, xyz in ((self.source, case['location']), (self.target, case['target'])):
             u.mem_write(p + 0x9C, words(*xyz))
@@ -833,7 +834,7 @@ def generate():
     assert equal['beam']['z_adjust'] == 0
     assert not any(row['name'] == 'project_for_source_adjust' for row in equal['calls'])
     birth = births[0]['beam']
-    result = dict(schema_version=1, native_sha256=native.image_sha256(),
+    result = dict(schema_version=1,
         inputs=machine.reader_inputs, color_controls=colors,
         birth_rng_before=machine.rng_initial, birth_rng_after=machine.rng_trace.states(),
         birth_rows=births, fps_rows=fps_rows(birth), length_rows=length_rows(birth),
@@ -853,7 +854,7 @@ def generate_chrono():
     cases = [dict(case, name=case['name'].replace('deso', 'cleg'))
              for case in birth_cases()[:4]]
     births = [machine.birth(case) for case in cases]
-    result = dict(schema_version=1, native_sha256=native.image_sha256(),
+    result = dict(schema_version=1,
         inputs=machine.reader_inputs, color_controls=colors,
         birth_rng_before=machine.rng_initial, birth_rng_after=machine.rng_trace.states(),
         birth_rows=births, geometry_rows=geometry_rows(births[0]['beam'], cases=[

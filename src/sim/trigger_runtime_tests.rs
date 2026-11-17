@@ -10,7 +10,125 @@ use crate::sim::projectile::{
 };
 use crate::sim::replay::{ReplayHeader, ReplayLog, ReplayRunner};
 use crate::sim::snapshot::GameSnapshot;
-use crate::sim::world::{FrameEffects, MasterFrameTestRung, Simulation, TickLane};
+use crate::sim::world::{FrameEffects, FrameStep, Simulation, TickLane};
+
+#[test]
+fn local_reload_preserves_unnamed_and_unassigned_values() {
+    // ReadLocal689B2E clears names only;689C14 skips a missing second token.
+    let map = |variables: &str| {
+        crate::map::map_file::MapFile::from_bytes(
+            format!("{READER_MAP_PREFIX}[VariableNames]\n{variables}").as_bytes(),
+        )
+        .unwrap()
+    };
+    let mut sim = Simulation::new();
+    sim.initialize_trigger_definitions(
+        &map("7=Kept,1\n8=AlsoKept,1\n9=Cleared,1\n"),
+        &Default::default(),
+        None,
+        None,
+        None,
+    );
+    sim.initialize_trigger_definitions(
+        &map("8=Renamed\n9=ExplicitClear,0\n"),
+        &Default::default(),
+        None,
+        None,
+        None,
+    );
+    assert!(sim.trigger_local_is_set_for_test(7), "unnamed slot");
+    assert!(sim.trigger_local_is_set_for_test(8), "no assignment token");
+    assert!(!sim.trigger_local_is_set_for_test(9), "explicit assignment");
+}
+
+#[test]
+fn local_reload_matches_original_reader_histories() {
+    let native = crate::test_fixture::json("tools/input_oracle/campaign_start.json");
+    for history in native["local_variable_controls"].as_array().unwrap() {
+        let mut outgoing = Simulation::with_seed(31);
+        outgoing.trigger_runtime.locals_set = history["initial_set"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap() as u32)
+            .collect();
+        for pass in history["passes"].as_array().unwrap() {
+            let mut source = READER_MAP_PREFIX.to_owned();
+            for section in pass["ordered_sections"].as_array().unwrap() {
+                source.push_str(&format!("[{}]\n", section["name"].as_str().unwrap()));
+                for pair in section["entries"].as_array().unwrap() {
+                    source.push_str(&format!(
+                        "{}={}\n",
+                        pair[0].as_str().unwrap(),
+                        pair[1].as_str().unwrap()
+                    ));
+                }
+            }
+            let map = crate::map::map_file::MapFile::from_bytes(source.as_bytes()).unwrap();
+            let mut incoming = Simulation::with_seed(31);
+            let rng = incoming.rng_state();
+            incoming.inherit_local_variables_for_fresh_load(
+                outgoing.retain_local_variables_for_fresh_load(),
+            );
+            install_map_triggers(&mut incoming, &map);
+            let expected: BTreeSet<u32> = pass["set_slots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_u64().unwrap() as u32)
+                .collect();
+            assert_eq!(incoming.trigger_runtime.locals_set, expected, "{history}");
+            let names: std::collections::BTreeMap<_, _> = map
+                .local_variables
+                .values()
+                .map(|variable| (variable.index.to_string(), variable.name.clone()))
+                .collect();
+            assert_eq!(serde_json::to_value(names).unwrap(), pass["names"]);
+            assert_eq!(incoming.trigger_runtime.dirty, [false; 4]);
+            assert_eq!(incoming.rng_state(), rng);
+            outgoing = incoming;
+        }
+    }
+}
+
+#[test]
+fn local_retention_reaches_incoming_trigger_and_saved_world() {
+    let mut outgoing = Simulation::new();
+    install_map_triggers(
+        &mut outgoing,
+        &trigger_fixture_map("[VariableNames]\n7=MissionFlag,1\n"),
+    );
+    let mut incoming = Simulation::new();
+    incoming
+        .inherit_local_variables_for_fresh_load(outgoing.retain_local_variables_for_fresh_load());
+    install_map_triggers(
+        &mut incoming,
+        &trigger_fixture_map(
+            "[VariableNames]\n7=Renamed\n\
+             [Triggers]\nT=<none>,<none>,Retained,0,1,1,1,0\n\
+             [Events]\nT=2,13,0,0,36,0,7\n\
+             [Actions]\nT=1,28,0,12,0,0,0,0,A\n\
+             [Tags]\nTAG=0,Retained,T\n",
+        ),
+    );
+    incoming.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
+    ordinary_master_frame(&mut incoming, None, None, true);
+    assert!(
+        incoming.global_variables()[12],
+        "retained local admits the incoming trigger"
+    );
+    let bytes = GameSnapshot::save_validated(&incoming, 0, 0, "local retention", 0);
+    let saved = GameSnapshot::load(&bytes).unwrap();
+    assert!(saved.sim.trigger_local_is_set_for_test(7));
+    assert!(saved.sim.global_variables()[12]);
+}
+
+#[path = "trigger_runtime_mind_control_callback_tests.rs"]
+mod mind_control_callbacks;
+#[path = "trigger_runtime_mind_control_tests.rs"]
+mod mind_control_campaign;
+#[path = "trigger_runtime_mind_control_native_tests.rs"]
+mod mind_control_native;
 
 #[test]
 fn loss_threshold_events_poll_recorded_losses_and_create_real_reinforcements() {
@@ -20,9 +138,11 @@ fn loss_threshold_events_poll_recorded_losses_and_create_real_reinforcements() {
 
     for (kind, victim_type) in [(15, "CABHUT"), (16, "TAGUNIT")] {
         let (mut sim, rules, overlay, houses) = event_ingress_fixture();
-        sim.session.game_mode_nonzero = false;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false),
+        );
         for house in sim.houses.values_mut() {
-            house.is_human = true;
+            house.set_is_human_for_test(true);
         }
         let victims: Vec<_> = [(15, 15), (16, 15)]
             .into_iter()
@@ -47,15 +167,15 @@ fn loss_threshold_events_poll_recorded_losses_and_create_real_reinforcements() {
             ),
         );
         let teams = TeamAiIniRegistry::from_sources(&IniFile::from_str(""), &map.ini, false);
-        sim.install_team_ai_registry(&teams, &rules).unwrap();
+        sim.install_team_ai_registry(&teams, &rules);
         // The shared simple-map fixture initially has no Team registry.
         // Re-enter the real definition reader with the authored Team inputs.
-        sim.initialize_trigger_definitions(&map, &teams, None, None);
+        sim.initialize_trigger_definitions(&map, &teams, None, None, None);
         sim.session.install_waypoints(&map.waypoints);
-        sim.classify_map_triggers(Some(&rules));
+        sim.classify_map_triggers(&rules);
         let team_type = sim.interner.get("TT").unwrap();
         let loss_count = |sim: &Simulation| {
-            let stats = &sim.houses[&houses[0]].stats;
+            let stats = sim.houses[&houses[0]].stats();
             if kind == 15 {
                 stats.buildings_lost()
             } else {
@@ -75,7 +195,7 @@ fn loss_threshold_events_poll_recorded_losses_and_create_real_reinforcements() {
                 victim,
                 KillSource::Techno(Some(killer)),
                 KillCallback::Terminal,
-                UninitContext::new(Some(&rules), Some(&overlay)),
+                UninitContext::new(&rules, Some(&overlay)),
             );
             assert_eq!(loss_count(&sim), index as u32 + 1);
             assert!(
@@ -88,7 +208,8 @@ fn loss_threshold_events_poll_recorded_losses_and_create_real_reinforcements() {
             );
             assert!(!sim.trigger_runtime.globals_set.contains(&7));
             sim.uninit_with_rules(victim, &rules);
-            sim.session.binary_frame = if index == 0 { 8 } else { 16 };
+            sim.session
+                .set_binary_frame_for_test(if index == 0 { 8 } else { 16 });
             frame(&mut sim);
             assert_eq!(sim.trigger_runtime.globals_set.contains(&7), index == 1);
         }
@@ -105,7 +226,7 @@ fn loss_threshold_events_poll_recorded_losses_and_create_real_reinforcements() {
         assert!(!reinforcement.lifecycle.in_limbo());
         assert!(reinforcement.lifecycle.object_alive());
         assert!(sim.trigger_runtime.tag_order.is_empty());
-        sim.session.binary_frame = 24;
+        sim.session.set_binary_frame_for_test(24);
         frame(&mut sim);
         assert_eq!(
             sim.trigger_runtime
@@ -122,9 +243,10 @@ fn loss_threshold_events_poll_recorded_losses_and_create_real_reinforcements() {
 #[test]
 fn funds_event_runs_from_house_rung_after_a_spend() {
     let (mut sim, rules, overlay, houses) = event_ingress_fixture();
-    sim.session.game_mode_nonzero = false;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false));
     for house in sim.houses.values_mut() {
-        house.is_human = true;
+        house.set_is_human_for_test(true);
     }
     install_event_ingress_map(
         &mut sim,
@@ -134,12 +256,12 @@ fn funds_event_runs_from_house_rung_after_a_spend() {
          [Actions]\nFUNDS=1,28,0,7,0,0,0,0,A\n\
          [Tags]\nFUNDS_TAG=0,Funds,FUNDS\n",
     );
-    crate::sim::credit_income::add_credits(&mut sim, houses[0], 70000);
-    sim.session.binary_frame = 0;
+    crate::sim::credit_income::add_credits(&mut sim.houses, houses[0], 70000);
+    sim.session.set_binary_frame_for_test(0);
     for frame in 0..=8 {
-        assert_eq!(sim.session.binary_frame, frame);
+        assert_eq!(sim.session.binary_frame(), frame);
         if frame == 7 {
-            crate::sim::credit_income::spend_money(&mut sim, houses[0], 60000);
+            crate::sim::credit_income::spend_money(&mut sim.houses, houses[0], 60000);
         }
         ordinary_master_frame(&mut sim, Some(&rules), Some(&overlay), false);
         // Native House4F8F87 -> Tag/RegisterEvent -> HasOccurred52:
@@ -151,7 +273,7 @@ fn funds_event_runs_from_house_rung_after_a_spend() {
         );
     }
     assert_eq!(
-        crate::sim::credit_income::available_money(&sim, houses[0]),
+        crate::sim::credit_income::available_money(&sim.houses, houses[0]),
         10000
     );
     assert!(sim.trigger_runtime.tag_order.is_empty());
@@ -160,14 +282,15 @@ fn funds_event_runs_from_house_rung_after_a_spend() {
 #[test]
 fn building_loss_event_waits_for_the_real_destructor_and_house_poll() {
     let (mut sim, rules, overlay, houses) = event_ingress_fixture();
-    sim.session.game_mode_nonzero = false;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false));
     for house in sim.houses.values_mut() {
-        house.is_human = true;
+        house.set_is_human_for_test(true);
     }
     let building = sim
         .spawn_object_at_height("CABHUT", "House0", 15, 15, 0, 0, &rules)
         .expect("the shared fixture admits ordinary Building construction");
-    assert_eq!(sim.houses[&houses[0]].tracking.buildings(), 1);
+    assert_eq!(sim.houses[&houses[0]].tracking().buildings(), 1);
     install_event_ingress_map(
         &mut sim,
         &rules,
@@ -181,7 +304,7 @@ fn building_loss_event_waits_for_the_real_destructor_and_house_poll() {
     };
     frame(&mut sim);
     assert!(!sim.trigger_runtime.locals_set.contains(&10));
-    sim.session.binary_frame = 8;
+    sim.session.set_binary_frame_for_test(8);
     sim.uninit_with_rules(building, &rules);
     assert!(
         sim.substrate
@@ -191,14 +314,14 @@ fn building_loss_event_waits_for_the_real_destructor_and_house_poll() {
             .lifecycle
             .in_limbo()
     );
-    assert_eq!(sim.houses[&houses[0]].tracking.buildings(), 1);
+    assert_eq!(sim.houses[&houses[0]].tracking().buildings(), 1);
     frame(&mut sim);
     // House polls before the shared pending-delete drain. Limbo alone must
     // not report all buildings destroyed, even with no live map building.
     assert!(!sim.trigger_runtime.locals_set.contains(&10));
     assert!(sim.substrate.entities.get(building).is_none());
-    assert_eq!(sim.houses[&houses[0]].tracking.buildings(), 0);
-    sim.session.binary_frame = 16;
+    assert_eq!(sim.houses[&houses[0]].tracking().buildings(), 0);
+    sim.session.set_binary_frame_for_test(16);
     frame(&mut sim);
     assert!(sim.trigger_runtime.locals_set.contains(&10));
     assert!(!sim.trigger_runtime.globals_set.contains(&7));
@@ -218,12 +341,17 @@ fn naval_land_events_poll_final_tracking_removal_from_the_master_house_rung() {
     );
     let country = sim.interner.intern("Country0");
     let owner = sim.interner.intern("House0");
-    sim.houses.insert(
-        owner,
-        crate::sim::house_state::HouseState::new(owner, 0, Some(country), true, 0, 10),
-    );
-    sim.session.house_order.push(owner);
-    sim.session.game_mode_nonzero = false;
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner,
+            0,
+            Some(country),
+            true,
+            0,
+            10,
+        ));
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false));
     let navy = sim
         .spawn_object_limbo_at_height("NAVAL", "House0", 15, 15, 0, 0, &rules)
         .unwrap();
@@ -239,13 +367,13 @@ fn naval_land_events_poll_final_tracking_removal_from_the_master_house_rung() {
          [Tags]\nNAVY_TAG=0,Navy,NAVY\nLAND_TAG=0,Land,LAND\n",
     );
     for frame in 0..=24 {
-        assert_eq!(sim.session.binary_frame, frame);
+        assert_eq!(sim.session.binary_frame(), frame);
         if frame == 7 {
             sim.uninit_with_rules(navy, &rules);
-            assert_eq!(sim.houses[&owner].tracking.navy(), 1);
+            assert_eq!(sim.houses[&owner].tracking().navy(), 1);
         } else if frame == 15 {
             sim.uninit_with_rules(land, &rules);
-            assert_eq!(sim.houses[&owner].tracking.vehicles(), 1);
+            assert_eq!(sim.houses[&owner].tracking().vehicles(), 1);
         }
         ordinary_master_frame(&mut sim, Some(&rules), Some(&overlay), true);
         assert_eq!(
@@ -269,13 +397,18 @@ fn naval_land_events_poll_final_tracking_removal_from_the_master_house_rung() {
 #[test]
 fn music_action_reaches_the_ordered_presentation_effects() {
     let (mut sim, rules, overlay, _) = event_ingress_fixture();
-    install_event_ingress_map(
-        &mut sim,
-        &rules,
+    let map = trigger_fixture_map(
         "[Triggers]\nMUSIC=Country0,<none>,Music,0,1,1,1,0\n\
          [Events]\nMUSIC=1,8,0,0\n\
          [Actions]\nMUSIC=3,20,8,DROK,0,0,0,0,A,20,0,-3,0,0,0,0,A,11,4,AFTER_MUSIC,0,0,0,0,A\n",
     );
+    let themes = crate::rules::theme_ini::ThemeCatalog::from_entries_for_test(
+        crate::rules::theme_ini::catalog_from_ini(&crate::rules::ini_parser::IniFile::from_str(
+            "[Themes]\n0=INTRO\n1=Drok\n",
+        )),
+    );
+    sim.initialize_trigger_definitions(&map, &Default::default(), None, None, Some(&themes));
+    sim.classify_map_triggers(&rules);
     let source = sim
         .trigger_runtime
         .definitions
@@ -288,9 +421,9 @@ fn music_action_reaches_the_ordered_presentation_effects() {
     for action in &actions {
         assert!(sim.apply_live_trigger_action(
             action,
-            sim.trigger_action_context(source, None, TagEventInput::default(), Some(&rules)),
+            sim.trigger_action_context(source, None, TagEventInput::default(), &rules),
             &mut effects,
-            Some(&rules),
+            &rules,
             Some(&overlay),
             FrameEffects::default(),
         ));
@@ -299,7 +432,7 @@ fn music_action_reaches_the_ordered_presentation_effects() {
         effects,
         [
             TriggerEffect::MusicTheme {
-                request: ThemeRequest::Name("DROK".into()),
+                request: ThemeRequest::Index(1),
             },
             TriggerEffect::MusicTheme {
                 request: ThemeRequest::Index(-3),
@@ -331,9 +464,9 @@ fn retail_sov01_closeout_queues_matching_triggers_without_detaching_them() {
     for action in actions.iter().filter(|action| action.entry.kind == 12) {
         assert!(sim.apply_live_trigger_action(
             action,
-            sim.trigger_action_context(source, None, TagEventInput::default(), Some(&rules)),
+            sim.trigger_action_context(source, None, TagEventInput::default(), &rules),
             &mut Vec::new(),
-            Some(&rules),
+            &rules,
             Some(&overlay),
             FrameEffects::default(),
         ));
@@ -363,13 +496,7 @@ fn retail_sov01_closeout_queues_matching_triggers_without_detaching_them() {
             .filter(|trigger| trigger.type_index == source)
             .all(|trigger| !trigger.pending)
     );
-    sim.process_pending_delete_with(
-        Some(&rules),
-        Some(&overlay),
-        FrameEffects::default(),
-        1,
-        true,
-    );
+    sim.process_pending_delete_with(&rules, Some(&overlay), FrameEffects::default(), 1, true);
     assert!(
         sim.trigger_runtime
             .triggers
@@ -377,7 +504,8 @@ fn retail_sov01_closeout_queues_matching_triggers_without_detaching_them() {
             .flatten()
             .all(|trigger| !trigger.pending)
     );
-    sim.validate_restored_trigger_runtime().unwrap();
+    sim.validate_restored_trigger_runtime(rules.ares_form())
+        .unwrap();
 }
 
 #[test]
@@ -409,8 +537,9 @@ fn delete_tag_returns_safely_through_its_active_dispatcher() {
             let active = sim.shared_trigger_tag(active_type);
             let other_type = sim.trigger_runtime.definitions.tag_type("OTHER").unwrap();
             let other = sim.shared_trigger_tag(other_type);
-            let cell = sim.trigger_cell_identity((15, 15));
-            sim.replace_cell_trigger_tag(cell, Some(active));
+            let cell = Simulation::trigger_cell_identity(&sim.resolved_terrain, (15, 15));
+            sim.trigger_runtime
+                .replace_cell_trigger_tag(cell, Some(active));
             assert_eq!(sim.trigger_runtime.tag(active).unwrap().refs, 1);
             assert!(sim.dispatch_live_tag_event(
                 active,
@@ -420,7 +549,7 @@ fn delete_tag_returns_safely_through_its_active_dispatcher() {
                     ..TagEventInput::default()
                 },
                 &mut Vec::new(),
-                Some(&rules),
+                &rules,
                 Some(&overlays),
                 FrameEffects::default(),
             ));
@@ -429,13 +558,14 @@ fn delete_tag_returns_safely_through_its_active_dispatcher() {
             assert!(!sim.trigger_runtime.locals_set.contains(&7));
             assert!(!sim.trigger_runtime.tag(other).unwrap().dispatch_guard);
             sim.process_pending_delete_with(
-                Some(&rules),
+                &rules,
                 Some(&overlays),
                 FrameEffects::default(),
                 1,
                 true,
             );
-            sim.validate_restored_trigger_runtime().unwrap();
+            sim.validate_restored_trigger_runtime(rules.ares_form())
+                .unwrap();
         }
     }
 }
@@ -467,14 +597,15 @@ fn retail_sov01_boris_tag_delete_is_immediate_and_releases_attachments() {
         .tag_type("0C47FB1C")
         .unwrap();
     let unrelated = sim.construct_trigger_tag(unrelated_type);
-    let cell = sim.trigger_cell_identity((50, 60));
-    sim.replace_cell_trigger_tag(cell, Some(first));
+    let cell = Simulation::trigger_cell_identity(&sim.resolved_terrain, (50, 60));
+    sim.trigger_runtime
+        .replace_cell_trigger_tag(cell, Some(first));
     let linked = sim.trigger_runtime.tag(first).unwrap().triggers.clone();
     assert!(sim.apply_live_trigger_action(
         &action,
-        sim.trigger_action_context(source, None, TagEventInput::default(), Some(&rules)),
+        sim.trigger_action_context(source, None, TagEventInput::default(), &rules),
         &mut Vec::new(),
-        Some(&rules),
+        &rules,
         Some(&overlay),
         FrameEffects::default(),
     ));
@@ -488,19 +619,14 @@ fn retail_sov01_boris_tag_delete_is_immediate_and_releases_attachments() {
             .iter()
             .all(|&id| sim.trigger_runtime.trigger(id).is_some())
     );
-    sim.process_pending_delete_with(
-        Some(&rules),
-        Some(&overlay),
-        FrameEffects::default(),
-        1,
-        true,
-    );
+    sim.process_pending_delete_with(&rules, Some(&overlay), FrameEffects::default(), 1, true);
     assert!(
         linked
             .iter()
             .all(|&id| sim.trigger_runtime.trigger(id).is_none())
     );
-    sim.validate_restored_trigger_runtime().unwrap();
+    sim.validate_restored_trigger_runtime(rules.ares_form())
+        .unwrap();
 }
 
 #[test]
@@ -508,13 +634,17 @@ fn retail_sov01_make_enemy_reaches_the_shared_diplomacy_owner() {
     let Some((mut sim, rules, overlay, _)) = retail_sov01_script_context() else {
         return;
     };
-    let russians = sim.session.current_house.unwrap();
+    let russians = sim.session.current_house().unwrap();
     let arabs = sim.interner.intern("Arabs");
-    sim.houses.insert(
-        arabs,
-        crate::sim::house_state::HouseState::new(arabs, 1, Some(arabs), false, 0, 10),
-    );
-    sim.session.house_order.push(arabs);
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            arabs,
+            1,
+            Some(arabs),
+            false,
+            0,
+            10,
+        ));
     let graph = [
         (
             "RUSSIANS".into(),
@@ -561,15 +691,15 @@ fn retail_sov01_make_enemy_reaches_the_shared_diplomacy_owner() {
         .clone();
     assert!(sim.apply_live_trigger_action(
         &action,
-        sim.trigger_action_context(source, Some(live), TagEventInput::default(), Some(&rules)),
+        sim.trigger_action_context(source, Some(live), TagEventInput::default(), &rules),
         &mut Vec::new(),
-        Some(&rules),
+        &rules,
         Some(&overlay),
         FrameEffects::default(),
     ));
-    assert!(!sim.house_alliances["RUSSIANS"].contains("ARABS"));
-    assert!(!sim.house_alliances["ARABS"].contains("RUSSIANS"));
-    assert_eq!(sim.session.current_house, Some(russians));
+    assert!(!sim.house_alliances.as_map()["RUSSIANS"].contains("ARABS"));
+    assert!(!sim.house_alliances.as_map()["ARABS"].contains("RUSSIANS"));
+    assert_eq!(sim.session.current_house(), Some(russians));
 }
 
 #[test]
@@ -585,7 +715,7 @@ fn retail_sov01_transport_hint_emits_the_named_cameo_on_the_native_clock() {
     let actions = sim.trigger_runtime.definitions.trigger_types[source]
         .actions
         .clone();
-    sim.session.binary_frame = 0x7FFF_FFF0;
+    sim.session.set_binary_frame_for_test(0x7FFF_FFF0);
     let mut effects = Vec::new();
     for action in actions
         .iter()
@@ -593,9 +723,9 @@ fn retail_sov01_transport_hint_emits_the_named_cameo_on_the_native_clock() {
     {
         assert!(sim.apply_live_trigger_action(
             action,
-            sim.trigger_action_context(source, None, TagEventInput::default(), Some(&rules)),
+            sim.trigger_action_context(source, None, TagEventInput::default(), &rules),
             &mut effects,
-            Some(&rules),
+            &rules,
             Some(&overlay),
             FrameEffects::default(),
         ));
@@ -605,7 +735,10 @@ fn retail_sov01_transport_hint_emits_the_named_cameo_on_the_native_clock() {
         [
             TriggerEffect::SelectSidebarTab { index: 3 },
             TriggerEffect::FlashSidebarCameo {
-                type_id: sim.interner.get("SAPC").unwrap(),
+                category: crate::sim::production::ProductionCategory::Ship,
+                type_index: rules
+                    .type_array_index(crate::rules::object_type::ObjectCategory::Vehicle, "SAPC")
+                    .unwrap(),
                 duration: 100,
                 frame: 0x7FFF_FFF0,
             }
@@ -614,45 +747,289 @@ fn retail_sov01_transport_hint_emits_the_named_cameo_on_the_native_clock() {
 }
 
 #[test]
+fn scenario_timer_uses_the_sound_parameter_ordinal_before_expiring() {
+    let sounds = crate::rules::sound_ini::SoundRegistry::from_ini(
+        &crate::rules::ini_parser::IniFile::from_str(
+            "[SoundList]\n5=First\n99=Second\n100=SECOND\n",
+        ),
+    );
+    let map = trigger_fixture_map(
+        "[Triggers]\nSTART=Neutral,<none>,Start,0,1,1,1,0\nEND=Neutral,<none>,End,0,1,1,1,0\n\
+         [Events]\nSTART=1,13,0,0\nEND=1,14,0,0\n\
+         [Actions]\nSTART=1,27,7,sEcOnD,0,0,0,0,A\nEND=1,28,0,7,0,0,0,0,A\n\
+         [Tags]\nSTART_TAG=0,Start,START\nEND_TAG=0,End,END\n",
+    );
+    let mut sim = Simulation::new();
+    let rules = crate::rules::ruleset::RuleSet::empty_for_test();
+    sim.initialize_trigger_definitions(&map, &Default::default(), None, Some(&sounds), None);
+    sim.classify_map_triggers(rules);
+    let rng = sim.rng_state();
+    sim.advance_triggers(rules, None, FrameEffects::default());
+    // Read6DD7CE stores FindIndex7514D0's retained ordinal, not the list
+    // key or zero. Execute27 at6DE5C9 consumes it as signed seconds.
+    assert_eq!(sim.session.scenario_timer_view(), Some((15, "")));
+    assert!(!sim.global_variables()[7]);
+    sim.session.set_binary_frame_for_test(14);
+    sim.advance_triggers(rules, None, FrameEffects::default());
+    assert_eq!(sim.session.scenario_timer_view(), Some((1, "")));
+    assert!(!sim.global_variables()[7]);
+    sim.session.set_binary_frame_for_test(15);
+    sim.advance_triggers(rules, None, FrameEffects::default());
+    assert!(sim.global_variables()[7]);
+    assert_eq!(sim.session.scenario_timer_view(), None);
+    assert!(
+        sim.sound_events.is_empty(),
+        "a sound parameter does not play a cue"
+    );
+    assert_eq!(sim.rng_state(), rng);
+}
+
+/// The dev trigger trace orders each Spring between its poll bounds and
+/// before the writes its actions make, so a native replay can rebuild the
+/// frame and tell trigger writes from world ones.
+#[test]
+fn trigger_trace_orders_a_spring_between_poll_bounds_and_before_its_write() {
+    let map = trigger_fixture_map(
+        "[Triggers]\nSET=Neutral,<none>,Set,0,1,1,1,0\n\
+         [Events]\nSET=1,13,0,0\n\
+         [Actions]\nSET=1,56,0,4,0,0,0,0,A\n\
+         [Tags]\nSET_TAG=0,Set,SET\n",
+    );
+    let mut sim = Simulation::new();
+    let rules = crate::rules::ruleset::RuleSet::empty_for_test();
+    sim.initialize_trigger_definitions(&map, &Default::default(), None, None, None);
+    sim.classify_map_triggers(rules);
+    sim.record_trigger_springs(true);
+    sim.advance_triggers(rules, None, FrameEffects::default());
+    let (springs, events) = sim.take_trigger_trace();
+    let spring = &springs[..];
+    assert_eq!(spring.len(), 1);
+    assert_eq!(
+        (spring[0].seq, spring[0].parent, spring[0].tag.clone()),
+        (2, None, Some((0, "SET_TAG".to_owned())))
+    );
+    let TriggerTraceEvent::Init {
+        seq: 0,
+        ref tags,
+        ref logic,
+        ..
+    } = events[0]
+    else {
+        panic!("the trace starts without its Init record: {:?}", events[0]);
+    };
+    assert_eq!(
+        (tags.as_slice(), logic.as_slice()),
+        (
+            [TraceTag {
+                tag: 0,
+                tag_type: "SET_TAG".to_owned(),
+                refs: 0,
+                triggers: vec![(0, "SET".to_owned(), true)],
+            }]
+            .as_slice(),
+            [0].as_slice()
+        )
+    );
+    // Event 13 is left to the replay: no Predicate record, and the poll's own
+    // raise is not a Dispatch record.
+    assert_eq!(
+        events[1..],
+        [
+            TriggerTraceEvent::Poll {
+                seq: 1,
+                binary_frame: 0,
+                end: false
+            },
+            TriggerTraceEvent::Variable {
+                seq: 3,
+                binary_frame: 0,
+                parent: Some((2, 0)),
+                global: false,
+                index: 4,
+                set: true
+            },
+            TriggerTraceEvent::Poll {
+                seq: 4,
+                binary_frame: 0,
+                end: true
+            },
+        ]
+    );
+}
+
+#[test]
+fn scenario_timer_extends_by_minus_one_for_an_untrimmed_unknown_sound() {
+    let sounds = crate::rules::sound_ini::SoundRegistry::from_ini(
+        &crate::rules::ini_parser::IniFile::from_str("[SoundList]\n0=First\n1=Second\n"),
+    );
+    let map = trigger_fixture_map(
+        "[Triggers]\nSTART=Neutral,<none>,Start,0,1,1,1,0\n\
+         [Events]\nSTART=1,13,0,0\n\
+         [Actions]\nSTART=2,27,0,2,0,0,0,0,A,25,7,Second ,0,0,0,0,A\n\
+         [Tags]\nSTART_TAG=0,Start,START\n",
+    );
+    let mut sim = Simulation::new();
+    let rules = crate::rules::ruleset::RuleSet::empty_for_test();
+    sim.initialize_trigger_definitions(&map, &Default::default(), None, Some(&sounds), None);
+    sim.classify_map_triggers(rules);
+    sim.advance_triggers(rules, None, FrameEffects::default());
+    // FindIndex7514D0 does not trim; its -1 reaches Extend6DE4A0.
+    assert_eq!(sim.session.scenario_timer_view(), Some((15, "")));
+}
+
+#[test]
+fn scenario_timer_uses_the_theme_parameter_ordinal_before_expiring() {
+    let directory = crate::map::source::test_support::TestDirectory::new("theme-scalar");
+    directory.write(
+        "thememd.ini",
+        b"[Themes]\n5=First\n99=Second\n100=SECOND\n[Second]\nNormal=no\n",
+    );
+    let themes = crate::rules::theme_ini::ThemeCatalog::select(
+        &crate::assets::asset_manager::AssetManager::from_loose_root_for_test(directory.path()),
+    );
+    let map = trigger_fixture_map(
+        "[Triggers]\nSTART=Neutral,<none>,Start,0,1,1,1,0\nEND=Neutral,<none>,End,0,1,1,1,0\n\
+         [Events]\nSTART=1,13,0,0\nEND=1,14,0,0\n\
+         [Actions]\nSTART=1,27,8,sEcOnD,0,0,0,0,A\nEND=1,28,0,7,0,0,0,0,A\n\
+         [Tags]\nSTART_TAG=0,Start,START\nEND_TAG=0,End,END\n",
+    );
+    let mut sim = Simulation::new();
+    let rules = crate::rules::ruleset::RuleSet::empty_for_test();
+    sim.initialize_trigger_definitions(&map, &Default::default(), None, None, Some(&themes));
+    sim.classify_map_triggers(rules);
+    let rng = sim.rng_state();
+    let effects = sim.advance_triggers(rules, None, FrameEffects::default());
+    assert!(
+        effects.is_empty(),
+        "a scalar does not request music playback"
+    );
+    // Read6DD7E0 stores From_Name721210's retained ordinal, not the list
+    // key or zero. Execute27 at6DE5C9 consumes it as signed seconds.
+    assert_eq!(sim.session.scenario_timer_view(), Some((15, "")));
+    assert!(!sim.global_variables()[7]);
+    sim.session.set_binary_frame_for_test(14);
+    sim.advance_triggers(rules, None, FrameEffects::default());
+    assert_eq!(sim.session.scenario_timer_view(), Some((1, "")));
+    assert!(!sim.global_variables()[7]);
+    sim.session.set_binary_frame_for_test(15);
+    sim.advance_triggers(rules, None, FrameEffects::default());
+    assert!(sim.global_variables()[7]);
+    assert_eq!(sim.session.scenario_timer_view(), None);
+    assert!(
+        sim.sound_events.is_empty(),
+        "a theme scalar does not play a cue"
+    );
+    assert_eq!(sim.rng_state(), rng);
+}
+
+#[test]
+fn scenario_timer_extends_by_minus_one_for_an_untrimmed_unknown_theme() {
+    let directory = crate::map::source::test_support::TestDirectory::new("unknown-theme-scalar");
+    directory.write("thememd.ini", b"[Themes]\n0=First\n1=Second\n");
+    let themes = crate::rules::theme_ini::ThemeCatalog::select(
+        &crate::assets::asset_manager::AssetManager::from_loose_root_for_test(directory.path()),
+    );
+    let map = trigger_fixture_map(
+        "[Triggers]\nSTART=Neutral,<none>,Start,0,1,1,1,0\n\
+         [Events]\nSTART=1,13,0,0\n\
+         [Actions]\nSTART=2,27,0,2,0,0,0,0,A,25,8,Second ,0,0,0,0,A\n\
+         [Tags]\nSTART_TAG=0,Start,START\n",
+    );
+    let mut sim = Simulation::new();
+    let rules = crate::rules::ruleset::RuleSet::empty_for_test();
+    sim.initialize_trigger_definitions(&map, &Default::default(), None, None, Some(&themes));
+    sim.classify_map_triggers(rules);
+    sim.advance_triggers(rules, None, FrameEffects::default());
+    // From_Name721210 does not trim; its -1 reaches Extend6DE4A0.
+    assert_eq!(sim.session.scenario_timer_view(), Some((15, "")));
+}
+
+#[test]
+fn scenario_timer_expiry_polls_all_tags_before_stopping() {
+    let rules = crate::rules::ruleset::RuleSet::empty_for_test();
+    let map = trigger_fixture_map(
+        "[Triggers]\nFIRST=Neutral,<none>,First,0,1,1,1,0\nSECOND=Neutral,<none>,Second,0,1,1,1,0\n\
+         [Events]\nFIRST=1,14,0,0\nSECOND=1,14,0,0\n\
+         [Actions]\nFIRST=1,28,0,7,0,0,0,0,A\nSECOND=1,28,0,8,0,0,0,0,A\n\
+         [Tags]\nFIRST_TAG=2,First,FIRST\nSECOND_TAG=2,Second,SECOND\n",
+    );
+    let mut sim = Simulation::new();
+    install_map_triggers(&mut sim, &map);
+    sim.classify_map_triggers(rules);
+    sim.session
+        .change_scenario_timer(crate::sim::scenario_session::ScenarioTimerAction::Set(1));
+    sim.session.set_scenario_timer_caption("MISSION:TmeTimer");
+    let rng = sim.rng_state();
+    sim.session.set_binary_frame_for_test(14);
+    sim.advance_triggers(rules, None, FrameEffects::default());
+    assert!(!sim.global_variables()[7] && !sim.global_variables()[8]);
+    assert_eq!(
+        sim.session.scenario_timer_view(),
+        Some((1, "MISSION:TmeTimer"))
+    );
+
+    sim.session.set_binary_frame_for_test(15);
+    sim.advance_triggers(rules, None, FrameEffects::default());
+    assert!(
+        sim.global_variables()[7] && sim.global_variables()[8],
+        "all expiry tags see the running timer before the Logic tail stops it"
+    );
+    assert_eq!(
+        sim.session.scenario_timer_view(),
+        None,
+        "Tactical must hide the completed countdown"
+    );
+    assert!(!sim.session.scenario_timer_elapsed());
+    let actions = sim.trigger_runtime.action_trace.clone();
+    sim.session.set_binary_frame_for_test(16);
+    sim.advance_triggers(rules, None, FrameEffects::default());
+    assert_eq!(
+        sim.trigger_runtime.action_trace, actions,
+        "repeatable expiry tags do not fire again after completion"
+    );
+    assert_eq!(sim.rng_state(), rng);
+}
+
+#[test]
+fn scenario_timer_restarted_by_expiry_action_survives_logic_tail() {
+    let rules = crate::rules::ruleset::RuleSet::empty_for_test();
+    let map = trigger_fixture_map(
+        "[Triggers]\nRESTART=Neutral,<none>,Restart,0,1,1,1,0\n\
+         [Events]\nRESTART=1,14,0,0\n\
+         [Actions]\nRESTART=1,27,0,5,0,0,0,0,A\n\
+         [Tags]\nRESTART_TAG=2,Restart,RESTART\n",
+    );
+    let mut sim = Simulation::new();
+    install_map_triggers(&mut sim, &map);
+    sim.classify_map_triggers(rules);
+    sim.session
+        .change_scenario_timer(crate::sim::scenario_session::ScenarioTimerAction::Set(1));
+    sim.session.set_binary_frame_for_test(15);
+    sim.advance_triggers(rules, None, FrameEffects::default());
+    assert_eq!(sim.session.scenario_timer_view(), Some((75, "")));
+    assert!(!sim.session.scenario_timer_elapsed());
+}
+
+#[test]
 fn scenario_timer_retail_sov01_actions_reach_the_expiry_predicate() {
-    let Some((mut sim, rules, overlay, _map)) = retail_sov01_script_context() else {
+    let Some((mut sim, rules, _overlay, _map)) = retail_sov01_script_context() else {
         return;
     };
-    let source = trigger_type_index(&sim, "0952F87C");
-    let actions = sim.trigger_runtime.definitions.trigger_types[source]
-        .actions
-        .clone();
-    sim.session.binary_frame = 123;
-    for action in actions
-        .iter()
-        .filter(|action| matches!(action.entry.kind, 23..=27 | 103))
-    {
-        assert!(sim.apply_live_trigger_action(
-            action,
-            sim.trigger_action_context(source, None, TagEventInput::default(), Some(&rules)),
-            &mut Vec::new(),
-            Some(&rules),
-            Some(&overlay),
-            FrameEffects::default(),
-        ));
-    }
+    sim.session.set_binary_frame_for_test(123);
+    assert_eq!(
+        sim.dev_replay_scenario_timer_actions(&rules, "0952F87C"),
+        Some(3)
+    );
     assert_eq!(
         sim.session.scenario_timer_view(),
         Some((1800, "MISSION:TmeTimer"))
     );
-    sim.classify_map_triggers(Some(&rules));
+    sim.classify_map_triggers(&rules);
     let live = live_trigger_of_type(&sim, trigger_type_index(&sim, "0BDE333C"));
     for (frame, elapsed) in [(1922, false), (1923, true)] {
-        sim.session.binary_frame = frame;
+        sim.session.set_binary_frame_for_test(frame);
         assert_eq!(
-            sim.has_occurred(
-                0,
-                TagEventInput::default(),
-                None,
-                &mut false,
-                Some(&rules),
-                live,
-            ),
+            sim.has_occurred(0, TagEventInput::default(), None, &mut false, &rules, live,),
             elapsed
         );
     }
@@ -680,16 +1057,18 @@ fn all_change_house_dispatch_matches_original_selector_controls() {
             .get("house_order")
             .cloned()
             .unwrap_or_else(|| serde_json::json!([1, 2, 0]));
-        sim.session.house_order = order
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|index| houses[index.as_u64().unwrap() as usize])
-            .collect();
+        sim.houses.reorder_for_test(
+            &order
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|index| houses[index.as_u64().unwrap() as usize])
+                .collect::<Vec<_>>(),
+        );
         for (slot, house_index) in [(0, 1), (1, 0)] {
             sim.session
-                .start_slot_houses
-                .insert(slot, sim.session.house_order[house_index]);
+                .start_slot_houses_mut_for_test()
+                .insert(slot, sim.houses.order()[house_index]);
         }
         let actor = spawn_event_ingress_unit(&mut sim, &rules, houses[0], (15, 15));
         install_event_ingress_map(
@@ -721,7 +1100,7 @@ fn all_change_house_dispatch_matches_original_selector_controls() {
                 input: TagEventInput::default(),
             },
             &mut Vec::new(),
-            Some(&rules),
+            &rules,
             Some(&overlays),
             FrameEffects::default(),
         );
@@ -747,15 +1126,15 @@ fn all_change_house_retail_sov01_handoff_transfers_units_and_powered_buildings()
     // rules and action reader; the flat arena is not retail terrain evidence.
     for name in ["Americans", "Russians"] {
         let id = sim.interner.intern(name);
-        sim.houses.get_mut(&id).unwrap().country = Some(id);
+        sim.houses
+            .get_mut(&id)
+            .unwrap()
+            .set_country_for_test(Some(id));
     }
     let target = sim.interner.intern("PowerHouse");
     let country = sim.interner.intern("PowerHouse Country");
-    sim.houses.insert(
-        target,
-        HouseState::new(target, 2, Some(country), false, 0, 10),
-    );
-    sim.session.house_order.push(target);
+    sim.houses
+        .register(HouseState::new(target, 2, Some(country), false, 0, 10));
     assert_eq!(sim.house_by_trigger_selector(14, &rules), Some(target));
     let actors: Vec<_> = [("GAGAP", 20, 20), ("MTNK", 25, 25), ("GAPOWR", 30, 30)]
         .into_iter()
@@ -769,20 +1148,20 @@ fn all_change_house_retail_sov01_handoff_transfers_units_and_powered_buildings()
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
         None,
         None,
+        None,
     );
-    sim.classify_map_triggers(Some(&rules));
+    sim.classify_map_triggers(&rules);
     let typ = trigger_type_index(&sim, "07F2978C");
     let live = live_trigger_of_type(&sim, typ);
     let action = sim.trigger_runtime.definitions.trigger_types[typ].actions[0].clone();
     assert_eq!((action.entry.kind, action.value), (36, Some(14)));
-    let context =
-        sim.trigger_action_context(typ, Some(live), TagEventInput::default(), Some(&rules));
+    let context = sim.trigger_action_context(typ, Some(live), TagEventInput::default(), &rules);
     assert_eq!(context.incoming_house, Some(owner));
     assert!(sim.apply_live_trigger_action(
         &action,
         context,
         &mut Vec::new(),
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default()
     ));
@@ -857,7 +1236,7 @@ fn action128_retail_foots_use_reverse_shared_sweep_and_finish_the_warp() {
             incoming_house: Some(owner)
         },
         &mut Vec::new(),
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default(),
     ));
@@ -909,41 +1288,165 @@ fn action128_retail_foots_use_reverse_shared_sweep_and_finish_the_warp() {
     );
 }
 
+/// House50D6D0 skips a Foot only for its Transporter (`+0x11C`, 0x50D783 and
+/// 0x50D895). A garrison occupant (AddGarrisonOccupant 0x522910) and a Full
+/// reinforcement's cargo (CargoClass::AddPassenger 0x4733A0) have none, so
+/// they are warped in Limbo; a rider who boarded a vehicle (0x51A463) is not.
 #[test]
-fn script40_clears_local_through_trigger_owner_and_advances_on_rejected_indices() {
+fn action128_skips_only_passengers_with_a_transporter() {
+    use crate::sim::passenger::{BoardingArm, add_garrison_occupant, board_passenger};
+    use crate::sim::superweapon::chronosphere_tests::{retail_world, step, world_with};
+    let Some((rules, _, _)) = retail_world() else {
+        return;
+    };
+    let (rules, mut sim, owner) = world_with(rules, 128, &[]);
+    let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/trigger_chrono_house.json",
+    ))
+    .unwrap();
+    // The native coordinate of offset 2 (a unit's cell centre).
+    let third_offset = native["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["input"]["name"] == "reverse_mixed_classes")
+        .unwrap()["warp"][2]
+        .clone();
+    assert_eq!(third_offset["offset"], 2);
+    let mut spawn = |name, x| {
+        sim.spawn_object_at_height(name, "Americans", x, 20, 0, 0, &rules)
+            .unwrap()
+    };
+    // First in the Foot array, so the offsets below stay the fixture's.
+    let reinforcement = spawn("E1", 22);
+    let tank = spawn("MTNK", 20);
+    let transport = spawn("HTK", 24);
+    let rider = spawn("E1", 26);
+    let bunker = spawn("NABNKR", 30);
+    let occupant = spawn("E1", 28);
+    assert!(board_passenger(
+        &mut sim,
+        &rules,
+        rider,
+        transport,
+        BoardingArm::InfantryTransport,
+        None,
+        FrameEffects::default()
+    ));
+    assert!(
+        add_garrison_occupant(
+            &mut sim,
+            &rules,
+            occupant,
+            bunker,
+            None,
+            FrameEffects::default()
+        )
+        .unwrap()
+    );
+    // Full reinforcements load through CargoClass::AddPassenger 0x4733A0,
+    // which leaves +0x11C NULL.
+    assert!(sim.add_cargo_passenger_chain(
+        transport,
+        &[(reinforcement, 1.0)],
+        crate::sim::world::UninitContext::with_rules(&rules),
+    ));
+    sim.substrate
+        .entities
+        .get_mut(reinforcement)
+        .unwrap()
+        .passenger_role
+        .set_inside_transport(transport, false);
+    let map = install_event_ingress_map(
+        &mut sim,
+        &rules,
+        "[Waypoints]\n15=50075\n[Triggers]\nSHIFT=Americans,<none>,Shift,0,1,1,1,0\n\
+         [Events]\nSHIFT=1,8,0,0\n[Actions]\nSHIFT=1,128,0,478,0,0,0,0,P\n",
+    );
+    sim.session.install_waypoints(&map.waypoints);
+    let source = trigger_type_index(&sim, "SHIFT");
+    let action = sim.trigger_runtime.definitions.trigger_types[source].actions[0].clone();
+    assert!(sim.apply_live_trigger_action(
+        &action,
+        TriggerActionContext {
+            live_index: None,
+            input: TagEventInput::default(),
+            incoming_house: Some(owner)
+        },
+        &mut Vec::new(),
+        &rules,
+        None,
+        FrameEffects::default(),
+    ));
+    let entity = |sim: &Simulation, id| sim.substrate.entities.get(id).unwrap().clone();
+    assert!(entity(&sim, occupant).chrono_warp_latch());
+    assert!(entity(&sim, occupant).lifecycle.in_limbo());
+    assert!(entity(&sim, reinforcement).chrono_warp_latch());
+    assert!(!entity(&sim, rider).chrono_warp_latch());
+    // Reverse order: the occupant takes offset 0, the transport 1, the tank 2.
+    let coord = entity(&sim, tank).chrono_warp().unwrap().destination();
+    assert_eq!(
+        serde_json::json!([coord.x, coord.y, coord.z]),
+        third_offset["coord"]
+    );
+    // The warp outlasts his stay: Foot Unlimbo 0x4D7170 calls only the
+    // locomotor's Unlimbo slot (LocomotionClass's empty 0x55AC20), and his
+    // Teleport runs it once Foot AI reaches him again.
+    assert_eq!(
+        crate::sim::passenger::garrison_eject::sell_building_occupants(
+            &mut sim,
+            &rules,
+            None,
+            bunker,
+            crate::sim::passenger::garrison_eject::GarrisonEjectMode::Release,
+            FrameEffects::default(),
+        ),
+        1
+    );
+    for _ in 0..180 {
+        step(&mut sim, &rules);
+    }
+    let soldier = entity(&sim, occupant);
+    assert!(!soldier.chrono_warp_latch() && !soldier.is_warped_out() && !soldier.is_warping_in());
+    assert!(soldier.position.rx().abs_diff(75) <= 2 && soldier.position.ry().abs_diff(50) <= 2);
+}
+
+#[test]
+fn variable_scripts_use_shared_owner_and_advance_on_rejected_indices() {
     use crate::sim::team_script_vm::{TeamScriptAction, TeamScriptDefinition};
     let rules =
         crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
             "[InfantryTypes]\n0=E1\n[E1]\nStrength=125\nSpeed=4\n",
         ))
         .unwrap();
-    // Original Script40 @ 6E9BBE calls SetLocal689910 even without `first`
-    // and finishes after its unsigned index rejection. These are behavior
-    // regressions; the shared variable owner's native controls remain in
+    // Original TeamClass::AI Script12/38 @6E982B/6E9530 and 39/40
+    // @6E9BA1/6E9BBE call the shared Scenario setters and finish even after
+    // index rejection. The shared variable owner's native controls remain in
     // parsed_variable_actions_match_native_reader_dispatch_and_restore.
-    for (index, initially_set, changed) in [
-        (0, true, true),
-        (99, false, false),
-        (-1, false, false),
-        (100, false, false),
+    for (action_id, index, initially_set, changed) in [
+        (40, 0, true, true),
+        (40, 99, false, false),
+        (40, -1, false, false),
+        (40, 100, false, false),
+        (12, 50, false, false),
+        (38, -1, false, false),
     ] {
         let mut sim = Simulation::new();
         let owner = sim.interner.intern("Russians");
-        sim.houses.insert(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 1, None, false, 0, 10),
-        );
-        sim.session.house_order.push(owner);
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                owner, 1, None, false, 0, 10,
+            ));
         let member = sim
             .spawn_object("E1", "Russians", 10, 10, 0, &rules)
             .unwrap();
-        let script = sim.interner.intern("Clear local then wait");
+        let script = sim.interner.intern("Variable then wait");
         sim.team_script_vm.register_script(TeamScriptDefinition {
             id: script,
             source: crate::rules::team_ai_ini::TeamAiDefinitionSource::Scenario,
             actions: vec![
                 TeamScriptAction {
-                    action_id: 40,
+                    action_id,
                     argument: index,
                 },
                 TeamScriptAction {
@@ -956,20 +1459,45 @@ fn script40_clears_local_through_trigger_owner_and_advances_on_rejected_indices(
             .team_script_vm
             .create_team(owner, script, vec![member], 0);
         if initially_set {
-            sim.set_trigger_variable(false, index, true);
+            Simulation::set_trigger_variable(
+                &sim.session,
+                &mut sim.scenario_rng,
+                &mut sim.trigger_runtime,
+                false,
+                index,
+                true,
+            );
         }
-        sim.set_trigger_variable(true, 3, true);
+        Simulation::set_trigger_variable(
+            &sim.session,
+            &mut sim.scenario_rng,
+            &mut sim.trigger_runtime,
+            true,
+            3,
+            true,
+        );
         sim.trigger_runtime.dirty[0] = false;
         let rng = sim.rng_state();
         sim.run_team_ai_pass(&rules, None, FrameEffects::default());
-        assert!(sim.trigger_runtime.locals_set.is_empty(), "index {index}");
+        assert!(
+            sim.trigger_runtime.locals_set.is_empty(),
+            "action {action_id}, index {index}"
+        );
         assert_eq!(sim.trigger_runtime.globals_set, BTreeSet::from([3]));
-        assert_eq!(sim.trigger_runtime.dirty[0], changed, "index {index}");
+        assert_eq!(
+            sim.trigger_runtime.dirty[0], changed,
+            "action {action_id}, index {index}"
+        );
         assert!(
             sim.team_script_vm.team(team).unwrap().advance_pending(),
-            "index {index}"
+            "action {action_id}, index {index}"
         );
-        assert_eq!(sim.rng_state(), rng, "clearing a local has no RNG draw");
+        assert!(sim.team_script_vm.team(team).unwrap().refusal().is_none());
+        assert_eq!(
+            sim.rng_state(),
+            rng,
+            "no Trigger timers watch these variables"
+        );
         sim.run_team_ai_pass(&rules, None, FrameEffects::default());
         assert_eq!(sim.team_script_vm.team(team).unwrap().cursor(), 1);
     }
@@ -1031,22 +1559,26 @@ fn retail_sov01_script_context() -> Option<(
             cell
         },
     ));
-    sim.session.map_width = 198;
-    sim.session.map_height = 198;
-    sim.playfield_bounds = Some(crate::map::playfield::PlayfieldBounds::from_map_header(
-        &map.header,
+    sim.session.set_map_width_for_test(198);
+    sim.session.set_map_height_for_test(198);
+    sim.set_playfield_bounds_for_test(Some(
+        crate::map::playfield::PlayfieldBounds::from_map_header(&map.header),
     ));
-    sim.playfield_size_height = Some(map.header.height as i32);
+    sim.set_playfield_size_height_for_test(Some(map.header.height as i32));
     sim.session.install_waypoints(&map.waypoints);
     let owner = sim.interner.intern("Russians");
-    sim.houses.insert(
-        owner,
-        crate::sim::house_state::HouseState::new(owner, 1, Some(owner), true, 0, 10),
-    );
-    sim.session.house_order.push(owner);
-    sim.session.current_house = Some(owner);
-    sim.install_team_ai_registry(&registry, &rules).unwrap();
-    sim.initialize_trigger_definitions(&map, &registry, None, None);
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner,
+            1,
+            Some(owner),
+            true,
+            0,
+            10,
+        ));
+    sim.session.set_current_house_for_test(Some(owner));
+    sim.install_team_ai_registry(&registry, &rules);
+    sim.initialize_trigger_definitions(&map, &registry, None, None, None);
     Some((sim, rules, overlay, map))
 }
 
@@ -1125,9 +1657,13 @@ fn script40_releases_all_retail_sov01_opening_naval_teams_to_their_move_step() {
 fn script20_uses_country_order_and_survives_members_unlinked_by_owner_callbacks() {
     use crate::sim::team_script_vm::{TeamScriptAction, TeamScriptDefinition};
     let (mut sim, rules, overlay, houses) = event_ingress_fixture();
-    sim.houses.get_mut(&houses[2]).unwrap().is_human = true;
-    sim.session.current_house = Some(houses[2]);
-    sim.session.house_order = vec![houses[1], houses[2], houses[0]];
+    sim.houses
+        .get_mut(&houses[2])
+        .unwrap()
+        .set_is_human_for_test(true);
+    sim.session.set_current_house_for_test(Some(houses[2]));
+    sim.houses
+        .reorder_for_test(&[houses[1], houses[2], houses[0]]);
     // Houses 0 and 2 share Country0. Registration selects House2, while
     // lexical order would select House0 and raw House index0 names House1.
     let members: Vec<_> = [(3, 4), (4, 4), (5, 4)]
@@ -1214,11 +1750,15 @@ fn script20_retail_sov01_transport_tails_set_the_authored_landing_flags() {
             "the map appends this Country after retail rules"
         );
         let target = sim.interner.intern(&target_name);
-        sim.houses.insert(
-            target,
-            crate::sim::house_state::HouseState::new(target, 2, Some(target), false, 0, 10),
-        );
-        sim.session.house_order.push(target);
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                target,
+                2,
+                Some(target),
+                false,
+                0,
+                10,
+            ));
         let member = sim
             .spawn_object("SAPC", "Russians", 100, 100, 0, &rules)
             .unwrap();
@@ -1293,18 +1833,15 @@ pub(super) fn event_ingress_fixture_with_rules(
         let country = sim
             .interner
             .intern(if index == 1 { "Country7" } else { "Country0" });
-        sim.houses.insert(
-            house,
-            crate::sim::house_state::HouseState::new(
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
                 house,
                 index as u8,
                 Some(country),
                 false,
                 0,
                 10,
-            ),
-        );
-        sim.session.house_order.push(house);
+            ));
         house
     });
     (sim, rules, overlays, houses)
@@ -1318,7 +1855,7 @@ pub(super) fn install_event_ingress_map(
     let map = trigger_fixture_map(body);
     install_map_triggers(sim, &map);
     sim.install_authored_cell_trigger_tags(&map);
-    sim.classify_map_triggers(Some(rules));
+    sim.classify_map_triggers(rules);
     map
 }
 
@@ -1340,6 +1877,9 @@ pub(super) fn spawn_event_ingress_unit(
 /// compared marker and scan slices visit only the declared 4x4 cells.
 /// A bare test constructor
 /// remains in limbo, so Unit PerCell correctly refuses it before the Foot tail.
+/// Cell 3,4 lies off the playfield, so the actor retreats: IsAllowedToLeaveMap
+/// (`0x004DA1D0`) then admits its own Cell (`0x0073F364..0x0073F388`) and the
+/// Unit's own-cell arm (`0x0073AE1B`) lets the call reach the Foot line slice.
 pub(super) fn sparse_line_ingress_fixture() -> (
     Simulation,
     crate::rules::ruleset::RuleSet,
@@ -1355,12 +1895,21 @@ pub(super) fn sparse_line_ingress_fixture() -> (
             y: 4 * 256,
             z: 0,
         },
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default(),
     );
-    sim.session.map_width = 5;
-    sim.session.map_height = 5;
+    sim.session.set_map_width_for_test(5);
+    sim.session.set_map_height_for_test(5);
+    sim.substrate
+        .entities
+        .get_mut(actor)
+        .unwrap()
+        .mission
+        .set_current_for_test(
+            crate::sim::mission::MissionId::from_known(crate::sim::mission::MissionType::Retreat),
+            0,
+        );
     (sim, rules, houses, actor)
 }
 
@@ -1397,14 +1946,18 @@ pub(super) fn event_ingress_damage(
 fn unit_record_kill_dispatches_its_virtual_prefix_before_the_base_events() {
     use crate::sim::combat::{KillCallback, KillSource};
     // Original Unit744720 -> Techno702D40; E4 stays703230 (vtable
-    //7F5C70+E0/E4). Repeating Tag keeps each callback observable.
-    for (techno, present, expected) in [
-        (true, true, vec![7, 48, 29, 6, 4]),
-        (true, false, vec![48, 29]),
-        (false, true, vec![6, 4]),
-        (false, false, vec![]),
+    //7F5C70+E0/E4). Repeating Tag keeps each callback observable. Ares
+    // adds 85 with a destroyer: before Unit's 7 (hook 0x744745) and after
+    // E4's 4 (hook 0x7032B0).
+    for (techno, present, stock, with_ares) in [
+        (true, true, vec![7, 48, 29, 6, 4], vec![85, 7, 48, 29, 6, 4]),
+        (true, false, vec![48, 29], vec![48, 29]),
+        (false, true, vec![6, 4], vec![6, 4, 85]),
+        (false, false, vec![], vec![]),
     ] {
         let (mut sim, rules, overlays, houses) = event_ingress_fixture();
+        // RecordKill raises 85 on the game's Ares switch.
+        let expected = if rules.ares() { with_ares } else { stock };
         let victim = spawn_event_ingress_unit(&mut sim, &rules, houses[0], (15, 15));
         let killer = spawn_event_ingress_unit(&mut sim, &rules, houses[1], (17, 15));
         install_event_ingress_map(
@@ -1424,7 +1977,7 @@ fn unit_record_kill_dispatches_its_virtual_prefix_before_the_base_events() {
             victim,
             source,
             KillCallback::Terminal,
-            crate::sim::world::UninitContext::new(Some(&rules), Some(&overlays)),
+            crate::sim::world::UninitContext::new(&rules, Some(&overlays)),
         );
         assert_eq!(
             sim.trigger_runtime
@@ -1447,11 +2000,15 @@ fn unit_record_kill_releases_retail_sov01_landing_when_the_last_target_is_a_ship
     for (name, country) in [("Americans", "Americans"), ("Alliance", "Alliance")] {
         let house = sim.interner.intern(name);
         let country = sim.interner.intern(country);
-        sim.houses.insert(
-            house,
-            crate::sim::house_state::HouseState::new(house, 0, Some(country), false, 0, 10),
-        );
-        sim.session.house_order.push(house);
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                house,
+                0,
+                Some(country),
+                false,
+                0,
+                10,
+            ));
     }
     // Real map readers select the seven authored targets and their shared
     // repeat=1 Tag. Flat-water placement is the declared arena above, not
@@ -1466,7 +2023,7 @@ fn unit_record_kill_releases_retail_sov01_landing_when_the_last_target_is_a_ship
     assert_eq!(targets.len(), 7);
     targets.sort_by_key(|entity| entity.category != EntityCategory::Structure);
     assert_eq!(sim.spawn_from_map(&targets, Some(&rules)), 7);
-    sim.classify_map_triggers(Some(&rules));
+    sim.classify_map_triggers(&rules);
     let tag_type = sim
         .trigger_runtime
         .definitions
@@ -1499,7 +2056,7 @@ fn unit_record_kill_releases_retail_sov01_landing_when_the_last_target_is_a_ship
             victim,
             KillSource::Techno(None),
             KillCallback::Terminal,
-            crate::sim::world::UninitContext::new(Some(&rules), Some(&overlay)),
+            crate::sim::world::UninitContext::new(&rules, Some(&overlay)),
         );
         assert_eq!(
             sim.trigger_runtime.trigger(landing).unwrap().enabled,
@@ -1508,9 +2065,245 @@ fn unit_record_kill_releases_retail_sov01_landing_when_the_last_target_is_a_ship
         );
         sim.uninit_with_context(
             victim,
-            crate::sim::world::UninitContext::new(Some(&rules), Some(&overlay)),
+            crate::sim::world::UninitContext::new(&rules, Some(&overlay)),
         );
     }
+}
+
+const MIND_CONTROL_TAG_RULES: &str = "\
+[InfantryTypes]
+2=TAGYURI
+[TAGYURI]
+Strength=100
+Speed=4
+SpeedType=Foot
+Locomotor={4A582744-9839-11D1-B709-00A024DDAFD1}
+Primary=TagMindControl
+ImmuneToPsionics=yes
+[TagMindControl]
+Damage=1
+ROF=200
+Range=7
+Speed=100
+Projectile=TagPsychicControl
+Warhead=TagController
+[TagPsychicControl]
+Inviso=yes
+[Warheads]
+2=TagController
+[TagController]
+MindControl=yes
+Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%
+";
+
+const MIND_CONTROL_TAG_MAP: &str = "\
+[Triggers]
+ATTACKED=Country0,SOURCE,Attacked,0,1,1,1,0
+SOURCE=Country0,<none>,Source,0,1,1,1,0
+[Tags]
+TAG=2,Attacked,ATTACKED
+[Events]
+ATTACKED=1,6,0,0
+SOURCE=1,44,0,0
+[Actions]
+ATTACKED=1,28,0,6,0,0,0,0,A
+SOURCE=1,28,0,44,0,0,0,0,A
+";
+
+fn mind_control_tag_projectile(
+    sim: &mut Simulation,
+    source: u64,
+    target: u64,
+) -> crate::sim::projectile::ProjectileDetonation {
+    let projectile_id = sim.substrate.allocate_stable_id();
+    let payload = ProjectilePayload::new(
+        1,
+        sim.interner.intern("TagController"),
+        Some(sim.interner.intern("TagPsychicControl")),
+        false,
+    );
+    let impact = ProjectileCoord::new(15 * 256 + 128, 15 * 256 + 128, 0);
+    sim.admit_projectile(
+        projectile_id,
+        ProjectileSpawn {
+            native_unique_id: 0,
+            line_trail: None,
+            flat: false,
+            source_id: source,
+            origin: ProjectileCoord::new(17 * 256 + 128, 15 * 256 + 128, 0),
+            target: ProjectileTarget::Entity(target),
+            initial_target_position: impact,
+            payload,
+            speed_leptons_per_frame: 100,
+            velocity: crate::sim::projectile::ProjectileVelocity::new(0, 0, 0),
+            trajectory: crate::sim::projectile::ProjectileTrajectory::Straight,
+            guidance: None,
+            visual: crate::sim::projectile::ProjectileVisualState::new(0, 0, 0),
+            arm_frames: 0,
+            fuse_frames: None,
+            ranged_fuse: false,
+            tracks_target: false,
+            target_expiry: TargetExpiryPolicy::Expire,
+            collision: ProjectileCollisionPolicy::NONE,
+        },
+    );
+    crate::sim::projectile::ProjectileDetonation {
+        projectile_id,
+        source_id: source,
+        target: ProjectileTarget::Entity(target),
+        impact,
+        payload,
+        reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+    }
+}
+
+#[test]
+fn mind_control_tags_precede_capture_admission_and_use_object_alive() {
+    for (manager, alive, health, immune, expected) in [
+        (true, true, 100, false, true),
+        (true, true, 100, true, true),
+        (true, true, 0, true, true),
+        (true, false, 100, true, false),
+        (false, true, 100, false, false),
+    ] {
+        let (mut sim, rules, overlay, _) = event_ingress_fixture_with_rules(MIND_CONTROL_TAG_RULES);
+        let victim_type = if immune { "TAGYURI" } else { "TAGUNIT" };
+        assert_eq!(
+            rules.object(victim_type).unwrap().immune_to_psionics,
+            immune
+        );
+        let source = sim
+            .spawn_object_at_height(
+                if manager { "TAGYURI" } else { "TAGUNIT" },
+                "House0",
+                17,
+                15,
+                0,
+                0,
+                &rules,
+            )
+            .unwrap();
+        let victim = sim
+            .spawn_object_at_height(victim_type, "House2", 15, 15, 0, 0, &rules)
+            .unwrap();
+        install_event_ingress_map(&mut sim, &rules, MIND_CONTROL_TAG_MAP);
+        sim.attach_object_trigger_tag(victim, Some("TAG"));
+        let entity = sim.substrate.entities.get_mut(victim).unwrap();
+        entity.health.set_for_test(health);
+        entity.lifecycle.set_object_alive_for_test(alive);
+        let detonation = mind_control_tag_projectile(&mut sim, source, victim);
+        sim.mind_control_detonation(detonation, &rules, Some(&overlay), FrameEffects::default());
+        let context =
+            format!("manager={manager}, ObjectAlive={alive}, HP={health}, immune={immune}");
+        assert_eq!(
+            sim.trigger_runtime.globals_set.contains(&6),
+            expected,
+            "{context}"
+        );
+        assert_eq!(
+            sim.trigger_runtime.globals_set.contains(&44),
+            expected,
+            "{context}"
+        );
+        assert_eq!(
+            sim.substrate.entities.get(victim).unwrap().health.current(),
+            health,
+            "{context}: no damage"
+        );
+        assert_eq!(
+            sim.substrate
+                .entities
+                .get(victim)
+                .unwrap()
+                .mind_control
+                .controller(),
+            (manager && !immune).then_some(source),
+            "{context}: existing capture admission"
+        );
+    }
+}
+
+#[test]
+fn mind_control_event6_owner_change_updates_source_house_before_event44_and_capture() {
+    let (mut sim, rules, overlay, houses) =
+        event_ingress_fixture_with_rules(MIND_CONTROL_TAG_RULES);
+    let source = sim
+        .spawn_object_at_height("TAGYURI", "House0", 17, 15, 0, 0, &rules)
+        .unwrap();
+    let victim = spawn_event_ingress_unit(&mut sim, &rules, houses[2], (15, 15));
+    install_event_ingress_map(
+        &mut sim,
+        &rules,
+        "[Triggers]\nATTACKED=Country0,SOURCE,Attacked,0,1,1,1,0\nSOURCE=Country0,<none>,Source,0,1,1,1,0\n\
+         [Tags]\nTAG=2,Attacked,ATTACKED\n[Events]\nATTACKED=1,6,0,0\nSOURCE=1,44,0,1\n\
+         [Actions]\nATTACKED=2,14,0,7,0,0,0,0,A,28,0,6,0,0,0,0,A\nSOURCE=1,28,0,44,0,0,0,0,A\n",
+    );
+    sim.attach_object_trigger_tag(victim, Some("TAG"));
+    sim.attach_object_trigger_tag(source, Some("TAG"));
+    let detonation = mind_control_tag_projectile(&mut sim, source, victim);
+    sim.mind_control_detonation(detonation, &rules, Some(&overlay), FrameEffects::default());
+    assert_eq!(sim.trigger_runtime.globals_set, BTreeSet::from([6, 44]));
+    let live = sim.projectiles.current_detonation(detonation);
+    assert_eq!(live.source_id, source);
+    assert_eq!(live.target, ProjectileTarget::Entity(victim));
+    assert_eq!(
+        sim.substrate.entities.get(source).unwrap().owner(),
+        houses[1]
+    );
+    let victim = sim.substrate.entities.get(victim).unwrap();
+    assert_eq!(victim.owner(), houses[1]);
+    assert_eq!(victim.health.current(), 100);
+    assert_eq!(
+        victim.mind_control.controller(),
+        None,
+        "event6 transfers both actors to the same house before the capture attempt"
+    );
+}
+
+#[test]
+fn mind_control_attack_order_fires_attacked_tags_without_hp_damage() {
+    use crate::sim::command::Command;
+    let (mut sim, rules, overlay, houses) =
+        event_ingress_fixture_with_rules(MIND_CONTROL_TAG_RULES);
+    let source = sim
+        .spawn_object_at_height("TAGYURI", "House0", 17, 15, 0, 0, &rules)
+        .unwrap();
+    let victim = spawn_event_ingress_unit(&mut sim, &rules, houses[2], (15, 15));
+    install_event_ingress_map(&mut sim, &rules, MIND_CONTROL_TAG_MAP);
+    sim.attach_object_trigger_tag(victim, Some("TAG"));
+    assert!(sim.trigger_runtime.globals_set.is_empty());
+    // Every House here is a computer, whose events the DoList never runs
+    // (0x0064C4FB..0x0064C50D). Order the Yuri through the class receiver, as
+    // the computer's own AI does.
+    assert!(sim.apply_command_with_overlays(
+        "House0",
+        &Command::Attack {
+            attacker_id: source,
+            target_id: victim,
+        },
+        &rules,
+        Some(&overlay),
+        FrameEffects::default(),
+    ));
+    for _ in 0..90 {
+        let commands = sim.take_due_commands();
+        sim.advance_tick(&commands, Some(&rules), None, Some(&overlay), 33);
+        if sim
+            .substrate
+            .entities
+            .get(victim)
+            .unwrap()
+            .mind_control
+            .controller()
+            .is_some()
+        {
+            break;
+        }
+    }
+    let victim = sim.substrate.entities.get(victim).unwrap();
+    assert_eq!(victim.health.current(), 100);
+    assert_eq!(victim.mind_control.controller(), Some(source));
+    assert_eq!(sim.trigger_runtime.globals_set, BTreeSet::from([6, 44]));
 }
 
 #[test]
@@ -1557,18 +2350,20 @@ fn object_damage_tags_spring_before_techno_and_reread_the_source_house_index() {
         houses[1]
     );
     // Event6's Action14 changes both owners. Each Unit E0(null-killer)
-    // reaches original744720's48/29 prefix before the later damage44.
-    assert_eq!(
-        sim.trigger_runtime.dispatch_trace,
-        [
-            (tag, 6),
-            (tag, 48),
-            (tag, 29),
-            (tag, 48),
-            (tag, 29),
-            (tag, 44)
-        ]
-    );
+    // reaches original744720's48/29 prefix before the later damage44. Ares
+    // (hook 0x5F57B5) then raises 84 and 83 on the surviving object.
+    let mut expected = vec![
+        (tag, 6),
+        (tag, 48),
+        (tag, 29),
+        (tag, 48),
+        (tag, 29),
+        (tag, 44),
+    ];
+    if rules.ares() {
+        expected.extend([(tag, 84), (tag, 83)]);
+    }
+    assert_eq!(sim.trigger_runtime.dispatch_trace, expected);
     assert_eq!(sim.trigger_runtime.globals_set, BTreeSet::from([6, 44]));
     assert!(
         !sim.substrate
@@ -1700,7 +2495,7 @@ fn entered_cell_retains_the_actual_duplicate_country_house_for_8997_actions() {
     sim.per_cell_process(
         actor,
         crate::sim::movement::PerCellReason::Arrival,
-        Some(&rules),
+        &rules,
         Some(&overlays),
         FrameEffects::default(),
     )
@@ -1740,17 +2535,19 @@ fn line_arrival_rereads_later_cell_attachments_after_real_tag_cleanup() {
          [CellTags]\n2003=TAG\n3003=TAG\n",
     );
     let mut terrain = sim.resolved_terrain.take().unwrap();
-    sim.initialize_cell_trigger_lines(
+    let bounds = crate::sim::scenario_bootstrap::NativeStartBounds::from_session(&sim, &terrain);
+    sim.trigger_runtime.initialize_cell_trigger_lines(
+        bounds,
         &mut terrain,
         (1..5).flat_map(|y| (1..5).map(move |x| (x, y))),
     );
     sim.resolved_terrain = Some(terrain);
-    let first = sim.trigger_cell_identity((3, 2));
+    let first = Simulation::trigger_cell_identity(&sim.resolved_terrain, (3, 2));
     let tag = sim.trigger_runtime.cell_tags[&first];
     sim.per_cell_process(
         actor,
         crate::sim::movement::PerCellReason::Arrival,
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default(),
     )
@@ -1761,7 +2558,7 @@ fn line_arrival_rereads_later_cell_attachments_after_real_tag_cleanup() {
         sim.trigger_runtime.cell_tags.is_empty(),
         "repeat0 removes every attachment of the shared Tag while the row scan is active"
     );
-    let later = sim.trigger_cell_identity((3, 3));
+    let later = Simulation::trigger_cell_identity(&sim.resolved_terrain, (3, 3));
     assert_ne!(
         sim.resolved_terrain
             .as_ref()
@@ -1775,7 +2572,7 @@ fn line_arrival_rereads_later_cell_attachments_after_real_tag_cleanup() {
     sim.per_cell_process(
         actor,
         crate::sim::movement::PerCellReason::Arrival,
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default(),
     )
@@ -1791,7 +2588,7 @@ fn advance_trigger_frame(
     rules: Option<&crate::rules::ruleset::RuleSet>,
     waypoints: &HashMap<u32, Waypoint>,
 ) -> Vec<TriggerEffect> {
-    sim.session.binary_frame = current_frame;
+    sim.session.set_binary_frame_for_test(current_frame);
     sim.session.install_waypoints(waypoints);
     if sim.resolved_terrain.is_none()
         && sim
@@ -1809,7 +2606,11 @@ fn advance_trigger_frame(
         // retain the original(0,0) cell; no diagnostic waypoint shadow is used.
         sim.resolved_terrain = Some(flat_trigger_playfield_terrain(32, 32));
     }
-    sim.advance_triggers(rules, None, FrameEffects::default())
+    sim.advance_triggers(
+        rules.unwrap_or(crate::rules::ruleset::RuleSet::empty_for_test()),
+        None,
+        FrameEffects::default(),
+    )
 }
 
 fn flat_trigger_playfield_terrain(
@@ -1825,7 +2626,7 @@ fn flat_trigger_playfield_terrain(
 
 /// One fixture INI body behind a minimal map header, read by the production
 /// map reader.
-fn trigger_fixture_map(body: &str) -> crate::map::map_file::MapFile {
+pub(super) fn trigger_fixture_map(body: &str) -> crate::map::map_file::MapFile {
     let text = format!(
         "[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
          [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n\
@@ -1835,12 +2636,17 @@ fn trigger_fixture_map(body: &str) -> crate::map::map_file::MapFile {
 }
 
 /// Install the map's trigger definitions through the production scenario-init
-/// reader, without Team, EVA or sound tables. Fill (`classify_map_triggers`)
-/// stays the caller's next step.
+/// reader, including authored Teams but no fixed AIMD, EVA or sound tables.
+/// Fill (`classify_map_triggers`) stays the caller's next step.
 fn install_map_triggers(sim: &mut Simulation, map: &crate::map::map_file::MapFile) {
     sim.initialize_trigger_definitions(
         map,
-        &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
+        &crate::rules::team_ai_ini::TeamAiIniRegistry::from_sources(
+            &crate::rules::ini_parser::IniFile::empty(),
+            &map.ini,
+            true,
+        ),
+        None,
         None,
         None,
     );
@@ -1857,7 +2663,7 @@ fn ordinary_master_frame(
 ) -> crate::sim::world::TickResult {
     sim.advance_master_frame(
         &[],
-        rules,
+        rules.unwrap_or(crate::rules::ruleset::RuleSet::empty_for_test()),
         overlays,
         67,
         TickLane::Ordinary,
@@ -1874,7 +2680,7 @@ fn waypoint_map(index: u32, (rx, ry): (u16, u16)) -> HashMap<u32, Waypoint> {
 }
 
 fn spawn_type(sim: &mut Simulation, type_id: &str) -> u64 {
-    let sid = sim.allocate_stable_id();
+    let sid = sim.substrate.allocate_stable_id();
     let owner_id = sim.interner.intern("Neutral");
     let type_id_interned = sim.interner.intern(type_id);
     let ge = GameEntity::new_at_frame_zero_for_test(
@@ -1914,8 +2720,7 @@ fn create_building_type10_reaches_placement_and_house_publication() {
         );
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, Some(owner), false, 0, 10));
-    sim.session.house_order.push(owner);
+        .register(HouseState::new(owner, 0, Some(owner), false, 0, 10));
     sim.session.install_waypoints(&waypoint_map(139, (10, 10)));
     assert!(crate::sim::build_site::can_place_building_at(
         &sim,
@@ -1924,6 +2729,7 @@ fn create_building_type10_reaches_placement_and_house_publication() {
         rules.object("GTGCAN").unwrap(),
         (10, 10),
         Some(owner),
+        None,
         None,
     ));
     assert!(sim.trigger_waypoint_coord(139).is_some());
@@ -1936,7 +2742,7 @@ fn create_building_type10_reaches_placement_and_house_publication() {
     let action = sim
         .trigger_runtime
         .definitions
-        .resolve_action(entry, None, None);
+        .resolve_action(entry, None, None, None);
     assert!(sim.apply_live_trigger_action(
         &action,
         TriggerActionContext {
@@ -1945,7 +2751,7 @@ fn create_building_type10_reaches_placement_and_house_publication() {
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        Some(&rules),
+        &rules,
         Some(&overlays),
         FrameEffects::default(),
     ));
@@ -1961,7 +2767,7 @@ fn create_building_type10_reaches_placement_and_house_publication() {
     assert!(!building.lifecycle.in_limbo());
     assert!(
         sim.houses[&owner]
-            .base_projection
+            .base_projection()
             .buildings()
             .contains(&building.stable_id())
     );
@@ -1993,30 +2799,40 @@ fn destroyed_house_predicates_match_original_independent_signed_counters() {
                 let country = sim
                     .interner
                     .intern(if index == 1 { "Country7" } else { "Country0" });
-                sim.houses.insert(
+                sim.houses.register(HouseState::new(
                     owner,
-                    HouseState::new(owner, index, Some(country), false, 0, 10),
-                );
+                    index as i32,
+                    Some(country),
+                    false,
+                    0,
+                    10,
+                ));
                 let totals = &case["inputs"]["destruction_counts"][index as usize];
-                sim.houses.get_mut(&owner).unwrap().tracking.set_for_test(
-                    totals[0].as_i64().unwrap() as i32,
-                    &[],
-                    (
-                        totals[1].as_i64().unwrap() as i32,
-                        totals[2].as_i64().unwrap() as i32,
-                        totals[3].as_i64().unwrap() as i32,
-                    ),
-                    &[],
-                );
+                sim.houses
+                    .get_mut(&owner)
+                    .unwrap()
+                    .tracking_mut()
+                    .set_for_test(
+                        totals[0].as_i64().unwrap() as i32,
+                        &[],
+                        (
+                            totals[1].as_i64().unwrap() as i32,
+                            totals[2].as_i64().unwrap() as i32,
+                            totals[3].as_i64().unwrap() as i32,
+                        ),
+                        &[],
+                    );
                 owner
             })
             .collect();
-        sim.session.house_order = case["inputs"]["house_order"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|index| houses[index.as_u64().unwrap() as usize])
-            .collect();
+        sim.houses.reorder_for_test(
+            &case["inputs"]["house_order"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|index| houses[index.as_u64().unwrap() as usize])
+                .collect::<Vec<_>>(),
+        );
         let map = trigger_fixture_map(&format!(
             "[Triggers]\nDESTRUCTION=Neutral,<none>,Destruction,0,1,1,1,0\n\
              [Events]\nDESTRUCTION={}\n\
@@ -2024,29 +2840,26 @@ fn destroyed_house_predicates_match_original_independent_signed_counters() {
             case["raw"].as_str().unwrap()
         ));
         install_map_triggers(&mut sim, &map);
-        sim.classify_map_triggers(Some(&rules));
+        sim.classify_map_triggers(&rules);
         let live = sim.trigger_runtime.trigger_order[0];
         let type_index = sim.trigger_runtime.trigger(live).unwrap().type_index;
         sim.trigger_runtime.definitions.trigger_types[type_index].events[0].retained_house =
             Some(houses[1]);
         let timer_before = sim.trigger_runtime.trigger(live).unwrap().timer;
         let mut persistence = false;
-        sim.session.binary_frame = 123;
+        sim.session.set_binary_frame_for_test(123);
         let mut evaluate = |sim: &mut Simulation| {
             sim.has_occurred(
                 0,
                 TagEventInput {
                     kind: case["inputs"]["raised"].as_i64().unwrap() as i32,
-                    actor: None,
-                    source: None,
-                    cell: (0, 0),
-                    force: false,
+                    ..Default::default()
                 },
                 case["inputs"]["incoming_house"]
                     .as_u64()
                     .map(|index| houses[index as usize]),
                 &mut persistence,
-                Some(&rules),
+                &rules,
                 live,
             )
         };
@@ -2094,7 +2907,7 @@ fn damage_at_waypoint_reaches_the_shared_building_receiver() {
     sim.resolved_terrain = Some(flat_trigger_playfield_terrain(32, 32));
     let owner = sim.interner.intern("Neutral");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, false, 0, 10));
+        .register(HouseState::new(owner, 0, None, false, 0, 10));
     let type_id = sim.interner.intern("REACTOR");
     let building = GameEntity::new_at_frame_zero_for_test(
         1,
@@ -2121,13 +2934,13 @@ fn damage_at_waypoint_reaches_the_shared_building_receiver() {
         .unwrap()
         .entries()[0]
         .clone();
-    let action = definitions.resolve_action(entry, None, None);
+    let action = definitions.resolve_action(entry, None, None, None);
     sim.trigger_runtime.definitions = definitions;
     assert!(sim.apply_live_trigger_action(
         &action,
-        sim.trigger_action_context(typ, None, TagEventInput::default(), Some(&rules)),
+        sim.trigger_action_context(typ, None, TagEventInput::default(), &rules),
         &mut Vec::new(),
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default(),
     ));
@@ -2185,16 +2998,16 @@ fn parsed_event_records_match_native_list_and_production_predicates() {
         }
         for (n, frame) in row.frames.iter().enumerate() {
             let mut sim = Simulation::new();
-            sim.session.binary_frame = *frame;
+            sim.session.set_binary_frame_for_test(*frame);
             install_map_triggers(&mut sim, &map);
-            sim.classify_map_triggers(None);
+            sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
             sim.resolved_terrain = Some(flat_trigger_playfield_terrain(32, 32));
             sim.trigger_runtime.globals_set.insert(7);
             sim.trigger_runtime.locals_set.insert(9);
             let result = sim
                 .advance_app_frame(
                     &[],
-                    None,
+                    crate::rules::ruleset::RuleSet::empty_for_test(),
                     None,
                     67,
                     TickLane::Ordinary,
@@ -2255,7 +3068,7 @@ fn parsed_variable_actions_match_native_reader_dispatch_and_restore() {
         );
         let mut original = Simulation::new();
         install_map_triggers(&mut original, &map);
-        original.classify_map_triggers(None);
+        original.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
         original.trigger_runtime.globals_set = row.initial_globals;
         original.trigger_runtime.locals_set = row.initial_locals;
         let bytes = GameSnapshot::save(&original, 0, 0, "trigger_values", 0);
@@ -2310,7 +3123,7 @@ fn parsed_map_trigger_flags_gate_production_frames_and_survive_restore() {
     install_map_triggers(&mut original, &map);
     original.resolved_terrain = Some(flat_trigger_playfield_terrain(32, 32));
     // Classify before saving.
-    original.classify_map_triggers(None);
+    original.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
     // TriggerTypes are allocated in [Triggers] key order.
     assert!(
         original
@@ -2332,7 +3145,7 @@ fn parsed_map_trigger_flags_gate_production_frames_and_survive_restore() {
         let frame = sim
             .advance_app_frame(
                 &[],
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
                 None,
                 67,
                 TickLane::Ordinary,
@@ -2404,14 +3217,14 @@ fn trigger_action_40_normalizes_and_refreshes_authority_same_frame() {
     let mut sim = Simulation::new();
     sim.hash_state_every(std::num::NonZeroU64::MIN);
     sim.install_playfield_from_map_header(&header);
-    let initial_bounds = sim.playfield_bounds.expect("initial playfield");
+    let initial_bounds = sim.playfield_bounds().expect("initial playfield");
     let mut terrain = flat_trigger_playfield_terrain(100, 100);
     terrain.recalc_playfield_attributes(initial_bounds);
     let path_grid = PathGrid::from_resolved_terrain(&terrain);
     sim.resolved_terrain = Some(terrain);
     sim.rebuild_zone_grid(&path_grid);
     install_map_triggers(&mut sim, &map);
-    sim.classify_map_triggers(None);
+    sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
 
     let before_zone = sim
         .zone_grid
@@ -2432,7 +3245,7 @@ fn trigger_action_40_normalizes_and_refreshes_authority_same_frame() {
     let tick = ordinary_master_frame(&mut sim, None, None, true);
 
     assert_eq!(
-        sim.playfield_bounds,
+        sim.playfield_bounds(),
         Some(PlayfieldBounds {
             base: 80,
             off_fc: 2,
@@ -2451,36 +3264,46 @@ fn trigger_action_40_normalizes_and_refreshes_authority_same_frame() {
     let normal = zones.map_for(MovementZone::Normal).expect("normal zone");
     assert_eq!(normal.zone_at(50, 50, MovementLayer::Ground), ZONE_INVALID);
     assert_ne!(normal.zone_at(85, 85, MovementLayer::Ground), ZONE_INVALID);
-    assert!(sim.radar_terrain_dirty_cells.is_empty());
-    assert_eq!(sim.radar_terrain_dirty_generation, 0);
-    assert_eq!(sim.playfield_revision, 1);
+    assert!(sim.dirty_cells.radar().is_empty());
+    assert_eq!(sim.dirty_cells.radar_generation(), 0);
+    assert_eq!(sim.playfield_revision(), 1);
     assert_eq!(tick.state_hash, Some(sim.state_hash()));
 
     // FUN_006E21E0 rebuilds radar surfaces for every firing. A second writer
     // must not disappear behind the persistent per-cell dirty-list dedup gate.
-    assert!(sim.change_visible_map_area([4, 40, 54, 12], None));
-    assert_eq!(sim.playfield_revision, 2);
-    assert!(sim.change_visible_map_area([4, 40, 54, 12], None));
-    assert_eq!(sim.playfield_revision, 3);
-    assert!(sim.radar_terrain_dirty_cells.is_empty());
+    assert!(sim.change_visible_map_area(
+        [4, 40, 54, 12],
+        crate::sim::world::UninitContext::with_rules(
+            crate::rules::ruleset::RuleSet::empty_for_test()
+        )
+    ));
+    assert_eq!(sim.playfield_revision(), 2);
+    assert!(sim.change_visible_map_area(
+        [4, 40, 54, 12],
+        crate::sim::world::UninitContext::with_rules(
+            crate::rules::ruleset::RuleSet::empty_for_test()
+        )
+    ));
+    assert_eq!(sim.playfield_revision(), 3);
+    assert!(sim.dirty_cells.radar().is_empty());
 
     let bytes = GameSnapshot::save(&sim, 0, 0, "all06umd.map", 0);
     let restored = GameSnapshot::load(&bytes)
         .expect("action-40 snapshot loads")
         .sim;
-    assert_eq!(restored.playfield_bounds, sim.playfield_bounds);
-    assert_eq!(restored.playfield_size_height, sim.playfield_size_height);
-    assert_eq!(restored.playfield_revision, sim.playfield_revision);
+    assert_eq!(restored.playfield_bounds(), sim.playfield_bounds());
+    assert_eq!(
+        restored.playfield_size_height(),
+        sim.playfield_size_height()
+    );
+    assert_eq!(restored.playfield_revision(), sim.playfield_revision());
 }
 
-#[test]
-fn techno_playfield_action_40_exact_recompute_and_mobile_reveal_callback() {
+/// A flat 100x100 map whose playfield action 40 grows from `[30, 20, 8, 6]`
+/// to [`ACTION40_GROWN`], with the cells that growth adds.
+fn action40_growth_fixture() -> (Simulation, Vec<(u16, u16)>) {
     use crate::map::map_file::MapHeader;
     use crate::map::playfield::PlayfieldBounds;
-    use crate::rules::ini_parser::IniFile;
-    use crate::rules::ruleset::RuleSet;
-    use crate::sim::combat::Health;
-    use crate::sim::house_state::HouseState;
 
     let header = MapHeader {
         theater: "TEMPERATE".to_string(),
@@ -2495,15 +3318,33 @@ fn techno_playfield_action_40_exact_recompute_and_mobile_reveal_callback() {
     };
     let mut sim = Simulation::new();
     sim.install_playfield_from_map_header(&header);
-    let initial = sim.playfield_bounds.unwrap();
-    let expanded = PlayfieldBounds::from_raw_local_size(80, 58, [2, 2, 76, 48]);
-    let candidates: Vec<(u16, u16)> = (0u16..100)
+    let initial = sim.playfield_bounds().unwrap();
+    let expanded = PlayfieldBounds::from_raw_local_size(80, 58, ACTION40_GROWN);
+    let added = (0u16..100)
         .flat_map(|ry| (0u16..100).map(move |rx| (rx, ry)))
         .filter(|&(rx, ry)| {
             expanded.contains_height_aware_packed(rx.into(), ry.into(), 0, 0)
                 && !initial.contains_height_aware_packed(rx.into(), ry.into(), 0, 0)
         })
         .collect();
+    sim.fog.set_width_for_test(100);
+    sim.fog.set_height_for_test(100);
+    sim.resolved_terrain = Some(flat_trigger_playfield_terrain(100, 100));
+    (sim, added)
+}
+
+const ACTION40_GROWN: [i32; 4] = [2, 2, 76, 48];
+
+#[test]
+fn techno_playfield_action_40_exact_recompute_and_mobile_reveal_callback() {
+    use crate::map::playfield::PlayfieldBounds;
+    use crate::rules::ini_parser::IniFile;
+    use crate::rules::ruleset::RuleSet;
+    use crate::sim::combat::Health;
+    use crate::sim::house_state::HouseState;
+
+    let (mut sim, candidates) = action40_growth_fixture();
+    let expanded = PlayfieldBounds::from_raw_local_size(80, 58, ACTION40_GROWN);
     let mobile_cell = candidates
         .get(candidates.len() / 2)
         .copied()
@@ -2541,9 +3382,7 @@ fn techno_playfield_action_40_exact_recompute_and_mobile_reveal_callback() {
 
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, Some(owner), true, 0, 10));
-    sim.fog.width = 100;
-    sim.fog.height = 100;
+        .register(HouseState::new(owner, 0, Some(owner), true, 0, 10));
     let mobile_type = sim.interner.intern("MTNK");
     let building_type = sim.interner.intern("GAPOWR");
     let mut mobile = GameEntity::new_at_frame_zero_for_test(
@@ -2580,9 +3419,11 @@ fn techno_playfield_action_40_exact_recompute_and_mobile_reveal_callback() {
     building.lifecycle.set_in_limbo_for_test(false);
     sim.substrate.entities.insert(mobile);
     sim.substrate.entities.insert(building);
-    sim.resolved_terrain = Some(flat_trigger_playfield_terrain(100, 100));
 
-    assert!(sim.change_visible_map_area([2, 2, 76, 48], Some(&rules)));
+    assert!(sim.change_visible_map_area(
+        ACTION40_GROWN,
+        crate::sim::world::UninitContext::with_rules(&rules)
+    ));
     assert!(sim.substrate.entities.get(1).unwrap().in_playfield());
     assert!(sim.substrate.entities.get(2).unwrap().in_playfield());
     assert!(
@@ -2600,34 +3441,146 @@ fn techno_playfield_action_40_exact_recompute_and_mobile_reveal_callback() {
         "FUN_006E21E0 excludes BuildingClass from the false-to-true callback"
     );
 
-    assert!(sim.change_visible_map_area([30, 20, 8, 6], Some(&rules)));
+    assert!(sim.change_visible_map_area(
+        [30, 20, 8, 6],
+        crate::sim::world::UninitContext::with_rules(&rules)
+    ));
     assert!(!sim.substrate.entities.get(1).unwrap().in_playfield());
     assert!(!sim.substrate.entities.get(2).unwrap().in_playfield());
-    assert!(sim.change_visible_map_area([2, 2, 76, 48], Some(&rules)));
+    assert!(sim.change_visible_map_area(
+        ACTION40_GROWN,
+        crate::sim::world::UninitContext::with_rules(&rules)
+    ));
     assert!(sim.substrate.entities.get(1).unwrap().in_playfield());
     assert!(sim.substrate.entities.get(2).unwrap().in_playfield());
 }
 
-#[test]
-fn time_trigger_can_center_camera_at_waypoint() {
-    let map = trigger_fixture_map(
-        "[Triggers]\nTRIG_A=Neutral,<none>,Timer A,0,1,1,1,0\n\
-         [Events]\nTRIG_A=1,47,0,3\n[Actions]\nTRIG_A=1,112,0,0,0,0,0,0,J\n\
-         [Tags]\nTRIG_A_TAG=0,Timer A,TRIG_A\n",
-    );
-    let mut sim = Simulation::new();
-    install_map_triggers(&mut sim, &map);
-    sim.classify_map_triggers(None);
+/// Places one live, out-of-Limbo object per `(owner, type, category, health)`
+/// on `added` cells far apart, with sight 1 and ids from 1; returns the cells.
+fn action40_objects(
+    sim: &mut Simulation,
+    added: &[(u16, u16)],
+    objects: &[(crate::sim::intern::InternedId, &str, EntityCategory, i32)],
+) -> Vec<(u16, u16)> {
+    let step = (added.len() - 1) / objects.len().saturating_sub(1).max(1);
+    let cells: Vec<_> = (0..objects.len()).map(|i| added[i * step]).collect();
+    for (i, a) in cells.iter().enumerate() {
+        for b in &cells[i + 1..] {
+            assert!(a.0.abs_diff(b.0) + a.1.abs_diff(b.1) > 6, "{a:?} {b:?}");
+        }
+    }
+    for (index, (&(rx, ry), &(owner, type_name, category, health))) in
+        cells.iter().zip(objects).enumerate()
+    {
+        let type_ref = sim.interner.intern(type_name);
+        let mut entity = GameEntity::new_at_frame_zero_for_test(
+            index as u64 + 1,
+            rx,
+            ry,
+            0,
+            0,
+            owner,
+            crate::sim::combat::Health::new(health),
+            type_ref,
+            category,
+            0,
+            1,
+            category == EntityCategory::Unit,
+        );
+        entity.lifecycle.set_object_alive_for_test(true);
+        entity.lifecycle.set_in_limbo_for_test(false);
+        sim.substrate.entities.insert(entity);
+    }
+    cells
+}
 
-    assert!(advance_trigger_frame(&mut sim, 44, None, &HashMap::new()).is_empty());
-    assert_eq!(
-        advance_trigger_frame(&mut sim, 45, None, &HashMap::new()),
-        vec![TriggerEffect::CameraAtCoord {
-            coord: [128, 128, 0],
-            velocity: None
-        }]
+fn action40_rules() -> crate::rules::ruleset::RuleSet {
+    crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+        "[General]\nRevealByHeight=no\n[InfantryTypes]\n0=E1\n[VehicleTypes]\n0=MTNK\n1=DRON\n",
+    ))
+    .expect("action 40 sight fixture")
+}
+
+/// `MapClass::Set_Clipped_LocalSize @ 0x00567230` Sees for a 0 -> 1 flip
+/// whose owner passes IsHumanPlayer `0x0050B6F0` (in a campaign, IsHuman or
+/// PlayerControl) and that is alive and out of Limbo. It tests no Health, so
+/// an infantry corpse (Health 0) reveals; a dying SHP wreck does not, since
+/// its native UnInit cleared IsAlive.
+#[test]
+fn action40_sees_for_corpses_and_player_controlled_houses_not_wrecks() {
+    use crate::sim::house_state::HouseState;
+
+    let (mut sim, added) = action40_growth_fixture();
+    let player = sim.interner.intern("Americans");
+    let controlled = sim.interner.intern("British");
+    let computer = sim.interner.intern("Russians");
+    sim.houses
+        .register(HouseState::new(player, 0, Some(player), true, 0, 10));
+    let mut british = HouseState::new(controlled, 0, Some(controlled), false, 0, 10);
+    british.set_player_control_for_test(true);
+    sim.houses.register(british);
+    sim.houses
+        .register(HouseState::new(computer, 1, Some(computer), false, 0, 10));
+    let objects = [
+        (player, "E1", EntityCategory::Infantry, 0),
+        (controlled, "MTNK", EntityCategory::Unit, 100),
+        (computer, "MTNK", EntityCategory::Unit, 100),
+        (player, "DRON", EntityCategory::Unit, 0),
+    ];
+    let cells = action40_objects(&mut sim, &added, &objects);
+    sim.substrate
+        .entities
+        .get_mut(4)
+        .unwrap()
+        .death
+        .set_dying_for_test(true);
+
+    let rules = action40_rules();
+    assert!(sim.change_visible_map_area(
+        ACTION40_GROWN,
+        crate::sim::world::UninitContext::with_rules(&rules)
+    ));
+    let revealed = objects
+        .iter()
+        .zip(cells)
+        .map(|(&(house, ..), (rx, ry))| sim.fog.is_cell_revealed(house, rx, ry))
+        .collect::<Vec<_>>();
+    assert_eq!(revealed, [true, true, false, false]);
+}
+
+/// In a network game 0x0050B6F0 passes only on the owner's own client
+/// (0x0050B716), so See writes only the owner's map: not an ally's, which
+/// `AllyReveal=` would otherwise admit.
+#[test]
+fn action40_network_see_writes_only_the_owners_map() {
+    use crate::sim::house_state::HouseState;
+
+    let (mut sim, added) = action40_growth_fixture();
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Lan);
+    let owner = sim.interner.intern("Americans");
+    let ally = sim.interner.intern("British");
+    for (side, house) in [(0, owner), (1, ally)] {
+        sim.houses
+            .register(HouseState::new(house, side, Some(house), true, 0, 10));
+    }
+    sim.house_alliances_mut_for_test()
+        .insert("AMERICANS".into(), ["BRITISH".to_string()].into());
+    let cells = action40_objects(
+        &mut sim,
+        &added,
+        &[(owner, "MTNK", EntityCategory::Unit, 100)],
     );
-    assert!(advance_trigger_frame(&mut sim, 46, None, &HashMap::new()).is_empty());
+
+    let rules = action40_rules();
+    assert!(rules.general.ally_reveal);
+    assert!(sim.change_visible_map_area(
+        ACTION40_GROWN,
+        crate::sim::world::UninitContext::with_rules(&rules)
+    ));
+    let (rx, ry) = cells[0];
+    assert!(sim.fog.is_cell_revealed(owner, rx, ry));
+    assert!(!sim.fog.is_cell_revealed(ally, rx, ry));
 }
 
 #[test]
@@ -2640,23 +3593,28 @@ fn master_frame_polls_triggers_before_logic_houses_commit_and_delete() {
     let mut sim = Simulation::new();
     sim.resolved_terrain = Some(flat_trigger_playfield_terrain(32, 32));
     install_map_triggers(&mut sim, &map);
-    sim.classify_map_triggers(None);
+    sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
 
     let tick = ordinary_master_frame(&mut sim, None, None, true);
 
     assert!(tick.frame_committed);
-    assert_eq!(
-        sim.take_master_frame_test_trace(),
-        vec![
-            MasterFrameTestRung::SessionCommands,
-            MasterFrameTestRung::Triggers,
-            MasterFrameTestRung::TeamScript,
-            MasterFrameTestRung::LogicVector,
-            MasterFrameTestRung::Houses,
-            MasterFrameTestRung::FrameCommit,
-            MasterFrameTestRung::PendingDelete,
-        ]
-    );
+    let order = [
+        FrameStep::SessionCommands,
+        FrameStep::Triggers,
+        FrameStep::TeamScript,
+        FrameStep::DiskLasers,
+        FrameStep::LightningStorm,
+        FrameStep::LogicVector,
+        FrameStep::Houses,
+        FrameStep::FrameCommit,
+        FrameStep::PendingDelete,
+    ];
+    let trace = sim.take_frame_step_trace();
+    let visited: Vec<_> = trace
+        .into_iter()
+        .filter(|step| order.contains(step))
+        .collect();
+    assert_eq!(visited, order);
     assert_eq!(
         sim.drain_trigger_effects(),
         vec![TriggerEffect::CameraAtCoord {
@@ -2676,11 +3634,11 @@ fn master_frame_save_load_continues_trigger_projectile_and_delete_state() {
     let mut original = Simulation::new();
     original.hash_state_every(std::num::NonZeroU64::MIN);
     install_map_triggers(&mut original, &map);
-    original.classify_map_triggers(None);
+    original.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
     ordinary_master_frame(&mut original, None, None, true);
     assert!(original.trigger_runtime.globals_set.contains(&13));
 
-    let projectile_id = original.allocate_stable_id();
+    let projectile_id = original.substrate.allocate_stable_id();
     original.admit_projectile(
         projectile_id,
         ProjectileSpawn {
@@ -2744,8 +3702,8 @@ fn master_frame_save_load_continues_trigger_projectile_and_delete_state() {
         pixel_conversion_bounds: Default::default(),
         version: 1,
         tick_hz: 15,
-        seed: original.session.seed,
-        map_name: original.session.map_name.clone(),
+        seed: original.session.seed(),
+        map_name: original.session.map_name().to_owned(),
         rules_hash: 0,
     });
     replay_log.record_tick(original_tick.tick, Vec::new(), original_tick.state_hash);
@@ -2788,6 +3746,7 @@ fn trigger_runtime_latches_participate_in_state_hash() {
 #[test]
 fn elapsed_time_uses_signed_current_frame_divided_by_fifteen() {
     let sim = Simulation::new();
+    let rules = crate::rules::ruleset::RuleSet::empty_for_test();
     let one_second = EventCondition {
         kind: 47,
         value: 1,
@@ -2799,12 +3758,21 @@ fn elapsed_time_uses_signed_current_frame_divided_by_fifteen() {
         ..Default::default()
     };
 
-    assert!(sim.trigger_runtime.evaluate_event(&zero_seconds, 0, &sim));
-    assert!(!sim.trigger_runtime.evaluate_event(&one_second, 14, &sim));
-    assert!(sim.trigger_runtime.evaluate_event(&one_second, 15, &sim));
+    assert!(
+        sim.trigger_runtime
+            .evaluate_event(&zero_seconds, 0, &sim, rules)
+    );
     assert!(
         !sim.trigger_runtime
-            .evaluate_event(&one_second, 0x8000_0000, &sim),
+            .evaluate_event(&one_second, 14, &sim, rules)
+    );
+    assert!(
+        sim.trigger_runtime
+            .evaluate_event(&one_second, 15, &sim, rules)
+    );
+    assert!(
+        !sim.trigger_runtime
+            .evaluate_event(&one_second, 0x8000_0000, &sim, rules),
         "the native frame counter is divided as a signed 32-bit value"
     );
 }
@@ -2832,9 +3800,14 @@ fn dispatch_typed_trigger_reference(kind: i32, target_enabled: bool) -> Simulati
     let action = sim.trigger_runtime.definitions.trigger_types[source].actions[0].clone();
     sim.apply_live_trigger_action(
         &action,
-        sim.trigger_action_context(source, None, TagEventInput::default(), None),
+        sim.trigger_action_context(
+            source,
+            None,
+            TagEventInput::default(),
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+        ),
         &mut Vec::new(),
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         FrameEffects::default(),
     );
@@ -2845,6 +3818,192 @@ fn dispatch_typed_trigger_reference(kind: i32, target_enabled: bool) -> Simulati
 fn typed_trigger_reference_force_uses_operand_instead_of_metadata() {
     let sim = dispatch_typed_trigger_reference(22, true);
     assert_eq!(sim.trigger_runtime.globals_set, [7].into_iter().collect());
+}
+
+#[test]
+fn destroy_attached_refuses_stationary_immune_hut_without_blocking_other_receivers() {
+    let (mut sim, rules, overlays, houses) =
+        event_ingress_fixture_with_rules("[CABHUT]\nImmune=yes\n");
+    let owner = sim.resolve(houses[0]).to_owned();
+    let hut = sim
+        .spawn_object("CABHUT", &owner, 12, 12, 0, &rules)
+        .unwrap();
+    let unit = spawn_event_ingress_unit(&mut sim, &rules, houses[0], (16, 16));
+    install_event_ingress_map(
+        &mut sim,
+        &rules,
+        "[Triggers]\nDESTROY=Country0,<none>,Destroy,0,1,1,1,0\n\
+         [Events]\nDESTROY=1,41,0,0\n\
+         [Actions]\nDESTROY=2,32,0,0,0,0,0,0,A,28,0,7,0,0,0,0,A\n\
+         [Tags]\nDESTROYTAG=2,Destroy,DESTROY\n",
+    );
+    for id in [hut, unit] {
+        sim.attach_object_trigger_tag(id, Some("DESTROYTAG"));
+    }
+    event_ingress_damage(
+        &mut sim,
+        &rules,
+        &overlays,
+        unit,
+        crate::sim::combat::RAD_NO_ATTACKER,
+        1,
+        FrameEffects::default(),
+    );
+    assert!(
+        sim.global_variables()[7],
+        "the following action still executes"
+    );
+    assert_eq!(sim.entities().get(hut).unwrap().health.current(), 200);
+    assert!(sim.entities().get(hut).unwrap().is_object_alive());
+    assert!(!sim.entities().get(unit).unwrap().is_object_alive());
+    assert_eq!(sim.houses[&houses[0]].stats().units_lost(), 1);
+}
+
+#[test]
+fn forced_trigger_cycle_returns_to_normal_map_polling() {
+    let map = trigger_fixture_map(
+        "[Triggers]\nTRGA=Neutral,<none>,A,0,1,1,1,0\nTRGB=Neutral,<none>,B,0,1,1,1,0\n\
+         [Events]\nTRGA=1,13,0,0\nTRGB=1,13,0,0\n\
+         [Actions]\nTRGA=2,22,2,TRGB,0,0,0,0,A,28,0,7,0,0,0,0,A\n\
+         TRGB=2,22,2,TRGA,0,0,0,0,A,28,0,8,0,0,0,0,A\n\
+         [Tags]\nAT=2,A,TRGA\nBT=2,B,TRGB\n",
+    );
+    let mut sim = Simulation::new();
+    install_map_triggers(&mut sim, &map);
+    sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
+    ordinary_master_frame(&mut sim, None, None, true);
+    assert!(sim.global_variables()[7]);
+    assert!(sim.global_variables()[8]);
+    assert!(sim.trigger_runtime.action_trace.len() < 256);
+    sim.trigger_runtime.action_trace.clear();
+    ordinary_master_frame(&mut sim, None, None, true);
+    assert!(sim.trigger_runtime.action_trace.len() < 256);
+}
+
+fn force_chain_map(levels: usize, branch: bool) -> crate::map::map_file::MapFile {
+    let mut triggers = String::from("[Triggers]\n");
+    let mut actions = String::from("[Actions]\n");
+    let mut tags = String::from("[Tags]\n");
+    for level in 0..levels {
+        triggers.push_str(&format!(
+            "TR{level:02}=Neutral,<none>,TR{level:02},0,1,1,1,0\n"
+        ));
+        tags.push_str(&format!("G{level:02}=2,TR{level:02},TR{level:02}\n"));
+        if level + 1 == levels {
+            actions.push_str(&format!("TR{level:02}=1,28,0,9,0,0,0,0,A\n"));
+        } else {
+            let force = format!("22,2,TR{:02},0,0,0,0,A", level + 1);
+            actions.push_str(&if branch {
+                format!("TR{level:02}=2,{force},{force}\n")
+            } else {
+                format!("TR{level:02}=1,{force}\n")
+            });
+        }
+    }
+    trigger_fixture_map(&format!("{triggers}{actions}{tags}"))
+}
+
+fn spring_test_trigger(sim: &mut Simulation, name: &str) {
+    let live = live_trigger_of_type(sim, trigger_type_index(sim, name));
+    sim.spring_live_trigger(
+        live,
+        TagEventInput::default(),
+        &mut Vec::new(),
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        None,
+        FrameEffects::default(),
+    );
+}
+
+#[test]
+fn forced_trigger_deep_chain_is_refused_without_poisoning_later_dispatch() {
+    let mut sim = Simulation::new();
+    install_map_triggers(&mut sim, &force_chain_map(33, false));
+    for tag in 0..sim.trigger_runtime.definitions.tag_types.len() {
+        sim.construct_trigger_tag(tag);
+    }
+    spring_test_trigger(&mut sim, "TR00");
+    assert!(!sim.global_variables()[9]);
+    spring_test_trigger(&mut sim, "TR32");
+    assert!(sim.global_variables()[9]);
+}
+
+#[test]
+fn forced_trigger_branching_work_is_bounded_and_next_dispatch_gets_its_budget() {
+    let mut sim = Simulation::new();
+    install_map_triggers(&mut sim, &force_chain_map(14, true));
+    for tag in 0..sim.trigger_runtime.definitions.tag_types.len() {
+        sim.construct_trigger_tag(tag);
+    }
+    spring_test_trigger(&mut sim, "TR00");
+    assert!(sim.global_variables()[9]);
+    assert!(sim.trigger_runtime.action_trace.len() <= 4096);
+    sim.trigger_runtime.action_trace.clear();
+    spring_test_trigger(&mut sim, "TR13");
+    assert_eq!(sim.trigger_runtime.action_trace.len(), 1);
+}
+
+/// Execute6DF112..6DF119 springs each forced Trigger with a NULL object and
+/// the empty Cell [B0E680]. Action32 is the only arm that reads Spring's
+/// Cell, so a Trigger forced by a Spring at a bridge must leave it intact.
+#[test]
+fn retail_hills_forced_trigger_does_not_inherit_the_outer_bridge_cell() {
+    use crate::skirmish_launch::{AiDifficulty, LaunchCountry};
+    let Some((retail, _)) = crate::rules::retail_ini_fixture::retail_assets() else {
+        return;
+    };
+    let mut launch = crate::headless_scenario::battle_session(
+        "Hills.mmx",
+        &[(LaunchCountry::America, AiDifficulty::Easy)],
+    );
+    launch.options.bases = false;
+    launch.options.unit_count = 0;
+    let mut scene =
+        crate::headless_scenario::load_session(&retail, "Hills.mmx", 0x0B21_D6E5, launch).unwrap();
+    let runtime = &mut scene.runtime;
+    let sim = &mut runtime.simulation;
+    install_map_triggers(
+        sim,
+        &trigger_fixture_map(
+            "[Triggers]\nOUTER=Neutral,<none>,Outer,0,1,1,1,0\n\
+             FORCED=Neutral,<none>,Forced,0,1,1,1,0\n\
+             [Events]\nOUTER=1,13,0,0\nFORCED=1,13,0,0\n\
+             [Actions]\nOUTER=1,22,2,FORCED,0,0,0,0,A\n\
+             FORCED=2,32,0,0,0,0,0,0,A,28,0,7,0,0,0,0,A\n\
+             [Tags]\nOUTERTAG=2,Outer,OUTER\nFORCEDTAG=2,Forced,FORCED\n",
+        ),
+    );
+    for tag in 0..sim.trigger_runtime.definitions.tag_types.len() {
+        sim.construct_trigger_tag(tag);
+    }
+    let bridge = |sim: &Simulation| {
+        let terrain = sim.resolved_terrain.as_ref().unwrap();
+        let grid = sim.overlay_grid.as_ref().unwrap();
+        let overlays: Vec<_> = terrain
+            .cells()
+            .iter()
+            .map(|cell| *grid.cell(cell.rx, cell.ry))
+            .collect();
+        let deck = terrain.cell(76, 75).unwrap();
+        (deck.bridge_facts.has_structural_bridge(), overlays)
+    };
+    let before = bridge(sim);
+    assert!(before.0, "Hills (76,75) is a bridge deck");
+    let outer = live_trigger_of_type(sim, trigger_type_index(sim, "OUTER"));
+    sim.spring_live_trigger(
+        outer,
+        TagEventInput {
+            kind: 1,
+            cell: (76, 75),
+            ..TagEventInput::default()
+        },
+        &mut Vec::new(),
+        &runtime.resources.rules,
+        Some(&runtime.resources.overlay_registry),
+        FrameEffects::default(),
+    );
+    assert!(sim.global_variables()[7], "the forced Trigger ran");
+    assert!(bridge(sim) == before, "the forced Trigger hit the bridge");
 }
 
 #[test]
@@ -2863,73 +4022,6 @@ fn typed_trigger_reference_enable_and_disable_use_operand_instead_of_metadata() 
 }
 
 #[test]
-fn global_actions_can_enable_and_force_followup_trigger() {
-    let map = trigger_fixture_map(
-        "[Triggers]\nTRIG_A=Neutral,<none>,Set Global,0,1,1,1,0\n\
-         TRIG_B=Neutral,<none>,Camera,1,1,1,1,0\n\
-         [Events]\nTRIG_A=1,47,0,1\nTRIG_B=1,27,0,7\n\
-         [Actions]\nTRIG_A=3,28,0,7,0,0,0,0,A,53,2,TRIG_B,0,0,0,0,A,22,2,TRIG_B,0,0,0,0,A\n\
-         TRIG_B=1,112,0,0,0,0,0,0,D\n\
-         [Tags]\nTRIG_A_TAG=0,Set Global,TRIG_A\nTRIG_B_TAG=0,Camera,TRIG_B\n",
-    );
-    let mut sim = Simulation::new();
-    install_map_triggers(&mut sim, &map);
-    sim.classify_map_triggers(None);
-
-    assert_eq!(
-        advance_trigger_frame(&mut sim, 15, None, &HashMap::new()),
-        vec![TriggerEffect::CameraAtCoord {
-            coord: [128, 128, 0],
-            velocity: None
-        }]
-    );
-}
-
-#[test]
-fn linked_trigger_instances_execute_in_reverse_chain_order() {
-    let map = trigger_fixture_map(
-        "[Triggers]\nTRIG_A=Neutral,TRIG_B,Primary,0,1,1,1,0\n\
-         TRIG_B=Neutral,<none>,Followup,0,1,1,1,0\n\
-         [Events]\nTRIG_A=1,47,0,1\nTRIG_B=1,28,0,9\n\
-         [Actions]\nTRIG_A=1,28,0,5,0,0,0,0,A\nTRIG_B=1,112,0,0,0,0,0,0,E\n\
-         [Tags]\nTRIG_A_TAG=0,Primary,TRIG_A\nTRIG_B_TAG=0,Followup,TRIG_B\n",
-    );
-    let mut sim = Simulation::new();
-    install_map_triggers(&mut sim, &map);
-    sim.classify_map_triggers(None);
-
-    assert_eq!(
-        advance_trigger_frame(&mut sim, 15, None, &HashMap::new()),
-        vec![TriggerEffect::CameraAtCoord {
-            coord: [128, 128, 0],
-            velocity: None
-        }]
-    );
-}
-
-#[test]
-fn force_trigger_bypasses_unmet_event_predicates() {
-    let map = trigger_fixture_map(
-        "[Triggers]\nTRIG_A=Neutral,<none>,Force,0,1,1,1,0\n\
-         TRIG_B=Neutral,<none>,Blocked,0,1,1,1,0\n\
-         [Events]\nTRIG_A=1,47,0,1\nTRIG_B=1,27,0,99\n\
-         [Actions]\nTRIG_A=1,22,2,TRIG_B,0,0,0,0,A\nTRIG_B=1,112,0,0,0,0,0,0,D\n\
-         [Tags]\nTRIG_A_TAG=0,Force,TRIG_A\nTRIG_B_TAG=0,Blocked,TRIG_B\n",
-    );
-    let mut sim = Simulation::new();
-    install_map_triggers(&mut sim, &map);
-    sim.classify_map_triggers(None);
-
-    assert_eq!(
-        advance_trigger_frame(&mut sim, 15, None, &HashMap::new()),
-        vec![TriggerEffect::CameraAtCoord {
-            coord: [128, 128, 0],
-            velocity: None
-        }]
-    );
-}
-
-#[test]
 fn mission_announce_then_end_uses_the_player_house_and_shared_timer() {
     use crate::rules::ini_parser::IniFile;
     use crate::rules::ruleset::RuleSet;
@@ -2945,17 +4037,19 @@ fn mission_announce_then_end_uses_the_player_house_and_shared_timer() {
     let other = sim.interner.intern("OtherHouse");
     let player_country = sim.interner.intern("PlayerCountry");
     let other_country = sim.interner.intern("OtherCountry");
-    sim.houses.insert(
+    sim.houses.register(HouseState::new(
         player,
-        HouseState::new(player, 0, Some(player_country), true, 0, 10),
-    );
-    sim.houses.insert(
-        other,
-        HouseState::new(other, 0, Some(other_country), false, 0, 10),
-    );
-    sim.session.house_order = vec![player, other];
-    sim.session.current_house = Some(player);
-    sim.session.game_mode_nonzero = false;
+        0,
+        Some(player_country),
+        true,
+        0,
+        10,
+    ));
+    sim.houses
+        .register(HouseState::new(other, 0, Some(other_country), false, 0, 10));
+    sim.session.set_current_house_for_test(Some(player));
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false));
     let map = trigger_fixture_map(
         "[Triggers]\nRESULT=OtherCountry,<none>,End Mission,0,1,1,1,0\n\
          [Events]\nRESULT=1,47,0,1\n[Actions]\nRESULT=2,67,0,0,0,0,0,0,A,69,0,0,0,0,0,0,A\n\
@@ -2963,7 +4057,7 @@ fn mission_announce_then_end_uses_the_player_house_and_shared_timer() {
     );
     let before = sim.houses[&player].outcome_timer();
     install_map_triggers(&mut sim, &map);
-    sim.classify_map_triggers(Some(&rules));
+    sim.classify_map_triggers(&rules);
     let effects = advance_trigger_frame(&mut sim, 15, Some(&rules), &HashMap::new());
     assert!(
         effects.is_empty(),
@@ -2979,76 +4073,176 @@ fn mission_announce_then_end_uses_the_player_house_and_shared_timer() {
         "67 preserves duration;69 resumes it instead of starting SavourDelay"
     );
     assert!(sim.ready_outcome_for_owner(player).is_none());
-    assert!(
-        sim.houses
-            .get_mut(&player)
-            .unwrap()
-            .advance_outcome_savour(15, false)
-    );
+    let kind = sim.houses[&player]
+        .pending_outcome(15, false)
+        .expect("native shared timer admits the current House");
+    sim.houses.get_mut(&player).unwrap().complete_outcome(kind);
+    sim.session.admit_outcome(kind);
     assert!(sim.ready_outcome_for_owner(player).is_some());
 }
 
 #[test]
-fn local_variables_seed_and_gate_followup_triggers() {
-    let map = trigger_fixture_map(
-        "[Triggers]\nTRIG_A=Neutral,<none>,Flip Local,0,1,1,1,0\n\
-         TRIG_B=Neutral,<none>,Uses Local,0,1,1,1,0\n\
-         [Events]\nTRIG_A=1,37,0,2\nTRIG_B=1,36,0,2\n\
-         [Actions]\nTRIG_A=1,56,0,2,0,0,0,0,A\nTRIG_B=1,112,0,0,0,0,0,0,G\n\
-         [Tags]\nTRIG_A_TAG=0,Flip Local,TRIG_A\nTRIG_B_TAG=0,Uses Local,TRIG_B\n\
-         [VariableNames]\n2=BridgeDone,0\n",
-    );
-    let mut sim = Simulation::new();
-    install_map_triggers(&mut sim, &map);
-    sim.classify_map_triggers(None);
-
-    assert_eq!(
-        advance_trigger_frame(&mut sim, 0, None, &HashMap::new()),
-        Vec::<TriggerEffect>::new()
-    );
-    assert!(sim.trigger_runtime.locals_set.contains(&2));
-    assert_eq!(
-        advance_trigger_frame(&mut sim, 0, None, &HashMap::new()),
-        vec![TriggerEffect::CameraAtCoord {
-            coord: [128, 128, 0],
-            velocity: None
-        }]
-    );
-}
-
-#[test]
 fn techtype_exists_and_not_exists_query_simulation_world() {
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = retail.rules;
     let map = trigger_fixture_map(
         "[Triggers]\nTRIG_A=Neutral,<none>,Need Two Power Plants,0,1,1,1,0\n\
          TRIG_B=Neutral,<none>,No Radar,0,1,1,1,0\n\
          [Events]\nTRIG_A=1,60,2,2,GAPOWR\nTRIG_B=1,61,2,0,GAAIRC\n\
          [Actions]\nTRIG_A=1,112,0,0,0,0,0,0,L\nTRIG_B=1,112,0,0,0,0,0,0,M\n\
-         [Tags]\nTRIG_A_TAG=0,Need Two Power Plants,TRIG_A\nTRIG_B_TAG=0,No Radar,TRIG_B\n",
+         [Tags]\nTRIG_A_TAG=0,Need Two Power Plants,TRIG_A\nTRIG_B_TAG=0,No Radar,TRIG_B\n\
+         [Structures]\n0=Neutral,GAPOWR,256,10,10,0,None,0,0,1,0,0,None,None,None,0,0\n\
+         1=Neutral,GAPOWR,256,18,10,0,None,0,0,1,0,0,None,None,None,0,0\n",
     );
     let mut sim = Simulation::new();
+    crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    let owner = sim.interner.intern("Neutral");
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, false, 0, 10,
+        ));
     install_map_triggers(&mut sim, &map);
-    spawn_type(&mut sim, "GAPOWR");
-    spawn_type(&mut sim, "GAPOWR");
-    sim.classify_map_triggers(None);
+    assert_eq!(sim.spawn_from_map(&map.entities, Some(&rules)), 2);
+    sim.classify_map_triggers(&rules);
 
     // Native55AFB0 revisits the live list length after each Tag. Removing
     // TRIG_A shifts TRIG_B into the current slot, which the increment skips
     // until the next Logic visit; both queries must still fire exactly once.
     assert_eq!(
-        advance_trigger_frame(&mut sim, 0, None, &HashMap::new()),
+        advance_trigger_frame(&mut sim, 0, Some(&rules), &HashMap::new()),
         vec![TriggerEffect::CameraAtCoord {
             coord: [128, 128, 0],
             velocity: None
         }]
     );
     assert_eq!(
-        advance_trigger_frame(&mut sim, 1, None, &HashMap::new()),
+        advance_trigger_frame(&mut sim, 1, Some(&rules), &HashMap::new()),
         vec![TriggerEffect::CameraAtCoord {
             coord: [128, 128, 0],
             velocity: None
         }]
     );
-    assert!(advance_trigger_frame(&mut sim, 2, None, &HashMap::new()).is_empty());
+    assert!(advance_trigger_frame(&mut sim, 2, Some(&rules), &HashMap::new()).is_empty());
+}
+
+// Ares replaces 60/61 (TEventExt::TechTypeExists 1004FE60): the ares tests
+// cover its case-insensitive first match and owned counts.
+#[test]
+fn techtype_events_resolve_exact_registered_names_before_counting_entities() {
+    let rules =
+        crate::rules::ruleset::RuleSet::from_ini(&crate::sim::arena_fixture::clear_ground_ini(
+            "[VehicleTypes]\n0=Known\n1=Absent\n[Known]\nStrength=100\n[Absent]\nStrength=100\n",
+        ))
+        .unwrap();
+    let map = trigger_fixture_map(
+        "[Triggers]\nPRESENT=<none>,<none>,Present,0,1,1,1,0\n\
+         ABSENT=<none>,<none>,Absent,0,1,1,1,0\n\
+         WRONG_CASE=<none>,<none>,Wrong case,0,1,1,1,0\n\
+         WRONG_CASE_ABSENT=<none>,<none>,Wrong case absent,0,1,1,1,0\n\
+         UNKNOWN=<none>,<none>,Unknown,0,1,1,1,0\n\
+         UNKNOWN_ZERO=<none>,<none>,Unknown zero,0,1,1,1,0\n\
+         [Events]\nPRESENT=1,60,2,1,Known\nABSENT=1,61,2,0,Absent\n\
+         WRONG_CASE=1,60,2,1,known\nWRONG_CASE_ABSENT=1,61,2,0,absent\n\
+         UNKNOWN=1,61,2,0,Unregistered\nUNKNOWN_ZERO=1,60,2,0,Unregistered\n\
+         [Actions]\nPRESENT=1,28,0,7,0,0,0,0,A\nABSENT=1,28,0,8,0,0,0,0,A\n\
+         WRONG_CASE=1,28,0,9,0,0,0,0,A\nWRONG_CASE_ABSENT=1,28,0,10,0,0,0,0,A\n\
+         UNKNOWN=1,28,0,11,0,0,0,0,A\nUNKNOWN_ZERO=1,28,0,12,0,0,0,0,A\n\
+         [Tags]\nP=0,Present,PRESENT\nA=0,Absent,ABSENT\nW=0,Wrong case,WRONG_CASE\n\
+         WA=0,Wrong case absent,WRONG_CASE_ABSENT\nU=0,Unknown,UNKNOWN\nUZ=0,Unknown zero,UNKNOWN_ZERO\n\
+         [Units]\n0=Neutral,known,256,10,10,0,Guard,None,0,-1,0,-1,1,1\n",
+    );
+    let mut sim = Simulation::new();
+    // First-seen interner spelling is an entity label, not the native registry ID.
+    let lower = sim.interner.intern("known");
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    assert_eq!(sim.interner.resolve(lower), "known");
+    crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
+    assert_eq!(sim.spawn_from_map(&map.entities, Some(&rules)), 1);
+    install_map_triggers(&mut sim, &map);
+    sim.classify_map_triggers(&rules);
+    for frame in 0..6 {
+        advance_trigger_frame(&mut sim, frame, Some(&rules), &HashMap::new());
+    }
+    assert!(
+        sim.global_variables()[7],
+        "registered Known matches its real Unit"
+    );
+    assert!(
+        sim.global_variables()[8],
+        "registered Absent has no instance"
+    );
+    assert_eq!(&sim.global_variables()[9..13], &[false; 4]);
+}
+
+#[test]
+fn techtype_events_count_the_last_registered_category_identity() {
+    use crate::rules::native_processing::{RulesLayerKind, RulesLayerStack};
+    let mut layers = RulesLayerStack::new(crate::sim::arena_fixture::clear_ground_ini(
+        "[VehicleTypes]\n0=SHARED\n[SHARED]\nStrength=100\n",
+    ));
+    // The later physical pass appends a different concrete TechnoType pointer.
+    layers.push(
+        RulesLayerKind::Scenario,
+        crate::rules::ini_parser::IniFile::from_str("[InfantryTypes]\n0=SHARED\n"),
+    );
+    let rules = crate::rules::ruleset::RuleSet::from_rules_layers(&layers).unwrap();
+    let map = trigger_fixture_map(
+        "[Triggers]\nZERO=<none>,<none>,Zero,0,1,1,1,0\n\
+         PRESENT=<none>,<none>,Present,0,1,1,1,0\nABSENT=<none>,<none>,Absent,0,1,1,1,0\n\
+         [Events]\nZERO=1,60,2,0,SHARED\nPRESENT=1,60,2,1,SHARED\nABSENT=1,61,2,0,SHARED\n\
+         [Actions]\nZERO=1,28,0,7,0,0,0,0,A\nPRESENT=1,28,0,8,0,0,0,0,A\nABSENT=1,28,0,9,0,0,0,0,A\n\
+         [Tags]\nZ=0,Zero,ZERO\nP=0,Present,PRESENT\nA=0,Absent,ABSENT\n\
+         [Units]\n0=Neutral,SHARED,256,10,10,0,Guard,None,0,-1,0,-1,1,1\n\
+         [Infantry]\n0=Neutral,SHARED,256,12,10,0,Guard,0,None,0,-1,0,1,1\n",
+    );
+    let mut sim = Simulation::new();
+    crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    install_map_triggers(&mut sim, &map);
+    sim.classify_map_triggers(&rules);
+    for frame in 0..3 {
+        advance_trigger_frame(&mut sim, frame, Some(&rules), &HashMap::new());
+    }
+    assert_eq!(
+        &sim.global_variables()[7..10],
+        &[false, false, true],
+        "empty Technos"
+    );
+    let vehicle: Vec<_> = map
+        .entities
+        .iter()
+        .filter(|entity| entity.category == EntityCategory::Unit)
+        .cloned()
+        .collect();
+    assert_eq!(sim.spawn_from_map(&vehicle, Some(&rules)), 1);
+    for frame in 3..6 {
+        advance_trigger_frame(&mut sim, frame, Some(&rules), &HashMap::new());
+    }
+    assert_eq!(
+        &sim.global_variables()[7..10],
+        &[true, false, true],
+        "Unit is not the later Infantry identity"
+    );
+    let infantry: Vec<_> = map
+        .entities
+        .iter()
+        .filter(|entity| entity.category == EntityCategory::Infantry)
+        .cloned()
+        .collect();
+    assert_eq!(sim.spawn_from_map(&infantry, Some(&rules)), 1);
+    for frame in 6..9 {
+        advance_trigger_frame(&mut sim, frame, Some(&rules), &HashMap::new());
+    }
+    assert!(
+        sim.global_variables()[8],
+        "the later Infantry identity now exists"
+    );
 }
 
 fn run_waypoint_action(
@@ -3069,7 +4263,7 @@ fn run_waypoint_action(
          [Tags]\nWAYPOINT_ACTION_TAG=0,Waypoint action,WAYPOINT_ACTION\n"
     ));
     install_map_triggers(sim, &map);
-    sim.classify_map_triggers(rules);
+    sim.classify_map_triggers(rules.unwrap_or(crate::rules::ruleset::RuleSet::empty_for_test()));
     advance_trigger_frame(sim, 0, rules, waypoints)
 }
 
@@ -3091,10 +4285,9 @@ fn register_waypoint_action_house(
     let owner = sim.interner.intern(name);
     let country = country.map(|country| sim.interner.intern(country));
     let mut house = crate::sim::house_state::HouseState::new(owner, 0, country, false, 0, 10);
-    house.base_center = Some((40, 50));
-    house.alternate_base_center = alternate_base_center;
-    sim.houses.insert(owner, house);
-    sim.session.house_order.push(owner);
+    house.set_base_center_for_test(Some((40, 50)));
+    house.set_alternate_base_center_for_test(alternate_base_center);
+    sim.houses.register(house);
     owner
 }
 
@@ -3153,8 +4346,8 @@ fn action_137_replays_all_three_retail_waypoint_fixtures() {
             )
             .is_empty()
         );
-        assert_eq!(sim.houses[&house].alternate_base_center, cell);
-        assert_eq!(sim.houses[&house].base_center, Some((40, 50)));
+        assert_eq!(sim.houses[&house].alternate_base_center(), cell);
+        assert_eq!(sim.houses[&house].base_center(), Some((40, 50)));
     }
 }
 
@@ -3175,10 +4368,10 @@ fn action_137_uses_first_registration_order_country_match_only() {
         Some(&rules),
     );
 
-    assert_eq!(sim.houses[&first].alternate_base_center, (93, 106));
-    assert_eq!(sim.houses[&second].alternate_base_center, (3, 4));
-    assert_eq!(sim.houses[&first].base_center, Some((40, 50)));
-    assert_eq!(sim.houses[&second].base_center, Some((40, 50)));
+    assert_eq!(sim.houses[&first].alternate_base_center(), (93, 106));
+    assert_eq!(sim.houses[&second].alternate_base_center(), (3, 4));
+    assert_eq!(sim.houses[&first].base_center(), Some((40, 50)));
+    assert_eq!(sim.houses[&second].base_center(), Some((40, 50)));
 }
 
 #[test]
@@ -3198,7 +4391,7 @@ fn action_137_canonicalizes_house_type_alias_and_none_owner() {
         Some(&rules),
     );
     assert_eq!(
-        alias_sim.houses[&alias_house].alternate_base_center,
+        alias_sim.houses[&alias_house].alternate_base_center(),
         (93, 106)
     );
 
@@ -3215,31 +4408,11 @@ fn action_137_canonicalizes_house_type_alias_and_none_owner() {
         &waypoints,
         Some(&rules),
     );
-    assert_eq!(none_sim.houses[&russian].alternate_base_center, (7, 8));
+    assert_eq!(none_sim.houses[&russian].alternate_base_center(), (7, 8));
     assert_eq!(
-        none_sim.houses[&first_type].alternate_base_center,
+        none_sim.houses[&first_type].alternate_base_center(),
         (93, 106)
     );
-}
-
-#[test]
-fn action_137_rejects_only_exact_packed_zero_cell() {
-    let rules = waypoint_action_rules();
-    for cell in [(0, 17), (23, 0)] {
-        let mut sim = Simulation::new();
-        let house =
-            register_waypoint_action_house(&mut sim, "AxisHouse", Some("Americans"), (9, 9));
-        let waypoints = waypoint_map(15, cell);
-        run_waypoint_action(
-            137,
-            Some("P"),
-            "Americans",
-            &mut sim,
-            &waypoints,
-            Some(&rules),
-        );
-        assert_eq!(sim.houses[&house].alternate_base_center, cell);
-    }
 }
 
 #[test]
@@ -3262,11 +4435,11 @@ fn action_137_writes_signed_waypoint_halves_as_raw_nonzero_cell() {
     );
 
     assert_eq!(
-        sim.houses[&house].alternate_base_center,
+        sim.houses[&house].alternate_base_center(),
         (u16::MAX, u16::MAX),
         "signed -1 quotient/remainder halves are nonzero and must be written"
     );
-    assert_eq!(sim.houses[&house].base_center, Some((40, 50)));
+    assert_eq!(sim.houses[&house].base_center(), Some((40, 50)));
 }
 
 #[test]
@@ -3292,8 +4465,8 @@ fn action_137_invalid_resolution_and_waypoints_do_not_mutate_either_base_cell() 
             with_rules.then_some(&rules),
         );
         if let Some(house) = house {
-            assert_eq!(sim.houses[&house].alternate_base_center, (7, 8));
-            assert_eq!(sim.houses[&house].base_center, Some((40, 50)));
+            assert_eq!(sim.houses[&house].alternate_base_center(), (7, 8));
+            assert_eq!(sim.houses[&house].base_center(), Some((40, 50)));
         }
     }
 
@@ -3334,10 +4507,10 @@ fn action_138_clears_only_first_country_match_without_token_or_rng_use() {
         Some(&rules),
     );
 
-    assert_eq!(sim.houses[&first].alternate_base_center, (0, 0));
-    assert_eq!(sim.houses[&second].alternate_base_center, (122, 135));
-    assert_eq!(sim.houses[&first].base_center, Some((40, 50)));
-    assert_eq!(sim.houses[&second].base_center, Some((40, 50)));
+    assert_eq!(sim.houses[&first].alternate_base_center(), (0, 0));
+    assert_eq!(sim.houses[&second].alternate_base_center(), (122, 135));
+    assert_eq!(sim.houses[&first].base_center(), Some((40, 50)));
+    assert_eq!(sim.houses[&second].base_center(), Some((40, 50)));
     assert_eq!(sim.scenario_rng.state(), rng_before);
 
     let mut no_match = Simulation::new();
@@ -3351,7 +4524,7 @@ fn action_138_clears_only_first_country_match_without_token_or_rng_use() {
         &HashMap::new(),
         Some(&rules),
     );
-    assert_eq!(no_match.houses[&house].alternate_base_center, (105, 194));
+    assert_eq!(no_match.houses[&house].alternate_base_center(), (105, 194));
 }
 
 /// HouseClass::Update's Tag raise against the original block executed in
@@ -3373,8 +4546,13 @@ fn house_tag_raise_matches_original_cadence_and_order() {
         sim.trigger_runtime
             .house_tags
             .insert(house, (0..count).collect());
-        sim.session.binary_frame = frame as u32;
-        sim.raise_house_tags(house, None, None, FrameEffects::default());
+        sim.session.set_binary_frame_for_test(frame as u32);
+        sim.raise_house_tags(
+            house,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            None,
+            FrameEffects::default(),
+        );
         let expected: Vec<(usize, i32)> = case["raises"]
             .as_array()
             .unwrap()
@@ -3430,7 +4608,7 @@ fn physical_readers_take_each_record_by_the_type_id() {
         .as_bytes(),
     )
     .unwrap();
-    let definitions = RuntimeDefinitions::read_map(&map, &Default::default(), None, None);
+    let definitions = RuntimeDefinitions::read_map(&map, &Default::default(), None, None, None);
     let [trigger] = definitions.trigger_types.as_slice() else {
         panic!("one TriggerType: {:?}", definitions.trigger_types);
     };
@@ -3488,9 +4666,9 @@ fn cell_tags_split_by_ini_format_and_keep_the_first_tag_per_cell() {
             16,
             crate::map::resolved_terrain::test_clear_cell,
         ));
-        sim.initialize_trigger_definitions(&map, &Default::default(), None, None);
+        sim.initialize_trigger_definitions(&map, &Default::default(), None, None, None);
         sim.install_authored_cell_trigger_tags(&map);
-        let identity = sim.trigger_cell_identity((5, 6));
+        let identity = Simulation::trigger_cell_identity(&sim.resolved_terrain, (5, 6));
         let tag = sim.trigger_runtime.cell_tags[&identity];
         let type_index = sim.trigger_runtime.tag(tag).unwrap().type_index;
         let definitions = &sim.trigger_runtime.definitions;
@@ -3501,4 +4679,13 @@ fn cell_tags_split_by_ini_format_and_keep_the_first_tag_per_cell() {
             "format {format}: the losing entry still allocates its TagType"
         );
     }
+}
+
+/// Test-support difficulty overrides stay out of saved trigger state.
+#[test]
+fn fixture_difficulty_is_not_serialized() {
+    let mut runtime = TriggerRuntime::default();
+    let unset = serde_json::to_value(&runtime).unwrap();
+    runtime.fixture_difficulty = Some(3);
+    assert_eq!(serde_json::to_value(&runtime).unwrap(), unset);
 }

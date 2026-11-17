@@ -27,11 +27,6 @@ pub(crate) mod gates;
 pub(crate) mod kernel;
 pub(crate) mod receive;
 
-/// 0..=10 armor class index (none..special_2). Newtype over u8 to stop
-/// raw-int confusion with Verses/percent values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ArmorClass(pub u8);
-
 /// `TechnoClass::ReceiveDamage @ 0x00701900`'s defence divisors for one
 /// target, gathered by the caller (`0x00701939..0x007019E3`, see
 /// [`receive::defence_divides`]).
@@ -45,6 +40,10 @@ pub(crate) struct DefenceDivisors {
     pub house_type_armor: NativeF32Bits,
     /// `Techno+0x158`, the per-object ArmorMultiplier.
     pub unit_armor: NativeF64Bits,
+    /// Phobos `TechnoClass_ReceiveDamage_ArmorMultiplier` (`0x00701966`, 6
+    /// bytes replaced): the active AttachEffect armor product, divided as its
+    /// own step after the stock divide and before the STRONGER rank divide.
+    pub ae_armor: f64,
     /// `Rules+0x688` `VeteranArmor=` when the target's rank holds STRONGER.
     pub rank_armor: Option<NativeF64Bits>,
 }
@@ -54,6 +53,7 @@ impl Default for DefenceDivisors {
         Self {
             house_type_armor: NativeF32Bits::from_bits(1.0_f32.to_bits()),
             unit_armor: NativeF64Bits::ONE,
+            ae_armor: 1.0,
             rank_armor: None,
         }
     }
@@ -89,6 +89,9 @@ pub(crate) struct ImmunityInputs {
     pub affects_allies: bool,
     /// Attacker owner IsAlliedWith target owner (AffectsAllies operand).
     pub attacker_is_allied: bool,
+    /// Ares replaces the stock attacker-only ally gate with WarheadExt's
+    /// House policy, including a house-only source. None keeps stock behavior.
+    pub ares_house_damage_allowed: Option<bool>,
     /// Target owner IsAlliedWith sourceHouse (Psychedelic operand).
     pub source_house_is_allied: bool,
     /// Warhead Psychedelic/MindControl (warhead+0x16d).
@@ -96,15 +99,22 @@ pub(crate) struct ImmunityInputs {
     /// Target ImmuneToPsionics.
     pub psionics_immune: bool,
     pub target_is_building: bool,
+    /// The Phobos shield hook wrote a zero packet and suppressed
+    /// `0x007019D8`'s `< 1 -> 1` floor for it.
+    pub skip_low_damage_check: bool,
 }
 
 /// Caller-built target view — decouples the service from GameEntity.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TargetDamageView {
-    pub armor: ArmorClass,
     pub current_hp: i32,
     /// ObjectType `Immune=` entry gate in ObjectClass::ReceiveDamage.
     pub object_immune: bool,
+    /// Ares `RelativeDamage=yes`: WarheadTypeExt::GetRelativeDamage
+    /// (installed 10051C50) for this victim, which
+    /// ObjectClass_ReceiveDamage_Relative (10053A80, hook 0x5F53E5)
+    /// substitutes for the packet with its sign. `None` without the key.
+    pub relative_damage: Option<i32>,
 }
 
 /// What the receiver-side gates decide before the kernel runs.
@@ -112,7 +122,9 @@ pub(crate) struct TargetDamageView {
 pub(crate) enum DamageGate {
     Pass,
     /// Short-circuit to 0 HP delta, no state change.
-    Nullified,
+    Nullified {
+        clear_damage: bool,
+    },
     /// Active IronCurtain/ForceShield short-circuit. Kept distinct because
     /// TechnoClass emits its transient combat-light before returning.
     Invulnerable,
@@ -135,6 +147,9 @@ pub enum DamageState {
 /// Prepared receiver packet, before the Object HP transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DamageOutcome {
+    /// Packet at Techno701ADB, before bunker/warhead/Object immunity.
+    /// None when TypeImmune, IC/FS or WarpingOut returned earlier.
+    pub readiness_damage: Option<i32>,
     /// Object entry admitted the packet before its kernel (which may yield0).
     pub apply_object_damage: bool,
     /// Prepared signed kernel result; Object owns the final cap and HP write.

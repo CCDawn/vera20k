@@ -26,6 +26,7 @@ use vera20k_core::sim::combat::Health;
 use vera20k_core::sim::components::DriveCoord;
 use vera20k_core::sim::house_state::HouseState;
 use vera20k_core::sim::runtime::{SimResources, SimRuntime};
+use vera20k_core::sim::telemetry::{SessionContext, TerrainGrid};
 use vera20k_core::sim::world::Simulation;
 
 /// Entities per house per category.
@@ -122,13 +123,17 @@ fn parse_args() -> Result<Args, String> {
 /// set here — the dashboard frames its ground plane from it, and wander
 /// orders target cells inside it.
 fn build_world(seed: u32, per_category: u16, structures: u16) -> Simulation {
-    let mut sim = Simulation::with_seed(u64::from(seed));
-    if sim.session.map_width == 0 || sim.session.map_height == 0 {
-        sim.session.map_width = DEFAULT_MAP_SIDE;
-        sim.session.map_height = DEFAULT_MAP_SIDE;
-    }
-    let width = sim.session.map_width;
-    let height = sim.session.map_height;
+    let mut sim = Simulation::synthetic(
+        u64::from(seed),
+        &vera20k_core::sim::scenario_session::ScenarioDescriptor {
+            map_name: "synthetic.map".to_owned(),
+            map_width: DEFAULT_MAP_SIDE,
+            map_height: DEFAULT_MAP_SIDE,
+            ..Default::default()
+        },
+    );
+    let width = sim.session().map_width();
+    let height = sim.session().map_height();
     let homes = [
         (10u16, 10u16),
         (width.saturating_sub(30), height.saturating_sub(30)),
@@ -143,17 +148,17 @@ fn build_world(seed: u32, per_category: u16, structures: u16) -> Simulation {
     };
 
     for (index, (owner_name, side)) in [("Americans", 0u8), ("Russians", 1u8)].iter().enumerate() {
-        let owner = sim.interner.intern(owner_name);
+        let owner = sim.intern(owner_name);
         let mut house = HouseState::new(owner, *side, None, index == 0, 10_000, 10);
         // Raw-inserted entities would otherwise resolve the match on tick 1.
-        house.multiplay_passive = true;
-        sim.houses.insert(owner, house);
+        house.make_multiplay_passive();
+        sim.register_house(house);
 
         let (hx, hy) = homes[index];
-        let type_ref = sim.interner.intern("GACNST");
-        let infantry_ref = sim.interner.intern("E1");
-        let vehicle_ref = sim.interner.intern("HARV");
-        let aircraft_ref = sim.interner.intern("MIG");
+        let type_ref = sim.intern("GACNST");
+        let infantry_ref = sim.intern("E1");
+        let vehicle_ref = sim.intern("HARV");
+        let aircraft_ref = sim.intern("MIG");
 
         for slot in 0..structures {
             sim.insert_synthetic_techno_for_diagnostics(
@@ -206,14 +211,14 @@ fn build_world(seed: u32, per_category: u16, structures: u16) -> Simulation {
 /// The synthetic entities are lifecycle-free diagnostic inserts: the movement
 /// system never touches them (they are not in the logic vector), so issuing
 /// real move commands does nothing — the startup probe proved that with
-/// 0/732 movers. This stroll therefore writes positions directly through
-/// `Position::put_location`, the same public setter the placement paths use.
+/// 0/732 movers. This stroll therefore places them through
+/// `Simulation::place_synthetic_for_diagnostics`, which moves only such inserts.
 /// It is demo animation, not simulation: the real engine moves entities
 /// through the locomotor and command path, and the dashboard renders whatever
 /// the sim says either way.
 fn stroll(sim: &mut Simulation, tick: u64, targets: &mut HashMap<u64, (f32, f32)>) {
-    let width = u32::from(sim.session.map_width);
-    let height = u32::from(sim.session.map_height);
+    let width = u32::from(sim.session().map_width());
+    let height = u32::from(sim.session().map_height());
     if width == 0 || height == 0 {
         return;
     }
@@ -232,15 +237,21 @@ fn stroll(sim: &mut Simulation, tick: u64, targets: &mut HashMap<u64, (f32, f32)
             (next_random() % height) as f32 + 0.5,
         )
     };
-    for entity in sim.entities_mut().values_mut() {
-        if entity.category() == EntityCategory::Structure {
-            continue;
-        }
-        let id = entity.stable_id();
+    let walkers: Vec<(u64, f32, f32)> = sim
+        .entities()
+        .values()
+        .filter(|entity| entity.category() != EntityCategory::Structure)
+        .map(|entity| {
+            let position = &entity.position;
+            (
+                entity.stable_id(),
+                f32::from(position.rx()) + position.sub_x().to_num::<f32>() / 256.0,
+                f32::from(position.ry()) + position.sub_y().to_num::<f32>() / 256.0,
+            )
+        })
+        .collect();
+    for (id, cur_x, cur_y) in walkers {
         let target = targets.entry(id).or_insert_with(&mut fresh_target);
-        let position = &mut entity.position;
-        let cur_x = f32::from(position.rx()) + position.sub_x().to_num::<f32>() / 256.0;
-        let cur_y = f32::from(position.ry()) + position.sub_y().to_num::<f32>() / 256.0;
         let (dx, dy) = (target.0 - cur_x, target.1 - cur_y);
         let distance = (dx * dx + dy * dy).sqrt();
         let (next_x, next_y) = if distance <= STROLL_STEP {
@@ -252,11 +263,102 @@ fn stroll(sim: &mut Simulation, tick: u64, targets: &mut HashMap<u64, (f32, f32)
                 cur_y + dy / distance * STROLL_STEP,
             )
         };
-        position.put_location(DriveCoord {
-            x: (next_x * 256.0) as i32,
-            y: (next_y * 256.0) as i32,
-            z: 0,
-        });
+        sim.place_synthetic_for_diagnostics(
+            id,
+            DriveCoord {
+                x: (next_x * 256.0) as i32,
+                y: (next_y * 256.0) as i32,
+                z: 0,
+            },
+        );
+    }
+}
+
+/// Synthetic terrain for the demo world: the app's grid is the loaded map's,
+/// but the synthetic world has none, so the 3D view would be flat without
+/// this. The layout is designed, not real map data, so one look shows the
+/// dashboard's terracing and all three land features the wire carries:
+///
+///  - a level-2 plateau carrying a rectangular level-0 **lake** (water land
+///    type, so it paints solid blue with no grid);
+///  - the lake's north shore is one **ramp** row, a non-zero slope type whose
+///    top tilts down into the water instead of dropping a step face;
+///  - a raised **bridge** deck crosses the lake at its middle row, lifted to
+///    the plateau level and flush with both shores, with side faces down to
+///    the water — the same `deck_rises` the app encodes from a structural deck.
+///
+/// Encoded row-major, two lowercase hex digits per cell, in the same order and
+/// format the app's capture uses.
+fn synthetic_terrain(width: u16, height: u16) -> TerrainGrid {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    /// Plateau ground level; the lake sits `Lake` levels below it.
+    const PLATEAU: u8 = 2;
+    const LAKE: u8 = 0;
+    /// `rules::terrain_rules::LandType::Clear`.
+    const CLEAR: u8 = 0;
+    /// `rules::terrain_rules::LandType::Water`.
+    const WATER: u8 = 2;
+    /// One ramp tile: any non-zero slope type tilts the cell's top.
+    const RAMP: u8 = 1;
+
+    let w = u32::from(width);
+    let h = u32::from(height);
+    // Lake rectangle, inset from the map edges; the ramp row lies just north
+    // of it and the bridge row down its middle.
+    let lake_x0 = w * 3 / 8;
+    let lake_x1 = w * 5 / 8;
+    let lake_y0 = h * 3 / 8;
+    let lake_y1 = h * 5 / 8;
+    let ramp_row = lake_y0.saturating_sub(1);
+    let bridge_row = (lake_y0 + lake_y1) / 2;
+    // The span reaches a few cells onto each shore so its abutments meet the
+    // plateau; only the cells over water carry a raised deck.
+    let span_x0 = lake_x0.saturating_sub(3);
+    let span_x1 = lake_x1 + 3;
+
+    let stride = usize::from(width) * usize::from(height) * 2;
+    let mut levels = String::with_capacity(stride);
+    let mut land_types = String::with_capacity(stride);
+    let mut slope_types = String::with_capacity(stride);
+    let mut deck_rises = String::with_capacity(stride);
+    let hex = |out: &mut String, value: u8| {
+        out.push(HEX[usize::from(value >> 4)] as char);
+        out.push(HEX[usize::from(value & 0x0f)] as char);
+    };
+
+    for ry in 0..h {
+        for rx in 0..w {
+            let over_lake = rx >= lake_x0 && rx < lake_x1 && ry >= lake_y0 && ry < lake_y1;
+            let level = if over_lake { LAKE } else { PLATEAU };
+            let land = if over_lake { WATER } else { CLEAR };
+            // The north shore tilts down into the water; its own level stays the
+            // plateau's, and the corner interpolation reaches the lake.
+            let slope = if ry == ramp_row && rx >= lake_x0 && rx < lake_x1 {
+                RAMP
+            } else {
+                0
+            };
+            // A bridge cell over the water lifts a deck up to the plateau, so
+            // the span lands flush with both shores; shore cells are ordinary
+            // ground and add no rise.
+            let deck = if ry == bridge_row && over_lake && rx >= span_x0 && rx < span_x1 {
+                PLATEAU - LAKE
+            } else {
+                0
+            };
+            hex(&mut levels, level);
+            hex(&mut land_types, land);
+            hex(&mut slope_types, slope);
+            hex(&mut deck_rises, deck);
+        }
+    }
+    TerrainGrid {
+        width,
+        height,
+        levels,
+        land_types,
+        slope_types,
+        deck_rises,
     }
 }
 
@@ -272,7 +374,7 @@ fn main() -> Result<(), String> {
 
     let mut runtime = SimRuntime {
         simulation: build_world(args.seed, args.per_category, args.structures),
-        resources: SimResources::empty(),
+        resources: SimResources::empty().into(),
     };
     let spawned = runtime.simulation.telemetry_snapshot();
     println!(
@@ -287,6 +389,11 @@ fn main() -> Result<(), String> {
         .map_err(|error| format!("telemetry server on {}: {error}", args.addr))?;
     println!("dashboard: {}", server.bootstrap_url());
     println!("Ctrl+C to stop");
+
+    // The map never changes in this demo, so build the elevation grid once and
+    // hand it to each client that attaches, mirroring the app's one-shot send.
+    let terrain = synthetic_terrain(spawned.map_width, spawned.map_height);
+    let mut last_attached: u64 = 0;
 
     let mut ring = TickTimingRing::default();
     let mut last_publish = Instant::now();
@@ -331,7 +438,36 @@ fn main() -> Result<(), String> {
                 PUBLISH_EVERY as f32 / now.duration_since(last_publish).as_secs_f32().max(1e-3);
             last_publish = now;
             snapshot.timing = Some(timing);
+            // The app fills this section from live app state; this headless
+            // demo reads the same facts off its own simulation so the
+            // dashboard's header shows a real session instead of blanks.
+            let sim = &runtime.simulation;
+            snapshot.session = Some(SessionContext {
+                map_name: sim.session().map_name().to_owned(),
+                game_mode: sim.session().game_mode().as_str().to_owned(),
+                game_speed: vera20k::sim::game_options::clamp_game_speed(
+                    sim.session().game_options().game_speed,
+                ),
+                local_owner: sim
+                    .session()
+                    .current_house()
+                    .map(|owner| sim.interner().resolve(owner).to_owned()),
+                local_outcome: sim
+                    .session()
+                    .current_house()
+                    .and_then(|owner| sim.ready_outcome_for_owner(owner))
+                    .map(|outcome| outcome.kind),
+                // Mirrors the app's `BUILD_STAMP`; the crate path is private.
+                build_stamp: concat!("VERA20K ", env!("CARGO_PKG_VERSION")).to_owned(),
+            });
             snapshot.profile = runtime.simulation.frame_profile().report();
+            // A client that attached since the last publish needs the elevation
+            // grid once; every other publish leaves `terrain` as `None`.
+            let attached = server.attach_generation();
+            if attached != last_attached {
+                last_attached = attached;
+                snapshot.terrain = Some(terrain.clone());
+            }
             match serde_json::to_string(&snapshot) {
                 Ok(json) => server.publish(json),
                 Err(error) => log::warn!("snapshot serialization failed: {error}"),

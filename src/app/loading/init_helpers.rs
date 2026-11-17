@@ -22,14 +22,11 @@ use crate::render::tile_atlas::{self, TileAtlas};
 use crate::render::unit_atlas::{self, UnitAtlas};
 use crate::rules::effect_asset_catalog::tolerant_anim_class_roots;
 use crate::rules::ini_parser::IniFile;
-use crate::rules::process_owner::NativeRulesProcessOwner;
 #[cfg(test)]
 use crate::rules::retail_sources::load_startup_rules;
 use crate::rules::ruleset::RuleSet;
 
 use crate::sim::world::Simulation;
-
-use crate::app::frontend::skirmish::deployable_building_types;
 
 pub(crate) fn build_sidebar_cameo_atlas(
     gpu: &GpuContext,
@@ -97,8 +94,26 @@ pub(crate) fn load_sidebar_cameo_palette(asset_manager: &AssetManager) -> Option
     None
 }
 
-pub(crate) fn parse_debug_spawn_units_env() -> Option<Vec<String>> {
+/// `RA2_DEBUG_SPAWN_UNITS` owner: the scenario's current House (`A83D4C`), so
+/// every run spawns for the local player. A world without one has no player to
+/// own the spawn, and the spawn is skipped.
+pub(crate) fn debug_spawn_owner(sim: &Simulation) -> Option<String> {
+    let owner = crate::app::match_runtime::state::scenario_local_owner(sim).map(str::to_owned);
+    if owner.is_none() {
+        log::warn!("RA2_DEBUG_SPAWN_UNITS ignored: the scenario has no current House");
+    }
+    owner
+}
+
+/// `RA2_DEBUG_SPAWN_UNITS` stress spawn list: `TYPE` places one, `TYPE:COUNT`
+/// places `COUNT`. A count that is not a positive integer drops that entry with
+/// a warning, so a typo cannot quietly become a one-unit run.
+pub(crate) fn parse_debug_spawn_units_env() -> Option<Vec<(String, usize)>> {
     let raw = std::env::var("RA2_DEBUG_SPAWN_UNITS").ok()?;
+    parse_debug_spawn_units(&raw)
+}
+
+fn parse_debug_spawn_units(raw: &str) -> Option<Vec<(String, usize)>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -108,28 +123,101 @@ pub(crate) fn parse_debug_spawn_units_env() -> Option<Vec<String>> {
         .iter()
         .any(|v| trimmed.eq_ignore_ascii_case(v))
     {
-        return Some(vec![
-            "HTNK".to_string(),
-            "MTNK".to_string(),
-            "E1".to_string(),
-        ]);
+        return Some(
+            ["HTNK", "MTNK", "E1"]
+                .iter()
+                .map(|type_id| (type_id.to_string(), 1))
+                .collect(),
+        );
     }
-    let items: Vec<String> = trimmed
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
+    let mut items: Vec<(String, usize)> = Vec::new();
+    for entry in trimmed.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (type_id, count) = match entry.split_once(':') {
+            Some((name, count)) => {
+                let name = name.trim();
+                let Some(count) = count.trim().parse::<usize>().ok().filter(|c| *c > 0) else {
+                    log::warn!("Debug spawn entry '{entry}' has an unusable count; skipped");
+                    continue;
+                };
+                (name.to_string(), count)
+            }
+            None => (entry.to_string(), 1),
+        };
+        if type_id.is_empty() {
+            continue;
+        }
+        items.push((type_id, count));
+    }
     if items.is_empty() { None } else { Some(items) }
 }
 
+/// Where `RA2_DEBUG_SPAWN_MARCH` sends a stress army after the spawn pass.
+pub(crate) enum DebugSpawnMarch {
+    /// The cell opposite the spawn anchor, so the army crosses the whole map.
+    FarSide,
+    /// A cell named by the variable.
+    Cell(u16, u16),
+}
+
+pub(crate) fn parse_debug_spawn_march_env() -> Option<DebugSpawnMarch> {
+    let raw = std::env::var("RA2_DEBUG_SPAWN_MARCH").ok()?;
+    parse_debug_spawn_march(&raw)
+}
+
+/// `RA2_DEBUG_SPAWN_MARCH=1` marches to the far side; `=<rx>,<ry>` marches to
+/// that cell. Unset, empty or `0` leaves the army standing.
+fn parse_debug_spawn_march(raw: &str) -> Option<DebugSpawnMarch> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return None;
+    }
+    let enabled_tokens = ["1", "true", "yes", "on"];
+    if enabled_tokens
+        .iter()
+        .any(|v| trimmed.eq_ignore_ascii_case(v))
+    {
+        return Some(DebugSpawnMarch::FarSide);
+    }
+    let (rx, ry) = trimmed.split_once(',')?;
+    let (Ok(rx), Ok(ry)) = (rx.trim().parse::<u16>(), ry.trim().parse::<u16>()) else {
+        log::warn!("Debug spawn march '{raw}' is neither an enable switch nor an rx,ry cell");
+        return None;
+    };
+    Some(DebugSpawnMarch::Cell(rx, ry))
+}
+
+/// Every cell ordered by how near it stands to `anchor`, ties broken by cell so
+/// the order is total and reproducible. The stress spawn walks this until each
+/// type's quota is placed: an occupied or impassable cell costs a step, not a
+/// unit.
+pub(crate) fn cells_by_distance_from(cells: &[(u16, u16)], anchor: (u16, u16)) -> Vec<(u16, u16)> {
+    let (ax, ay) = (i32::from(anchor.0), i32::from(anchor.1));
+    let mut ordered = cells.to_vec();
+    ordered.sort_unstable_by_key(|&(rx, ry)| {
+        let (dx, dy) = (i32::from(rx) - ax, i32::from(ry) - ay);
+        (dx * dx + dy * dy, rx, ry)
+    });
+    ordered
+}
+
 /// Build a texture atlas from pre-loaded theater data and the terrain grid.
+/// `terrain_deformation` is the scenario rules' `[CombatDamage]
+/// TerrainDeformation=`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "theater inputs, the grid, the GPU pair and the deformation switch"
+)]
 pub(crate) fn build_tile_atlas(
     asset_manager: &AssetManager,
     lookup: &theater::TilesetLookup,
     palette: &Palette,
     _ext: &str,
     grid: &TerrainGrid,
+    terrain_deformation: bool,
     gpu: &GpuContext,
     batch: &BatchRenderer,
 ) -> Option<TileAtlas> {
@@ -153,6 +241,22 @@ pub(crate) fn build_tile_atlas(
         theater::inject_bridge_middle_tiles(&mut needed, table, lookup, asset_manager);
         log::info!(
             "Atlas pre-load: injected {} bridge middle TileKeys",
+            needed.len() - before,
+        );
+    }
+    // Terrain deformation stamps clear and ramp tiles, and its LAT and slope
+    // fixups pick neighbours' tiles, that the map may never use.
+    if terrain_deformation && !grid.deformation_tiles.is_empty() {
+        let before = needed.len();
+        for &tile_id in &grid.deformation_tiles {
+            if let Err(error) =
+                theater::inject_template_tiles(&mut needed, tile_id, lookup, asset_manager)
+            {
+                log::debug!("Deformation tile_id {tile_id} not pre-loaded: {error}");
+            }
+        }
+        log::info!(
+            "Atlas pre-load: injected {} terrain deformation TileKeys",
             needed.len() - before,
         );
     }
@@ -195,6 +299,26 @@ pub(crate) fn load_rules_with_merged_ini(
     IniFile,
     crate::rules::process_owner::NativeScenarioRulesReceipt,
 )> {
+    load_rules_with_prefix_for_test(
+        asset_manager,
+        crate::rules::process_owner::NativeScenarioRulesPrefix::NonCampaign(mode_rules_override),
+        map_rules_overrides,
+    )
+}
+
+/// Same production owner as the ordinary fixture; the generated launch snapshot
+/// explicitly preserves Full_Init's RMG admission instead of inferring it from INI.
+#[cfg(test)]
+pub(crate) fn load_rules_with_prefix_for_test(
+    asset_manager: &AssetManager,
+    prefix: crate::rules::process_owner::NativeScenarioRulesPrefix<'_>,
+    map_rules_overrides: Option<&IniFile>,
+) -> Option<(
+    RuleSet,
+    IniFile,
+    IniFile,
+    crate::rules::process_owner::NativeScenarioRulesReceipt,
+)> {
     let audio = crate::rules::audio_sources::AudioDefinitions::select(asset_manager);
     let (_, _, mut native_owner) = load_startup_rules(
         asset_manager,
@@ -204,46 +328,11 @@ pub(crate) fn load_rules_with_merged_ini(
     .into_parts();
     let no_map = IniFile::from_str("");
     let (rules, processed_ini, fixed_art_ini, receipt) = native_owner
-        .load_scenario(
-            crate::rules::process_owner::NativeScenarioRulesPrefix::NonCampaign(
-                mode_rules_override,
-            ),
-            map_rules_overrides.unwrap_or(&no_map),
-        )
+        .load_scenario(prefix, map_rules_overrides.unwrap_or(&no_map))
         .map_err(|error| log::warn!("Failed native noncampaign rules rebuild: {error}"))
         .ok()?
         .into_parts();
     Some((rules, processed_ini, fixed_art_ini, receipt))
-}
-
-/// Resolve the neutral tech buildings the random map generator may place.
-///
-/// The type list lives in `[AI] NeutralTechBuildings` and each footprint in
-/// `Foundation=`, so RULESMD/LANGRULE and fixed ARTMD are both needed.
-/// An unavailable INI yields an empty catalog, which the placement phase
-/// treats as "place nothing" rather than as an error.
-pub(crate) fn load_neutral_tech_types(
-    owner: Option<&NativeRulesProcessOwner>,
-) -> Vec<crate::map::rmg::phases::tech_buildings::TechType> {
-    let Some(owner) = owner else {
-        log::warn!("random map: startup rules/art unavailable; placing no neutral tech buildings");
-        return Vec::new();
-    };
-    let Ok(processed) = owner.startup_compatibility_projection() else {
-        log::warn!(
-            "random map: startup rules projection failed; placing no neutral tech buildings"
-        );
-        return Vec::new();
-    };
-    let types = crate::map::rmg::tech_catalog::resolve(
-        processed.neutral_tech_buildings(),
-        owner.fixed_art(),
-    );
-    log::info!(
-        "random map: resolved {} neutral tech building type(s)",
-        types.len()
-    );
-    types
 }
 
 /// Install the process-selected ART metadata before terrain construction or
@@ -257,6 +346,8 @@ pub(crate) fn bind_rules_art_metadata(
     theater_ext: &str,
     theater_name: &str,
 ) {
+    // ARTMD is read the way the game's Rules were (`ares_switch::ares_way`).
+    let _ares_way = crate::rules::ares_switch::read_ares_way(rules.reads_ares_way());
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(fixed_art));
     let (populated, fallback) = rules.populate_anim_frame_dims(assets, theater_ext, theater_name);
     log::info!("Anim frame dims: {populated} populated, {fallback} fallback (defaults to 30x30)");
@@ -264,27 +355,33 @@ pub(crate) fn bind_rules_art_metadata(
 
 /// The common post-terrain asset binding order. Saved loading supplies the
 /// complete retained scheduler closure, including authored animations that
-/// have since expired, rather than constructing their objects again.
+/// have since expired, rather than constructing their objects again. The
+/// Terrain phase preserves the distinct fresh/saved shape residency.
+/// Map-authored trigger and script animations bind tolerantly; the ones that
+/// bind join that closure.
 pub(crate) fn bind_rules_asset_closure(
     rules: &mut RuleSet,
-    processed_ini: &IniFile,
-    fixed_art: &IniFile,
+    overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
     roots: &[String],
+    authored_anim_roots: &[String],
     assets: &AssetManager,
     theater_ext: &str,
     theater_name: &str,
+    terrain_phase: crate::rules::terrain_asset_catalog::TerrainAssetLoadPhase,
 ) -> anyhow::Result<()> {
-    rules.bind_scheduler_anim_assets(roots, assets, theater_ext, theater_name)?;
+    // The asset closures follow the way the game's Rules were read.
+    let _ares_way = crate::rules::ares_switch::read_ares_way(rules.reads_ares_way());
+    rules.bind_scheduler_anim_assets(roots, assets, theater_ext, theater_name);
     // The strict pass replaces the scheduler set; tolerant bindings must follow.
     let tolerant_roots = tolerant_anim_class_roots(rules);
     let unbound = rules.bind_anim_class_assets(&tolerant_roots, assets, theater_ext, theater_name);
     crate::rules::effect_asset_catalog::log_unbound_combat_explosion_roots(unbound);
+    rules.bind_anim_class_assets(authored_anim_roots, assets, theater_ext, theater_name);
     rules.bind_effect_assets(assets, theater_ext, theater_name);
     rules.bind_building_buildup_assets(assets, theater_name);
     rules.bind_building_rubble_assets(assets, theater_ext, theater_name);
-    rules.bind_terrain_spawner_assets(processed_ini, assets, theater_ext, theater_name);
-    let sequences = crate::rules::infantry_sequence::parse_infantry_sequence_registry(fixed_art);
-    rules.bind_animation_sequences(&sequences);
+    rules.bind_terrain_assets(assets, theater_ext, terrain_phase);
+    rules.bind_alpha_images(overlay_registry, assets);
     Ok(())
 }
 
@@ -294,7 +391,7 @@ pub(crate) fn bind_rules_asset_closure(
 pub(crate) fn startup_crate_anim_remap_keys(
     rules: &RuleSet,
     overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
-) -> HashSet<(String, crate::rules::house_colors::HouseColorIndex)> {
+) -> HashSet<sprite_atlas::AnimRemapKey> {
     [
         rules.crate_rules.wood_crate_img.as_deref(),
         rules.crate_rules.crate_img.as_deref(),
@@ -306,18 +403,35 @@ pub(crate) fn startup_crate_anim_remap_keys(
     .filter_map(|overlay_id| {
         let flags = overlay_registry.flags(overlay_id)?;
         let anim = flags.cell_anim.as_deref()?;
-        let tiberium = overlay_registry
-            .tiberium_type_for_overlay(&rules.tiberium_types, overlay_id)
-            .and_then(|type_id| rules.tiberium_types.get(type_id))?;
-        let color = tiberium.color.as_deref()?;
-        let entry = crate::rules::color_scheme::scheme_entry_by_name(&rules.color_schemes, color)?;
-        let color = u8::try_from(entry)
+        // This is speculative prefetch, not a reached Mark: an unused
+        // cold-null Image needs no palette. Actual CellAnim Mark is checked.
+        let Ok(Some(type_id)) =
+            overlay_registry.tiberium_type_for_overlay(&rules.tiberium_types, overlay_id)
+        else {
+            return None;
+        };
+        let tiberium = rules.tiberium_types.get(type_id)?;
+        let color = u8::try_from(tiberium.color_scheme() / 2)
             .ok()
             .map(crate::rules::house_colors::HouseColorIndex)?;
-        Some((anim.trim().to_ascii_uppercase(), color))
+        Some((
+            anim.trim().to_ascii_uppercase(),
+            sprite_atlas::ShpPaletteContext::SelectedScheme,
+            color,
+        ))
     })
-    .filter(|(anim, _)| !anim.is_empty())
+    .filter(|(anim, _, _)| !anim.is_empty())
     .collect()
+}
+
+#[path = "presentation_jobs.rs"]
+mod presentation_jobs;
+pub(crate) use presentation_jobs::PresentationAtlasJob;
+
+pub(crate) struct PreparedManifest {
+    unit_atlas: Option<UnitAtlas>,
+    sprite_work: Option<sprite_atlas::PreparedSpriteAtlas>,
+    palette_set: Option<crate::render::palette_textures::PaletteSet>,
 }
 
 /// The presentation-side atlas bundle the app builds AFTER GPU-free scenario
@@ -339,14 +453,14 @@ pub(crate) fn populate_staged_app_scenario<F>(
     map_data: &MapFile,
     resolved_terrain: &ResolvedTerrainGrid,
     theater_name: &str,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
     overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     overlay_grid: Option<&crate::sim::overlay_grid::OverlayGrid>,
     bridge_destroyability_mode: BridgeDestroyabilityMode,
     descriptor: &crate::sim::scenario_session::ScenarioDescriptor,
     generated_inits: Option<&crate::sim::world::GeneratedTechnoInitTable>,
     initialize_houses_before_objects: F,
-) -> Result<(), crate::sim::world::GeneratedTechnoInitError>
+) -> Result<(), crate::sim::runtime::ScenarioPopulationError>
 where
     F: FnOnce(&mut Simulation),
 {
@@ -381,43 +495,64 @@ pub(crate) fn build_presentation_manifest(
     theater_unit_palette: Option<&Palette>,
     theater_iso_palette: Option<&Palette>,
 ) -> PresentationManifest {
+    prepare_presentation_manifest(
+        sim,
+        asset_manager,
+        gpu,
+        batch,
+        theater_ext,
+        theater_name,
+        rules,
+        overlay_registry,
+        house_colors,
+        theater_unit_palette,
+        theater_iso_palette,
+    )
+    .finish(gpu, batch)
+}
+
+pub(crate) fn prepare_presentation_manifest(
+    sim: &Simulation,
+    asset_manager: &AssetManager,
+    gpu: &GpuContext,
+    _batch: &BatchRenderer,
+    theater_ext: &str,
+    theater_name: &str,
+    rules: Option<&RuleSet>,
+    overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    house_colors: &HouseColorMap,
+    theater_unit_palette: Option<&Palette>,
+    theater_iso_palette: Option<&Palette>,
+) -> PreparedManifest {
     let art = rules.map(RuleSet::art);
     // `load_theater_unit_and_iso_palettes` owns both theater palettes:
     // `load_theater` publishes them and mid-match atlas growth re-reads them.
     // Without a loaded theater nothing renders, so no entity atlas is built.
     let palette = theater_unit_palette;
-    let unit_atlas: Option<UnitAtlas> = if palette.is_some() {
-        unit_atlas::build_unit_atlas(
-            &gpu.device,
-            &gpu.queue,
-            batch,
+    // The world's voxel models, admitted without drawing a picture: each is
+    // drawn the first time a frame shows it.
+    let mut unit_atlas = None;
+    if palette.is_some() {
+        unit_atlas::admit_world_models(
+            &mut unit_atlas,
             sim.entities(),
             asset_manager,
             rules,
-            None, // initial build — no existing cache
-            Some(&sim.interner),
-        )
-    } else {
-        None
-    };
-    // Pre-load building types that can be spawned at runtime (e.g., ConYards from MCV deploy).
-    let extra_buildings: Vec<&str> = deployable_building_types(rules);
-    let mut anim_remap_keys = sprite_atlas::collect_anim_remap_base_keys(sim, house_colors);
-    if let Some(rules) = rules {
-        anim_remap_keys.extend(startup_crate_anim_remap_keys(rules, overlay_registry));
+            Some(sim.interner()),
+            gpu.device.limits().max_texture_dimension_2d,
+        );
     }
-    let cell_drawer_type_ids: HashSet<String> = sim
-        .resolved_terrain
-        .as_ref()
-        .into_iter()
-        .flat_map(|terrain| terrain.tile_animations())
-        .map(|anim| anim.anim_name.to_ascii_uppercase())
-        .collect();
-    let shp_atlas: Option<SpriteAtlas> = palette.and_then(|pal| {
-        sprite_atlas::build_sprite_atlas(
-            &gpu.device,
-            &gpu.queue,
-            batch,
+    // Mid-match growth collects the same coverage; only the scenario-start
+    // crate remaps are load-only.
+    let mut coverage = sprite_atlas::EntityAtlasCoverage::collect(sim, rules, house_colors);
+    if let Some(rules) = rules {
+        coverage
+            .anim_remap_keys
+            .extend(startup_crate_anim_remap_keys(rules, overlay_registry));
+    }
+    let sprite_work = palette.map(|pal| {
+        sprite_atlas::prepare_sprite_atlas(
+            gpu.device.limits().max_texture_dimension_2d,
             sim.entities(),
             asset_manager,
             pal,
@@ -426,12 +561,13 @@ pub(crate) fn build_presentation_manifest(
             rules,
             art,
             house_colors,
-            &extra_buildings,
-            &anim_remap_keys,
-            &cell_drawer_type_ids,
+            &coverage.extra_buildings,
+            &coverage.anim_remap_keys,
+            &coverage.cell_drawer_type_ids,
+            &coverage.frozen_keys,
             theater_iso_palette,
             None, // initial build — no existing cache
-            Some(&sim.interner),
+            Some(sim.interner()),
         )
     });
     // Init_Game52BFCE..52C075 builds the global 53-row plain Convert
@@ -452,11 +588,27 @@ pub(crate) fn build_presentation_manifest(
             let active = voxel_palette_demand(house_colors, rules);
             crate::render::palette_textures::PaletteSet::new(gpu, pal, global, house_ramps, &active)
         });
-    PresentationManifest {
+    PreparedManifest {
         unit_atlas,
-        sprite_atlas: shp_atlas,
+        sprite_work,
         palette_set,
     }
+}
+
+/// Read the mod's `veraui.ini` (loose in the game or mod folder, or in a mod
+/// MIX) for the match being loaded. The match lays the player's own file
+/// over it and reports what either refuses (`presentation::player_layout`).
+fn read_match_layouts(asset_manager: &AssetManager) -> Option<crate::rules::ini_parser::IniFile> {
+    let (bytes, source) = asset_manager.get_with_source_ref(crate::ui::match_layout::FILE_NAME)?;
+    log::info!(
+        "Interface layout file {} found in {source}",
+        crate::ui::match_layout::FILE_NAME
+    );
+    // `LoadFromStraw` drops a last line that has no line break.
+    let mut complete = Vec::with_capacity(bytes.len() + 1);
+    complete.extend_from_slice(bytes);
+    complete.push(b'\n');
+    crate::rules::ini_parser::IniFile::from_bytes(&complete).ok()
 }
 
 /// Complete the common presentation preparation after the caller's world is
@@ -484,7 +636,7 @@ pub(crate) fn finish_presentation_assets(
     overlays: crate::app::frontend::skirmish::OverlayPresentationAssets,
     house_color_map: HouseColorMap,
     csf: Option<crate::assets::csf_file::CsfFile>,
-) -> crate::app::loading::init::PresentationLoadAssets {
+) -> anyhow::Result<crate::app::loading::init::PresentationLoadAssets> {
     // These nested MIXes live inside local.mix/localmd.mix and are not
     // auto-extracted by the two-level archive discovery pass.
     for cameo_mix in ["cameomd.mix", "cameo.mix"] {
@@ -494,8 +646,93 @@ pub(crate) fn finish_presentation_assets(
         }
     }
     let sidebar_cameo_atlas = build_sidebar_cameo_atlas(gpu, batch, asset_manager, Some(rules));
-    let sidebar_chrome =
-        crate::render::sidebar_chrome::build_sidebar_chrome_set(gpu, batch, asset_manager);
+    let match_layout_ini = read_match_layouts(asset_manager);
+    #[cfg(feature = "phobos")]
+    let uimd_bytes = asset_manager.get_ref("UIMD.INI");
+    #[cfg(feature = "phobos")]
+    let sw_sidebar_ui = uimd_bytes
+        .map(crate::rules::phobos_sw_sidebar::SuperWeaponSidebarUi::from_uimd_bytes)
+        .unwrap_or_default();
+    // The same loaded `uimd.ini` carries the pause-menu switch; Phobos reads
+    // both from `[Sidebar]` at startup.
+    #[cfg(feature = "phobos")]
+    let center_pause_menu_background = uimd_bytes
+        .map(crate::rules::phobos_pause_menu::PauseMenuUi::from_uimd_bytes)
+        .unwrap_or_default()
+        .center_background;
+    #[cfg(feature = "phobos")]
+    let sw_sidebar_art = sw_sidebar_ui
+        .enabled
+        .then(|| {
+            crate::render::sw_sidebar_art::build_sw_sidebar_art(
+                gpu,
+                batch,
+                asset_manager,
+                rules,
+                simulation.session().scenario_side(),
+            )
+        })
+        .flatten();
+    let sidebar_chrome = crate::render::sidebar_chrome::build_sidebar_chrome_set(
+        gpu,
+        batch,
+        asset_manager,
+        rules,
+        simulation.session().scenario_side(),
+    )?;
+    // `Game_LoadUI_LoadSideData` (0x1002F4A0) hands the local side's
+    // `GraphicalText.Image=` / `.Palette=` to the overlay slot writer at
+    // 0x1002ECC0 on every game load, freeing the previous match's surfaces
+    // first. Only a side that names one of the two keys differs from the
+    // process InitGame art, so the override atlas belongs to this world.
+    // Only when Ares plays in the game (`RuleSet::ares`).
+    let outcome_banner_side_art = if rules.ares() {
+        let (image, palette) = rules
+            .side_graphical_text(simulation.session().scenario_side())
+            .unwrap_or((None, None));
+        if image.is_some() || palette.is_some() {
+            crate::app::presentation::outcome_banner::OutcomeBannerArt::build_for_side(
+                gpu,
+                batch,
+                asset_manager,
+                image,
+                palette,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // `[EndGameScreens]` may name the local player's own country a win/lose
+    // card. It takes the retail `GRFXTXT` banner's slot in the tactical
+    // viewport, so it is built with the world like the banner art above; the
+    // player's Custom End Game Banner switch is read when it is drawn.
+    let end_game_banner = {
+        let country = simulation
+            .session()
+            .current_house()
+            .and_then(|house| simulation.houses().get(&house))
+            .and_then(|house| house.country())
+            .map(|country| simulation.resolve(country).to_owned());
+        match country {
+            Some(country) => crate::app::presentation::outcome_banner::EndGameBanner::build(
+                gpu,
+                batch,
+                asset_manager,
+                rules.end_game_screens(),
+                &country,
+            ),
+            None => {
+                if !rules.end_game_screens().is_empty() {
+                    log::warn!(
+                        "[EndGameScreens]: no local country at load; the retail end-game banner stays"
+                    );
+                }
+                None
+            }
+        }
+    };
     let fnt_file = asset_manager.get_ref("GAME.FNT").and_then(|data| {
         crate::assets::fnt_file::FntFile::from_bytes(data)
             .map_err(|error| log::warn!("Failed to parse GAME.FNT: {error}"))
@@ -506,8 +743,18 @@ pub(crate) fn finish_presentation_assets(
     if building_zshape.is_none() {
         log::warn!("BUILDNGZ.SHA not loaded: building bodies write flat depth");
     }
-    let software_cursor =
-        crate::render::cursor_atlas::build_software_cursor(gpu, batch, asset_manager);
+    // Ares draws every cursor through the scenario's [MouseCursors] list
+    // (`render::cursor_atlas`, hook 0x5BDC8C).
+    let software_cursor = if crate::app::input::ares_cursor::draws_through_list(rules) {
+        crate::render::cursor_atlas::build_ares_software_cursor(
+            gpu,
+            batch,
+            asset_manager,
+            rules.ares_mouse_cursors(),
+        )
+    } else {
+        crate::render::cursor_atlas::build_software_cursor(gpu, batch, asset_manager)
+    };
     if software_cursor.is_some() {
         log::info!("Software cursor loaded from mouse.sha — OS cursor will be hidden");
     } else {
@@ -519,7 +766,7 @@ pub(crate) fn finish_presentation_assets(
         Some(simulation),
         detail_level,
     );
-    crate::app::loading::init::PresentationLoadAssets {
+    Ok(crate::app::loading::init::PresentationLoadAssets {
         tile_atlas,
         building_zshape,
         unit_atlas: manifest.unit_atlas,
@@ -529,6 +776,15 @@ pub(crate) fn finish_presentation_assets(
         bridge_atlas: overlays.bridge_atlas,
         sidebar_cameo_atlas,
         sidebar_chrome,
+        match_layout_ini,
+        #[cfg(feature = "phobos")]
+        sw_sidebar_ui,
+        #[cfg(feature = "phobos")]
+        center_pause_menu_background,
+        #[cfg(feature = "phobos")]
+        sw_sidebar_art,
+        outcome_banner_side_art,
+        end_game_banner,
         software_cursor,
         overlay_names: overlays.overlay_names,
         overlay_radar_colors: overlays.overlay_radar_colors,
@@ -536,14 +792,14 @@ pub(crate) fn finish_presentation_assets(
         lighting_grid,
         csf,
         fnt_file,
-    }
+    })
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 #[path = "init_helpers_retail_placement_oracle_tests.rs"]
 mod retail_placement_oracle_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 #[path = "init_helpers_retail_buildup_tests.rs"]
 mod retail_buildup_tests;
 
@@ -572,7 +828,7 @@ fn voxel_palette_demand(
     colors
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     /// Building animations are tolerant roots, and only those the rules
     /// register as AnimTypes: art sections no rules list names (retail
@@ -650,8 +906,8 @@ mod tests {
         land: LandType,
         no_use_tile_land_type: bool,
         land_speed_costs: Option<SpeedCostProfile>,
-        strength: u16,
-        damage_levels: u16,
+        strength: i32,
+        damage_levels: i32,
     }
 
     #[test]
@@ -710,6 +966,7 @@ mod tests {
              [OverlayTypes]\n0=STARTBOX\n[STARTBOX]\nTiberium=yes\nCellAnim=crate_spark\n\
              [CrateRules]\nCrateImg=STARTBOX\nWoodCrateImg=STARTBOX\nWaterCrateImg=STARTBOX\n",
         );
+        let ini = crate::rules::tiberium_type::with_tiberium_image_slots(&ini);
         let rules = RuleSet::from_ini(&ini).expect("rules");
         let overlay_registry =
             crate::rules::overlay_types::OverlayTypeRegistry::from_ini(&ini, None);
@@ -728,21 +985,16 @@ mod tests {
         assert_eq!(flags.cell_anim.as_deref(), Some("CRATE_SPARK"));
         let tiberium = overlay_registry
             .tiberium_type_for_overlay(&rules.tiberium_types, overlay_id)
+            .unwrap()
             .and_then(|type_id| rules.tiberium_types.get(type_id))
             .expect("tiberium authority for startup crate CellAnim");
-        assert_eq!(tiberium.color.as_deref(), Some("NeonGreen"));
-        assert_eq!(
-            crate::rules::color_scheme::scheme_entry_by_name(
-                &rules.color_schemes,
-                tiberium.color.as_deref().unwrap(),
-            ),
-            Some(1)
-        );
+        assert_eq!(tiberium.color_scheme(), 3);
 
         assert_eq!(
             startup_crate_anim_remap_keys(&rules, &overlay_registry),
             HashSet::from([(
                 "CRATE_SPARK".to_string(),
+                crate::render::sprite_atlas::ShpPaletteContext::SelectedScheme,
                 crate::rules::house_colors::HouseColorIndex(1),
             )])
         );
@@ -753,18 +1005,19 @@ mod tests {
         let mut rules =
             RuleSet::from_ini(&IniFile::from_str("[General]\nDamageFireTypes=\n")).expect("rules");
         let mut art = ArtRegistry::from_ini(&IniFile::from_str(
-            "[CUSTOM_TOP]\nLoopCount=-1\nStartSound=WaterfallLoop\n\
+            "[CUSTOM_TOP]\nLoopCount=-1\n\
              [CUSTOM_GROUND]\nLayer=ground\nLoopCount=-1\nYSortAdjust=1000\n",
         ));
         art.bind_anim_frame_count_for_test("CUSTOM_TOP", 16);
+        art.set_anim_sounds_for_test("CUSTOM_TOP", Some("WaterfallLoop"), None);
         art.bind_anim_frame_count_for_test("CUSTOM_GROUND", 2);
         rules.replace_art_registry_for_test(art);
 
         let mut sim = Simulation::new();
-        let owner = sim.interner.intern("Neutral");
-        let type_ref = sim.interner.intern("MAP_OBJECT");
-        let map_object_id = sim.allocate_stable_id();
-        sim.entities_mut()
+        let owner = sim.intern("Neutral");
+        let type_ref = sim.intern("MAP_OBJECT");
+        let map_object_id = sim.substrate_mut_for_test().allocate_stable_id();
+        sim.entities_mut_for_test()
             .insert(GameEntity::new_at_frame_zero_for_test(
                 map_object_id,
                 1,
@@ -808,30 +1061,30 @@ mod tests {
         for (id, tile) in ids.iter().zip(&tiles) {
             let anim = sim.anim(*id).expect("spawned terrain AnimClass");
             assert_eq!(
-                anim.world_coord,
+                anim.world_coord(),
                 crate::sim::anim_class::AnimWorldCoord {
                     x: tile.world_x,
                     y: tile.world_y,
                     z: tile.world_z,
                 }
             );
-            assert_eq!(anim.draw_flags, 0x1600);
-            assert_eq!(anim.z_adjust, tile.z_adjust);
-            assert_eq!(anim.runtime.loop_remaining, u8::MAX);
-            assert!(!anim.runtime.constructor_reverse);
-            assert!(anim.use_cell_drawer);
-            assert!(anim.terrain_attached);
+            assert_eq!(anim.draw_flags(), 0x1600);
+            assert_eq!(anim.z_adjust(), tile.z_adjust);
+            assert_eq!(anim.runtime().loop_remaining, u8::MAX);
+            assert!(!anim.runtime().constructor_reverse);
+            assert!(anim.use_cell_drawer());
+            assert!(anim.terrain_attached());
         }
         assert!(matches!(
-            sim.sound_events.as_slice(),
+            sim.sound_events(),
             [SimSoundEvent::AnimationStarted { anim_id, .. }] if *anim_id == ids[0]
         ));
-        assert_eq!(sim.sound_events.drain(..).count(), 1);
-        assert!(sim.sound_events.is_empty());
+        assert_eq!(sim.take_sound_events_for_test().len(), 1);
+        assert!(sim.sound_events().is_empty());
 
         // Native load resets Scenario RNG to Seed(0); isolate persistence of
         // the AnimStore and authoritative LogicVector registration order.
-        sim.scenario_rng = crate::sim::rng::SimRng::new(0);
+        *sim.scenario_rng_mut_for_test() = crate::sim::rng::SimRng::new(0);
         let expected_hash = sim.state_hash();
         let bytes =
             crate::util::save_codec::serialize(&sim).expect("serialize terrain AnimClass state");
@@ -840,9 +1093,9 @@ mod tests {
         restored.rebuild_logic_membership();
         assert_eq!(restored.live_object_order_snapshot(), expected_order);
         assert_eq!(restored.state_hash(), expected_hash);
-        assert!(restored.anim(ids[0]).unwrap().use_cell_drawer);
-        assert!(restored.anim(ids[0]).unwrap().terrain_attached);
-        assert!(restored.sound_events.is_empty());
+        assert!(restored.anim(ids[0]).unwrap().use_cell_drawer());
+        assert!(restored.anim(ids[0]).unwrap().terrain_attached());
+        assert!(restored.sound_events().is_empty());
     }
 
     fn overlay_registry_snapshot(
@@ -918,22 +1171,102 @@ mod tests {
         );
     }
 
-    /// AT-9 inverse: a map with no rules-shaped sections changes nothing.
     #[test]
-    fn map_without_overrides_leaves_rules_unchanged() {
-        let mut with_map = RulesLayerStack::new(IniFile::from_str(RULES_BASE));
-        let map = IniFile::from_str("[Basic]\nName=Clean\n[Waypoints]\n0=45035\n");
-        with_map.push(
-            crate::rules::native_processing::RulesLayerKind::Scenario,
-            map,
+    fn particle_frame_reader_keeps_prior_values_when_scenario_omits_keys() {
+        use crate::rules::native_processing::RulesLayerKind;
+
+        let Some(rulesmd) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+            return;
+        };
+        let probe_rules = RuleSet::from_ini(&rulesmd).expect("retail root rules parse");
+        let particle_name = "GasCloud1";
+        let stock_particle_id = probe_rules
+            .p_type_id_by_name(particle_name)
+            .expect("retail root allocates GasCloud1");
+        let stock_particle = probe_rules.particle_type(stock_particle_id);
+        assert_eq!(stock_particle.start_frame, 0);
+        assert_eq!(stock_particle.num_loop_frames, 1);
+        let mut layers = RulesLayerStack::new(rulesmd);
+        layers.push(
+            RulesLayerKind::GameMode,
+            IniFile::from_str(&format!(
+                "[{particle_name}]\nStartFrame=-3\nNumLoopFrames=-5\n"
+            )),
         );
-        let a = RuleSet::from_rules_layers(&with_map).expect("parse");
-        let b = RuleSet::from_ini(&IniFile::from_str(RULES_BASE)).expect("parse");
-        assert_eq!(a.c4_delay_frames(), b.c4_delay_frames());
-        assert_eq!(a.production.build_speed, b.production.build_speed);
-        assert_eq!(
-            a.object("E1").map(|o| o.strength),
-            b.object("E1").map(|o| o.strength)
+        layers.push(
+            RulesLayerKind::Scenario,
+            IniFile::from_str(&format!(
+                "[{particle_name}]\nStartFrame=not-a-hexH\nFixtureOnly=1\n"
+            )),
+        );
+
+        let rules = RuleSet::from_rules_layers(&layers).expect("retail layered rules parse");
+        let particle_id = rules
+            .p_type_id_by_name(&particle_name)
+            .expect("the same root-registered ParticleType survives projection");
+        let particle = rules.particle_type(particle_id);
+        assert_eq!(particle.start_frame, -3);
+        assert_eq!(particle.num_loop_frames, -5);
+    }
+
+    fn retail_rulesmd_with_bullet_reader_triggers() -> Option<IniFile> {
+        let mut rulesmd = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini")?;
+        // ChemLauncher and Grenade are retail weapons whose projectiles this
+        // rules fixture needs to allocate before the BulletType body reads.
+        rulesmd.merge(&IniFile::from_str(
+            "[E1]\nPrimary=ChemLauncher\nSecondary=Grenade\n",
+        ));
+        Some(rulesmd)
+    }
+
+    #[test]
+    fn projectile_rule_state_retains_stock_reader_fields() {
+        let Some(rulesmd) = retail_rulesmd_with_bullet_reader_triggers() else {
+            return;
+        };
+        let rules = RuleSet::from_ini(&rulesmd).expect("retail RULESMD through production reader");
+
+        assert!(
+            rules
+                .projectile("ChemMissile")
+                .expect("stock ChemMissile projectile")
+                .proximity
+        );
+        assert!(
+            rules
+                .projectile("Lobbed")
+                .expect("stock Lobbed projectile")
+                .bouncy
+        );
+    }
+
+    #[test]
+    fn projectile_rule_state_retains_bools_across_invalid_and_missing_pass_keys() {
+        let Some(rulesmd) = retail_rulesmd_with_bullet_reader_triggers() else {
+            return;
+        };
+        let patch =
+            IniFile::from_str("[ChemMissile]\nProximity=invalid\n[Lobbed]\nFixtureOnly=1\n");
+        let mut layers = RulesLayerStack::new(rulesmd);
+        layers.push(
+            crate::rules::native_processing::RulesLayerKind::Scenario,
+            patch,
+        );
+        let rules = RuleSet::from_rules_layers(&layers).expect("retail layered rules parse");
+
+        assert!(
+            rules
+                .projectile("ChemMissile")
+                .expect("stock ChemMissile projectile")
+                .proximity,
+            "the map pass's invalid value retains the prior stock Proximity=yes"
+        );
+        assert!(
+            rules
+                .projectile("Lobbed")
+                .expect("stock Lobbed projectile")
+                .bouncy,
+            "the map pass's section without Bouncy retains the prior stock Bouncy=yes"
         );
     }
 
@@ -992,16 +1325,20 @@ mod tests {
              [Riparius]\nImage=4\n\
              [TIB01]\nTiberium=yes\n",
         );
+        let rulesmd = crate::rules::tiberium_type::with_tiberium_image_slots(&rulesmd);
 
         let (rules, merged_ini, _fixed_art_ini) = scenario_rules(rulesmd, langrule, &mode, &map);
         let registry = OverlayTypeRegistry::from_ini(&merged_ini, None);
 
         assert_eq!(rules.tiberium_types.types()[0].section, "Riparius");
-        assert_eq!(rules.tiberium_types.types()[0].image, 4);
-        assert_eq!(registry.len(), 2);
+        assert_eq!(
+            rules.tiberium_types.types()[0].image().base_overlay(),
+            Some(147)
+        );
+        assert_eq!(registry.len(), 149);
         assert_eq!(registry.id_for_name("TIB01"), Some(0));
         assert_eq!(registry.name(0), Some("TIB01"));
-        assert_eq!(registry.name(1), Some("GASAND"));
+        assert_eq!(registry.name(148), Some("GASAND"));
         assert!(registry.flags(0).is_some_and(|flags| flags.tiberium));
     }
 

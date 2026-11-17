@@ -3,7 +3,7 @@
 use crate::assets::asset_manager::{AssetManager, MediaArchiveMode};
 use crate::map::terrain::iso_to_screen;
 use crate::render::batch::{BatchRenderer, InstanceBufferPool, SpriteInstance};
-use crate::render::selection_overlay::CenteredShapeStrip;
+use crate::render::selection_overlay::{CenteredShapeStrip, placement_cell_draws};
 use crate::render::shroud_buffer::ShroudBuffer;
 use crate::render::terrain_draw_gpu_tests::{
     Gpu, assert_native_color_and_depth, camera, clear, encoded,
@@ -16,11 +16,11 @@ fn ordinary_frame(
     scene: &mut crate::headless_scenario::HeadlessScenario,
     payload: Option<crate::sim::command::Command>,
 ) {
-    let owner = scene.sim().session.current_house.unwrap();
+    let owner = scene.sim().session().current_house().unwrap();
     let commands: Vec<_> = payload
         .into_iter()
         .map(|payload| {
-            crate::sim::command::CommandEnvelope::new(owner, scene.sim().session.tick, payload)
+            crate::sim::command::CommandEnvelope::new(owner, scene.sim().session().tick(), payload)
         })
         .collect();
     scene
@@ -47,7 +47,7 @@ fn paid_goldst(root: &std::path::Path) -> crate::headless_scenario::HeadlessScen
             (LaunchCountry::America, AiDifficulty::Easy),
         ],
     );
-    launch.local.start_position = LaunchStartPosition::Position(3);
+    launch.local_slot_mut().start_position = LaunchStartPosition::Position(3);
     launch.options.starting_credits = 50_000;
     launch.options.unit_count = 0;
     launch.options.tech_level = 10;
@@ -55,13 +55,13 @@ fn paid_goldst(root: &std::path::Path) -> crate::headless_scenario::HeadlessScen
     launch.options.fog_of_war = false;
     let mut scene =
         crate::headless_scenario::load_session(root, "GoldSt.mmx", 305419896, launch).unwrap();
-    let owner = scene.sim().session.current_house.unwrap();
+    let owner = scene.sim().session().current_house().unwrap();
     let mcv = scene
         .sim()
         .entities()
         .iter_sorted()
         .find_map(|(id, entity)| {
-            (entity.owner() == owner && scene.sim().interner.resolve(entity.type_ref()) == "AMCV")
+            (entity.owner() == owner && scene.sim().interner().resolve(entity.type_ref()) == "AMCV")
                 .then_some(id)
         })
         .expect("normal starting MCV");
@@ -78,7 +78,7 @@ fn paid_goldst(root: &std::path::Path) -> crate::headless_scenario::HeadlessScen
                 Some(Command::DeployMcv { entity_id: mcv })
             }
             400 => Some(Command::QueueProduction {
-                type_id: scene.sim().interner.get("GAPOWR").unwrap(),
+                type_id: scene.sim().interner().get("GAPOWR").unwrap(),
             }),
             _ => None,
         };
@@ -87,19 +87,19 @@ fn paid_goldst(root: &std::path::Path) -> crate::headless_scenario::HeadlessScen
     assert_eq!(scene.map.header.theater, "URBAN");
     let sim = scene.sim();
     let rules = &scene.runtime.resources.rules;
-    let owner_name = sim.interner.resolve(owner);
+    let owner_name = sim.interner().resolve(owner);
     let held = production::ready_building_entity_for_owner(
         sim,
         rules,
         owner,
-        sim.interner.get("GAPOWR").unwrap(),
+        sim.interner().get("GAPOWR").unwrap(),
     )
     .expect("ordinary paid completion");
     assert!(sim.entities().get(held).unwrap().lifecycle.in_limbo());
     assert_eq!(production::credits_for_owner(sim, owner_name), 49_200);
     assert!(sim.entities().values().any(|entity| {
         entity.owner() == owner
-            && sim.interner.resolve(entity.type_ref()) == "GACNST"
+            && sim.interner().resolve(entity.type_ref()) == "GACNST"
             && (entity.position.rx(), entity.position.ry()) == (107, 29)
     }));
     scene
@@ -139,7 +139,7 @@ fn retail_placement_matches_original_cell_and_foundation_raster() {
     let sim = scene.sim();
     // Consume the original full selected Recalc/LAT outputs against the live
     // loader result, rather than treating authored tile bytes as final state.
-    let terrain = sim.resolved_terrain.as_ref().unwrap();
+    let terrain = sim.resolved_terrain().unwrap();
     let recalc = &packet["inputs"]["map"]["native_recalc"];
     assert_eq!(recalc["rows"].as_array().unwrap().len(), 2);
     for row in recalc["rows"].as_array().unwrap() {
@@ -173,11 +173,11 @@ fn retail_placement_matches_original_cell_and_foundation_raster() {
         }
     }
     let rules = &scene.runtime.resources.rules;
-    let owner = sim.session.current_house.unwrap();
+    let owner = sim.session().current_house().unwrap();
     let preview = production::placement_preview_for_owner_with_overlays(
         sim,
         rules,
-        sim.interner.resolve(owner),
+        sim.interner().resolve(owner),
         "GAPOWR",
         106,
         34,
@@ -233,7 +233,8 @@ fn retail_placement_matches_original_cell_and_foundation_raster() {
                 // Independent original caller camera, actual loaded map/paid
                 // preview, and production X-outer traversal, with no fitted
                 // cell positions or native-admission input in this scene.
-                let instances = shape.build_building_preview(&preview);
+                let instances = shape
+                    .build_building_preview(&placement_cell_draws(Some(&preview), None, true), 1.0);
                 assert_eq!(instances.len(), 4);
                 assert_eq!(
                     row["native_order"],
@@ -259,29 +260,25 @@ fn retail_placement_matches_original_cell_and_foundation_raster() {
                 match input["flags"].as_u64().unwrap() {
                     0 => Vec::new(),
                     4 => {
-                        // Pending producer remains outside the active chain.
-                        // Consume this original component as frame1 resource,
-                        // geometry and material coverage, not pending parity.
+                        // The pending grid's flag-4 cell through production.
                         assert_eq!(row["draws"][0]["frame"], 1);
-                        let anchor = &row["draws"][0]["point"];
-                        let mut instance = shape
-                            .instance(
-                                1,
-                                (
-                                    anchor[0].as_i64().unwrap() as f32 + cam.camera_pos[0],
-                                    anchor[1].as_i64().unwrap() as f32 + cam.camera_pos[1],
-                                ),
-                                0.0,
-                            )
-                            .unwrap();
-                        instance.palette_light =
-                            crate::render::palette_light::PaletteLight::plain(53, 1000);
-                        vec![instance]
+                        let pending = production::BuildingPlacementPreview {
+                            cells: vec![cell],
+                            ..preview.clone()
+                        };
+                        let draws = placement_cell_draws(None, Some(&pending), true);
+                        shape.build_building_preview(&draws, 1.0)
                     }
-                    2 => vec![
-                        shape.building_placement_instance(cell).unwrap();
-                        input["repeat"].as_u64().unwrap() as usize
-                    ],
+                    2 => {
+                        let current = production::BuildingPlacementPreview {
+                            cells: vec![cell],
+                            wall_autofill_cells: Vec::new(),
+                            ..preview.clone()
+                        };
+                        let draws = placement_cell_draws(Some(&current), None, true);
+                        let instance = shape.build_building_preview(&draws, 1.0)[0];
+                        vec![instance; input["repeat"].as_u64().unwrap() as usize]
+                    }
                     other => panic!("uncovered marker input {other}"),
                 }
             };
@@ -361,8 +358,8 @@ fn paid_refinery_centering_and_free_unit(
 ) {
     use crate::rules::foundation::placement_origin_at_cursor;
     use crate::sim::command::Command;
-    let owner = scene.sim().session.current_house.unwrap();
-    let power = scene.sim().interner.get("GAPOWR").unwrap();
+    let owner = scene.sim().session().current_house().unwrap();
+    let power = scene.sim().interner().get("GAPOWR").unwrap();
     let power_origin = placement_origin_at_cursor("2x2", (110, 33));
     ordinary_frame(
         scene,
@@ -377,15 +374,17 @@ fn paid_refinery_centering_and_free_unit(
         ordinary_frame(scene, None);
     }
     let name = centering["building"]["name"].as_str().unwrap();
-    let refinery = scene.sim().interner.get(name).unwrap();
+    let refinery = scene.sim().interner().get(name).unwrap();
     let rules = &scene.runtime.resources.rules;
     let foundation = rules.object(name).unwrap().foundation.clone();
-    assert_eq!(crate::rules::foundation::foundation_id(&foundation), 12);
+    let selector = match &foundation {
+        crate::rules::foundation::Foundation::Stock(index) => *index,
+        _ => panic!("retail fixture must retain a stock foundation"),
+    };
+    assert_eq!(selector, 12);
     assert_eq!(rules.building_free_unit(name), Some("CMIN"));
     assert_eq!(
-        serde_json::json!(crate::rules::foundation::foundation_cell_offsets(
-            &foundation
-        )),
+        serde_json::json!(foundation.cell_offsets()),
         centering["building"]["offsets"]
     );
     ordinary_frame(scene, Some(Command::QueueProduction { type_id: refinery }));
@@ -405,7 +404,7 @@ fn paid_refinery_centering_and_free_unit(
     }
     let held = ready(scene).expect("normal paid refinery completion");
     assert_eq!(
-        production::credits_for_owner(scene.sim(), scene.sim().interner.resolve(owner)),
+        production::credits_for_owner(scene.sim(), scene.sim().interner().resolve(owner)),
         47_200
     );
     let miners = |scene: &crate::headless_scenario::HeadlessScenario| {
@@ -415,7 +414,7 @@ fn paid_refinery_centering_and_free_unit(
             .iter_sorted()
             .filter_map(|(id, entity)| {
                 (entity.owner() == owner
-                    && scene.sim().interner.resolve(entity.type_ref()) == "CMIN")
+                    && scene.sim().interner().resolve(entity.type_ref()) == "CMIN")
                     .then_some(id)
             })
             .collect::<Vec<_>>()
@@ -425,11 +424,11 @@ fn paid_refinery_centering_and_free_unit(
         "limbo paid refinery has no opening miner"
     );
     let preview = |scene: &crate::headless_scenario::HeadlessScenario, cursor| {
-        let origin = placement_origin_at_cursor(&foundation, cursor);
+        let origin = foundation.placement_origin_at_cursor(cursor);
         production::placement_preview_for_owner_with_overlays(
             scene.sim(),
             &scene.runtime.resources.rules,
-            scene.sim().interner.resolve(owner),
+            scene.sim().interner().resolve(owner),
             name,
             origin.0,
             origin.1,
@@ -542,7 +541,7 @@ fn paid_refinery_centering_and_free_unit(
         "completion never duplicates the free unit"
     );
     assert_eq!(
-        production::credits_for_owner(scene.sim(), scene.sim().interner.resolve(owner)),
+        production::credits_for_owner(scene.sim(), scene.sim().interner().resolve(owner)),
         47_200
     );
     assert!(

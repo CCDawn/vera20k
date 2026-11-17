@@ -11,11 +11,12 @@ use crate::rules::object_type::ObjectType;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::game_entity::GameEntity;
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::movement;
 use crate::sim::movement::ScatterFlags;
 use crate::sim::world::FrameEffects;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
 
 /// Unit+0x68C, the runtime Deploy continuation (not the type's
@@ -112,11 +113,14 @@ fn deploys_into_build_const(sim: &Simulation, entity: &GameEntity, rules: &RuleS
 }
 
 /// The owner's AutoBaseBuilding latch (House+0x1F3) and that no human
-/// controls it (`IsControlledByHuman 0x0050B730`).
+/// controls it (`IsControlledByHuman 0x0050B730`). Fork-only: a command-driven
+/// house's yard maker waits for the command layer's deploy order
+/// (`docs/superai.md`).
 fn owner_builds_its_own_base(sim: &Simulation, entity: &GameEntity) -> bool {
     sim.houses.get(&entity.owner()).is_some_and(|house| {
         house.ai_activation().auto_base_building
-            && !house.is_controlled_by_human(sim.session.game_mode_nonzero)
+            && !house.is_controlled_by_human(sim.session.game_mode_nonzero())
+            && !house.command_driven()
     })
 }
 
@@ -130,17 +134,17 @@ pub(crate) fn ai_queue_hunt(sim: &mut Simulation, id: u64, rules: &RuleSet) {
     };
     let hunts = deploys_into_build_const(sim, entity, rules)
         && owner_builds_its_own_base(sim, entity)
-        && sim.session.game_mode_nonzero
+        && sim.session.game_mode_nonzero()
         && sim
             .houses
             .get(&entity.owner())
-            .is_some_and(|house| house.build_const_order.is_empty())
+            .is_some_and(|house| house.build_const_order().is_empty())
         && !matches!(
             entity.mission.current().known(),
             Some(MissionType::Hunt | MissionType::Unload)
         );
     if hunts {
-        queue(sim, id, MissionType::Hunt);
+        queue(sim, id, MissionType::Hunt, rules);
     }
 }
 
@@ -194,7 +198,13 @@ pub(crate) fn mission_hunt_deploy(
         }
         _ => {}
     }
-    sim.mission_rate_epilogue_for(rules, id, MissionType::Hunt)
+    Simulation::mission_rate_epilogue_for(
+        &mut sim.scenario_rng,
+        &sim.substrate,
+        rules,
+        id,
+        MissionType::Hunt,
+    )
 }
 
 /// `UnitClass::TryToDeploy @ 0x00738D30`: true when the unit may deploy where
@@ -231,7 +241,7 @@ pub(crate) fn try_to_deploy(
             .is_some_and(|e| e.navigation.nav_com().is_some())
     };
     let origin_of = |cell: (i16, i16)| (cell.0.wrapping_sub(1), cell.1.wrapping_sub(1));
-    sim.foot_mark_remove(id, Some(rules), registry, effects);
+    sim.foot_mark_remove(id, rules, registry, effects);
     if !has_destination(sim) {
         if crate::sim::build_site::can_place_building_at(
             sim,
@@ -241,8 +251,9 @@ pub(crate) fn try_to_deploy(
             origin_of(cell),
             None,
             None,
+            None,
         ) {
-            sim.foot_mark_put(id, Some(rules), registry, effects);
+            sim.foot_mark_put(id, rules, registry, effects);
             return true;
         }
         // 0x007392CA..0x00739360: the first fallback site the type can stand
@@ -259,6 +270,7 @@ pub(crate) fn try_to_deploy(
                     origin_of(site),
                     None,
                     None,
+                    None,
                 )
             })
         {
@@ -273,7 +285,7 @@ pub(crate) fn try_to_deploy(
             );
         }
     }
-    sim.foot_mark_put(id, Some(rules), registry, effects);
+    sim.foot_mark_put(id, rules, registry, effects);
     // 0x00739372..0x00739394: vt+0x174 Scatter(&ZeroCoord, 0, 0), the Unit
     // receiver's null arm.
     if !has_destination(sim)
@@ -318,17 +330,17 @@ pub(crate) fn is_mcv(sim: &Simulation, entity: &GameEntity, rules: &RuleSet) -> 
             })
 }
 
-pub(crate) fn queue_guard(sim: &mut Simulation, id: u64) {
-    queue(sim, id, MissionType::Guard);
+pub(crate) fn queue_guard(sim: &mut Simulation, id: u64, rules: &RuleSet) {
+    queue(sim, id, MissionType::Guard, rules);
 }
 
-fn queue(sim: &mut Simulation, id: u64, mission: MissionType) {
+fn queue(sim: &mut Simulation, id: u64, mission: MissionType, rules: &RuleSet) {
     let _ = sim.mission_queue_exact(
         id,
         MissionId::from_known(mission),
         0,
-        sim.session.binary_frame,
-        &EntityReadyInputProvider,
+        sim.session.binary_frame(),
+        &LiveReadyInputProvider { rules },
     );
 }
 
@@ -352,23 +364,17 @@ pub(crate) fn mission_unload(
             sim,
             id,
             crate::sim::radio::RadioMessage::Break,
-            Some(rules),
+            rules,
             effects,
         );
         if let Some(e) = sim.substrate.entities.get_mut(id) {
             // `Path[0] = -1`, the empty queue (`0x0073DD8E`).
-            e.navigation.path_replay.set_cursor(
-                e.navigation
-                    .path_replay
-                    .directions()
-                    .len()
-                    .min(u16::MAX as usize) as u16,
-            );
+            e.navigation.path_replay_mut().exhaust();
             e.mission.set_handler_state(1);
         }
         // Native state 0 falls through to state 1 in this same invocation.
     }
-    let now = sim.session.binary_frame;
+    let now = sim.session.binary_frame();
     match state {
         Some(0 | 1) => {
             // The locomotor's Is_Moving (vt+0x10 at `0x0073DDBD`).
@@ -385,11 +391,11 @@ pub(crate) fn mission_unload(
                     queued != MissionId::NONE
                         && queued != MissionId::from_known(MissionType::Unload)
                 }) {
-                    let _ = sim.mission_commence_exact(id, now);
+                    let _ = sim.substrate.mission_commence_exact(id, now);
                 }
             } else {
                 sim.deploy_mcv(id, rules, registry, effects);
-                finish_initial_attempt(sim, id);
+                finish_initial_attempt(sim, id, rules);
             }
         }
         Some(2) => {
@@ -400,25 +406,33 @@ pub(crate) fn mission_unload(
                 .is_some_and(|e| e.mcv_deploy_pending.is_pending());
             if pending {
                 let accepted = sim.deploy_mcv(id, rules, registry, effects);
-                finish_retry(sim, id, accepted);
+                finish_retry(&mut sim.substrate, id, accepted);
             } else {
                 // 0x0073D6CA..0x0073D6DB: Enter_Idle_Mode(0, 1), then
                 // NextMission.
-                sim.unit_enter_idle_mode(id, Some(rules), false, effects);
-                let _ = sim.mission_commence_exact(id, now);
+                sim.unit_enter_idle_mode(id, rules, false, effects);
+                let _ = sim.substrate.mission_commence_exact(id, now);
             }
         }
         _ => {}
     }
-    sim.mission_rate_epilogue_for(rules, id, MissionType::Unload)
+    Simulation::mission_rate_epilogue_for(
+        &mut sim.scenario_rng,
+        &sim.substrate,
+        rules,
+        id,
+        MissionType::Unload,
+    )
 }
 
 // Kept as the production result seam so original interior-block oracle outputs
 // can be compared without claiming to emulate the whole construction transaction.
 /// Mission_Unload state 1 after its Deploy (`0x0073DDCB..0x0073DE1E`): a
 /// pending deploy moves to state 2; otherwise a computer house in a nonzero
-/// game mode hunts and everyone else guards.
-pub(crate) fn finish_initial_attempt(sim: &mut Simulation, id: u64) {
+/// game mode hunts and everyone else guards. Fork-only: a command-driven
+/// house's maker guards too, until the command layer deploys it
+/// (`docs/superai.md`).
+pub(crate) fn finish_initial_attempt(sim: &mut Simulation, id: u64, rules: &RuleSet) {
     if let Some(e) = sim
         .substrate
         .entities
@@ -433,10 +447,10 @@ pub(crate) fn finish_initial_attempt(sim: &mut Simulation, id: u64) {
                 .mission
                 .set_handler_state(2);
         } else {
-            let hunt =
-                sim.houses.get(&e.owner()).is_some_and(|house| {
-                    !house.is_controlled_by_human(sim.session.game_mode_nonzero)
-                }) && sim.session.game_mode_nonzero;
+            let hunt = sim.houses.get(&e.owner()).is_some_and(|house| {
+                !house.is_controlled_by_human(sim.session.game_mode_nonzero())
+                    && !house.command_driven()
+            }) && sim.session.game_mode_nonzero();
             queue(
                 sim,
                 id,
@@ -445,6 +459,7 @@ pub(crate) fn finish_initial_attempt(sim: &mut Simulation, id: u64) {
                 } else {
                     MissionType::Guard
                 },
+                rules,
             );
         }
     }
@@ -452,9 +467,9 @@ pub(crate) fn finish_initial_attempt(sim: &mut Simulation, id: u64) {
 
 /// `UnitClass::Mission_Unload @ 0x0073D630`'s state-2 retry (`0x0073DD5D..0x0073DD76`):
 /// a refused `Deploy` with a NavCom (`+0x5A4`) clears `+0x68C`.
-pub(crate) fn finish_retry(sim: &mut Simulation, id: u64, accepted: bool) {
+pub(crate) fn finish_retry(substrate: &mut ObjectSubstrate, id: u64, accepted: bool) {
     if !accepted
-        && let Some(e) = sim.substrate.entities.get_mut(id)
+        && let Some(e) = substrate.entities.get_mut(id)
         && e.navigation.nav_com().is_some()
     {
         e.mcv_deploy_pending.clear();
@@ -480,10 +495,10 @@ pub(crate) fn per_cell_process(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "mcv_deploy_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "mcv_deploy_retask_retail_tests.rs"]
 mod retail_retask_tests;

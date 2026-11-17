@@ -9,7 +9,7 @@ use glam::IVec3;
 
 pub(super) struct ResolvedBounceTerrain<'a> {
     pub sim: &'a Simulation,
-    pub rules: Option<&'a RuleSet>,
+    pub rules: &'a RuleSet,
 }
 
 impl<'a> BounceTerrain for ResolvedBounceTerrain<'a> {
@@ -73,7 +73,9 @@ impl<'a> BounceTerrain for ResolvedBounceTerrain<'a> {
                 return matches!(
                     crate::sim::cell_kernel::wall_connection_step(
                         cell.overlay_identity_state().0,
-                        -1
+                        -1,
+                        Some(self.rules.overlay_registry()),
+                        self.rules.ares_form(),
                     ),
                     crate::sim::cell_kernel::WallConnectionStep::Return(true)
                 );
@@ -91,13 +93,11 @@ impl<'a> BounceTerrain for ResolvedBounceTerrain<'a> {
                 .sim
                 .entities()
                 .get(sid)
-                .and_then(|entity| {
-                    self.rules
-                        .and_then(|rules| self.sim.object_type(entity.type_ref(), rules))
-                })
+                .and_then(|entity| self.sim.object_type(entity.type_ref(), self.rules))
                 .is_some_and(|kind| !kind.is_1x1_with_undeploy());
         }
-        // 480510(-1,-1) accepts these three raw overlay IDs only.
+        // 480510(-1,-1) accepts these three raw overlay IDs only (any
+        // `Wall=yes` overlay under Ares, hook 0x480534).
         self.sim
             .overlay_grid
             .as_ref()
@@ -107,6 +107,8 @@ impl<'a> BounceTerrain for ResolvedBounceTerrain<'a> {
                     crate::sim::cell_kernel::wall_connection_step(
                         grid.cell(cell.rx, cell.ry).overlay_id.map_or(-1, i32::from),
                         -1,
+                        Some(self.rules.overlay_registry()),
+                        self.rules.ares_form(),
                     ),
                     crate::sim::cell_kernel::WallConnectionStep::Return(true)
                 )
@@ -116,7 +118,7 @@ impl<'a> BounceTerrain for ResolvedBounceTerrain<'a> {
     fn is_water(&self, coord: IVec3) -> bool {
         match self.select_cell(coord) {
             CellRef::Real(cell) => {
-                cell.land_type() == crate::rules::terrain_rules::LandType::Water.as_index()
+                cell.land_type == crate::rules::terrain_rules::LandType::Water.as_index()
             }
             // Constructor dummy land is Clear; no modelled live writer changes it.
             CellRef::Dummy { .. } => false,
@@ -124,6 +126,6 @@ impl<'a> BounceTerrain for ResolvedBounceTerrain<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "bounce_terrain_tests.rs"]
 mod tests;

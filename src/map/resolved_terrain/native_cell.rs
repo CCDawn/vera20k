@@ -201,11 +201,11 @@ impl NativeAllocatedCellCursor {
         terrain: &ResolvedTerrainGrid,
         size_width: i32,
     ) -> Option<NativeCellIdentity> {
-        let index = self.y.wrapping_mul(512).wrapping_add(self.x);
-        let selected = (0..0x40000)
-            .contains(&index)
-            .then(|| terrain.native_fixed_cell_index((index % 512) as i16, (index / 512) as i16))
-            .flatten()
+        let grid = terrain.cell_grid();
+        let index = self.y.wrapping_shl(grid.shift()).wrapping_add(self.x);
+        let selected = grid
+            .coord_from_index(i64::from(index))
+            .and_then(|(x, y)| terrain.native_fixed_cell_index(x as i16, y as i16))
             .map(NativeCellIdentity::Real);
         self.advance(size_width);
         selected
@@ -254,7 +254,20 @@ impl<'a> NativeCellQuery<'a> {
         }
     }
 
-    pub(crate) fn terrain(&self) -> &'a ResolvedTerrainGrid {
+    /// A simulation lookup driven by one client's input (PlayerPtr, the
+    /// selection). Offline games and their replays share that input, so a
+    /// miss stamps the shared Dummy (`0x00ABDC50`) as native does. VERA
+    /// network adaptation: peers differ in it, so a network game stamps a
+    /// fork, whose coordinate no retained target reads.
+    pub fn for_local_input(terrain: &'a ResolvedTerrainGrid, network: bool) -> Self {
+        if network {
+            Self::isolated(terrain)
+        } else {
+            Self::canonical(terrain)
+        }
+    }
+
+    pub fn terrain(&self) -> &'a ResolvedTerrainGrid {
         self.terrain
     }
     pub fn dummy(&self) -> SharedCellDummy {
@@ -276,11 +289,10 @@ impl<'a> NativeCellQuery<'a> {
 
     pub fn lookup_world(&self, x: i32, y: i32) -> NativeCellIdentity {
         let (x, y) = (x / 256, y / 256);
-        let index = y.wrapping_mul(512).wrapping_add(x);
-        if (0..0x40000).contains(&index)
-            && let Some(real) = self
-                .terrain
-                .native_fixed_cell_index((index % 512) as i16, (index / 512) as i16)
+        let grid = self.terrain.cell_grid();
+        let index = y.wrapping_shl(grid.shift()).wrapping_add(x);
+        if let Some((rx, ry)) = grid.coord_from_index(i64::from(index))
+            && let Some(real) = self.terrain.native_fixed_cell_index(rx as i16, ry as i16)
         {
             return NativeCellIdentity::Real(real);
         }
@@ -299,7 +311,18 @@ impl<'a> NativeCellQuery<'a> {
         }
     }
 
-    pub(crate) fn ground_fields(&self, cell: NativeCellIdentity) -> (u8, u8) {
+    /// CellClass::GetAdjacentCell481810: re-read the retained cell's current
+    /// packed coordinate before lookup. A Dummy center can be stamped by each
+    /// neighbor lookup; retaining only its initial coordinate loses that order.
+    pub fn neighbor(&self, cell: NativeCellIdentity, direction: usize) -> NativeCellIdentity {
+        let Some(&(dx, dy)) = crate::util::direction::DIRECTION_DELTAS.get(direction) else {
+            return cell;
+        };
+        let (x, y) = self.coord(cell);
+        self.lookup((x.wrapping_add(dx as i16), y.wrapping_add(dy as i16)))
+    }
+
+    pub fn ground_fields(&self, cell: NativeCellIdentity) -> (u8, u8) {
         match cell {
             NativeCellIdentity::Real(_) => self.terrain.native_cell_ground_fields(cell),
             NativeCellIdentity::Dummy => {
@@ -316,15 +339,11 @@ impl<'a> NativeCellQuery<'a> {
         }
     }
 
-    /// Retained CellClass+44, without another lookup or dummy replacement.
-    pub(crate) fn overlay_identity(&self, cell: NativeCellIdentity) -> i32 {
-        match cell {
-            NativeCellIdentity::Real(index) => self.terrain.cells[index]
-                .bridge_facts
-                .overlay_id
-                .map_or(-1, i32::from),
-            NativeCellIdentity::Dummy => self.dummy.overlay_identity_state().0,
-        }
+    /// This query's fallback CellClass+44, without another lookup or dummy
+    /// replacement. A real cell's identity belongs to the simulation's
+    /// OverlayGrid.
+    pub(crate) fn dummy_overlay_identity(&self) -> i32 {
+        self.dummy.overlay_identity_state().0
     }
 
     /// CellClass+EC through an already retained allocation identity. Reading
@@ -758,7 +777,11 @@ impl SharedCellDummy {
                 | BridgeStampSlot::Forward2
                 | BridgeStampSlot::Opposite
         ) {
-            self.write_overlay_state(facts.state_byte);
+            self.write_overlay_state(if stamp.set {
+                crate::map::bridge_facts::bridge_setter_state(stamp.direction)
+            } else {
+                0
+            });
         }
     }
 
@@ -797,9 +820,9 @@ pub(super) fn native_resolved_cell_index(
     x: i32,
     y: i32,
 ) -> Option<usize> {
-    let linear = crate::map::cell_index::cell_linear_index(x, y)?;
-    let rx = (linear % crate::map::cell_index::CELL_ROW_STRIDE) as usize;
-    let ry = (linear / crate::map::cell_index::CELL_ROW_STRIDE) as usize;
+    let grid = crate::map::cell_index::CellGrid::for_extent(width, height);
+    let (rx, ry) = grid.canonical_coord(x, y)?;
+    let (rx, ry) = (usize::from(rx), usize::from(ry));
     if rx >= usize::from(width) || ry >= usize::from(height) {
         return None;
     }
@@ -810,8 +833,20 @@ pub(super) fn native_resolved_cell_index(
 }
 
 impl ResolvedTerrainGrid {
+    /// Derived from this grid's existing rectangle; no global map mode is retained.
+    pub fn cell_grid(&self) -> crate::map::cell_index::CellGrid {
+        crate::map::cell_index::CellGrid::for_extent(self.width, self.height)
+    }
+
     pub fn shared_cell_dummy(&self) -> SharedCellDummy {
         self.shared_cell_dummy.clone()
+    }
+
+    /// Give this grid its own Dummy, a copy of the one it shared: a
+    /// presentation copy of the world (`Simulation::presentation_copy`) must
+    /// not read the live Dummy the simulation stamps while it ticks.
+    pub(crate) fn fork_cell_dummy(&mut self) {
+        self.shared_cell_dummy = self.shared_cell_dummy.fork_query_identity();
     }
 
     /// Resolve one already-narrowed native fixed-grid coordinate to an
@@ -821,7 +856,7 @@ impl ResolvedTerrainGrid {
         native_resolved_cell_index(
             self.width,
             self.height,
-            self.native_allocated.as_deref(),
+            self.native_allocated.as_deref().map(Vec::as_slice),
             self.cells.len(),
             i32::from(x),
             i32::from(y),
@@ -838,6 +873,18 @@ impl ResolvedTerrainGrid {
             },
             NativeCellIdentity::Real,
         )
+    }
+
+    /// The index of the real cell at `coord` ([`Self::native_cell_coord`])
+    /// on a regular terrain, whose real cells each have their own
+    /// coordinate, the one their index gives: a real cell is at `coord`
+    /// exactly when it has this index. `None` on any other terrain, or when
+    /// no real cell is at `coord`.
+    pub(crate) fn regular_cell_index(&self, (x, y): (i16, i16)) -> Option<usize> {
+        let width = usize::from(self.width);
+        let (x, y) = (usize::try_from(x).ok()?, usize::try_from(y).ok()?);
+        let index = y * width + x;
+        (x < width && index < self.cells.len() && self.is_regular()).then_some(index)
     }
 
     pub(crate) fn native_cell_coord(&self, cell: NativeCellIdentity) -> (i16, i16) {
@@ -932,13 +979,6 @@ impl ResolvedTerrainGrid {
         }
     }
 
-    pub(crate) fn native_cell_state(&self, cell: NativeCellIdentity) -> u8 {
-        match cell {
-            NativeCellIdentity::Real(index) => self.cells[index].bridge_facts.state_byte,
-            NativeCellIdentity::Dummy => self.shared_cell_dummy.overlay_identity_state().1,
-        }
-    }
-
     pub(crate) fn native_cell_anchor(
         &self,
         cell: NativeCellIdentity,
@@ -985,20 +1025,13 @@ impl ResolvedTerrainGrid {
         }
     }
 
-    pub(crate) fn write_native_cell_state(&mut self, cell: NativeCellIdentity, state: u8) {
-        match cell {
-            NativeCellIdentity::Real(index) => self.cells[index].bridge_facts.state_byte = state,
-            NativeCellIdentity::Dummy => self.shared_cell_dummy.write_overlay_state(state),
-        }
-    }
-
     /// Native568E40/569760 raw Cell+11B write, without47D2B0 Recalc.
     /// Evidence: tools/spatial_oracle/bridge_repair.{py,json}. The world owns
     /// subsequent publication to current readers; retained zone inputs stay intact.
     pub(crate) fn write_native_cell_level(&mut self, cell: NativeCellIdentity, level: u8) {
         match cell {
             NativeCellIdentity::Real(index) => {
-                self.cells[index].level = level;
+                self.set_cell_level(index, level);
                 self.cells[index].refresh_current_height_projection();
             }
             NativeCellIdentity::Dummy => self.shared_cell_dummy.set_level(level as i8),
@@ -1018,30 +1051,11 @@ impl ResolvedTerrainGrid {
         }
     }
 
-    pub(crate) fn clear_native_cell_overlay(&mut self, cell: NativeCellIdentity) {
-        self.write_native_cell_overlay(cell, None);
-    }
-
-    /// Raw Cell+44 publication; derived Recalc fields remain untouched until
-    /// the caller reaches47D2B0. Ordinary repair stores all three identities first.
-    pub(crate) fn write_native_cell_overlay(
-        &mut self,
-        cell: NativeCellIdentity,
-        overlay: Option<u8>,
-    ) {
-        match cell {
-            NativeCellIdentity::Real(index) => self.cells[index].bridge_facts.overlay_id = overlay,
-            NativeCellIdentity::Dummy => self
-                .shared_cell_dummy
-                .write_overlay_identity(overlay.map_or(-1, i32::from)),
-        }
-    }
-
     /// Borrow the sparse native CellClass allocation plane used by fixed-grid
     /// map lookups. Load-local owners may snapshot this once so later overlay
     /// writes do not need to keep an immutable borrow of the live terrain grid.
     pub(crate) fn native_allocation_mask(&self) -> Option<&[bool]> {
-        self.native_allocated.as_deref()
+        self.native_allocated.as_deref().map(Vec::as_slice)
     }
 
     pub fn bind_shared_cell_dummy(&mut self, shared_cell_dummy: SharedCellDummy) {
@@ -1059,7 +1073,7 @@ impl ResolvedTerrainGrid {
         if let Some(index) = native_resolved_cell_index(
             self.width,
             self.height,
-            self.native_allocated.as_deref(),
+            self.native_allocated.as_deref().map(Vec::as_slice),
             self.cells.len(),
             x,
             y,
@@ -1110,7 +1124,7 @@ impl ResolvedTerrainGrid {
     /// outside the fixed array instead of reproducing native out-of-array UB.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn cellclass_allocation_probe(&self, x: i32, y: i32) -> bool {
-        let Some((rx, ry)) = crate::map::cell_index::canonical_cell_coord(x, y) else {
+        let Some((rx, ry)) = self.cell_grid().canonical_coord(x, y) else {
             return false;
         };
         self.cell(rx, ry).is_some()
@@ -1136,7 +1150,7 @@ impl ResolvedTerrainGrid {
                 mask[usize::from(ry) * usize::from(self.width) + usize::from(rx)] = true;
             }
         }
-        self.native_allocated = Some(mask);
+        self.native_allocated = Some(mask.into());
         self.allocation_caches = Default::default();
     }
 

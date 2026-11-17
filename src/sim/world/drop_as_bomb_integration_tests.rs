@@ -19,6 +19,7 @@ const EXTRA: &str = "[General]\nWake=DROPWAKE\nAlliedCrew=ENGINEER\nAlliedSurviv
     [TRANSPORT]\nStrength=200\nSpeed=6\nPassengers=5\nSizeLimit=2\nCrewed=yes\n\
     Cost=1000\nExplosion=DROPBOOM\nLocomotor={4A582741-9839-11D1-B709-00A024DDAFD1}\n\
     [CombatDamage]\nC4Warhead=FORCEDC4\nSplashList=DROPSMALL,DROPLARGE\n\
+    [Animations]\n0=DROPSMALL\n1=DROPLARGE\n\
     [Warheads]\n2=FORCEDC4\n\
     [FORCEDC4]\nVerses=0%,0%,0%,0%,0%,0%,0%,0%,0%,0%,0%\nInfDeath=3\n";
 const ART: &str = "[DROPWAKE]\nEnd=40\n[DROPSMALL]\nEnd=40\n\
@@ -28,8 +29,7 @@ fn houses(sim: &mut Simulation) {
     for (name, side) in [("Americans", 0), ("Russians", 1)] {
         let owner = sim.interner.intern(name);
         sim.houses
-            .insert(owner, HouseState::new(owner, side, None, true, 0, 10));
-        sim.session.house_order.push(owner);
+            .register(HouseState::new(owner, side, None, true, 0, 10));
     }
 }
 
@@ -46,10 +46,11 @@ fn boarded_transport(sim: &mut Simulation, rules: &RuleSet, kind: &str) -> (u64,
     assert!(
         sim.apply_command(
             "Americans",
-            &Command::EnterTransport {
-                passenger_id: passenger,
-                transport_id: carrier
-            },
+            &Command::clicked_mission(
+                passenger,
+                crate::sim::mission::MissionType::Enter,
+                crate::sim::combat::TargetKind::Entity(carrier)
+            ),
             Some(rules),
         ),
         "board failed: passenger={:?} transport={:?} admitted={}",
@@ -114,12 +115,12 @@ fn boarded_transport(sim: &mut Simulation, rules: &RuleSet, kind: &str) -> (u64,
 /// Supplied intact-deck scene; the ordinary Mark owner relayers the transport
 /// around its initial Location. Collapse below will use the real producer.
 fn put_on_deck(sim: &mut Simulation, rules: &RuleSet, id: u64, water: bool) {
-    sim.foot_mark_remove(id, Some(rules), None, FrameEffects::default());
+    sim.foot_mark_remove(id, rules, None, FrameEffects::default());
     let cell = sim
         .resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(CELL.0, CELL.1)
+        .cell_mut_for_test(CELL.0, CELL.1)
         .unwrap();
     cell.bridge_facts.raw_flags |= crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL;
     cell.has_bridge_deck = true;
@@ -137,7 +138,7 @@ fn put_on_deck(sim: &mut Simulation, rules: &RuleSet, id: u64, water: bool) {
         z: BRIDGE_DECK_HEIGHT_LEPTONS,
         ..at
     });
-    assert!(sim.foot_mark_put(id, Some(rules), None, FrameEffects::default()));
+    assert!(sim.foot_mark_put(id, rules, None, FrameEffects::default()));
     assert_eq!(
         sim.substrate.occupancy.listed_layer(CELL.0, CELL.1, id),
         Some(MovementLayer::Bridge)
@@ -149,11 +150,115 @@ fn remove_deck(sim: &mut Simulation) {
         .resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(CELL.0, CELL.1)
+        .cell_mut_for_test(CELL.0, CELL.1)
         .unwrap();
     cell.bridge_facts.raw_flags &= !crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL;
     cell.has_bridge_deck = false;
     cell.bridge_walkable = false;
+}
+
+/// FootAI4DAB3C..4DABB1 observes DropAsBomb before the ordinary sinking and
+/// crash sound edges. The new voice runs once through the production turn.
+#[test]
+fn a_bridge_drop_plays_voice_falling_once_through_foot_ai() {
+    let Some(battle) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let mut rules = battle.rules;
+    let sounds = crate::rules::sound_ini::SoundRegistry::from_ini(&IniFile::from_str(
+        "[SoundList]\n0=FallingVoice\n",
+    ));
+    rules.bind_type_sound_references(
+        &IniFile::from_str("[MTNK]\nVoiceFalling=FallingVoice\n"),
+        &sounds,
+    );
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 1);
+    let tank = sim
+        .spawn_object("MTNK", "Americans", CELL.0, CELL.1, 0, &rules)
+        .unwrap();
+    put_on_deck(&mut sim, &rules, tank, false);
+    remove_deck(&mut sim);
+    blow_up_bridge_cell_fallout(
+        &mut sim,
+        &rules,
+        CELL.0,
+        CELL.1,
+        None,
+        FrameEffects::default(),
+    );
+    for expected in [1, 0] {
+        // The app consumes this retained channel between frames; observe
+        // only the new turn's emissions here.
+        sim.sound_events.clear_for_test();
+        let grid = sim.path_grid_snapshot().unwrap();
+        assert!(
+            sim.advance_tick(&[], Some(&rules), Some(&grid), None, 33)
+                .frame_committed
+        );
+        assert_eq!(sim.sound_events.iter().filter(|event| matches!(
+            event, super::SimSoundEvent::VocAt { sound_id, .. } if sound_id == "FallingVoice"
+        )).count(), expected);
+        assert!(sim.substrate.entities.get(tank).unwrap().is_falling_down());
+    }
+}
+
+/// `TechnoClass::AI_Update` keeps going after the landing kills a bridge
+/// faller: MissionClass::AI skips the handler (`0x005B306C`), but the passive
+/// scan (`0x006FA65A..0x006FA6EE`) still runs before the IsAlive test at
+/// `0x006FA735`.
+#[test]
+fn a_tank_killed_by_its_bridge_fall_still_scans_on_that_visit() {
+    let Some(battle) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = battle.rules;
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 1);
+    let tank = sim
+        .spawn_object("MTNK", "Americans", CELL.0, CELL.1, 0, &rules)
+        .unwrap();
+    put_on_deck(&mut sim, &rules, tank, false);
+    sim.object_custom_sounds
+        .insert(tank, "TestAmbient".to_owned());
+    remove_deck(&mut sim);
+    blow_up_bridge_cell_fallout(
+        &mut sim,
+        &rules,
+        CELL.0,
+        CELL.1,
+        None,
+        FrameEffects::default(),
+    );
+    for _ in 0..100 {
+        let frame = sim.session.binary_frame() + 1;
+        sim.session.set_binary_frame_for_test(frame);
+        sim.sound_events.clear_for_test();
+        sim.substrate
+            .entities
+            .get_mut(tank)
+            .unwrap()
+            .passive_scan
+            .arm_timer(frame, 0);
+        sim.advance_live_object_turn(tank, &rules, super::techno_ai::ObjectAiCtx::default())
+            .unwrap();
+        let entity = sim.substrate.entities.get(tank).unwrap();
+        if !entity.is_object_alive() {
+            assert_eq!(
+                entity.passive_scan.last_scan_frame(),
+                frame,
+                "the dead faller's visit still runs the passive scan"
+            );
+            let owner = super::object_sound::custom_sound_owner(tank);
+            assert!(
+                sim.sound_events.as_slice().iter().any(|event| matches!(
+                    event,
+                    super::SimSoundEvent::AnimationStarted { anim_id, .. } if *anim_id == owner
+                )),
+                "its sound plays before the fall kills it"
+            );
+            return;
+        }
+    }
+    panic!("the tank never landed");
 }
 
 fn run_drop(sim: &mut Simulation, rules: &RuleSet, carrier: u64, passenger: u64, water: bool) {
@@ -175,7 +280,7 @@ fn run_drop(sim: &mut Simulation, rules: &RuleSet, carrier: u64, passenger: u64,
     let owner = sim.substrate.entities.get(carrier).unwrap().owner();
     let landing_xy =
         ground_pose::position_world_xy(&sim.substrate.entities.get(carrier).unwrap().position);
-    let losses = sim.houses[&owner].stats.units_lost();
+    let losses = sim.houses[&owner].stats().units_lost();
     let existing = sim.substrate.entities.keys_sorted();
     sim.clear_lifecycle_test_events_for_test();
     remove_deck(sim);
@@ -242,7 +347,7 @@ fn run_drop(sim: &mut Simulation, rules: &RuleSet, carrier: u64, passenger: u64,
         !sim.substrate.entities.contains(passenger),
         "bomb cargo dies without escape"
     );
-    assert_eq!(sim.houses[&owner].stats.units_lost(), losses + 2);
+    assert_eq!(sim.houses[&owner].stats().units_lost(), losses + 2);
     assert!(
         sim.substrate
             .entities
@@ -276,10 +381,10 @@ fn run_drop(sim: &mut Simulation, rules: &RuleSet, carrier: u64, passenger: u64,
         .filter(|(id, _)| !anims_before_landing.contains(id))
         .map(|(_, anim)| {
             (
-                sim.interner.resolve(anim.type_id).to_owned(),
-                anim.world_coord,
-                anim.draw_flags,
-                anim.z_adjust,
+                sim.interner.resolve(anim.type_id()).to_owned(),
+                anim.world_coord(),
+                anim.draw_flags(),
+                anim.z_adjust(),
             )
         })
         .collect::<Vec<_>>();
@@ -336,7 +441,7 @@ fn vanished_structural_deck_per_cell_arms_the_same_object_fall() {
     sim.per_cell_process(
         id,
         PerCellReason::Arrival,
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default(),
     )
@@ -366,6 +471,7 @@ fn vanished_structural_deck_per_cell_arms_the_same_object_fall() {
 /// The bomb byte kills cargo independently of the killing hit's force
 /// flags (Unit737F80): being shot while still falling must never escape a
 /// passenger merely because this ordinary hit did not use ignoreDefenses.
+// The +8F passenger kill (7380AF) is in the stock Unit tail Ares replaces.
 #[test]
 fn a_transport_shot_mid_fall_kills_its_passenger_without_the_landing_force_flags() {
     use crate::sim::combat::{EntityDamageEvent, RAD_NO_ATTACKER, ReceiverCallFlags};
@@ -457,4 +563,87 @@ fn retail_ifv_bridge_fall_uses_retail_c4_and_water_splash_rules() {
     sim.resolve_type_handles(&retail.rules);
     let (carrier, passenger) = boarded_transport(&mut sim, &retail.rules, "FV");
     run_drop(&mut sim, &retail.rules, carrier, passenger, true);
+}
+
+/// AnimClass::SetOwnerObject424B50 / UnInit4255B0 release Object+84 when
+/// the last attached Anim ends. DropAsBomb5F4160 retains that byte, which
+/// ObjectAI5F3FB2 uses to choose parachute or free-fall acceleration.
+#[test]
+fn attached_animation_retirement_releases_a_landed_paratrooper() {
+    let Some(battle) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let mut rules = battle.rules;
+    // Retail ra2.mix/conquer.mix/PARACH.SHP has 140 raw frames.
+    rules.bind_anim_frame_count_for_test("PARACH", 140);
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 1);
+    let infantry = sim
+        .spawn_object("E1", "Americans", CELL.0, CELL.1, 0, &rules)
+        .unwrap();
+    let landing = DriveCoord {
+        z: 600,
+        ..ground_pose::position_world_coord(&sim.substrate.entities.get(infantry).unwrap().position)
+    };
+    sim.techno_limbo_with_rules(infantry, &rules, None);
+    crate::sim::aircraft::drop_payload::spawn_parachuted(
+        &mut sim,
+        &rules,
+        None,
+        infantry,
+        landing,
+        0,
+        FrameEffects::default(),
+    )
+    .unwrap();
+    let canopy = sim
+        .substrate
+        .entities
+        .get(infantry)
+        .unwrap()
+        .parachute_animation()
+        .expect("retail canopy is bound");
+    for _ in 0..512 {
+        let grid = sim.path_grid_snapshot().unwrap();
+        assert!(
+            sim.advance_tick(&[], Some(&rules), Some(&grid), None, 33)
+                .frame_committed
+        );
+        if !sim
+            .substrate
+            .entities
+            .get(infantry)
+            .unwrap()
+            .is_falling_down()
+            && sim.anim(canopy).is_none()
+        {
+            break;
+        }
+    }
+    let entity = sim.substrate.entities.get(infantry).unwrap();
+    assert!(!entity.is_falling_down(), "paratrooper landed");
+    assert!(sim.anim(canopy).is_none(), "canopy finished naturally");
+    assert!(
+        !entity.is_parachuted(),
+        "last attached Anim released Object+84"
+    );
+    let landing_rate = entity.fall_rate();
+
+    put_on_deck(&mut sim, &rules, infantry, false);
+    remove_deck(&mut sim);
+    blow_up_bridge_cell_fallout(
+        &mut sim,
+        &rules,
+        CELL.0,
+        CELL.1,
+        None,
+        FrameEffects::default(),
+    );
+    let grid = sim.path_grid_snapshot().unwrap();
+    sim.advance_tick(&[], Some(&rules), Some(&grid), None, 33);
+    let entity = sim.substrate.entities.get(infantry).unwrap();
+    assert!(entity.is_falling_down());
+    assert!(
+        entity.fall_rate() < landing_rate,
+        "bridge fall is no longer canopy-capped"
+    );
 }

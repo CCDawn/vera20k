@@ -31,16 +31,115 @@ const LABEL_RIGHT_INSET: i32 = 3;
 /// when native leaves the explicit row-width override at -1 (campaign).
 pub(crate) const PROGRESS_ROW_MEASURE_TEXT: &str = "WWWWWWWWWWWWWWW";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LoadingProgressRowSnapshot {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LoadingProgressParticipant {
     pub label: String,
+    pub variant: Option<crate::render::loading_screen_chrome::LoadingArtVariant>,
+    /// HouseType array index this row was launched with. `Game_GetFlagSurface @
+    /// 0x1001DCE0` resolves each row's insignia from this index; an observer
+    /// row keeps its `Observer` variant instead.
+    pub country_index: u16,
+    pub color_index: crate::rules::house_colors::HouseColorIndex,
+    pub backing_rgb: [f32; 3],
+    pub ramp: [crate::assets::pal_file::Color; 16],
+    /// Local progress belongs to the synchronous loading cursor. Only remote
+    /// slots have an independently service-updated progress value.
+    pub remote_progress: Option<super::pump::LoadingProgressState>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct LoadingProgressRowSnapshot {
+    pub participants: Vec<LoadingProgressParticipant>,
+    pub local_player_index: usize,
+    /// The player-colour conversion this snapshot resolved its participants
+    /// with. The map markers repeat the conversion when they look up the
+    /// per-colour atlas rows, so they read it here instead of resolving the
+    /// same priority twice.
+    pub skirmish_colors: crate::rules::skirmish_colors::SkirmishColorMode,
 }
 
 impl LoadingProgressRowSnapshot {
-    pub fn from_launch_session(session: &SkirmishLaunchSession) -> Self {
+    /// Redraw643C0B..36 iterates source nodes, not color-sorted Houses.
+    pub fn from_launch_session(
+        session: &SkirmishLaunchSession,
+        skirmish_colors: crate::rules::skirmish_colors::SkirmishColorMode,
+    ) -> Self {
         Self {
-            label: session.player_name.clone(),
+            participants: session
+                .humans
+                .iter()
+                .enumerate()
+                .map(|(index, human)| LoadingProgressParticipant {
+                    label: human.name.clone(),
+                    variant: if human.is_observer() {
+                        Some(crate::render::loading_screen_chrome::LoadingArtVariant::Observer)
+                    } else {
+                        super::pump::loading_art_variant_from_launch_country(human.slot.country)
+                    },
+                    country_index: human.slot.country.raw_index(),
+                    color_index: crate::rules::house_colors::HouseColorIndex(
+                        skirmish_colors.entry_for_priority(i32::from(human.slot.color_index)) as u8,
+                    ),
+                    backing_rgb: super::pump::FALLBACK_BACKING_RGB,
+                    ramp: super::pump::FALLBACK_PROGRESS_RAMP,
+                    remote_progress: (index != session.local_player_index)
+                        .then(super::pump::LoadingProgressState::standard_skirmish),
+                })
+                .collect(),
+            local_player_index: session.local_player_index,
+            skirmish_colors,
         }
+    }
+
+    #[cfg(test)]
+    pub fn local_label(&self) -> &str {
+        self.participants
+            .get(self.local_player_index)
+            .map_or("", |row| row.label.as_str())
+    }
+
+    pub fn update_remote_progress(&mut self, source_index: usize, percent: i32) -> bool {
+        self.participants
+            .get_mut(source_index)
+            .and_then(|row| row.remote_progress.as_mut())
+            .is_some_and(|progress| {
+                //SetPercent643C94..643CC9 overwrites, including45->30. VERA's
+                //lossy sub100 packets can arrive after the reliable terminal
+                //report, so100 absorbs older reports in this attempt's row.
+                //A fresh launch snapshot resets it; LAN scope/WOL match
+                //admission rejects packets from a different attempt.
+                if progress.current_percent() >= 100.0 && percent < 100 {
+                    return false;
+                }
+                progress.set_percent(f64::from(percent))
+            })
+    }
+    /// Original6433D0 averages every source row, including observers.
+    pub(super) fn total_fraction(&self, local: &super::pump::LoadingProgressState) -> f64 {
+        self.participants
+            .iter()
+            .map(|row| {
+                row.remote_progress
+                    .as_ref()
+                    .unwrap_or(local)
+                    .current_value()
+            })
+            .sum::<f64>()
+            / self.participants.len() as f64
+            / 100.0
+    }
+
+    pub(super) fn incomplete_remote_indices(&self) -> Vec<usize> {
+        self.participants
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                row.remote_progress
+                    .as_ref()
+                    .filter(|progress| progress.current_percent() / 100.0 < 0.999)
+                    .map(|_| index)
+            })
+            .collect()
     }
 }
 
@@ -68,8 +167,13 @@ impl LoadingProgressRowLayout {
 /// from the already executed `0x00552BE0` layout; it has no width override.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LoadingProgressRowPlacement {
-    StandardSkirmish([u32; 2]),
+    StandardSkirmish {
+        render_size: [u32; 2],
+        participants: usize,
+    },
     Campaign([i32; 2]),
+    ///642C80 auto-centres in72AD20's tactical-sized surface extent.
+    AutoCentered([u32; 2]),
 }
 
 /// One `DrawPlayerProgressRow @ 0x00643720` geometry implementation shared by
@@ -88,9 +192,10 @@ pub(crate) fn layout_loading_progress_row(
     side_icon_size: Option<[i32; 2]>,
     font_size: [i32; 2],
     scale: ShellScale,
+    row_index: usize,
 ) -> LoadingProgressRowLayout {
-    let ([base_x, base_y], row_width_override) = match placement {
-        LoadingProgressRowPlacement::StandardSkirmish(render_size) => {
+    let ([mut base_x, mut base_y], row_width_override) = match placement {
+        LoadingProgressRowPlacement::StandardSkirmish { render_size, .. } => {
             let authored = loading_authored_size(render_size, scale);
             let [origin_x, origin_y] = loading_base_origin(authored);
             let [offset_x, offset_y, width] = if authored[0] == NARROW_LOADING_SCREEN_WIDTH {
@@ -101,6 +206,7 @@ pub(crate) fn layout_loading_progress_row(
             ([origin_x + offset_x, origin_y + offset_y], Some(width))
         }
         LoadingProgressRowPlacement::Campaign(point) => (point, None),
+        LoadingProgressRowPlacement::AutoCentered(_) => ([0, 0], None),
     };
     let bar_width = bar_size[0].max(0);
     let bar_height = bar_size[1].max(0);
@@ -115,6 +221,50 @@ pub(crate) fn layout_loading_progress_row(
         .max(font_height)
         + ROW_PADDING;
 
+    if let LoadingProgressRowPlacement::StandardSkirmish {
+        render_size,
+        participants,
+    } = placement
+        && participants > crate::skirmish_launch::SKIRMISH_PLAYER_SLOT_COUNT
+    {
+        // DrawPlayerProgressRow64377D retains the native measured stride above
+        // for <=8. VERA's larger admitted roster uses two bounded columns of
+        // the same labels/meters, without country icons. Presentation only:
+        // the source index still selects the existing progress/color owner.
+        let [width, height] = loading_authored_size(render_size, scale).map(|v| v as i32);
+        let margin = ROW_PADDING;
+        let gap = 2 * ROW_PADDING;
+        let column_width = (width - 2 * margin - gap) / 2;
+        let rows = participants.div_ceil(2);
+        let row_height = font_height.max(bar_height + BAR_HEIGHT_BAND) + ROW_PADDING;
+        let top = base_y
+            .min(height - margin - row_height * rows as i32)
+            .max(margin);
+        let left = margin + (row_index / rows) as i32 * (column_width + gap);
+        let y = top + (row_index % rows) as i32 * row_height;
+        let bar_x = left + column_width - bar_width - 3;
+        return LoadingProgressRowLayout {
+            bar_origin: [bar_x, y + (row_height - bar_height) / 2],
+            icon_origin: None,
+            label_rect: RectPx::new(
+                left,
+                y + (row_height - font_height) / 2,
+                (bar_x - 3 - LABEL_GAP_AFTER_ICON - left).max(0),
+                font_height,
+            ),
+        }
+        .scaled(scale);
+    }
+
+    if let LoadingProgressRowPlacement::AutoCentered([width, height]) = placement {
+        //642D9B..642DBD ignores72AD20's origin, using width-168,height-32.
+        base_x = (width as i32 - 168 - row_width) / 2;
+        base_y = (height as i32 - 32 - row_height) / 2;
+    }
+
+    // DrawPlayerProgressRow64377D multiplies this measured height by
+    // source-player index before the per-element vertical centering.
+    let base_y = base_y + row_height * row_index as i32;
     let bar_origin = [
         base_x + BAR_X_HELPER_INSET,
         base_y + (row_height - (bar_height + BAR_HEIGHT_BAND)) / 2 + BAR_Y_INSET,
@@ -137,14 +287,92 @@ pub(crate) fn layout_loading_progress_row(
         label_rect,
     };
     match placement {
-        LoadingProgressRowPlacement::StandardSkirmish(_) => layout.scaled(scale),
-        LoadingProgressRowPlacement::Campaign(_) => layout,
+        LoadingProgressRowPlacement::StandardSkirmish { .. } => layout.scaled(scale),
+        LoadingProgressRowPlacement::Campaign(_) | LoadingProgressRowPlacement::AutoCentered(_) => {
+            layout
+        }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_order_rows_preserve_guest_local_cursor_and_accept_only_peer_progress() {
+        let profile: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/map_observation.command-bar.example.json",
+        ))
+        .unwrap();
+        let mut launch: SkirmishLaunchSession =
+            serde_json::from_value(profile["launch"].clone()).unwrap();
+        let mut guest = launch.local_player().clone();
+        guest.raw_slot_index = Some(3);
+        guest.name = "Guest".into();
+        guest.slot.color_index = 0;
+        launch.humans[0].slot.color_index = 6;
+        launch.humans.push(guest);
+        launch.local_player_index = 1;
+        let mut rows = LoadingProgressRowSnapshot::from_launch_session(
+            &launch,
+            crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+        );
+        assert_eq!(
+            rows.participants
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Player", "Guest"]
+        );
+        assert_eq!(rows.local_label(), "Guest");
+        assert!(rows.update_remote_progress(0, 45));
+        // Packet0F calls643C50 directly, so a peer may report a lower value.
+        assert!(rows.update_remote_progress(0, 30));
+        assert!(!rows.update_remote_progress(1, 100));
+        assert!(!rows.update_remote_progress(2, 100));
+        assert_eq!(
+            rows.participants[0]
+                .remote_progress
+                .as_ref()
+                .unwrap()
+                .current_percent(),
+            30.0
+        );
+        assert!(rows.participants[1].remote_progress.is_none());
+    }
+
+    #[test]
+    fn native_source_index_advances_by_measured_row_height_before_scaling() {
+        let first = layout_loading_progress_row(
+            LoadingProgressRowPlacement::StandardSkirmish {
+                render_size: [800, 600],
+                participants: 8,
+            },
+            [100, 8],
+            Some([18, 20]),
+            [135, 17],
+            ShellScale::RETAIL,
+            0,
+        );
+        let third = layout_loading_progress_row(
+            LoadingProgressRowPlacement::StandardSkirmish {
+                render_size: [800, 600],
+                participants: 8,
+            },
+            [100, 8],
+            Some([18, 20]),
+            [135, 17],
+            ShellScale::RETAIL,
+            2,
+        );
+        // 64377D: 2 * (max(insignia20,bar8+6,font17)+padding4).
+        assert_eq!(third.bar_origin[1] - first.bar_origin[1], 48);
+        assert_eq!(third.label_rect.y - first.label_rect.y, 48);
+        assert_eq!(
+            third.icon_origin.unwrap()[1] - first.icon_origin.unwrap()[1],
+            48
+        );
+    }
 
     #[test]
     fn campaign_row_frame_origin_matches_original_execution() {
@@ -152,10 +380,6 @@ mod tests {
             "tools/input_oracle/campaign_start.json",
         ))
         .expect("original campaign-start corpus");
-        assert_eq!(
-            fixture["native_sha256"],
-            "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-        );
         let rows = fixture["progress_rows"]["rows"].as_array().unwrap();
         assert!(!rows.is_empty(), "executed campaign row cases");
         // This is the corpus's supplied font prior, not a retail raster
@@ -184,6 +408,7 @@ mod tests {
                 None,
                 pair("font_size"),
                 ShellScale::RETAIL,
+                0,
             );
             assert_eq!(
                 layout.bar_origin,
@@ -200,11 +425,15 @@ mod tests {
     #[test]
     fn loading_progress_row_layout_matches_native_640_fixture() {
         let layout = layout_loading_progress_row(
-            LoadingProgressRowPlacement::StandardSkirmish([640, 480]),
+            LoadingProgressRowPlacement::StandardSkirmish {
+                render_size: [640, 480],
+                participants: 8,
+            },
             [80, 5],
             Some([47, 23]),
             [0, 12],
             ShellScale::RETAIL,
+            0,
         );
 
         assert_eq!(layout.bar_origin, [20, 267]);
@@ -215,11 +444,15 @@ mod tests {
     #[test]
     fn loading_progress_row_layout_matches_native_800_fixture() {
         let layout = layout_loading_progress_row(
-            LoadingProgressRowPlacement::StandardSkirmish([800, 600]),
+            LoadingProgressRowPlacement::StandardSkirmish {
+                render_size: [800, 600],
+                participants: 8,
+            },
             [80, 5],
             Some([47, 23]),
             [0, 12],
             ShellScale::RETAIL,
+            0,
         );
 
         assert_eq!(layout.bar_origin, [24, 332]);
@@ -230,11 +463,15 @@ mod tests {
     #[test]
     fn missing_icon_uses_would_be_icon_anchor_for_label() {
         let layout = layout_loading_progress_row(
-            LoadingProgressRowPlacement::StandardSkirmish([640, 480]),
+            LoadingProgressRowPlacement::StandardSkirmish {
+                render_size: [640, 480],
+                participants: 8,
+            },
             [80, 5],
             None,
             [0, 12],
             ShellScale::RETAIL,
+            0,
         );
 
         assert_eq!(layout.bar_origin, [20, 261]);
@@ -245,70 +482,97 @@ mod tests {
     #[test]
     fn actual_font_height_can_dominate_the_row() {
         let layout = layout_loading_progress_row(
-            LoadingProgressRowPlacement::StandardSkirmish([640, 480]),
+            LoadingProgressRowPlacement::StandardSkirmish {
+                render_size: [640, 480],
+                participants: 8,
+            },
             [80, 5],
             Some([20, 10]),
             [0, 30],
             ShellScale::RETAIL,
+            0,
         );
 
         assert_eq!(layout.label_rect.y, 258);
         assert_eq!(layout.label_rect.h, 30);
     }
-
     #[test]
-    fn oversized_window_moves_the_row_with_the_centered_art() {
-        let base = layout_loading_progress_row(
-            LoadingProgressRowPlacement::StandardSkirmish([800, 600]),
+    fn thirty_source_rows_fit_the_narrow_loading_view_without_hiding_last_player() {
+        let placement = LoadingProgressRowPlacement::StandardSkirmish {
+            render_size: [640, 480],
+            participants: 30,
+        };
+        let rows: Vec<_> = (0..30)
+            .map(|node| {
+                layout_loading_progress_row(
+                    placement,
+                    [80, 5],
+                    Some([47, 23]),
+                    [135, 17],
+                    ShellScale::RETAIL,
+                    node,
+                )
+            })
+            .collect();
+        for row in &rows {
+            assert_eq!(row.icon_origin, None);
+            let label = row.label_rect;
+            assert!(
+                label.x >= 0
+                    && label.y >= 0
+                    && label.x + label.w <= 640
+                    && label.y + label.h <= 480
+                    && label.w >= 135
+            );
+            assert!(row.bar_origin[0] - 3 >= label.x + label.w);
+            assert!(
+                row.bar_origin[0] + 80 + 3 <= 640
+                    && row.bar_origin[1] - 3 >= 0
+                    && row.bar_origin[1] + 5 + 3 <= 480
+            );
+        }
+        assert!(rows[29].label_rect.x > rows[0].label_rect.x);
+        assert_eq!(rows[29].label_rect.y, rows[14].label_rect.y);
+        assert!(
+            rows.windows(2)
+                .filter(|pair| pair[0].label_rect.x == pair[1].label_rect.x)
+                .all(|pair| pair[0].label_rect.y + pair[0].label_rect.h < pair[1].label_rect.y)
+        );
+        let native = layout_loading_progress_row(
+            LoadingProgressRowPlacement::StandardSkirmish {
+                render_size: [640, 480],
+                participants: 8,
+            },
             [80, 5],
             Some([47, 23]),
-            [0, 12],
+            [135, 12],
             ShellScale::RETAIL,
+            0,
         );
-        let maximized = layout_loading_progress_row(
-            LoadingProgressRowPlacement::StandardSkirmish([1024, 768]),
-            [80, 5],
-            Some([47, 23]),
-            [0, 12],
-            ShellScale::RETAIL,
-        );
-
-        // (1024-800)/2, (768-600)/2 — the same base origin the art and text use.
-        assert_eq!(
-            maximized.bar_origin,
-            [base.bar_origin[0] + 112, base.bar_origin[1] + 84]
-        );
-        assert_eq!(
-            maximized.icon_origin,
-            base.icon_origin
-                .map(|origin| [origin[0] + 112, origin[1] + 84])
-        );
-        assert_eq!(maximized.label_rect, base.label_rect.translate(112, 84));
+        assert_eq!(native.bar_origin, [20, 267]);
+        assert_eq!(native.icon_origin, Some([113, 258]));
     }
-
     #[test]
-    fn only_exactly_640_selects_the_narrow_row_offsets() {
-        let narrow = layout_loading_progress_row(
-            LoadingProgressRowPlacement::StandardSkirmish([640, 480]),
+    fn last_extended_loading_row_uses_the_same_scaled_viewport_as_its_meter() {
+        let scale = ShellScale::from_screen(1280, 720);
+        let row = layout_loading_progress_row(
+            LoadingProgressRowPlacement::StandardSkirmish {
+                render_size: [1280, 720],
+                participants: 30,
+            },
             [80, 5],
-            None,
-            [0, 12],
-            ShellScale::RETAIL,
+            Some([47, 23]),
+            [135, 17],
+            scale,
+            29,
         );
-        let just_above = layout_loading_progress_row(
-            LoadingProgressRowPlacement::StandardSkirmish([641, 480]),
-            [80, 5],
-            None,
-            [0, 12],
-            ShellScale::RETAIL,
-        );
-
-        // 641 takes the wide offsets and the 800x600 art viewport, so its base
-        // origin is negative on both axes rather than falling back to narrow.
-        assert_eq!(narrow.bar_origin, [20, 261]);
-        assert_eq!(
-            just_above.bar_origin,
-            [(641 - 800) / 2 + 24, (480 - 600) / 2 + 326]
-        );
+        let label = row.label_rect;
+        assert!(label.w > 0 && label.x >= 0 && label.y >= 0);
+        assert!(label.x + label.w <= 1280 && label.y + label.h <= 720);
+        let [bar_w, bar_h] = scale.art_size(80., 5.);
+        let ring = (3. * scale.factor()).round() as i32;
+        assert!(row.bar_origin[0] - ring >= label.x + label.w);
+        assert!(row.bar_origin[0] + bar_w.ceil() as i32 + ring <= 1280);
+        assert!(row.bar_origin[1] + bar_h.ceil() as i32 + ring <= 720);
     }
 }

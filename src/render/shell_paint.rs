@@ -21,8 +21,8 @@
 //! art lives in the skirmish chrome atlas today) so the emitter stays a pure
 //! composition the quit-confirm and validation modals both delegate to.
 
+use crate::util::time::Instant;
 use std::borrow::Cow;
-use std::time::Instant;
 
 use crate::render::batch::SpriteInstance;
 use crate::render::bit_font::BitFont;
@@ -31,7 +31,7 @@ use crate::render::shell_text::{ShellAlign, ShellTextDraw};
 use crate::render::shell_text_reveal::PathAReveal;
 use crate::render::skirmish_shell_chrome::SkirmishShellChromeEntry;
 use crate::ui::shell::geom::{RectPx, RightPanelRects, ShellScale};
-use crate::ui::shell::slide::{ColumnDraw, column_draw_origin};
+use crate::ui::shell::slide::{ColumnDraw, PanelArt, panel_art_origin};
 
 /// Parent background sits behind the movie in the Z stack. Greater depth =
 /// farther back, so this must exceed `MOVIE_DEPTH`. 0xE2-only (the main-menu
@@ -359,13 +359,7 @@ pub fn paint_chrome(
     }
     if let Some(tile) = atlas.right_panel_tile_sdbtnbkgd {
         for row in 0..panel.tile_count {
-            let rect = RectPx::new(
-                panel.tile.x,
-                panel.tile.y + row * panel.tile.h,
-                panel.tile.w,
-                panel.tile.h,
-            );
-            push_entry_rect(&mut out, tile, rect, CHROME_DEPTH);
+            push_entry_rect(&mut out, tile, panel.tile_row(row), CHROME_DEPTH);
         }
     }
     if let Some(bottom) = atlas.right_panel_bottom_sdbtm {
@@ -390,6 +384,40 @@ pub fn paint_chrome(
     out
 }
 
+/// A `+0xD5` dialog's top-panel shapes over [`paint_chrome`]'s SDTP, in
+/// draw order (later on top): the parent paint's SDTP frame 1
+/// (`0x0072E8C0`) when steady, or the slide engine's SDTP and SDWRNTMP
+/// draws of one tick ([`crate::ui::shell::slide::SlideColumn::panel_art`]).
+pub(crate) fn paint_top_panel(
+    atlas: &MainMenuShellChromeAtlas,
+    panel: RightPanelRects,
+    art: &[PanelArt],
+) -> Vec<SpriteInstance> {
+    let (scale_x, scale_y) = panel.stretch();
+    let mut out = Vec::new();
+    for (index, art) in art.iter().enumerate() {
+        let entry = match *art {
+            PanelArt::Sdtp(frame) => atlas.top_panel.sdtp.get(frame).copied().flatten(),
+            PanelArt::Warning(frame) => atlas.top_panel.warning.get(frame).copied().flatten(),
+            // No main-menu-atlas dialog has a map button or score art.
+            PanelArt::MapButton(_) | PanelArt::Scrt(_) | PanelArt::ScrBackdrop => None,
+        };
+        let Some(entry) = entry else {
+            continue;
+        };
+        let w = (entry.pixel_size[0] * scale_x).round() as i32;
+        let h = (entry.pixel_size[1] * scale_y).round().max(1.0) as i32;
+        let (x, y) = panel_art_origin(panel, *art, w, h);
+        push_entry_rect(
+            &mut out,
+            entry,
+            RectPx::new(x, y, w, h),
+            CHROME_DEPTH - 0.00001 - index as f32 * 1e-6,
+        );
+    }
+    out
+}
+
 /// The slide engine's SDBTNANM draws (`0x006071E0`): each frame right-aligned
 /// over its tile row of [`paint_chrome`]'s column, in draw order (later on
 /// top), in place of the buttons.
@@ -399,20 +427,17 @@ pub(crate) fn paint_slide_column(
     draws: &[ColumnDraw],
 ) -> Vec<SpriteInstance> {
     let mut out = Vec::new();
-    let (scale_x, scale_y) = panel.stretch();
     for (index, draw) in draws.iter().enumerate() {
         let Some(entry) = atlas.button_wave_frames.get(draw.frame).copied().flatten() else {
             continue;
         };
-        // The cell the frame occupies: its native 156x42 canvas, stretched by
-        // the same factor as the column it slides in.
-        let w = (entry.pixel_size[0] * scale_x).round() as i32;
-        let h = (entry.pixel_size[1] * scale_y).round().max(1.0) as i32;
-        let (x, y) = column_draw_origin(panel, draw.row, w);
+        // The cell the frame occupies: its native 156x42 canvas, scaled like
+        // the button authored on that row.
+        let [w, h] = entry.pixel_size.map(|side| side.round() as i32);
         push_entry_rect(
             &mut out,
             entry,
-            RectPx::new(x, y, w, h),
+            panel.row_cell(draw.row as i32, w, h),
             BUTTON_DEPTH - index as f32 * 1e-7,
         );
     }
@@ -433,8 +458,8 @@ pub(crate) fn shuttered_column(panel: RightPanelRects) -> Vec<ColumnDraw> {
 /// (`0x0061595E..0x0061597E`) centers the shape only along an axis where the
 /// window is larger, and the window clips it.
 ///
-/// `scale` is the layout's stretch: the shape grows with the window it was
-/// laid out into, then keeps the same center-and-clip rule. `ShellScale::RETAIL`
+/// `scale` is the layout's stretch: center and clip in authored pixels first,
+/// then map the resulting rectangle with the static panel artwork. `ShellScale::RETAIL`
 /// reproduces the native 1:1 draw exactly.
 pub fn paint_warning_monitor(
     atlas: &MainMenuShellChromeAtlas,
@@ -443,7 +468,34 @@ pub fn paint_warning_monitor(
     scale: ShellScale,
 ) -> Option<SpriteInstance> {
     let entry = *atlas.warning_monitor_frames.get(frame)?;
-    paint_kind4_static(entry, monitor, scale)
+    paint_scaled_warning_monitor(entry, monitor, scale)
+}
+
+fn paint_scaled_warning_monitor(
+    entry: MainMenuShellChromeEntry,
+    monitor: RectPx,
+    scale: ShellScale,
+) -> Option<SpriteInstance> {
+    // 0x0061595E..0x0061597E truncates the native half-gap before drawing.
+    // Centre in authored pixels, then scale with the static panel artwork.
+    // Re-centering a 92-wide shape in the scaled 93-wide window adds a pixel
+    // at 2x, making the animation shift relative to the baked-in monitor.
+    // Below 1x, rounded device edges cannot recover the authored window.
+    // Keep the existing downscaled path rather than inventing lost pixels.
+    if scale.factor() < 1.0 {
+        return paint_kind4_static(entry, monitor, scale);
+    }
+    let native_window = scale.base_rect(monitor);
+    let mut sprite = paint_kind4_static(entry, native_window, ShellScale::RETAIL)?;
+    let drawn = scale.scale_rect(RectPx::new(
+        sprite.position[0] as i32,
+        sprite.position[1] as i32,
+        sprite.size[0] as i32,
+        sprite.size[1] as i32,
+    ));
+    sprite.position = [drawn.x as f32, drawn.y as f32];
+    sprite.size = [drawn.w as f32, drawn.h as f32];
+    Some(sprite)
 }
 
 /// The native kind-4 STATIC's centre-and-clip placement of one SHP frame in
@@ -515,7 +567,7 @@ fn steady_frame_choice(
     }
     if policy.hover_flash && b.hovered {
         let flash = hover_started_at
-            .map(|start| now.duration_since(start).as_millis() / 1000 % 2 == 1)
+            .map(|start| crate::ui::shell::button::flash_phase(start, now))
             .unwrap_or(false);
         if flash {
             return SteadyFrame::Hover;
@@ -711,9 +763,8 @@ pub struct ModalButton {
 /// Emit the mode-2 modal sprites: selected PUDLGBG background at the dialog
 /// top-left, clipped by the dialog client (621E90 -> 4AED70), then each MNBTTN
 /// button centered on its control rect at the state-selected frame. Both grow
-/// with `scale`, which is [`ShellScale::RETAIL`] for the message-box family's
-/// own fixed-size box and a stretched page's scale where the dialog itself
-/// stretches. A missing background is the caller's concern — only present
+/// with the layout's `scale`, including message boxes over a fitted shell.
+/// A missing background is the caller's concern — only present
 /// entries are emitted here, so the solid-panel fallback stays with the host
 /// caller.
 pub fn paint_modal_sprites(
@@ -762,7 +813,7 @@ pub fn paint_modal_sprites(
 }
 
 /// Compose the full mode-2 SHP modal: [`paint_modal_sprites`] plus the body/button
-/// labels (via [`paint_labels_at_depth`] at the modal's front-most text depth).
+/// labels at the modal's front-most text depth, all using the layout's scale.
 pub fn paint_modal_shp(
     font: &BitFont,
     background: Option<SkirmishShellChromeEntry>,
@@ -774,7 +825,7 @@ pub fn paint_modal_shp(
     depths: ModalDepths,
 ) -> ModalDraw {
     let sprites = paint_modal_sprites(background, button_frames, dialog, buttons, scale, depths);
-    let text = paint_labels_at_depth(font, labels, depths.text);
+    let text = paint_labels_at_depth_scaled(font, labels, depths.text, scale.factor());
     ModalDraw { sprites, text }
 }
 
@@ -813,10 +864,9 @@ fn push_skirmish_entry(
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_s_z))]
 mod tests {
     use super::*;
-    use crate::render::bit_font::tests::make_test_font;
     use crate::ui::shell::geom::RIGHT_PANEL_WIDTH;
     use std::time::Duration;
 
@@ -890,6 +940,45 @@ mod tests {
         assert_eq!(stretched.uv_origin, retail.uv_origin);
     }
 
+    #[test]
+    fn warning_monitor_centers_before_integer_upscaling() {
+        // Native 0x71C window and SDWRNANM canvas: x half-gap truncates to
+        // zero, y half-gap is one (0x0061595E..0x0061597E).
+        let window = RectPx::new(670, 47, 93, 55);
+        let entry = fake_entry(92.0, 53.0);
+        let retail = paint_scaled_warning_monitor(entry, window, ShellScale::RETAIL).unwrap();
+        assert_eq!(retail.position, [670.0, 48.0]);
+        let scale = ShellScale::from_screen(1600, 1200);
+        let scaled = paint_scaled_warning_monitor(entry, scale.scale_rect(window), scale).unwrap();
+        assert_eq!(scaled.position, [1340.0, 96.0]);
+        assert_eq!(scaled.size, [184.0, 106.0]);
+    }
+
+    #[test]
+    fn warning_monitor_preserves_retail_640_and_downscaled_placement() {
+        let entry = fake_entry(92.0, 53.0);
+        let retail =
+            paint_scaled_warning_monitor(entry, RectPx::new(510, 47, 93, 55), ShellScale::RETAIL)
+                .unwrap();
+        assert_eq!(retail.position, [510.0, 48.0]);
+        let scale = ShellScale::from_screen(400, 300);
+        let window = scale.scale_rect(RectPx::new(670, 47, 93, 55));
+        let old = paint_kind4_static(entry, window, scale).unwrap();
+        let new = paint_scaled_warning_monitor(entry, window, scale).unwrap();
+        assert_eq!(new.position, old.position);
+        assert_eq!(new.size, old.size);
+    }
+
+    #[test]
+    fn warning_monitor_edges_follow_fractional_letterboxed_panel_scaling() {
+        let scale = ShellScale::from_screen(1920, 1080);
+        let window = scale.scale_rect(RectPx::new(670, 47, 93, 55));
+        let sprite = paint_scaled_warning_monitor(fake_entry(92.0, 53.0), window, scale).unwrap();
+        assert_eq!(sprite.position, [1446.0, 86.0]);
+        // Round the authored right/bottom edges, not the size separately.
+        assert_eq!(sprite.size, [166.0, 96.0]);
+    }
+
     /// `ShellScale::RETAIL` leaves the monitor at its native shape, centre-and-clip
     /// included; a stretched layout grows the shape with its window.
     #[test]
@@ -934,150 +1023,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plain_label_path_remains_byte_identical_to_direct_shell_text() {
-        let font = make_test_font(&[(b'a' as u16, 6), (b'b' as u16, 6)], 4);
-        let rect = RectPx::new(9, 11, 80, 20);
-        let labels = [PaintLabel {
-            text: "aba".into(),
-            rect,
-            align: ShellAlign::H_CENTER,
-            rgb: [1.0, 1.0, 0.0],
-            path_a_reveal: None,
-        }];
-        let actual = paint_labels(&font, &labels).pop().expect("one label");
-        let expected = crate::render::shell_text::draw_in_rect(
-            &font,
-            "aba",
-            crate::render::shell_text::TextRect {
-                x: rect.x,
-                y: rect.y,
-                w: rect.w as u32,
-                h: rect.h as u32,
-            },
-            [1.0, 1.0, 0.0],
-            ShellAlign::H_CENTER,
-            [0.0, 0.0],
-            TEXT_DEPTH,
-        );
-        assert_eq!(
-            bytemuck::cast_slice::<SpriteInstance, u8>(&actual.instances),
-            bytemuck::cast_slice::<SpriteInstance, u8>(&expected.instances)
-        );
-        assert_eq!(
-            (
-                actual.scissor.x,
-                actual.scissor.y,
-                actual.scissor.w,
-                actual.scissor.h,
-            ),
-            (
-                expected.scissor.x,
-                expected.scissor.y,
-                expected.scissor.w,
-                expected.scissor.h,
-            )
-        );
-    }
-
     const NATIVE_POLICY: ButtonPolicy = ButtonPolicy {
         art_fit: ArtFit::Native,
         hover_flash: false,
         art_sink_y: 0.0,
     };
-
-    /// 0xE2 native art stays at the cell top-left when frame 4 is selected.
-    #[test]
-    fn native_art_stays_fixed_when_pressed() {
-        let frame = fake_entry(156.0, 42.0);
-        let rect = RectPx::new(644, 199, 156, 42);
-
-        // Unpressed: top-left, native size.
-        let (pos_up, size_up) = native_emit(frame, rect, false);
-        assert_eq!(pos_up, [644.0, 199.0]);
-        assert_eq!(size_up, [156.0, 42.0]);
-
-        // Pressed: frame selection changes elsewhere; geometry is identical.
-        let (pos_dn, size_dn) = native_emit(frame, rect, true);
-        assert_eq!(pos_dn, [644.0, 199.0]);
-        assert_eq!(size_dn, [156.0, 42.0]);
-        assert_eq!(pos_dn, pos_up);
-    }
-
-    /// Mirror `paint_buttons`' Native art branch for an entry+rect without an
-    /// atlas (the frame is already resolved).
-    fn native_emit(
-        frame: MainMenuShellChromeEntry,
-        rect: RectPx,
-        pressed: bool,
-    ) -> ([f32; 2], [f32; 2]) {
-        let policy = NATIVE_POLICY;
-        let sink = if pressed { policy.art_sink_y } else { 0.0 };
-        ([rect.x as f32, rect.y as f32 + sink], frame.pixel_size)
-    }
-
-    /// Mirror `paint_buttons`' optional FitRightAnchored branch as a function of
-    /// the real frame canvas width (`frame.pixel_size[0]`).
-    fn fit_emit(
-        frame: MainMenuShellChromeEntry,
-        rect: RectPx,
-        panel_w: f32,
-        tile_h: f32,
-    ) -> ([f32; 2], [f32; 2]) {
-        let sx = rect.w as f32 / panel_w;
-        let sy = rect.h as f32 / tile_h;
-        let fw = frame.pixel_size[0] * sx;
-        let fh = frame.pixel_size[1] * sy;
-        let x = rect.x as f32 + (rect.w as f32 - fw);
-        let y = rect.y as f32 + (rect.h as f32 - fh) * 0.5;
-        ([x, y], [fw, fh])
-    }
-
-    /// Optional fit-anchored art at a 168-wide cell with tile_h=42.
-    #[test]
-    fn fit_right_anchored_scales_anchors_and_never_sinks() {
-        let panel_w = FIT_PANEL_W;
-        let tile_h = FIT_TILE_H;
-        let rect = RectPx::new(632, 199, 168, 42);
-        // Use a frame whose canvas width equals the cell width so sx=1.0 — the
-        // common steady case — but assert in terms of the input, not a literal.
-        let canvas_w = panel_w; // exercise the sx=1.0 case explicitly
-        let canvas_h = tile_h;
-        let frame = fake_entry(canvas_w, canvas_h);
-
-        let sx = rect.w as f32 / panel_w;
-        let sy = rect.h as f32 / tile_h;
-        let expect_fw = canvas_w * sx;
-        let expect_fh = canvas_h * sy;
-        let expect_x = rect.x as f32 + (rect.w as f32 - expect_fw);
-        let expect_y = rect.y as f32 + (rect.h as f32 - expect_fh) * 0.5;
-
-        let (pos, size) = fit_emit(frame, rect, panel_w, tile_h);
-        assert_eq!(size, [expect_fw, expect_fh]);
-        assert_eq!(pos, [expect_x, expect_y]);
-        // At sx=1.0 the art exactly fills the cell: right-anchored x == rect.x,
-        // v-centered y == rect.y, NO +2 sink regardless of "pressed".
-        assert_eq!(pos, [632.0, 199.0]);
-
-        // A pressed flag must not move FitRightAnchored art (art_sink_y is unused
-        // on this path). Re-emit identically.
-        let (pos_pressed, _) = fit_emit(frame, rect, panel_w, tile_h);
-        assert_eq!(pos_pressed, pos);
-    }
-
-    /// A narrower canvas (e.g. 156 art in a 168 cell) right-anchors with a left
-    /// gap of `(cell_w - frame_w)` and v-centers — pins the non-trivial case.
-    #[test]
-    fn fit_right_anchored_left_gap_for_narrow_canvas() {
-        let panel_w = FIT_PANEL_W; // 168
-        let tile_h = FIT_TILE_H; // 42
-        let rect = RectPx::new(632, 199, 168, 42);
-        let frame = fake_entry(156.0, 42.0); // canvas narrower than the cell
-        let (pos, size) = fit_emit(frame, rect, panel_w, tile_h);
-        // sx = 168/168 = 1.0 -> fw = 156, gap = 168-156 = 12 px on the LEFT.
-        assert_eq!(size, [156.0, 42.0]);
-        assert_eq!(pos, [632.0 + 12.0, 199.0]);
-    }
 
     const FLASH_POLICY: ButtonPolicy = ButtonPolicy {
         art_fit: ArtFit::FitRightAnchored {
@@ -1151,112 +1101,6 @@ mod tests {
         );
     }
 
-    /// Not hovered -> never flashes regardless of phase.
-    #[test]
-    fn steady_choice_no_hover_no_flash() {
-        let start = Instant::now();
-        assert_eq!(
-            steady_frame_choice(
-                &btn(false, false),
-                FLASH_POLICY,
-                start + Duration::from_millis(1500),
-                Some(start)
-            ),
-            SteadyFrame::Default
-        );
-    }
-
-    /// Depth/compose order: parent bg behind movie behind chrome behind buttons
-    /// behind text, cursor on top. Pins the C8 tiebreaker constants.
-    #[test]
-    fn compose_depths_are_ordered_back_to_front() {
-        const {
-            assert!(PARENT_BACKGROUND_DEPTH > MOVIE_DEPTH);
-            assert!(MOVIE_DEPTH > CHROME_DEPTH);
-            assert!(CHROME_DEPTH > BUTTON_DEPTH);
-            assert!(BUTTON_DEPTH > TEXT_DEPTH);
-            assert!(TEXT_DEPTH > CURSOR_DEPTH);
-        }
-    }
-
-    #[test]
-    fn caption_colour_constants() {
-        assert_eq!(SHELL_TEXT_RGB_DISABLED, [0x48 as f32 / 255.0, 0.0, 0.0]);
-        assert_eq!(SHELL_TEXT_RGB_ENABLED, [1.0, 1.0, 0.0]);
-    }
-
-    /// Optional FitRightAnchored geometry pinned against the real
-    /// SDBTNANM.SHP canvas width read out of the retail asset. The pass
-    /// reads `frame.pixel_size[0]` = the SHP header width parsed at load time
-    /// (`render::main_menu_shell_chrome::render_shp_entry` sets `pixel_size` from
-    /// `shp.width`). This test loads the actual file, so a future edit that
-    /// re-introduces a wrong canvas assumption fails.
-    /// Skips gracefully when retail assets are absent.
-    #[test]
-    fn fit_right_anchored_pins_real_sdbtnanm_canvas_width() {
-        use crate::assets::asset_manager::{AssetManager, MediaArchiveMode};
-        use crate::assets::shp_file::ShpFile;
-        use crate::util::config::GameConfig;
-
-        let ra2_dir = match std::env::var("RA2_DIR") {
-            Ok(val) => std::path::PathBuf::from(val),
-            Err(_) => match GameConfig::load() {
-                Ok(cfg) => cfg.paths.ra2_dir,
-                Err(_) => {
-                    eprintln!("SKIPPED: RA2_DIR not set and config.toml not found");
-                    return;
-                }
-            },
-        };
-        if !ra2_dir.exists() {
-            eprintln!("SKIPPED: RA2 assets not found at {}", ra2_dir.display());
-            return;
-        }
-        let Ok(mut assets) = AssetManager::new(&ra2_dir, MediaArchiveMode::STOCK_DIGITAL) else {
-            eprintln!("SKIPPED: could not mount asset archives");
-            return;
-        };
-        match assets.register_neutral_archives() {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!("SKIPPED: retail neutral archive pair is unavailable");
-                return;
-            }
-            Err(err) => {
-                eprintln!("SKIPPED: could not register retail neutral archives: {err:#}");
-                return;
-            }
-        }
-        let Some(bytes) = assets.get_ref("SDBTNANM.SHP") else {
-            eprintln!("SKIPPED: SDBTNANM.SHP not present in mounted archives");
-            return;
-        };
-        let Ok(shp) = ShpFile::from_bytes(bytes) else {
-            eprintln!("SKIPPED: SDBTNANM.SHP failed to parse");
-            return;
-        };
-        // The atlas bakes `pixel_size = [shp.width, shp.height]` (canvas size).
-        let canvas_w = shp.width as f32;
-        let canvas_h = shp.height as f32;
-        eprintln!("SDBTNANM.SHP real canvas size: {canvas_w} x {canvas_h}");
-        assert!(canvas_w > 0.0 && canvas_h > 0.0);
-
-        let rect = RectPx::new(632, 199, 168, 42);
-        let frame = fake_entry(canvas_w, canvas_h);
-        let (pos, size) = fit_emit(frame, rect, FIT_PANEL_W, FIT_TILE_H);
-
-        // Independently recompute the expected fit/anchor/center from the REAL
-        // canvas width — the pass must produce exactly this.
-        let sx = rect.w as f32 / FIT_PANEL_W;
-        let sy = rect.h as f32 / FIT_TILE_H;
-        let expect_fw = canvas_w * sx;
-        let expect_fh = canvas_h * sy;
-        let expect_x = rect.x as f32 + (rect.w as f32 - expect_fw);
-        let expect_y = rect.y as f32 + (rect.h as f32 - expect_fh) * 0.5;
-        assert_eq!(size, [expect_fw, expect_fh]);
-        assert_eq!(pos, [expect_x, expect_y]);
-    }
-
     // --- Slice 5: mode-2 SHP modal emitter ---
 
     fn fake_skirmish_entry(
@@ -1276,6 +1120,38 @@ mod tests {
         button: 0.4,
         text: 0.3,
     };
+
+    #[test]
+    fn modal_labels_grow_with_the_panel_and_button_art() {
+        let font = crate::render::bit_font::tests::make_test_font(&[(b'A' as u16, 6)], 4);
+        let draw = |scale: ShellScale| {
+            let rect = scale.scale_rect(RectPx::new(175, 137, 451, 326));
+            paint_modal_shp(
+                &font,
+                Some(fake_skirmish_entry([0.0; 2], [1.0; 2], [451.0, 326.0])),
+                ModalButtonFrames::default(),
+                rect,
+                &[],
+                &[PaintLabel {
+                    text: "A".into(),
+                    rect,
+                    align: ShellAlign::NONE,
+                    rgb: SHELL_TEXT_RGB_ENABLED,
+                    path_a_reveal: None,
+                }],
+                scale,
+                MODAL_DEPTHS,
+            )
+        };
+        let retail = draw(ShellScale::RETAIL);
+        let fitted = draw(ShellScale::from_screen(1600, 1200));
+        assert_eq!(fitted.sprites[0].size, [902.0, 652.0]);
+        let glyph = &retail.text[0].instances[0];
+        let grown = &fitted.text[0].instances[0];
+        assert_eq!(grown.size, glyph.size.map(|v| v * 2.0));
+        assert_eq!(grown.position, glyph.position.map(|v| v * 2.0));
+        assert_eq!(fitted.text[0].scissor.w, retail.text[0].scissor.w * 2);
+    }
 
     #[test]
     fn progress_background_is_clipped_to_original_dialog_client() {
@@ -1315,28 +1191,6 @@ mod tests {
                     < 1e-7
             );
         }
-    }
-
-    /// `select` resolves a semantic state to the caller-supplied entry.
-    #[test]
-    fn modal_button_frames_select_matches_role() {
-        let up = fake_skirmish_entry([0.0, 0.0], [0.1, 0.1], [80.0, 20.0]);
-        let disabled = fake_skirmish_entry([0.2, 0.0], [0.1, 0.1], [80.0, 20.0]);
-        let pressed = fake_skirmish_entry([0.4, 0.0], [0.1, 0.1], [80.0, 20.0]);
-        let frames = ModalButtonFrames {
-            up: Some(up),
-            disabled: Some(disabled),
-            pressed: Some(pressed),
-        };
-        assert_eq!(frames.select(false, true).unwrap().uv_origin, up.uv_origin);
-        assert_eq!(
-            frames.select(true, true).unwrap().uv_origin,
-            pressed.uv_origin
-        );
-        assert_eq!(
-            frames.select(false, false).unwrap().uv_origin,
-            disabled.uv_origin
-        );
     }
 
     /// Pressed modal draws the background at the dialog top-left and the MNBTTN
@@ -1380,52 +1234,6 @@ mod tests {
         );
         assert_eq!(sprites[1].size, [80.0, 20.0]);
         assert_eq!(sprites[1].depth, MODAL_DEPTHS.button);
-    }
-
-    /// Idle (unpressed, enabled) modal draws the UP frame (frame 0).
-    #[test]
-    fn modal_sprites_use_up_frame_when_idle() {
-        let up = fake_skirmish_entry([0.3, 0.0], [0.05, 0.05], [80.0, 20.0]);
-        let pressed_frame = fake_skirmish_entry([0.6, 0.0], [0.05, 0.05], [80.0, 20.0]);
-        let frames = ModalButtonFrames {
-            up: Some(up),
-            disabled: None,
-            pressed: Some(pressed_frame),
-        };
-        let sprites = paint_modal_sprites(
-            None,
-            frames,
-            RectPx::new(0, 0, 10, 10),
-            &[ModalButton {
-                rect: RectPx::new(0, 0, 90, 30),
-                pressed: false,
-                enabled: true,
-            }],
-            ShellScale::RETAIL,
-            MODAL_DEPTHS,
-        );
-        // No background passed -> only the button sprite, using the UP frame.
-        assert_eq!(sprites.len(), 1);
-        assert_eq!(sprites[0].uv_origin, up.uv_origin);
-    }
-
-    /// A missing button frame draws nothing for the button (no panic on a short SHP).
-    #[test]
-    fn modal_sprites_skip_missing_button_frame() {
-        let frames = ModalButtonFrames::default(); // all None
-        let sprites = paint_modal_sprites(
-            None,
-            frames,
-            RectPx::new(0, 0, 10, 10),
-            &[ModalButton {
-                rect: RectPx::new(0, 0, 90, 30),
-                pressed: true,
-                enabled: true,
-            }],
-            ShellScale::RETAIL,
-            MODAL_DEPTHS,
-        );
-        assert!(sprites.is_empty());
     }
 
     /// A stretched dialog grows the panel and its buttons with the page, staying

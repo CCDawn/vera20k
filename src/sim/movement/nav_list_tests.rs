@@ -21,10 +21,10 @@ fn retail_world(human: bool) -> Option<(Simulation, RuleSet)> {
     let mut sim = Simulation::new();
     crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
     let owner = sim.intern("Americans");
-    sim.houses.insert(
-        owner,
-        crate::sim::house_state::HouseState::new(owner, 0, None, human, 0, 10),
-    );
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, human, 0, 10,
+        ));
     Some((sim, rules))
 }
 
@@ -171,7 +171,7 @@ fn enter_idle_sends_the_list_head(type_name: &str, case: &str) {
             .set_for_test(Some(TargetKind::from(ELSEWHERE)));
     }
     if type_name == "MTNK" {
-        sim.unit_enter_idle_mode(id, Some(&rules), false, FrameEffects::default());
+        sim.unit_enter_idle_mode(id, &rules, false, FrameEffects::default());
     } else {
         sim.infantry_enter_idle_mode(id, &rules, None, FrameEffects::default());
     }
@@ -228,7 +228,8 @@ fn a_computer_area_guard_takes_its_archived_list_head() {
             id,
             &rules,
             crate::sim::world::ObjectAiCtx::default(),
-        );
+        )
+        .unwrap();
         let context = format!("human {human}, archive {archive:?}");
         if !human && archive == A {
             assert_eq!(nav_com(&sim, id), Some(A), "{context}");
@@ -274,7 +275,7 @@ fn a_move_order_empties_the_list() {
     assert_eq!(list(&sim, id), (vec![], true));
 }
 
-/// A miner's HarvestCell order takes the same Foot clears.
+/// A miner's Harvest order takes the same Foot clears.
 #[test]
 fn a_harvest_order_empties_the_list() {
     let Some((mut sim, rules)) = retail_world(true) else {
@@ -289,11 +290,11 @@ fn a_harvest_order_empties_the_list() {
         .unwrap()
         .navigation
         .set_nav_list_for_test(vec![A, B], true);
-    let order = crate::sim::command::Command::HarvestCell {
-        entity_id: id,
-        target_rx: 12,
-        target_ry: 12,
-    };
+    let order = crate::sim::command::Command::clicked_mission(
+        id,
+        MissionType::Harvest,
+        TargetKind::Cell(12, 12),
+    );
     assert!(sim.apply_command("Americans", &order, Some(&rules)));
     assert_eq!(list(&sim, id), (vec![], true));
 }
@@ -353,7 +354,7 @@ fn a_war_factory_null_destination_empties_the_list() {
         let tank = sim.substrate.entities.get_mut(id).unwrap();
         tank.navigation.set_nav_com_for_test(Some(ELSEWHERE));
         tank.navigation.set_nav_list_for_test(vec![A, B], true);
-        sim.set_unit_null_destination(id, Some(&rules), None, FrameEffects::default());
+        sim.set_unit_null_destination(id, &rules, None, FrameEffects::default());
         if factory_contact {
             assert_eq!(nav_com(&sim, id), Some(ELSEWHERE));
             assert_eq!(list(&sim, id), (vec![], true));
@@ -405,7 +406,7 @@ fn an_order_during_a_war_factory_exit_waits_on_the_list() {
         sim.assign_destination_represented(
             tank,
             Some(order),
-            Some(&rules),
+            &rules,
             None,
             FrameEffects::default(),
         )
@@ -456,18 +457,12 @@ fn an_order_before_the_factory_door_opens_goes_at_once_or_is_dropped() {
                     z: 0,
                 });
         }
-        sim.assign_destination_represented(
-            tank,
-            Some(A),
-            Some(&rules),
-            None,
-            FrameEffects::default(),
-        )
-        .unwrap();
+        sim.assign_destination_represented(tank, Some(A), &rules, None, FrameEffects::default())
+            .unwrap();
         assert_eq!(list(&sim, tank), (vec![A], false), "listed");
         assert_eq!(nav_com(&sim, tank), None, "listed");
         set_mission(&mut sim, tank, MissionType::Move);
-        sim.unit_enter_idle_mode(tank, Some(&rules), false, FrameEffects::default());
+        sim.unit_enter_idle_mode(tank, &rules, false, FrameEffects::default());
         assert_eq!(list(&sim, tank), (vec![], false), "at centre {at_centre}");
         let linked = sim
             .substrate

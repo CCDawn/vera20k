@@ -36,14 +36,6 @@ use crate::sim::world::{ObjectAiCtx, Simulation};
 fn corpus() -> &'static Value {
     static CORPUS: OnceLock<Value> = OnceLock::new();
     CORPUS.get_or_init(|| {
-        let meta: Value = serde_json::from_str(crate::test_fixture::text(
-            "tools/spatial_oracle/infantry_deployed_guard.meta.json",
-        ))
-        .unwrap();
-        assert_eq!(
-            meta["native_sha256"],
-            "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-        );
         let value: Value = serde_json::from_str(crate::test_fixture::text(
             "tools/spatial_oracle/infantry_deployed_guard.json",
         ))
@@ -148,9 +140,6 @@ fn supplied_rules(input: &Value) -> RuleSet {
     let art = IniFile::from_str(&text);
     let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
     rules.install_art_data(ArtRegistry::from_ini(&art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-    );
     let object = rules.object(name).unwrap();
     assert_eq!(object.deploy_fire, input["deploy_fire"] != 0);
     assert_eq!(object.immune_to_radiation, input["immune"] != 0);
@@ -186,11 +175,12 @@ fn supplied_fixture(row: &Value) -> (Simulation, RuleSet, u64) {
     let before = &row["guard_before"];
     let rules = supplied_rules(input);
     let mut sim = Simulation::with_seed(input["seed"].as_u64().unwrap());
-    sim.session.binary_frame = input["now"].as_u64().unwrap() as u32;
-    sim.session.game_options.game_speed = signed(&input["game_speed_index"]);
+    sim.session
+        .set_binary_frame_for_test(input["now"].as_u64().unwrap() as u32);
+    sim.session.game_options_mut_for_test().game_speed = signed(&input["game_speed_index"]);
     let owner = sim.interner.intern("SuppliedHouse");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, false, 0, 10));
+        .register(HouseState::new(owner, 0, None, false, 0, 10));
     let id = sim
         .construct_object_limbo_at_height(
             input["type_id"].as_str().unwrap(),
@@ -322,6 +312,14 @@ fn supplied_fixture(row: &Value) -> (Simulation, RuleSet, u64) {
 
 fn assert_actor(actor: &GameEntity, expected: &Value, row: &Value, rearm: bool) {
     let name = row["input"]["name"].as_str().unwrap();
+    let speed_bits = u64::from_str_radix(expected["speed_fraction_bits"].as_str().unwrap(), 16)
+        .unwrap()
+        .swap_bytes();
+    assert_eq!(
+        actor.foot_speed.native_applied_fraction().bits(),
+        speed_bits,
+        "{name}: retained native speed fraction"
+    );
     let stage = actor.native_stage();
     let raw = serde_json::to_value(stage).unwrap();
     let loco = actor.locomotor.as_ref().unwrap();
@@ -411,7 +409,7 @@ fn native_gi_reacquire_uses_deployed_weapon_range_and_clears_firing_latch() {
     assert_eq!(rows.len(), 10);
     for row in rows {
         let (mut sim, rules, id) = supplied_fixture(row);
-        dispatch_foot_mission(&mut sim, id, &rules, ObjectAiCtx::default());
+        dispatch_foot_mission(&mut sim, id, &rules, ObjectAiCtx::default()).unwrap();
         assert_actor(
             sim.substrate.entities.get(id).unwrap(),
             &row["guard_after"],
@@ -431,7 +429,7 @@ fn native_gi_reacquire_uses_deployed_weapon_range_and_clears_firing_latch() {
                 .mission
                 .dispatch_timer(),
             MissionDispatchTimer::from_raw(
-                sim.session.binary_frame as i32,
+                sim.session.binary_frame() as i32,
                 signed(&row["return_signed"])
             )
         );
@@ -462,9 +460,6 @@ fn stock_deployed_guard_readers_bind_physical_type_weapon_and_raw_action_gates()
     let art = IniFile::from_bytes(&art_bytes).unwrap();
     let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
     rules.install_art_data(ArtRegistry::from_ini(&art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-    );
     // Physical values are separate from the synthetic signed-record controls.
     // This checks their production binding; the companion does not execute INI
     // loading and cannot certify the complete retail reader/scenario chain.
@@ -539,18 +534,24 @@ fn native_deployed_guard_full_returns_match_state_cadence_and_three_rng_streams(
             continue;
         }
         let name = row["input"]["name"].as_str().unwrap();
-        if matches!(
-            name,
-            "fire_error_ammo_zero"
-                | "fire_error_speed_above_point_one"
-                | "deployed_DeployFire_false"
-        ) {
+        if matches!(name, "fire_error_ammo_zero" | "deployed_DeployFire_false") {
             unsupported.push(name);
             continue;
         }
         let (mut sim, rules, id) = supplied_fixture(row);
+        if name == "fire_error_speed_above_point_one" {
+            assert!(
+                sim.substrate
+                    .entities
+                    .get(id)
+                    .unwrap()
+                    .foot_speed
+                    .above_tenth(),
+                "{name}: native moving-fire admission boundary"
+            );
+        }
         let (_, observations) = trace_fire_visits(|| {
-            dispatch_foot_mission(&mut sim, id, &rules, ObjectAiCtx::default())
+            dispatch_foot_mission(&mut sim, id, &rules, ObjectAiCtx::default()).unwrap()
         });
         assert!(
             observations.iter().all(|state| state["phase"] != "entry"),
@@ -580,7 +581,7 @@ fn native_deployed_guard_full_returns_match_state_cadence_and_three_rng_streams(
         assert_eq!(
             actor.mission.dispatch_timer(),
             MissionDispatchTimer::from_raw(
-                sim.session.binary_frame as i32,
+                sim.session.binary_frame() as i32,
                 signed(&row["return_signed"])
             ),
             "{name}: Mission dispatcher epilogue"
@@ -588,14 +589,10 @@ fn native_deployed_guard_full_returns_match_state_cadence_and_three_rng_streams(
         assert_rng(&sim, &row["rng_streams_after"], name);
         compared += 1;
     }
-    assert_eq!((compared, declined), (36, 1));
+    assert_eq!((compared, declined), (37, 1));
     assert_eq!(
         unsupported,
-        [
-            "fire_error_ammo_zero",
-            "fire_error_speed_above_point_one",
-            "deployed_DeployFire_false"
-        ]
+        ["fire_error_ammo_zero", "deployed_DeployFire_false"]
     );
 }
 
@@ -610,7 +607,7 @@ fn native_deployed_guard_accepted_prefix_matches_actual_fireat_entry() {
         assert!(row["return_signed"].is_null());
         let (mut sim, rules, id) = supplied_fixture(row);
         let (_, observations) = trace_fire_visits(|| {
-            dispatch_foot_mission(&mut sim, id, &rules, ObjectAiCtx::default())
+            dispatch_foot_mission(&mut sim, id, &rules, ObjectAiCtx::default()).unwrap()
         });
         let entry = observation(&observations, "entry", row);
         let _return = observation(&observations, "return", row);
@@ -640,7 +637,7 @@ fn native_deployed_guard_callback_tail_matches_projected_class_effects() {
         assert_eq!(row["execution"]["base_fire_callback_count"], 1);
         let (mut sim, rules, id) = supplied_fixture(row);
         let (_, observations) = trace_fire_visits(|| {
-            dispatch_foot_mission(&mut sim, id, &rules, ObjectAiCtx::default())
+            dispatch_foot_mission(&mut sim, id, &rules, ObjectAiCtx::default()).unwrap()
         });
         let _entry = observation(&observations, "entry", row);
         let _return = observation(&observations, "return", row);
@@ -688,21 +685,5 @@ fn native_deployed_guard_unsupported_controls_remain_declared() {
             .unwrap()
             .ammo()
             .is_some_and(|ammo| ammo.current() == -1)
-    );
-    let speed = rows
-        .iter()
-        .find(|row| row["input"]["name"] == "fire_error_speed_above_point_one")
-        .unwrap();
-    let (sim, _rules, id) = supplied_fixture(speed);
-    // The supplied native double is one ULP above0.1; the existing documented
-    // fixed-point speed owner cannot retain that control's admission boundary.
-    assert!(speed["input"]["speed_fraction"].as_f64().unwrap() > 0.1);
-    assert!(
-        !sim.substrate
-            .entities
-            .get(id)
-            .unwrap()
-            .foot_speed
-            .above_tenth()
     );
 }

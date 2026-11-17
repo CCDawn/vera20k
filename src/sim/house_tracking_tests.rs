@@ -128,7 +128,7 @@ fn factory_counts_match_original_raw_class_dispatch() {
                     _ => panic!("unreviewed original counter offset {offset:x}"),
                 });
                 assert_eq!(
-                    TrackingFacts::of(EntityCategory::Structure, Some(ty), Some(&rules)).factory,
+                    TrackingFacts::of(EntityCategory::Structure, Some(ty), &rules).factory,
                     expected,
                     "{} {row} Naval={naval}",
                     table["name"],
@@ -214,9 +214,9 @@ fn native_tracking_corpus() {
         let mut sim = Simulation::with_seed(3);
         let house = sim.interner.intern("Americans");
         sim.houses
-            .insert(house, HouseState::new(house, 0, None, true, 0, 10));
+            .register(HouseState::new(house, 0, None, true, 0, 10));
         let counts = |sim: &Simulation| {
-            let tracking = &sim.houses[&house].tracking;
+            let tracking = sim.houses[&house].tracking();
             (
                 tracking.buildings(),
                 tracking.units_for_test(),
@@ -250,6 +250,64 @@ fn native_tracking_corpus() {
     assert_eq!(compared, 34);
 }
 
+/// Original active-count bodies, including signed wrap and DontScore.
+/// Actual ChangeOwner composition is covered by the crew lifecycle test.
+#[test]
+fn nominal_active_counts_match_executed_native_histories() {
+    use crate::rules::ruleset::HouseCostFactors;
+    use crate::util::native_x87::NativeF32Bits;
+    let corpus = crate::test_fixture::json("tools/spatial_oracle/nominal_building_survivor.json");
+    let factors = HouseCostFactors {
+        country: [NativeF32Bits::ONE; 5],
+        factory_plant: [NativeF32Bits::ONE; 5],
+    };
+    let mut compared = 0;
+    for row in corpus["count_histories"].as_array().unwrap() {
+        if row["input"]["name"].as_str().unwrap().contains("capture") {
+            continue;
+        }
+        let (mut sim, rules, owner) = one_house();
+        let kind = if row["input"]["dont_score"] == true {
+            "GID"
+        } else {
+            "GI"
+        };
+        let id = sim
+            .spawn_object_limbo_at_height(kind, "Americans", 10, 10, 0, 0, &rules)
+            .unwrap();
+        let entity = sim.substrate.entities.get_mut(id).unwrap();
+        if row["input"]["nominal"] == true {
+            entity.mark_nominal_survivor();
+        }
+        let entity = entity.clone();
+        let tracking = sim.houses.get_mut(&owner).unwrap().tracking_mut();
+        tracking.set_active_for_test(
+            EntityCategory::Infantry,
+            entity.type_ref(),
+            row["initial"]["houses"]["old"]["slot"].as_i64().unwrap() as i32,
+        );
+        for step in row["steps"].as_array().unwrap() {
+            match step["operation"].as_str().unwrap() {
+                "add" => tracking.added_to_game(&entity, &factors),
+                "remove" => tracking.removed_from_game(&entity, &factors),
+                operation => panic!("unexpected counter operation {operation}"),
+            }
+            assert_eq!(
+                i64::from(tracking.active_count(EntityCategory::Infantry, entity.type_ref())),
+                step["after"]["houses"]["old"]["slot"].as_i64().unwrap(),
+                "{} {step}",
+                row["input"]["name"]
+            );
+            assert_eq!(
+                i64::from(tracking.active_for_test().1),
+                step["after"]["houses"]["old"]["total"].as_i64().unwrap()
+            );
+        }
+        compared += 1;
+    }
+    assert_eq!(compared, 6);
+}
+
 fn one_house() -> (Simulation, RuleSet, InternedId) {
     let rules = RuleSet::from_ini_with_fixed_art_for_test(
         &IniFile::from_str(RULES),
@@ -259,7 +317,7 @@ fn one_house() -> (Simulation, RuleSet, InternedId) {
     let mut sim = Simulation::with_seed(3);
     let house = sim.interner.intern("Americans");
     sim.houses
-        .insert(house, HouseState::new(house, 0, None, true, 0, 10));
+        .register(HouseState::new(house, 0, None, true, 0, 10));
     (sim, rules, house)
 }
 
@@ -283,7 +341,7 @@ fn on_map_counts_follow_unlimbo_and_limbo() {
         .collect();
     let bldg = sim.interner.get("BLDG").unwrap();
     let bldgd = sim.interner.get("BLDGD").unwrap();
-    let tracking = &sim.houses[&house].tracking;
+    let tracking = sim.houses[&house].tracking();
     assert_eq!(
         tracking.active_for_test(),
         (2, 1, 1),
@@ -295,7 +353,7 @@ fn on_map_counts_follow_unlimbo_and_limbo() {
     for id in ids {
         sim.uninit_with_rules(id, &rules);
     }
-    let tracking = &sim.houses[&house].tracking;
+    let tracking = sim.houses[&house].tracking();
     assert_eq!(tracking.active_for_test(), (1, 0, 0), "but not removed");
     assert_eq!(tracking.active_count(EntityCategory::Structure, bldg), 0);
 }
@@ -308,7 +366,7 @@ fn change_owner_moves_the_counts() {
     let (mut sim, rules, first) = one_house();
     let second = sim.interner.intern("Russians");
     sim.houses
-        .insert(second, HouseState::new(second, 1, None, false, 0, 10));
+        .register(HouseState::new(second, 1, None, false, 0, 10));
     let on_map = sim
         .spawn_object_at_height("TANK", "Americans", 10, 10, 0, 0, &rules)
         .unwrap();
@@ -316,7 +374,7 @@ fn change_owner_moves_the_counts() {
         .spawn_object_limbo_at_height("TANK", "Americans", 14, 10, 0, 0, &rules)
         .unwrap();
     let counts = |sim: &Simulation, house| {
-        let tracking = &sim.houses[&house].tracking;
+        let tracking = sim.houses[&house].tracking();
         (tracking.units_for_test(), tracking.active_for_test().0)
     };
     assert_eq!(counts(&sim, first), (2, 1));
@@ -342,11 +400,11 @@ fn a_helipads_docks_follow_its_opening_capture_and_limbo() {
     let (mut sim, rules, first) = one_house();
     let second = sim.interner.intern("Russians");
     sim.houses
-        .insert(second, HouseState::new(second, 1, None, false, 0, 10));
+        .register(HouseState::new(second, 1, None, false, 0, 10));
     let docks = |sim: &Simulation| {
         (
-            sim.houses[&first].tracking.airport_docks(),
-            sim.houses[&second].tracking.airport_docks(),
+            sim.houses[&first].tracking().airport_docks(),
+            sim.houses[&second].tracking().airport_docks(),
         )
     };
     let pad = sim
@@ -357,7 +415,7 @@ fn a_helipads_docks_follow_its_opening_capture_and_limbo() {
         sim.houses
             .get_mut(&house)
             .unwrap()
-            .tracking
+            .tracking_mut()
             .add_airport_docks(docks);
     };
     add_docks(&mut sim, first, -3);
@@ -385,20 +443,20 @@ fn discarding_a_constructed_object_releases_its_tracking() {
     let unit = sim
         .spawn_object_limbo_at_height("TANK", "Americans", 14, 10, 0, 0, &rules)
         .unwrap();
-    let tracking = &sim.houses[&house].tracking;
+    let tracking = sim.houses[&house].tracking();
     assert_eq!((tracking.buildings(), tracking.units_for_test()), (1, 1));
 
     assert!(sim.discard_constructed_limbo(
         building,
-        Some(&rules),
+        &rules,
         crate::sim::world::FrameEffects::default()
     ));
     assert!(sim.discard_constructed_limbo(
         unit,
-        Some(&rules),
+        &rules,
         crate::sim::world::FrameEffects::default()
     ));
-    let tracking = &sim.houses[&house].tracking;
+    let tracking = sim.houses[&house].tracking();
     assert_eq!((tracking.buildings(), tracking.units_for_test()), (0, 0));
     assert_eq!(tracking.active_for_test(), (0, 0, 0));
 }
@@ -452,7 +510,7 @@ Cost=1000
 ";
 
 fn force_values_of(sim: &Simulation, house: InternedId) -> (i32, i32, i32) {
-    let values = sim.houses[&house].tracking.force_values();
+    let values = sim.houses[&house].tracking().force_values();
     (values.infantry, values.vehicles, values.air)
 }
 
@@ -474,7 +532,7 @@ fn force_values_follow_the_objects_on_the_map() {
         let house = sim.interner.intern(name);
         let mut state = HouseState::new(house, 0, None, false, 0, 10);
         state.project_country_mults(&rules, &sim.interner);
-        sim.houses.insert(house, state);
+        sim.houses.register(state);
         house
     });
     let ids: Vec<u64> = [
@@ -516,7 +574,7 @@ fn vehicle_and_infantry_totals_follow_tracking() {
                 .unwrap_or_else(|| panic!("{kind} spawns"))
         })
         .collect();
-    let tracking = &sim.houses[&house].tracking;
+    let tracking = sim.houses[&house].tracking();
     assert_eq!(tracking.vehicles(), 2, "the tank and the 1x1 undeployer");
     assert_eq!(tracking.infantry(), 1);
     assert_eq!(tracking.buildings(), 1);
@@ -525,7 +583,7 @@ fn vehicle_and_infantry_totals_follow_tracking() {
         sim.uninit_with_rules(id, &rules);
     }
     sim.flush_pending_delete();
-    let tracking = &sim.houses[&house].tracking;
+    let tracking = sim.houses[&house].tracking();
     assert_eq!((tracking.vehicles(), tracking.infantry()), (0, 0));
 }
 
@@ -551,7 +609,7 @@ fn naval_tracking_uses_unit_naval_and_exact_zero_passengers() {
     let mut sim = Simulation::new();
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+        .register(HouseState::new(owner, 0, None, true, 0, 10));
     let ids: Vec<_> = [
         "BOAT",
         "TRANSPORT",
@@ -566,7 +624,7 @@ fn naval_tracking_uses_unit_naval_and_exact_zero_passengers() {
             .unwrap()
     })
     .collect();
-    let tracking = &sim.houses[&owner].tracking;
+    let tracking = sim.houses[&owner].tracking();
     assert_eq!(
         (tracking.vehicles(), tracking.navy(), tracking.buildings()),
         (4, 1, 0)
@@ -575,7 +633,7 @@ fn naval_tracking_uses_unit_naval_and_exact_zero_passengers() {
         sim.uninit_with_rules(id, &rules);
     }
     sim.flush_pending_delete();
-    let tracking = &sim.houses[&owner].tracking;
+    let tracking = sim.houses[&owner].tracking();
     assert_eq!(
         (tracking.vehicles(), tracking.navy(), tracking.buildings()),
         (0, 0, 0)
@@ -589,7 +647,7 @@ fn naval_tracking_retains_limbo_capture_and_reload_deletion_authority() {
     let (mut sim, rules, first) = one_house();
     let second = sim.interner.intern("Russians");
     sim.houses
-        .insert(second, HouseState::new(second, 1, None, false, 0, 10));
+        .register(HouseState::new(second, 1, None, false, 0, 10));
     let boat = sim
         .spawn_object_at_height("BOAT", "Americans", 10, 10, 0, 0, &rules)
         .unwrap();
@@ -598,23 +656,23 @@ fn naval_tracking_retains_limbo_capture_and_reload_deletion_authority() {
         .unwrap();
     assert_eq!(
         (
-            sim.houses[&first].tracking.vehicles(),
-            sim.houses[&first].tracking.navy()
+            sim.houses[&first].tracking().vehicles(),
+            sim.houses[&first].tracking().navy()
         ),
         (2, 1)
     );
     sim.techno_limbo_with_rules(boat, &rules, None);
-    assert_eq!(sim.houses[&first].tracking.active_for_test().0, 0);
+    assert_eq!(sim.houses[&first].tracking().active_for_test().0, 0);
     assert_eq!(
-        sim.houses[&first].tracking.navy(),
+        sim.houses[&first].tracking().navy(),
         1,
         "Limbo is not destruction"
     );
     sim.change_owner(boat, second);
     assert_eq!(
         (
-            sim.houses[&first].tracking.navy(),
-            sim.houses[&second].tracking.navy()
+            sim.houses[&first].tracking().navy(),
+            sim.houses[&second].tracking().navy()
         ),
         (0, 1)
     );
@@ -630,7 +688,7 @@ fn naval_tracking_retains_limbo_capture_and_reload_deletion_authority() {
         .houses
         .get_mut(&second)
         .unwrap()
-        .tracking
+        .tracking_mut()
         .set_naval_land_for_test(1, 0, 0);
     assert_ne!(
         restored.state_hash(),
@@ -641,7 +699,7 @@ fn naval_tracking_retains_limbo_capture_and_reload_deletion_authority() {
         .houses
         .get_mut(&second)
         .unwrap()
-        .tracking
+        .tracking_mut()
         .set_naval_land_for_test(1, 1, 0);
     let facts = restored
         .substrate
@@ -671,15 +729,61 @@ fn naval_tracking_retains_limbo_capture_and_reload_deletion_authority() {
     for candidate in [&mut sim, &mut restored] {
         candidate.uninit_with_rules(boat, &rules);
         assert_eq!(
-            candidate.houses[&second].tracking.navy(),
+            candidate.houses[&second].tracking().navy(),
             1,
             "UnInit leaves tracking until the destructor drain"
         );
         candidate.flush_pending_delete();
-        assert_eq!(candidate.houses[&second].tracking.navy(), 0);
+        assert_eq!(candidate.houses[&second].tracking().navy(), 0);
         candidate.uninit_with_rules(transport, &rules);
         candidate.flush_pending_delete();
-        assert_eq!(candidate.houses[&first].tracking.vehicles(), 0);
+        assert_eq!(candidate.houses[&first].tracking().vehicles(), 0);
     }
     assert_eq!(sim.state_hash(), restored.state_hash());
+}
+
+/// `BuildingClass::ChangeOwner` (`0x00448C9A..0x00448CD6`): only a
+/// Construction Yard taken from a human player (`0x0050B6F0`) cancels that
+/// player's current building placement.
+#[test]
+fn a_captured_human_construction_yard_cancels_placement() {
+    use crate::sim::world::{FrameEffects, LifecycleOutput};
+    let rules = RuleSet::from_ini_with_fixed_art_for_test(
+        &IniFile::from_str(
+            "[BuildingTypes]\n0=YARD\n1=PLANT\n[YARD]\nConstructionYard=yes\n[PLANT]\n",
+        ),
+        &IniFile::from_str("[YARD]\nFoundation=2x2\n[PLANT]\nFoundation=2x2\n"),
+    )
+    .unwrap();
+    let mut sim = Simulation::with_seed(3);
+    let human = sim.interner.intern("Americans");
+    let computer = sim.interner.intern("Russians");
+    sim.houses
+        .register(HouseState::new(human, 0, None, true, 0, 10));
+    sim.houses
+        .register(HouseState::new(computer, 1, None, false, 0, 10));
+    sim.session.set_current_house_for_test(Some(human));
+    let [yard, plant] = [("YARD", 10), ("PLANT", 14)].map(|(kind, rx)| {
+        sim.spawn_object_at_height(kind, "Americans", rx, 10, 0, 0, &rules)
+            .unwrap()
+    });
+    let capture = |sim: &mut Simulation, id, to| {
+        sim.lifecycle_outputs.clear_for_test();
+        sim.change_owner_with_rules(id, to, &rules, None, FrameEffects::default());
+        sim.lifecycle_outputs
+            .as_slice()
+            .iter()
+            .copied()
+            .filter(|output| matches!(output, LifecycleOutput::ConstructionYardCaptured { .. }))
+            .collect::<Vec<_>>()
+    };
+    assert!(capture(&mut sim, plant, computer).is_empty());
+    assert_eq!(
+        capture(&mut sim, yard, computer),
+        [LifecycleOutput::ConstructionYardCaptured { owner: human }]
+    );
+    assert!(
+        capture(&mut sim, yard, human).is_empty(),
+        "a computer's yard"
+    );
 }

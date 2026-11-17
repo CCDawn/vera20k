@@ -211,7 +211,7 @@ impl Simulation {
             .entities
             .get(id)
             .ok_or("retired Walk tube owner")?;
-        let Some(word) = tube_word(&actor.navigation.path_replay, &actor.position, terrain) else {
+        let Some(word) = tube_word(actor.navigation.path_replay(), &actor.position, terrain) else {
             return Ok(false);
         };
         match word {
@@ -220,13 +220,13 @@ impl Simulation {
             }
             TubeWord::NoTube => {
                 if let Some(actor) = self.substrate.entities.get_mut(id) {
-                    actor.navigation.path_replay.clear_live_head();
+                    actor.navigation.path_replay_mut().clear_live_head();
                     if let Some(locomotor) = actor.locomotor.as_mut() {
                         locomotor.set_step_head(None);
                     }
                 }
-                self.walk_stop_moving(id, Some(rules), effects)?;
-                self.assign_null_destination(id, Some(rules), registry, effects);
+                self.walk_stop_moving(id, rules, effects)?;
+                self.assign_null_destination(id, rules, registry, effects);
             }
         }
         Ok(true)
@@ -264,8 +264,16 @@ impl Simulation {
         let on_bridge = actor.on_bridge();
         let target = walk_tube_target(&mut actor.position, on_bridge, tube, terrain)?;
         let location = ground_pose::position_world_coord(&actor.position);
-        self.foot_mark_remove(id, Some(rules), registry, effects);
-        self.object_raw_receiver_at(id, location, false);
+        self.foot_mark_remove(id, rules, registry, effects);
+        Self::object_raw_receiver_at(
+            &mut self.substrate,
+            &self.path_grid,
+            &self.resolved_terrain,
+            id,
+            location,
+            false,
+            rules.ares_form(),
+        );
         let actor = self
             .substrate
             .entities
@@ -274,7 +282,7 @@ impl Simulation {
         if let Some(locomotor) = actor.locomotor.as_mut() {
             locomotor.set_step_head(Some(head));
         }
-        super::path_markers::consume_path_replay(&mut actor.navigation.path_replay, 1);
+        actor.navigation.path_replay_mut().consume(1);
         actor.low_bridge_tube_state = Some(LowBridgeTubeMovementState {
             tube_id,
             cursor: 0,
@@ -309,7 +317,7 @@ impl Simulation {
         &mut self,
         id: u64,
         family: TrackFamily,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> Result<bool, String> {
@@ -327,7 +335,7 @@ impl Simulation {
         {
             return Ok(false);
         }
-        let Some(word) = tube_word(&actor.navigation.path_replay, &actor.position, terrain) else {
+        let Some(word) = tube_word(actor.navigation.path_replay(), &actor.position, terrain) else {
             return Ok(false);
         };
         // The target reads only the Location and the floor, which Mark(UP)
@@ -363,7 +371,7 @@ impl Simulation {
         match entry {
             Some((tube_id, head, target)) => {
                 locomotor.store_track_head(family, Some(head));
-                super::path_markers::consume_path_replay(&mut actor.navigation.path_replay, 1);
+                actor.navigation.path_replay_mut().consume(1);
                 actor.low_bridge_tube_state = Some(LowBridgeTubeMovementState {
                     tube_id,
                     cursor: 0,
@@ -371,7 +379,7 @@ impl Simulation {
                 });
                 locomotor.store_track_valid(family, true);
             }
-            None => actor.navigation.path_replay.clear_live_head(),
+            None => actor.navigation.path_replay_mut().clear_live_head(),
         }
         progress.retire_selector();
         locomotor.store_track_progress(family, progress);
@@ -404,7 +412,7 @@ fn tick_active_tube_object(
     entity_id: u64,
     terrain: &ResolvedTerrainGrid,
     occupancy: &OccupancyGrid,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
     interner: &StringInterner,
 ) -> TubeTurn {
     let Some(entity) = entities.get(entity_id) else {
@@ -417,8 +425,8 @@ fn tick_active_tube_object(
         return TubeTurn::Moved;
     };
     let category = entity.category();
-    let speed = rules
-        .and_then(|rules| interner.object_type(entity.type_ref(), rules))
+    let speed = interner
+        .object_type(entity.type_ref(), rules)
         .map_or(0, |object| {
             crate::util::fixed_math::ra2_speed_to_leptons_per_frame(object.speed)
         });
@@ -516,10 +524,11 @@ impl Simulation {
     pub(crate) fn tube_object_turn(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> Result<TubeObjectTurn, FrameAdvanceError> {
+        let _area = crate::sim::frame_profile::area(crate::sim::frame_profile::phase::MOVEMENT);
         let mut turn = TubeObjectTurn::default();
         self.complete_pending_order(id, rules, registry, effects);
         let Some(terrain) = self.resolved_terrain.as_ref() else {
@@ -542,7 +551,7 @@ impl Simulation {
         };
         turn.movement.movers_total = 1;
         turn.bridge_state_changed = exit.map_err(|cause| {
-            FrameAdvanceError::new(self.session.tick, self.session.binary_frame, id, cause)
+            FrameAdvanceError::new(self.session.tick(), self.session.binary_frame(), id, cause)
         })?;
         // Only a completed exit leaves the tube, and each runs its
         // Per_Cell_Process(2).
@@ -551,6 +560,9 @@ impl Simulation {
             .entities
             .get(id)
             .is_some_and(|entity| entity.low_bridge_tube_state.is_none());
+        // Infantry51BACD/Unit7363BB call the same virtual+4A0(0) after the
+        // tube leaf; this early-return path bypasses common Techno AI.
+        self.update_techno_discovery_from_shroud(id);
         Ok(turn)
     }
 
@@ -560,15 +572,14 @@ impl Simulation {
     /// is copied first and each copy tested as the loop reaches it (Unit
     /// `0x00735E74..0x00735F62`, Infantry `0x0051B7E6..0x0051B8F4`). Then the
     /// object's speed becomes 0 (Unit `0x00735F6A`, Infantry `0x0051B8FC`)
-    /// and it stays in the tube, to try again on its next turn. Without rules
-    /// no Scatter admits, so none runs.
+    /// and it stays in the tube, to try again on its next turn.
     ///
     /// Answers whether an Infantry Scatter's immediate Process changed bridge
     /// state.
     fn tube_exit_blocked(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> Result<bool, String> {
@@ -583,23 +594,21 @@ impl Simulation {
             })
             .map_or_else(Vec::new, |cell| cell.snapshot_layer(MovementLayer::Ground));
         let mut bridge_state_changed = false;
-        if let Some(rules) = rules {
-            for blocker in occupants {
-                if self
-                    .substrate
-                    .entities
-                    .get(blocker)
-                    .is_some_and(tube_exit_scatters)
-                {
-                    bridge_state_changed |= self.scatter(
-                        blocker,
-                        None,
-                        ScatterFlags::new(true, true),
-                        rules,
-                        registry,
-                        effects,
-                    )?;
-                }
+        for blocker in occupants {
+            if self
+                .substrate
+                .entities
+                .get(blocker)
+                .is_some_and(tube_exit_scatters)
+            {
+                bridge_state_changed |= self.scatter(
+                    blocker,
+                    None,
+                    ScatterFlags::new(true, true),
+                    rules,
+                    registry,
+                    effects,
+                )?;
             }
         }
         stop_blocked_mover(&mut self.substrate.entities, id);
@@ -626,7 +635,7 @@ impl Simulation {
     fn unit_tube_exit(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> Result<bool, String> {
@@ -662,7 +671,7 @@ impl Simulation {
         let navcom_names_cell = self.substrate.entities.get(id).is_some_and(|actor| {
             matches!(actor.navigation.nav_com(), Some(NavTargetRef::Cell { rx, ry }) if (rx, ry) == at)
         });
-        if let (true, Some(rules)) = (navcom_names_cell, rules) {
+        if navcom_names_cell {
             self.scatter(
                 id,
                 None,
@@ -686,7 +695,7 @@ impl Simulation {
                 &mut self.substrate.entities,
                 id,
                 terrain,
-                self.session.binary_frame,
+                self.session.binary_frame(),
             );
         }
         Ok(bridge_state_changed)
@@ -728,11 +737,10 @@ impl Simulation {
     fn infantry_tube_exit(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> Result<bool, String> {
-        let rules = rules.ok_or("Infantry tube exit requires rules")?;
         let terrain = self
             .resolved_terrain
             .as_ref()
@@ -751,14 +759,20 @@ impl Simulation {
             previous_cell: None,
         };
         if self.foot_can_enter(id, cell, args, rules, registry)? != 0 {
-            return self.tube_exit_blocked(id, Some(rules), registry, effects);
+            return self.tube_exit_blocked(id, rules, registry, effects);
         }
 
-        let out = self
-            .place_infantry_in_ground_cell(rules, location)
-            .map_or(DriveCoord { x: 0, y: 0, z: 0 }, |spot| {
-                walk_head::selected_head(location, spot, 0, false)
-            });
+        let out = Self::place_infantry_in_ground_cell(
+            &self.interner,
+            &mut self.scenario_rng,
+            &self.substrate,
+            &self.resolved_terrain,
+            rules,
+            location,
+        )
+        .map_or(DriveCoord { x: 0, y: 0, z: 0 }, |spot| {
+            walk_head::selected_head(location, spot, 0, false)
+        });
         let (exit, level) = {
             let cells = NativeCellQuery::canonical(
                 self.resolved_terrain
@@ -778,7 +792,7 @@ impl Simulation {
             &mut self.substrate.entities,
             id,
             exit,
-            Some(rules),
+            rules,
             &self.interner,
         );
         if let Some(actor) = self.substrate.entities.get_mut(id) {
@@ -793,7 +807,7 @@ impl Simulation {
             let on_bridge = actor.on_bridge();
             actor.position.store_cell_level(level, on_bridge);
         }
-        self.foot_force_immediate_destination(id, None, Some(rules), registry, effects)?;
+        self.foot_force_immediate_destination(id, None, rules, registry, effects)?;
         if let Some(locomotor) = self
             .substrate
             .entities
@@ -802,10 +816,18 @@ impl Simulation {
         {
             locomotor.stop_movement_animation();
         }
-        self.foot_mark_put(id, Some(rules), registry, effects);
+        self.foot_mark_put(id, rules, registry, effects);
         if let Some(actor) = self.substrate.entities.get(id) {
             let location = ground_pose::position_world_coord(&actor.position);
-            self.object_raw_receiver_at(id, location, true);
+            Self::object_raw_receiver_at(
+                &mut self.substrate,
+                &self.path_grid,
+                &self.resolved_terrain,
+                id,
+                location,
+                true,
+                rules.ares_form(),
+            );
         }
 
         let navcom_names_cell = self.substrate.entities.get(id).is_some_and(|actor| {
@@ -829,7 +851,7 @@ impl Simulation {
             actor.runtime_bridge_transition.latch();
         }
         bridge_state_changed |= self
-            .per_cell_process(id, PerCellReason::Arrival, Some(rules), registry, effects)
+            .per_cell_process(id, PerCellReason::Arrival, rules, registry, effects)
             .map_err(|error| error.cause)?;
         Ok(bridge_state_changed)
     }
@@ -928,7 +950,7 @@ fn advance_amount(
     DriveCoord { x, y, z }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::*;
     use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid};
@@ -991,7 +1013,7 @@ mod tests {
             true,
         );
         entity.lifecycle.set_in_limbo_for_test(false);
-        entity.lifecycle.set_cell_marked(true);
+        entity.lifecycle.set_cell_marked_for_test(true);
         entity.locomotor = Some(LocomotorState::for_test_kind(
             crate::rules::locomotor_type::LocomotorKind::Drive,
         ));
@@ -1016,7 +1038,8 @@ mod tests {
         .expect("rules");
         let mut terrain = explicit_terrain(vec![2, 2]);
         for x in 0..=3 {
-            terrain.cell_mut(x, 0).unwrap().speed_costs.foot = Some(100);
+            terrain.cell_mut_for_test(x, 0).unwrap().speed_costs.foot =
+                Some(crate::util::native_x87::NativeF32Bits::ONE);
         }
         let mut sim = Simulation::new();
         let owner = sim.interner.intern("Americans");
@@ -1036,7 +1059,7 @@ mod tests {
             true,
         );
         entity.lifecycle.set_in_limbo_for_test(false);
-        entity.lifecycle.set_cell_marked(false);
+        entity.lifecycle.set_cell_marked_for_test(false);
         let spot = DriveCoord {
             x: 2 * 256 + 64,
             y: 192,
@@ -1071,23 +1094,25 @@ mod tests {
     /// (`0x006F511A`).
     /// The floor is native's: `tools/ramp_height_vectors.json`
     /// `ramp_1_sub_64_192` (level 0, ramp 1, sub-cell (64, 192)) is 26.
+    /// The rider is bound past the exit, so that arrival's idle entry
+    /// (`0x0051A88B`) leaves him alone.
     #[test]
     fn infantry_leaves_a_tube_at_the_floor_of_its_spot() {
         let (mut sim, rules) = infantry_at_tube_end();
-        sim.playfield_bounds = Some(crate::sim::arena_fixture::OPEN_PLAYFIELD);
-        sim.substrate
-            .entities
-            .get_mut(1)
-            .unwrap()
-            .set_in_playfield(false);
+        sim.set_playfield_bounds_for_test(Some(crate::sim::arena_fixture::OPEN_PLAYFIELD));
+        let rider = sim.substrate.entities.get_mut(1).unwrap();
+        rider.set_in_playfield(false);
+        rider
+            .navigation
+            .set_nav_com_for_test(Some(crate::sim::components::NavTargetRef::cell(3, 0)));
         sim.resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(2, 0)
+            .cell_mut_for_test(2, 0)
             .unwrap()
             .slope_type = 1;
         let turn = sim
-            .tube_object_turn(1, Some(&rules), None, FrameEffects::default())
+            .tube_object_turn(1, &rules, None, FrameEffects::default())
             .expect("tube turn");
         assert!(turn.per_cell_ran);
         assert_eq!(turn.movement.movers_total, 1);
@@ -1136,8 +1161,9 @@ mod tests {
         infantry.locomotor.as_mut().unwrap().set_step_head(None);
         infantry.position.put_location(spot);
         infantry.set_sub_cell(Some(3));
-        infantry.navigation.path_replay =
-            crate::sim::components::FootPathQueue::for_test(vec![8, 2], 0, Some((0, 0)));
+        infantry.navigation.set_path_replay_for_test(
+            crate::sim::components::FootPathQueue::for_test(vec![8, 2], 0, Some((0, 0))),
+        );
         infantry
             .navigation
             .set_nav_com_for_test(Some(NavTargetRef::Cell { rx: 3, ry: 0 }));
@@ -1147,7 +1173,15 @@ mod tests {
             .unwrap()
             .set_walk_destination(Some(DriveCoord::cell(3, 0, 0)));
         sim.add_entity_occupancy(1);
-        sim.object_raw_receiver_at(1, spot, true);
+        Simulation::object_raw_receiver_at(
+            &mut sim.substrate,
+            &sim.path_grid,
+            &sim.resolved_terrain,
+            1,
+            spot,
+            true,
+            rules.ares_form(),
+        );
         (sim, rules)
     }
 
@@ -1184,7 +1218,15 @@ mod tests {
         ));
         sim.substrate.entities.insert(friend);
         sim.add_entity_occupancy(2);
-        sim.object_raw_receiver_at(2, centre, true);
+        Simulation::object_raw_receiver_at(
+            &mut sim.substrate,
+            &sim.path_grid,
+            &sim.resolved_terrain,
+            2,
+            centre,
+            true,
+            rules.ares_form(),
+        );
         let exit_bits = |sim: &Simulation| {
             sim.substrate.raw_cell_occupation.bits_at(
                 crate::sim::occupancy::RawCellKey::Real(2, 0),
@@ -1204,7 +1246,7 @@ mod tests {
             .low_bridge_tube_state
             .is_some()
         {
-            sim.tube_object_turn(1, Some(&rules), None, FrameEffects::default())
+            sim.tube_object_turn(1, &rules, None, FrameEffects::default())
                 .expect("tube turn");
             turns += 1;
             assert!(turns < 1000, "the tube's two steps end");
@@ -1229,7 +1271,7 @@ mod tests {
         assert!(
             infantry
                 .navigation
-                .path_replay
+                .path_replay()
                 .remaining_directions()
                 .is_empty()
         );
@@ -1282,10 +1324,11 @@ mod tests {
             crate::sim::mission::MissionId::from_known(crate::sim::mission::MissionType::Move),
             0,
         );
-        vehicle.lifecycle.set_cell_marked(false);
+        vehicle.lifecycle.set_cell_marked_for_test(false);
         vehicle.position.put_location(DriveCoord::cell(rx, 0, 0));
-        vehicle.navigation.path_replay =
-            crate::sim::components::FootPathQueue::for_test(vec![8, 2], 0, Some((rx as i16, 0)));
+        vehicle.navigation.set_path_replay_for_test(
+            crate::sim::components::FootPathQueue::for_test(vec![8, 2], 0, Some((rx as i16, 0))),
+        );
         vehicle
             .navigation
             .set_nav_com_for_test(Some(NavTargetRef::Cell { rx: 3, ry: 0 }));
@@ -1331,13 +1374,7 @@ mod tests {
                 z: 0,
             });
         assert_eq!(
-            sim.track_tube_head(
-                1,
-                TrackFamily::Drive,
-                Some(&rules),
-                None,
-                FrameEffects::default()
-            ),
+            sim.track_tube_head(1, TrackFamily::Drive, &rules, None, FrameEffects::default()),
             Ok(true)
         );
         let vehicle = sim.substrate.entities.get(1).unwrap();
@@ -1366,9 +1403,9 @@ mod tests {
         assert!(!sim.substrate.occupancy.contains_entity(0, 0, 1));
         assert_eq!(vehicle_bits(&sim, 0), 0);
         assert!(vehicle.foot_occupation_enabled.get());
-        assert_eq!(vehicle.navigation.path_replay.remaining_directions(), [2]);
+        assert_eq!(vehicle.navigation.path_replay().remaining_directions(), [2]);
         assert_eq!(
-            vehicle.navigation.path_replay.reference_cell(),
+            vehicle.navigation.path_replay().reference_cell(),
             Some((0, 0))
         );
         assert_eq!(
@@ -1384,8 +1421,9 @@ mod tests {
         let (mut sim, rules) = unit_driving_into(2);
         sim.remove_entity_occupancy(1);
         let vehicle = sim.substrate.entities.get_mut(1).unwrap();
-        vehicle.navigation.path_replay =
-            crate::sim::components::FootPathQueue::for_test(vec![8, 2], 1, Some((0, 0)));
+        vehicle.navigation.set_path_replay_for_test(
+            crate::sim::components::FootPathQueue::for_test(vec![8, 2], 1, Some((0, 0))),
+        );
         vehicle.low_bridge_tube_state = Some(LowBridgeTubeMovementState {
             tube_id: TubeId(0),
             cursor: 2,
@@ -1411,7 +1449,7 @@ mod tests {
             .unwrap()
             .set_in_playfield(false);
         let turn = sim
-            .tube_object_turn(1, Some(&rules), None, FrameEffects::default())
+            .tube_object_turn(1, &rules, None, FrameEffects::default())
             .expect("tube turn");
         assert!(turn.per_cell_ran);
         let vehicle = sim.substrate.entities.get(1).unwrap();
@@ -1430,5 +1468,39 @@ mod tests {
             vehicle.navigation.nav_com(),
             Some(NavTargetRef::Cell { rx: 3, ry: 0 })
         );
+    }
+
+    #[test]
+    fn tube_only_turns_promote_campaign_discovery_without_cell_entry() {
+        // Infantry51BACD and Unit7363BB still call Techno70D990 after their
+        // tube leaf, although neither reaches the common Techno AI bracket.
+        for (mut sim, rules) in [infantry_at_tube_end(), unit_at_tube_end()] {
+            sim.session
+                .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Campaign);
+            let player = sim.intern("Russians");
+            sim.session.set_current_house_for_test(Some(player));
+            sim.fog = crate::sim::vision::FogState::new(4, 1);
+            sim.fog.reveal_all_for_owner(player);
+            let rider = sim.substrate.entities.get_mut(1).unwrap();
+            rider.position.put_location(DriveCoord::cell(0, 0, 0));
+            rider.low_bridge_tube_state = Some(LowBridgeTubeMovementState {
+                tube_id: TubeId(0),
+                cursor: 0,
+                target: DriveCoord::cell(2, 0, 0),
+            });
+            assert!(!rider.discovery.discovered_by_current_house());
+            let turn = sim
+                .tube_object_turn(1, &rules, None, FrameEffects::default())
+                .unwrap();
+            assert!(
+                !turn.per_cell_ran,
+                "movement inside the tube has no cell entry"
+            );
+            let rider = sim.substrate.entities.get(1).unwrap();
+            assert!(rider.low_bridge_tube_state.is_some());
+            assert!(!rider.lifecycle.cell_marked());
+            assert!(rider.discovery.discovered_by_current_house());
+            assert!(!rider.discovery.discovered_by_other_house());
+        }
     }
 }

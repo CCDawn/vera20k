@@ -50,29 +50,40 @@ fn map_music_action_follows_native_read_and_queue() {
             .as_bytes(),
         )
         .unwrap();
+        let mut theme = ThemeRuntime::with_entries(catalog_from_ini(&IniFile::from_str(
+            fixture["theme_ini"].as_str().unwrap(),
+        )));
         let mut sim = Simulation::with_seed(31);
-        sim.initialize_trigger_definitions(&map, &TeamAiIniRegistry::default(), None, None);
-        sim.classify_map_triggers(None);
-        sim.set_trigger_variable(false, 9, true);
-        let effects = sim.advance_triggers(None, None, FrameEffects::default());
+        sim.initialize_trigger_definitions(
+            &map,
+            &TeamAiIniRegistry::default(),
+            None,
+            None,
+            theme.catalog(),
+        );
+        sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
+        sim.set_trigger_variable_for_test(false, 9, true);
+        let effects = sim.advance_triggers(
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            None,
+            FrameEffects::default(),
+        );
         assert_eq!(effects.len(), actions.len(), "{case}");
 
         let prior = &fixture["default_prior"];
-        let theme = ThemeRuntime {
-            catalog_loaded: input["scores"].as_bool().unwrap_or(true),
-            entries: catalog_from_ini(&IniFile::from_str(fixture["theme_ini"].as_str().unwrap())),
-            slots: ThemeSlots {
-                retained: input["retained"]
-                    .as_i64()
-                    .unwrap_or(prior["slots"][1].as_i64().unwrap())
-                    as i32,
-                ..slots(&prior["slots"])
-            },
-            score_volume: input["volume"]
+        if !input["scores"].as_bool().unwrap_or(true) {
+            theme.catalog = None;
+            theme.resolved_sides.clear();
+        }
+        theme.slots = ThemeSlots {
+            retained: input["retained"]
                 .as_i64()
-                .unwrap_or(prior["volume"].as_i64().unwrap()) as i32,
-            ..ThemeRuntime::default()
+                .unwrap_or(prior["slots"][1].as_i64().unwrap()) as i32,
+            ..slots(&prior["slots"])
         };
+        theme.score_volume = input["volume"]
+            .as_i64()
+            .unwrap_or(prior["volume"].as_i64().unwrap()) as i32;
         let mut audio = AppAudioRuntime {
             theme,
             service_clock: Default::default(),
@@ -80,7 +91,8 @@ fn map_music_action_follows_native_read_and_queue() {
             sfx_player: None,
             launcher_audio_available: input["device"].as_bool().unwrap_or(true),
             theme_startup_suppressed: input["suppressed"].as_bool().unwrap_or(false),
-            movie_audio: Default::default(),
+            master_groups: Default::default(),
+            restore_muted: false,
         };
         for (index, effect) in effects.iter().enumerate() {
             let TriggerEffect::MusicTheme { request } = effect else {
@@ -103,7 +115,6 @@ fn map_music_action_follows_native_read_and_queue() {
                         startup_suppressed: audio.theme_startup_suppressed,
                     },
                     MusicOutputState::Playing,
-                    wall_ms,
                 );
                 assert!(output.start.is_none(), "Queue never starts a track inline");
             } else {
@@ -113,13 +124,11 @@ fn map_music_action_follows_native_read_and_queue() {
         assert_eq!(audio.theme.slots, slots(&case["slots"]), "{case}");
         assert_eq!(audio.theme.fading, case["fading"], "{case}");
         assert!(case["rng_draws"].as_array().unwrap().is_empty());
-        if let Some(wall_ms) = input["settle_at_ms"].as_u64() {
-            // Original SetTarget/Tick execute in this control. The existing
-            // linear-ramp residual is at most 1 ms here; this observation is
-            // deliberately after both ramps finish, not a gain golden.
-            let (playing, output) = audio
-                .theme
-                .still_playing(MusicOutputState::Playing, wall_ms);
+        if input["settle_at_ms"].as_u64().is_some() {
+            // Original SetTarget/Tick execute in this control. The
+            // observation is deliberately after both ramps finish, so the
+            // stream's own interp is at rest; it is not a gain golden.
+            let (playing, output) = audio.theme.still_playing(MusicOutputState::Playing);
             assert_eq!(playing, case["settled"]["playing"], "{case}");
             assert_eq!(output.stop_output, case["settled"]["stopped"], "{case}");
         }
@@ -207,23 +216,20 @@ fn saved_theme_load_and_volume_ai_follow_native_transitions() {
         }
         let input = &case["input"];
         let name = input["name"].as_str().unwrap();
-        let mut theme = ThemeRuntime::with_entries(entries.clone());
-        theme.catalog_loaded = input["scores_present"].as_i64().unwrap() != 0;
+        let mut case_entries = entries.clone();
+        for index in input["repeat_entries"].as_array().unwrap() {
+            case_entries[index.as_u64().unwrap() as usize].repeat = true;
+        }
+        let mut theme = ThemeRuntime::with_entries(case_entries);
+        if input["scores_present"].as_i64().unwrap() == 0 {
+            theme.catalog = None;
+            theme.resolved_sides.clear();
+        }
         theme.slots = slots(&input["outgoing_slots"]);
         theme.set_volume(input["volume"].as_i64().unwrap() as i32);
         theme.global_repeat = input["global_repeat"].as_i64().unwrap() != 0;
-        for index in input["repeat_entries"].as_array().unwrap() {
-            theme.entries[index.as_u64().unwrap() as usize].repeat = true;
-        }
         theme.fading = input["fading"].as_i64().unwrap() != 0;
-        theme.fade_started_at_ms =
-            theme
-                .fading
-                .then_some(if input["interpolating"].as_bool().unwrap() {
-                    1_500
-                } else {
-                    0
-                });
+        let interpolating = input["interpolating"].as_bool().unwrap_or(false);
         let gates = ThemeGates {
             launcher_audio_available: input["device"].as_i64().unwrap() != 0,
             startup_suppressed: input["startup_suppressed"].as_i64().unwrap() != 0,
@@ -231,7 +237,11 @@ fn saved_theme_load_and_volume_ai_follow_native_transitions() {
         let mut physical = if !input["stream_exists"].as_bool().unwrap() {
             MusicOutputState::Unavailable
         } else if input["stream_playing"].as_bool().unwrap() {
-            MusicOutputState::Playing
+            if interpolating {
+                MusicOutputState::Ramping
+            } else {
+                MusicOutputState::Playing
+            }
         } else {
             MusicOutputState::Idle
         };
@@ -244,7 +254,6 @@ fn saved_theme_load_and_volume_ai_follow_native_transitions() {
             &assets,
             gates,
             physical,
-            2_000,
             |action| {
                 if physical.stream_exists() {
                     if action.stop_output {
@@ -255,17 +264,16 @@ fn saved_theme_load_and_volume_ai_follow_native_transitions() {
                         starts.push(format!("{}.WAV", track.stem));
                         physical = MusicOutputState::Playing;
                     }
+                    if action.fade_out && physical.playing() {
+                        physical = MusicOutputState::Ramping;
+                    }
                 }
                 physical
             },
         );
         assert_eq!(theme.slots, slots(&case["loaded_slots"]), "{name}");
         assert_eq!(theme.fading, case["fading"], "{name}");
-        assert_eq!(
-            physical == MusicOutputState::Playing,
-            case["stream_playing"],
-            "{name}"
-        );
+        assert_eq!(physical.playing(), case["stream_playing"], "{name}");
         let events = case["events"].as_array().unwrap();
         let native_starts: Vec<_> = events
             .iter()
@@ -282,7 +290,6 @@ fn saved_theme_load_and_volume_ai_follow_native_transitions() {
             let action = theme.ai(
                 gates,
                 physical,
-                2_001,
                 &mut |_| panic!("{name}: absent stream must not decode"),
                 &mut |_, _| panic!("{name}: native consumed no Main draws"),
             );
@@ -293,7 +300,7 @@ fn saved_theme_load_and_volume_ai_follow_native_transitions() {
         if let Some(after) = case.get("after_settle_consumer") {
             let action = match after["consumer"].as_str().unwrap() {
                 "query" => {
-                    let (playing, action) = theme.still_playing(physical, 2_000);
+                    let (playing, action) = theme.still_playing(physical);
                     assert_eq!(playing, after["query_playing"], "{name}");
                     action
                 }
@@ -301,18 +308,15 @@ fn saved_theme_load_and_volume_ai_follow_native_transitions() {
                     after["arguments"][0].as_i64().unwrap() as i32,
                     gates,
                     physical,
-                    2_000,
                 ),
                 "stop" => theme.stop(
                     gates,
                     after["arguments"][0].as_i64().unwrap() != 0,
                     physical,
-                    2_000,
                 ),
                 "ai_hold" => theme.ai(
                     gates,
                     physical,
-                    2_000,
                     &mut |_| panic!("{name}: held pending must not decode"),
                     &mut |_, _| panic!("{name}: native consumed no Main draws"),
                 ),
@@ -333,11 +337,7 @@ fn saved_theme_load_and_volume_ai_follow_native_transitions() {
             }
             assert_eq!(theme.slots, slots(&after["slots"]), "{name}");
             assert_eq!(theme.fading, after["fading"], "{name}");
-            assert_eq!(
-                physical == MusicOutputState::Playing,
-                after["stream_playing"],
-                "{name}"
-            );
+            assert_eq!(physical.playing(), after["stream_playing"], "{name}");
         }
         covered += 1;
     }

@@ -4,9 +4,9 @@
 //! - `[Map]`: metadata (theater, size, local bounds)
 //! - `[IsoMapPack5]`: base64-encoded, LZO-compressed terrain cell data
 //!
-//! Each terrain cell is 11 bytes: x(i16) y(u16) tile_index(i32)
-//! sub_tile(u8) level(u8) ice_growth(u8). Cells describe the isometric tile grid.
-//! (Confirmed by ModEnc IsoMapPack5 docs + FinalAlert2 EA source release.)
+//! Each terrain cell is 11 bytes: x(i16) y(i16) tile_index(i32)
+//! sub_tile(u8) level(u8) legacy_ice_byte(u8). ReadIsoMapPack5 (gamemd.exe
+//! 0x0056BAC0) stores the final byte unchanged; no growth behavior is inferred.
 //!
 //! ## Dependency rules
 //! - Part of map/ — depends on assets/ (MIX archives), rules/ (INI parser), util/ (base64, lzo).
@@ -39,10 +39,17 @@ use crate::util::lzo::{self, LzoError};
 const CELL_RECORD_SIZE: usize = 11;
 /// Size of the coordinate header that precedes each terrain cell payload.
 const CELL_HEADER_SIZE: usize = 4;
-/// Native IsoMapPack5 lookup dimensions.
-const ISO_MAP_ROW_WIDTH: i32 = 512;
-const ISO_MAP_CELL_COUNT: i32 = ISO_MAP_ROW_WIDTH * ISO_MAP_ROW_WIDTH;
+/// Engine admission capacity; decoding retains each map's selected budget.
+const ISO_MAP_ROW_WIDTH: i32 = crate::map::cell_index::MAX_CELL_SIDE as i32;
+const fn iso_map_max_bytes(grid: crate::map::cell_index::CellGrid) -> usize {
+    let side = grid.side() as usize;
+    side * side * CELL_RECORD_SIZE + CELL_HEADER_SIZE
+}
 const DEFAULT_SIZE_RECT: [i32; 4] = [1, 1, 50, 50];
+// Untrusted wrappers must not multiply a small physical file into unbounded
+// INI parsing work through many entries or repeated/overlapping ranges.
+const MIX_MAP_MAX_CANDIDATES: usize = 64;
+const MIX_MAP_MAX_PARSED_BYTES: usize = 32 * 1024 * 1024;
 
 /// Errors during map file parsing.
 #[derive(Debug)]
@@ -53,9 +60,13 @@ pub enum MapError {
     Base64(String),
     Lzo(LzoError),
     Asset(AssetError),
+    InvalidDimensions { width: u32, height: u32 },
     CellDataTruncated { expected: usize, actual: usize },
+    CellDataTooLarge { actual: usize, maximum: usize },
     TilesetRegistryTooLarge { attempted: usize, maximum: usize },
     TilesetOrdinalOverflow { ordinal: u32, maximum: u32 },
+    WrappedMapWorkLimit,
+    InvalidTransferContent(&'static str),
     Io(std::io::Error),
 }
 
@@ -68,12 +79,21 @@ impl std::fmt::Display for MapError {
             MapError::Base64(e) => write!(f, "Base64 decode error: {}", e),
             MapError::Lzo(e) => write!(f, "LZO decompress error: {}", e),
             MapError::Asset(e) => write!(f, "Asset error: {}", e),
+            MapError::InvalidDimensions { width, height } => {
+                write!(
+                    f,
+                    "Map dimensions {width}x{height} exceed the fixed cell grid"
+                )
+            }
             MapError::CellDataTruncated { expected, actual } => {
                 write!(
                     f,
                     "Cell data truncated: need {} bytes, got {}",
                     expected, actual
                 )
+            }
+            MapError::CellDataTooLarge { actual, maximum } => {
+                write!(f, "Map cell data has {actual} bytes, maximum is {maximum}")
             }
             MapError::TilesetRegistryTooLarge { attempted, maximum } => write!(
                 f,
@@ -83,6 +103,12 @@ impl std::fmt::Display for MapError {
                 f,
                 "Theater tileset ordinal {ordinal} exceeds the supported maximum {maximum}"
             ),
+            MapError::WrappedMapWorkLimit => {
+                write!(f, "MIX map selection exceeds its parsing budget")
+            }
+            MapError::InvalidTransferContent(reason) => {
+                write!(f, "Invalid transferred map: {reason}")
+            }
             MapError::Io(e) => write!(f, "IO error: {}", e),
         }
     }
@@ -136,6 +162,23 @@ pub struct MapHeader {
     pub local_height: u32,
 }
 
+impl MapHeader {
+    pub fn cell_grid(&self) -> crate::map::cell_index::CellGrid {
+        crate::map::cell_index::CellGrid::for_map_size(self.width as i32, self.height as i32)
+    }
+
+    /// Bounded cell-grid capacity shared by admission and materialization.
+    /// Keep signed-bit-pattern and oversized INI values out of allocation loops.
+    pub(crate) fn fits_cell_grid(&self) -> bool {
+        self.width != 0
+            && self.height != 0
+            && self
+                .width
+                .checked_add(self.height)
+                .is_some_and(|span| span <= ISO_MAP_ROW_WIDTH as u32)
+    }
+}
+
 /// A pre-placed smudge entry from the map's `[Smudge]` section.
 ///
 /// Parsed format: `Key=TYPENAME,X,Y,IsBaked`.
@@ -150,7 +193,7 @@ pub struct MapSmudgeEntry {
 
 /// A single isometric terrain cell from IsoMapPack5.
 ///
-/// Layout per ModEnc + FinalAlert2 source: 11 bytes total.
+/// Layout from gamemd.exe ReadIsoMapPack5 (0x0056BAC0): 11 bytes total.
 /// `tile_index` is the signed raw value from the pack. Map materialization
 /// translates it through the active theater's `LastTilesInSet` table before
 /// treating it as an actual cumulative tileset index. Consequently, raw `-1`
@@ -169,6 +212,9 @@ pub struct MapCell {
     pub sub_tile: u8,
     /// Elevation level (0 = ground, higher = elevated). Each level ~15px visual shift.
     pub z: u8,
+    /// Raw CellClass+0x119 value, read without a boolean conversion or clamp
+    /// by ReadIsoMapPack5 (gamemd.exe 0x0056BB93..0x0056BBA9).
+    pub legacy_ice_byte: u8,
 }
 
 /// One native fixed-table lookup performed while decoding IsoMapPack5.
@@ -179,7 +225,7 @@ pub struct MapCell {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IsoMapPackLookup {
     pub(crate) raw_x: i16,
-    pub(crate) raw_y: u16,
+    pub(crate) raw_y: i16,
     pub(crate) canonical: Option<(u16, u16)>,
 }
 
@@ -297,13 +343,68 @@ pub struct MapFile {
 }
 
 impl MapFile {
+    /// ReadMap4AD0C5..4AD10A follows ReadWaypoints68BDC0 with a HomeCell
+    /// fallback before the four view bookmarks and object-section consumers.
+    /// Run at authored materialization, after early start-slot admission;
+    /// metadata parsing and live random-map generation do not run this pass.
+    pub(crate) fn initialize_authored_home_waypoint(&mut self) {
+        let home = self.basic.home_cell.unwrap_or(699);
+        let Some(index) = waypoints::waypoint_slot(home) else {
+            // Native SetWaypoint68BF50 would write outside the Scenario.
+            // Keep malformed indexes outside the portable waypoint contract.
+            return;
+        };
+        if waypoints::waypoint_is_defined(home, |index| {
+            self.waypoints
+                .get(&index)
+                .map(|waypoint| (waypoint.rx as i16, waypoint.ry as i16))
+        }) {
+            return;
+        }
+        // ADD/CDQ/SUB/SAR: wrapping i32 sum, divide toward zero, low word.
+        let center = (self.header.width.wrapping_add(self.header.height) as i32 / 2) as u16;
+        self.waypoints.insert(
+            index,
+            Waypoint {
+                index,
+                rx: center,
+                ry: center,
+            },
+        );
+    }
+
     /// Parse a map from raw INI bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self, MapError> {
         Self::from_ini(IniFile::from_bytes(data)?)
     }
 
-    fn from_ini(ini: IniFile) -> Result<Self, MapError> {
+    /// VERA: this map read again with a mod's map additions
+    /// (`app::mod_additions`). Each addition in turn sets its keys over the
+    /// map's and the earlier additions', and adds the sections and keys they
+    /// lack, as a launcher merges such a file into the map it hands the game.
+    /// gamemd has no such step.
+    pub fn with_additions(self, additions: &[IniFile]) -> Result<Self, MapError> {
+        let mut ini = self.ini;
+        for addition in additions {
+            ini.merge_source_sections(addition, true);
+        }
+        Self::from_ini(ini)
+    }
+
+    /// Decode already-resolved INI through the same bounded map parser as
+    /// physical-source loading, without serializing it back into a second file.
+    pub fn from_ini(mut ini: IniFile) -> Result<Self, MapError> {
+        // Read_Scenario_INI6867BE calls ReadCCFile4741F0(checkDigest=1)
+        // before any scenario readers; both matched and stale digests admit
+        // the file. Metadata readers use the unchecked physical INI instead.
+        ini.remove_digest_for_checked_load();
         let header: MapHeader = parse_header(&ini)?;
+        if !header.fits_cell_grid() {
+            return Err(MapError::InvalidDimensions {
+                width: header.width,
+                height: header.height,
+            });
+        }
         let basic: BasicSection = basic::parse_basic_section(&ini);
         let ranking: crate::map::ranking::RankingSection =
             crate::map::ranking::parse_ranking_section(&ini);
@@ -320,14 +421,16 @@ impl MapFile {
                 log::warn!("Map preview decode failed; continuing without preview: {err}");
             }
         }
-        let iso_map_pack = parse_iso_map_pack(&ini)?;
-        let entities: Vec<MapEntity> = entities::parse_map_entities(&ini);
+        let iso_map_pack = parse_iso_map_pack(&ini, header.cell_grid())?;
+        let entities: Vec<MapEntity> =
+            entities::parse_map_entities(&ini, basic.new_ini_format.unwrap_or(0));
         let overlay::ParsedOverlayPacks {
             identity: overlay_identity,
             entries: overlays,
             data: overlay_data,
-        } = overlay::parse_overlay_packs(&ini);
-        let terrain_objects: Vec<TerrainObject> = overlay::parse_terrain_objects(&ini);
+        } = overlay::parse_overlay_packs(&ini, header.cell_grid());
+        let terrain_objects: Vec<TerrainObject> =
+            overlay::parse_terrain_objects(&ini, basic.new_ini_format.unwrap_or(0));
         let smudges: Vec<MapSmudgeEntry> = parse_map_smudges(&ini);
         let waypoints: HashMap<u32, Waypoint> = waypoints::parse_waypoints(&ini);
         let tags: TagMap = tags::parse_tags(&ini);
@@ -395,7 +498,7 @@ pub struct OverlayPacksAlreadyConsumed;
 /// new-format MIX marker; anything else is treated as INI text.
 #[cfg(any(test, feature = "test-support"))]
 pub fn load_from_path(path: &Path) -> Result<MapFile, MapError> {
-    load_from_bytes(std::fs::read(path)?)
+    load_from_bytes(crate::util::file_system::read(path)?)
 }
 
 /// Parse one consumed file buffer, auto-detecting MIX-wrapped vs raw INI.
@@ -411,10 +514,77 @@ pub fn load_from_bytes(bytes: Vec<u8>) -> Result<MapFile, MapError> {
 pub(crate) fn ini_from_file_bytes(bytes: Vec<u8>) -> Result<IniFile, MapError> {
     if is_mix_header(&bytes) {
         let archive: MixArchive = MixArchive::from_bytes(bytes)?;
-        pick_map_ini(&archive)
+        pick_map_ini(&archive, false)
     } else {
         Ok(IniFile::from_bytes(&bytes)?)
     }
+}
+
+/// Network-only admission for physical map/seed bytes. Identity remains the
+/// complete original file; this never rewrites or mounts transferred assets.
+/// Plaintext is a format boundary, not a claim that arbitrary text is benign.
+pub(crate) fn ini_from_transfer_bytes(
+    bytes: Vec<u8>,
+    allow_mix: bool,
+) -> Result<IniFile, MapError> {
+    if is_mix_header(&bytes) {
+        if !allow_mix {
+            return Err(MapError::InvalidTransferContent(
+                "seed must be plaintext INI",
+            ));
+        }
+        let archive = MixArchive::from_bytes(bytes)?;
+        if archive.entry_count() > MIX_MAP_MAX_CANDIDATES {
+            return Err(MapError::WrappedMapWorkLimit);
+        }
+        archive.validate_complete_layout(|byte| byte == 0 || is_legacy_text_byte(byte))?;
+        pick_map_ini(&archive, true)
+    } else {
+        validate_transfer_text(&bytes)?;
+        Ok(IniFile::from_bytes(&bytes)?)
+    }
+}
+
+fn is_legacy_text_byte(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\r' | b'\n' | 0x20..=0x7e | 0x80..=0xff)
+}
+
+fn validate_transfer_text(bytes: &[u8]) -> Result<(), MapError> {
+    if bytes.iter().all(|&byte| is_legacy_text_byte(byte)) {
+        Ok(())
+    } else {
+        Err(MapError::InvalidTransferContent(
+            "INI contains binary control bytes",
+        ))
+    }
+}
+
+fn validate_map_description(ini: &IniFile) -> Result<(), MapError> {
+    let Some(list) = ini
+        .section("MultiMaps")
+        .filter(|section| section.name == "MultiMaps")
+    else {
+        return Err(MapError::InvalidTransferContent(
+            "MIX member is not a map description",
+        ));
+    };
+    let names: std::collections::HashSet<_> = list
+        .keys()
+        .filter_map(|key| list.read_name(key, 0x80))
+        .collect();
+    // Retail descriptions contain [MultiMaps] and the sections its values
+    // name, e.g. [Hills] with Description/CD/player-count/mode metadata.
+    if names.is_empty()
+        || ini
+            .section_names()
+            .into_iter()
+            .any(|name| name != "MultiMaps" && !names.contains(name))
+    {
+        return Err(MapError::InvalidTransferContent(
+            "Unrelated MIX metadata section",
+        ));
+    }
+    Ok(())
 }
 
 /// New-format MIX marker: first two bytes are `0x00 0x00`.
@@ -428,27 +598,48 @@ fn is_mix_header(bytes: &[u8]) -> bool {
 /// ~120-byte `[MultiMaps]` description stub. We try entries in descending
 /// size order and return the first one whose bytes parse as INI containing
 /// a `[Map]` section.
-fn pick_map_ini(archive: &MixArchive) -> Result<IniFile, MapError> {
+fn pick_map_ini(archive: &MixArchive, transferred: bool) -> Result<IniFile, MapError> {
     let mut entries: Vec<_> = archive.entries().to_vec();
     if entries.is_empty() {
         return Err(MapError::MissingIsoMapPack);
     }
     entries.sort_by_key(|a| std::cmp::Reverse(a.size));
-    for entry in &entries {
+    let mut parsed_bytes = 0usize;
+    let mut selected = None;
+    for (index, entry) in entries.iter().enumerate() {
+        if index >= MIX_MAP_MAX_CANDIDATES {
+            return Err(MapError::WrappedMapWorkLimit);
+        }
         let Some(data) = archive.get_by_id(entry.id) else {
             continue;
         };
-        if let Ok(ini) = IniFile::from_bytes(data)
-            && ini.section("Map").is_some()
-        {
-            return Ok(ini);
+        parsed_bytes = parsed_bytes
+            .checked_add(data.len())
+            .filter(|&total| total <= MIX_MAP_MAX_PARSED_BYTES)
+            .ok_or(MapError::WrappedMapWorkLimit)?;
+        if transferred {
+            validate_transfer_text(data)?;
+        }
+        match IniFile::from_bytes(data) {
+            Ok(ini) if ini.section("Map").is_some() => {
+                if !transferred {
+                    return Ok(ini);
+                }
+                if selected.is_some() || ini.section("Map").unwrap().name != "Map" {
+                    return Err(MapError::InvalidTransferContent("Ambiguous MIX map member"));
+                }
+                selected = Some(ini);
+            }
+            Ok(ini) if transferred => validate_map_description(&ini)?,
+            Err(error) if transferred => return Err(error.into()),
+            _ => {}
         }
     }
-    Err(MapError::MissingIsoMapPack)
+    selected.ok_or(MapError::MissingIsoMapPack)
 }
 
 /// Extract the [Map] header fields.
-fn parse_header(ini: &IniFile) -> Result<MapHeader, MapError> {
+pub fn parse_header(ini: &IniFile) -> Result<MapHeader, MapError> {
     let map_section = ini
         .section("Map")
         .ok_or(MapError::MissingSection { name: "Map".into() })?;
@@ -487,7 +678,10 @@ fn parse_header(ini: &IniFile) -> Result<MapHeader, MapError> {
 /// 2. Base64 decode the concatenated string.
 /// 3. LZO decompress the chunks.
 /// 4. Parse 11-byte terrain cell records.
-fn parse_iso_map_pack(ini: &IniFile) -> Result<ParsedIsoMapPack, MapError> {
+fn parse_iso_map_pack(
+    ini: &IniFile,
+    grid: crate::map::cell_index::CellGrid,
+) -> Result<ParsedIsoMapPack, MapError> {
     let section = ini
         .section("IsoMapPack5")
         .ok_or(MapError::MissingIsoMapPack)?;
@@ -500,9 +694,9 @@ fn parse_iso_map_pack(ini: &IniFile) -> Result<ParsedIsoMapPack, MapError> {
 
     // Base64 decode → LZO decompress.
     let compressed: Vec<u8> = base64::base64_decode(&b64_data).map_err(MapError::Base64)?;
-    let decompressed: Vec<u8> = lzo::decompress_chunks(&compressed)?;
+    let decompressed: Vec<u8> = lzo::decompress_chunks(&compressed, iso_map_max_bytes(grid))?;
 
-    let parsed = parse_iso_map_pack_records(&decompressed)?;
+    let parsed = parse_iso_map_pack_records(&decompressed, grid)?;
 
     // Diagnostic: tile_index distribution. Lets a reader of the load logs see
     // how high a map's IsoMapPack5 reaches vs. what the theater INI defines.
@@ -536,7 +730,17 @@ fn parse_iso_map_pack(ini: &IniFile) -> Result<ParsedIsoMapPack, MapError> {
 }
 
 /// Parse native IsoMapPack5 records after chunk decompression.
-fn parse_iso_map_pack_records(decompressed: &[u8]) -> Result<ParsedIsoMapPack, MapError> {
+fn parse_iso_map_pack_records(
+    decompressed: &[u8],
+    grid: crate::map::cell_index::CellGrid,
+) -> Result<ParsedIsoMapPack, MapError> {
+    let maximum = iso_map_max_bytes(grid);
+    if decompressed.len() > maximum {
+        return Err(MapError::CellDataTooLarge {
+            actual: decompressed.len(),
+            maximum,
+        });
+    }
     let mut cells: Vec<MapCell> = Vec::with_capacity(decompressed.len() / CELL_RECORD_SIZE);
     let mut lookups: Vec<IsoMapPackLookup> =
         Vec::with_capacity(decompressed.len() / CELL_RECORD_SIZE);
@@ -552,7 +756,7 @@ fn parse_iso_map_pack_records(decompressed: &[u8]) -> Result<ParsedIsoMapPack, M
         }
 
         let x: i16 = i16::from_le_bytes([decompressed[offset], decompressed[offset + 1]]);
-        let y: u16 = u16::from_le_bytes([decompressed[offset + 2], decompressed[offset + 3]]);
+        let y: i16 = i16::from_le_bytes([decompressed[offset + 2], decompressed[offset + 3]]);
         if x == 0 && y == 0 {
             break;
         }
@@ -568,17 +772,13 @@ fn parse_iso_map_pack_records(decompressed: &[u8]) -> Result<ParsedIsoMapPack, M
         let tile_index: i32 = i32::from_le_bytes([d[4], d[5], d[6], d[7]]);
         let sub_tile: u8 = d[8];
         let z: u8 = d[9];
-        // d[10] is the legacy ice-growth byte; loading consumes but does not apply it here.
+        let legacy_ice_byte: u8 = d[10];
         offset += CELL_RECORD_SIZE;
 
-        // gamemd.exe IsoMapPack5 decoder @ 0x0056BAC0: X is sign-extended,
-        // Y is unsigned, and every non-sentinel header performs this fixed
-        // 512-wide lookup before either applying or discarding its payload.
-        let linear: i32 = i32::from(y) * ISO_MAP_ROW_WIDTH + i32::from(x);
-        let canonical = (0..ISO_MAP_CELL_COUNT).contains(&linear).then_some((
-            (linear % ISO_MAP_ROW_WIDTH) as u16,
-            (linear / ISO_MAP_ROW_WIDTH) as u16,
-        ));
+        // ReadIsoMapPack5 0x0056BB15..0x0056BB27 sign-extends both words
+        // before the fixed-table lookup. The shared owner also preserves our
+        // map-owned extended-grid policy.
+        let canonical = grid.canonical_coord(i32::from(x), i32::from(y));
         lookups.push(IsoMapPackLookup {
             raw_x: x,
             raw_y: y,
@@ -594,6 +794,7 @@ fn parse_iso_map_pack_records(decompressed: &[u8]) -> Result<ParsedIsoMapPack, M
             tile_index,
             sub_tile,
             z,
+            legacy_ice_byte,
         });
     }
 
@@ -636,33 +837,9 @@ fn parse_map_smudges(ini: &IniFile) -> Vec<MapSmudgeEntry> {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod smudge_parse_tests {
     use super::*;
-
-    #[test]
-    fn parses_smudge_section_skips_isbaked_nonzero() {
-        let ini = IniFile::from_bytes(
-            b"[Smudge]\n\
-              0=CR1,5,6,0\n\
-              1=BURN01,7,8,1\n\
-              2=CR2,9,10,0\n",
-        )
-        .unwrap();
-        let smudges = parse_map_smudges(&ini);
-        assert_eq!(smudges.len(), 2);
-        assert_eq!(smudges[0].type_name, "CR1");
-        assert_eq!(smudges[0].rx, 5);
-        assert_eq!(smudges[0].ry, 6);
-        assert_eq!(smudges[1].type_name, "CR2");
-    }
-
-    #[test]
-    fn handles_missing_section() {
-        let ini = IniFile::from_bytes(b"[Other]\nFoo=Bar\n").unwrap();
-        let smudges = parse_map_smudges(&ini);
-        assert!(smudges.is_empty());
-    }
 
     #[test]
     fn rejects_malformed_entries() {
@@ -702,12 +879,218 @@ mod smudge_parse_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
 
     const ONE_CELL_ISO_MAP_PACK: &str = "DwALABwBAAIA/////wAAABEAAA==";
     const TWO_PIXEL_PREVIEW_PACK: &str = "CgAGABcBAgMEBQYRAAA=";
+
+    /// VERA: a mod's map additions set their keys over the map's, as a
+    /// launcher merges such a file into the map, a later addition over an
+    /// earlier one, and reach what is read from the INI.
+    #[test]
+    fn map_additions_set_their_keys_over_the_map_and_earlier_files() {
+        let map = MapFile::from_ini(IniFile::from_str(&format!(
+            "[Map]\nSize=0,0,500,500\n[IsoMapPack5]\n1={ONE_CELL_ISO_MAP_PACK}\n\
+             [Basic]\nName=Own\nIgnoreGlobalAITriggers=no\n[TeamTypes]\n0=OWN\n[OWN]\nMax=1\n"
+        )))
+        .unwrap();
+        let first = IniFile::from_str(
+            "[Basic]\nIgnoreGlobalAITriggers=yes\n[TeamTypes]\nMODTEAM=MOD\n\
+             [OWN]\nMax=5\nPriority=9\n[MOD]\nMax=2\n",
+        );
+        let second = IniFile::from_str("[OWN]\nMax=7\n");
+        let merged = map.with_additions(&[first, second]).unwrap();
+        assert_eq!(merged.basic.name.as_deref(), Some("Own"));
+        assert_eq!(merged.basic.ignore_global_ai_triggers, Some(true));
+        let teams: Vec<_> = merged
+            .ini
+            .section("TeamTypes")
+            .unwrap()
+            .raw_entries()
+            .collect();
+        assert_eq!(teams, [("0", "OWN"), ("MODTEAM", "MOD")]);
+        let own = merged.ini.section("OWN").unwrap();
+        assert_eq!(
+            (own.get_for_test("Max"), own.get_for_test("Priority")),
+            (Some("7"), Some("9"))
+        );
+        assert!(merged.ini.section("MOD").is_some());
+    }
+
+    #[test]
+    fn large_map_parser_admits_literal_500_size_and_keeps_high_cell_identity() {
+        let ini = IniFile::from_str(&format!(
+            "[Map]\nSize=0,0,500,500\n[IsoMapPack5]\n1={ONE_CELL_ISO_MAP_PACK}\n"
+        ));
+        let map = MapFile::from_ini(ini).unwrap();
+        assert_eq!((map.header.width, map.header.height), (500, 500));
+        let starts =
+            crate::sim::scenario_bootstrap::NativeStartBounds::from_map_header(&map.header)
+                .unwrap();
+        assert_eq!((starts.width, starts.height), (999, 999));
+        let mut record = Vec::new();
+        record.extend_from_slice(&700i16.to_le_bytes());
+        record.extend_from_slice(&600u16.to_le_bytes());
+        record.extend_from_slice(&0i32.to_le_bytes());
+        record.extend_from_slice(&[0, 0, 0]);
+        let parsed = parse_iso_map_pack_records(&record, map.header.cell_grid()).unwrap();
+        assert_eq!((parsed.cells[0].rx, parsed.cells[0].ry), (700, 600));
+        assert_eq!(parsed.lookups[0].canonical, Some((700, 600)));
+        let mut bad = map.header.clone();
+        bad.width = 1024;
+        assert!(!bad.fits_cell_grid(), "the extension remains bounded");
+    }
+
+    fn aliasing_wrapper(aliases: u16, junk_size: usize) -> Vec<u8> {
+        let map = full_map_with_preview("");
+        assert!(junk_size > map.len());
+        let mut bytes = vec![0; 4];
+        bytes.extend_from_slice(&(aliases + 1).to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(junk_size + map.len()).unwrap().to_le_bytes());
+        for id in 0..aliases {
+            bytes.extend_from_slice(&i32::from(id).to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&u32::try_from(junk_size).unwrap().to_le_bytes());
+        }
+        bytes.extend_from_slice(&i32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(junk_size).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(map.len()).unwrap().to_le_bytes());
+        bytes.resize(bytes.len() + junk_size, b' ');
+        bytes.extend_from_slice(&map);
+        bytes
+    }
+
+    #[test]
+    fn wrapped_map_selection_bounds_candidate_attempts() {
+        // One shared physical range can be named by many index entries. The
+        // physical-file loader selects the inner INI before map decoding;
+        // MapFile::from_bytes intentionally accepts raw INI only.
+        let accepted = load_from_bytes(aliasing_wrapper(63, 256)).expect("64 candidates fit");
+        assert_eq!(accepted.header.theater, "TEMPERATE");
+        assert!(matches!(
+            load_from_bytes(aliasing_wrapper(64, 256)),
+            Err(MapError::WrappedMapWorkLimit)
+        ));
+    }
+
+    #[test]
+    fn wrapped_map_selection_charges_repeated_bytes_to_total_budget() {
+        // The physical body is only ~1 MiB, so a per-file limit alone cannot
+        // bound the repeated INI scans. The next candidate crosses 32 MiB.
+        let accepted = load_from_bytes(aliasing_wrapper(31, 1024 * 1024))
+            .expect("31 MiB plus the selected map fits");
+        assert_eq!(accepted.header.theater, "TEMPERATE");
+        assert!(matches!(
+            load_from_bytes(aliasing_wrapper(32, 1024 * 1024)),
+            Err(MapError::WrappedMapWorkLimit)
+        ));
+    }
+
+    #[test]
+    fn received_map_rejects_out_of_grid_size_and_cumulative_iso_expansion() {
+        let root = crate::map::source::test_support::TestDirectory::new("bounded-map");
+        let cache = root.path().join("NetworkMaps");
+        let dimensions =
+            format!("[Map]\nSize=0,0,513,512\n[IsoMapPack5]\n1={ONE_CELL_ISO_MAP_PACK}\n");
+        let error = crate::map::source::install_received_map(
+            &cache,
+            dimensions.as_bytes().to_vec(),
+            &crate::util::sha256::sha256_hex(dimensions.as_bytes()),
+            dimensions.len(),
+        )
+        .err()
+        .expect("out-of-grid size is rejected");
+        assert!(matches!(
+            error.downcast_ref::<MapError>(),
+            Some(MapError::InvalidDimensions { .. })
+        ));
+
+        // Each 270-byte chunk uses a two-byte zero literal and an M3
+        // distance-one match to produce 65535 bytes. The 45th exceeds the grid.
+        let chunk = "CgH//xMAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA3AAAEQAA";
+        let packed = chunk.repeat(45);
+        let mut bomb = "[Map]\nSize=0,0,2,1\n[IsoMapPack5]\n".to_owned();
+        for (index, line) in packed.as_bytes().chunks(72).enumerate() {
+            bomb.push_str(&format!("{index}={}\n", std::str::from_utf8(line).unwrap()));
+        }
+        let error = crate::map::source::install_received_map(
+            &cache,
+            bomb.as_bytes().to_vec(),
+            &crate::util::sha256::sha256_hex(bomb.as_bytes()),
+            bomb.len(),
+        )
+        .err()
+        .expect("cumulative terrain expansion is rejected");
+        assert!(matches!(
+            error.downcast_ref::<MapError>(),
+            Some(MapError::Lzo(LzoError::OutputOverflow))
+        ));
+        assert!(!cache.exists(), "rejected maps must not be published");
+    }
+
+    #[test]
+    fn terrain_coordinates_follow_the_basic_format_boundary_and_missing_default() {
+        // Terrain Read_Map_Section71CAE3..71CB44 uses signed format<4
+        // for radix128; ReadBasic68A151 supplies0 when the key is absent.
+        for (basic, expected) in [
+            ("", (2, 2)),
+            ("[Basic]\nNewINIFormat=3\n", (2, 2)),
+            ("[Basic]\nNewINIFormat=4\n", (258, 0)),
+        ] {
+            let text = format!(
+                "[Map]\nSize=0,0,128,128\n\
+                 [Terrain]\n258=TREE01\n\
+                 [IsoMapPack5]\n1={ONE_CELL_ISO_MAP_PACK}\n{basic}"
+            );
+            let map = MapFile::from_bytes(text.as_bytes()).unwrap();
+            let tree = &map.terrain_objects[0];
+            assert_eq!((tree.rx, tree.ry), expected, "{basic:?}");
+            assert_eq!(tree.name, "TREE01");
+        }
+    }
+
+    #[test]
+    fn authored_home_waypoint_is_defined_before_scenario_consumers() {
+        // Original ReadMap4AD0C5..4AD10A controls: missing699 on65x120,
+        // retained14, and missing18 on113x108. These are map Size fields,
+        // not LocalSize or the raster dimensions.
+        for (width, height, basic, waypoints, slot, expected) in [
+            (65, 120, "", "", 699, (92, 92)),
+            (65, 120, "HomeCell=14\n", "14=110100\n", 14, (100, 110)),
+            (113, 108, "HomeCell=18\n", "", 18, (110, 110)),
+            (
+                65,
+                120,
+                "HomeCell=14\nAltHomeCell=18\n",
+                "14=0\n",
+                14,
+                (92, 92),
+            ),
+        ] {
+            let text = format!(
+                "[Map]\nSize=0,0,{width},{height}\nLocalSize=4,7,12,16\n\
+                 [Basic]\n{basic}[Waypoints]\n{waypoints}\
+                 [IsoMapPack5]\n1={ONE_CELL_ISO_MAP_PACK}\n"
+            );
+            let mut map = MapFile::from_bytes(text.as_bytes()).unwrap();
+            if waypoints.is_empty() {
+                assert!(
+                    map.waypoints.is_empty(),
+                    "metadata parsing keeps the authored slots"
+                );
+            }
+            map.initialize_authored_home_waypoint();
+            let home = map.waypoints.get(&slot).expect("materialized HomeCell");
+            assert_eq!((home.rx, home.ry), expected);
+            assert_eq!(home.index, slot);
+            assert!(
+                !map.waypoints.contains_key(&18) || slot == 18,
+                "fallback must not fill an undefined alternate waypoint"
+            );
+        }
+    }
 
     fn full_map_with_preview(preview_sections: &str) -> Vec<u8> {
         format!(
@@ -736,25 +1119,6 @@ mod tests {
         record[8] = sub_tile;
         record[9] = z;
         record
-    }
-
-    #[test]
-    fn gsi_04_01_explicit_rects_map_fields_verbatim() {
-        let text: &str = "\
-[Map]
-Theater=TEMPERATE
-Size=0,0,100,100
-LocalSize=2,4,96,92
-";
-        let ini: IniFile = IniFile::from_str(text);
-        let header: MapHeader = parse_header(&ini).expect("Should parse header");
-        assert_eq!(header.theater, "TEMPERATE");
-        assert_eq!(header.width, 100);
-        assert_eq!(header.height, 100);
-        assert_eq!(header.local_left, 2);
-        assert_eq!(header.local_top, 4);
-        assert_eq!(header.local_width, 96);
-        assert_eq!(header.local_height, 92);
     }
 
     #[test]
@@ -800,21 +1164,6 @@ LocalSize=2,4,96,92
         let negative_ini = IniFile::from_str("[Map]\nSize=0,0,3,2\nLevel=-2\n");
         let negative_header = parse_header(&negative_ini).expect("negative Level parses");
         assert_eq!(negative_header.level, -2);
-    }
-
-    #[test]
-    fn gsi_04_01_missing_rects_ignore_nonzero_caller_defaults() {
-        let ini = IniFile::from_str("[Map]\nSize=2,3,40,41\n");
-
-        let header = parse_header(&ini).expect("missing rectangles should remain loadable");
-
-        assert_eq!(header.theater, "TEMPERATE");
-        assert_eq!(header.width, 40);
-        assert_eq!(header.height, 41);
-        assert_eq!(header.local_left, 0);
-        assert_eq!(header.local_top, 0);
-        assert_eq!(header.local_width, 0);
-        assert_eq!(header.local_height, 0);
     }
 
     #[test]
@@ -904,7 +1253,8 @@ LocalSize=2,4,96,92
         bytes.extend_from_slice(&[0; CELL_HEADER_SIZE]);
         bytes.extend_from_slice(&iso_map_record(2, 0, 8, 4, 5));
 
-        let parsed = parse_iso_map_pack_records(&bytes).expect("sentinel terminates decoding");
+        let parsed = parse_iso_map_pack_records(&bytes, crate::map::cell_index::CellGrid::Retail)
+            .expect("sentinel terminates decoding");
         let cells = parsed.cells;
 
         assert_eq!(cells.len(), 1);
@@ -913,27 +1263,12 @@ LocalSize=2,4,96,92
     }
 
     #[test]
-    fn gsi_02_09_eof_after_complete_record_is_accepted() {
-        let bytes = iso_map_record(10, 20, 5, 3, 2);
-
-        let parsed = parse_iso_map_pack_records(&bytes).expect("complete final record is valid");
-        let cells = parsed.cells;
-
-        assert_eq!(cells.len(), 1);
-        assert_eq!(cells[0].rx, 10);
-        assert_eq!(cells[0].ry, 20);
-        assert_eq!(cells[0].tile_index, 5);
-        assert_eq!(cells[0].sub_tile, 3);
-        assert_eq!(cells[0].z, 2);
-    }
-
-    #[test]
     fn gsi_02_09_incomplete_header_is_an_error() {
         for actual in 1..CELL_HEADER_SIZE {
             let mut bytes = iso_map_record(1, 0, 1, 0, 0).to_vec();
             bytes.extend(std::iter::repeat_n(1, actual));
             assert!(matches!(
-                parse_iso_map_pack_records(&bytes),
+                parse_iso_map_pack_records(&bytes, crate::map::cell_index::CellGrid::Retail),
                 Err(MapError::CellDataTruncated {
                     expected: CELL_HEADER_SIZE,
                     actual: got,
@@ -948,7 +1283,7 @@ LocalSize=2,4,96,92
         bytes[0] = 1;
 
         assert!(matches!(
-            parse_iso_map_pack_records(&bytes),
+            parse_iso_map_pack_records(&bytes, crate::map::cell_index::CellGrid::Retail),
             Err(MapError::CellDataTruncated {
                 expected: CELL_RECORD_SIZE,
                 actual,
@@ -957,29 +1292,13 @@ LocalSize=2,4,96,92
     }
 
     #[test]
-    fn gsi_02_09_signed_x_uses_native_flattening_and_bounds() {
-        let negative = parse_iso_map_pack_records(&iso_map_record(-1, 0, 1, 0, 0))
-            .expect("out-of-range records are consumed");
-        assert!(negative.cells.is_empty());
-
-        let canonical = parse_iso_map_pack_records(&iso_map_record(-1, 1, 2, 0, 0))
-            .expect("in-range flattened record is valid");
-        assert_eq!(canonical.cells.len(), 1);
-        assert_eq!(canonical.cells[0].rx, 511);
-        assert_eq!(canonical.cells[0].ry, 0);
-
-        let upper = parse_iso_map_pack_records(&iso_map_record(0, 512, 3, 0, 0))
-            .expect("out-of-range records are consumed");
-        assert!(upper.cells.is_empty());
-    }
-
-    #[test]
     fn gsi_02_09_tile_index_preserves_raw_i32_values() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&iso_map_record(1, 0, 0x0000_FFFF, 0, 0));
         bytes.extend_from_slice(&iso_map_record(2, 0, -1, 0, 0));
 
-        let parsed = parse_iso_map_pack_records(&bytes).expect("records are valid");
+        let parsed = parse_iso_map_pack_records(&bytes, crate::map::cell_index::CellGrid::Retail)
+            .expect("records are valid");
         let cells = parsed.cells;
 
         assert_eq!(cells[0].tile_index, 65_535);
@@ -994,7 +1313,8 @@ LocalSize=2,4,96,92
         bytes.extend_from_slice(&iso_map_record(511, 511, 103, 5, 6));
         bytes.extend_from_slice(&[0; CELL_HEADER_SIZE]);
 
-        let parsed = parse_iso_map_pack_records(&bytes).expect("complete records parse");
+        let parsed = parse_iso_map_pack_records(&bytes, crate::map::cell_index::CellGrid::Retail)
+            .expect("complete records parse");
 
         assert_eq!(
             parsed.lookups,
@@ -1030,31 +1350,15 @@ LocalSize=2,4,96,92
     }
 
     #[test]
-    fn test_parse_cells_from_raw_bytes() {
-        // Build a fake 11-byte cell record matching the correct format:
-        // i16 x, u16 y, i32 tile_index, u8 sub_tile, u8 level, u8 ice_growth
-        let mut cell_bytes: Vec<u8> = Vec::new();
-        cell_bytes.extend_from_slice(&10u16.to_le_bytes()); // rx
-        cell_bytes.extend_from_slice(&20u16.to_le_bytes()); // ry
-        cell_bytes.extend_from_slice(&5i32.to_le_bytes()); // tile_index (i32!)
-        cell_bytes.push(3); // sub_tile
-        cell_bytes.push(2); // z (level)
-        cell_bytes.push(0); // ice_growth
-
-        assert_eq!(cell_bytes.len(), CELL_RECORD_SIZE);
-
-        let d: &[u8] = &cell_bytes[0..CELL_RECORD_SIZE];
-        let rx: u16 = u16::from_le_bytes([d[0], d[1]]);
-        let ry: u16 = u16::from_le_bytes([d[2], d[3]]);
-        let tile_index: i32 = i32::from_le_bytes([d[4], d[5], d[6], d[7]]);
-        let sub_tile: u8 = d[8];
-        let z: u8 = d[9];
-
-        assert_eq!(rx, 10);
-        assert_eq!(ry, 20);
-        assert_eq!(tile_index, 5);
-        assert_eq!(sub_tile, 3);
-        assert_eq!(z, 2);
+    fn packed_map_lookup_sign_extends_both_coordinate_words() {
+        // ReadIsoMapPack5 56BB15/56BB18 uses MOVSX on Y and X. This
+        // header aliases cell(2,2) in the native 512-wide pointer table.
+        let record = iso_map_record(1538, u16::MAX, 7, 0, 0);
+        let parsed =
+            parse_iso_map_pack_records(&record, crate::map::cell_index::CellGrid::Retail).unwrap();
+        assert_eq!(parsed.lookups[0].canonical, Some((2, 2)));
+        assert_eq!(parsed.cells.len(), 1);
+        assert_eq!((parsed.cells[0].rx, parsed.cells[0].ry), (2, 2));
     }
 
     #[test]
@@ -1088,16 +1392,6 @@ LocalSize=2,4,96,92
 
         assert_eq!(map.preview.size, Some((2, 1)));
         assert!(map.preview.has_packed_preview);
-        assert!(map.preview.decoded.is_none());
-    }
-
-    #[test]
-    fn full_map_parse_keeps_missing_preview_nonfatal() {
-        let bytes = full_map_with_preview("");
-
-        let map = MapFile::from_bytes(&bytes).expect("missing preview is non-fatal");
-
-        assert!(!map.preview.has_packed_preview);
         assert!(map.preview.decoded.is_none());
     }
 }

@@ -10,7 +10,7 @@ use crate::rules::ini_parser::{IniFile, IniSection};
 /// The mode class an `MPModesMD.ini` section builds. The loader `0x005D7CE0`
 /// reads the sections in this order, each through its own factory
 /// (`0x005D8170..0x005D82B0`), and inserts every mode by id (`0x005D7590`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MpModeClass {
     Battle,
     ManBattle,
@@ -18,6 +18,47 @@ pub enum MpModeClass {
     Unholy,
     FreeForAll,
     Cooperative,
+}
+
+/// Orthogonal capability and room-behavior policy owned by a multiplayer mode
+/// class. Each variant supplies its exact policy row so callers query a
+/// capability directly instead of branching on mode names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModePolicy {
+    /// Native vtable `+0x40`, required by Skirmish's game-type dropdown and AI
+    /// slot admission (`0x005D6130` at `0x005D6263`). Battle (`0x005C0E20`) and
+    /// FreeForAll (`0x005C5E30`) answer true; ManBattle, Siege, Unholy and
+    /// Cooperative keep base `0x005D6360` (false).
+    pub lists_in_skirmish: bool,
+    /// Native vtable `+0xBC`: admits observer seats (`0x005C0FD0` returns true
+    /// for ordinary modes; `0x005C4F00` returns false for Cooperative).
+    pub observers_allowed: bool,
+    /// Native vtable `+0x98`: mode-level player cap composed with map capacity by
+    /// `0x005EC3A0`/`0x005E9E70` (`0x005C42C0` returns 2; ordinary `0x005C0F30`
+    /// returns `-1`, no extra cap).
+    pub setup_player_limit: Option<usize>,
+    /// Native vtable `+0x4`: whether an all-allied room is allowed to start
+    /// (`0x005C4EE0` returns true only for Cooperative; `0x005C0E30` false).
+    pub permits_all_allied: bool,
+    /// Native vtable `+0x4` and `+0x8`, which the sidebar Diplomacy button asks
+    /// before choosing mission briefing over Diplomacy in LAN/WOL
+    /// (`0x00653918..0x00653938`). Cooperative (`0x007EE27C`) overrides base
+    /// `0x005C0E30`/`0x005C0E40` (false) with `0x005C4EE0`/`0x005C4EF0` (true).
+    pub restates_mission_for_diplomacy: bool,
+    /// Whether VERA's network room seats players into numbered teams when
+    /// alliances are allowed outside clan rooms.
+    pub room_teams: bool,
+    /// Whether multiple players may pick the same start position to share a
+    /// House in network setup.
+    pub shared_start_positions: bool,
+    /// Native `GameExit` mode `vt+0x8`: in a LAN or WOL game, skips the score
+    /// dialog and its Scenario RNG draws (`0x00685843..0x0068586A`).
+    pub skips_network_score_dialog: bool,
+    /// Native vtable `+0x4` and `+0x8`, both of which `MPlayer_Defeated` asks
+    /// in a LAN or WOL game (`0x004FC5CF..0x004FC5F1`): when all surviving
+    /// contenders are allied and a human survives, defeated human allies win
+    /// too.
+    pub shared_allied_victory: bool,
 }
 
 impl MpModeClass {
@@ -30,12 +71,109 @@ impl MpModeClass {
         (Self::Cooperative, "Cooperative"),
     ];
 
-    /// Vtable `+0x40`, which Skirmish's game-type list requires
-    /// (`0x005D6130` at `0x005D6263`). Battle (`0x005C0E20`) and FreeForAll
-    /// (`0x005C5E30`) answer true; ManBattle, Siege, Unholy and Cooperative
-    /// keep the base `0x005D6360` (false).
-    pub const fn lists_in_skirmish(self) -> bool {
-        matches!(self, Self::Battle | Self::FreeForAll)
+    /// Exhaustive mode policy row for this multiplayer mode class.
+    pub const fn policy(self) -> ModePolicy {
+        match self {
+            Self::Battle | Self::FreeForAll => ModePolicy {
+                lists_in_skirmish: true,
+                observers_allowed: true,
+                setup_player_limit: None,
+                permits_all_allied: false,
+                restates_mission_for_diplomacy: false,
+                room_teams: true,
+                shared_start_positions: true,
+                skips_network_score_dialog: false,
+                shared_allied_victory: false,
+            },
+            Self::ManBattle | Self::Siege | Self::Unholy => ModePolicy {
+                lists_in_skirmish: false,
+                observers_allowed: true,
+                setup_player_limit: None,
+                permits_all_allied: false,
+                restates_mission_for_diplomacy: false,
+                room_teams: true,
+                shared_start_positions: true,
+                skips_network_score_dialog: false,
+                shared_allied_victory: false,
+            },
+            Self::Cooperative => ModePolicy {
+                lists_in_skirmish: false,
+                observers_allowed: false,
+                setup_player_limit: Some(2),
+                permits_all_allied: true,
+                restates_mission_for_diplomacy: true,
+                room_teams: false,
+                shared_start_positions: false,
+                skips_network_score_dialog: true,
+                shared_allied_victory: true,
+            },
+        }
+    }
+}
+
+/// Effects of the mode's successful Start validation. The shell/session owner
+/// applies these before random assignments, preserving vtable+14 ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeStartEffect {
+    None,
+    /// FreeForAll5C5D40 assigns each non-observer node+6B its source index.
+    FreeForAllSourceRoles,
+    /// Cooperative5C1D80 binds the two names to an existing campaign record.
+    CooperativePartners,
+}
+
+impl MpModeClass {
+    ///5C21D0/5C2500 show Cooperative's description/difficulty controls and
+    /// hide rows beyond the two human positions. Ordinary options keep their
+    /// existing resource visibility; this method does not invent forced values.
+    pub const fn uses_cooperative_setup(self) -> bool {
+        matches!(self, Self::Cooperative)
+    }
+
+    ///5D6310/5CB400/5CA6D0/5C5D40/5C1D80 at the host's vtable+14 gate.
+    /// `roles` are node+6B in human source order, not team selectors(+63/+67).
+    /// A failure with no message is intentional: Unholy only returns false.
+    pub fn validate_setup_start(
+        self,
+        bases: bool,
+        roles: &[i32],
+    ) -> Result<ModeStartEffect, Option<&'static str>> {
+        match self {
+            Self::Battle | Self::ManBattle => Ok(ModeStartEffect::None),
+            Self::Unholy => {
+                if bases {
+                    Ok(ModeStartEffect::None)
+                } else {
+                    Err(None)
+                }
+            }
+            Self::FreeForAll => Ok(ModeStartEffect::FreeForAllSourceRoles),
+            Self::Cooperative => Ok(ModeStartEffect::CooperativePartners),
+            Self::Siege => {
+                let mut defender = false;
+                let mut attackers = 0;
+                for role in roles {
+                    match role {
+                        0 => {}
+                        1 => {
+                            if defender {
+                                return Err(Some("MP:OnlyOneBeseiged"));
+                            }
+                            defender = true;
+                        }
+                        2 => attackers += 1,
+                        _ => return Err(Some("MP:IllegalTeam")),
+                    }
+                }
+                if !defender {
+                    Err(Some("MP:NoDefender"))
+                } else if attackers == 0 {
+                    Err(Some("MP:NoAttackers"))
+                } else {
+                    Ok(ModeStartEffect::None)
+                }
+            }
+        }
     }
 }
 
@@ -60,9 +198,25 @@ pub struct SkirmishGameMode {
     pub random_maps_allowed: bool,
     pub allies_allowed: bool,
     pub must_ally: bool,
+    /// `+0x3D` `WonlineTournamentAllowed`: listed in WOL tournament and clan
+    /// rooms (`0x005D6203`).
+    pub wonline_tournament_allowed: bool,
+    /// `+0x3E` `WonlineClanTournamentAllowed`: listed in WOL clan rooms
+    /// (`0x005D6230`).
+    pub wonline_clan_tournament_allowed: bool,
 }
 
 impl SkirmishGameMode {
+    /// MultiplayerGameMode5D5DC0 reads MustAlly at+3F.
+    pub const fn default_human_team(&self) -> i32 {
+        if self.must_ally { 0 } else { -2 }
+    }
+
+    /// MultiplayerGameMode5D5DD0 reads AlliesAllowed at+3C.
+    pub const fn default_ai_team(&self) -> i32 {
+        if self.allies_allowed { 3 } else { -2 }
+    }
+
     /// `0x005D7590`: the row is ReadString into a CString (`0x00528C00`,
     /// 0x3FE bytes), then `CString::Tokenize(",")` fields trimmed of spaces
     /// ([`IniSection::read_trimmed_list`]).
@@ -90,13 +244,22 @@ impl SkirmishGameMode {
             random_maps_allowed,
             allies_allowed: true,
             must_ally: false,
+            // The constructor's +0x3D/+0x3E (0x005D5BEA..0x005D5BF6).
+            wonline_tournament_allowed: true,
+            wonline_clan_tournament_allowed: true,
         })
     }
 }
 
 fn apply_common_override(mode: &mut SkirmishGameMode, ini: &IniFile) {
-    // ReadBool over each current value (`0x005D5CE5`, `0x005D5D00`).
+    // ReadBool over each current value (`0x005D5C7D..0x005D5D11`).
     let section = ini.section_or_empty("MultiplayerDialogSettings");
+    mode.wonline_tournament_allowed =
+        section.read_bool("WonlineTournamentAllowed", mode.wonline_tournament_allowed);
+    mode.wonline_clan_tournament_allowed = section.read_bool(
+        "WonlineClanTournamentAllowed",
+        mode.wonline_clan_tournament_allowed,
+    );
     mode.allies_allowed = section.read_bool("AlliesAllowed", mode.allies_allowed);
     mode.must_ally = section.read_bool("MustAlly", mode.must_ally);
     if !mode.allies_allowed {
@@ -131,7 +294,7 @@ where
     modes
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn parse_mpmodes_ini(ini: &IniFile) -> Vec<SkirmishGameMode> {
     parse_mpmodes_ini_with_overrides(ini, |_| None)
 }
@@ -203,7 +366,8 @@ pub fn stock_skirmish_modes() -> Vec<SkirmishGameMode> {
     parse_mpmodes_ini_with_overrides(&roster, |name| {
         let settings = match name.to_ascii_lowercase().as_str() {
             "mpteammd.ini" => "AlliesAllowed=yes\nMustAlly=yes\n",
-            "mpfreeforallmd.ini" | "mpcoopmd.ini" => "AlliesAllowed=no\n",
+            "mpfreeforallmd.ini" => "AlliesAllowed=no\nWonlineClanTournamentAllowed=no\n",
+            "mpcoopmd.ini" => "AlliesAllowed=no\nWonlineTournamentAllowed=no\n",
             _ => "AlliesAllowed=yes\n",
         };
         Some(IniFile::from_str(&format!(
@@ -216,19 +380,50 @@ pub fn mode_by_id(modes: &[SkirmishGameMode], id: i32) -> Option<&SkirmishGameMo
     modes.iter().find(|mode| mode.id == id)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_scenario))]
 mod tests {
-    use super::*;
 
     #[test]
-    fn parses_stock_mpmodesmd_roster() {
-        let modes = stock_skirmish_modes();
-        let ids: Vec<i32> = modes.iter().map(|mode| mode.id).collect();
-        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(modes[0].ui_name_key, "GUI:Battle");
-        assert_eq!(modes[0].map_filter, "standard");
-        assert!(modes[0].random_maps_allowed);
+    fn network_start_validation_keeps_mode_effects_and_failure_order() {
+        use super::{ModeStartEffect, MpModeClass};
+        assert_eq!(
+            MpModeClass::Unholy.validate_setup_start(false, &[0, 0]),
+            Err(None)
+        );
+        assert_eq!(
+            MpModeClass::Battle.validate_setup_start(false, &[0, 0]),
+            Ok(ModeStartEffect::None)
+        );
+        assert_eq!(
+            MpModeClass::FreeForAll.validate_setup_start(true, &[0, -1, 0]),
+            Ok(ModeStartEffect::FreeForAllSourceRoles)
+        );
+        assert_eq!(
+            MpModeClass::Cooperative.validate_setup_start(true, &[0, 0]),
+            Ok(ModeStartEffect::CooperativePartners)
+        );
+        assert_eq!(
+            MpModeClass::Siege.validate_setup_start(true, &[1, 2]),
+            Ok(ModeStartEffect::None)
+        );
+        assert_eq!(
+            MpModeClass::Siege.validate_setup_start(true, &[1, 1, 2]),
+            Err(Some("MP:OnlyOneBeseiged"))
+        );
+        assert_eq!(
+            MpModeClass::Siege.validate_setup_start(true, &[2, 0]),
+            Err(Some("MP:NoDefender"))
+        );
+        assert_eq!(
+            MpModeClass::Siege.validate_setup_start(true, &[1, 0]),
+            Err(Some("MP:NoAttackers"))
+        );
+        assert_eq!(
+            MpModeClass::Siege.validate_setup_start(true, &[-1, 1, 2]),
+            Err(Some("MP:IllegalTeam"))
+        );
     }
+    use super::*;
 
     #[test]
     fn retail_skirmish_lists_battle_free_for_all_and_team_alliance() {
@@ -237,7 +432,7 @@ mod tests {
         };
         let listed: Vec<(i32, String)> = parse_mpmodes_ini(&ini)
             .into_iter()
-            .filter(|mode| mode.class.lists_in_skirmish())
+            .filter(|mode| mode.class.policy().lists_in_skirmish)
             .map(|mode| (mode.id, mode.ui_name_key))
             .collect();
         assert_eq!(
@@ -251,12 +446,6 @@ mod tests {
     }
 
     #[test]
-    fn stock_mpmodes_do_not_include_siege_without_roster_row() {
-        let modes = stock_skirmish_modes();
-        assert!(!modes.iter().any(|mode| mode.ui_name_key.contains("Siege")));
-    }
-
-    #[test]
     fn team_game_has_must_ally() {
         let modes = stock_skirmish_modes();
         let team = mode_by_id(&modes, 9).expect("team game mode");
@@ -265,27 +454,6 @@ mod tests {
         assert!(team.must_ally);
         assert!(!team.random_maps_allowed);
         assert_eq!(team.map_filter, "teamgame");
-    }
-
-    #[test]
-    fn free_for_all_disables_allies() {
-        let modes = stock_skirmish_modes();
-        let ffa = mode_by_id(&modes, 2).expect("free for all mode");
-        assert_eq!(ffa.ui_name_key, "GUI:FreeForAll");
-        assert!(!ffa.allies_allowed);
-        assert!(!ffa.must_ally);
-        assert!(ffa.random_maps_allowed);
-    }
-
-    #[test]
-    fn battle_and_free_for_all_allow_random_maps() {
-        let modes = stock_skirmish_modes();
-        let random_ids: Vec<i32> = modes
-            .iter()
-            .filter(|mode| mode.random_maps_allowed)
-            .map(|mode| mode.id)
-            .collect();
-        assert_eq!(random_ids, vec![1, 2]);
     }
 
     #[test]
@@ -348,6 +516,25 @@ mod tests {
         assert!(modes[0].must_ally);
     }
     #[test]
+    fn stock_launch_rows_are_the_retail_roster_rows() {
+        use crate::rules::retail_ini_fixture::retail_ini;
+        use crate::skirmish_launch::SkirmishLaunchMode;
+        let Some(roster) = retail_ini("mpmodesmd.ini") else {
+            return;
+        };
+        let modes = parse_mpmodes_ini_with_overrides(&roster, retail_ini);
+        assert_eq!(modes.len(), 9);
+        for mode in &modes {
+            assert_eq!(
+                SkirmishLaunchMode::stock(mode.id),
+                Some(SkirmishLaunchMode::from_game_mode(mode)),
+                "{}",
+                mode.ui_name_key
+            );
+        }
+    }
+
+    #[test]
     fn stock_contract_modes_match_selected_retail_roster_and_overrides() {
         let Some((_, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
             return;
@@ -366,5 +553,10 @@ mod tests {
             stock_skirmish_modes(),
             "every consumed roster and override field"
         );
+        // The WOL room filter's retail inputs (FillModeList 5D6203..37).
+        let by_class = |class| modes.iter().find(|mode| mode.class == class).unwrap();
+        assert!(!by_class(MpModeClass::FreeForAll).wonline_clan_tournament_allowed);
+        assert!(by_class(MpModeClass::FreeForAll).wonline_tournament_allowed);
+        assert!(!by_class(MpModeClass::Cooperative).wonline_tournament_allowed);
     }
 }

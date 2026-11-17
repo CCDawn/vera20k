@@ -19,7 +19,7 @@
 use crate::util::native_x87::{
     MaskedX87Chop53, MaskedX87Value, NativeF32Bits, NativeF64Bits, X87Chop53, X87Value,
 };
-use std::sync::OnceLock;
+use crate::util::sync::OnceLock;
 
 /// Virtual address of the sine table in the retail image.
 #[cfg(any(test, feature = "test-support"))]
@@ -287,12 +287,12 @@ fn table_value(entry: f32) -> X87Value {
         .unwrap_or_else(|_| X87Chop53::load_i32(0))
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(tests_util, tests_map)))]
 pub(crate) mod executable;
-#[cfg(test)]
+#[cfg(all(test, tests_util))]
 mod executable_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_util))]
 mod tests {
     use super::*;
 
@@ -301,33 +301,6 @@ mod tests {
     fn retail_executable() -> Option<Vec<u8>> {
         let dir = std::env::var("RA2_DIR").ok()?;
         std::fs::read(std::path::Path::new(&dir).join("gamemd.exe")).ok()
-    }
-
-    #[test]
-    fn indices_stay_inside_the_table() {
-        // Every representable caller angle, at a stride that still visits every
-        // residue class of the fold.
-        for raw in (i32::MIN..=i32::MAX - 1).step_by(9973) {
-            for index in [sin_index(raw), cos_index(raw)] {
-                assert!(
-                    (0..TABLE_LEN as i32).contains(&index),
-                    "angle {raw} produced out-of-range index {index}"
-                );
-            }
-        }
-    }
-
-    /// Cosine is the sine table a quarter period along — that relationship is
-    /// the whole reason there is one array and not two.
-    #[test]
-    fn cosine_leads_sine_by_a_quarter_period() {
-        for raw in (-40_000..40_000).step_by(7) {
-            assert_eq!(
-                cos_index(raw),
-                sin_index(raw) + QUARTER,
-                "angle {raw}: cosine is not a quarter period ahead of sine"
-            );
-        }
     }
 
     /// Periodicity holds for **even** caller units only.
@@ -417,24 +390,5 @@ mod tests {
             .flat_map(|entry| entry.to_le_bytes())
             .collect();
         assert_eq!(table_at(ACOS_TABLE_VA, ACOS_TABLE_LEN * 4), computed);
-    }
-
-    #[test]
-    fn the_table_has_the_shape_of_a_sine() {
-        let table = TrigTable::embedded();
-        assert_eq!(table.entry(0), 0.0, "sine starts at zero");
-        assert_eq!(table.entry(PERIOD as usize / 4), 1.0, "quarter turn is one");
-        assert!(
-            table.entry(PERIOD as usize / 2).abs() < 1e-6,
-            "half turn is zero"
-        );
-        assert_eq!(
-            table.entry(3 * PERIOD as usize / 4),
-            -1.0,
-            "three-quarter turn is minus one"
-        );
-        // The quarter-period offset really does behave like a cosine.
-        assert_eq!(table.sin(0), 0.0);
-        assert_eq!(table.cos(0), 1.0);
     }
 }

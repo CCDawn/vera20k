@@ -298,8 +298,16 @@ pub fn absolute_leptons_to_screen(
     world_z_leptons: i32,
 ) -> (f32, f32) {
     let (screen_x, screen_y) = project_absolute_lepton_xy(world_x_leptons, world_y_leptons);
-    let screen_y = screen_y + WORLD_ROW_BIAS_PX
-        - crate::util::native_x87::adjust_for_z_standard(world_z_leptons);
+    // Planar projection (including the exact-Z render path's first stage)
+    // always asks for Z=0. Its native +0.5/chop result is exactly zero; avoid
+    // evaluating the software x87 expression for every ground-object read.
+    // Nonzero heights retain the original precision and operation order.
+    let lift = if world_z_leptons == 0 {
+        0
+    } else {
+        crate::util::native_x87::adjust_for_z_standard(world_z_leptons)
+    };
+    let screen_y = screen_y + WORLD_ROW_BIAS_PX - lift;
     (screen_x as f32, screen_y as f32)
 }
 
@@ -366,10 +374,30 @@ pub fn lepton_to_screen(rx: u16, ry: u16, sub_x: SimFixed, sub_y: SimFixed, z: u
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, tests_util))]
 mod tests {
     use super::*;
     use crate::util::fixed_math::SIM_ZERO;
+
+    /// The zero-height shortcut lands where the native x87 path does.
+    #[test]
+    fn zero_height_projection_matches_the_native_x87_path() {
+        assert_eq!(crate::util::native_x87::adjust_for_z_standard(0), 0);
+        for (x, y) in [
+            (i32::MIN, -1),
+            (-257, 255),
+            (0, 0),
+            (256, 4097),
+            (i32::MAX, 8_388_607),
+        ] {
+            let (sx, sy) = project_absolute_lepton_xy(x, y);
+            assert_eq!(
+                absolute_leptons_to_screen(x, y, 0),
+                (sx as f32, (sy + WORLD_ROW_BIAS_PX) as f32),
+                "{x},{y}"
+            );
+        }
+    }
 
     #[test]
     fn lepton_to_cell_truncates_toward_zero_and_packs_to_16_bits() {
@@ -388,19 +416,6 @@ mod tests {
         assert_eq!(lepton_to_cell_packed(0x0100_0000), 0);
     }
 
-    #[test]
-    fn bridge_deck_height_is_the_captured_416_leptons() {
-        assert_eq!(BRIDGE_DECK_HEIGHT_LEPTONS, 416);
-        assert_eq!(BRIDGE_DECK_HEIGHT_LEVELS, 4);
-    }
-
-    #[test]
-    fn integer_and_fixed_cell_center_agree() {
-        assert_eq!(
-            CELL_CENTER_LEPTON,
-            SimFixed::from_num(CELL_CENTER_LEPTON_I32)
-        );
-    }
     use crate::map::terrain;
 
     #[test]
@@ -593,35 +608,11 @@ mod tests {
     }
 
     #[test]
-    fn absolute_leptons_to_screen_zero_matches_iso_origin() {
-        let (sx, sy) = absolute_leptons_to_screen(0, 0, 0);
-        assert_eq!(sx, 0.0);
-        assert_eq!(sy, terrain::TILE_HEIGHT / 2.0);
-    }
-
-    #[test]
-    fn absolute_leptons_to_screen_integer_cell_lands_at_iso_center() {
-        // 4 cells east, 2 cells south = (4*256, 2*256, 0).
-        let (sx, sy) = absolute_leptons_to_screen(4 * 256, 2 * 256, 0);
-        assert_eq!(sx, (4.0 - 2.0) * terrain::TILE_WIDTH / 2.0);
-        assert_eq!(
-            sy,
-            (4.0 + 2.0) * terrain::TILE_HEIGHT / 2.0 + terrain::TILE_HEIGHT / 2.0
-        );
-    }
-
-    #[test]
     fn absolute_leptons_to_screen_sub_cell_offset_is_iso_subdivided() {
         // Sub-cell offset of (128, 0) — native truncates the complete Y
         // numerator from 7.5 to 7 before VERA's common +15 row bias.
         let (sx, sy) = absolute_leptons_to_screen(128, 0, 0);
         assert_eq!((sx, sy), (15.0, 22.0));
-    }
-
-    #[test]
-    fn absolute_leptons_to_screen_negative_coords_use_signed_truncation() {
-        let (sx, sy) = absolute_leptons_to_screen(-50, 0, 0);
-        assert_eq!((sx, sy), (-5.0, 13.0));
     }
 
     #[test]

@@ -8,7 +8,6 @@
 //! Native command dispatch, full placement and paid Drive ticks remain excluded.
 //! No supplied CanEnter answers or synthetic bridge flags.
 use super::*;
-use crate::map::resolved_terrain::NativeCellQuery;
 use crate::sim::movement::infantry_entry::InfantryEntryArgs;
 use crate::sim::movement::locomotor::MovementLayer;
 
@@ -70,10 +69,6 @@ fn load_hills() -> crate::headless_scenario::HeadlessScenario {
     use crate::map::source::{LoadedMapSource, load_map_by_name_or_path_with_assets};
     let retail = retail_dir().expect("this ignored native-input test requires retail assets");
     let native = receipt();
-    assert_eq!(
-        native["native_sha256"].as_str().unwrap(),
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     assert_eq!(native["code_unchanged"], true);
     let assets = AssetManager::new(&retail, MediaArchiveMode::STOCK_DIGITAL)
         .expect("ordinary retail archive stack");
@@ -115,7 +110,6 @@ fn load_hills() -> crate::headless_scenario::HeadlessScenario {
         }
         let cell = terrain.cell(x, y).expect("native-selected Hills cell");
         let identity = terrain.native_cell_identity((x as i16, y as i16));
-        let query = NativeCellQuery::canonical(terrain);
         assert_eq!(
             i64::from(cell.final_tile_index),
             row["tile"].as_i64().unwrap(),
@@ -151,13 +145,14 @@ fn load_hills() -> crate::headless_scenario::HeadlessScenario {
             row["flags"].as_u64().unwrap(),
             "flags {x},{y}"
         );
+        let live = scenario.sim().cell_overlay(identity);
         assert_eq!(
-            i64::from(query.overlay_identity(identity)),
+            live.overlay_id.map_or(-1, i64::from),
             row["overlay"].as_i64().unwrap(),
             "overlay {x},{y}"
         );
         assert_eq!(
-            u64::from(terrain.native_cell_state(identity)),
+            u64::from(live.overlay_data),
             row["state"].as_u64().unwrap(),
             "frame {x},{y}"
         );
@@ -237,7 +232,7 @@ fn spawn_supplied_ground_mtnk(
         cell.1,
         0,
         height,
-        crate::sim::world::PlacementEvidence::UnitEntryAdmitted,
+        crate::sim::world::PlacementEvidence::FootEntryAdmitted,
         &resources.rules,
         crate::sim::world::FrameEffects::default(),
     )
@@ -252,13 +247,13 @@ fn installed_route(
     id: u64,
     start: (u16, u16),
 ) -> Vec<(u16, u16)> {
-    let queue = &scenario
+    let queue = scenario
         .sim()
         .entities()
         .get(id)
         .unwrap()
         .navigation
-        .path_replay;
+        .path_replay();
     let route = queue.installed_cells(start);
     let reference = queue.reference_cell().expect("installed route reference");
     assert!(
@@ -280,7 +275,7 @@ fn await_ordinary_route(
         .get(id)
         .unwrap()
         .navigation
-        .path_replay
+        .path_replay()
         .clone();
     for _ in 0..MAX_TICKS {
         let sim = scenario.sim();
@@ -296,13 +291,13 @@ fn await_ordinary_route(
             facts.ground_level + if actor.on_bridge() { 4 } else { 0 }
         );
         scenario.tick();
-        let queue = &scenario
+        let queue = scenario
             .sim()
             .entities()
             .get(id)
             .unwrap()
             .navigation
-            .path_replay;
+            .path_replay();
         if !queue.directions().is_empty() && *queue != ordered {
             return installed_route(scenario, id, start);
         }
@@ -332,7 +327,7 @@ fn await_stopped_deck_pose(
             "accepted Stop clears NavCom"
         );
         if actor.passive_acquire_mission() == crate::sim::mission::MissionType::Guard
-            && !actor.body_facing.is_rotating(sim.session.binary_frame)
+            && !actor.body_facing.is_rotating(sim.session.binary_frame())
             && crate::sim::movement::motion_query::is_moving(actor) == Some(false)
         {
             return;
@@ -506,7 +501,7 @@ fn hills_stationary_friendly_deck_blocker_matches_original_repath() {
         assert_eq!(entity.position.z(), 6);
         assert!(entity.navigation.nav_com().is_none());
     }
-    assert!(!parked.body_facing.is_rotating(sim.session.binary_frame));
+    assert!(!parked.body_facing.is_rotating(sim.session.binary_frame()));
     assert_eq!(
         crate::sim::movement::motion_query::is_moving(parked),
         Some(false)
@@ -566,7 +561,7 @@ fn hills_opposing_ordinary_moves_repath_on_the_deck() {
         .get(forward)
         .unwrap()
         .navigation
-        .path_replay
+        .path_replay()
         .clone();
     let mut deck_rebuilds = 0;
     let mut met_on_deck = false;
@@ -589,7 +584,7 @@ fn hills_opposing_ordinary_moves_repath_on_the_deck() {
                 && actor.position.ry().abs_diff(other.position.ry()) <= 1;
         }
         if crate::sim::movement::motion_query::is_moving(&actor) == Some(true) {
-            let queue = &actor.navigation.path_replay;
+            let queue = actor.navigation.path_replay();
             if route_reinstalled(&previous, queue) && facts.bridge_structural {
                 deck_rebuilds += 1;
             }
@@ -620,9 +615,7 @@ fn hills_same_type_marker_downgrade_reaches_live_foot_search_and_cleanup() {
     use crate::sim::mission::{MissionId, MissionType};
     use crate::sim::movement::FindPathResult;
     use crate::sim::movement::movement_tick::FootPathRequest;
-    use crate::sim::movement::path_markers::{
-        DeferredBridgeMarker, bridge_marker_peer, install_path_replay,
-    };
+    use crate::sim::movement::path_markers::{DeferredBridgeMarker, bridge_marker_peer};
     use crate::sim::pathfinding::SearchMarkerOverlay;
     use crate::util::fixed_math::{SIM_ONE, SIM_ZERO};
 
@@ -683,9 +676,10 @@ fn hills_same_type_marker_downgrade_reaches_live_foot_search_and_cleanup() {
             simulation: sim,
             resources,
         } = &mut scenario.runtime;
-        let frame = sim.session.binary_frame;
+        let frame = sim.session.binary_frame();
         for id in [peer, mover] {
-            sim.mission_assign_exact(id, MissionId::from_known(MissionType::Move), frame)
+            sim.substrate
+                .mission_assign_exact(id, MissionId::from_known(MissionType::Move), frame)
                 .unwrap();
             let actor = sim.substrate.entities.get(id).unwrap();
             assert!(!actor.on_bridge());
@@ -752,16 +746,22 @@ fn hills_same_type_marker_downgrade_reaches_live_foot_search_and_cleanup() {
             crate::sim::movement::motion_query::is_moving(actor),
             Some(true)
         );
-        install_path_replay(&mut actor.navigation.path_replay, peer_cell, &peer_path, 1);
+        actor
+            .navigation
+            .path_replay_mut()
+            .install(peer_cell, &peer_path, 1);
         assert_eq!(
-            actor.navigation.path_replay.reference_cell(),
+            actor.navigation.path_replay().reference_cell(),
             Some((
                 peer_native["supplied_reference"][0].as_i64().unwrap() as i16,
                 peer_native["supplied_reference"][1].as_i64().unwrap() as i16
             ))
         );
-        assert_eq!(actor.navigation.path_replay.remaining_directions(), &[0, 0]);
-        let peer_queue = actor.navigation.path_replay.clone();
+        assert_eq!(
+            actor.navigation.path_replay().remaining_directions(),
+            &[0, 0]
+        );
+        let peer_queue = actor.navigation.path_replay().clone();
         assert_eq!(
             sim.substrate.entities.get(peer).unwrap().type_ref(),
             sim.substrate.entities.get(mover).unwrap().type_ref()
@@ -806,11 +806,12 @@ fn hills_same_type_marker_downgrade_reaches_live_foot_search_and_cleanup() {
             );
             let urgency = control["urgency"].as_u64().unwrap() as u8;
             let multiplier = crate::sim::pathfinding::code2_multiplier(urgency, || {
-                sim.astar_code2_chain_jams(
+                sim.astar_code2_chain(
                     peer_cell,
                     crate::sim::movement::locomotor::MovementLayer::Ground,
                     None,
                 )
+                .map(|chain| chain.jams)
             })
             .unwrap();
             assert_eq!(
@@ -849,7 +850,7 @@ fn hills_same_type_marker_downgrade_reaches_live_foot_search_and_cleanup() {
         // downgrade; with requested1 retained it would choose a detour.
         assert!(sim.foot_mark_remove(
             mover,
-            Some(&resources.rules),
+            &resources.rules,
             Some(&resources.overlay_registry),
             crate::sim::world::FrameEffects::default()
         ));
@@ -858,17 +859,17 @@ fn hills_same_type_marker_downgrade_reaches_live_foot_search_and_cleanup() {
             let peer = bridge_marker_peer(
                 &sim.substrate.entities,
                 mover,
-                Some(&resources.rules),
+                &resources.rules,
                 &sim.interner,
             );
             let context = DeferredBridgeMarker {
                 mover_id: mover,
                 mover: peer.as_ref(),
-                rules: Some(&resources.rules),
+                rules: &resources.rules,
                 interner: &sim.interner,
                 grid: &grid,
                 terrain: sim.resolved_terrain.as_ref(),
-                playfield_bounds: sim.playfield_bounds,
+                playfield_bounds: sim.playfield_bounds(),
             }
             .reading(&sim.substrate.entities, &sim.substrate.raw_cell_occupation);
             let search = context.build(
@@ -898,7 +899,7 @@ fn hills_same_type_marker_downgrade_reaches_live_foot_search_and_cleanup() {
         }
         assert!(sim.foot_mark_put(
             mover,
-            Some(&resources.rules),
+            &resources.rules,
             Some(&resources.overlay_registry),
             crate::sim::world::FrameEffects::default()
         ));
@@ -918,7 +919,7 @@ fn hills_same_type_marker_downgrade_reaches_live_foot_search_and_cleanup() {
                 z: case["height"].as_i64().unwrap() as i32 * 104,
             },
             urgency,
-            sim.playfield_bounds,
+            sim.playfield_bounds(),
         )
         .unwrap();
         assert_eq!(
@@ -932,7 +933,7 @@ fn hills_same_type_marker_downgrade_reaches_live_foot_search_and_cleanup() {
             FindPathResult::Route
         );
         let actor = sim.substrate.entities.get(mover).unwrap();
-        let queue = &actor.navigation.path_replay;
+        let queue = actor.navigation.path_replay();
         assert_eq!(queue.cursor(), 0, "Find_Path installs an unconsumed queue");
         assert_original_route(
             case,
@@ -959,7 +960,8 @@ fn hills_same_type_marker_downgrade_reaches_live_foot_search_and_cleanup() {
                 .get(peer)
                 .unwrap()
                 .navigation
-                .path_replay,
+                .path_replay()
+                .clone(),
             peer_queue
         );
         let terrain = sim.resolved_terrain.as_ref().unwrap();

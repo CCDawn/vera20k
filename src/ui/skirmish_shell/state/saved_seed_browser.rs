@@ -84,6 +84,10 @@ pub struct SavedSeedBrowserRow<I = NativeFileName> {
     /// Metadata admission belongs to the file format. SED uses nonempty
     /// descriptions; a valid game header can admit an empty description.
     pub visible: bool,
+    /// Whether Load may open this row. VERA-only: a saved game another build
+    /// wrote stays listed in Load and Delete (gamemd hides it at
+    /// `0x005599DF`), so the player can see why it is gone and delete it.
+    pub loadable: bool,
 }
 
 impl<I> SavedSeedBrowserRow<I> {
@@ -100,29 +104,94 @@ pub struct SavedSeedDescriptionEdit {
     pub caret: usize,
     pub first_visible_unit: usize,
     pub focused: bool,
+    /// `ES_PASSWORD`: the paint passes `(style >> 5) & 1` to
+    /// `NewEdit__DrawTextAndCaret` `0x00623880`, which draws every unit as
+    /// `*` (`0x00614FDC..0x00615009`).
+    pub password: bool,
 }
 
 impl SavedSeedDescriptionEdit {
     pub fn set_text(&mut self, description: &SeedDescription) {
         // Programmatic assignment also passes through7B78D0 after EM_LIMITTEXT.
-        self.units = description
-            .units()
-            .iter()
-            .copied()
-            .take(SAVED_SEED_DESCRIPTION_MAX_UNITS)
+        self.set_units_limited(
+            description.units().iter().copied(),
+            SAVED_SEED_DESCRIPTION_MAX_UNITS,
+        );
+    }
+
+    /// NewEdit614B30's shared assignment: limits count UTF-16 units, and zero
+    /// means unlimited. D7 uses five/eleven units; its port has no limit.
+    pub fn set_units_limited(&mut self, units: impl IntoIterator<Item = u16>, limit: usize) {
+        self.units = units
+            .into_iter()
+            .take(if limit == 0 { usize::MAX } else { limit })
             .collect();
         self.caret = self.units.len();
         self.first_visible_unit = 0;
     }
 
     pub fn insert_text(&mut self, text: &str) {
-        for unit in text.encode_utf16().filter(|unit| *unit > 0x1f) {
-            if self.units.len() == SAVED_SEED_DESCRIPTION_MAX_UNITS {
-                break;
-            }
-            self.units.insert(self.caret, unit);
-            self.caret += 1;
+        self.insert_text_limited(text, SAVED_SEED_DESCRIPTION_MAX_UNITS);
+    }
+
+    /// Native 614B30 insertion, retaining the caller's configured EM_LIMITTEXT.
+    pub fn insert_text_limited(&mut self, text: &str, limit: usize) {
+        for unit in text.encode_utf16() {
+            self.insert_unit_filtered(unit, limit, false, &[]);
         }
+    }
+
+    /// NewEdit614B30 at615226..61527A: reject-character table, UTF-16
+    /// limit, control-character gate and optional byte-only input (<0x100).
+    /// One unit lets callers run their native EN_CHANGE handler after each
+    /// admitted WM_CHAR instead of applying that handler after a pasted batch.
+    pub fn insert_unit_filtered(
+        &mut self,
+        unit: u16,
+        limit: usize,
+        byte_only: bool,
+        rejected: &[u16],
+    ) -> bool {
+        if unit <= 0x1f
+            || (byte_only && unit >= 0x100)
+            || rejected.contains(&unit)
+            || (limit != 0 && self.units.len() >= limit)
+        {
+            return false;
+        }
+        self.units.insert(self.caret, unit);
+        self.caret += 1;
+        true
+    }
+
+    /// NewEdit multiline Enter614DEB appends CRLF to the end, independently
+    /// of the caret and EM_LIMITTEXT, before notifying its parent with501.
+    pub fn append_enter_line_end(&mut self) {
+        self.units.extend([13, 10]);
+    }
+
+    /// NewEdit4B3 getter614D49: caller capacity includes its forced final NUL.
+    pub fn wide_text(&self, capacity: usize) -> Vec<u16> {
+        self.units
+            .iter()
+            .copied()
+            .take(capacity.saturating_sub(1))
+            .take_while(|unit| *unit != 0)
+            .collect()
+    }
+
+    /// NewEdit message 0x4B5 (614D28): narrow each UTF-16 unit to its low byte,
+    /// then terminate the caller's buffer at capacity-1. This is not ACP.
+    pub fn narrow_text(&self, capacity: usize) -> String {
+        crate::util::native_string::widen_bytes(
+            &self
+                .units
+                .iter()
+                .take(capacity.saturating_sub(1))
+                .map(|unit| *unit as u8)
+                .take_while(|byte| *byte != 0)
+                .collect::<Vec<_>>(),
+        )
     }
 
     pub fn backspace(&mut self) {
@@ -152,22 +221,65 @@ impl SavedSeedDescriptionEdit {
     }
 
     pub fn description(&self) -> SeedDescription {
-        // Save driver727D60 trims wide units <=0x20 after reading at most79.
-        let start = self
-            .units
-            .iter()
-            .position(|u| *u > 0x20)
-            .unwrap_or(self.units.len());
-        let end = self
-            .units
-            .iter()
-            .rposition(|u| *u > 0x20)
-            .map_or(start, |i| i + 1);
-        SeedDescription::from_units(self.units[start..end].iter().copied())
+        // The save driver trims with wcstrim 727D60 after reading at most 79.
+        SeedDescription::from_units(
+            crate::util::native_string::wcstrim(&self.units)
+                .iter()
+                .copied(),
+        )
     }
 
     pub fn display_text(&self) -> String {
         String::from_utf16_lossy(&self.units)
+    }
+
+    /// The units `start..end` as the NewEdit paints them (masked for
+    /// `ES_PASSWORD`).
+    pub fn painted_range(&self, start: usize, end: usize) -> String {
+        let end = end.min(self.units.len());
+        let start = start.min(end);
+        if self.password {
+            "*".repeat(end - start)
+        } else {
+            String::from_utf16_lossy(&self.units[start..end])
+        }
+    }
+
+    /// The painted text from the first visible unit on.
+    pub fn painted_text(&self) -> String {
+        self.painted_range(self.first_visible_unit, self.units.len())
+    }
+
+    /// NewEdit__DrawTextAndCaret `0x00623880` with an open IME composition
+    /// (`0x006238D0..0x006239C2`): the composition units are spliced in at the
+    /// caret, the painted caret sits at the composition cursor and the scroll
+    /// keeps that position visible. Returns the painted editor and the
+    /// composition's unit range in it.
+    pub fn with_composition(
+        &self,
+        composition: &[u16],
+        cursor: usize,
+        available: u32,
+        measure: impl Fn(&str) -> u32,
+    ) -> (Self, std::ops::Range<usize>) {
+        let caret = self.caret.min(self.units.len());
+        let mut view = self.clone();
+        view.units.splice(caret..caret, composition.iter().copied());
+        view.caret = caret + cursor.min(composition.len());
+        view.scroll_to_caret(available, measure);
+        (view, caret..caret + composition.len())
+    }
+
+    /// Keep the insertion point visible using the active font's measured width.
+    pub fn scroll_to_caret(&mut self, available: u32, measure: impl Fn(&str) -> u32) {
+        self.first_visible_unit = self.first_visible_unit.min(self.caret);
+        while self.first_visible_unit < self.caret {
+            let prefix = self.painted_range(self.first_visible_unit, self.caret);
+            if measure(&prefix) <= available {
+                break;
+            }
+            self.first_visible_unit += 1;
+        }
     }
 }
 
@@ -180,9 +292,9 @@ pub struct SavedSeedBrowserState<I = NativeFileName> {
     pub description_edit: SavedSeedDescriptionEdit,
     pub pressed_control: Option<SavedSeedControl>,
     pub prompt: Option<SavedSeedPrompt<I>>,
-    pub scroll_repeat_at: Option<std::time::Instant>,
-    pub opened_at: std::time::Instant,
-    pub last_list_press: Option<(std::time::Instant, i32, i32)>,
+    pub scroll_repeat_at: Option<crate::util::time::Instant>,
+    pub opened_at: crate::util::time::Instant,
+    pub last_list_press: Option<(crate::util::time::Instant, i32, i32)>,
     current_description: SeedDescription,
 }
 
@@ -202,6 +314,7 @@ impl SavedSeedBrowserState<NativeFileName> {
                 .map(|entry| SavedSeedBrowserRow {
                     file_name: Some(entry.file_name),
                     visible: !entry.description.is_empty(),
+                    loadable: true,
                     description: entry.description,
                     last_write_time: entry.last_write_time,
                 })
@@ -211,6 +324,31 @@ impl SavedSeedBrowserState<NativeFileName> {
             new_slot_time,
             visible_rows,
         )
+    }
+}
+
+impl<I> SavedSeedBrowserState<I> {
+    /// The name field's caret phase: one second on, one second off from the
+    /// browser's opening. The caret is drawn only while the field has focus.
+    pub fn caret_blink_on(&self) -> bool {
+        self.opened_at.elapsed().as_millis() % 2000 < 1000
+    }
+
+    /// Raise a message box over the browser. It takes the edit focus and ends
+    /// any held press or scroll repeat; its buttons own input until answered.
+    pub fn show_prompt(&mut self, prompt: SavedSeedPrompt<I>) {
+        self.description_edit.focused = false;
+        self.pressed_control = None;
+        self.scroll_repeat_at = None;
+        self.prompt = Some(prompt);
+    }
+
+    /// Window focus loss: the release that would end the held press, the
+    /// scroll repeat and the double-click pair never arrives.
+    pub fn reset_interaction(&mut self) {
+        self.pressed_control = None;
+        self.scroll_repeat_at = None;
+        self.last_list_press = None;
     }
 }
 
@@ -232,6 +370,7 @@ impl<I: Clone + PartialEq> SavedSeedBrowserState<I> {
                 description: empty_slot_label,
                 last_write_time: new_slot_time,
                 visible: true,
+                loadable: true,
             });
         }
         rows.extend(entries);
@@ -266,7 +405,7 @@ impl<I: Clone + PartialEq> SavedSeedBrowserState<I> {
             pressed_control: None,
             prompt: None,
             scroll_repeat_at: None,
-            opened_at: std::time::Instant::now(),
+            opened_at: crate::util::time::Instant::now(),
             last_list_press: None,
             current_description,
         };
@@ -329,7 +468,7 @@ impl<I: Clone + PartialEq> SavedSeedBrowserState<I> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
 
@@ -422,6 +561,24 @@ mod tests {
     }
 
     #[test]
+    fn open_composition_splices_at_the_caret_and_scrolls_to_its_cursor() {
+        let mut edit = SavedSeedDescriptionEdit::default();
+        edit.insert_text("abcd");
+        edit.left();
+        edit.left();
+        let composition: Vec<u16> = "xyz".encode_utf16().collect();
+        // Ten pixels a unit: thirty pixels show three units.
+        let (view, units) = edit.with_composition(&composition, 2, 30, |text| {
+            text.encode_utf16().count() as u32 * 10
+        });
+        assert_eq!(view.display_text(), "abxyzcd");
+        assert_eq!(units, 2..5);
+        assert_eq!(view.caret, 4, "the caret sits at the composition cursor");
+        assert_eq!(view.first_visible_unit, 1, "scrolled to keep it in view");
+        assert_eq!(edit.display_text(), "abcd", "the edit keeps its own text");
+    }
+
+    #[test]
     fn edit_operates_on_utf16_units_and_programmatic_assignment_is_bounded() {
         let mut edit = SavedSeedDescriptionEdit::default();
         edit.set_text(&SeedDescription::from_units([0xd83d, 0xde00, 0x41]));
@@ -448,6 +605,7 @@ mod tests {
                 description: "Saved description".into(),
                 last_write_time: 110,
                 visible: true,
+                loadable: true,
             }],
             "Working".into(),
             "[EMPTY SLOT]".into(),
@@ -489,6 +647,7 @@ mod tests {
                 description: SeedDescription::default(),
                 last_write_time: 1,
                 visible: true,
+                loadable: true,
             }],
             SeedDescription::default(),
             "[EMPTY SLOT]".into(),

@@ -31,11 +31,7 @@ fn ground_head(
             rx,
             ry,
             crate::sim::movement::locomotor::MovementLayer::Ground,
-            world
-                .production
-                .terrain_object_cells
-                .get(&(rx, ry))
-                .copied(),
+            world.terrain_objects.members_at((rx, ry)),
         )
         .next()
 }
@@ -52,7 +48,7 @@ pub(super) fn emit_projectile_shrapnel(
     let Some(parent_projectile) = detonation
         .payload
         .projectile_type()
-        .and_then(|kind| rules.projectile(world.interner.resolve(kind)))
+        .and_then(|kind| world.interner.projectile_type(kind, rules))
     else {
         return;
     };
@@ -62,11 +58,7 @@ pub(super) fn emit_projectile_shrapnel(
     let Some(child_weapon) = rules.weapon(child_weapon_name) else {
         return;
     };
-    let Some(child_projectile) = child_weapon
-        .projectile
-        .as_deref()
-        .and_then(|name| rules.projectile(name))
-    else {
+    let Some(child_projectile) = rules.weapon_projectile(child_weapon) else {
         return;
     };
     let Some(child_warhead_name) = child_weapon.warhead.as_deref() else {
@@ -154,7 +146,7 @@ pub(super) fn emit_projectile_shrapnel(
                 // Terrain+48 is ObjectGetCoords5F65A0: retained Location,
                 // including construction Z, never a fresh ground sample.
                 ProjectileTarget::Terrain(id) => {
-                    let Some(terrain) = world.production.terrain_objects.get(&id) else {
+                    let Some(terrain) = world.terrain_objects.objects().get(&id) else {
                         return;
                     };
                     terrain.world_coord()
@@ -193,6 +185,14 @@ pub(super) fn emit_projectile_shrapnel(
                 world.interner.intern(child_warhead_name),
                 Some(world.interner.intern(&child_projectile.id)),
                 child_weapon.bright,
+            )
+            // Ares BulletClass_Shrapnel_WeaponType1/2 (1001ABF0, hooks
+            // 0x46A5B2 and 0x46AA27) store the shrapnel weapon in the child's
+            // WeaponType (+0x130) before its Fire.
+            .with_installed_weapon(
+                rules
+                    .ares()
+                    .then(|| world.interner.intern(&child_weapon.id)),
             ),
             speed_leptons_per_frame: child_weapon.speed.clamp(1, i32::from(u16::MAX)) as u16,
             velocity: crate::sim::projectile::launch::shrapnel_launch_velocity(
@@ -227,10 +227,14 @@ pub(super) fn emit_projectile_shrapnel(
                 flak_scatter: child_projectile.flak_scatter,
                 anti_air: child_projectile.aa,
                 airburst: child_projectile.airburst,
+                explodes_airburst: Some(child_projectile.airburst_arm()),
                 inaccurate: child_projectile.inaccurate,
                 floater: child_projectile.floater,
+                #[cfg(feature = "phobos")]
+                gravity: child_projectile.gravity(),
                 elasticity_bits: child_projectile.elasticity.to_bits(),
                 arcing: child_projectile.arcing,
+                subject_to_solid: rules.ares() && child_projectile.bullet_type_ext.subject_to_solid,
             },
         };
         world.admit_projectile_spawns([spawn], rules);
@@ -304,11 +308,9 @@ pub(super) fn emit_projectile_shrapnel(
                     continue;
                 };
                 if source_owner.is_some_and(|owner| {
-                    crate::map::houses::is_allied_with(
-                        &world.house_alliances,
-                        world.interner.resolve(owner),
-                        world.interner.resolve(target.owner()),
-                    )
+                    world
+                        .house_alliances
+                        .is_allied(&world.interner, owner, target.owner())
                 }) {
                     continue;
                 }
@@ -342,27 +344,15 @@ pub(super) fn emit_projectile_shrapnel(
                 crate::sim::projectile::cell_target_coord(None, rx as u16, ry as u16),
             )
         } else {
-            match crate::sim::cell_rect::get_cellclass_fallback(
+            let cell = crate::sim::cell_rect::get_cellclass_fallback(
                 world.resolved_terrain.as_ref(),
                 rx,
                 ry,
-            ) {
-                crate::sim::cell_rect::CellRef::Real(cell) => (
-                    ProjectileTarget::Cell {
-                        rx: cell.rx,
-                        ry: cell.ry,
-                    },
-                    crate::sim::projectile::cell_target_coord(
-                        world.resolved_terrain.as_ref(),
-                        cell.rx,
-                        cell.ry,
-                    ),
-                ),
-                crate::sim::cell_rect::CellRef::Dummy { cell } => (
-                    ProjectileTarget::DummyCell,
-                    crate::sim::projectile::dummy_cell_target_coord(&cell),
-                ),
-            }
+            );
+            (
+                ProjectileTarget::of_cell(&cell),
+                crate::sim::projectile::cell_ref_target_coord(&cell),
+            )
         };
         construct(world, target, Some(initial_target_position), Some((rx, ry)));
         emitted += 1;

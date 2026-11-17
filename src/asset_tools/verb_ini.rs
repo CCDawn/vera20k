@@ -224,6 +224,9 @@ fn assemble_type(rules: &RuleSet, type_id: &str, layers: Vec<Value>) -> Result<V
             "ui_name": object.ui_name,
             "image": object.image,
             "category": object.category,
+            "no_shadow": object.no_shadow,
+            "considered_aircraft": object.considered_aircraft,
+            "voxel_shadow_index": object.voxel_shadow_index(),
             "locomotor": object.locomotor,
             "locomotor_clsid": object.locomotor.clsid(),
             "speed_type": object.speed_type,
@@ -251,7 +254,7 @@ fn assemble_type(rules: &RuleSet, type_id: &str, layers: Vec<Value>) -> Result<V
         "limits": [
             "Fields come from the final Rust scenario RuleSet, including its constructors/readers/post-passes; this report alone establishes no new native equivalence.",
             "Jumpjet parameters are stored type values on every ObjectType, independent of JumpJet. Locomotor Link conversions/clamps and live flight state are not applied.",
-            "Rules inspection executes the supported noncampaign skirmish path with the special TMCJ4F flag absent; campaign passes, LANGRULE Digest handling and that flagged extra pass are not modeled.",
+            "Rules inspection executes the supported noncampaign skirmish path, including the LANGRULE Digest check, with the THETEAM flag absent; campaign passes and the TMCJ4F pass are not run.",
             "Existing production parser/reader residuals remain; no replacement parser or type loader is used."
         ],
     }))
@@ -279,7 +282,7 @@ fn assemble(
         "result_kind": "production_ini_accessor",
         "limits": [
             "An accessor result is not a final gameplay field: constructors, type allocation timing, field-specific defaults/clamps, art indirection and post-read passes may change it.",
-            "Rules inspection executes the supported noncampaign skirmish path with the special TMCJ4F flag absent; campaign passes, LANGRULE Digest handling and that flagged extra pass are not modeled.",
+            "Rules inspection executes the supported noncampaign skirmish path, including the LANGRULE Digest check, with the THETEAM flag absent; campaign passes and the TMCJ4F pass are not run.",
             "Authored values reflect the production byte parser: empty values are omitted and duplicate-key resolution retains its documented stock-inert residual.",
             "Reader residuals remain: malformed ReadDouble/coord values use deterministic Rust recovery; ReadRange overflow differs from native. No new native equivalence is claimed."
         ],
@@ -312,9 +315,11 @@ fn run_inner(
         let IniQuery::Accessor { section, key } = query else {
             unreachable!("validated art accessor")
         };
-        let art = select_ini(assets, "artmd.ini")?;
+        let art = select_ini(assets, assets.ini_roots().art())?;
         let layers = vec![layer("fixed_art", json!(art.source), Some(&art.ini), query)];
-        return assemble(&art.ini, section, key, options, layers);
+        let mut report = assemble(&art.ini, section, key, options, layers)?;
+        report["ini_roots"] = json!(assets.ini_roots());
+        return Ok(report);
     }
     let audio_definitions = crate::rules::audio_sources::AudioDefinitions::select(assets);
     let sources = RetailRulesSources::select(assets)?;
@@ -339,7 +344,7 @@ fn run_inner(
     let id = options.mode_id.expect("validated mode id");
     let mode = crate::skirmish_modes::mode_by_id(&modes, id)
         .ok_or_else(|| format!("mode id {id} is absent from MPModesMD.ini"))?;
-    if !mode.class.lists_in_skirmish() {
+    if !mode.class.policy().lists_in_skirmish {
         return Err(format!(
             "mode id {id} is not in the supported noncampaign skirmish list"
         ));
@@ -413,6 +418,7 @@ fn run_inner(
         IniQuery::Type { type_id } => assemble_type(&rules, type_id, layers)?,
     };
     report["mode_roster_source"] = json!(roster.source);
+    report["ini_roots"] = json!(assets.ini_roots());
     report["mode"] = json!({"id": mode.id, "class": format!("{:?}", mode.class), "override_file": mode.override_file});
     report["source_selection_route"] =
         json!("app_noncampaign_startup_then_shell_registration_then_map_then_theater_then_mode");
@@ -428,7 +434,7 @@ fn run_inner(
     Ok(report)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
     use crate::rules::process_owner::NativeRulesProcessOwner;
@@ -440,6 +446,38 @@ mod tests {
             default: (reader != "raw").then(|| default.into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn ini_roots_art_probe_reads_selected_mo_source_and_reports_choice() {
+        use crate::util::ini_roots::{IniProfile, IniRootConfig};
+        let dir = crate::map::source::test_support::TestDirectory::new("ini-roots-art-tool");
+        dir.write("rulesmo.ini", b"[General]\nBuildSpeed=.7\n");
+        dir.write("artmo.ini", b"[TEST]\nVoxel=yes\n");
+        dir.write("aimo.ini", b"[Marker]\nValue=MO\n");
+        dir.write("artmd.ini", b"[TEST]\nVoxel=no\n");
+        let mut assets = AssetManager::from_loose_root_for_test(dir.path())
+            .with_ini_roots(&IniRootConfig {
+                profile: IniProfile::Mo,
+                ..Default::default()
+            })
+            .unwrap();
+        let report = run(
+            &mut assets,
+            dir.path(),
+            IniQuery::Accessor {
+                section: "TEST",
+                key: "Voxel",
+            },
+            &options("bool", "false"),
+        )
+        .unwrap();
+        assert_eq!(report["ini_roots"]["art"], "artmo.ini");
+        assert_eq!(
+            report["authored_layers"][0]["source"]["logical_name"],
+            "artmo.ini"
+        );
+        assert_eq!(report["accessor_result"], serde_json::json!(true));
     }
 
     #[test]
@@ -547,12 +585,14 @@ mod tests {
             "[VehicleTypes]\n0=UNIT\n[UNIT]\nName=Fixture unit\n\
              Locomotor={92612C46-F71F-11D1-AC9F-006008055BB5}\n\
              BalloonHover=yes\nIsSimpleDeployer=yes\nDeployToLand=no\nHoverAttack=yes\n\
+             NoShadow=yes\nConsideredAircraft=yes\nShadowIndex=7\n\
              JumpjetTurnRate=7\nJumpjetSpeed=27\nJumpjetClimb=3.125\nJumpjetCrash=9.5\n\
              JumpjetHeight=600\nJumpjetAccel=1.25\nJumpjetWobbles=0.25\n\
              JumpjetNoWobbles=yes\nJumpjetDeviation=42\n",
         );
-        let mode =
-            IniFile::from_str("[UNIT]\nBalloonHover=no\nDeployToLand=yes\nJumpjetHeight=650\n");
+        let mode = IniFile::from_str(
+            "[UNIT]\nBalloonHover=no\nDeployToLand=yes\nJumpjetHeight=650\nNoShadow=no\n",
+        );
         let map = IniFile::from_str(
             "[UNIT]\nIsSimpleDeployer=no\nJumpjetClimb=6.5\nJumpjetSpeed=29.75\n\
              JumpjetWobbles=-0.0\nJumpJetTurnRate=99\nJumpJetAccel=99\n",
@@ -592,6 +632,11 @@ mod tests {
         assert_eq!(object["id"], "UNIT");
         assert_eq!(object["category"], "Vehicle");
         assert_eq!(object["locomotor"], "Jumpjet");
+        assert_eq!(object["no_shadow"], false);
+        assert_eq!(object["considered_aircraft"], true);
+        // ShadowIndex belongs to fixed ART, so the rules token cannot replace
+        // the native constructor default when ART supplies no value.
+        assert_eq!(object["voxel_shadow_index"], 0);
         assert_eq!(object["balloon_hover"], false);
         assert_eq!(object["is_simple_deployer"], false);
         assert_eq!(object["deploy_to_land"], true);
@@ -675,8 +720,8 @@ mod tests {
     #[ignore = "requires retail YR installation containing RiverRam.yro; run explicitly"]
     fn retail_yro_scenario_inspection_uses_retained_discovery() {
         let retail = std::path::PathBuf::from(std::env::var("RA2_DIR").expect("set RA2_DIR"));
-        let mut assets =
-            crate::asset_tools::root::open_manager(&retail, false).expect("retail manager");
+        let mut assets = crate::asset_tools::root::open_manager(&retail, false, Default::default())
+            .expect("retail manager");
         let query = IniOptions {
             domain: Some("rules".into()),
             reader: Some("speed".into()),

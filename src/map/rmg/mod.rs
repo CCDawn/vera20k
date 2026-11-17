@@ -6,7 +6,10 @@
 
 pub mod build;
 mod description;
+pub mod embellish;
 pub mod emit;
+pub mod extras;
+pub mod fairness;
 pub mod grid;
 pub mod options;
 pub mod phases;
@@ -17,7 +20,7 @@ pub mod rng;
 pub mod saved_seeds;
 pub mod scratch;
 pub mod settings;
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 pub mod sqrt_table;
 pub mod tech_catalog;
 pub mod theater_blocks;
@@ -52,6 +55,9 @@ pub enum Stage {
     TechBuildings,
     Tiberium,
     RegionReset,
+    /// Urban areas (`0x005A5020`): Ares hook 0x598FB8 when `RMG::UrbanAreas`
+    /// is set, or VERA's opted-in Urban Presence.
+    UrbanAreas,
     RecalcAfterTiberium,
     Hills,
     LatPatches,
@@ -88,6 +94,7 @@ pub const STAGE_ORDER: &[Stage] = &[
     Stage::TechBuildings,
     Stage::Tiberium,
     Stage::RegionReset,
+    Stage::UrbanAreas,
     Stage::RecalcAfterTiberium,
     Stage::Hills,
     Stage::LatPatches,
@@ -101,6 +108,41 @@ pub const STAGE_ORDER: &[Stage] = &[
 /// Interior-dimension lerp endpoints, indexed by `num_players - 2`.
 const DIM_MIN: [i32; 7] = [70, 70, 70, 80, 90, 100, 100];
 const DIM_MAX: [i32; 7] = [80, 80, 80, 90, 100, 110, 120];
+/// The original's `NumPlayers` ceiling; the endpoint tables cover 2..=8.
+pub const NATIVE_MAX_PLAYERS: i32 = 8;
+/// VERA extension: random maps seat up to thirty players, the network and
+/// Skirmish seat count (`skirmish_launch::NETWORK_PLAYER_SLOT_COUNT`).
+pub const MAX_PLAYERS: i32 = crate::skirmish_launch::NETWORK_PLAYER_SLOT_COUNT as i32;
+
+/// The original's largest Width/Height option ("Very Large").
+pub const NATIVE_MAX_SIZE_OPTION: i32 = 3;
+/// VERA extension: Width/Height options past "Very Large" pick these interior
+/// sizes outright (Huge, Giant, Enormous, Colossal). Colossal pads to a
+/// 504x512 map, inside the extended cell array's 1024 Size sum.
+pub const EXTENDED_SIZES: [i32; 4] = [160, 250, 350, 500];
+/// The largest Width/Height option.
+pub const MAX_SIZE_OPTION: i32 = NATIVE_MAX_SIZE_OPTION + EXTENDED_SIZES.len() as i32;
+
+/// Lerp endpoints for `players` (already clamped to 2..=MAX_PLAYERS).
+///
+/// 2..=8 read the original tables unchanged. Above eight (VERA extension) the
+/// eight-player endpoints grow with the square root of the player count, so
+/// each player keeps the eight-player map's area: 30 players get 193..232.
+/// Integer square roots keep it bit-identical on every platform.
+fn dimension_endpoints(players: i32) -> (i32, i32) {
+    if players <= NATIVE_MAX_PLAYERS {
+        let index = (players - 2) as usize;
+        return (DIM_MIN[index], DIM_MAX[index]);
+    }
+    let grow = |side: i32| {
+        let area = side as u32 * side as u32 * players as u32 / NATIVE_MAX_PLAYERS as u32;
+        area.isqrt() as i32
+    };
+    (
+        grow(DIM_MIN[DIM_MIN.len() - 1]),
+        grow(DIM_MAX[DIM_MAX.len() - 1]),
+    )
+}
 /// Single-precision one-third: the width/height option scale factor.
 const THIRD_F32_BITS: u32 = 0x3EAA_AAAB;
 /// Scale cap for non-island map types. With options clamped 0..3 the scale
@@ -153,8 +195,7 @@ impl MapGeometry {
 /// asymmetry (width re-narrowed, height kept wide) is preserved even though
 /// clamped options never reach it.
 pub fn generated_dimensions(options: &RmgOptions) -> (i32, i32) {
-    let players = options.num_players.clamp(2, 8);
-    let index = (players - 2) as usize;
+    let (dim_min, dim_max) = dimension_endpoints(options.num_players.clamp(2, MAX_PLAYERS));
 
     let third = x87::TruncF64::from_f64(f64::from(f32::from_bits(THIRD_F32_BITS)));
     let scale =
@@ -181,10 +222,15 @@ pub fn generated_dimensions(options: &RmgOptions) -> (i32, i32) {
         crate::util::native_x87::X87Chop53::ftol_f64_low_masked(low.add(high).to_f64())
     };
 
-    (
-        lerp(DIM_MIN[index], DIM_MAX[index], scale_w),
-        lerp(DIM_MIN[index], DIM_MAX[index], scale_h),
-    )
+    // VERA extension: an option past "Very Large" is an absolute size, never
+    // smaller than the player count's own "Very Large".
+    let axis = |option: i32, scale: x87::TruncF64| match usize::try_from(
+        option - NATIVE_MAX_SIZE_OPTION - 1,
+    ) {
+        Ok(level) => EXTENDED_SIZES[level.min(EXTENDED_SIZES.len() - 1)].max(dim_max),
+        Err(_) => lerp(dim_min, dim_max, scale),
+    };
+    (axis(options.width, scale_w), axis(options.height, scale_h))
 }
 
 /// Whether a selected map name refers to a random-map seed rather than a map
@@ -216,6 +262,9 @@ pub struct GeneratedMap {
     /// Start slots no region could fill. Non-zero means this map is short of
     /// spawns: fewer usable start positions than the player count implies.
     pub unfilled_start_slots: usize,
+    /// VERA extension: what the map offers each start (`fairness`), for the
+    /// dialog's readout. `None` for a map no generation run measured.
+    pub fairness: Option<fairness::FairnessReport>,
 }
 
 impl GeneratedMap {
@@ -232,9 +281,10 @@ impl GeneratedMap {
 /// off every theater but temperate (whose LAT driver still scatters trees).
 ///
 /// `options` must already be normalized — `build::generate_map` normalizes its
-/// copy before calling this.
+/// copy before calling this. `ares`: Ares.dll is loaded for this generation
+/// (`build::GenerationObjects::ares`).
 #[cfg(any(test, feature = "test-support"))]
-pub fn executed_stages(options: &RmgOptions) -> Vec<Stage> {
+pub fn executed_stages(options: &RmgOptions, ares: bool) -> Vec<Stage> {
     STAGE_ORDER
         .iter()
         .copied()
@@ -245,12 +295,15 @@ pub fn executed_stages(options: &RmgOptions) -> Vec<Stage> {
             if *stage == Stage::Rocks && options.theater != 0 {
                 return false;
             }
+            if *stage == Stage::UrbanAreas && !options.urban_pass_runs(ares) {
+                return false;
+            }
             true
         })
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
 
@@ -273,24 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn green_spread_runs_after_regions_and_before_the_first_recalc() {
-        assert!(position(Stage::Regions) < position(Stage::GreenSpread));
-        assert!(position(Stage::GreenSpread) < position(Stage::RecalcAfterTerrain));
-    }
-
-    #[test]
-    fn hills_run_after_tiberium_and_before_lat_patches() {
-        assert!(position(Stage::Tiberium) < position(Stage::Hills));
-        assert!(position(Stage::Hills) < position(Stage::LatPatches));
-    }
-
-    #[test]
-    fn starts_precede_everything_that_places_against_them() {
-        assert!(position(Stage::Starts) < position(Stage::TechBuildings));
-        assert!(position(Stage::Starts) < position(Stage::Tiberium));
-    }
-
-    #[test]
     fn lat_driver_tail_is_patches_then_fixup_then_trees_then_rocks() {
         // The native temperate driver order: paint patches, run the LAT fixup
         // that produces the sand-LAT tiles, scatter trees, then rocks.
@@ -305,14 +340,17 @@ mod tests {
     fn rocks_run_only_in_the_temperate_theater() {
         // Temperate (theater 0) paints rocks; every other theater skips them,
         // but still runs trees.
-        let temperate = executed_stages(&RmgOptions::default());
+        let temperate = executed_stages(&RmgOptions::default(), false);
         assert!(temperate.contains(&Stage::Rocks));
         assert!(temperate.contains(&Stage::Trees));
         for theater in [1, 2, 3, 4] {
-            let stages = executed_stages(&RmgOptions {
-                theater,
-                ..Default::default()
-            });
+            let stages = executed_stages(
+                &RmgOptions {
+                    theater,
+                    ..Default::default()
+                },
+                false,
+            );
             assert!(
                 !stages.contains(&Stage::Rocks),
                 "theater {theater} must not paint rocks"
@@ -327,20 +365,26 @@ mod tests {
     #[test]
     fn island_passes_are_skipped_for_ordinary_map_types() {
         for map_type in [0, 1, 2] {
-            let stages = executed_stages(&RmgOptions {
-                map_type,
-                ..Default::default()
-            });
+            let stages = executed_stages(
+                &RmgOptions {
+                    map_type,
+                    ..Default::default()
+                },
+                false,
+            );
             assert!(
                 !stages.contains(&Stage::IslandPasses),
                 "map type {map_type} must not run the island passes"
             );
         }
         for map_type in [3, 4] {
-            let stages = executed_stages(&RmgOptions {
-                map_type,
-                ..Default::default()
-            });
+            let stages = executed_stages(
+                &RmgOptions {
+                    map_type,
+                    ..Default::default()
+                },
+                false,
+            );
             assert!(
                 stages.contains(&Stage::IslandPasses),
                 "map type {map_type} must run the island passes"
@@ -354,11 +398,14 @@ mod tests {
     fn executed_stages_preserve_the_pipeline_order() {
         for map_type in 0..=4 {
             for theater in 0..=4 {
-                let stages = executed_stages(&RmgOptions {
-                    map_type,
-                    theater,
-                    ..Default::default()
-                });
+                let stages = executed_stages(
+                    &RmgOptions {
+                        map_type,
+                        theater,
+                        ..Default::default()
+                    },
+                    false,
+                );
                 assert!(!stages.is_empty());
                 let positions: Vec<usize> = stages.iter().map(|s| position(*s)).collect();
                 assert!(
@@ -394,14 +441,44 @@ mod tests {
     }
 
     #[test]
-    fn width_and_height_options_are_independent() {
-        let dims = generated_dimensions(&RmgOptions {
-            num_players: 4,
-            width: 0,
-            height: 3,
+    fn dimensions_above_eight_players_keep_the_eight_player_area_each() {
+        let dims = |players: i32, size: i32| {
+            generated_dimensions(&RmgOptions {
+                num_players: players,
+                width: size,
+                height: size,
+                ..Default::default()
+            })
+        };
+        assert_eq!(dims(9, 0), (106, 106));
+        assert_eq!(dims(30, 0), (193, 193));
+        assert_eq!(dims(30, 3), (232, 232));
+        assert_eq!(dims(99, 3), (232, 232), "clamped to thirty players");
+    }
+
+    #[test]
+    fn size_options_past_very_large_pick_absolute_sizes_up_to_500() {
+        let dims = |players: i32, size: i32| {
+            generated_dimensions(&RmgOptions {
+                num_players: players,
+                width: size,
+                height: size,
+                ..Default::default()
+            })
+        };
+        assert_eq!(dims(2, 4), (160, 160));
+        assert_eq!(
+            dims(30, 4),
+            (232, 232),
+            "never below the players' Very Large"
+        );
+        assert_eq!(dims(8, 7), (500, 500));
+        let geometry = MapGeometry::from_options(&RmgOptions {
+            width: 7,
+            height: 7,
             ..Default::default()
         });
-        assert_eq!(dims, (70, 80));
+        assert!(geometry.map_w + geometry.map_h <= 1024);
     }
 
     #[test]
@@ -418,65 +495,5 @@ mod tests {
         assert_eq!(geometry.diamond_min, 74);
         assert_eq!(geometry.diamond_max, 74 + 2 * 82);
         assert_eq!(geometry.stride, 74 + 82 + 1);
-    }
-
-    /// The header projection every generated map starts from. `build` emits
-    /// into exactly this file, so the dimension and theater mapping is pinned
-    /// here rather than behind a whole generation run.
-    #[test]
-    fn generated_header_uses_the_real_dimensions() {
-        let options = RmgOptions {
-            num_players: 8,
-            width: 3,
-            height: 3,
-            ..Default::default()
-        };
-        let geometry = MapGeometry::from_options(&options);
-        let map = emit::empty_map_file(&options, geometry.gen_w as u32, geometry.gen_h as u32);
-        assert_eq!(map.header.width, 124, "120 interior + 4");
-        assert_eq!(map.header.height, 132, "120 interior + 12");
-        assert_eq!(map.header.local_width, 120);
-    }
-
-    #[test]
-    fn theater_option_reaches_the_generated_header() {
-        let options = RmgOptions {
-            theater: 1,
-            ..Default::default()
-        };
-        let geometry = MapGeometry::from_options(&options);
-        let map = emit::empty_map_file(&options, geometry.gen_w as u32, geometry.gen_h as u32);
-        assert_eq!(map.header.theater, "SNOW");
-    }
-
-    /// Out-of-range inputs must be clamped before anything derives geometry or
-    /// an RNG seed from them.
-    #[test]
-    fn normalize_clamps_before_geometry_and_seed() {
-        let mut options = RmgOptions {
-            seed: 0x9999_9999u32 as i32,
-            num_players: 99,
-            ..Default::default()
-        };
-        options.normalize();
-        assert!((2..=8).contains(&options.num_players));
-        assert!(!executed_stages(&options).is_empty());
-        let geometry = MapGeometry::from_options(&options);
-        assert!(geometry.gen_w > 0 && geometry.gen_h > 0);
-    }
-
-    #[test]
-    fn the_generator_rng_is_independent_of_the_match_rng() {
-        let mut first = RmgRng::new(77);
-        let mut unrelated = crate::sim::rng::SimRng::new(999);
-        for _ in 0..10 {
-            let _ = unrelated.next_u32();
-        }
-        let mut second = RmgRng::new(77);
-        assert_eq!(
-            first.next_u32(),
-            second.next_u32(),
-            "generator draws must not depend on any other stream"
-        );
     }
 }

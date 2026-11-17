@@ -23,6 +23,7 @@ from unicorn import Uc, UC_ARCH_X86, UC_MODE_32, UC_HOOK_CODE
 from unicorn.x86_const import UC_X86_REG_EAX, UC_X86_REG_ECX, UC_X86_REG_ESP
 
 from tools import native_oracle as oracle
+from tools.tests.pe_fixture import pe_image
 
 
 CODE = 0x1000
@@ -332,7 +333,7 @@ class IdentityAndReferenceTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.target = Path(self.directory.name) / "vectors.json"
-        self.metadata = {"native_sha256": "synthetic-test-only", "unicorn_core": [2, 1, 0]}
+        self.metadata = {"scope": "synthetic-test-only", "unicorn_core": [2, 1, 0]}
         # The recorded command depends on how the suite was launched.
         replay = patch.object(oracle.oracle_sources, "replay_command", return_value=None)
         replay.start()
@@ -353,29 +354,56 @@ class IdentityAndReferenceTests(unittest.TestCase):
     def sidecar(self, suffix=".meta.json"):
         return json.loads(self.target.with_suffix(suffix).read_text(encoding="utf-8"))
 
-    def test_wrong_executable_is_rejected_explicitly(self):
-        self.target.write_bytes(b"not the original executable")
-        with self.assertRaisesRegex(oracle.OracleError, "Unsupported gamemd.exe SHA-256"):
-            oracle._verified_image(self.target)
+    def configure_executable(self, data=b"any gamemd.exe build"):
+        executable = Path(self.directory.name) / "gamemd.exe"
+        executable.write_bytes(data)
+        environment = patch.dict(os.environ, {"VERA20K_GAMEMD_EXE": str(executable)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        oracle._image.cache_clear()
+        self.addCleanup(oracle._image.cache_clear)
+        return hashlib.sha256(data).hexdigest()
 
-    def test_both_supported_executable_identities_load_the_same_read_bytes(self):
-        self.target.write_bytes(b"synthetic identity test, not native evidence")
-        self.addCleanup(oracle._verified_image.cache_clear)
-        for digest in (oracle.NATIVE_SHA256, oracle.STEAM_NATIVE_SHA256):
-            with self.subTest(digest=digest), patch.object(oracle.hashlib, "sha256") as sha:
-                sha.return_value.hexdigest.return_value = digest
-                oracle._verified_image.cache_clear()
-                self.assertEqual(oracle._verified_image(self.target), self.target.read_bytes())
+    def test_any_executable_loads_without_an_identity_check(self):
+        for data in (pe_image(), b"any gamemd.exe build"):
+            with self.subTest(size=len(data)):
+                self.target.write_bytes(data)
+                oracle._image.cache_clear()
+                self.addCleanup(oracle._image.cache_clear)
+                self.assertEqual(oracle._image(self.target), data)
+        metadata = oracle.provenance(scope="synthetic", assumptions=["not native evidence"],
+                                     substitutions=[], entry_points={"test": CODE})
+        self.assertNotIn("native_sha256", metadata)
 
-    def test_actual_input_identity_is_not_the_legacy_reference_identity(self):
-        data = b"synthetic execution bytes"
-        with patch.object(oracle, "image_bytes", return_value=data):
-            actual = hashlib.sha256(data).hexdigest()
-            self.assertEqual(oracle.image_sha256(), actual)
-            self.assertNotEqual(actual, oracle.NATIVE_SHA256)
-            metadata = oracle.provenance(scope="synthetic", assumptions=["not native evidence"],
-                                         substitutions=[], entry_points={"test": CODE})
-            self.assertEqual(metadata["native_sha256"], actual)
+    def test_another_runtime_version_is_not_a_provenance_change(self):
+        self.finish({"value": 42}, "--write")
+        before = self.files()
+        provenance = dict(self.metadata, unicorn_binding="2.1.5", unicorn_core=[2, 2, 0])
+        self.assertIn("PASS", self.finish({"value": 42}, provenance=provenance))
+        self.assertEqual(before, self.files())
+
+    def test_the_configured_executables_hash_is_never_published(self):
+        digest = self.configure_executable()
+        with self.assertRaisesRegex(oracle.OracleError, r"gamemd\.exe hash at vectors\.json \$\.build\b"):
+            self.finish({"build": digest, "value": 42}, "--write")
+        provenance = dict(self.metadata, gamemd_sha256=digest)
+        with self.assertRaisesRegex(oracle.OracleError, r"vectors\.meta\.json \$\.gamemd_sha256"):
+            self.finish({"value": 42}, "--write", provenance=provenance)
+        with self.assertRaisesRegex(oracle.OracleError, r"vectors\.raw\.json\.gz \$\.rows\[\*\]\.build"):
+            self.finish({"rows": [{"build": digest}], "value": 1}, "--write",
+                        projection=lambda raw: {"value": raw["value"]})
+        self.assertEqual(self.files(), {})
+        # A reference that already holds this build's hash is not grandfathered.
+        self.target.write_text(json.dumps({"build": digest.upper()}))
+        with self.assertRaisesRegex(oracle.OracleError, "Remove these fields from the producer"):
+            self.finish({"build": digest.upper()})
+
+    def test_another_builds_hash_is_compared_as_ordinary_payload(self):
+        # Only the configured executable's own hash is recognized. Every build
+        # is the same game, so no other build's hash is named in code.
+        self.configure_executable()
+        self.target.write_text(json.dumps({"value": "ab" * 32}))
+        self.assertIn("PASS", self.finish({"value": "ab" * 32}))
 
     def test_explicit_missing_path_does_not_fall_back(self):
         (self.target.parent / "gamemd.exe").write_bytes(b"fallback must not be selected")
@@ -414,7 +442,7 @@ class IdentityAndReferenceTests(unittest.TestCase):
     def test_provenance_change_rejects_matching_payload(self):
         self.finish({"value": 42}, "--write")
         with self.assertRaisesRegex(oracle.OracleError, "Provenance mismatch"):
-            self.finish({"value": 42}, provenance=dict(self.metadata, unicorn_core=[2, 2, 0]))
+            self.finish({"value": 42}, provenance=dict(self.metadata, scope="another claim"))
 
     def test_projection_preserves_full_raw_and_checks_deterministic_archive(self):
         data = {"value": 42, "raw": {"bytes": "001122", "retained": [1, 2, 3]}}
@@ -437,6 +465,20 @@ class IdentityAndReferenceTests(unittest.TestCase):
         self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before})
         self.finish(data, "--write", projection=projection)
         self.assertEqual(archive.read_bytes(), compressed)
+
+    def test_projection_accepts_an_archive_another_zlib_compressed(self):
+        data = {"value": 42, "raw": [1, 2, 3]}
+        projection = lambda raw: {"value": raw["value"]}
+        self.finish(data, "--write", projection=projection)
+        archive = self.target.with_suffix(".raw.json.gz")
+        archive.write_bytes(gzip.compress(gzip.decompress(archive.read_bytes()), compresslevel=1, mtime=0))
+        for suffix in (".meta.json", ".raw.meta.json"):
+            sidecar = self.target.with_suffix(suffix)
+            metadata = json.loads(sidecar.read_text())
+            metadata["raw_archive"].update(sha256="0" * 64, bytes=1)
+            metadata["raw_archive"]["compression"]["zlib_runtime"] = "another build"
+            sidecar.write_text(json.dumps(metadata))
+        self.assertIn("PASS", self.finish(data, projection=projection))
 
     def test_projection_optional_raw_hash_guard_rejects_before_publication(self):
         data = {"value": 42, "raw": [1, 2, 3]}
@@ -474,7 +516,7 @@ class IdentityAndReferenceTests(unittest.TestCase):
         self.finish(data, "--write", projection=projection)
         sidecar = self.target.with_suffix(".raw.meta.json")
         metadata = json.loads(sidecar.read_text())
-        metadata["native_sha256"] = "altered-only-in-raw-receipt"
+        metadata["scope"] = "altered-only-in-raw-receipt"
         sidecar.write_text(json.dumps(metadata))
         with self.assertRaisesRegex(oracle.OracleError, "Full raw archive provenance mismatch"):
             self.finish(data, projection=projection)
@@ -519,7 +561,7 @@ class IdentityAndReferenceTests(unittest.TestCase):
             self.finish({'value': 43}, source_paths={'helper': source})
         with self.assertRaisesRegex(oracle.OracleMismatch, 'Provenance mismatch'):
             self.finish({'value': 42}, source_paths={'helper': source},
-                        provenance=dict(self.metadata, unicorn_core=[2, 2, 0]))
+                        provenance=dict(self.metadata, scope='another claim'))
         self.assertEqual(before, self.files())
 
     def test_the_replay_command_is_recorded_but_not_evidence(self):
@@ -533,19 +575,9 @@ class IdentityAndReferenceTests(unittest.TestCase):
             self.assertIn('PASS', self.finish({'value': 42}))
         self.assertEqual(before, self.files())
 
-    def test_a_legacy_source_pin_from_another_branch_passes_and_write_drops_it(self):
-        self.finish({'value': 42}, '--write')
-        legacy = dict(self.sidecar(), source_normalized_lf_sha256={'tools/helper.py': '0' * 64})
-        self.target.with_suffix('.meta.json').write_text(json.dumps(legacy, indent=2) + '\n',
-                                                         encoding='utf-8')
-        self.assertIn('PASS', self.finish({'value': 42}))
-        self.finish({'value': 42}, '--write')
-        self.assertNotIn('source_normalized_lf_sha256', self.sidecar())
-
-    def test_producer_cannot_supply_source_pins_or_the_replay_command(self):
-        for name in ('source_normalized_lf_sha256', 'replay_command'):
-            with self.subTest(name=name), self.assertRaisesRegex(oracle.OracleError, 'pin no sources'):
-                self.finish({'value': 42}, '--write', provenance=dict(self.metadata, **{name: {}}))
+    def test_producer_cannot_supply_the_replay_command(self):
+        with self.assertRaisesRegex(oracle.OracleError, 'records the replay command'):
+            self.finish({'value': 42}, '--write', provenance=dict(self.metadata, replay_command='x'))
         self.assertFalse(self.target.exists())
 
     def test_help_does_not_evaluate_native_callables(self):

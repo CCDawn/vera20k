@@ -58,7 +58,7 @@ struct DiskLaser {
 
 /// Shared stable IDs are strictly increasing. Thus key order is the original
 /// vector's birth order; removal is stable without a second ordered registry.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(super) struct DiskLasers {
     shots: BTreeMap<u64, DiskLaser>,
 }
@@ -118,7 +118,7 @@ impl Simulation {
     /// calls Create_ID410230/68BCB0 or spends Scenario+214. Reserve only the
     /// independent Rust handle, before FireAt's GetROF continuation.
     pub(crate) fn construct_disk_laser(&mut self) -> u64 {
-        let id = self.allocate_stable_id();
+        let id = self.substrate.allocate_stable_id();
         assert!(
             self.disk_lasers
                 .shots
@@ -264,9 +264,7 @@ impl Simulation {
                 && let Some(building) = self.substrate.entities.get(target_id)
                 && building.category() == EntityCategory::Structure
             {
-                let (width, height) = crate::rules::foundation::foundation_dimensions(
-                    building.type_facts.foundation(),
-                );
+                let (width, height) = building.type_facts.foundation().dimensions();
                 distance = distance
                     .wrapping_sub((i32::from(width) + i32::from(height)) * 64)
                     .max(0);
@@ -313,7 +311,8 @@ impl Simulation {
                 let impact = effect_target_coordinate(self, rules, target.projectile_target(self))
                     .expect("Disk effect target");
                 construct(
-                    self,
+                    &self.session,
+                    &mut self.lifecycle_outputs,
                     first,
                     impact,
                     0,
@@ -322,18 +321,20 @@ impl Simulation {
                     NativeF32Bits::POSITIVE_ZERO,
                 );
                 let warhead_name = weapon.warhead.as_deref().expect("Disk damage warhead");
-                let warhead = rules.warhead(warhead_name).expect("Disk damage warhead");
+                let warhead = rules.weapon_warhead(weapon).expect("Disk damage warhead");
                 let warhead_id = self.interner.intern(warhead_name);
-                bridge_changed |= crate::sim::combat::world_receiver::apply_area_damage(
+                let receipt = crate::sim::combat::world_receiver::apply_area_damage(
                     self,
                     rules,
                     registry,
                     impact,
                     shot.damage,
                     warhead,
+                    true,
                     (source_id, None, warhead_id),
                     effects,
                 );
+                bridge_changed |= receipt.bridge_state_changed;
                 if let Some(source) = self.substrate.entities.get(source_id)
                     && let Some(report) = crate::sim::combat::world_fire::per_shot_report(
                         weapon,
@@ -341,7 +342,7 @@ impl Simulation {
                         source.techno_ctor_random_word(),
                     )
                 {
-                    self.sound_events.push(SimSoundEvent::voc_at_world_coord(
+                    self.sound_events.emit(SimSoundEvent::voc_at_world_coord(
                         report.to_owned(),
                         AnimWorldCoord {
                             x: first.x,
@@ -349,14 +350,61 @@ impl Simulation {
                             z: first.z,
                         },
                     ));
-                    effects.flush_sound(self, Some(rules));
+                    effects.flush_sound(self, rules);
+                }
+                // Ares DiskLaserClass_Update_Anim (1004CFF0, hook 0x4A76ED):
+                // with DiskLaserAnimEnabled, the warhead's damage animation
+                // over Clear land (AnimClass(type, coords, 0, 1, 0x600, 0)),
+                // then always the warhead's flash at the hit.
+                if rules.ares() {
+                    if rules.ares_general().disk_laser_anim_enabled()
+                        && let Some(anim) = crate::sim::combat::detonation_anim::select(
+                            self,
+                            rules,
+                            warhead,
+                            shot.damage,
+                            0,
+                            impact,
+                            receipt.crit_active,
+                        )
+                    {
+                        let coord = AnimWorldCoord {
+                            x: impact.x,
+                            y: impact.y,
+                            z: impact.z,
+                        };
+                        let (rx, ry, sub_x, sub_y, level) = coord.to_cell_sub_z();
+                        let descriptor = crate::sim::components::AnimClassSpawnDescriptor {
+                            delay: 0,
+                            loop_count: 1,
+                            draw_flags: 0x600,
+                            z_adjust: 0,
+                            reverse: false,
+                            ..crate::sim::components::AnimClassSpawnDescriptor::new(
+                                anim, rx, ry, sub_x, sub_y, level,
+                            )
+                        };
+                        if let Err(error) = self.spawn_anim_at_world(rules, descriptor, coord) {
+                            log::debug!("disk laser anim did not construct: {error}");
+                        }
+                    }
+                    self.combat_light_requests.emit(
+                        crate::sim::combat::CombatLightRequest::Impact {
+                            target_id: None,
+                            damage: shot.damage,
+                            warhead_ref: warhead_id,
+                            coord: impact,
+                            force_create: false,
+                            flags: 0,
+                        },
+                    );
                 }
                 self.disk_lasers.shots.get_mut(&id).unwrap().countdown = -1;
             } else {
                 if shot.step == 0
                     && let Some(sound) = rules.general.disk_laser_charge_up()
                 {
-                    self.sound_events.push(SimSoundEvent::voc_at_world_coord(
+                    self.sound_events.emit(SimSoundEvent::voc_at_world_coord(
                         sound.to_owned(),
                         AnimWorldCoord {
                             x: first.x,
@@ -364,11 +412,12 @@ impl Simulation {
                             z: first.z,
                         },
                     ));
-                    effects.flush_sound(self, Some(rules));
+                    effects.flush_sound(self, rules);
                 }
                 let duration = 8 - shot.step;
                 construct(
-                    self,
+                    &self.session,
+                    &mut self.lifecycle_outputs,
                     first,
                     point(a + 1),
                     0,
@@ -377,7 +426,8 @@ impl Simulation {
                     NativeF32Bits::from_bits(0x3F000000),
                 );
                 construct(
-                    self,
+                    &self.session,
+                    &mut self.lifecycle_outputs,
                     point(b),
                     point(b - 1),
                     0,
@@ -398,7 +448,7 @@ impl Simulation {
     /// Negative countdown never dereferences stale post-Detach pointers.
     pub(crate) fn validate_disk_lasers_after_restore(
         &self,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
     ) -> Result<(), (u64, &'static str)> {
         if self.disk_lasers.shots.is_empty() {
             return Ok(());
@@ -415,7 +465,7 @@ impl Simulation {
                 let Some(name) = self.interner.try_resolve(weapon) else {
                     return Err((id, "missing weapon identity"));
                 };
-                if rules.is_some_and(|rules| rules.weapon(name).is_none()) {
+                if rules.weapon(name).is_none() {
                     return Err((id, "missing retained weapon"));
                 }
             }
@@ -429,7 +479,7 @@ impl Simulation {
                 if !shot.target.is_some_and(|target| match target {
                     TargetKind::Entity(target) => {
                         self.substrate.entities.get(target).is_some()
-                            || self.production.terrain_objects.contains_key(&target)
+                            || self.terrain_objects.objects().contains_key(&target)
                     }
                     TargetKind::Cell(_, _) => true,
                 }) {

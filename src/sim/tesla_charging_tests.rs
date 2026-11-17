@@ -24,12 +24,23 @@ impl Fixture {
         let coil = sim
             .spawn_object("TESLA", "Americans", 12, 12, 0, &rules)
             .unwrap();
+        // The arena's GameMode 0 makes human Americans a controlled campaign
+        // House, whose power scan admits only discovered buildings (508CC7).
+        // Supply that discovered coil; the admission is tested separately.
+        sim.substrate
+            .entities
+            .get_mut(coil)
+            .unwrap()
+            .discovery
+            .set_discovered_by_current_house_for_test(true);
         let troopers = std::array::from_fn(|i| {
             sim.spawn_object("SHK", "Americans", 11, 12 + i as u16, 0, &rules)
                 .unwrap()
         });
         let owner = sim.interner.intern("Americans");
-        sim.power_states.insert(owner, PowerState::default());
+        sim.power_states
+            .map_mut_for_test()
+            .insert(owner, PowerState::default());
         Some(Self {
             sim,
             rules,
@@ -43,7 +54,7 @@ impl Fixture {
             .assign_target_represented(
                 source,
                 target.map(TargetKind::Entity),
-                Some(&self.rules),
+                &self.rules,
                 None,
                 FrameEffects::default(),
             )
@@ -97,18 +108,19 @@ impl Fixture {
             .entities
             .get(self.coil)
             .unwrap()
+            .building
             .tesla_charge
     }
 
     fn set_power(&mut self, output: i32, drain: i32) {
         let owner = self.sim.substrate.entities.get(self.coil).unwrap().owner();
         let power = self.sim.power_states.get_mut(&owner).unwrap();
-        power.total_output = output;
-        power.total_drain = drain;
+        power.set_total_output_for_test(output);
+        power.set_total_drain_for_test(drain);
     }
 
     fn dispatch(&mut self, source: u64, mission: MissionType) {
-        let now = self.sim.session.binary_frame;
+        let now = self.sim.session.binary_frame();
         self.sim
             .substrate
             .entities
@@ -130,7 +142,8 @@ impl Fixture {
             source,
             &self.rules,
             ObjectAiCtx::default(),
-        );
+        )
+        .unwrap();
     }
 }
 
@@ -220,7 +233,9 @@ fn impact_refreshes_order_without_damage_or_rearm_and_class_refusals_claim_it() 
     // The complete detonation still runs its existing animation tail. Only
     // ElectricAssault's list refresh itself must leave RNG untouched.
     let rng = f.sim.scenario_rng.logical_state();
-    f.sim.electric_assault_detonation(a, Some(f.coil));
+    f.sim
+        .substrate
+        .electric_assault_detonation(a, Some(f.coil), f.rules.ares());
     assert_eq!(f.sim.scenario_rng.logical_state(), rng);
     assert_eq!(f.sim.substrate.entities.get(a).unwrap().rearm_timer, rearm);
 
@@ -231,7 +246,13 @@ fn impact_refreshes_order_without_damage_or_rearm_and_class_refusals_claim_it() 
     let tank_health = f.sim.substrate.entities.get(tank).unwrap().health.current();
     f.hit(tank, f.coil); // wrong firer class
     f.hit(a, tank); // wrong target class, still no ordinary area damage
-    assert_eq!(f.charge().chargers(), &[b, c, a]);
+    // Ares BulletClass_Fire_Overpower (1005C650, hook 0x4693B0) admits a
+    // Unit firer too.
+    if f.rules.ares() {
+        assert_eq!(f.charge().chargers(), &[b, c, a, tank]);
+    } else {
+        assert_eq!(f.charge().chargers(), &[b, c, a]);
+    }
     assert_eq!(
         f.sim.substrate.entities.get(tank).unwrap().health.current(),
         tank_health
@@ -248,6 +269,7 @@ fn impact_refreshes_order_without_damage_or_rearm_and_class_refusals_claim_it() 
             .entities
             .get(hostile_plant)
             .unwrap()
+            .building
             .tesla_charge
             .chargers(),
         &[a]
@@ -275,6 +297,7 @@ fn operational_power_and_overpowered_weapon_use_different_thresholds() {
             .entities
             .get_mut(f.coil)
             .unwrap()
+            .building
             .tesla_charge = BuildingCharge::default();
         f.set_power(output, drain);
         for i in 0..count {
@@ -284,7 +307,13 @@ fn operational_power_and_overpowered_weapon_use_different_thresholds() {
             f.sim.building_operational_state(f.coil, &f.rules),
             Some(operational)
         );
-        f.sim.update_tesla_charge(f.coil, &f.rules);
+        crate::sim::world::Simulation::update_tesla_charge(
+            &f.sim.interner,
+            &mut f.sim.substrate,
+            &f.sim.power_states,
+            f.coil,
+            &f.rules,
+        );
         assert_eq!(
             f.charge().is_overpowered(),
             overpowered,
@@ -292,7 +321,7 @@ fn operational_power_and_overpowered_weapon_use_different_thresholds() {
         );
         let owner = f.sim.substrate.entities.get(f.coil).unwrap().owner();
         let power = &f.sim.power_states[&owner];
-        assert_eq!((power.total_output, power.total_drain), (output, drain));
+        assert_eq!((power.total_output(), power.total_drain()), (output, drain));
     }
 }
 
@@ -335,7 +364,13 @@ fn retarget_waits_for_building_turn_and_both_expiry_controls_remove_indexed_char
         let a = f.troopers[0];
         f.assign(a, Some(f.coil));
         f.hit(a, f.coil);
-        f.sim.update_tesla_charge(f.coil, &f.rules);
+        crate::sim::world::Simulation::update_tesla_charge(
+            &f.sim.interner,
+            &mut f.sim.substrate,
+            &f.sim.power_states,
+            f.coil,
+            &f.rules,
+        );
         assert!(f.charge().is_overpowered());
         // No other Building reference names a: the derived expiry index must
         // discover this listener from the new charger list alone.
@@ -347,7 +382,13 @@ fn retarget_waits_for_building_turn_and_both_expiry_controls_remove_indexed_char
         }
         assert!(f.charge().chargers().is_empty());
         assert!(f.charge().is_overpowered(), "expiry does not write +661");
-        f.sim.update_tesla_charge(f.coil, &f.rules);
+        crate::sim::world::Simulation::update_tesla_charge(
+            &f.sim.interner,
+            &mut f.sim.substrate,
+            &f.sim.power_states,
+            f.coil,
+            &f.rules,
+        );
         assert!(!f.charge().is_overpowered());
     }
     let Some(mut f) = Fixture::new() else { return };
@@ -356,11 +397,23 @@ fn retarget_waits_for_building_turn_and_both_expiry_controls_remove_indexed_char
         f.hit(source, f.coil);
     }
     f.set_power(0, 100);
-    f.sim.update_tesla_charge(f.coil, &f.rules);
+    crate::sim::world::Simulation::update_tesla_charge(
+        &f.sim.interner,
+        &mut f.sim.substrate,
+        &f.sim.power_states,
+        f.coil,
+        &f.rules,
+    );
     f.assign(f.troopers[1], None);
     assert_eq!(f.charge().chargers(), &f.troopers);
     assert!(f.charge().is_overpowered());
-    f.sim.update_tesla_charge(f.coil, &f.rules);
+    crate::sim::world::Simulation::update_tesla_charge(
+        &f.sim.interner,
+        &mut f.sim.substrate,
+        &f.sim.power_states,
+        f.coil,
+        &f.rules,
+    );
     assert_eq!(f.charge().chargers(), &[f.troopers[0], f.troopers[2]]);
     assert!(!f.charge().is_overpowered());
 }
@@ -373,7 +426,13 @@ fn snapshot_preserves_order_intent_and_stale_latch_then_rejects_invalid_referenc
         f.hit(source, f.coil);
     }
     f.hit(f.troopers[0], f.coil);
-    f.sim.update_tesla_charge(f.coil, &f.rules);
+    crate::sim::world::Simulation::update_tesla_charge(
+        &f.sim.interner,
+        &mut f.sim.substrate,
+        &f.sim.power_states,
+        f.coil,
+        &f.rules,
+    );
     for source in f.troopers {
         f.assign(source, None);
     }
@@ -388,7 +447,13 @@ fn snapshot_preserves_order_intent_and_stale_latch_then_rejects_invalid_referenc
     let mut loaded = GameSnapshot::load(&bytes).unwrap().sim;
     loaded.restore_after_snapshot_load().unwrap();
     assert_eq!(
-        loaded.substrate.entities.get(f.coil).unwrap().tesla_charge,
+        loaded
+            .substrate
+            .entities
+            .get(f.coil)
+            .unwrap()
+            .building
+            .tesla_charge,
         *f.charge()
     );
     assert!(
@@ -400,13 +465,20 @@ fn snapshot_preserves_order_intent_and_stale_latch_then_rejects_invalid_referenc
             .tesla_charger
             .is_active()
     );
-    loaded.update_tesla_charge(f.coil, &f.rules);
+    crate::sim::world::Simulation::update_tesla_charge(
+        &loaded.interner,
+        &mut loaded.substrate,
+        &loaded.power_states,
+        f.coil,
+        &f.rules,
+    );
     assert!(
         loaded
             .substrate
             .entities
             .get(f.coil)
             .unwrap()
+            .building
             .tesla_charge
             .is_default()
     );
@@ -421,6 +493,7 @@ fn snapshot_preserves_order_intent_and_stale_latch_then_rejects_invalid_referenc
             .entities
             .get_mut(f.coil)
             .unwrap()
+            .building
             .tesla_charge
             .chargers = invalid;
         let bytes = GameSnapshot::save(&f.sim, 0, 0, "Tesla-invalid", 0);
@@ -442,6 +515,7 @@ fn hash_distinguishes_charger_order_weapon_latch_and_foot_intent() {
         .entities
         .get_mut(f.coil)
         .unwrap()
+        .building
         .tesla_charge
         .chargers = f.troopers.to_vec();
     let list = f.sim.state_hash();
@@ -451,6 +525,7 @@ fn hash_distinguishes_charger_order_weapon_latch_and_foot_intent() {
         .entities
         .get_mut(f.coil)
         .unwrap()
+        .building
         .tesla_charge
         .chargers
         .reverse();
@@ -461,6 +536,7 @@ fn hash_distinguishes_charger_order_weapon_latch_and_foot_intent() {
         .entities
         .get_mut(f.coil)
         .unwrap()
+        .building
         .tesla_charge
         .overpowered = true;
     let latch = f.sim.state_hash();
@@ -478,9 +554,7 @@ fn hash_distinguishes_charger_order_weapon_latch_and_foot_intent() {
 #[test]
 fn adjacency_uses_native_direction_order_and_same_owner_not_alliance() {
     let Some(mut f) = Fixture::new() else { return };
-    let (_, height) = crate::rules::foundation::foundation_dimensions(
-        &f.rules.object("TESLA").unwrap().foundation,
-    );
+    let (_, height) = f.rules.object("TESLA").unwrap().foundation.dimensions();
     let north = f
         .sim
         .spawn_object("TESLA", "Russians", 20, 20 - u16::from(height), 0, &f.rules)
@@ -494,7 +568,7 @@ fn adjacency_uses_native_direction_order_and_same_owner_not_alliance() {
         .spawn_object("SHK", "Americans", 20, 20, 0, &f.rules)
         .unwrap();
     f.sim
-        .house_alliances
+        .house_alliances_mut_for_test()
         .entry("Americans".into())
         .or_default()
         .insert("Russians".into());
@@ -604,7 +678,7 @@ fn guard_and_area_guard_queue_charging_before_their_normal_cadence() {
     for mission in [MissionType::Guard, MissionType::AreaGuard] {
         let Some(mut f) = Fixture::new() else { return };
         let source = f.troopers[0];
-        let now = f.sim.session.binary_frame;
+        let now = f.sim.session.binary_frame();
         f.sim
             .substrate
             .entities
@@ -683,6 +757,8 @@ fn charging_attack_keeps_its_coil_until_a_direct_enemy_scan_succeeds() {
         .sim
         .spawn_object("MTNK", "Russians", 10, 11, 0, &f.rules)
         .unwrap();
+    // The player has seen the enemy: the campaign scan gate needs +0x41B.
+    crate::sim::arena_fixture::discover(&mut f.sim, enemy);
     let owner = f.sim.substrate.entities.get(source).unwrap().owner();
     f.sim.fog.reveal_all_for_owner(owner);
     f.dispatch(source, MissionType::Attack);
@@ -714,7 +790,13 @@ fn freezing_a_retail_charger_clears_its_intent_before_release() {
             .acquire_adjacent_tesla_coil(source, &f.rules, None, FrameEffects::default(),)
     );
     f.hit(source, f.coil);
-    f.sim.update_tesla_charge(f.coil, &f.rules);
+    crate::sim::world::Simulation::update_tesla_charge(
+        &f.sim.interner,
+        &mut f.sim.substrate,
+        &f.sim.power_states,
+        f.coil,
+        &f.rules,
+    );
     assert!(f.charge().is_overpowered());
     f.assign(cleg, Some(source));
     f.sim
@@ -728,11 +810,23 @@ fn freezing_a_retail_charger_clears_its_intent_before_release() {
     // Infantry51BBEF calls its concrete +3C8 setter, whose reached tail
     // clears +68E at51B33F before the frozen object returns from AI.
     assert!(!actor.tesla_charger.is_active());
-    f.sim.update_tesla_charge(f.coil, &f.rules);
+    crate::sim::world::Simulation::update_tesla_charge(
+        &f.sim.interner,
+        &mut f.sim.substrate,
+        &f.sim.power_states,
+        f.coil,
+        &f.rules,
+    );
     assert!(f.charge().chargers().is_empty());
     assert!(!f.charge().is_overpowered());
 
-    f.sim.temporal_let_go(cleg);
+    crate::sim::world::Simulation::temporal_let_go(
+        &mut f.sim.substrate,
+        &mut f.sim.houses,
+        &mut f.sim.power_states,
+        cleg,
+        f.rules.ares_form(),
+    );
     assert!(!f.sim.substrate.entities.get(source).unwrap().ai_frozen());
     f.dispatch(source, MissionType::Attack);
     assert!(
@@ -784,7 +878,13 @@ fn retail_fireat_charges_low_power_coil_and_pruning_disables_it_again() {
         f.sim.building_operational_state(f.coil, &f.rules),
         Some(true)
     );
-    f.sim.update_tesla_charge(f.coil, &f.rules);
+    crate::sim::world::Simulation::update_tesla_charge(
+        &f.sim.interner,
+        &mut f.sim.substrate,
+        &f.sim.power_states,
+        f.coil,
+        &f.rules,
+    );
     assert!(
         !f.charge().is_overpowered(),
         "two at low power supply normal firing only"
@@ -795,7 +895,13 @@ fn retail_fireat_charges_low_power_coil_and_pruning_disables_it_again() {
         Some(true),
         "retained list is sampled before its later prune"
     );
-    f.sim.update_tesla_charge(f.coil, &f.rules);
+    crate::sim::world::Simulation::update_tesla_charge(
+        &f.sim.interner,
+        &mut f.sim.substrate,
+        &f.sim.power_states,
+        f.coil,
+        &f.rules,
+    );
     assert_eq!(
         f.sim.building_operational_state(f.coil, &f.rules),
         Some(false)

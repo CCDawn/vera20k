@@ -1,6 +1,5 @@
 //! Full original LightConvert556090 RGB565 controls and live trigger consumers.
-//! Steam gamemd.exe SHA256
-//! 3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600.
+//! Steam gamemd.exe.
 //! Native controls use tools.palette_oracle's machine/call at556090 with
 //! declared N27/N53 objects, RGB(i,i*73 mod256,255-i), MMX and liveCW0E7F.
 //! Rows0/middle/last, indices64/128/200. No scene/GPU parity claim.
@@ -199,6 +198,26 @@ fn twenty_original_palette_histories_keep_mutable_normal_rgb_and_native_pixels()
     }
 }
 
+/// TechnoClass_DrawSHP's TerrainPalette arm (`0x00705ED5..0x00705F52`) lights
+/// a building from the cell of its GetCoords (`0x00447AC0`, the foundation
+/// centre: (12, 12) for retail CITY06's 4x4 at (10, 10)); the house-scheme arm
+/// keeps the Location cell's top scalar.
+#[test]
+fn terrain_palette_building_takes_its_foundation_centre_cell() {
+    let mut grid = crate::map::lighting::CellLightGrid::new();
+    grid.insert_profiled_light((10, 10), [0.5, 0.5, 0.5], 0.5);
+    grid.insert_profiled_light((12, 12), [1.5, 1.0, 0.5], 1.5);
+    let art = ArtRegistry::from_ini(&IniFile::from_str("[CITY06]\nTerrainPalette=yes\n"));
+    assert_eq!(
+        building_palette_light(&grid, (10, 10), (12, 12), art.get("CITY06"), false),
+        PaletteLight::cell(&grid, (12, 12), false)
+    );
+    assert_eq!(
+        building_palette_light(&grid, (10, 10), (12, 12), None, false),
+        body_palette_light(&grid, (10, 10), 0)
+    );
+}
+
 #[test]
 fn mutable_lookup_keeps_old_cell_pointers_and_row_counts_while_new_samples_get_new_converts() {
     //544E94 returns neutral index0;544EF8 compares normal cache from
@@ -232,27 +251,34 @@ fn live_tag_rgb_overrides_reach_packets_and_survive_ambient_writes_during_storm(
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
         None,
         None,
+        None,
     );
-    sim.classify_map_triggers(None);
-    sim.session.set_started(true);
+    sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
+    sim.publish_scenario_started();
     // Declared raging-storm fixture; its lifecycle has separate tests.
-    let owner = sim.interner.intern("Americans");
-    sim.lightning_storm =
+    let owner = sim.intern("Americans");
+    *sim.lightning_storm_mut_for_test() =
         crate::sim::superweapon::lightning_storm::LightningStorm::raging_for_test(owner, (0, 0));
-    sim.session.lighting.select(ScenarioLightingProfile::Ion);
+    sim.session_mut_for_test()
+        .lighting_mut()
+        .select(ScenarioLightingProfile::Ion);
     let terrain =
         crate::map::resolved_terrain::test_grid(3, 1, crate::map::resolved_terrain::test_flat_cell);
     let mut lights = MatchLighting::default();
     lights
         .grid
         .insert_profiled_light((0, 0), [0.512, 0.640, 0.768], 1.0);
-    sim.publish_global_lighting(PaletteUpdate::from_scenario(&sim.session.lighting));
-    lights.apply_events(&terrain, &sim.lighting_sources.pending);
-    sim.discard_lighting_events();
-    sim.advance_triggers(None, None, FrameEffects::default());
-    assert_eq!(sim.lighting_sources.pending.len(), 3);
-    lights.apply_events(&terrain, &sim.lighting_sources.pending);
-    sim.discard_lighting_events();
+    sim.publish_global_lighting(PaletteUpdate::from_scenario(&sim.session().lighting()));
+    lights.apply_events(&terrain, sim.lighting_sources().pending());
+    sim.lighting_sources_mut_for_test().discard_pending();
+    sim.advance_triggers(
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        None,
+        FrameEffects::default(),
+    );
+    assert_eq!(sim.lighting_sources().pending().len(), 3);
+    lights.apply_events(&terrain, sim.lighting_sources().pending());
+    sim.lighting_sources_mut_for_test().discard_pending();
     //73 changes normal Ambient after the final RGB publication. Reconciling
     // that state must not infer a new Ion palette operation.
     lights.refresh(&terrain, &sim, 2);
@@ -262,18 +288,41 @@ fn live_tag_rgb_overrides_reach_packets_and_survive_ambient_writes_during_storm(
     let expected = PaletteLight::color_scheme([1200, 800, 600], brightness);
     assert_eq!(body_palette_light(&lights.grid, (0, 0), 0), expected);
     assert_eq!(
-        building_palette_light(&lights.grid, (0, 0), None, false),
+        building_palette_light(&lights.grid, (0, 0), (0, 0), None, false),
         expected
     );
     let art = ArtRegistry::from_ini(&IniFile::from_str("[ALT]\nAltPalette=yes\n"));
     // Default N1 schemes are skipped by53AD4D, independently of N53 and
     // cell caches (68C710 RGB1000;4232E2 selects B054D4[0]+30C).
     assert_eq!(
-        anim_palette_light(&lights.grid, (0, 0), art.anim_runtime_config("ALT"), false),
+        anim_palette_light(
+            &lights.grid,
+            (0, 0),
+            art.anim_runtime_config("ALT"),
+            false,
+            None,
+            brightness,
+        ),
         PaletteLight::new([1000; 3], 1, brightness, true)
     );
+    // The same AltPalette type with an instance Convert at+0xD4 draws before
+    //4232E2 swaps that one-row scheme in, so it keeps the 53-row selection
+    // Paradrop5F5AFE stored: the shroud's A still selects a row.
     assert_eq!(
-        anim_palette_light(&lights.grid, (0, 0), None, false),
+        anim_palette_light(
+            &lights.grid,
+            (0, 0),
+            art.anim_runtime_config("ALT"),
+            false,
+            Some(&crate::sim::anim_class::AnimRemap::House(
+                crate::sim::intern::InternedId::default()
+            )),
+            brightness,
+        ),
+        expected
+    );
+    assert_eq!(
+        anim_palette_light(&lights.grid, (0, 0), None, false, None, brightness),
         PaletteLight::plain(53, brightness)
     );
     //555E50 constructs a new Convert with Storm RGB even though the
@@ -293,4 +342,237 @@ fn live_tag_rgb_overrides_reach_packets_and_survive_ambient_writes_during_storm(
     );
     assert_eq!(lights.grid.palette_rgb(before), [1200, 800, 600]);
     assert_eq!(lights.grid.palette_rgb(after), [960, 640, 512]);
+}
+
+/// A radiation site's bound type drives the field's cell light: the same
+/// scene lights purple for a `255,0,255` type and green for the default one.
+/// Phobos builds only: other builds never read `[RadiationTypes]`.
+#[cfg(feature = "phobos")]
+#[test]
+fn a_bound_radiation_type_tints_the_field_with_its_own_color() {
+    let rules = crate::rules::ruleset::RuleSet::from_ini(&IniFile::from_str(
+        "[Radiation]\n\
+         RadDurationMultiple=1\nRadApplicationDelay=16\nRadLevelMax=500\n\
+         RadLevelDelay=90\nRadLevelFactor=.2\nRadSiteWarhead=RadSite\n\
+         [RadiationTypes]\n0=Violet\n\
+         [Violet]\nRadColor=255,0,255\nRadLightFactor=1.0\nRadTintFactor=1.0\n",
+    ))
+    .expect("rules with a violet radiation type");
+    let terrain = crate::map::resolved_terrain::test_grid(
+        20,
+        20,
+        crate::map::resolved_terrain::test_flat_cell,
+    );
+    let sample = |bound: Option<&str>| {
+        let mut sim = Simulation::with_seed(0);
+        let mut lights = MatchLighting::default();
+        lights.install(
+            CellLightGrid::new(),
+            LightingConfig::default(),
+            2,
+            Some((&terrain, &sim)),
+            None,
+        );
+        let mut sources = std::mem::take(sim.lighting_sources_mut_for_test());
+        sim.radiation_mut_for_test().apply_detonation(
+            crate::sim::radiation::RadDetonation {
+                rx: 10,
+                ry: 10,
+                rad_level: 500,
+                spread: 2,
+                rad_type: bound.map(str::to_owned),
+                firing_house: None,
+                invoker: None,
+            },
+            0,
+            "TEMPERATE",
+            &rules,
+            Some(&terrain),
+            &mut sources,
+        );
+        *sim.lighting_sources_mut_for_test() = sources;
+        lights.apply_events(&terrain, sim.lighting_sources().pending());
+        let cell = lights.grid.cell_light_at((10, 10)).expect("lit cell");
+        lights.grid.palette_rgb(cell.profile_id)
+    };
+    let retail = sample(None);
+    let violet = sample(Some("Violet"));
+    assert_eq!(violet[0], violet[2], "red and blue match: {violet:?}");
+    assert!(
+        violet[1] * 2 < violet[0],
+        "green stays far under red/blue for a violet field: {violet:?}"
+    );
+    assert!(
+        retail[1] > violet[1],
+        "the default green field keeps more green: {retail:?} vs {violet:?}"
+    );
+}
+
+/// Phobos `TechnoExt::UpdateTintValues`'s AttachEffect arm: every active
+/// effect with a tint ORs its `Tint.Color` word and sums
+/// `Tint.Intensity * 1000`, filtered by `Tint.VisibleToHouses` against the
+/// current player's Owner/Allies/Enemies bucket.
+#[cfg(feature = "phobos")]
+#[test]
+fn attach_effect_tint_ors_colours_and_sums_intensities_by_viewer() {
+    let ini = IniFile::from_str(
+        "[InfantryTypes]\n[AircraftTypes]\n[BuildingTypes]\n\
+         [VehicleTypes]\n0=TARGET\n\
+         [TARGET]\nStrength=1000\nSpeed=6\n\
+         AttachEffect.AttachTypes=RED,BLUE,HIDDEN\n\
+         [AttachEffectTypes]\n0=RED\n1=BLUE\n2=HIDDEN\n\
+         [RED]\nDuration=100\nTint.Color=255,0,0\nTint.Intensity=1.0\n\
+         [BLUE]\nDuration=100\nTint.Color=0,0,255\nTint.Intensity=0.5\n\
+         Tint.VisibleToHouses=enemies\n\
+         [HIDDEN]\nDuration=100\nTint.Color=0,255,0\nTint.Intensity=2.0\n\
+         Tint.VisibleToHouses=none\n",
+    );
+    let rules = crate::rules::ruleset::RuleSet::from_ini(&ini).expect("rules");
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 3);
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    let target = sim
+        .spawn_object("TARGET", "Americans", 20, 20, 0, &rules)
+        .expect("spawn");
+    sim.advance_tick(&[], Some(&rules), None, Some(rules.overlay_registry()), 22);
+    let americans = sim.interner().get("Americans").expect("owner");
+    let russians = sim.interner().get("Russians").expect("rival");
+
+    sim.session_mut_for_test()
+        .set_current_house_for_test(Some(americans));
+    assert_eq!(
+        attach_effect_tint(
+            &crate::app::presentation::frame::ObjectRecord::of_test_sim(&sim, &rules, target),
+            &sim,
+            &rules
+        ),
+        (0xF800, 1000),
+        "the owner sees RED only; enem-only and none stay out"
+    );
+    sim.session_mut_for_test()
+        .set_current_house_for_test(Some(russians));
+    assert_eq!(
+        attach_effect_tint(
+            &crate::app::presentation::frame::ObjectRecord::of_test_sim(&sim, &rules, target),
+            &sim,
+            &rules
+        ),
+        (0xF800 | 0x001F, 1500),
+        "an enemy also sees BLUE; HIDDEN never applies"
+    );
+}
+
+/// `Tint.Cumulative`: stacked instances of one cumulative effect sum their
+/// colour channels and intensities before a single tint; without it the type
+/// tints once with its own colour.
+#[cfg(feature = "phobos")]
+#[test]
+fn cumulative_effect_tint_stacks_by_type_or_once() {
+    let scene = |extra: &str| {
+        let ini = IniFile::from_str(&format!(
+            "[InfantryTypes]\n[AircraftTypes]\n[BuildingTypes]\n\
+             [VehicleTypes]\n0=TARGET\n\
+             [TARGET]\nStrength=1000\nSpeed=6\n\
+             AttachEffect.AttachTypes=SAME,SAME\n\
+             [AttachEffectTypes]\n0=SAME\n\
+             [SAME]\nDuration=100\nCumulative=yes\nCumulative.MaxCount=3\n\
+             Tint.Color=10,20,30\nTint.Intensity=0.5\n{extra}"
+        ));
+        let rules = crate::rules::ruleset::RuleSet::from_ini(&ini).expect("rules");
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 3);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        let target = sim
+            .spawn_object("TARGET", "Americans", 20, 20, 0, &rules)
+            .expect("spawn");
+        sim.advance_tick(&[], Some(&rules), None, Some(rules.overlay_registry()), 22);
+        (sim, rules, target)
+    };
+
+    // Base (10,20,30)/(0.5) stacked twice sums to (20,40,60)/1.0.
+    let (sim, rules, target) = scene("");
+    assert_eq!(
+        attach_effect_tint(
+            &crate::app::presentation::frame::ObjectRecord::of_test_sim(&sim, &rules, target),
+            &sim,
+            &rules
+        ),
+        (0x1147, 1000),
+        "the two instances of one type sum their tint"
+    );
+
+    let (sim, rules, target) = scene("Tint.Cumulative=no\n");
+    assert_eq!(
+        attach_effect_tint(
+            &crate::app::presentation::frame::ObjectRecord::of_test_sim(&sim, &rules, target),
+            &sim,
+            &rules
+        ),
+        (0x08A3, 500),
+        "without Tint.Cumulative the type tints once"
+    );
+}
+
+/// Phobos `ApplyCustomTintValues` selects the viewer's shield-tint bucket and
+/// `Drawing::RGB_To_Int` packs `Tint.Color` as RGB565.
+#[cfg(feature = "phobos")]
+#[test]
+fn shield_tint_uses_the_viewers_bucket_and_rgb565_word() {
+    use crate::rules::phobos_shields::AffectedHouse;
+    use crate::sim::intern::InternedId;
+    let owner = InternedId::from_index(0);
+    let other = InternedId::from_index(1);
+    assert_eq!(
+        tint_bucket(owner, Some(owner), || panic!(
+            "the owner needs no alliance query"
+        )),
+        AffectedHouse::OWNER
+    );
+    assert_eq!(
+        tint_bucket(owner, Some(other), || true),
+        AffectedHouse::ALLIES
+    );
+    assert_eq!(
+        tint_bucket(owner, Some(other), || false),
+        AffectedHouse::ENEMIES
+    );
+    assert_eq!(
+        tint_bucket(owner, None, || panic!("no viewer to ask")),
+        AffectedHouse::ENEMIES
+    );
+    // RGB_To_Int: (B >> 3) | ((G >> 2) << 5) | ((R >> 3) << 11).
+    assert_eq!(rgb565_word([255, 0, 0]), 0xF800);
+    assert_eq!(rgb565_word([0, 255, 0]), 0x07E0);
+    assert_eq!(rgb565_word([0, 0, 255]), 0x001F);
+    // Tint.VisibleToHouses gates each bucket independently.
+    assert!(AffectedHouse::OWNER.contains(AffectedHouse::OWNER));
+    assert!(!AffectedHouse::ENEMIES.contains(AffectedHouse::OWNER));
+    assert!(AffectedHouse::ALL.contains(AffectedHouse::ENEMIES));
+}
+
+/// Phobos `TechnoClass_InvulnerabilityIntensity_Adjust` (`0x70E475`): the
+/// configured extra intensity scales by 1000 and is added by kind.
+#[cfg(feature = "phobos")]
+#[test]
+fn curtain_extra_tint_reads_the_audio_visual_globals() {
+    use crate::sim::superweapon::invulnerability::InvulnKind;
+    let rules =
+        crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+            "[AudioVisual]\nIronCurtain.ExtraTintIntensity=0.4\n\
+             ForceShield.ExtraTintIntensity=-0.25\n",
+        ))
+        .expect("rules");
+    assert_eq!(
+        super::curtain_extra_tint(Some(&rules), Some(InvulnKind::IronCurtain)),
+        400
+    );
+    assert_eq!(
+        super::curtain_extra_tint(Some(&rules), Some(InvulnKind::ForceShield)),
+        -250
+    );
+    assert_eq!(
+        super::curtain_extra_tint(None, Some(InvulnKind::IronCurtain)),
+        0
+    );
+    assert_eq!(super::curtain_extra_tint(Some(&rules), None), 0);
 }

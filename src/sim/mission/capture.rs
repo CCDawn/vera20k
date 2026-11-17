@@ -72,7 +72,7 @@ pub(crate) fn mission_capture(
         let _ = sim.assign_destination_represented(
             id,
             Some(NavTargetRef::object(building)),
-            Some(rules),
+            rules,
             registry,
             effects,
         );
@@ -118,9 +118,9 @@ pub(crate) fn mission_capture(
                     .is_some_and(|object| object.occupier))
     });
     if hunts {
-        let _ = sim.assign_target_represented(id, None, Some(rules), registry, effects);
-        sim.assign_null_destination(id, Some(rules), registry, effects);
-        let now = sim.session.binary_frame;
+        let _ = sim.assign_target_represented(id, None, rules, registry, effects);
+        sim.assign_null_destination(id, rules, registry, effects);
+        let now = sim.session.binary_frame();
         let _ = sim.mission_queue_exact(
             id,
             MissionId::from_known(MissionType::Hunt),
@@ -129,9 +129,15 @@ pub(crate) fn mission_capture(
             &LiveReadyInputProvider { rules },
         );
     }
-    sim.mission_rate_epilogue_for(rules, id, MissionType::Capture)
+    Simulation::mission_rate_epilogue_for(
+        &mut sim.scenario_rng,
+        &sim.substrate,
+        rules,
+        id,
+        MissionType::Capture,
+    )
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "capture_tests.rs"]
 mod tests;

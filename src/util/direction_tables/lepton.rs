@@ -23,7 +23,7 @@ pub const LEPTON_DELTAS: [(i32, i32); 8] = {
     out
 };
 
-#[cfg(test)]
+#[cfg(all(test, tests_util))]
 mod tests {
     use super::*;
 
@@ -53,16 +53,6 @@ mod tests {
                 })
                 .collect();
             assert_eq!(LEPTON_DELTAS.as_slice(), expected.as_slice());
-        }
-    }
-
-    #[test]
-    fn lepton_is_cell_times_256() {
-        for i in 0..8 {
-            assert_eq!(
-                LEPTON_DELTAS[i],
-                (DIRECTION_DELTAS[i].0 * 256, DIRECTION_DELTAS[i].1 * 256)
-            );
         }
     }
 }

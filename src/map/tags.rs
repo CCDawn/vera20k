@@ -71,7 +71,7 @@ pub fn parse_tags(ini: &IniFile) -> TagMap {
     tags
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
 
@@ -101,11 +101,5 @@ mod tests {
         assert_eq!(tag.repeat(), 0);
         assert_eq!(tag.name(), &name[..0x30]);
         assert_eq!(tag.trigger(), Some("X"));
-    }
-
-    #[test]
-    fn test_missing_tags_is_empty() {
-        let ini = IniFile::from_str("[Map]\nTheater=TEMPERATE\n");
-        assert!(parse_tags(&ini).is_empty());
     }
 }

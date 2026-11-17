@@ -1,8 +1,8 @@
 //! Saved local view facts, independent of window, renderer and input devices.
 //!
 //! Active-retail authorities: ScenarioSave689310/Load689470 (four cell
-//! bookmarks), MiscSave67F82A/Load67FA2A (ordered selection), Techno+214 (one
-//! group membership), MouseLoad5BE117..123 (Follow target) and the Display
+//! bookmarks), MiscSave67F82A/Load67FA2A (ordered selection),
+//! MouseLoad5BE117..123 (Follow target) and the Display
 //! cursor modes below. The committed Tactical center is the separate
 //! `SavedTacticalView`. Original executed
 //! bookmark controls live in tools/spatial_oracle/native_id_snapshot.json.
@@ -12,9 +12,6 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-
-/// Ten native team-selection slots; an object belongs to at most one slot.
-pub const CONTROL_GROUP_SLOTS: usize = 10;
 
 /// Mouse5BE715/5BE092 preserves Power's semantic state in its raw display
 /// stream. Geometry is derived; Sidebar NoInit6A4F8E/94 overwrites slide start
@@ -29,6 +26,73 @@ pub struct SavedPowerBar {
     pub animating: bool,
 }
 
+/// Neutral transport for the client-owned RadarEvent array. Native
+/// Save6607D0/Load660840 copy live records; PostLoad6851DF->660C50 clears
+/// the separate Spacebar ring, so that ring is deliberately absent here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedRadarEvents {
+    pub events: Vec<SavedRadarEvent>,
+    pub last_advanced_frame: Option<u64>,
+}
+
+/// Animation scalars retain their binary32 bits without moving presentation
+/// decisions into sim. The render owner validates and hydrates this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedRadarEvent {
+    pub event_type: crate::sim::radar::RadarEventType,
+    pub cell: (u16, u16),
+    pub radar_pixel: (i32, i32),
+    pub created_frame: u64,
+    pub radius: u32,
+    pub rotation: u32,
+    pub rotation_speed: u32,
+    pub fade: u32,
+    pub fade_speed: u32,
+    pub expanding: bool,
+    pub needs_draw: bool,
+    pub phase_started_frame: Option<u64>,
+}
+
+/// The radar housing and its movie mode as a load reads them back:
+/// `RadarClass::Load @ 0x006568A0` reads Mode, State, PendingMode and
+/// MovieStage, and `MouseClass::Load @ 0x005BDF70` reads the Display body,
+/// AnimFrame, its timer words and TacticalMapAvailable included, at
+/// `0x005BE092`. The render owner validates and hydrates this record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedRadarHousing {
+    pub phase: SavedRadarPhase,
+    pub frame: u8,
+    /// The housing timer's raw words: the start bucket and its duration.
+    pub timer: [i32; 2],
+    pub movie: Option<SavedRadarMovie>,
+    /// TacticalMapAvailable, which Mode 3 and 4 also hold as PendingMode.
+    pub available: bool,
+}
+
+/// Native housing State 0..5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SavedRadarPhase {
+    Offline,
+    Opening,
+    Online,
+    Closing,
+    MovieOpening,
+    MovieRestoring,
+}
+
+/// Mode 4's MovieStage 1 and 2, then Mode 3. Stage 0 never lasts past the
+/// pass that admits the clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SavedRadarMovie {
+    WaitAnnouncement,
+    WaitStreams,
+    Playback,
+}
+
+/// RESIDUAL: `MouseClass::Load @ 0x005BDF70` reads the whole 0x556C-byte Display
+/// body at `0x005BE092`, ScrollClass's and MouseClass's own fields with it; VERA keeps
+/// none of those, and the one difference a player could meet is that an edge-scroll
+/// glide under way at the save does not carry on after the load.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedLocalView {
     /// Raw signed CellStruct words preserved in the app's u16 bit-pattern form.
@@ -37,25 +101,52 @@ pub struct SavedLocalView {
     /// App projection of the serialized Simulation Select queue. No command
     /// payload is duplicated here; admission checks the existing queue owner.
     selection_order_pending: bool,
-    control_groups: [Vec<u64>; CONTROL_GROUP_SLOTS],
     follow_target: Option<u64>,
     modes: SavedCursorModes,
     /// The save coordinator attaches the Power owner's projection after the
     /// input owner supplies its own facts. App loads require this payload.
     power_bar: Option<SavedPowerBar>,
+    radar_events: Option<SavedRadarEvents>,
+    /// Absent when no radar housing was built.
+    radar_housing: Option<SavedRadarHousing>,
+    /// MouseClass::Save5BE6D0 (5BE715) / Load5BDF70 (5BE092) retain
+    /// CreditsClass+4 (Mouse+5520).
+    /// None preserves the client's not-yet-observed counter, rather than
+    /// replacing an initialized display with the simulation's wallet balance.
+    credits_counter: Option<i32>,
+    /// Local Cell104/108/10A value history. Anim+FC remains in its existing
+    /// snapshot envelope, and process ColorScheme cache state is not saved.
+    lighting: Option<crate::map::lighting::SavedCellLighting>,
 }
 
 /// The Display's armed cursor modes. MouseLoad5BDF70 reads the whole Display
 /// body at 5BE083 and swizzles the placement product and type at
 /// 5BE101/5BE112, so Repair +11B0, Sell +11B1, the selected Super +11B8 and
 /// the placement +11A4/+11A8/+11AC all survive a load.
+///
+/// RESIDUAL (kept by the maintainer): beacon mode (+11B4, owned by
+/// `app::input::beacon`) is in the same body and survives a native load too;
+/// VERA saves no beacon field, so a save made while placing a beacon loads with
+/// the mode off. Saving it would change this layout and refuse older saves.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SavedCursorModes {
     pub repair: bool,
     pub sell: bool,
-    /// Local PlanMgr input mode; physical-key ownership is never saved.
+    /// Retained VERA wire field, written false and ignored on restoration.
+    /// Active YR PlanMgr at AC4CF4 is not saved. This is not an owner for the
+    /// distinct legacy Display waypoint byte at +11B3.
     pub planning: bool,
     pub targeting: Option<SavedTargeting>,
+    /// TabClass IsCommandBarOpen (+0x5544) is in the same raw Mouse body;
+    /// TabClass::NoInit 5BE9B0 and the postload Init 6D03A0 /
+    /// ToggleSidebar 6D04F0 keep it, so a load shows the bar as saved.
+    #[serde(default)]
+    pub command_bar_closed: bool,
+    /// UpdateFoundationCenter's latch in the same Display body: the
+    /// foundation's top-left Cell (+0x1174) and whether the whole foundation
+    /// was visible there (+0x1181). `None` is the constructor's null Cell.
+    #[serde(default)]
+    pub foundation: Option<((u16, u16), bool)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -75,8 +166,6 @@ pub enum SavedTargeting {
 pub enum SavedLocalViewError {
     #[error("saved selection repeats object {object_id}")]
     DuplicateSelectionReference { object_id: u64 },
-    #[error("saved control groups repeat object {object_id}")]
-    DuplicateGroupReference { object_id: u64 },
     #[error("saved {field} references absent object {object_id}")]
     MissingEntityReference { field: &'static str, object_id: u64 },
     #[error("saved selection order does not match its simulation selection timeline")]
@@ -87,6 +176,8 @@ pub enum SavedLocalViewError {
     MissingPowerBar,
     #[error("saved Power bar has invalid {field}")]
     InvalidPowerState { field: &'static str },
+    #[error("saved local lighting has invalid {field}")]
+    InvalidLighting { field: &'static str },
 }
 
 impl SavedLocalView {
@@ -94,7 +185,6 @@ impl SavedLocalView {
         view_bookmarks: [[u16; 2]; 4],
         selection_order: Vec<u64>,
         selection_order_pending: bool,
-        control_groups: [Vec<u64>; CONTROL_GROUP_SLOTS],
         follow_target: Option<u64>,
         modes: SavedCursorModes,
     ) -> Result<Self, SavedLocalViewError> {
@@ -102,10 +192,13 @@ impl SavedLocalView {
             view_bookmarks,
             selection_order,
             selection_order_pending,
-            control_groups,
             follow_target,
             modes,
             power_bar: None,
+            radar_events: None,
+            radar_housing: None,
+            credits_counter: None,
+            lighting: None,
         };
         saved.validate_structure()?;
         Ok(saved)
@@ -121,12 +214,6 @@ impl SavedLocalView {
                 return Err(SavedLocalViewError::DuplicateSelectionReference { object_id });
             }
         }
-        let mut grouped = BTreeSet::new();
-        for &object_id in self.control_groups.iter().flatten() {
-            if !grouped.insert(object_id) {
-                return Err(SavedLocalViewError::DuplicateGroupReference { object_id });
-            }
-        }
         Ok(())
     }
 
@@ -140,10 +227,6 @@ impl SavedLocalView {
 
     pub fn selection_order_pending(&self) -> bool {
         self.selection_order_pending
-    }
-
-    pub fn control_groups(&self) -> &[Vec<u64>; CONTROL_GROUP_SLOTS] {
-        &self.control_groups
     }
 
     pub fn follow_target(&self) -> Option<u64> {
@@ -162,13 +245,42 @@ impl SavedLocalView {
         self.power_bar.take()
     }
 
-    pub fn into_local_input(
-        self,
-    ) -> (Vec<u64>, bool, [Vec<u64>; CONTROL_GROUP_SLOTS], Option<u64>) {
+    pub fn set_radar_events(&mut self, radar_events: SavedRadarEvents) {
+        self.radar_events = Some(radar_events);
+    }
+
+    pub fn take_radar_events(&mut self) -> Option<SavedRadarEvents> {
+        self.radar_events.take()
+    }
+
+    pub fn set_radar_housing(&mut self, housing: Option<SavedRadarHousing>) {
+        self.radar_housing = housing;
+    }
+
+    pub fn take_radar_housing(&mut self) -> Option<SavedRadarHousing> {
+        self.radar_housing.take()
+    }
+
+    pub fn set_credits_counter(&mut self, displayed: Option<i32>) {
+        self.credits_counter = displayed;
+    }
+
+    pub fn take_credits_counter(&mut self) -> Option<i32> {
+        self.credits_counter.take()
+    }
+
+    pub fn set_lighting(&mut self, lighting: crate::map::lighting::SavedCellLighting) {
+        self.lighting = Some(lighting);
+    }
+
+    pub fn take_lighting(&mut self) -> Option<crate::map::lighting::SavedCellLighting> {
+        self.lighting.take()
+    }
+
+    pub fn into_local_input(self) -> (Vec<u64>, bool, Option<u64>) {
         (
             self.selection_order,
             self.selection_order_pending,
-            self.control_groups,
             self.follow_target,
         )
     }

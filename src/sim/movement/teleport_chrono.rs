@@ -54,6 +54,10 @@
 //!
 //! Evidence: instruction reading of the addresses cited here.
 //!
+//! Landed Aircraft sent onto water join the shared retained sinking owner:
+//! AircraftAI414DB6 follows FootAI, lowers raw Z, emits jittered wakes and
+//! records the terminal kill/UnInit below height -400, like UnitAI7364A1.
+//!
 //! RESIDUALS:
 //! - A destination given while warping in (states 2 to 7, the latch down)
 //!   runs the Unit setter's Teleporter arm, whose Drive suspends the warp's
@@ -61,16 +65,11 @@
 //!   destination while its owner warps (`0x004AFD40`) and ends at the Foot
 //!   AI tail. The NavCom it published stays, so state 5's NULL destination,
 //!   which the prologue runs, installs another Drive: FootClass::AI's
-//!   Process runs that Drive, and state 6's TimerCheck with its scan draw
-//!   waits for the next prologue. That frame and draw order is read, not
-//!   executed. Natively the prologue also runs a Drive active at its call
-//!   (`0x007362A7..0x007362F5`); VERA runs none. Trigger: a destination for
-//!   a Chrono Miner in the warp's last frames. Effect: TimerCheck's draw
-//!   moves a frame and the warp's END up to one; the Drive goes nowhere.
-//! - A landed Aircraft that sinks keeps `+0x3CD` with nothing to end it:
-//!   VERA ports only the Unit's sinking (Unit AI `0x007364A1`); the Aircraft
-//!   AI's handling is not established. Trigger: an airfield's Harriers
-//!   chronoshifted onto water.
+//!   Process runs that Drive. Natively the prologue also runs a Drive active
+//!   at its call (`0x007362A7..0x007362F5`); VERA skips that visit. Bounded
+//!   native A/B histories observe earlier NavCom, timer, speed and turn writes,
+//!   but no TimerCheck draw or warp-END frame shift. A player-visible effect
+//!   through intervening Techno/mission work remains unestablished.
 
 use crate::map::entities::EntityCategory;
 use crate::map::resolved_terrain::NativeCellQuery;
@@ -95,7 +94,7 @@ const CELL_FLAG_BRIDGE_DECK: u32 = 0x200;
 
 impl Simulation {
     /// Foot4DF7F0 / Infantry522FE0, virtual508. Source: unchanged active-YR
-    /// bodies, Steam3e81a617..08600 (tools.native_inspect). Reuses the single
+    /// bodies, Steam gamemd (tools.native_inspect). Reuses the single
     /// Teleport/piggyback warp owner; no action-specific position/state copy.
     /// No own RNG/timer/detach: class destination and Walk sub-cell consumers
     /// retain theirs, and subsequent Teleport Process owns warp timers.
@@ -118,7 +117,7 @@ impl Simulation {
             Some((rules, &self.interner)),
         ) || crate::sim::superweapon::invulnerability::is_invulnerable(
             actor.invulnerability.as_ref(),
-            self.session.binary_frame,
+            self.session.binary_frame(),
         ) || actor.chrono_warp_latch()
             || actor.is_warped_out()
             || actor.is_warping_in()
@@ -133,9 +132,22 @@ impl Simulation {
         let mut cell = super::coord_cell(coord);
         //Infantry prepares its old Walk head before creating the Teleport;
         //Foot adjusts the bridge first, then prepares Unit Force_Track.
+        // RESIDUAL: for an infantryman warped in Limbo (action 128's garrison
+        // occupants and cargo riders), Walk 0x0075CA30 and Teleport
+        // 0x0071A090 still clear the bit at his retained head; VERA's release
+        // skips Limbo. His Limbo cleared it already, so this only matters if
+        // another infantryman took that spot: a later placement may stack.
         if infantry {
-            self.locomotor_mark_all_occupation_bits(id, false);
-            self.object_raw_receiver_at(id, coord, false);
+            self.locomotor_mark_all_occupation_bits(id, false, rules.ares_form());
+            Self::object_raw_receiver_at(
+                &mut self.substrate,
+                &self.path_grid,
+                &self.resolved_terrain,
+                id,
+                coord,
+                false,
+                rules.ares_form(),
+            );
             let Some(actor) = self.substrate.entities.get_mut(id) else {
                 return Ok(false);
             };
@@ -146,12 +158,12 @@ impl Simulation {
                     cell.0 as u16,
                     cell.1 as u16,
                 )),
-                Some(rules),
+                rules,
                 registry,
                 effects,
             )
             .map_err(|error| error.to_string())?;
-            self.foot_force_immediate_destination(id, Some(coord), Some(rules), registry, effects)?;
+            self.foot_force_immediate_destination(id, Some(coord), rules, registry, effects)?;
         }
         let terrain = self
             .resolved_terrain
@@ -164,9 +176,17 @@ impl Simulation {
                 .wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
         }
         if category == EntityCategory::Unit {
-            self.locomotor_mark_all_occupation_bits(id, false);
-            self.force_track(id, -1, coord, Some(rules), registry, effects);
-            self.object_raw_receiver_at(id, coord, false);
+            self.locomotor_mark_all_occupation_bits(id, false, rules.ares_form());
+            self.force_track(id, -1, coord, rules, registry, effects);
+            Self::object_raw_receiver_at(
+                &mut self.substrate,
+                &self.path_grid,
+                &self.resolved_terrain,
+                id,
+                coord,
+                false,
+                rules.ares_form(),
+            );
             let Some(actor) = self.substrate.entities.get_mut(id) else {
                 return Ok(false);
             };
@@ -177,15 +197,15 @@ impl Simulation {
                     cell.0 as u16,
                     cell.1 as u16,
                 )),
-                Some(rules),
+                rules,
                 registry,
                 effects,
             )
             .map_err(|error| error.to_string())?;
-            self.assign_destination_represented(id, None, Some(rules), registry, effects)
+            self.assign_destination_represented(id, None, rules, registry, effects)
                 .map_err(|error| error.to_string())?;
         }
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         let Some(loco) = self
             .substrate
             .entities
@@ -205,13 +225,13 @@ impl Simulation {
                 cell.0 as u16,
                 cell.1 as u16,
             )),
-            Some(rules),
+            rules,
             registry,
             effects,
         )
         .map_err(|error| error.to_string())?;
         if infantry {
-            self.locomotor_mark_all_occupation_bits(id, false);
+            self.locomotor_mark_all_occupation_bits(id, false, rules.ares_form());
         }
         Ok(true)
     }
@@ -225,18 +245,6 @@ fn foot(category: EntityCategory) -> bool {
 }
 
 impl Simulation {
-    /// The warp of the Teleport running this Process, which the Unit
-    /// setter may have suspended under a Drive by now.
-    fn chrono_warp_mut(&mut self, id: u64) -> Option<&mut ChronoWarp> {
-        self.substrate
-            .entities
-            .get_mut(id)?
-            .locomotor
-            .as_mut()?
-            .warp_teleport_mut()?
-            .chrono_mut()
-    }
-
     /// Object `+0x90`.
     fn chrono_owner_alive(&self, id: u64) -> bool {
         self.substrate
@@ -268,35 +276,43 @@ impl Simulation {
         else {
             return Ok(bridge_state_changed);
         };
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         // Original719304..719342 precedes both the ordinary movement and
         // Chronosphere arms. Reinforcement's pending3 transfers on one visit;
         // the next visit runs state3. WarpingIn alone instead runs TimerCheck.
         if warp.state() == 0 && warp.warping_in() && warp.pending_state() == 0 {
-            self.teleport_timer_check(id, Some(rules), ctx);
+            self.teleport_timer_check(id, rules, ctx);
             return Ok(false);
         }
         if warp.state() == 0 && warp.pending_state() != 0 {
-            if let Some(active) = self.chrono_warp_mut(id) {
+            if let Some(active) = self.substrate.chrono_warp_mut(id) {
                 active.set_state(warp.pending_state());
             }
             return Ok(false);
         }
         match warp.state() {
             0 => {
-                if let Some(warp) = self.chrono_warp_mut(id) {
+                if let Some(warp) = self.substrate.chrono_warp_mut(id) {
                     warp.set_bytes(true, true, false);
                     warp.start_timer(frame, CHRONO_WARP_OUT_FRAMES);
                     warp.set_state(1);
                 }
             }
             1 | 6 => {
-                self.teleport_timer_check(id, Some(rules), ctx);
+                self.teleport_timer_check(id, rules, ctx);
             }
             2 => {
                 self.teleport_warp_out(id, rules);
-                self.foot_mark_remove(id, Some(rules), registry, ctx.effects);
-                self.teleport_warp_sound(id, WarpSound::Out, rules);
+                self.foot_mark_remove(id, rules, registry, ctx.effects);
+                Self::teleport_warp_sound(
+                    &mut self.interner,
+                    &self.substrate,
+                    self.resolved_terrain.as_ref(),
+                    &mut self.sound_events,
+                    id,
+                    WarpSound::Out,
+                    rules,
+                );
                 if let Some(entity) = self.substrate.entities.get_mut(id) {
                     // The warp-out's OnBridge clear (`0x007198FA`).
                     entity.on_bridge.store(false);
@@ -304,7 +320,7 @@ impl Simulation {
                         locomotor.store_ground_layer(false);
                     }
                 }
-                if let Some(warp) = self.chrono_warp_mut(id) {
+                if let Some(warp) = self.substrate.chrono_warp_mut(id) {
                     warp.set_bytes(false, false, true);
                 }
                 let landed = self.chrono_update_position(
@@ -315,7 +331,7 @@ impl Simulation {
                     registry,
                     ctx.effects,
                 );
-                if let Some(warp) = self.chrono_warp_mut(id) {
+                if let Some(warp) = self.substrate.chrono_warp_mut(id) {
                     warp.set_state(if landed { 4 } else { 3 });
                 }
             }
@@ -328,7 +344,7 @@ impl Simulation {
                     registry,
                     ctx.effects,
                 );
-                if landed && let Some(warp) = self.chrono_warp_mut(id) {
+                if landed && let Some(warp) = self.substrate.chrono_warp_mut(id) {
                     warp.set_state(4);
                 }
                 if let Some(entity) = self.substrate.entities.get_mut(id) {
@@ -345,13 +361,21 @@ impl Simulation {
                     ctx.effects,
                 );
                 self.chrono_settle(id, rules, registry, ctx.effects);
-                if let Some(warp) = self.chrono_warp_mut(id) {
+                if let Some(warp) = self.substrate.chrono_warp_mut(id) {
                     warp.set_state(5);
                 }
             }
             5 => {
                 let marked = self.chrono_settle(id, rules, registry, ctx.effects);
-                self.teleport_warp_sound(id, WarpSound::In, rules);
+                Self::teleport_warp_sound(
+                    &mut self.interner,
+                    &self.substrate,
+                    self.resolved_terrain.as_ref(),
+                    &mut self.sound_events,
+                    id,
+                    WarpSound::In,
+                    rules,
+                );
                 self.chrono_playfield_check(id);
                 //719AA3..719AC9: a newly reinforced member skips the
                 //Chronosphere's terrain kill/sink/transform validation.
@@ -364,7 +388,7 @@ impl Simulation {
                 bridge_state_changed |= self.per_cell_process(
                     id,
                     super::PerCellReason::Arrival,
-                    Some(rules),
+                    rules,
                     registry,
                     ctx.effects,
                 )?;
@@ -374,28 +398,28 @@ impl Simulation {
                     entity.drop_credit.forget();
                     entity.set_archive_target(None);
                 }
-                self.assign_null_destination(id, Some(rules), registry, ctx.effects);
+                self.assign_null_destination(id, rules, registry, ctx.effects);
                 let delay = self
                     .substrate
                     .entities
                     .get(id)
                     .map_or(0, |entity| entity.chrono_warp_delay());
-                if let Some(warp) = self.chrono_warp_mut(id) {
+                if let Some(warp) = self.substrate.chrono_warp_mut(id) {
                     warp.start_timer(frame, delay);
                 }
                 self.teleport_warp_out(id, rules);
-                if let Some(warp) = self.chrono_warp_mut(id) {
+                if let Some(warp) = self.substrate.chrono_warp_mut(id) {
                     warp.set_state(6);
                 }
             }
             7 => {
-                if let Some(warp) = self.chrono_warp_mut(id) {
+                if let Some(warp) = self.substrate.chrono_warp_mut(id) {
                     warp.set_warping_in(false);
                 }
                 if let Some(entity) = self.substrate.entities.get_mut(id) {
                     entity.set_archive_target(None);
                 }
-                self.assign_null_destination(id, Some(rules), registry, ctx.effects);
+                self.assign_null_destination(id, rules, registry, ctx.effects);
                 if let Some(runtime) = self
                     .substrate
                     .entities
@@ -429,9 +453,9 @@ impl Simulation {
             .and_then(|locomotor| locomotor.teleport_runtime())
             .and_then(|runtime| runtime.resolved_destination())
             .unwrap_or(DriveCoord { x: 0, y: 0, z: 0 });
-        self.foot_set_location_marked(id, marked, Some(rules), registry, effects);
-        self.set_object_height(id, 0, Some(rules), registry, effects);
-        self.foot_mark_put(id, Some(rules), registry, effects);
+        self.foot_set_location_marked(id, marked, rules, registry, effects);
+        self.set_object_height(id, 0, rules, registry, effects);
+        self.foot_mark_put(id, rules, registry, effects);
         marked
     }
 
@@ -449,7 +473,7 @@ impl Simulation {
         };
         if !crate::sim::cell_rect::cell_is_in_playfield_height_aware(
             cell,
-            self.playfield_bounds,
+            self.playfield_bounds(),
             self.resolved_terrain.as_ref(),
         ) && let Some(entity) = self.substrate.entities.get_mut(id)
         {
@@ -506,7 +530,15 @@ impl Simulation {
             .and_then(|runtime| runtime.resolved_destination())
             .unwrap_or(location);
         if place {
-            self.object_raw_receiver_at(id, marked, false);
+            Self::object_raw_receiver_at(
+                &mut self.substrate,
+                &self.path_grid,
+                &self.resolved_terrain,
+                id,
+                marked,
+                false,
+                rules.ares_form(),
+            );
             let (ground, bridge) = self
                 .resolved_terrain
                 .as_ref()
@@ -538,8 +570,24 @@ impl Simulation {
                     runtime.set_resolved_destination(marked);
                 }
             }
-            self.object_raw_receiver_at(id, marked, true);
-            self.object_raw_receiver_at(id, marked, true);
+            Self::object_raw_receiver_at(
+                &mut self.substrate,
+                &self.path_grid,
+                &self.resolved_terrain,
+                id,
+                marked,
+                true,
+                rules.ares_form(),
+            );
+            Self::object_raw_receiver_at(
+                &mut self.substrate,
+                &self.path_grid,
+                &self.resolved_terrain,
+                id,
+                marked,
+                true,
+                rules.ares_form(),
+            );
             return true;
         }
         let owner_infantry = entity.category() == EntityCategory::Infantry;
@@ -552,16 +600,31 @@ impl Simulation {
         ) {
             let mut next = self.cell_objects(cell, layer).next();
             while let Some(member) = next {
-                self.chrono_telefrag(
-                    id,
-                    owner_infantry,
-                    member,
-                    coord,
-                    &mut blocked,
-                    rules,
-                    registry,
-                    effects,
-                );
+                // Ares 3.0 1004B980 (hook 0x718275) replaces the walk; it reads
+                // each successor before the kill, as the vanilla loop does.
+                if rules.ares() {
+                    self.ares_chrono_make_room(
+                        id,
+                        owner_infantry,
+                        member,
+                        coord,
+                        &mut blocked,
+                        rules,
+                        registry,
+                        effects,
+                    );
+                } else {
+                    self.chrono_telefrag(
+                        id,
+                        owner_infantry,
+                        member,
+                        coord,
+                        &mut blocked,
+                        rules,
+                        registry,
+                        effects,
+                    );
+                }
                 next = self.next_cell_object(member);
             }
         }
@@ -576,8 +639,83 @@ impl Simulation {
             self.chrono_retarget_blocked(id, coord, location, rules);
             return false;
         }
-        self.object_raw_receiver_at(id, marked, true);
+        Self::object_raw_receiver_at(
+            &mut self.substrate,
+            &self.path_grid,
+            &self.resolved_terrain,
+            id,
+            marked,
+            true,
+            rules.ares_form(),
+        );
         true
+    }
+
+    /// TeleportLocomotionClass_MakeRoom (Ares 3.0 `1004B980`, hook
+    /// `0x718275`, resuming at `0x7184CE`) for one object of the destination
+    /// cell's list: an object is protected while under the Iron Curtain or
+    /// when its TechnoTypeExt `Chronoshift.Crushable` is off. With RulesExt
+    /// `ChronoInfantryCrush=no` arriving infantry dies on anything but
+    /// infantry; infantry on infantry kills only the unprotected one at
+    /// exactly `coord`; a protected object kills the arriving one, an
+    /// unprotected Foot dies, and anything else sends the arrival to
+    /// another cell. Every kill is the victim's Strength as `C4Warhead=`,
+    /// ignoring defenses, with no attacker or house.
+    #[allow(clippy::too_many_arguments)]
+    fn ares_chrono_make_room(
+        &mut self,
+        id: u64,
+        owner_infantry: bool,
+        member: CellObjectMember,
+        coord: DriveCoord,
+        blocked: &mut bool,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        effects: FrameEffects<'_>,
+    ) {
+        let crush_infantry = rules.ares_chrono_infantry_crush();
+        // A TerrainClass is no infantry, no Techno and never curtained.
+        let (other, object_infantry, protected, object_foot) = match member {
+            CellObjectMember::Entity(other) => {
+                let frame = self.session.binary_frame();
+                let Some(entity) = self.substrate.entities.get(other) else {
+                    return;
+                };
+                let crushable = self
+                    .object_type(entity.type_ref(), rules)
+                    .is_none_or(|object| object.ares_chronoshift().crushable);
+                (
+                    Some(other),
+                    entity.category() == EntityCategory::Infantry,
+                    crate::sim::superweapon::invulnerability::is_invulnerable(
+                        entity.invulnerability.as_ref(),
+                        frame,
+                    ) || !crushable,
+                    foot(entity.category()),
+                )
+            }
+            _ => (None, false, false, false),
+        };
+        let victim = if !crush_infantry && owner_infantry && !object_infantry {
+            Some(id)
+        } else if !protected && object_infantry && owner_infantry {
+            other.filter(|&other| {
+                self.substrate.entities.get(other).is_some_and(|entity| {
+                    super::ground_pose::object_get_coords(entity, self.resolved_terrain.as_ref())
+                        == coord
+                })
+            })
+        } else if protected {
+            Some(id)
+        } else if object_foot {
+            other
+        } else {
+            *blocked = true;
+            None
+        };
+        if let Some(victim) = victim {
+            self.chrono_c4_kill(victim, rules, registry, effects);
+        }
     }
 
     /// One object of Update_Position's walk (`0x007182DC..0x0071842A`).
@@ -597,7 +735,7 @@ impl Simulation {
             *blocked = true;
             return;
         };
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         let Some(entity) = self.substrate.entities.get(other) else {
             return;
         };
@@ -720,7 +858,7 @@ impl Simulation {
             y: to.y.wrapping_add(coord.y.wrapping_sub(from.y)),
             z: to.z.wrapping_add(coord.z.wrapping_sub(from.z)),
         };
-        if let Some(warp) = self.chrono_warp_mut(id) {
+        if let Some(warp) = self.substrate.chrono_warp_mut(id) {
             warp.set_destination(destination);
         }
     }
@@ -759,12 +897,15 @@ impl Simulation {
         let land = cells.land_type(cell);
         let water_tile = terrain.native_cell_is_water_tile(cell);
         if matches!(cell, crate::map::cell_index::NativeCellIdentity::Real(_)) {
-            let frame = self.session.binary_frame;
+            let frame = self.session.binary_frame();
             let mut next = self
                 .cell_objects((cx as u16, cy as u16), MovementLayer::Ground)
                 .next();
             while let Some(member) = next {
+                // Ares 3.0 TeleportLocomotionClass_Unwarp_PreventSelfCrush
+                // (10037BC0, hook 0x7187DA) skips the warper itself.
                 if let CellObjectMember::Entity(other) = member
+                    && !(rules.ares() && other == id)
                     && self.substrate.entities.get(other).is_some_and(|entity| {
                         crate::sim::superweapon::invulnerability::is_invulnerable(
                             entity.invulnerability.as_ref(),
@@ -782,12 +923,48 @@ impl Simulation {
                 (
                     entity.category(),
                     object.naval,
-                    object.speed_type == SpeedType::Hover
-                        && !(object.powered_unit && !self.has_powered_center(entity.owner())),
+                    // Ares 3.0 TeleportLocomotionClass_UnfreezeObject_SinkOrSwim
+                    // (1005D420, hook 0x718871): an Amphibious,
+                    // AmphibiousCrusher, AmphibiousDestroyer or WaterBeach
+                    // MovementZone floats too, powered or not.
+                    rules.ares()
+                        && matches!(
+                            object.movement_zone,
+                            MovementZone::Amphibious
+                                | MovementZone::AmphibiousCrusher
+                                | MovementZone::AmphibiousDestroyer
+                                | MovementZone::WaterBeach
+                        )
+                        || object.speed_type == SpeedType::Hover
+                            && !(object.powered_unit && !self.has_powered_center(entity.owner())),
                 )
             })
         }) else {
             return;
+        };
+        // Ares 3.0 TeleportLocomotionClass_Unwarp_SinkJumpJets (10037BE0,
+        // hook 0x7188F2): on a water tile (`0x004865D0`) a Unit offline for
+        // want of power (`+0x1C8`) does not float, and a `SpeedType=Hover`
+        // `JumpJet=` Unit goes straight to `0x00718A66`, whose water-tile,
+        // non-infantry arm sinks it with no kill booked.
+        let hover = if rules.ares() {
+            let unit = (water_tile && category == EntityCategory::Unit)
+                .then(|| {
+                    let entity = self.substrate.entities.get(id)?;
+                    let object = self.object_type(entity.type_ref(), rules)?;
+                    Some((
+                        entity.deactivated.is_offline(),
+                        object.speed_type == SpeedType::Hover && object.jumpjet,
+                    ))
+                })
+                .flatten();
+            if unit.is_some_and(|(_, jumpjet)| jumpjet) {
+                self.chrono_warp_sink(id, rules, registry, effects);
+                return;
+            }
+            hover && !unit.is_some_and(|(offline, _)| offline)
+        } else {
+            hover
         };
         let road = land == LandType::Road.as_index() as i32;
         let bridge = flags & CELL_FLAG_BRIDGE != 0;
@@ -800,7 +977,7 @@ impl Simulation {
             self.record_manipulated_kill(
                 id,
                 id,
-                crate::sim::world::UninitContext::new(Some(rules), registry).with_effects(effects),
+                crate::sim::world::UninitContext::new(rules, registry).with_effects(effects),
             );
             return;
         }
@@ -856,5 +1033,18 @@ impl Simulation {
             return;
         };
         self.free_slaves(id, killer, house, rules, registry, effects);
+    }
+}
+
+impl crate::sim::world::ObjectSubstrate {
+    /// The warp of the Teleport running this Process, which the Unit
+    /// setter may have suspended under a Drive by now.
+    fn chrono_warp_mut(&mut self, id: u64) -> Option<&mut ChronoWarp> {
+        self.entities
+            .get_mut(id)?
+            .locomotor
+            .as_mut()?
+            .warp_teleport_mut()?
+            .chrono_mut()
     }
 }

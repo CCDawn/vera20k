@@ -17,14 +17,7 @@ use crate::sim::movement::infantry_action::{DO_DEPLOY, DO_DEPLOYED, DO_DEPLOYED_
 use crate::sim::world::Simulation;
 
 fn retail_rules() -> Option<RuleSet> {
-    let art = crate::rules::retail_ini_fixture::retail_ini("artmd.ini")?;
-    let mut rules = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()?;
-    // The app's ART sequence binding, without which an infantryman's
-    // Do_Action refuses an action his sequence holds.
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-    );
-    Some(rules)
+    crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
 }
 
 /// The flat arena with the computer `Russians` and the human `Americans`.
@@ -32,8 +25,8 @@ fn arena(rules: &RuleSet) -> Simulation {
     let mut sim = crate::sim::arena_fixture::rival_arena(rules, 0x4D5690);
     sim.intern_rule_type_ids(rules);
     sim.resolve_type_handles(rules);
-    sim.input_delay_ticks = 0;
-    sim.session.binary_frame = 1;
+    sim.set_input_delay_ticks(0);
+    sim.session.set_binary_frame_for_test(1);
     sim
 }
 
@@ -43,10 +36,11 @@ fn spawn(sim: &mut Simulation, rules: &RuleSet, kind: &str, owner: &str, cell: (
 }
 
 fn start_mission(sim: &mut Simulation, id: u64, mission: MissionType) {
-    let now = sim.session.binary_frame;
-    sim.mission_assign_exact(id, MissionId::from_known(mission), now)
+    let now = sim.session.binary_frame();
+    sim.substrate
+        .mission_assign_exact(id, MissionId::from_known(mission), now)
         .unwrap();
-    let _ = sim.mission_commence_exact(id, now);
+    let _ = sim.substrate.mission_commence_exact(id, now);
 }
 
 fn target(sim: &mut Simulation, id: u64, target: u64) {
@@ -60,7 +54,7 @@ fn target(sim: &mut Simulation, id: u64, target: u64) {
 
 fn order(sim: &mut Simulation, owner: &str, command: Command) {
     let owner = sim.interner.intern(owner);
-    let tick = sim.session.tick + 1;
+    let tick = sim.session.tick() + 1;
     sim.queue_command(CommandEnvelope::new(owner, tick, command));
 }
 
@@ -253,6 +247,19 @@ fn a_robot_tank_stops_on_entering_the_first_cell_with_its_target_in_range() {
     spawn(&mut sim, &rules, "GAROBO", "Americans", (6, 20));
     let robot = spawn(&mut sim, &rules, "ROBO", "Americans", (4, 10));
     let tank = spawn(&mut sim, &rules, "MTNK", "Russians", (24, 13));
+    // Placement counts the Center's drain at once (0x00502B48..0x00502B52)
+    // but the plant's output only at the House's first power assessment, so
+    // the Center first counts as powered in the second frame. Its
+    // RobotTanksBackOnline (0x0050E010) Reactivates the tank, which resets
+    // its orders (0x0070FBE0): order the tank after that.
+    let americans = sim.interner.get("Americans").unwrap();
+    for _ in 0..10 {
+        if sim.has_powered_center(americans) {
+            break;
+        }
+        step(&mut sim, &rules);
+    }
+    assert!(sim.has_powered_center(americans), "the Center powers up");
     order(
         &mut sim,
         "Americans",
@@ -328,9 +335,11 @@ fn a_rhino_stops_short_of_its_approach_cell_when_its_target_closes_in() {
             target_id: tank,
         },
     );
+    // Synthetic setup uses the registered human sender without changing
+    // the Russian actor's AI flags or the order's frame-tail timing.
     order(
         &mut sim,
-        "Russians",
+        "Americans",
         Command::Move {
             entity_id: tank,
             target_rx: 4,
@@ -598,9 +607,11 @@ fn a_hunting_conscript_drops_his_walk_to_approach_his_quarry() {
     let mut sim = arena(&rules);
     let conscript = spawn(&mut sim, &rules, "E2", "Russians", (4, 10));
     let tank = spawn(&mut sim, &rules, "MTNK", "Americans", (24, 10));
+    // Synthetic setup uses the registered human sender without changing
+    // the Russian actor's AI flags or the order's frame-tail timing.
     order(
         &mut sim,
-        "Russians",
+        "Americans",
         Command::Move {
             entity_id: conscript,
             target_rx: 4,
@@ -799,6 +810,34 @@ fn a_computers_deployed_gi_undeploys_to_approach_a_target_out_of_reach() {
             None if !approaches => {}
             other => panic!("against {tank_cell:?}: NavCom {other:?}"),
         }
+    }
+}
+
+/// Phobos `InfantryAutoDeploy`: after the Foot body the hook at `0x00522373`
+/// enters the deploy arm, where a computer's still GI with the tank in his
+/// deploy weapon's reach deploys (Do_Action(0x1B), `0x00522472`). Without
+/// the key he takes only the Foot body.
+#[cfg(feature = "phobos")]
+#[test]
+fn a_computers_gi_auto_deploys_with_a_target_in_reach() {
+    let Some(mut rules) = retail_rules() else {
+        return;
+    };
+    for auto_deploy in [false, true] {
+        rules.general.infantry_auto_deploy = auto_deploy;
+        let mut sim = arena(&rules);
+        let gi = spawn(&mut sim, &rules, "E1", "Russians", (10, 10));
+        let tank = spawn(&mut sim, &rules, "MTNK", "Americans", (13, 10));
+        target(&mut sim, gi, tank);
+        start_mission(&mut sim, gi, MissionType::Attack);
+        sim.approach_target(gi, &rules, None, crate::sim::world::FrameEffects::default());
+        let entity = sim.substrate.entities.get(gi).unwrap();
+        let doing = entity.mission_leaf.as_infantry().unwrap().doing();
+        assert_eq!(
+            doing == DO_DEPLOY,
+            auto_deploy,
+            "InfantryAutoDeploy={auto_deploy}"
+        );
     }
 }
 
@@ -1048,4 +1087,51 @@ fn a_brute_ordered_to_attack_a_tank_walks_beside_it_and_smashes_it() {
     assert!(rx.abs_diff(16) <= 1 && ry.abs_diff(10) <= 1, "{first:?}");
     let smashed = smashed.expect("the Brute smashes the tank");
     assert!(smashed.distance <= range(&rules, "Smash"), "{smashed:?}");
+}
+
+/// Production Hunt must carry a stock Kirov through approach and bomb release.
+/// A stationary power plant keeps target motion out of this regression.
+#[test]
+fn a_hunting_kirov_closes_on_a_building_and_drops_bombs() {
+    let Some(rules) = retail_rules() else {
+        return;
+    };
+    let mut sim = arena(&rules);
+    spawn(&mut sim, &rules, "NAPOWR", "Russians", (2, 24));
+    let victim = spawn(&mut sim, &rules, "GAPOWR", "Americans", (18, 10));
+    let kirov = spawn(&mut sim, &rules, "ZEP", "Russians", (4, 10));
+    let goal = crate::sim::movement::ground_pose::object_get_coords(
+        sim.substrate.entities.get(victim).unwrap(),
+        sim.resolved_terrain.as_ref(),
+    );
+    let health = sim.substrate.entities.get(victim).unwrap().health.current();
+    start_mission(&mut sim, kirov, MissionType::Hunt);
+    let mut closest = i32::MAX;
+    let mut fired = false;
+    let mut seen = Vec::new();
+    let mut last = None;
+    for visit in 0..900 {
+        step(&mut sim, &rules);
+        let actor = sim.substrate.entities.get(kirov).expect("Kirov lives");
+        assert_eq!(actor.mission.current().known(), Some(MissionType::Hunt));
+        let at = position_world_coord(&actor.position);
+        let distance =
+            crate::util::native_x87::distance_3d_leptons([at.x, at.y, 0], [goal.x, goal.y, 0]);
+        closest = closest.min(distance);
+        fired |= actor.rearm_timer.duration() > 0;
+        let state = (actor.attack_target.target(), actor.navigation.nav_com());
+        if Some(state) != last {
+            seen.push((visit, state, distance, at));
+            last = Some(state);
+        }
+        if !sim.substrate.entities.contains(victim)
+            || sim.substrate.entities.get(victim).unwrap().health.current() < health
+        {
+            assert!(fired, "bomb damage must follow a committed shot");
+            return;
+        }
+    }
+    panic!(
+        "Hunt never bombed the stationary plant: closest={closest}, fired={fired}, transitions={seen:?}"
+    );
 }

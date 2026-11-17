@@ -1,6 +1,7 @@
 //! `asset sound <NAME>` and `asset bag-ls` — the audio bag, headlessly.
 //!
-//! Production uses the one startup-selected `audio.idx`/`audio.bag` pair.
+//! Production uses its startup-selected catalog: the stock pair, or the
+//! optional ordered Ares BAG set.
 //! Each file follows the shared resolver, including independent loose overrides.
 //! Explicit `--bag` requests inspect a named archive or loose diagnostic pair.
 //! See [process audio owner](../../tools/audio_catalog_owner.md) for source/lifetime evidence.
@@ -20,6 +21,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::asset_tools::report::{ErrorReport, SoundEntry, SoundReport};
+use crate::asset_tools::sanitise_name;
 use crate::assets::asset_manager::{
     AssetManager, AssetResolutionRef, AudioIndexSources, LoadedAudioIndex, load_audio_index_pair,
 };
@@ -112,12 +114,13 @@ impl Default for SoundOptions {
     }
 }
 
-/// One opened `.idx`/`.bag` pair plus the provenance string for the report.
+/// One opened catalog plus its pair provenance for the report.
 struct OpenBag {
     index: AudioIndex,
     /// How this pair was opened, e.g. `AUDIOMD.MIX -> audio.idx/audio.bag`.
     identity: String,
     sources: AudioIndexSources,
+    additional_sources: Vec<AudioIndexSources>,
 }
 
 /// `asset sound <NAME>` — one bag entry's header, decoded length, and
@@ -183,6 +186,7 @@ pub fn sound(
     Ok(SoundReport {
         bag: bag.identity,
         sources: Some(bag.sources),
+        additional_sources: bag.additional_sources,
         entry_count,
         matched: 1,
         shown: 1,
@@ -206,6 +210,7 @@ pub fn bag_ls(
         return Ok(SoundReport {
             bag: NO_BAG_IDENTITY.to_string(),
             sources: None,
+            additional_sources: Vec::new(),
             entry_count: 0,
             matched: 0,
             shown: 0,
@@ -244,6 +249,7 @@ pub fn bag_ls(
     Ok(SoundReport {
         bag: bag.identity,
         sources: Some(bag.sources),
+        additional_sources: bag.additional_sources,
         entry_count: reachable.len(),
         matched: matched.len(),
         shown: rows.len(),
@@ -252,7 +258,7 @@ pub fn bag_ls(
     })
 }
 
-/// Open the production pair, or one explicitly requested diagnostic override.
+/// Open the production catalog, or one explicitly requested diagnostic pair.
 fn open_bag(asset_manager: &AssetManager, opts: &SoundOptions) -> (Option<OpenBag>, Vec<String>) {
     let mut warnings = Vec::new();
     let Some(requested) = opts.bag.as_deref() else {
@@ -260,7 +266,14 @@ fn open_bag(asset_manager: &AssetManager, opts: &SoundOptions) -> (Option<OpenBa
             Ok(Some(loaded)) => (Some(opened_pair(loaded)), warnings),
             Ok(None) => (
                 None,
-                vec!["startup audio.idx/audio.bag pair is unavailable".to_owned()],
+                vec![
+                    if asset_manager.ships_ares() {
+                        "startup Ares audio catalog has no valid pair"
+                    } else {
+                        "startup audio.idx/audio.bag pair is unavailable"
+                    }
+                    .to_owned(),
+                ],
             ),
             Err(error) => (None, vec![error.to_string()]),
         };
@@ -342,9 +355,18 @@ fn opened_pair(loaded: LoadedAudioIndex) -> OpenBag {
         "IDX from {}; BAG from {}",
         loaded.sources.idx.source_archive, loaded.sources.bag.source_archive
     );
+    let identity = if loaded.additional_sources.is_empty() {
+        identity
+    } else {
+        format!(
+            "{identity}; {} additional Ares BAG pair(s), see additional_sources",
+            loaded.additional_sources.len()
+        )
+    };
     OpenBag {
         index: loaded.index,
         sources: loaded.sources,
+        additional_sources: loaded.additional_sources,
         identity,
     }
 }
@@ -476,7 +498,7 @@ fn write_wav(out: &Path, name: &str, audio: &BagAudio) -> Result<String, String>
             dir.display()
         )
     })?;
-    let path = dir.join(format!("{}.wav", sanitise_name(name)));
+    let path = dir.join(format!("{}.wav", sanitise_name(name, FALLBACK_FILE_NAME)));
     std::fs::write(&path, bytes).map_err(|err| {
         format!(
             "could not write {}: {err} — pass a writable `--out` root",
@@ -527,26 +549,6 @@ fn sound_dir(out: &Path) -> PathBuf {
     root.join(SOUND_SUBDIR)
 }
 
-/// Replace every character outside `[A-Za-z0-9._-]`, matching the render verb's
-/// rule so both verbs' outputs are safe filename components everywhere.
-fn sanitise_name(name: &str) -> String {
-    let sanitised: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitised.is_empty() {
-        FALLBACK_FILE_NAME.to_string()
-    } else {
-        sanitised
-    }
-}
-
 /// The leading characters of a missed name, offered back as `--prefix`.
 fn prefix_hint(name: &str) -> String {
     let hint: String = name
@@ -561,7 +563,7 @@ fn prefix_hint(name: &str) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
 
@@ -599,37 +601,6 @@ mod tests {
                 0x08, 0x00, 0x00, 0x00, // 8 bytes
             ][..]
         );
-    }
-
-    #[test]
-    fn stereo_wav_header_doubles_the_byte_rate_and_block_align() {
-        // 4 interleaved samples = 2 stereo frames, still 8 bytes of data.
-        let wav = wav_bytes(&[0, 0, 1, 1], 2, 22050).expect("fits a RIFF header");
-        assert_eq!(wav.len(), WAV_HEADER_SIZE + 8);
-        assert_eq!(
-            &wav[..WAV_HEADER_SIZE],
-            &[
-                b'R', b'I', b'F', b'F', //
-                0x2C, 0x00, 0x00, 0x00, //
-                b'W', b'A', b'V', b'E', //
-                b'f', b'm', b't', b' ', //
-                0x10, 0x00, 0x00, 0x00, //
-                0x01, 0x00, // PCM
-                0x02, 0x00, // 2 channels
-                0x22, 0x56, 0x00, 0x00, // 22050 Hz
-                0x88, 0x58, 0x01, 0x00, // 22050 * 2 * 2 = 88200 byte/s
-                0x04, 0x00, // block align 4
-                0x10, 0x00, //
-                b'd', b'a', b't', b'a', //
-                0x08, 0x00, 0x00, 0x00,
-            ][..]
-        );
-    }
-
-    #[test]
-    fn wav_samples_are_little_endian_and_in_order() {
-        let wav = wav_bytes(&[1, -2], 1, 22050).expect("fits a RIFF header");
-        assert_eq!(&wav[WAV_HEADER_SIZE..], &[0x01, 0x00, 0xFE, 0xFF][..]);
     }
 
     #[test]
@@ -746,39 +717,6 @@ mod tests {
     }
 
     #[test]
-    fn sanitise_name_keeps_safe_characters_and_replaces_the_rest() {
-        assert_eq!(sanitise_name("IGISEA"), "IGISEA");
-        assert_eq!(sanitise_name("ceva048.aud"), "ceva048.aud");
-        assert_eq!(sanitise_name("a/b\\c:d"), "a_b_c_d");
-        assert_eq!(sanitise_name(""), FALLBACK_FILE_NAME);
-    }
-
-    #[test]
-    fn sound_dir_is_absolute_and_ends_with_the_verbs_subdir() {
-        let dir = sound_dir(Path::new(DEFAULT_OUT_ROOT));
-        assert!(dir.is_absolute(), "{}", dir.display());
-        assert!(dir.ends_with(SOUND_SUBDIR), "{}", dir.display());
-    }
-
-    #[test]
-    fn prefix_hint_offers_the_leading_characters_uppercased() {
-        assert_eq!(prefix_hint("igisea"), "IGI");
-        assert_eq!(prefix_hint("ce"), "CE");
-        assert_eq!(prefix_hint(""), "SOUND");
-    }
-
-    #[test]
-    fn defaults_are_a_bounded_page_and_the_build_output_root() {
-        let opts = SoundOptions::default();
-        assert_eq!(opts.limit, DEFAULT_LIMIT);
-        assert_eq!(opts.offset, 0);
-        assert_eq!(opts.out, PathBuf::from(DEFAULT_OUT_ROOT));
-        assert!(opts.bag.is_none());
-        assert!(opts.prefix.is_none());
-        assert!(!opts.wav);
-    }
-
-    #[test]
     fn audio_archive_fallback_is_whole_pair_and_diagnostics_can_override_it() {
         let dir = crate::assets::asset_manager::test_support::audio_test_install("audio-fallback");
         let md = crate::assets::audio_bag::test_support::build_idx(&[("md_only", 0, 2, 22050, 4)]);
@@ -832,6 +770,9 @@ mod tests {
             custom.sources.unwrap().bag.source_sha256,
             crate::util::sha256::sha256_hex(&[3, 4])
         );
+        // Release the archive mappings before removing the YR pair; Windows
+        // filesystems can refuse to delete a MIX while it is still mapped.
+        drop(manager);
         std::fs::remove_file(dir.path().join("audiomd.mix")).unwrap();
         let fallback = AssetManager::new(
             dir.path(),

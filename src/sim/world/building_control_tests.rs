@@ -1,6 +1,6 @@
 //! Building virtual+A0 and Object Select's state-admission prefix.
 //!
-//! Steam gamemd 3e81a617: original44F5C0,455DA0,50B730 and5F4520..5F45A0.
+//! Steam gamemd: original44F5C0,455DA0,50B730 and5F4520..5F45A0.
 //! Corpus: tools/procedural_drawing_oracle/factory_destination.py --control.
 //! Prepared live state, not constructor/INI execution or full UI selection.
 
@@ -59,12 +59,16 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
         0,
         1,
     );
-    house.player_control = input["player_control"].as_bool().unwrap_or(false);
-    sim.houses.insert(owner, house);
-    sim.session.house_order.push(owner);
-    sim.session.current_house = Some(owner);
-    sim.session.game_mode_nonzero = input["session_mode"].as_u64().unwrap_or(0) != 0;
-    sim.session.game_options.mcv_redeploy = input["mcv_redeploy"].as_bool().unwrap_or(false);
+    house.set_player_control_for_test(input["player_control"].as_bool().unwrap_or(false));
+    sim.houses.register(house);
+    sim.session.set_current_house_for_test(Some(owner));
+    sim.session.set_game_mode(
+        crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+            input["session_mode"].as_u64().unwrap_or(0) != 0,
+        ),
+    );
+    sim.session.game_options_mut_for_test().mcv_redeploy =
+        input["mcv_redeploy"].as_bool().unwrap_or(false);
     let mut actor = GameEntity::test_default_of_category(
         ACTOR,
         "BUILDING",
@@ -142,7 +146,7 @@ fn building_mission_only_selection_uses_native_virtual_control_admission() {
             }
             let key = if mission_only { "true" } else { "false" };
             assert_eq!(
-                sim.can_select_object(ACTOR, Some(&rules)),
+                sim.can_select_object(ACTOR, &rules),
                 row["expected"]["selection_admission"][key]
                     .as_bool()
                     .unwrap(),

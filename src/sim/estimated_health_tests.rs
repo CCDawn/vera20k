@@ -40,9 +40,10 @@ fn actual_object_ai_recovers_each_category_on_binary_frame_mask() {
         entity.health.set_for_test(100);
         entity.estimated_health = EstimatedHealth::from_raw(-100);
         sim.substrate.entities.insert(entity);
+        sim.interner = crate::sim::intern::test_interner();
         sim.set_logic_order_for_test(vec![1]);
-        sim.session.tick = 4;
-        sim.session.binary_frame = 3;
+        sim.session.set_tick_for_test(4);
+        sim.session.set_binary_frame_for_test(3);
         sim.object_ai_stage(None);
         assert_eq!(
             sim.substrate
@@ -53,8 +54,8 @@ fn actual_object_ai_recovers_each_category_on_binary_frame_mask() {
                 .get(),
             -100
         );
-        sim.session.tick = 8;
-        sim.session.binary_frame = 4;
+        sim.session.set_tick_for_test(8);
+        sim.session.set_binary_frame_for_test(4);
         sim.object_ai_stage(None);
         assert_eq!(
             sim.substrate
@@ -65,7 +66,7 @@ fn actual_object_ai_recovers_each_category_on_binary_frame_mask() {
                 .get(),
             -29
         );
-        sim.session.binary_frame = 5;
+        sim.session.set_binary_frame_for_test(5);
         sim.object_ai_stage(None);
         assert_eq!(
             sim.substrate
@@ -115,8 +116,9 @@ fn active_tube_bypasses_recovery_until_ordinary_ai_resumes() {
             },
         ));
         sim.substrate.entities.insert(entity);
+        sim.interner = crate::sim::intern::test_interner();
         sim.set_logic_order_for_test(vec![1]);
-        sim.session.binary_frame = 4;
+        sim.session.set_binary_frame_for_test(4);
         sim.object_ai_stage(None);
         assert_eq!(
             sim.substrate
@@ -150,7 +152,7 @@ fn save_restore_preserves_negative_reservations_and_ai_continuation() {
     use crate::sim::snapshot::GameSnapshot;
 
     let mut sim = Simulation::new();
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     let mut entity = GameEntity::test_default(id, "E1", "Americans", 5, 5);
     entity.set_category_for_test(EntityCategory::Infantry);
     entity.lifecycle.set_in_limbo_for_test(false);
@@ -160,7 +162,7 @@ fn save_restore_preserves_negative_reservations_and_ai_continuation() {
     sim.add_entity_occupancy(id);
     sim.interner = crate::sim::intern::test_interner();
     sim.scenario_rng = crate::sim::rng::SimRng::new(0);
-    sim.session.binary_frame = 3;
+    sim.session.set_binary_frame_for_test(3);
     let bytes = GameSnapshot::save(&sim, 0, 0, "estimated health", 0);
     let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
     restored.restore_after_snapshot_load().unwrap();
@@ -176,8 +178,8 @@ fn save_restore_preserves_negative_reservations_and_ai_continuation() {
     );
     assert_eq!(restored.state_hash(), sim.state_hash());
     for frame in [3, 4, 5, 8, 12] {
-        sim.session.binary_frame = frame;
-        restored.session.binary_frame = frame;
+        sim.session.set_binary_frame_for_test(frame);
+        restored.session.set_binary_frame_for_test(frame);
         sim.object_ai_stage(None);
         restored.object_ai_stage(None);
         assert_eq!(restored.state_hash(), sim.state_hash(), "frame {frame}");
@@ -209,14 +211,14 @@ fn common_ai_recovers_before_self_heal_without_mirroring_actual_health() {
     sim.interner = crate::sim::intern::test_interner();
     sim.substrate.entities.insert(entity);
     sim.set_logic_order_for_test(vec![1]);
-    sim.session.binary_frame = 900;
+    sim.session.set_binary_frame_for_test(900);
 
     sim.object_ai_stage(Some(&rules));
     let entity = sim.substrate.entities.get(1).unwrap();
     assert_eq!(entity.health.current(), 11);
     assert_eq!(entity.estimated_health.get(), 10);
 
-    sim.session.binary_frame = 904;
+    sim.session.set_binary_frame_for_test(904);
     sim.object_ai_stage(Some(&rules));
     let entity = sim.substrate.entities.get(1).unwrap();
     assert_eq!(entity.health.current(), 11);
@@ -226,7 +228,7 @@ fn common_ai_recovers_before_self_heal_without_mirroring_actual_health() {
         "frame 904 has mask 0x4 clear"
     );
 
-    sim.session.binary_frame = 908;
+    sim.session.set_binary_frame_for_test(908);
     sim.object_ai_stage(Some(&rules));
     assert_eq!(
         sim.substrate

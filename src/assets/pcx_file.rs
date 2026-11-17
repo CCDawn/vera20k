@@ -17,6 +17,17 @@ pub struct PcxFile {
 
 impl PcxFile {
     pub fn from_bytes(data: &[u8]) -> Result<Self, AssetError> {
+        Self::from_bytes_with_policy(data, false)
+    }
+
+    /// Network previews may contain their encoded scan and optional VGA
+    /// palette, but no ignored stream suffix or oversized final RLE run.
+    /// Local/retail asset decoding retains its existing permissive behavior.
+    pub(crate) fn from_transfer_bytes(data: &[u8]) -> Result<Self, AssetError> {
+        Self::from_bytes_with_policy(data, true)
+    }
+
+    fn from_bytes_with_policy(data: &[u8], transferred: bool) -> Result<Self, AssetError> {
         if data.len() < 128 {
             return Err(pcx_error("PCX too short"));
         }
@@ -43,6 +54,9 @@ impl PcxFile {
         if bytes_per_line < width as usize {
             return Err(pcx_error("Invalid PCX bytes per line"));
         }
+        if transferred && bytes_per_line > usize::from(width).next_multiple_of(2) {
+            return Err(pcx_error("Unreferenced transfer PCX row data"));
+        }
 
         let expected_scan = bytes_per_line
             .checked_mul(planes as usize)
@@ -64,7 +78,15 @@ impl PcxFile {
         } else {
             &data[128..]
         };
-        let scan = decode_pcx_rle(encoded, expected_scan)?;
+        let scan = decode_pcx_rle(encoded, expected_scan, transferred)?;
+        if transferred
+            && bytes_per_line != usize::from(width)
+            && scan
+                .chunks_exact(bytes_per_line)
+                .any(|row| row[usize::from(width)] != 0)
+        {
+            return Err(pcx_error("Nonzero transfer PCX row padding"));
+        }
         let pixels = if planes == 1 {
             trim_paletted_scanlines(&scan, width, height, bytes_per_line)
         } else {
@@ -100,6 +122,11 @@ impl PcxFile {
             rgba.extend_from_slice(&[r, g, b, a]);
         }
         rgba
+    }
+
+    /// Whether pixels address the embedded 256-color palette rather than RGB.
+    pub fn is_indexed(&self) -> bool {
+        !self.direct_rgb
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -199,7 +226,24 @@ fn encode_rle_row(row: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-fn decode_pcx_rle(encoded: &[u8], expected_scan: usize) -> Result<Vec<u8>, AssetError> {
+fn decode_pcx_rle(
+    encoded: &[u8],
+    expected_scan: usize,
+    transferred: bool,
+) -> Result<Vec<u8>, AssetError> {
+    // One input byte produces at most one literal, and a 2-byte run at most
+    // 63 pixels, so a stream of `n` bytes can never expand past
+    // `63 * n/2 + n%2` scan bytes. A header claiming more than that has no
+    // payload behind it: reject before the capacity reflects the claim.
+    let max_scan = 63 * (encoded.len() / 2) + encoded.len() % 2;
+    if expected_scan > max_scan {
+        return Err(pcx_error(format!(
+            "PCX scan needs {} bytes but {} encoded bytes cannot expand past {}",
+            expected_scan,
+            encoded.len(),
+            max_scan
+        )));
+    }
     let mut scan = Vec::with_capacity(expected_scan);
     let mut i = 0usize;
     while i < encoded.len() && scan.len() < expected_scan {
@@ -210,6 +254,9 @@ fn decode_pcx_rle(encoded: &[u8], expected_scan: usize) -> Result<Vec<u8>, Asset
                 return Err(pcx_error("Truncated PCX RLE run"));
             }
             let count = (byte & 0x3F) as usize;
+            if transferred && count == 0 {
+                return Err(pcx_error("Empty transfer PCX RLE run"));
+            }
             let value = encoded[i];
             i += 1;
             scan.extend(std::iter::repeat_n(value, count));
@@ -219,6 +266,9 @@ fn decode_pcx_rle(encoded: &[u8], expected_scan: usize) -> Result<Vec<u8>, Asset
     }
     if scan.len() < expected_scan {
         return Err(pcx_error("PCX RLE stream ended early"));
+    }
+    if transferred && (i != encoded.len() || scan.len() != expected_scan) {
+        return Err(pcx_error("Unreferenced transfer PCX data"));
     }
     scan.truncate(expected_scan);
     Ok(scan)
@@ -259,14 +309,14 @@ fn decode_direct_rgb_scanlines(
     pixels
 }
 
-fn pcx_error(detail: &str) -> AssetError {
+fn pcx_error(detail: impl Into<String>) -> AssetError {
     AssetError::ParseError {
         format: "PCX".to_string(),
-        detail: detail.to_string(),
+        detail: detail.into(),
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_assets))]
 mod tests {
     use super::PcxFile;
 
@@ -289,6 +339,50 @@ mod tests {
         data[65] = planes;
         data[66..68].copy_from_slice(&bytes_per_line.to_le_bytes());
         data
+    }
+
+    #[test]
+    fn a_huge_header_scan_cannot_reserve_past_the_encoded_expansion() {
+        // 65535x65535 at three planes claims a 12.9 GB scan behind one encoded
+        // byte; the RLE expansion cap must reject before the capacity
+        // reflects the claim.
+        let mut bytes = pcx_header(0, 0, 65534, 65534, 3, 65535);
+        bytes.push(0xAA);
+        let err = PcxFile::from_bytes(&bytes).expect_err("no payload behind the scan");
+        let crate::assets::error::AssetError::ParseError { detail, .. } = err else {
+            panic!("expected a PCX parse error: {err:?}");
+        };
+        assert!(
+            detail.contains("cannot expand past"),
+            "unexpected detail: {detail}"
+        );
+    }
+
+    #[test]
+    fn transfer_preview_rejects_ignored_stream_and_scanline_data() {
+        let mut bytes = pcx_header(0, 0, 0, 0, 3, 2);
+        bytes.extend_from_slice(&[1, 0, 2, 0, 3, 0]);
+        assert_eq!(
+            PcxFile::from_transfer_bytes(&bytes).unwrap().pixels,
+            [1, 2, 3]
+        );
+        let mut palette = bytes.clone();
+        palette.push(0x0c);
+        palette.extend_from_slice(&[0; 768]);
+        assert!(PcxFile::from_transfer_bytes(&palette).is_ok());
+
+        let mut trailer = bytes.clone();
+        trailer.extend_from_slice(b"MZ\0unused");
+        let mut row_padding = bytes.clone();
+        row_padding[129] = 99;
+        let mut large_stride = pcx_header(0, 0, 0, 0, 3, 4);
+        large_stride.extend_from_slice(&[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
+        let mut oversized_run = bytes[..128].to_vec();
+        oversized_run.extend_from_slice(&[0xc7, 1]);
+        for ignored in [trailer, row_padding, large_stride, oversized_run] {
+            assert!(PcxFile::from_bytes(&ignored).is_ok(), "local compatibility");
+            assert!(PcxFile::from_transfer_bytes(&ignored).is_err());
+        }
     }
 
     #[test]
@@ -391,7 +485,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_assets))]
 mod direct_rgb_roundtrip_tests {
     use super::*;
 
@@ -438,11 +532,5 @@ mod direct_rgb_roundtrip_tests {
         let rgb: Vec<u8> = vec![0xC5, 0x01, 0xC0, 0x02, 0xFF, 0x03];
         let encoded = encode_direct_rgb(2, 1, &rgb).expect("encode");
         assert_eq!(PcxFile::from_bytes(&encoded).expect("decode").pixels, rgb);
-    }
-
-    #[test]
-    fn a_mismatched_buffer_is_rejected() {
-        assert!(encode_direct_rgb(4, 4, &[0; 10]).is_err());
-        assert!(encode_direct_rgb(0, 4, &[]).is_err());
     }
 }

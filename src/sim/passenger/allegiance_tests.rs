@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::rules::{art_data::ArtRegistry, ini_parser::IniFile};
+use crate::sim::house_state::HouseState;
 use crate::sim::world::ObjectAiCtx;
 use serde_json::Value;
 
@@ -96,17 +97,22 @@ fn fixture(input: &Value) -> (Simulation, RuleSet, u64, Vec<InternedId>) {
                 0,
                 10,
             );
-            state.player_control = house["player_control"].as_bool().unwrap();
-            sim.houses.insert(owner, state);
-            sim.session.house_order.push(owner);
+            state.set_player_control_for_test(house["player_control"].as_bool().unwrap());
+            sim.houses.register(state);
             owner
         })
         .collect();
-    sim.session.game_mode_nonzero = integer(&input["game_mode"]) != 0;
-    sim.session.current_house = input["local_house"]
-        .as_u64()
-        .map(|index| houses[index as usize]);
-    let id = sim.allocate_stable_id();
+    sim.session.set_game_mode(
+        crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+            integer(&input["game_mode"]) != 0,
+        ),
+    );
+    sim.session.set_current_house_for_test(
+        input["local_house"]
+            .as_u64()
+            .map(|index| houses[index as usize]),
+    );
+    let id = sim.substrate.allocate_stable_id();
     let mut building =
         GameEntity::test_default_of_category(id, "B", "", 10, 11, EntityCategory::Structure);
     building.set_type_ref_for_test(sim.interner.intern("B"));
@@ -115,10 +121,12 @@ fn fixture(input: &Value) -> (Simulation, RuleSet, u64, Vec<InternedId>) {
     building.building_art.set_actually_placed_for_test(true);
     building.mission_leaf =
         crate::sim::mission::leaf::MissionLeafState::for_entity_category(EntityCategory::Structure);
-    let mut cargo = PassengerCargo::new(10, 1.0);
-    cargo.garrison_fire_index = integer(&input["fire_index"]) as u8;
+    building
+        .passenger_role
+        .occupants_mut()
+        .set_fire_index_for_test(integer(&input["fire_index"]));
     for owner in input["occupant_owners"].as_array().unwrap() {
-        let passenger_id = sim.allocate_stable_id();
+        let passenger_id = sim.substrate.allocate_stable_id();
         let mut passenger = GameEntity::test_default_of_category(
             passenger_id,
             "E1",
@@ -136,10 +144,9 @@ fn fixture(input: &Value) -> (Simulation, RuleSet, u64, Vec<InternedId>) {
                 crate::rules::locomotor_type::LocomotorKind::Walk,
             ),
         );
-        cargo.add_occupant(passenger_id, 1.0);
+        building.passenger_role.occupants_mut().add(passenger_id);
         sim.substrate.entities.insert(passenger);
     }
-    building.passenger_role = PassengerRole::transport(cargo);
     sim.substrate.entities.insert(building);
     assert!(matches!(
         sim.reveal_entity_with_rules(id, &rules),
@@ -153,7 +160,7 @@ fn fixture(input: &Value) -> (Simulation, RuleSet, u64, Vec<InternedId>) {
         .set_for_test(integer(&input["current_hp"]));
     sim.set_building_anim_slot(id, 3, false, false, 0, &rules)
         .unwrap();
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     (sim, rules, id, houses)
 }
 
@@ -197,14 +204,14 @@ fn allegiance_matches_native_decisions_for_valid_rosters() {
         let expected_owner = houses[expected["owner_after_callback"].as_u64().unwrap() as usize];
         assert_eq!(building.owner(), expected_owner, "{name}");
         assert_eq!(changed, old_owner != expected_owner, "{name}");
-        let cargo = building.passenger_role.cargo().unwrap();
+        let occupants = building.passenger_role.occupants();
         assert_eq!(
-            cargo.garrison_fire_index,
-            integer(&expected["fire_index_after_callback"]) as u8,
+            occupants.fire_index(),
+            integer(&expected["fire_index_after_callback"]),
             "{name}"
         );
-        let actual_owners: Vec<_> = cargo
-            .passengers
+        let actual_owners: Vec<_> = occupants
+            .ids()
             .iter()
             .map(|id| sim.substrate.entities.get(*id).unwrap().owner())
             .collect();
@@ -228,7 +235,7 @@ fn allegiance_matches_native_decisions_for_valid_rosters() {
             "{name}"
         );
         let event = sim.sound_events.iter().find_map(|event| match event {
-            SimSoundEvent::StructureAbandoned { owner, radar } => Some((*owner, *radar)),
+            SimSoundEvent::StructureAbandoned { owner, radar, .. } => Some((*owner, *radar)),
             _ => None,
         });
         assert_eq!(event.is_some(), called("radar_event"), "{name}");
@@ -267,7 +274,7 @@ fn missing_civilian_roster_does_not_fabricate_a_house() {
     }) {
         let (mut sim, rules, id, _) = fixture(&row["input"]);
         let old_owner = sim.substrate.entities.get(id).unwrap().owner();
-        let houses = sim.session.house_order.clone();
+        let houses = sim.houses.order().to_vec();
         assert!(!reconcile_civilian_garrison_owner_for_building(
             &mut sim,
             &rules,
@@ -276,7 +283,7 @@ fn missing_civilian_roster_does_not_fabricate_a_house() {
             crate::sim::world::FrameEffects::default()
         ));
         assert_eq!(sim.substrate.entities.get(id).unwrap().owner(), old_owner);
-        assert_eq!(sim.session.house_order, houses);
+        assert_eq!(sim.houses.order(), houses);
     }
 }
 
@@ -373,10 +380,9 @@ fn zero_capacity_map_garrison_abandons_without_allocated_cargo() {
             .unwrap()
             .0;
         sim.houses
-            .insert(owner, HouseState::new(owner, side, None, human, 0, 10));
-        sim.session.house_order.push(owner);
+            .register(HouseState::new(owner, side, None, human, 0, 10));
         if human {
-            sim.session.current_house = Some(owner);
+            sim.session.set_current_house_for_test(Some(owner));
         }
     }
     // Use the production constructor: unlike the corpus fixture, it represents
@@ -394,7 +400,7 @@ fn zero_capacity_map_garrison_abandons_without_allocated_cargo() {
     let old_anim = sim
         .set_building_anim_slot(id, 3, false, false, 0, &rules)
         .unwrap();
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     sim.object_ai_visit_one(id, Some(&rules), ObjectAiCtx::default());
 
     let building = sim.substrate.entities.get(id).unwrap();

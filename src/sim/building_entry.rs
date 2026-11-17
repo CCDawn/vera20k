@@ -63,35 +63,10 @@
 //! - Mission_Unload's eject clears the latch of a human house's passenger
 //!   (`0x0044DBEA`); the absorber Unload path calls
 //!   [`Simulation::clear_human_absorber_seek_on_unload`].
-//! - A tank bunker entry runs through VERA's bunker adapter
-//!   ([`crate::sim::docking::bunker_link::begin_entry`]), as a player's
-//!   EnterBunker order does. In place of the destination (vt+0x480(bunker,
-//!   1)), whose setter sends the bunker DOCKING (for a unit
-//!   `0x00741DCC..0x00741DDA`), the HELLO that makes the Foot the bunker's
-//!   first radio contact, and the receiver's DOCKING arm with its bunker
-//!   branch (`0x0043C7E9`, `0x0043C84C..`), the bunker answers CAN_LOAD and
-//!   DOCK_NOW and holds the Foot as its installing unit, which the seek's
-//!   walk reads as that contact, and the Foot drives to the bunker's cell.
-//!   While the adapter carries the Foot, Mission_Enter (`0x004D9290`) is not
-//!   run, so its DOCKING probe and its Rate epilogue draw (RandomRanged(0,
-//!   2), Scenario stream) are skipped each dispatch; once the adapter lets
-//!   it go (its bunker gone), the body's no-target arm idles it. The
-//!   adapter's CAN_LOAD repeats the walk's tests and also wants the bunker
-//!   alive and its install machine idle, so a true answer comes without the
-//!   entry, leaving the Foot out of its team on its old orders, when the
-//!   bunker is dying, or is being sold or erased (whose release clears its
-//!   occupant but leaves the machine occupied). Trigger: one of the nine
-//!   retail "Yuri Unit Hunter" TeamTypes reaching action 61 while its house
-//!   has a free Yuri Tank Bunker (`ThirdBaseDefenses=`). Effect: the
-//!   Scenario stream misses one draw per approaching unit per dispatch.
-//!   Frequency: AI Yuri games with Tank Bunkers. Player retasks and Stop
-//!   explicitly cancel this contact-free approach through
-//!   [`bunker_link::cancel_approach`]. An owner change does not clear it,
-//!   and the install does not check the unit's owner, so a seeker
-//!   mind-controlled on its way still installs
-//!   into its old house's bunker; what native ChangeOwner does to radio
-//!   contacts is unverified (the DOCKING arm's head, `0x0043C7E9..0x0043C882`,
-//!   has no house test).
+//!
+//! Tank-bunker entry uses the object destination, HELLO and shared Enter
+//! mission. Unit PerCellProcess sends DOCK_NOW on arrival, which starts
+//! Building Mission_Repair and its UpdateBunker visits.
 //!
 //! Script60 and CaptureManager share Foot's grinder seek (4DFA70).
 //! Infantry51973C..519948 and Unit739F7D..73A234 share the Eaten arrival
@@ -100,12 +75,14 @@
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::components::NavTargetRef;
-use crate::sim::docking::bunker_link::{self, can_auto_deploy_here};
+use crate::sim::docking::bunker_link::can_auto_deploy_here;
 use crate::sim::game_entity::GameEntity;
+use crate::sim::houses::Houses;
 use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::movement::ground_pose::object_get_coords;
 use crate::sim::radio::{RadioMessage, RadioPayload, RadioResponse, transmit};
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::{FrameEffects, Simulation};
 use crate::util::native_x87::object_distance;
 
@@ -124,6 +101,10 @@ pub(crate) struct BuildingEntryLatches {
 }
 
 impl BuildingEntryLatches {
+    /// Ares10046A8B/10046ACC reuses the native +691 seek latch.
+    pub(crate) fn set_nearest_occupiable_seek(&mut self, value: bool) {
+        self.should_enter_nearest_occupiable = value;
+    }
     /// `+0x68F`, which the Guard and AreaGuard heads test.
     pub(crate) const fn should_enter_absorber(self) -> bool {
         self.should_enter_absorber
@@ -213,8 +194,8 @@ fn garrison_seek_reissues(pick: u64, nav_com: Option<NavTargetRef>, mission: Mis
 }
 
 impl Simulation {
-    /// Foot PutInGrinder4DFA70..4DFB6D, original Steam gamemd
-    /// SHA2563e81a617..08600. No radio admission, latch or reissue gate:
+    /// Foot PutInGrinder4DFA70..4DFB6D, original Steam gamemd.
+    /// No radio admission, latch or reissue gate:
     /// walk House+98 backwards, keep the first strict nearest, set its
     /// destination, then Queue(Eaten9,0). Distance shares the existing port.
     pub(crate) fn foot_enter_grinder(
@@ -234,7 +215,7 @@ impl Simulation {
         let _ = self.assign_destination_represented(
             id,
             Some(NavTargetRef::object(best)),
-            Some(rules),
+            rules,
             registry,
             effects,
         );
@@ -242,7 +223,7 @@ impl Simulation {
             id,
             MissionId::from_known(MissionType::Eaten),
             0,
-            self.session.binary_frame,
+            self.session.binary_frame(),
             &LiveReadyInputProvider { rules },
         );
         true
@@ -252,7 +233,7 @@ impl Simulation {
     /// building-entry arms. Unit additionally refunds cargo and its parasite.
     /// Effective Eaten and the first ground Building matching NavCom OR
     /// TarCom admit this transaction, even if its type is not Grinding.
-    /// Original Steam gamemd SHA2563e81a617..08600, instruction-level reading.
+    /// Original Steam gamemd, instruction-level reading.
     pub(crate) fn foot_per_cell_eaten(
         &mut self,
         id: u64,
@@ -288,7 +269,7 @@ impl Simulation {
             y: coordinate.y,
             z: coordinate.z,
         };
-        let context = UninitContext::new(Some(rules), registry).with_effects(effects);
+        let context = UninitContext::new(rules, registry).with_effects(effects);
         self.dispatch_object_tag_event(building_id, 1, Some(id), None, context);
 
         //519790..519865: VoiceDie (local human only), then DieSound.
@@ -307,8 +288,8 @@ impl Simulation {
                 )
             {
                 self.sound_events
-                    .push(SimSoundEvent::voc_at_world_coord(sound_id, entry_world));
-                effects.flush_sound(self, Some(rules));
+                    .emit(SimSoundEvent::voc_at_world_coord(sound_id, entry_world));
+                effects.flush_sound(self, rules);
             }
         }
         // Infantry51986A / Unit73A0A5: the actor's refund comes first.
@@ -334,9 +315,20 @@ impl Simulation {
             }
         }
         self.dispatch_object_tag_event(id, 48, Some(id), None, context);
-        if let Some(building) = self.substrate.entities.get(building_id)
+        let grinding = self
+            .substrate
+            .entities
+            .get(building_id)
+            .and_then(|building| self.object_type(building.type_ref(), rules))
+            .is_some_and(|object| object.grinding);
+        // Ares 3.0 100498D0 (hook 0x5198AD) / 1004C460 (hook 0x73A1BC), first
+        // in the Grinding arm: reverse engineering and the hijacker refund.
+        if rules.ares_form() && grinding {
+            self.ares_entered_grinder(id, building_id, rules, context);
+        }
+        if grinding
+            && let Some(building) = self.substrate.entities.get(building_id)
             && let Some(object) = self.object_type(building.type_ref(), rules)
-            && object.grinding
         {
             let damaged = building.building_art.anim_slots()[3].map(|_| {
                 crate::sim::building_art::requested_damage_state(
@@ -349,7 +341,7 @@ impl Simulation {
                 && let Some(foot) = self.substrate.entities.get(id)
             {
                 let coordinate = object_get_coords(foot, self.resolved_terrain.as_ref());
-                self.sound_events.push(SimSoundEvent::voc_at_world_coord(
+                self.sound_events.emit(SimSoundEvent::voc_at_world_coord(
                     sound_id,
                     crate::sim::anim_class::AnimWorldCoord {
                         x: coordinate.x,
@@ -357,7 +349,7 @@ impl Simulation {
                         z: coordinate.z,
                     },
                 ));
-                effects.flush_sound(self, Some(rules));
+                effects.flush_sound(self, rules);
             }
             //5198CE gates the animation switch on the existing Active3
             //instance, not on the presence of a SpecialAnim declaration.
@@ -376,7 +368,7 @@ impl Simulation {
         if let Some(refund) = crate::sim::production::techno_refund(self, rules, victim)
             && let Some(owner) = self.substrate.entities.get(building).map(GameEntity::owner)
         {
-            crate::sim::credit_income::add_credits(self, owner, refund);
+            crate::sim::credit_income::add_credits(&mut self.houses, owner, refund);
         }
     }
 
@@ -390,8 +382,7 @@ impl Simulation {
         effects: FrameEffects<'_>,
     ) {
         use crate::sim::passenger::{DepartureRoute, depart_cargo_head};
-        let context =
-            crate::sim::world::UninitContext::new(Some(rules), registry).with_effects(effects);
+        let context = crate::sim::world::UninitContext::new(rules, registry).with_effects(effects);
         while self
             .substrate
             .entities
@@ -423,17 +414,16 @@ impl Simulation {
 
     /// Bio Reactor Unload's `IsHuman` gate (`House+0x1EC` at `0x0044DBE6`) and
     /// passenger latch clear. Computer-owned passengers retain the seek byte.
-    pub(crate) fn clear_human_absorber_seek_on_unload(&mut self, stable_id: u64) {
-        let Some(owner) = self
-            .substrate
-            .entities
-            .get(stable_id)
-            .map(GameEntity::owner)
-        else {
+    pub(crate) fn clear_human_absorber_seek_on_unload(
+        substrate: &mut ObjectSubstrate,
+        houses: &Houses,
+        stable_id: u64,
+    ) {
+        let Some(owner) = substrate.entities.get(stable_id).map(GameEntity::owner) else {
             return;
         };
-        if self.houses.get(&owner).is_some_and(|house| house.is_human)
-            && let Some(passenger) = self.substrate.entities.get_mut(stable_id)
+        if houses.get(&owner).is_some_and(|house| house.is_human())
+            && let Some(passenger) = substrate.entities.get_mut(stable_id)
         {
             passenger.building_entry.clear_absorber_seek();
         }
@@ -466,7 +456,7 @@ impl Simulation {
                 absorber,
                 RadioMessage::CanEnter,
                 RadioPayload::default(),
-                Some(rules),
+                rules,
                 effects,
             ) == RadioResponse::Roger;
             let distance = match (
@@ -500,7 +490,7 @@ impl Simulation {
         if !reissue {
             return true;
         }
-        let now = self.session.binary_frame;
+        let now = self.session.binary_frame();
         let _ = self.mission_queue_exact(
             id,
             MissionId::from_known(MissionType::Enter),
@@ -511,7 +501,7 @@ impl Simulation {
         let _ = self.assign_destination_represented(
             id,
             Some(NavTargetRef::object(best)),
-            Some(rules),
+            rules,
             registry,
             effects,
         );
@@ -555,11 +545,11 @@ impl Simulation {
         let _ = self.assign_destination_represented(
             id,
             Some(NavTargetRef::object(best)),
-            Some(rules),
+            rules,
             registry,
             effects,
         );
-        let now = self.session.binary_frame;
+        let now = self.session.binary_frame();
         let _ = self.mission_queue_exact(
             id,
             MissionId::from_known(MissionType::Capture),
@@ -570,8 +560,8 @@ impl Simulation {
         true
     }
 
-    /// Foot GarrisonStructure(vt+0x34C), original4DFE00..4DFF3F in Steam gamemd
-    /// SHA2563e81a617..08600. Admission457CE0 precedes each distance read;
+    /// Foot GarrisonStructure(vt+0x34C), original4DFE00..4DFF3F in Steam gamemd.
+    /// Admission457CE0 precedes each distance read;
     /// reverse Building registration order and strict comparison keep the
     /// later constructed building on a tie. This uses the shared admission,
     /// GetCoords, distance, destination, mission and occupy-latch owners.
@@ -582,6 +572,16 @@ impl Simulation {
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> bool {
+        // Installed Ares Foot4DFE00 hook10049130 redirects only Ext+B0.
+        if rules.ares_form()
+            && self
+                .substrate
+                .entities
+                .get(id)
+                .is_some_and(|foot| foot.ares.vehicle_driver.vehicle_seek())
+        {
+            return self.ares_enter_nearest_vehicle(id, rules, registry, effects);
+        }
         let mut best = None;
         let mut best_distance = i32::MAX;
         // EntityStore's monotonic construction registry includes dead/limbo
@@ -617,11 +617,11 @@ impl Simulation {
         let _ = self.assign_destination_represented(
             id,
             Some(NavTargetRef::object(best)),
-            Some(rules),
+            rules,
             registry,
             effects,
         );
-        let now = self.session.binary_frame;
+        let now = self.session.binary_frame();
         let _ = self.mission_queue_exact(
             id,
             MissionId::from_known(MissionType::Capture),
@@ -656,31 +656,38 @@ impl Simulation {
             return false;
         };
         let walk = self.walk_from_last(foot, self.house_bunkers(foot.owner(), rules));
-        // The bunker adapter holds an approaching unit as its installing
-        // unit, where native holds it as the first radio contact (module
-        // residual).
         let best = pick_nearest_admitted(walk, |bunker| {
             self.substrate.entities.get(bunker).is_some_and(|bunker| {
-                bunker.radio_contacts.slot(0).is_none()
-                    && bunker
-                        .bunker_runtime
-                        .is_none_or(|runtime| runtime.installing_unit().is_none())
-                    && bunker.bunker.occupant().is_none()
+                bunker.radio_contacts.slot(0).is_none() && bunker.bunker.occupant().is_none()
             })
         });
         let Some(best) = best else {
             return false;
         };
-        let now = self.session.binary_frame;
-        let _ = bunker_link::begin_entry(self, id, best, rules, registry, effects, |sim| {
-            let _ = sim.mission_queue_exact(
-                id,
-                MissionId::from_known(MissionType::Enter),
-                1,
-                now,
-                &LiveReadyInputProvider { rules },
-            );
-        });
+        let _ = self.assign_destination_represented(
+            id,
+            Some(NavTargetRef::object(best)),
+            rules,
+            registry,
+            effects,
+        );
+        transmit(
+            self,
+            id,
+            best,
+            RadioMessage::Hello,
+            RadioPayload::default(),
+            rules,
+            effects,
+        );
+        let now = self.session.binary_frame();
+        let _ = self.mission_queue_exact(
+            id,
+            MissionId::from_known(MissionType::Enter),
+            1,
+            now,
+            &LiveReadyInputProvider { rules },
+        );
         true
     }
 
@@ -726,10 +733,10 @@ pub(crate) fn set_should_enter_nearest_occupiable_for_test(entity: &mut GameEnti
     entity.building_entry.should_enter_nearest_occupiable = value;
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "building_entry_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "grinder_tests.rs"]
 mod grinder_tests;

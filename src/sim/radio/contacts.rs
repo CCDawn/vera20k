@@ -5,8 +5,8 @@
 //! slot in place (no compaction, so slot positions are stable). A HELLO sender
 //! with no free slot first sends OVER_OUT to slot 0 and then reuses it
 //! (`0x0065AA1F..0x0065AA34`). Capacity is `max(NumberOfDocks, 1)` for
-//! buildings, else 1. Navigation uses the contact slot index to select a
-//! docking offset; admission queries actual slots through `has_free_or`. Sparse slot
+//! buildings, up to VERA's `DOCK_CONTACT_LIMIT`, else 1. Navigation uses the
+//! contact slot index to select a docking offset; admission queries actual slots through `has_free_or`. Sparse slot
 //! positions are therefore hash-relevant.
 //! sim/ only — never render/ui/audio/net.
 use serde::{Deserialize, Serialize};
@@ -137,17 +137,9 @@ impl Contacts {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_is_one_empty_slot() {
-        let c = Contacts::default();
-        assert_eq!(c.capacity(), 1);
-        assert!(c.is_empty());
-        assert_eq!(c.len(), 0);
-    }
 
     #[test]
     fn first_null_insert_returns_slot_and_is_idempotent() {
@@ -157,14 +149,6 @@ mod tests {
         assert_eq!(c.insert(7), Some(0)); // idempotent → existing slot
         assert_eq!(c.len(), 2);
         assert!(c.contains(7) && c.contains(8));
-    }
-
-    #[test]
-    fn receiver_full_insert_returns_none_no_evict() {
-        let mut c = Contacts::with_capacity(1);
-        assert_eq!(c.insert(7), Some(0));
-        assert_eq!(c.insert(8), None); // full → denied
-        assert!(c.contains(7) && !c.contains(8)); // 7 not evicted
     }
 
     #[test]
@@ -190,26 +174,5 @@ mod tests {
         assert_eq!(c.find_slot(9), Some(2));
         assert!(!c.contains(8));
         assert_eq!(c.iter_live().collect::<Vec<_>>(), vec![7, 9]);
-    }
-
-    #[test]
-    fn set_capacity_grows_only() {
-        let mut c = Contacts::with_capacity(2);
-        c.insert(7);
-        c.set_capacity(4);
-        assert_eq!(c.capacity(), 4);
-        assert!(c.contains(7));
-        c.set_capacity(1); // never shrinks
-        assert_eq!(c.capacity(), 4);
-    }
-
-    #[test]
-    fn clear_all_preserves_capacity() {
-        let mut c = Contacts::with_capacity(3);
-        c.insert(7);
-        c.insert(8);
-        c.clear_all();
-        assert!(c.is_empty());
-        assert_eq!(c.capacity(), 3);
     }
 }

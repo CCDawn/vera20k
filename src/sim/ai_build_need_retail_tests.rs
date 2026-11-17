@@ -1,7 +1,6 @@
 //! Stock Soviet recovery through the bound production runtime. Original bodies:
 //! CanMakeMoney4F6540, CheckBuildNeed4FD9A0, ManageBuildQueue4FDD10 and
-//! Strategy4FD500, gamemd SHA256
-//! 1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c.
+//! Strategy4FD500, gamemd.
 //! Instruction reading establishes the gates, sale/abandon and mode changes;
 //! this regression exercises Rust, not an original executable or native timing.
 
@@ -52,9 +51,9 @@ fn stock_scene(root: &std::path::Path) -> HeadlessScenario {
         "XMP03T4.MAP",
         &[(LaunchCountry::Russia, AiDifficulty::Easy)],
     );
-    launch.player_name = "VERA-OBSERVER".to_owned();
-    launch.local.country = LaunchCountry::Russia;
-    launch.local.start_position = LaunchStartPosition::Position(0);
+    launch.local_player_mut().name = "VERA-OBSERVER".to_owned();
+    launch.local_slot_mut().country = LaunchCountry::Russia;
+    launch.local_slot_mut().start_position = LaunchStartPosition::Position(0);
     launch.opponents[0].start_position = LaunchStartPosition::Position(1);
     launch.options = SkirmishLaunchOptions {
         starting_credits: 5000,
@@ -75,6 +74,11 @@ fn stock_scene(root: &std::path::Path) -> HeadlessScenario {
         multi_engineer: false,
         harvester_truce: false,
         ally_change_allowed: true,
+        bans: Default::default(),
+        teams: None,
+        auto_balance: false,
+        queue: Vec::new(),
+        host_rules: Default::default(),
     };
     load_session(root, "XMP03T4.MAP", 0x1234_5678, launch).expect("stock Battle loads")
 }
@@ -86,7 +90,7 @@ fn stock_scene(root: &std::path::Path) -> HeadlessScenario {
 /// native output goldens. The 22 ms input matches the client capture cadence,
 /// rather than headless_scenario's separately documented 66 ms default.
 #[test]
-#[ignore = "slow; stock AI recovery uses retail assets and two 10000-frame histories"]
+#[ignore = "slow; stock AI recovery uses retail assets and two bounded gameplay histories"]
 fn stock_soviet_miner_loss_admits_recovery_and_returns_to_income() {
     let (root, _) = crate::rules::retail_ini_fixture::retail_assets()
         .expect("run with RA2_DIR and VERA20K_REQUIRE_RETAIL_ASSETS=1");
@@ -115,13 +119,15 @@ fn stock_soviet_miner_loss_admits_recovery_and_returns_to_income() {
         let mut recovered_unloaded = false;
         let mut recovered_income = false;
         let mut first_recovery = false;
+        let mut prepared_at = None;
+        let mut observed_recovery_interval = false;
 
-        for step in 0..10_000 {
+        for step in 0..20_000u32 {
             let sim = scene.sim();
             let rules = &scene.runtime.resources.rules;
             let live = gatherers(sim, rules, owner);
             assert_eq!(
-                sim.houses[&owner].tracking.resource_gatherers(),
+                sim.houses[&owner].tracking().resource_gatherers(),
                 live.len() as i32,
                 "committed-frame tracking consistency at {step}"
             );
@@ -136,7 +142,7 @@ fn stock_soviet_miner_loss_admits_recovery_and_returns_to_income() {
                     |(&entity_id, (target_rx, target_ry))| {
                         CommandEnvelope::new(
                             local,
-                            sim.session.tick,
+                            sim.session.tick(),
                             Command::Move {
                                 entity_id,
                                 target_rx,
@@ -146,14 +152,30 @@ fn stock_soviet_miner_loss_admits_recovery_and_returns_to_income() {
                     },
                 ));
             }
-            if step == 4910 {
+            // The attack needs a poor AI with a real held replacement, not
+            // a particular frame of unrelated base-building/harvest timing.
+            // Both histories issue the same preparation commands until this
+            // production state is reached through ordinary play.
+            if prepared_at.is_none()
+                && sim.houses[&owner].tracking().war_factories() > 0
+                && balance_owed(sim, rules, owner, |object| {
+                    object.category == ObjectCategory::Vehicle && object.resource_gatherer
+                })
+                .is_some_and(|owed| available_money(&sim.houses, owner) < owed)
+                && original
+                    .and_then(|id| sim.entities().get(id))
+                    .is_some_and(|miner| {
+                        sim.fog
+                            .is_cell_visible(local, miner.position.rx(), miner.position.ry())
+                    })
+            {
                 let original = original.expect("the AI generated a free miner");
                 assert_eq!(live, [original], "one on-map gatherer before the attack");
                 let house = &sim.houses[&owner];
-                assert!(house.tracking.resource_destinations() > 0);
-                assert!(house.tracking.war_factories() > 0);
-                assert!(!house.build_const_order.is_empty());
-                assert!(!house.base_plan.nodes.is_empty());
+                assert!(house.tracking().resource_destinations() > 0);
+                assert!(house.tracking().war_factories() > 0);
+                assert!(!house.build_const_order().is_empty());
+                assert!(!house.base_plan().nodes().is_empty());
                 assert_eq!(
                     house.difficulty_value(&rules.general.harvesters_per_refinery),
                     1,
@@ -170,7 +192,7 @@ fn stock_soviet_miner_loss_admits_recovery_and_returns_to_income() {
                 })
                 .expect("the earlier retained choice reached an actual Factory");
                 assert!(
-                    available_money(sim, owner) < owed,
+                    available_money(&sim.houses, owner) < owed,
                     "genuine poor held-production prior"
                 );
                 let held_candidates: Vec<_> = sim
@@ -199,27 +221,45 @@ fn stock_soviet_miner_loss_admits_recovery_and_returns_to_income() {
                     })
                     .map(|(id, _)| id);
                 assert!(war_factory.is_some());
+                prepared_at = Some(step);
                 if attack {
                     commands.extend(tanks.iter().map(|&attacker_id| {
                         CommandEnvelope::new(
                             local,
-                            sim.session.tick,
+                            sim.session.tick(),
                             Command::Attack {
                                 attacker_id,
                                 target_id: original,
                             },
                         )
                     }));
+                } else {
+                    // The longer preparation lets the ore front reach the
+                    // observing tanks. Withdraw this control's tanks before
+                    // their normal Guard acquisition can attack the miner.
+                    commands.extend(tanks.iter().zip([(70, 41), (71, 41), (70, 42)]).map(
+                        |(&entity_id, (target_rx, target_ry))| {
+                            CommandEnvelope::new(
+                                local,
+                                sim.session.tick(),
+                                Command::Move {
+                                    entity_id,
+                                    target_rx,
+                                    target_ry,
+                                },
+                            )
+                        },
+                    ));
                 }
             }
 
             let before_calls = calls.count();
             let admission = lost && !first_recovery && check_build_need(sim, rules, owner);
             let due = sim.houses[&owner]
-                .strategy_timer
-                .expired(sim.session.binary_frame as i32);
-            let before_income = i64::from(sim.houses[&owner].economy.credits())
-                + i64::from(sim.houses[&owner].economy.spent_credits());
+                .strategy_timer()
+                .expired(sim.session.binary_frame() as i32);
+            let before_income = i64::from(sim.houses[&owner].economy().credits())
+                + i64::from(sim.houses[&owner].economy().spent_credits());
             let carrying_before = recovered
                 .and_then(|id| sim.entities().get(id))
                 .and_then(|entity| entity.miner.as_ref())
@@ -233,13 +273,17 @@ fn stock_soviet_miner_loss_admits_recovery_and_returns_to_income() {
             let live = gatherers(sim, rules, owner);
             if let Some(id) = original {
                 if !live.contains(&id) {
-                    assert!(attack && step > 4910, "healthy miner must keep earning");
+                    assert!(
+                        attack && prepared_at.is_some_and(|prepared| step > prepared),
+                        "healthy miner must keep earning"
+                    );
                     lost = true;
                 } else if !attack {
                     let miner = sim.entities().get(id).unwrap();
                     assert_eq!(
                         miner.health.current(),
-                        sim.object_type(miner.type_ref(), rules).unwrap().strength
+                        sim.object_type(miner.type_ref(), rules).unwrap().strength,
+                        "healthy control miner at {step}"
                     );
                 }
             }
@@ -259,9 +303,9 @@ fn stock_soviet_miner_loss_admits_recovery_and_returns_to_income() {
                 );
                 let house = &sim.houses[&owner];
                 let harvester = EconomyTypes::of(sim, rules, house).harvester.unwrap();
-                assert_eq!(house.ai_production.mode(), 2);
+                assert_eq!(house.ai_production().mode(), 2);
                 assert_eq!(
-                    Some(house.ai_unit_choices.get(UnitChoiceKind::Unit)),
+                    Some(house.ai_unit_choices().get(UnitChoiceKind::Unit)),
                     rules.type_array_index(ObjectCategory::Vehicle, &harvester.id)
                 );
                 first_recovery = true;
@@ -274,15 +318,27 @@ fn stock_soviet_miner_loss_admits_recovery_and_returns_to_income() {
                 {
                     recovered_harvested |= miner.harvesting() && !miner.cargo().is_empty();
                     recovered_unloaded |= miner.unload_active();
-                    let after_income = i64::from(sim.houses[&owner].economy.credits())
-                        + i64::from(sim.houses[&owner].economy.spent_credits());
+                    let after_income = i64::from(sim.houses[&owner].economy().credits())
+                        + i64::from(sim.houses[&owner].economy().spent_credits());
                     recovered_income |= recovered_unloaded
                         && carrying_before
                         && miner.cargo().is_empty()
                         && after_income > before_income;
                 }
             }
+            if prepared_at.is_some_and(|prepared| step - prepared >= 5_000) {
+                observed_recovery_interval = true;
+                break;
+            }
         }
+        assert!(
+            prepared_at.is_some(),
+            "ordinary play must establish the recovery prior"
+        );
+        assert!(
+            observed_recovery_interval,
+            "observe 5000 frames after the recovery prior"
+        );
         if attack {
             assert!(lost && first_recovery && calls.count() > 0);
             assert_ne!(original, recovered, "a new production identity recovered");

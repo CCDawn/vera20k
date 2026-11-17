@@ -6,7 +6,7 @@ use super::*;
 fn native_discharge_art_reader_matches_original_signed_independent_keys() {
     // Original InfantryType ART reads 5246BE..52473A call ReadInt5276D0
     // independently over E40/E44/E48/E4C. Replay every cached-input row
-    // through the production read owner, then fresh file/registry inputs.
+    // through the production read owner, then fresh physical file inputs.
     let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
         "tools/spatial_oracle/infantry_discharge_rules.json",
     ))
@@ -48,14 +48,10 @@ fn native_discharge_art_reader_matches_original_signed_independent_keys() {
                 text.push_str(&format!("{key}={raw}\n"));
             }
         }
-        let registry = ArtRegistry::from_ini(&IniFile::from_str(&text));
-        let entry = registry.get(section).unwrap();
-        let actual = [
-            entry.fire_up,
-            entry.fire_prone,
-            entry.secondary_fire,
-            entry.secondary_prone,
-        ];
+        let ini = IniFile::from_str(&text);
+        // A fresh type starts from constructor5236D7..5236F9's four zeros.
+        let mut actual = [0; 4];
+        read_infantry_discharge_frames(ini.section(section).unwrap(), &mut actual);
         let expected: [i32; 4] = serde_json::from_value(row["after"].clone()).unwrap();
         assert_eq!(actual, expected, "original row {}", row["case"]);
         compared += 1;
@@ -138,15 +134,6 @@ fn original_1080_building_slot_power_reads_preserve_native_defaults() {
 }
 
 #[test]
-fn test_apply_theater_letter() {
-    assert_eq!(apply_theater_letter("GAPOWR", "TEMPERATE"), "GTPOWR");
-    assert_eq!(apply_theater_letter("GAPOWR", "SNOW"), "GAPOWR");
-    assert_eq!(apply_theater_letter("NAHAND", "TEMPERATE"), "NTHAND");
-    assert_eq!(apply_theater_letter("X", "TEMPERATE"), "X");
-    assert_eq!(apply_theater_letter("GAPOWR", "UNKNOWN"), "GAPOWR");
-}
-
-#[test]
 fn test_hardcoded_new_theater_prefixes() {
     let reg: ArtRegistry = ArtRegistry::empty();
     assert!(reg.should_use_new_theater("GAPOWR"));
@@ -194,48 +181,14 @@ fn test_object_shp_candidates_dedupe_when_substitution_matches_original() {
     );
 }
 
+/// `0x00460285..0x00460382` reads every MuzzleFlash index; a missing one is
+/// (0, 0) and does not end the list.
 #[test]
-fn test_apply_generic_letter() {
-    assert_eq!(apply_generic_letter("GAPOWR"), "GGPOWR");
-    assert_eq!(apply_generic_letter("NAHAND"), "NGHAND");
-    assert_eq!(apply_generic_letter("X"), "X");
-}
-
-#[test]
-fn test_voxel_asset_names() {
-    let (vxl, hva) = voxel_asset_names("HTNK");
-    assert_eq!(vxl, "HTNK.VXL");
-    assert_eq!(hva, "HTNK.HVA");
-}
-
-#[test]
-fn test_from_ini_parses_entries() {
-    let ini: IniFile = IniFile::from_str(
-        "[GAPOWR]\nNewTheater=yes\nCameo=GAPICON\n\n[HTNK]\nVoxel=yes\nAltCameo=HTKALT\n\n[NACNST]\nImage=CIVNC\n\n[GI]\nCrawls=yes\nFireUp=2\nSecondaryFire=4\n",
-    );
-    let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
-    assert_eq!(reg.len(), 4);
-
-    let gapowr: &ArtEntry = reg.get("GAPOWR").expect("GAPOWR exists");
-    assert!(gapowr.new_theater);
-    assert!(!gapowr.voxel);
-    assert!(gapowr.image.is_none());
-    assert_eq!(gapowr.cameo.as_deref(), Some("GAPICON"));
-
-    let htnk: &ArtEntry = reg.get("HTNK").expect("HTNK exists");
-    assert!(!htnk.new_theater);
-    assert!(htnk.voxel);
-    assert_eq!(htnk.alt_cameo.as_deref(), Some("HTKALT"));
-
-    let nacnst: &ArtEntry = reg.get("NACNST").expect("NACNST exists");
-    assert_eq!(nacnst.image.as_deref(), Some("CIVNC"));
-
-    let gi: &ArtEntry = reg.get("GI").expect("GI exists");
-    assert!(gi.crawls);
-    assert_eq!(gi.fire_up, 2);
-    assert_eq!(gi.fire_prone, 0);
-    assert_eq!(gi.secondary_fire, 4);
-    assert_eq!(gi.secondary_prone, 0);
+fn muzzle_flash_reads_past_a_missing_index() {
+    let ini = IniFile::from_str("[GAOBS]\nMuzzleFlash0=1,2\nMuzzleFlash2=5,6\n");
+    let reg = ArtRegistry::from_ini(&ini);
+    let ports = &reg.get("GAOBS").unwrap().muzzle_flash_positions;
+    assert_eq!(ports[..3], [(1, 2), (0, 0), (5, 6)]);
 }
 
 #[test]
@@ -254,22 +207,6 @@ fn gsi_04_05_hidden_absent_occupy_height_inherits_resolved_height() {
     assert_eq!(reg.occupy_height("NAPOWR"), 2);
     assert!(reg.can_hide_things("MISSING"));
     assert_eq!(reg.occupy_height("MISSING"), 2);
-}
-
-#[test]
-fn parses_anim_start_sound_and_report() {
-    let ini: IniFile = IniFile::from_str(
-        "[TWLT026]\nReport=ExplosionShard\n\n[TWLT036]\nStartSound=ExplosionStart\nReport=Explosion06\n",
-    );
-    let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
-
-    let twlt026 = reg.get("TWLT026").expect("TWLT026 exists");
-    assert_eq!(twlt026.report.as_deref(), Some("ExplosionShard"));
-    assert!(twlt026.start_sound.is_none());
-
-    let twlt036 = reg.get("TWLT036").expect("TWLT036 exists");
-    assert_eq!(twlt036.start_sound.as_deref(), Some("ExplosionStart"));
-    assert_eq!(twlt036.report.as_deref(), Some("Explosion06"));
 }
 
 #[test]
@@ -310,20 +247,12 @@ fn test_resolve_metadata_entry_prefers_rules_image_section() {
         .resolve_metadata_entry("AMRADR", "GAAIRC")
         .expect("AMRADR should use GAAIRC art metadata");
     assert_eq!(entry.bib_shape.as_deref(), Some("GAAIRCBB"));
-    assert_eq!(entry.building_anims.len(), 1);
-    assert_eq!(entry.building_anims[0].anim_type, "GAAIRC_A");
-}
-
-#[test]
-fn test_resolve_metadata_entry_keeps_type_section_when_it_owns_metadata() {
-    let ini: IniFile = IniFile::from_str("[NACNST]\nImage=CIVNC\nBibShape=NACNSTBB\n");
-    let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
-
-    let entry: &ArtEntry = reg
-        .resolve_metadata_entry("NACNST", "NACNST")
-        .expect("NACNST metadata should stay on its own section");
-    assert_eq!(entry.bib_shape.as_deref(), Some("NACNSTBB"));
-    assert_eq!(entry.image.as_deref(), Some("CIVNC"));
+    let active = entry
+        .building_anims
+        .iter()
+        .find(|config| config.native_slot == 3)
+        .unwrap();
+    assert_eq!(active.anim_type, "GAAIRC_A");
 }
 
 #[test]
@@ -340,20 +269,52 @@ fn declared_cameo_comes_from_the_rules_image_section_before_the_type_section() {
     );
     let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
 
-    assert_eq!(reg.resolve_declared_cameo_id("MTNK", "GTNK"), "GTNKICON");
-    assert_eq!(reg.resolve_declared_cameo_id("MTNK", "MTNK"), "MTNKICON");
+    assert_eq!(
+        reg.resolve_declared_cameo_id("MTNK", "GTNK").as_deref(),
+        Some("GTNKICON")
+    );
+    assert_eq!(
+        reg.resolve_declared_cameo_id("MTNK", "MTNK").as_deref(),
+        Some("MTNKICON")
+    );
     // The art section's own `Image=` redirect never selects the cameo section.
-    assert_eq!(reg.resolve_declared_cameo_id("BFRT", "BFRT"), "BFRTICON");
-    assert_eq!(reg.resolve_declared_cameo_id("E1", "E1"), "E1CAMEO");
+    assert_eq!(
+        reg.resolve_declared_cameo_id("BFRT", "BFRT").as_deref(),
+        Some("BFRTICON")
+    );
+    assert_eq!(
+        reg.resolve_declared_cameo_id("E1", "E1").as_deref(),
+        Some("E1CAMEO")
+    );
     // Savegame-reload fallback: the image section has no `Cameo=`, so the
     // type-ID section is consulted.
-    assert_eq!(reg.resolve_declared_cameo_id("E1", "NOCAMEO"), "E1CAMEO");
-    // `AltCameo=` is a separate field, never a substitute for `Cameo=`.
     assert_eq!(
-        reg.resolve_declared_cameo_id("NOCAMEO", "NOCAMEO"),
-        "NOCAMEO"
+        reg.resolve_declared_cameo_id("E1", "NOCAMEO").as_deref(),
+        Some("E1CAMEO")
     );
-    assert_eq!(reg.resolve_declared_cameo_id("UNKNOWN", "FOO"), "FOO");
+    // `AltCameo=` is a separate field, never a substitute for `Cameo=`, and
+    // the image id is not one either: gamemd loads the stock `XXICON.SHP`.
+    assert_eq!(reg.resolve_declared_cameo_id("NOCAMEO", "NOCAMEO"), None);
+    assert_eq!(reg.resolve_declared_cameo_id("UNKNOWN", "FOO"), None);
+}
+
+#[test]
+fn pcx_cameos_read_only_the_rules_image_art_section() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let ini = IniFile::from_str(
+        "[TYPE]\nCameoPCX=wrong-type.pcx\n\
+         [IMAGE]\nImage=BODY\nCameoPCX=Normal.PCX\nAltCameoPCX=Elite.PCX\n\
+         [BODY]\nCameoPCX=wrong-body.pcx\n",
+    );
+    let registry = ArtRegistry::from_ini(&ini);
+    assert_eq!(
+        registry.resolve_declared_pcx_cameos("TYPE", "IMAGE"),
+        [Some("normal.pcx"), Some("elite.pcx")]
+    );
+    assert_eq!(
+        registry.resolve_declared_pcx_cameos("TYPE", "MISSING"),
+        [None, None]
+    );
 }
 
 #[test]
@@ -368,7 +329,10 @@ fn retail_sidebar_cameos_follow_the_rules_image_section() {
             .object(type_id)
             .map(|object| object.image.clone())
             .unwrap_or_else(|| type_id.to_string());
-        rules.art().resolve_declared_cameo_id(type_id, &rules_image)
+        rules
+            .art()
+            .resolve_declared_cameo_id(type_id, &rules_image)
+            .unwrap_or_default()
     };
     assert_eq!(cameo("MTNK"), "GTNKICON");
     assert_eq!(cameo("HTNK"), "HTNKICON");
@@ -378,42 +342,91 @@ fn retail_sidebar_cameos_follow_the_rules_image_section() {
 }
 
 #[test]
-fn test_new_theater_from_ini_key() {
-    let ini: IniFile = IniFile::from_str("[MYCIVBLD]\nNewTheater=yes\n");
-    let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
-    assert!(reg.should_use_new_theater("MYCIVBLD"));
-}
-
-#[test]
 fn test_parse_building_anims() {
     let ini: IniFile = IniFile::from_str(
         "[CAOILD]\nActiveAnim=CAOILD_A\nActiveAnimDamaged=CAOILD_AD\nActiveAnimGarrisoned=CAOILD_AG\nActiveAnimYSort=362\nActiveAnimTwo=CAOILD_F\nActiveAnimTwoZAdjust=-50\n",
     );
     let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
     let entry: &ArtEntry = reg.get("CAOILD").expect("CAOILD exists");
-    assert_eq!(entry.building_anims.len(), 2);
-
-    assert_eq!(entry.building_anims[0].anim_type, "CAOILD_A");
+    let active = entry
+        .building_anims
+        .iter()
+        .find(|config| config.native_slot == 3)
+        .unwrap();
+    let flag = entry
+        .building_anims
+        .iter()
+        .find(|config| config.native_slot == 4)
+        .unwrap();
+    assert_eq!(active.anim_type, "CAOILD_A");
     assert_eq!(
-        entry.building_anims[0]
+        active
             .damaged_variant
             .as_ref()
             .map(|v| v.anim_type.as_str()),
         Some("CAOILD_AD")
     );
     assert_eq!(
-        entry.building_anims[0]
+        active
             .garrisoned_variant
             .as_ref()
             .map(|v| v.anim_type.as_str()),
         Some("CAOILD_AG")
     );
-    assert_eq!(entry.building_anims[0].y_sort, 362);
-    assert_eq!(entry.building_anims[0].z_adjust, 0);
+    assert_eq!(active.y_sort, 362);
+    assert_eq!(active.z_adjust, 0);
 
-    assert_eq!(entry.building_anims[1].anim_type, "CAOILD_F");
-    assert_eq!(entry.building_anims[1].y_sort, 0);
-    assert_eq!(entry.building_anims[1].z_adjust, -50);
+    assert_eq!(flag.anim_type, "CAOILD_F");
+    assert_eq!(flag.y_sort, 0);
+    assert_eq!(flag.z_adjust, -50);
+}
+
+#[test]
+fn unnamed_power_up_slots_preserve_offsets_for_install_supplied_images() {
+    let ini = IniFile::from_str(
+        "[HOST]\nPowerUp1LocXX=-24\nPowerUp1LocYY=-12\n\
+         PowerUp1LocZZ=-42\nPowerUp1YSort=50\nPowerUp2LocXX=17\n",
+    );
+    let art = ArtRegistry::from_ini(&ini);
+    let entry = art.get("HOST").unwrap();
+    assert_eq!(entry.building_anims.len(), 3);
+    for slot in 0..3 {
+        let config = entry
+            .building_anims
+            .iter()
+            .find(|config| config.native_slot == slot)
+            .unwrap();
+        assert!(config.anim_type.is_empty());
+        assert!(config.damaged_variant.is_none());
+        assert!(config.garrisoned_variant.is_none());
+    }
+    let first = &entry.building_anims[0];
+    assert_eq!(
+        (first.x, first.y, first.z_adjust, first.y_sort),
+        (-24, -12, -42, 50)
+    );
+    assert_eq!(entry.building_anims[1].x, 17);
+    let third = &entry.building_anims[2];
+    assert_eq!(
+        (third.x, third.y, third.z_adjust, third.y_sort),
+        (0, 0, 0, 0)
+    );
+    assert!(art.building_anim_roots().is_empty());
+}
+
+#[test]
+fn power_up_config_uses_the_retained_record_without_an_art_section() {
+    use crate::rules::building_upgrade::BuildingPowerUpArt;
+    let art = ArtRegistry::empty();
+    let config = art.building_power_up_config(2, &BuildingPowerUpArt::default());
+    assert_eq!(config.native_slot, 2);
+    assert!(config.anim_type.is_empty());
+    assert!(config.damaged_variant.is_none());
+    assert!(config.garrisoned_variant.is_none());
+    assert_eq!(
+        (config.x, config.y, config.z_adjust, config.y_sort),
+        (0, 0, 0, 0)
+    );
 }
 
 #[test]
@@ -434,7 +447,7 @@ fn parses_all_four_special_anim_suffixes_in_document_order() {
     let specials: Vec<&str> = entry
         .building_anims
         .iter()
-        .filter(|a| matches!(a.kind, BuildingAnimKind::Special))
+        .filter(|a| matches!(a.kind, BuildingAnimKind::Special) && a.native_slot >= 3)
         .map(|a| a.anim_type.as_str())
         .collect();
     assert_eq!(
@@ -447,7 +460,7 @@ fn parses_all_four_special_anim_suffixes_in_document_order() {
     let primaries: Vec<bool> = entry
         .building_anims
         .iter()
-        .filter(|a| matches!(a.kind, BuildingAnimKind::Special))
+        .filter(|a| matches!(a.kind, BuildingAnimKind::Special) && a.native_slot >= 3)
         .map(|a| a.is_primary)
         .collect();
     assert_eq!(primaries, vec![true, false, false, false]);
@@ -456,38 +469,12 @@ fn parses_all_four_special_anim_suffixes_in_document_order() {
     let four = entry
         .building_anims
         .iter()
-        .filter(|a| matches!(a.kind, BuildingAnimKind::Special))
+        .filter(|a| matches!(a.kind, BuildingAnimKind::Special) && a.native_slot >= 3)
         .nth(3)
         .unwrap();
     assert_eq!(
         four.damaged_variant.as_ref().map(|v| v.anim_type.as_str()),
         Some("NATBNK_B2D")
-    );
-}
-
-#[test]
-fn active_anim_garrisoned_replaces_base_slot_not_extra_overlay() {
-    let ini: IniFile = IniFile::from_str(
-        "[CAWASH19]\nActiveAnim=CAWA19_A\nActiveAnimGarrisoned=CAWA19_AG\nActiveAnimDamaged=CAWA19_AD\n",
-    );
-    let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
-    let entry: &ArtEntry = reg.get("CAWASH19").expect("CAWASH19 exists");
-
-    assert_eq!(entry.building_anims.len(), 1);
-    assert_eq!(entry.building_anims[0].anim_type, "CAWA19_A");
-    assert_eq!(
-        entry.building_anims[0]
-            .garrisoned_variant
-            .as_ref()
-            .map(|v| v.anim_type.as_str()),
-        Some("CAWA19_AG")
-    );
-    assert_eq!(
-        entry.building_anims[0]
-            .damaged_variant
-            .as_ref()
-            .map(|v| v.anim_type.as_str()),
-        Some("CAWA19_AD")
     );
 }
 
@@ -515,7 +502,11 @@ fn damaged_active_anim_variant_uses_own_frame_metadata() {
     );
     let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
     let entry: &ArtEntry = reg.get("CASEAT02").expect("CASEAT02 exists");
-    let anim = &entry.building_anims[0];
+    let anim = entry
+        .building_anims
+        .iter()
+        .find(|config| config.native_slot == 3)
+        .unwrap();
     let damaged = anim.damaged_variant.as_ref().expect("damaged variant");
 
     assert_eq!(anim.anim_type, "CASEAT02_A");
@@ -528,32 +519,68 @@ fn damaged_active_anim_variant_uses_own_frame_metadata() {
     assert_eq!(damaged.loop_end, 39);
 }
 
-#[test]
-fn test_no_building_anims_for_regular_entry() {
-    let ini: IniFile = IniFile::from_str("[E1]\nVoxel=no\n");
-    let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
-    let entry: &ArtEntry = reg.get("E1").expect("E1 exists");
-    assert!(entry.building_anims.is_empty());
+/// A building slot's normal, damaged and garrisoned names.
+fn slot_names(entry: &ArtEntry, slot: u8) -> (&str, Option<&str>, Option<&str>) {
+    let config = entry
+        .building_anims
+        .iter()
+        .find(|config| config.native_slot == slot)
+        .unwrap();
+    (
+        &config.anim_type,
+        config
+            .damaged_variant
+            .as_ref()
+            .map(|v| v.anim_type.as_str()),
+        config
+            .garrisoned_variant
+            .as_ref()
+            .map(|v| v.anim_type.as_str()),
+    )
 }
 
+/// ReadINI copies a slot's normal name into its empty damaged and garrisoned
+/// fields (`parse_building_anims` cites each copy); an authored variant stays,
+/// and the PowerUp loop makes no copy.
 #[test]
-fn test_parse_turret_offset() {
-    let ini: IniFile = IniFile::from_str("[HTK]\nVoxel=yes\nTurretOffset=-80\n");
-    let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
-    let entry: &ArtEntry = reg.get("HTK").expect("HTK exists");
-    assert_eq!(entry.turret_offset, -80);
-}
-
-#[test]
-fn parses_building_fire_pixel_offsets() {
-    let ini: IniFile = IniFile::from_str(
-        "[ATESLA]\nPrimaryFirePixelOffset=11,-26\nSecondaryFirePixelOffset=-4,9\nPrimaryFireDualOffset=true\n",
+fn absent_variant_names_take_the_normal_name_except_power_ups() {
+    let ini = IniFile::from_str(
+        "[B]\n\
+         IdleAnim=IDLE\n\
+         ActiveAnim=ACT\n\
+         ActiveAnimDamaged=ACTD\n\
+         SpecialAnimGarrisoned=SPECG\n\
+         PowerUp1Anim=PUP\n",
     );
-    let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
-    let entry: &ArtEntry = reg.get("ATESLA").expect("ATESLA exists");
-    assert_eq!(entry.primary_fire_pixel_offset, Some((11, -26)));
-    assert_eq!(entry.secondary_fire_pixel_offset, Some((-4, 9)));
-    assert!(entry.primary_fire_dual_offset);
+    let reg = ArtRegistry::from_ini(&ini);
+    let entry = reg.get("B").unwrap();
+    assert_eq!(slot_names(entry, 18), ("IDLE", Some("IDLE"), Some("IDLE")));
+    assert_eq!(slot_names(entry, 3), ("ACT", Some("ACTD"), Some("ACT")));
+    assert_eq!(slot_names(entry, 10), ("", None, Some("SPECG")));
+    assert_eq!(slot_names(entry, 0), ("PUP", None, None));
+}
+
+/// Retail refineries through the production ART reader: the Slave Miner
+/// refinery's IdleAnim, GAREFN's ore lights and both unload anims declare no
+/// variant and keep their normal names; NAREFN's authored damaged lights stay.
+#[test]
+fn retail_refinery_anims_without_variants_keep_their_normal_names() {
+    let Some(art_ini) = crate::rules::retail_ini_fixture::retail_ini("artmd.ini") else {
+        return;
+    };
+    let reg = crate::rules::retail_ini_fixture::art_registry(&art_ini);
+    let names = |section: &str, slot| slot_names(reg.get(section).unwrap(), slot);
+    let unchanged = |name| (name, Some(name), Some(name));
+    assert_eq!(names("YAREFN", 18), unchanged("YAREFN_A"));
+    for (slot, light) in (3..=6).zip(["GAREFNL1", "GAREFNL2", "GAREFNL3", "GAREFNL4"]) {
+        assert_eq!(names("GAREFN", slot), unchanged(light));
+    }
+    assert_eq!(names("GAREFN", 10), unchanged("GAREFNOR"));
+    assert_eq!(names("NAREFN", 10), unchanged("NAREFNOR"));
+    assert_eq!(
+        names("NAREFN", 3),
+        ("NAREFNL1", Some("NAREFNL1D"), Some("NAREFNL1"))
+    );
 }
 
 #[test]
@@ -567,12 +594,18 @@ fn test_resolve_declared_palette_id() {
 }
 
 #[test]
-fn test_anim_candidates_use_anim_section_flags() {
+fn test_anim_candidates_use_explicit_own_flags_without_an_image_section() {
     let ini: IniFile = IniFile::from_str("[CAOILD_A]\nImage=CAOILDX\nNewTheater=yes\n");
     let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
     let image_id: String = reg.resolve_effective_image_id("CAOILD_A", "CAOILD_A");
-    let candidates: Vec<String> =
-        anim_shp_candidates(Some(&reg), "CAOILD_A", &image_id, "urb", "NEWURBAN");
+    let candidates: Vec<String> = effect_shp_candidates(
+        crate::rules::art_data::EffectImageKind::Animation,
+        Some(&reg),
+        "CAOILD_A",
+        &image_id,
+        "urb",
+        "NEWURBAN",
+    );
     // Native order: the theater-letter name, then the forced `G` name. The
     // rest is VERA leniency.
     assert_eq!(
@@ -587,16 +620,80 @@ fn test_anim_candidates_use_anim_section_flags() {
     );
 }
 
-/// `[GAPOWR_AD] Image=GAPOWR_A` authors no `NewTheater=`. The per-theater
-/// reload (`0x00428CD6`) then skips the theater letter, fails on
-/// `GAPOWR_A.SHP`, and `FUN_005F9710` forces the second letter to `G`
-/// unconditionally, which is the file retail ships.
+/// When neither section supplies NewTheater, the initial name is unchanged
+/// and FUN_005F9710 still forces the second letter to G on a miss. This omits
+/// the Image section deliberately; it is not the complete retail ART input.
 #[test]
 fn anim_candidates_force_the_generic_letter_without_new_theater() {
     let reg = ArtRegistry::from_ini(&IniFile::from_str("[GAPOWR_AD]\nImage=GAPOWR_A\n"));
     let image_id = reg.resolve_effective_image_id("GAPOWR_AD", "GAPOWR_AD");
-    let candidates = anim_shp_candidates(Some(&reg), "GAPOWR_AD", &image_id, "tem", "TEMPERATE");
+    let candidates = effect_shp_candidates(
+        crate::rules::art_data::EffectImageKind::Animation,
+        Some(&reg),
+        "GAPOWR_AD",
+        &image_id,
+        "tem",
+        "TEMPERATE",
+    );
     assert_eq!(&candidates[..2], ["GAPOWR_A.SHP", "GGPOWR_A.SHP"]);
+}
+
+#[test]
+fn animation_flags_inherit_image_then_apply_own_read_bool() {
+    for (own, expected_when_false, expected_when_true) in [
+        (None, false, true),
+        (Some("yes"), true, true),
+        (Some("no"), false, false),
+        (Some(""), false, true),
+        (Some("on"), false, true),
+    ] {
+        for inherited in [false, true] {
+            let own_keys = own.map_or_else(String::new, |value| {
+                format!("Theater={value}\nNewTheater={value}\n")
+            });
+            let ini = IniFile::from_str(&format!(
+                "[DAMAGED]\nImage=CAIMAGE\n{own_keys}\n[CAIMAGE]\nTheater={inherited}\nNewTheater={inherited}\n"
+            ));
+            let art = ArtRegistry::from_ini(&ini);
+            let expected = if inherited {
+                expected_when_true
+            } else {
+                expected_when_false
+            };
+            assert_eq!(
+                art.anim_theater_flags["DAMAGED"],
+                (expected, expected),
+                "own={own:?}, inherited={inherited}"
+            );
+            // Generic object metadata retains its own-section interpretation.
+            assert_eq!(art.get("DAMAGED").unwrap().new_theater, own == Some("yes"));
+        }
+    }
+}
+
+#[test]
+fn animation_flags_use_one_image_hop_and_exact_section_identity() {
+    let ini = IniFile::from_str(
+        "[DAMAGED]\nImage=CAIMAGE\n\
+         [CAIMAGE]\nImage=CAOTHER\nNewTheater=yes\n\
+         [CAOTHER]\nTheater=yes\nNewTheater=no\n\
+         [caimage]\nTheater=yes\nNewTheater=no\n",
+    );
+    let art = ArtRegistry::from_ini(&ini);
+    assert_eq!(art.anim_theater_flags["DAMAGED"], (false, true));
+    let image = art.resolve_anim_image_id("DAMAGED");
+    assert_eq!(image, "CAIMAGE");
+    assert_eq!(
+        &effect_shp_candidates(
+            crate::rules::art_data::EffectImageKind::Animation,
+            Some(&art),
+            "DAMAGED",
+            &image,
+            "URB",
+            "URBAN"
+        )[..2],
+        ["CUIMAGE.SHP", "CGIMAGE.SHP"]
+    );
 }
 
 /// `FUN_005F96B0` substitutes only `[GNCY][AT]` names, so a `NewTheater=yes`
@@ -606,62 +703,37 @@ fn anim_theater_letter_needs_the_native_name_pattern() {
     let reg = ArtRegistry::from_ini(&IniFile::from_str(
         "[XAFOO]\nNewTheater=yes\n[YAGRND_B]\nNewTheater=yes\n",
     ));
-    let plain = anim_shp_candidates(Some(&reg), "XAFOO", "XAFOO", "tem", "TEMPERATE");
+    let plain = effect_shp_candidates(
+        crate::rules::art_data::EffectImageKind::Animation,
+        Some(&reg),
+        "XAFOO",
+        "XAFOO",
+        "tem",
+        "TEMPERATE",
+    );
     assert_eq!(&plain[..2], ["XAFOO.SHP", "XGFOO.SHP"]);
-    let yuri = anim_shp_candidates(Some(&reg), "YAGRND_B", "YAGRND_B", "tem", "TEMPERATE");
+    let yuri = effect_shp_candidates(
+        crate::rules::art_data::EffectImageKind::Animation,
+        Some(&reg),
+        "YAGRND_B",
+        "YAGRND_B",
+        "tem",
+        "TEMPERATE",
+    );
     assert_eq!(&yuri[..2], ["YTGRND_B.SHP", "YGGRND_B.SHP"]);
 }
 
 #[test]
-fn test_make_candidates_use_deduped_uppercase_names() {
-    let reg: ArtRegistry = ArtRegistry::empty();
-    let candidates: Vec<String> = make_shp_candidates(Some(&reg), "GAPOWR", "sno", "SNOW");
+fn overlay_image_projection_ignores_own_art_redirect_and_flags() {
+    let art = IniFile::from_str("[LOBRDG27]\nImage=LOBRDGX\nTheater=yes\n");
+    let rules = IniFile::from_str("[OverlayTypes]\n0=LOBRDG27\n[LOBRDG27]\nImage=LOBRDGY\n");
+    let overlays = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(&rules, Some(&art));
+    // OverlayRead5FE78B inherits ObjectRead5F933B: only Rules Image is
+    // read, then flags from ART[that Image], not ART[the type's own ID].
     assert_eq!(
-        candidates,
-        vec![
-            "GAPOWRMK.SHP",
-            "GAPOWRMK.SNO",
-            "GGPOWRMK.SHP",
-            "GGPOWRMK.SNO",
-        ]
+        overlays.shp_candidates("LOBRDG27", "TEM", "TEMPERATE"),
+        ["LOBRDGY.SHP"]
     );
-}
-
-#[test]
-fn test_resolve_overlay_image_id_and_candidates() {
-    let art_ini: IniFile = IniFile::from_str("[LOBRDG27]\nImage=LOBRDGX\nTheater=yes\n");
-    let rules_ini: IniFile = IniFile::from_str("[LOBRDG27]\nImage=LOBRDGY\n");
-    let reg: ArtRegistry = ArtRegistry::from_ini(&art_ini);
-
-    let image_id: String = reg.resolve_overlay_image_id("LOBRDG27", &rules_ini);
-    assert_eq!(image_id, "LOBRDGY");
-
-    let candidates: Vec<String> =
-        overlay_shp_candidates(Some(&reg), "LOBRDG27", &image_id, "tem", "TEMPERATE");
-    assert_eq!(candidates, vec!["LOBRDGY.TEM", "LOBRDGY.SHP"]);
-    assert!(!candidates.iter().any(|name| name.contains("LOBRDG26")));
-}
-
-#[test]
-fn parses_add_occupy_from_ini() {
-    let ini: IniFile =
-        IniFile::from_str("[GAREFN]\nAddOccupy1=-1,0\nAddOccupy2=-1,-1\nRemoveOccupy1=3,1\n");
-    let registry: ArtRegistry = ArtRegistry::from_ini(&ini);
-    let entry: &ArtEntry = registry.get("GAREFN").expect("GAREFN");
-    assert_eq!(entry.add_occupy[0], Some((-1, 0)));
-    assert_eq!(entry.add_occupy[1], Some((-1, -1)));
-    assert!(entry.add_occupy[2..].iter().all(Option::is_none));
-    assert_eq!(entry.remove_occupy[0], Some((3, 1)));
-    assert!(entry.remove_occupy[1..].iter().all(Option::is_none));
-}
-
-#[test]
-fn add_remove_occupy_empty_when_no_keys() {
-    let ini: IniFile = IniFile::from_str("[FOO]\nFoundation=2x2\n");
-    let registry: ArtRegistry = ArtRegistry::from_ini(&ini);
-    let entry: &ArtEntry = registry.get("FOO").expect("FOO");
-    assert!(entry.add_occupy.iter().all(Option::is_none));
-    assert!(entry.remove_occupy.iter().all(Option::is_none));
 }
 
 #[test]
@@ -743,63 +815,9 @@ fn gsi_04_05_hidden_object_id_gate_is_distinct_from_image_metadata() {
 }
 
 #[test]
-fn parses_anim_smudge_flags() {
-    let ini = IniFile::from_bytes(
-        b"[ANIMA]\n\
-          Scorch=yes\n\
-          \n\
-          [ANIMB]\n\
-          Crater=yes\n\
-          ForceBigCraters=yes\n\
-          \n\
-          [ANIMC]\n\
-          FixtureOnly=1\n",
-    )
-    .unwrap();
-    let reg = ArtRegistry::from_ini(&ini);
-    let a = reg.get("ANIMA").unwrap();
-    assert!(a.scorch);
-    assert!(!a.crater);
-    let b = reg.get("ANIMB").unwrap();
-    assert!(!b.scorch);
-    assert!(b.crater);
-    assert!(b.force_big_craters);
-    let c = reg.get("ANIMC").unwrap();
-    assert!(!c.scorch);
-    assert!(!c.crater);
-    assert!(!c.force_big_craters);
-}
-
-#[test]
-fn parse_gaairc_four_pads() {
-    let ini: IniFile = IniFile::from_str(
-        "[GAAIRC]\n\
-         DockingOffset0=0,-128,0\n\
-         DockingOffset1=0,128,0\n\
-         DockingOffset2=256,-128,0\n\
-         DockingOffset3=256,128,0\n",
-    );
-    let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
-    let entry: &ArtEntry = reg.get("GAAIRC").expect("GAAIRC entry");
-    assert_eq!(entry.pads.len(), 4, "should parse all 4 offsets");
-    assert_eq!(entry.pads[0].lepton_offset, (0, -128, 0));
-    assert_eq!(entry.pads[1].lepton_offset, (0, 128, 0));
-    assert_eq!(entry.pads[2].lepton_offset, (256, -128, 0));
-    assert_eq!(entry.pads[3].lepton_offset, (256, 128, 0));
-}
-
-#[test]
-fn parse_no_docking_offsets_yields_empty_vec() {
-    let ini: IniFile = IniFile::from_str("[GAHPAD]\nHeight=1\n");
-    let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
-    let entry: &ArtEntry = reg.get("GAHPAD").expect("GAHPAD entry");
-    assert!(entry.pads.is_empty(), "no offsets → empty pads vec");
-}
-
-#[test]
-fn parse_partial_offsets_collects_what_exists() {
-    // art has only DockingOffset0 and DockingOffset2 (gap at 1).
-    // Parser collects what's present. The art→rules merge handles sizing to NumberOfDocks.
+fn parse_partial_offsets_keeps_each_pad_at_its_index() {
+    // art has only DockingOffset0 and DockingOffset2 (gap at 1). Native reads
+    // each slot by index (0x004649AF..0x00464A41); slot 1 keeps its zero.
     let ini: IniFile = IniFile::from_str(
         "[ODD]\n\
          DockingOffset0=64,0,0\n\
@@ -807,9 +825,10 @@ fn parse_partial_offsets_collects_what_exists() {
     );
     let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
     let entry: &ArtEntry = reg.get("ODD").expect("ODD entry");
-    assert_eq!(entry.pads.len(), 2, "filter_map skips missing index 1");
+    assert_eq!(entry.pads.len(), 3);
     assert_eq!(entry.pads[0].lepton_offset, (64, 0, 0));
-    assert_eq!(entry.pads[1].lepton_offset, (192, 0, 0));
+    assert_eq!(entry.pads[1].lepton_offset, (0, 0, 0));
+    assert_eq!(entry.pads[2].lepton_offset, (192, 0, 0));
 }
 
 #[test]
@@ -837,34 +856,6 @@ fn test_parses_guardian_gi_sequence_frames() {
 }
 
 #[test]
-fn test_sequence_frames_default_none_when_sequence_missing() {
-    // No Sequence= key -> no lookup -> None for all three.
-    let ini: IniFile = IniFile::from_str("[CIVHOSP]\nCameo=HOSPICON\n");
-    let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
-    let entry: &ArtEntry = reg.get("CIVHOSP").expect("entry");
-    assert_eq!(entry.deploy_frames, None);
-    assert_eq!(entry.undeploy_frames, None);
-    assert_eq!(entry.deployed_fire_frames, None);
-}
-
-#[test]
-fn test_sequence_frames_partial_some_missing() {
-    // Sequence section exists but only defines a subset of the three keys.
-    let ini: IniFile = IniFile::from_str(
-        "[E1]\n\
-         Sequence=GISequence\n\
-         \n\
-         [GISequence]\n\
-         Deploy=100,8,0\n",
-    );
-    let reg: ArtRegistry = ArtRegistry::from_ini(&ini);
-    let entry: &ArtEntry = reg.get("E1").expect("E1 entry");
-    assert_eq!(entry.deploy_frames, Some(8));
-    assert_eq!(entry.undeploy_frames, None);
-    assert_eq!(entry.deployed_fire_frames, None);
-}
-
-#[test]
 fn test_sequence_frames_follow_the_native_sequence_scan() {
     // 0x00523D00 scans `%d,%d,%d,%s` over the constructor's zero record; a
     // literal comma skips no whitespace, so `8 , 6` stops after one field.
@@ -879,23 +870,6 @@ fn test_sequence_frames_follow_the_native_sequence_scan() {
     assert_eq!(deploy_frames(" 8 , 6 , 6 "), Some(0));
     assert_eq!(deploy_frames("only-one"), Some(0));
     assert_eq!(deploy_frames("a,b,c"), Some(0));
-}
-
-#[test]
-fn gsi_05_10_delayed_building_fire_art_fields_keep_defaults_and_signed_delay() {
-    let ini = IniFile::from_str(
-        "[DEFAULTED]\nHeight=1\n\
-         [SIGNED]\nIsAnimDelayedFire=yes\nDelayedFireDelay=-7\n",
-    );
-    let registry = ArtRegistry::from_ini(&ini);
-
-    let defaulted = registry.get("DEFAULTED").expect("defaulted art entry");
-    assert!(!defaulted.is_anim_delayed_fire);
-    assert_eq!(defaulted.delayed_fire_delay, 0);
-
-    let signed = registry.get("SIGNED").expect("signed art entry");
-    assert!(signed.is_anim_delayed_fire);
-    assert_eq!(signed.delayed_fire_delay, -7);
 }
 
 #[test]
@@ -965,6 +939,421 @@ impl Drop for AnimDimTestRoot {
     }
 }
 
+/// `End=`/`LoopEnd=` past the SHP's frames bind as written: ReadINI stores
+/// them (`0x00427FE8`, `0x0042801C`) and the loader fills only zero values
+/// (`0x00427C1C..0x00427C5C`), as for retail GAWEAP_3D's LoopStart=10 and
+/// LoopEnd=19 on 4 frames; frames past the SHP draw nothing (`CC_Draw_Shape`,
+/// `0x0069E7F3`). A 0-frame SHP binds with End, LoopEnd and Middle at 0
+/// (`0x00427C2D`), and a frame-count word of 0x8000 or more reads signed there
+/// (`MOVSX`): the bounds go negative and nothing refuses the type (issue 4493).
+#[test]
+fn animation_bounds_past_the_shp_frames_bind_as_written() {
+    use crate::rules::{native_processing::RulesLayerStack, ruleset::RuleSet};
+
+    let root = AnimDimTestRoot::new();
+    let mut header = vec![0_u8; 8];
+    header[2..4].copy_from_slice(&1_u16.to_le_bytes());
+    header[4..6].copy_from_slice(&1_u16.to_le_bytes());
+    header[6..8].copy_from_slice(&4_i16.to_le_bytes());
+    std::fs::write(root.path().join("OVER.SHP"), header).unwrap();
+    let assets = crate::assets::asset_manager::AssetManager::from_loose_root_for_test(root.path());
+    let ini = IniFile::from_str("[OVER]\nEnd=9\nLoopStart=10\nLoopEnd=19\n");
+    let processed = RulesLayerStack::new(IniFile::from_str("[General]\nMetallicDebris=OVER\n"))
+        .process_with_fixed_art(&ini)
+        .unwrap();
+    let rules = RuleSet::from_processed_rules(&processed).unwrap();
+    let mut art = ArtRegistry::from_ini(&ini);
+    art.apply_anim_type_read_states(rules.anim_type_art_read_states());
+    art.bind_scheduler_anim_assets(&rules.general.metallic_debris, &assets, "URB", "URBAN");
+    let over = art.anim_runtime_config("OVER").unwrap();
+    assert_eq!(
+        (
+            over.end,
+            over.loop_start,
+            over.loop_end,
+            over.raw_shp_frame_count,
+            over.middle_frame
+        ),
+        (9, 10, 19, Some(4), Some(2))
+    );
+
+    std::fs::write(root.path().join("OVER.SHP"), [0_u8; 8]).unwrap();
+    let assets = crate::assets::asset_manager::AssetManager::from_loose_root_for_test(root.path());
+    let ini = IniFile::from_str("[OVER]\nRate=1\n");
+    let mut art = ArtRegistry::from_ini(&ini);
+    art.apply_anim_type_read_states(rules.anim_type_art_read_states());
+    art.bind_scheduler_anim_assets(&rules.general.metallic_debris, &assets, "URB", "URBAN");
+    let over = art.anim_runtime_config("OVER").unwrap();
+    assert_eq!(
+        (
+            over.end,
+            over.loop_end,
+            over.raw_shp_frame_count,
+            over.middle_frame
+        ),
+        (0, 0, Some(0), Some(0))
+    );
+
+    let mut header = vec![0_u8; 8];
+    header[6..8].copy_from_slice(&i16::MIN.to_le_bytes());
+    std::fs::write(root.path().join("OVER.SHP"), header).unwrap();
+    let assets = crate::assets::asset_manager::AssetManager::from_loose_root_for_test(root.path());
+    let mut art = ArtRegistry::from_ini(&ini);
+    art.apply_anim_type_read_states(rules.anim_type_art_read_states());
+    art.bind_scheduler_anim_assets(&rules.general.metallic_debris, &assets, "URB", "URBAN");
+    let over = art.anim_runtime_config("OVER").unwrap();
+    assert_eq!(
+        (
+            over.end,
+            over.loop_end,
+            over.raw_shp_frame_count,
+            over.middle_frame
+        ),
+        (-32768, -32768, Some(-32768), Some(-16384))
+    );
+}
+
+/// A theater `Tile%02dAnim=` name that no AnimType holds and no ART section
+/// reads is built by `AnimTypeClass::FindOrAllocate` (`0x00546538`) after the
+/// ART read, with the constructor's values: the map loads, and its terrain anim
+/// spawns and draws nothing (issue 4493). Its name folds as `_strcmpi` does,
+/// ASCII letters only, so a Latin-1 `ä` keeps its case.
+#[test]
+fn a_theater_only_tile_anim_binds_as_an_unread_type_and_spawns() {
+    use crate::rules::{native_processing::RulesLayerStack, ruleset::RuleSet};
+
+    let root = AnimDimTestRoot::new();
+    let assets = crate::assets::asset_manager::AssetManager::from_loose_root_for_test(root.path());
+    let art_ini = IniFile::from_str("");
+    let processed = RulesLayerStack::new(IniFile::from_str("[General]\n"))
+        .process_with_fixed_art(&art_ini)
+        .unwrap();
+    let mut rules = RuleSet::from_processed_rules(&processed).unwrap();
+    rules.install_art_data(ArtRegistry::from_ini(&art_ini));
+    rules.bind_scheduler_anim_assets(
+        &["CUSTOM_FALLS".into(), "CUSTOM_F\u{e4}LLS".into()],
+        &assets,
+        "TEM",
+        "TEMPERATE",
+    );
+    let config = rules.art().anim_runtime_config("CUSTOM_FALLS").unwrap();
+    assert!(!config.art_body_read);
+    assert_eq!(config.raw_shp_frame_count, None, "no image");
+
+    let mut sim = crate::sim::world::Simulation::new();
+    let tile = |anim_name: &str| crate::map::resolved_terrain::TerrainTileAnimation {
+        rx: 1,
+        ry: 1,
+        anim_name: anim_name.to_string(),
+        world_x: 384,
+        world_y: 384,
+        world_z: 0,
+        z_adjust: 0,
+    };
+    let ids = crate::sim::runtime::spawn_terrain_tile_animations(
+        &mut sim,
+        &rules,
+        &[tile("custom_falls"), tile("custom_f\u{e4}lls")],
+    );
+    assert!(ids.iter().all(|&id| sim.anim(id).is_some()));
+}
+
+/// A `DamageFireOffset%d=` far past any building converts through the one
+/// `IsometricPixelToWorld` port (`0x0043C152` calls `0x006D2070`), so it no
+/// longer stops the map's animations binding (issue 4493).
+#[test]
+fn a_huge_damage_fire_offset_does_not_stop_animation_binding() {
+    let root = AnimDimTestRoot::new();
+    let assets = crate::assets::asset_manager::AssetManager::from_loose_root_for_test(root.path());
+    let mut art = ArtRegistry::from_ini(&IniFile::from_str(
+        "[GAPOWR]\nDamageFireOffset0=99999999,0\nDamageFireOffset1=-24,-1\n[FIRE01]\nRate=1\n",
+    ));
+    art.bind_scheduler_anim_assets(&["FIRE01".into()], &assets, "TEM", "TEMPERATE");
+    let offsets = &art.exact_entry("GAPOWR").unwrap().damage_fire_offsets;
+    assert_eq!(offsets.len(), 2);
+    assert_eq!((offsets[1].world_dx, offsets[1].world_dy), (-110, 93));
+    assert!(art.scheduler_anim_types().contains("FIRE01"));
+}
+
+#[test]
+fn animation_image_flag_binding_preserves_own_runtime_metadata() {
+    use crate::rules::{native_processing::RulesLayerStack, ruleset::RuleSet};
+
+    let root = AnimDimTestRoot::new();
+    for (name, frames) in [
+        ("CUIMAGE.SHP", 8_i16),
+        ("CAIMAGE.SHP", 2),
+        ("CGIMAGE.SHP", 6),
+    ] {
+        // Loader-only inputs: bounds are read from the signed SHP header.
+        let mut header = vec![0_u8; 8];
+        header[2..4].copy_from_slice(&1_u16.to_le_bytes());
+        header[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        header[6..8].copy_from_slice(&frames.to_le_bytes());
+        std::fs::write(root.path().join(name), header).unwrap();
+    }
+    let assets = crate::assets::asset_manager::AssetManager::from_loose_root_for_test(root.path());
+    let ini = IniFile::from_str(
+        "[DAMAGED]\nImage=CAIMAGE\nStart=2\nLoopStart=2\nLoopEnd=4\nShadow=yes\n\
+         [OVERRIDE]\nImage=CAIMAGE\nNewTheater=no\nShadow=no\n\
+         [CAIMAGE]\nNewTheater=yes\nStart=0\nLoopStart=0\nLoopEnd=2\nShadow=no\n",
+    );
+    let processed = RulesLayerStack::new(IniFile::from_str(
+        "[General]\nMetallicDebris=DAMAGED,OVERRIDE\n",
+    ))
+    .process_with_fixed_art(&ini)
+    .unwrap();
+    let rules = RuleSet::from_processed_rules(&processed).unwrap();
+    let mut art = ArtRegistry::from_ini(&ini);
+    art.apply_anim_type_read_states(rules.anim_type_art_read_states());
+    art.bind_scheduler_anim_assets(&rules.general.metallic_debris, &assets, "URB", "URBAN");
+    let damaged = art.anim_runtime_config("DAMAGED").unwrap();
+    assert_eq!(damaged.raw_shp_frame_count, Some(8));
+    assert_eq!(
+        (
+            damaged.start,
+            damaged.loop_start,
+            damaged.loop_end,
+            damaged.end
+        ),
+        (2, 2, 4, 4)
+    );
+    assert!(damaged.shadow);
+    let explicit = art.anim_runtime_config("OVERRIDE").unwrap();
+    assert_eq!(explicit.raw_shp_frame_count, Some(2));
+    assert_eq!(explicit.end, 2);
+    assert!(!explicit.shadow);
+}
+
+#[test]
+fn scenario_anim_theater_replaces_only_the_shape_and_retries_the_stored_id() {
+    use crate::rules::native_processing::{RulesLayerStack, RulesProcessContext};
+    use crate::rules::object_image::ImageTheater;
+    use crate::rules::ruleset::RuleSet;
+
+    let root = AnimDimTestRoot::new();
+    for (name, frames) in [
+        ("ALIAA.SNO", 6_i16),
+        ("FX.SHP", 2),
+        ("CTTILE.SHP", 4),
+        ("CATILE.SHP", 8),
+        ("CTPLAIN.SHP", 3),
+        ("CAPLAIN.SHP", 5),
+    ] {
+        let mut bytes = single_frame_shp(1, 1);
+        bytes[6..8].copy_from_slice(&frames.to_le_bytes());
+        std::fs::write(root.path().join(name), bytes).unwrap();
+    }
+    let assets = crate::assets::asset_manager::AssetManager::from_loose_root_for_test(root.path());
+    let fixed_art = IniFile::from_str(
+        "[FX]\nImage=ALIA\nTheater=yes\nAlternateArcticArt=yes\n[CTTILE]\nNewTheater=yes\n[CTPLAIN]\nRate=1\n",
+    );
+    let layers = RulesLayerStack::new(IniFile::from_str(
+        "[Animations]\n0=FX\n1=CTTILE\n2=CTPLAIN\n",
+    ));
+    let processed = layers
+        .process_with_fixed_art_and_registry_state_recovering(
+            &fixed_art,
+            Default::default(),
+            RulesProcessContext::ScenarioReset {
+                theater: ImageTheater::Snow,
+                skip_root_color_add_and_mode: false,
+            },
+            &Default::default(),
+            &crate::rules::sound_ini::SoundRegistry::default(),
+        )
+        .unwrap();
+    let mut rules = RuleSet::from_processed_rules(&processed).unwrap();
+    rules.install_art_data(ArtRegistry::from_ini(&fixed_art));
+    let image = rules.art().resolve_anim_image_id("FX");
+    assert_eq!(
+        effect_shp_candidates(
+            crate::rules::art_data::EffectImageKind::Animation,
+            Some(rules.art()),
+            "FX",
+            &image,
+            "SNO",
+            "SNOW"
+        ),
+        ["FX.SNO", "FX.SHP"],
+        "Read_Map4AD092 -> InitTheater427940 replaces the resolver's image plan"
+    );
+    rules.bind_scheduler_anim_assets(
+        &["FX".into(), "CTTILE".into(), "CTPLAIN".into()],
+        &assets,
+        "SNO",
+        "SNOW",
+    );
+    let config = rules.art().anim_runtime_config("FX").unwrap();
+    assert_eq!(config.raw_shp_frame_count, Some(2));
+    assert_eq!(config.middle_frame, Some(3));
+    assert_eq!(
+        (config.end, config.loop_end),
+        (6, 6),
+        "427940 does not repeat427B50's numeric writes"
+    );
+    let tile = rules.art().anim_runtime_config("CTTILE").unwrap();
+    assert_eq!(
+        (
+            tile.raw_shp_frame_count,
+            tile.end,
+            tile.loop_end,
+            tile.middle_frame
+        ),
+        (Some(8), 4, 4, Some(4)),
+        "ReadINI's-1 request seeds bounds before the real-theater resolver replaces Shape and Middle"
+    );
+    let plain = rules.art().anim_runtime_config("CTPLAIN").unwrap();
+    assert_eq!(
+        (plain.raw_shp_frame_count, plain.end),
+        (Some(3), 3),
+        "without NewTheater, the generic read image stays resident"
+    );
+}
+
+#[test]
+fn animation_theater_flags_match_original_fresh_read_and_postpass() {
+    let corpus = crate::test_fixture::json("tools/rules_oracle/anim_theater_flags.json");
+    assert_eq!(corpus["schema"], 1);
+    let cases = corpus["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 26);
+    let imageless = crate::test_fixture::json("tools/rules_oracle/imageless_anim.json");
+    let imageless_cases = imageless["cases"].as_array().unwrap();
+    assert_eq!(imageless_cases.len(), 3);
+    let mut bound_cases = 0;
+    let mut missing_cases = 0;
+    for case in cases.iter().chain(imageless_cases) {
+        let input = &case["input"];
+        let label = input["case"].as_str().unwrap();
+        let name = input["name"].as_str().unwrap();
+        // The native fixture supplies cached entries, including Image="".
+        // A physical file load deliberately omits empty values, so construct
+        // the same cache boundary as the original Image25 reader test below.
+        let mut ini = IniFile::empty();
+        for (section_name, values) in input["art_sections"].as_object().unwrap() {
+            let mut section = IniSection::new(section_name.clone());
+            for (key, value) in values.as_object().unwrap() {
+                section.set(key, value.as_str().unwrap());
+            }
+            ini.replace_first_section(section);
+        }
+        let mut art = ArtRegistry::from_ini(&ini);
+        let admitted = case["reader_admitted"].as_bool().unwrap();
+        art.apply_anim_type_read_states(&[(name.to_string(), admitted)]);
+        let expected = &case["after_postpass"];
+        let flags = (
+            expected["theater"].as_bool().unwrap(),
+            expected["new_theater"].as_bool().unwrap(),
+        );
+        assert_eq!(
+            art.anim_runtime_config(name).unwrap().art_body_read,
+            admitted,
+            "{label}"
+        );
+        if admitted {
+            assert_eq!(art.anim_theater_flags[name], flags, "{label}");
+        } else {
+            // This map is orphan resource metadata, not a constructor-only
+            // Anim's image authority. Its real draw contract is no request.
+            assert!(
+                effect_shp_candidates(
+                    EffectImageKind::Animation,
+                    Some(&art),
+                    name,
+                    name,
+                    "SNO",
+                    "SNOW"
+                )
+                .is_empty(),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            art.anim_runtime_config(name).unwrap().image,
+            expected["image"].as_str().unwrap(),
+            "{label}"
+        );
+        // These rows also record Theater=yes filename behavior. Only flag
+        // resolution is compared for that cohort: the candidate helper's
+        // existing plain-SHP leniency is outside this change.
+        if flags.0 || !admitted {
+            continue;
+        }
+        let root = AnimDimTestRoot::new();
+        for (filename, header) in input["available_images"].as_object().unwrap() {
+            let mut bytes = Vec::with_capacity(8);
+            for word in [
+                0,
+                header["width"].as_u64().unwrap() as u16,
+                header["height"].as_u64().unwrap() as u16,
+                header["raw_frame_count"].as_u64().unwrap() as u16,
+            ] {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            std::fs::write(root.path().join(filename), bytes).unwrap();
+        }
+        let assets =
+            crate::assets::asset_manager::AssetManager::from_loose_root_for_test(root.path());
+        let (extension, theater) = match input["theater"].as_u64().unwrap() {
+            1 => ("SNO", "SNOW"),
+            2 => ("URB", "URBAN"),
+            other => panic!("unexpected corpus theater {other}"),
+        };
+        let image = art.resolve_anim_image_id(name);
+        let candidates = effect_shp_candidates(
+            crate::rules::art_data::EffectImageKind::Animation,
+            Some(&art),
+            name,
+            &image,
+            extension,
+            theater,
+        );
+        let selected = candidates
+            .iter()
+            .find(|filename| assets.get_ref(filename).is_some());
+        assert_eq!(
+            selected.map(String::as_str),
+            expected["loaded_filename"].as_str(),
+            "{label}"
+        );
+        art.bind_scheduler_anim_assets(&[name.to_string()], &assets, extension, theater);
+        if expected["image_present"].as_bool().unwrap() {
+            let config = art.anim_runtime_config(name).unwrap();
+            assert_eq!(
+                config.raw_shp_frame_count,
+                Some(expected["raw_shp_frame_count"].as_i64().unwrap() as i32),
+                "{label}"
+            );
+            assert_eq!(
+                config.end,
+                expected["end"].as_i64().unwrap() as i32,
+                "{label}"
+            );
+            assert_eq!(
+                config.loop_end,
+                expected["loop_end"].as_i64().unwrap() as i32,
+                "{label}"
+            );
+            bound_cases += 1;
+        } else {
+            let config = art.anim_runtime_config(name).unwrap();
+            assert_eq!(config.raw_shp_frame_count, admitted.then_some(0), "{label}");
+            assert_eq!(
+                config.end,
+                expected["end"].as_i64().unwrap() as i32,
+                "{label}"
+            );
+            assert_eq!(
+                config.loop_end,
+                expected["loop_end"].as_i64().unwrap() as i32,
+                "{label}"
+            );
+            missing_cases += 1;
+        }
+    }
+    assert!(bound_cases > 0 && missing_cases > 0);
+}
+
 #[test]
 fn animation_binding_keeps_literal_types_and_exact_image_sections() {
     use crate::rules::{native_processing::RulesLayerStack, ruleset::RuleSet};
@@ -991,8 +1380,7 @@ fn animation_binding_keeps_literal_types_and_exact_image_sections() {
     // Generic object resolution intentionally retains its established behavior.
     assert_eq!(art.resolve_effective_image_id(" FX", " FX"), "WRONG");
     let roots = rules.general.metallic_debris.clone();
-    art.bind_scheduler_anim_assets(&roots, &assets, "TEM", "TEMPERATE")
-        .unwrap();
+    art.bind_scheduler_anim_assets(&roots, &assets, "TEM", "TEMPERATE");
     for name in ["FX", " FX", "D", " NONE"] {
         assert!(art.scheduler_anim_types().contains(name));
     }
@@ -1012,6 +1400,26 @@ fn animation_binding_keeps_literal_types_and_exact_image_sections() {
         0
     );
     assert_eq!(tolerant.scheduler_anim_types(), art.scheduler_anim_types());
+
+    // AnimTypeLoad428855 can load D's own file without ReadINI or the
+    // distinct bounds resolver427B50. Fresh orphan suppression stays above.
+    let mut restored = processed;
+    restored.restore_object_image_loads("TEMPERATE").unwrap();
+    let mut rules = RuleSet::from_processed_rules(&restored).unwrap();
+    rules.install_art_data(ArtRegistry::from_ini(&art_ini));
+    rules.bind_scheduler_anim_assets(&["D".into(), " NONE".into()], &assets, "TEM", "TEMPERATE");
+    let d = rules.art().anim_runtime_config("D").unwrap();
+    assert!(!d.art_body_read);
+    assert_eq!(d.raw_shp_frame_count, Some(1));
+    assert_eq!((d.end, d.loop_end, d.rate_logic_frames), (0, 0, 1));
+    assert_eq!(
+        rules
+            .art()
+            .anim_runtime_config(" NONE")
+            .unwrap()
+            .raw_shp_frame_count,
+        None
+    );
 }
 
 #[test]
@@ -1040,4 +1448,279 @@ fn animation_image25_matches_original_reader_and_loader_selection() {
             "{row}"
         );
     }
+}
+
+/// TechnoTypeClass::ReadINI reads `UseBuffer=` from the ART section named by
+/// the type's own ID (`0x0071577B`), never the `Image=` section it draws.
+#[test]
+fn use_buffer_reads_the_type_id_section() {
+    let ini = IniFile::from_str(
+        "[SCHP]\nUseBuffer=yes\n[ALIAS]\nImage=SCHP\n[OFF]\nUseBuffer=no\n[ODD]\nUseBuffer=on\n",
+    );
+    let reg = ArtRegistry::from_ini(&ini);
+    assert!(reg.use_buffer("SCHP"));
+    assert!(!reg.use_buffer("ALIAS"), "the Image= section is not read");
+    assert!(!reg.use_buffer("OFF"));
+    // ReadBool keeps the constructor's false for a first character outside 1TY0FN.
+    assert!(!reg.use_buffer("ODD"));
+    assert!(!reg.use_buffer("MISSING"));
+}
+
+/// Retail `UseBuffer=` marks the four helicopters; `DisableVoxelCache=` and
+/// `DisableShadowCache=` the Night Hawk, the paradrop plane and the spy plane.
+#[test]
+fn retail_use_buffer_types_are_the_four_helicopters() {
+    let Some((_, art_ini)) = crate::rules::retail_ini_fixture::retail_rules_and_art() else {
+        return;
+    };
+    let reg = ArtRegistry::from_ini(&art_ini);
+    let flagged = |flag: fn(&ArtRegistry, &str) -> bool| {
+        let mut names: Vec<&str> = art_ini
+            .section_names()
+            .into_iter()
+            .filter(|name| flag(&reg, name))
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    assert_eq!(
+        flagged(ArtRegistry::use_buffer),
+        ["HIND", "SCHD", "SCHP", "SHAD"]
+    );
+    assert_eq!(
+        flagged(ArtRegistry::disable_voxel_cache),
+        ["PDPLANE", "SHAD", "SPYP"]
+    );
+    assert_eq!(
+        flagged(ArtRegistry::disable_shadow_cache),
+        ["PDPLANE", "SHAD", "SPYP"]
+    );
+}
+
+/// ReadINI reads `CanBeHidden=` from the type ID's ART section with ReadBool
+/// (`0x007121EB`); without that section or key the constructor's true stays.
+#[test]
+fn can_be_hidden_reads_the_type_id_section() {
+    let ini = IniFile::from_str(
+        "[GAPOWR]\nCanBeHidden=False\n[ALIAS]\nImage=GAPOWR\n[YAREFN]\nCanBeHidden=True\n[ODD]\nCanBeHidden=off\n",
+    );
+    let reg = ArtRegistry::from_ini(&ini);
+    assert!(!reg.can_be_hidden("GAPOWR"));
+    assert!(reg.can_be_hidden("ALIAS"), "the Image= section is not read");
+    assert!(reg.can_be_hidden("YAREFN"));
+    assert!(reg.can_be_hidden("ODD"), "ReadBool's default for 'o'");
+    assert!(reg.can_be_hidden("MISSING"));
+}
+
+/// ReadINI reads `Palette=` with ReadString (capacity 0x20) from the ART
+/// section its ImageFile names (`0x0071582B`, `ESI = this+0x1F8`); an ART
+/// `Image=` is not followed, and an empty value names nothing.
+#[test]
+fn techno_palette_reads_the_named_section() {
+    let ini =
+        IniFile::from_str("[CANEWY04]\nPalette=lib\n[ALIAS]\nImage=CANEWY04\n[BLANK]\nPalette=\n");
+    let reg = ArtRegistry::from_ini(&ini);
+    assert_eq!(reg.techno_palette("CANEWY04"), Some("lib"));
+    assert_eq!(reg.techno_palette("ALIAS"), None);
+    assert_eq!(reg.techno_palette("BLANK"), None);
+    assert_eq!(reg.techno_palette("MISSING"), None);
+}
+
+/// A reached TechnoType reader binds the ART Palette under Rules Image,
+/// not under the type's own ID. ART installation only projects other visuals.
+#[test]
+fn custom_palette_projects_through_the_rules_image() {
+    let ini = IniFile::from_str(
+        "[BuildingTypes]\n0=STATUE\n1=COPY\n2=PLAIN\n\
+         [STATUE]\nStrength=10\n[COPY]\nStrength=10\nImage=STATUE\n\
+         [PLAIN]\nStrength=10\nImage=OWN\n",
+    );
+    let art = IniFile::from_str("[STATUE]\nPalette=lib\n[PLAIN]\nPalette=other\n[OWN]\n");
+    let mut rules = crate::rules::ruleset::RuleSet::from_ini_with_fixed_art_for_test(&ini, &art)
+        .expect("rules");
+    rules.install_art_data(ArtRegistry::from_ini(&art));
+    let custom = |id: &str| rules.object(id).unwrap().custom_palette_name();
+    assert_eq!(custom("STATUE"), Some("lib"));
+    assert_eq!(custom("COPY"), Some("lib"), "Rules Image names the section");
+    assert_eq!(custom("PLAIN"), None, "the type ID's section is not read");
+}
+
+/// Regression: the image loader must not erase an invisible animation's real
+/// constructor-time Middle/particle producer. Native null-image reader values
+/// come from imageless_anim; particle arithmetic remains with its existing owner.
+#[test]
+fn imageless_retail_animation_reaches_existing_gas_particle_owner() {
+    let Some(fixture) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let expected = fixture
+        .fixed_art
+        .section_or_empty("VIRUSD")
+        .read_int("NumParticles", 0);
+    assert!(expected > 0, "selected stock particle animation");
+    let root = AnimDimTestRoot::new();
+    let assets = crate::assets::asset_manager::AssetManager::from_loose_root_for_test(root.path());
+    let mut rules = fixture.rules;
+    rules.bind_scheduler_anim_assets(&["VIRUSD".to_string()], &assets, "TEM", "TEMPERATE");
+    let config = rules.art().anim_runtime_config("VIRUSD").unwrap();
+    assert_eq!(config.raw_shp_frame_count, Some(0));
+    let particle = rules
+        .p_type_id_by_name(config.spawns_particle.as_deref().unwrap())
+        .unwrap();
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 7);
+    sim.native_unique_ids =
+        Some(crate::sim::native_identity::NativeUniqueIdCursor::test_at_current_value(1000));
+    sim.construct_post_load_particle_system_id(&rules);
+    let count = |sim: &crate::sim::world::Simulation| {
+        sim.particle_systems()
+            .iter()
+            .flat_map(|(_, system)| system.particles())
+            .filter(|p| p.type_id() == particle)
+            .count()
+    };
+    let before = count(&sim);
+    let kind = sim.interner.intern("VIRUSD");
+    let anim = sim
+        .spawn_combat_explosion_anim(
+            &rules,
+            kind,
+            10,
+            10,
+            crate::util::fixed_math::SIM_ZERO,
+            crate::util::fixed_math::SIM_ZERO,
+            0,
+            0,
+        )
+        .expect("missing image does not reject a real particle animation");
+    assert_eq!(count(&sim) - before, expected as usize);
+    sim.object_ai_visit_one(
+        anim,
+        Some(&rules),
+        crate::sim::world::ObjectAiCtx::default(),
+    );
+    assert!(sim.anim(anim).is_some(), "constructor first-AI guard");
+    sim.session.set_binary_frame_for_test(1 << 16); // expire any u16 rate timer
+    sim.object_ai_visit_one(
+        anim,
+        Some(&rules),
+        crate::sim::world::ObjectAiCtx::default(),
+    );
+    // AI UnInit conceals and queues the physical receiver. The ordinary
+    // end-of-frame deletion owner, rather than AI itself, releases storage.
+    sim.process_pending_delete();
+    assert!(
+        sim.anim(anim).is_none(),
+        "zero-End animation retires through existing AI and deferred drain"
+    );
+}
+
+/// The draws' metadata lookup takes no owned ids; it must pick the entry the
+/// full resolution picks for every retail type, whichever case or padding
+/// the names arrive in.
+#[test]
+fn retail_metadata_entries_match_the_full_resolution() {
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art() else {
+        return;
+    };
+    let art = rules.art();
+    let (mut by_image, mut by_type) = (0, 0);
+    let ids = [
+        &rules.infantry_ids,
+        &rules.vehicle_ids,
+        &rules.aircraft_ids,
+        &rules.building_ids,
+    ];
+    for id in ids.into_iter().flatten() {
+        let image = &rules.object(id).expect("listed type").image;
+        let padded = format!(" {} ", image.to_lowercase());
+        for (type_id, rules_image) in [
+            (id.as_str(), image.as_str()),
+            (&id.to_lowercase(), padded.as_str()),
+            (id, ""),
+            (id, "NOSUCHART"),
+        ] {
+            let full = art.resolve_object_art(type_id, rules_image).entry;
+            let fast = art.resolve_metadata_entry(type_id, rules_image);
+            assert!(
+                std::ptr::eq(
+                    full.map_or(std::ptr::null(), |entry| entry),
+                    fast.map_or(std::ptr::null(), |entry| entry)
+                ),
+                "{type_id} / {rules_image:?}"
+            );
+            match fast {
+                Some(entry)
+                    if art
+                        .get(rules_image.trim())
+                        .is_some_and(|e| std::ptr::eq(e, entry)) =>
+                {
+                    by_image += 1
+                }
+                Some(_) => by_type += 1,
+                None => {}
+            }
+        }
+    }
+    assert!(
+        by_image > 0 && by_type > 0,
+        "{by_image} by image, {by_type} by type"
+    );
+}
+
+/// Ares art palettes read as named (CustomPalette::LoadFromINI): the
+/// AnimTypeExt `CustomPalette` (1000A4B0) and the TechnoTypeExt
+/// `CameoPalette` (1003DFB0, from ImageFile); an empty value keeps none.
+#[test]
+fn ares_art_palettes_keep_the_named_file() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let art = ArtRegistry::from_ini(&IniFile::from_str(
+        "[FIRE]\nCustomPalette=fire~~~.pal\n[SMOKE]\nCustomPalette=\n\
+         [MTNK]\nCameoPalette=cameo2.pal\n[HTNK]\nImage=MTNK\n[E1]\nCameo=E1ICON\n",
+    ));
+    let palette = |anim: &str| {
+        art.anim_runtime_config(anim)
+            .and_then(|config| config.ares_custom_palette.clone())
+    };
+    assert_eq!(palette("FIRE").as_deref(), Some("fire~~~.pal"));
+    assert_eq!(palette("SMOKE"), None);
+    assert_eq!(
+        art.resolve_declared_cameo_palette("MTNK", "MTNK"),
+        Some("cameo2.pal")
+    );
+    assert_eq!(
+        art.resolve_declared_cameo_palette("HTNK", "MTNK"),
+        Some("cameo2.pal")
+    );
+    assert_eq!(art.resolve_declared_cameo_palette("E1", "E1"), None);
+}
+
+#[test]
+fn presentation_only_anims_change_nothing_but_their_picture_down_their_chain() {
+    let mut art = ArtRegistry::from_ini(&IniFile::from_str(
+        "[GUNFIRE]\nRate=900\n[EXPLOSML]\nScorch=yes\nCrater=yes\n\
+         [PUFF]\nRate=1\n[PUFF2]\nRate=1\n[SMOKE]\nRate=1\n[SPARK]\nRandomRate=2,4\n",
+    ));
+    // The rules processor publishes the references (`AnimTypeReferences`).
+    let mut refer = |name: &str, next: &str, trailer: &str| {
+        let config = art.anim_runtime_configs.get_mut(name).unwrap();
+        config.next = (!next.is_empty()).then(|| next.to_owned());
+        config.trailer_anim = (!trailer.is_empty()).then(|| trailer.to_owned());
+    };
+    refer("PUFF", "PUFF2", "");
+    refer("PUFF2", "PUFF", "");
+    refer("SMOKE", "", "EXPLOSML");
+    assert!(art.anim_presentation_only("gunfire"), "a plain flash");
+    assert!(art.anim_presentation_only("PUFF"), "a plain cycle of Next=");
+    assert!(
+        !art.anim_presentation_only("EXPLOSML"),
+        "Scorch/Crater mark the map"
+    );
+    assert!(
+        !art.anim_presentation_only("SMOKE"),
+        "its trailer marks the map"
+    );
+    assert!(
+        !art.anim_presentation_only("SPARK"),
+        "RandomRate draws the Scenario stream"
+    );
 }

@@ -14,7 +14,7 @@ use crate::map::overlay_mark::{
 use crate::rules::locomotor_type::SpeedType;
 use crate::sim::world::load_object_lifecycle::LoadOverlayHandle;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "bridge_constructor_publication_tests.rs"]
 mod tests;
 
@@ -47,7 +47,7 @@ impl LivePublication<'_> {
         if self.sim.native_unique_ids.is_none() {
             return Err("live bridge constructor has no Scenario native-ID continuation".into());
         }
-        let id = self.sim.allocate_stable_id();
+        let id = self.sim.substrate.allocate_stable_id();
         let handle = self
             .sim
             .load_objects
@@ -74,12 +74,9 @@ impl LivePublication<'_> {
         ];
         let lookup = ((world[0] / 256) as i16, (world[1] / 256) as i16);
         let cell = self.lookup(lookup);
-        let terrain_present = self.real_coord(cell).is_some_and(|coord| {
-            self.sim
-                .production
-                .terrain_object_cells
-                .contains_key(&coord)
-        });
+        let terrain_present = self
+            .real_coord(cell)
+            .is_some_and(|coord| self.sim.terrain_objects.cell_index().contains_key(&coord));
         if terrain_present {
             self.sim
                 .load_objects
@@ -92,8 +89,8 @@ impl LivePublication<'_> {
             .begin_mark(handle, None)
             .map_err(|error| error.to_string())?;
         self.sim
-            .tactical_dirty_cells
-            .push((lookup.0 as u16, lookup.1 as u16));
+            .dirty_cells
+            .mark_tactical((lookup.0 as u16, lookup.1 as u16));
         let request = OverlayMarkRequest {
             overlay_id: overlay,
             flags,
@@ -129,8 +126,8 @@ impl LivePublication<'_> {
 }
 
 /// The bridge publication as the CellClass surface of `OverlayClass::Mark`.
-/// Its overlay identity and data are the live scalar cells the publication
-/// reads (`bridge_facts`), which the OverlayGrid mirrors on every store.
+/// Its overlay identity and data stores go to the OverlayGrid, or to the
+/// shared dummy for a missing cell, which the publication then reads.
 struct BridgeMarkHost<'p, 'a> {
     publication: &'p mut LivePublication<'a>,
     registry: &'a crate::rules::overlay_types::OverlayTypeRegistry,
@@ -138,6 +135,11 @@ struct BridgeMarkHost<'p, 'a> {
 
 impl OverlayMarkHost for BridgeMarkHost<'_, '_> {
     type Error = String;
+    type CellAnim = crate::sim::overlay_mark_host::OverlayCellAnimHandle;
+
+    fn tiberium_error(error: crate::rules::overlay_types::TiberiumImageError) -> Self::Error {
+        error.to_string()
+    }
 
     fn cell(&mut self, coord: (i16, i16)) -> Cell {
         self.publication.lookup(coord)
@@ -156,12 +158,11 @@ impl OverlayMarkHost for BridgeMarkHost<'_, '_> {
     }
 
     fn identity(&self, cell: Cell) -> i32 {
-        let terrain = self.publication.terrain();
-        let identity = match cell {
-            Cell::Real(index) => terrain.cells()[index].bridge_facts.overlay_id,
-            Cell::Dummy => terrain.shared_cell_dummy().overlay_fields().0,
-        };
-        identity.map_or(NO_OVERLAY, i32::from)
+        self.publication
+            .sim
+            .cell_overlay(cell)
+            .overlay_id
+            .map_or(NO_OVERLAY, i32::from)
     }
 
     fn data(&self, cell: Cell) -> u8 {
@@ -240,27 +241,31 @@ impl OverlayMarkHost for BridgeMarkHost<'_, '_> {
         Err("bridge reconstruction hosts no wall Mark".into())
     }
 
-    fn spawn_cell_anim(&mut self, request: OverlayCellAnim<'_>) -> Result<(), String> {
+    fn spawn_cell_anim(&mut self, request: OverlayCellAnim<'_>) -> Result<Self::CellAnim, String> {
         let rules = self.publication.rules;
         let ground = crate::sim::overlay_mark_host::OverlayCellAnimGround::read(
             self.publication.terrain(),
             &request,
         );
         let sim = &mut *self.publication.sim;
-        let lighting = sim
-            .session
-            .lighting
-            .profile(crate::sim::scenario_session::ScenarioLightingProfile::Normal)
-            .into();
         sim.construct_overlay_cell_anim(
             rules,
             request,
             ground,
-            lighting,
             crate::sim::anim_class::AnimConstructorInput::Runtime,
+            self.publication.frame_effects,
         )
-        .map(|_| ())
         .map_err(|error| error.to_string())
+    }
+
+    fn tint_cell_anim(
+        &mut self,
+        anim: Self::CellAnim,
+        tiberium: crate::rules::tiberium_type::TiberiumTypeId,
+    ) {
+        self.publication
+            .sim
+            .tint_overlay_cell_anim(self.publication.rules, anim, tiberium);
     }
 
     fn recalc(&mut self, cell: Cell) -> Result<(), String> {

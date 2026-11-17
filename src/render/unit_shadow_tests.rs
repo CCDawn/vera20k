@@ -82,8 +82,225 @@ fn sample_indices(
 }
 
 #[test]
-#[ignore = "requires GPU; actual atlas packing/upload, mask first fill/hit and growth"]
-fn shadow_first_fill_hits_and_atlas_growth_keep_payloads() {
+#[ignore = "requires GPU; native Jumpjet mask controls through atlas and pose-page upload"]
+fn jumpjet_native_masks_keep_ground_flight_and_frame_payloads_separate() {
+    use crate::assets::{hva_file::HvaFile, vxl_file::VxlFile};
+    use crate::render::unit_atlas::GROUNDED_SHADOW_FRAME_FLAG;
+    use crate::render::unit_pose_cache::VxlPoseFrameCache;
+    use crate::render::vxl_raster::{self, VxlRenderParams};
+    let gpu = crate::render::terrain_draw_gpu_tests::Gpu::new();
+    let batch = BatchRenderer::new_with_device(
+        &gpu.device,
+        &gpu.queue,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+    );
+    let fixture = crate::test_fixture::json("tools/voxel_oracle/unit_shadow.json");
+    let data = &fixture["generated"];
+    let decode = |s: &str| {
+        s.as_bytes()
+            .chunks_exact(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let vxl = VxlFile::from_bytes(&decode(data["vxl"].as_str().unwrap())).unwrap();
+    let hva = HvaFile::from_bytes(&decode(data["hva"].as_str().unwrap())).unwrap();
+    let body_key = UnitSpriteKey {
+        type_id: "native-unit".into(),
+        turret_index: 0,
+        facing: 0,
+        layer: VxlLayer::Body,
+        frame: 0,
+        slope_type: 0,
+        barrel_pitch: 0,
+    };
+    let mut cached = vec![CachedUnitSprite {
+        key: body_key.clone(),
+        pixels: decode(data["body"].as_str().unwrap()),
+        width: 256,
+        height: 256,
+        offset_x: -128.,
+        offset_y: -128.,
+        native_draw_bounds: Some([-128, -128, 256, 256]),
+        shadow_center: None,
+        pool_bytes: 0,
+    }];
+    let key_for = |caller: &serde_json::Value| UnitSpriteKey {
+        type_id: "native-unit".into(),
+        turret_index: 0,
+        facing: vxl_raster::voxel_facing_step_u16(
+            caller["input"]["primary"].as_u64().unwrap() as u16
+        ) * 8,
+        layer: VxlLayer::Shadow,
+        frame: 0,
+        slope_type: caller["input"]["slope"].as_u64().unwrap_or(0) as u8,
+        barrel_pitch: 0,
+    };
+    for case in data["cases"].as_array().unwrap() {
+        let caller = &fixture["callers"][case["caller"].as_u64().unwrap() as usize];
+        let key = key_for(caller);
+        if cached.iter().any(|s| s.key == key) {
+            continue;
+        }
+        let params = VxlRenderParams {
+            facing: key.facing,
+            slope_type: key.slope_type,
+            ..Default::default()
+        };
+        let sprite = vxl_raster::shadow::render(&vxl, Some(&hva), &params, 0, true).unwrap();
+        let center = vxl_raster::shadow::center(&vxl, Some(&hva), &params, 0, true);
+        for frame in [0, GROUNDED_SHADOW_FRAME_FLAG] {
+            let mut key = key.clone();
+            key.frame = frame;
+            cached.push(CachedUnitSprite {
+                key,
+                pixels: sprite.palette_indices.clone(),
+                width: sprite.width,
+                height: sprite.height,
+                offset_x: sprite.offset_x,
+                offset_y: sprite.offset_y,
+                native_draw_bounds: Some([
+                    sprite.offset_x as i32,
+                    sprite.offset_y as i32,
+                    sprite.width as i32,
+                    sprite.height as i32,
+                ]),
+                shadow_center: center,
+                pool_bytes: 0,
+            });
+        }
+    }
+    let mut atlas = UnitAtlas::from_test_sprites(cached);
+    atlas.upload(&gpu.device, &gpu.queue, &batch);
+    let expected = |case: &serde_json::Value| {
+        let r = &case["rect"];
+        let [x, y, w, h] = [2, 3, 4, 5].map(|i| r[i].as_u64().unwrap() as usize);
+        let mut full = vec![0; 65536];
+        for p in case["pixels"].as_array().unwrap() {
+            full[p[0].as_u64().unwrap() as usize] = p[1].as_u64().unwrap() as u8;
+        }
+        (y..y + h)
+            .flat_map(|row| full[row * 256 + x..row * 256 + x + w].iter().copied())
+            .collect::<Vec<_>>()
+    };
+    let parts = [UnitShadowPart {
+        entry: atlas.get(&body_key).unwrap(),
+        point: [0, 0],
+        posed: false,
+    }];
+    let mut poses = VxlPoseFrameCache::default();
+    // The body page fills first: shadow upload must select its own later page.
+    let opaque = poses.fill_test_page();
+    let mut fresh_first = None;
+    for case in data["cases"].as_array().unwrap() {
+        let caller = &fixture["callers"][case["caller"].as_u64().unwrap() as usize];
+        let key = key_for(caller);
+        if !caller["body_mask_present"].as_bool().unwrap() {
+            assert_eq!(sample_indices(&gpu, &atlas, &key), expected(case));
+            continue;
+        }
+        let offset =
+            std::array::from_fn(|i| caller["renderer"]["mask_offset"][i].as_i64().unwrap() as i32);
+        let entry = poses
+            .render_unit_shadow(&atlas, &key, offset, &parts)
+            .unwrap();
+        fresh_first.get_or_insert(entry);
+        poses.submit(&gpu.device, &gpu.queue, &batch);
+        let tex = poses.page_texture(entry.page).unwrap();
+        assert_eq!(
+            gpu.read_uint_texels(
+                &tex.view,
+                entry
+                    .uv_origin
+                    .map(|v| (v * tex.width as f32).round() as u32),
+                entry.pixel_size.map(|v| v as u32)
+            ),
+            expected(case)
+        );
+        let repeated = poses
+            .render_unit_shadow(&atlas, &key, offset, &parts)
+            .unwrap();
+        assert_eq!(
+            (repeated.page, repeated.uv_origin),
+            (entry.page, entry.uv_origin)
+        );
+    }
+    let key = key_for(&fixture["callers"][0]);
+    let mut grounded = key.clone();
+    grounded.frame |= GROUNDED_SHADOW_FRAME_FLAG;
+    assert!(atlas.prepare_native_shadow_with(&grounded, 0, |body| {
+        poses.stamp_shadow_parts(&atlas, &parts, body)
+    }));
+    atlas.upload(&gpu.device, &gpu.queue, &batch);
+    assert_eq!(
+        sample_indices(&gpu, &atlas, &grounded),
+        expected(&data["cases"][0])
+    );
+    assert_eq!(
+        sample_indices(&gpu, &atlas, &key),
+        expected(&data["cases"][4]),
+        "ground upload cannot mutate the high-flight stencil"
+    );
+    assert!(
+        atlas.prepare_native_shadow_with(&grounded, 0, |_| panic!("retained mask reread source"))
+    );
+    let posed = [UnitShadowPart {
+        entry: opaque,
+        point: [0, 0],
+        posed: true,
+    }];
+    let masked = poses
+        .render_unit_shadow(&atlas, &key, [0, 15], &posed)
+        .unwrap();
+    poses.submit(&gpu.device, &gpu.queue, &batch);
+    let tex = poses.page_texture(masked.page).unwrap();
+    assert!(
+        gpu.read_uint_texels(
+            &tex.view,
+            masked
+                .uv_origin
+                .map(|v| (v * tex.width as f32).round() as u32),
+            masked.pixel_size.map(|v| v as u32)
+        )
+        .iter()
+        .all(|&p| p == 0),
+        "frame-local body pixels must participate in the mask"
+    );
+    let first = fresh_first.unwrap();
+    let started = std::time::Instant::now();
+    for _ in 0..20_000 {
+        let hit = poses
+            .render_unit_shadow(&atlas, &key, [0, 0], &parts)
+            .unwrap();
+        assert_eq!((hit.page, hit.uv_origin), (first.page, first.uv_origin));
+    }
+    eprintln!(
+        "20k shared same-frame low-flight masks: {:?}",
+        started.elapsed()
+    );
+    poses.begin_frame();
+    let next = poses
+        .render_unit_shadow(&atlas, &key, [0, 0], &parts)
+        .unwrap();
+    assert_ne!(
+        next.page, first.page,
+        "begin_frame must discard old shadow-source identities"
+    );
+    poses.submit(&gpu.device, &gpu.queue, &batch);
+    let tex = poses.page_texture(next.page).unwrap();
+    assert_eq!(
+        gpu.read_uint_texels(
+            &tex.view,
+            next.uv_origin
+                .map(|v| (v * tex.width as f32).round() as u32),
+            next.pixel_size.map(|v| v as u32)
+        ),
+        expected(&data["cases"][0])
+    );
+}
+
+#[test]
+#[ignore = "requires GPU; actual atlas placement/upload, mask first fill/hit and a later picture"]
+fn shadow_first_fill_hits_and_later_pictures_keep_payloads() {
     let gpu = crate::render::terrain_draw_gpu_tests::Gpu::new();
     let batch = BatchRenderer::new_with_device(
         &gpu.device,
@@ -111,6 +328,8 @@ fn shadow_first_fill_hits_and_atlas_growth_keep_payloads() {
             width as i32,
             height as i32,
         ]),
+        shadow_center: None,
+        pool_bytes: 0,
     };
     let cache = vec![
         make(
@@ -124,11 +343,10 @@ fn shadow_first_fill_hits_and_atlas_growth_keep_payloads() {
     ];
     let shadow_key = cache[1].key.clone();
     let body_key = cache[0].key.clone();
-    let mut atlas =
-        super::super::pack_sprites_on_device(&gpu.device, &gpu.queue, &batch, &cache).unwrap();
-    atlas.rendered_cache = cache;
-    let body = *atlas.get(&body_key).unwrap();
-    assert!(atlas.prepare_native_shadow(&gpu.queue, &shadow_key, [(body, [0., 0.])]));
+    let mut atlas = UnitAtlas::from_test_sprites(cache);
+    let body = atlas.get(&body_key).unwrap();
+    assert!(atlas.prepare_native_shadow(&shadow_key, 0, [(body, [0., 0.])]));
+    atlas.upload(&gpu.device, &gpu.queue, &batch);
     let expected = vec![
         1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1,
     ];
@@ -136,20 +354,22 @@ fn shadow_first_fill_hits_and_atlas_growth_keep_payloads() {
     let bomb = std::iter::from_fn(|| -> Option<(UnitSpriteEntry, [f32; 2])> {
         panic!("cache hit read new body")
     });
-    assert!(atlas.prepare_native_shadow(&gpu.queue, &shadow_key, bomb));
-    // Growth appends to a new page and moves nothing already resident, so the
-    // uploaded mask stays where queued draws reference it.
-    let resident_shadow = *atlas.get(&shadow_key).unwrap();
+    assert!(atlas.prepare_native_shadow(&shadow_key, 0, bomb));
+    // A picture drawn later goes beside the resident ones on their shelf and
+    // moves nothing, so the uploaded mask stays where queued draws reference
+    // it, and its own upload overwrites none of their texels.
+    let resident_shadow = atlas.get(&shadow_key).unwrap();
     let turret = make(VxlLayer::Turret, vec![57; 320], 40, 8, [-20., -4.]);
     let turret_key = turret.key.clone();
-    atlas.append_sprites(&gpu.device, &gpu.queue, &batch, vec![turret]);
-    let grown_shadow = *atlas.get(&shadow_key).unwrap();
+    atlas.place_test_sprite(turret);
+    atlas.upload(&gpu.device, &gpu.queue, &batch);
+    let grown_shadow = atlas.get(&shadow_key).unwrap();
     assert_eq!(
         (grown_shadow.page, grown_shadow.uv_origin),
         (resident_shadow.page, resident_shadow.uv_origin)
     );
-    assert_ne!(atlas.get(&turret_key).unwrap().page, resident_shadow.page);
-    assert!(atlas.prepare_native_shadow(&gpu.queue, &shadow_key, []));
+    assert_eq!(atlas.get(&turret_key).unwrap().page, resident_shadow.page);
+    assert!(atlas.prepare_native_shadow(&shadow_key, 0, []));
     assert_eq!(sample_indices(&gpu, &atlas, &shadow_key), expected);
     assert_eq!(
         sample_indices(&gpu, &atlas, &body_key),
@@ -158,10 +378,55 @@ fn shadow_first_fill_hits_and_atlas_growth_keep_payloads() {
     assert_eq!(sample_indices(&gpu, &atlas, &turret_key), vec![57; 320]);
     let start = std::time::Instant::now();
     for _ in 0..20_000 {
-        assert!(atlas.prepare_native_shadow(&gpu.queue, &shadow_key, []));
+        assert!(atlas.prepare_native_shadow(&shadow_key, 0, []));
     }
     eprintln!(
         "20k stable shadow cache-hit CPU lookup: {:?}; no mask reads/uploads",
         start.elapsed()
     );
+}
+
+/// Shadow composition finds a part's source by its atlas placement and a
+/// template by key, through the index placement keeps, without walking every
+/// resident sprite; an unknown rectangle stamps nothing.
+#[test]
+fn shadow_sources_are_found_by_placement_and_key() {
+    let key = |layer| UnitSpriteKey {
+        type_id: "indexed".into(),
+        turret_index: 0,
+        facing: 0,
+        layer,
+        frame: 0,
+        slope_type: 0,
+        barrel_pitch: 0,
+    };
+    let sprite = |layer, pixels: Vec<u8>| CachedUnitSprite {
+        key: key(layer),
+        pixels,
+        width: 2,
+        height: 2,
+        offset_x: 0.,
+        offset_y: 0.,
+        native_draw_bounds: Some([0, 0, 2, 2]),
+        shadow_center: None,
+        pool_bytes: 0,
+    };
+    let atlas = UnitAtlas::from_test_sprites(vec![
+        sprite(VxlLayer::Body, vec![7, 0, 0, 7]),
+        sprite(VxlLayer::Shadow, vec![0, 9, 9, 0]),
+    ]);
+    let shadow = atlas.get(&key(VxlLayer::Shadow)).unwrap();
+
+    let mut body = vec![0u8; 65536];
+    assert!(atlas.stamp_shadow_part(&mut body, &shadow, [10, 20]));
+    let stamped = [20 * 256 + 10, 20 * 256 + 11, 21 * 256 + 10, 21 * 256 + 11].map(|i| body[i]);
+    assert_eq!(stamped, [0, 1, 1, 0]);
+    let elsewhere = UnitSpriteEntry {
+        page: shadow.page + 1,
+        ..shadow
+    };
+    assert!(!atlas.stamp_shadow_part(&mut body, &elsewhere, [0, 0]));
+    let resident = atlas.resident.borrow();
+    let template = resident.rendered_by_key(&key(VxlLayer::Body)).unwrap();
+    assert_eq!(template.pixels, [7, 0, 0, 7]);
 }

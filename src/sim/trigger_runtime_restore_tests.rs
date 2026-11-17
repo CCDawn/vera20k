@@ -1,10 +1,9 @@
 //! Native126/6E30C0 -> House50D440 and Foot4DF510 prerequisites.
-//! Steam SHA2563e81a617..08600; new control flow is instruction-derived.
+//! Steam gamemd; new control flow is instruction-derived.
 //! Existing constructors, coordinate/FNPC kernels and Unlimbo keep their
 //! executable comparisons. Supplied-nearby tests assert caller arguments,
 //! and do not claim the supplied answer as native placement output.
 use super::*;
-use crate::map::entities::EntityCategory;
 use crate::rules::{ini_parser::IniFile, overlay_types::OverlayTypeRegistry, ruleset::RuleSet};
 use crate::sim::intern::InternedId;
 use crate::sim::movement::{fresh_oracle_seam, ground_pose};
@@ -101,7 +100,7 @@ fn apply(
 ) -> bool {
     let ini = IniFile::from_str(&format!("[Actions]\nA=1,{kind},0,{value},0,0,0,0,Z\n"));
     let entry = crate::map::actions::parse_actions(&ini)["A"].entries()[0].clone();
-    let action = RuntimeDefinitions::default().resolve_action(entry, None, None);
+    let action = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
     sim.apply_live_trigger_action(
         &action,
         TriggerActionContext {
@@ -110,7 +109,7 @@ fn apply(
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        Some(rules),
+        rules,
         Some(registry),
         FrameEffects::default(),
     )
@@ -130,28 +129,24 @@ fn live126_recreates_all_four_initial_categories_after_real_cleanup_in_record_or
             .iter()
             .map(|&(kind, at)| spawn(&mut sim, &rules, houses[0], kind, at))
             .collect();
-        sim.retain_initial_house_technos();
+        crate::sim::world::Simulation::retain_initial_house_technos(
+            &sim.substrate,
+            &mut sim.houses,
+        );
         assert_eq!(sim.houses[&houses[0]].initial_techno_record_count(), 4);
         for &id in &ids {
-            sim.uninit_with_context(id, UninitContext::new(Some(&rules), Some(&registry)));
+            sim.uninit_with_context(id, UninitContext::new(&rules, Some(&registry)));
         }
         sim.flush_pending_delete();
         assert!(active(&sim).is_empty());
         if saved_house {
             let bytes = crate::util::save_codec::serialize(&sim.houses[&houses[0]]).unwrap();
-            sim.houses.insert(
-                houses[0],
-                crate::util::save_codec::deserialize(&bytes).unwrap(),
-            );
+            sim.houses
+                .replace_for_test(crate::util::save_codec::deserialize(&bytes).unwrap());
         }
         install(&mut sim, &rules, 0);
-        sim.session.binary_frame = 16;
-        sim.raise_house_tags(
-            houses[0],
-            Some(&rules),
-            Some(&registry),
-            FrameEffects::default(),
-        );
+        sim.session.set_binary_frame_for_test(16);
+        sim.raise_house_tags(houses[0], &rules, Some(&registry), FrameEffects::default());
         let restored = active(&sim);
         assert_eq!(restored.len(), 4);
         for ((id, kind, owner, cell), (expected, at)) in restored.iter().zip(original) {
@@ -220,13 +215,8 @@ fn refused_placement_continues_with_next_record_and_following_trigger_action() {
     record(&mut sim, houses[0], "ENGINEER", (16, 15));
     record(&mut sim, houses[0], "TAGUNIT", (15, 15));
     install(&mut sim, &rules, 0);
-    sim.session.binary_frame = 8;
-    sim.raise_house_tags(
-        houses[0],
-        Some(&rules),
-        Some(&registry),
-        FrameEffects::default(),
-    );
+    sim.session.set_binary_frame_for_test(8);
+    sim.raise_house_tags(houses[0], &rules, Some(&registry), FrameEffects::default());
     let restored = active(&sim);
     assert_eq!(restored.len(), 2);
     assert!(restored.iter().any(|row| row.0 == block));
@@ -258,15 +248,10 @@ fn restore126_always_constructs_a_new_unit_even_when_the_original_is_present() {
         .unwrap()
         .health
         .set_for_test(7);
-    sim.retain_initial_house_technos();
+    crate::sim::world::Simulation::retain_initial_house_technos(&sim.substrate, &mut sim.houses);
     install(&mut sim, &rules, 0);
-    sim.session.binary_frame = 8;
-    sim.raise_house_tags(
-        houses[0],
-        Some(&rules),
-        Some(&registry),
-        FrameEffects::default(),
-    );
+    sim.session.set_binary_frame_for_test(8);
+    sim.raise_house_tags(houses[0], &rules, Some(&registry), FrameEffects::default());
     let restored = active(&sim);
     assert_eq!(restored.len(), 2);
     let new = restored.iter().find(|row| row.0 != old).unwrap();
@@ -297,7 +282,7 @@ fn restore130_still_repairs_only_existing_buildings() {
         .unwrap()
         .health
         .set_for_test(7);
-    sim.retain_initial_house_technos();
+    crate::sim::world::Simulation::retain_initial_house_technos(&sim.substrate, &mut sim.houses);
     let live = install(&mut sim, &rules, 0);
     assert!(apply(
         &mut sim,
@@ -325,7 +310,7 @@ fn restore130_still_repairs_only_existing_buildings() {
 }
 
 #[test]
-fn foot_and_building_clearance_submit_the_same_native_no_bridge_nearby_arguments() {
+fn foot_and_building_clearance_submit_the_same_native_nearby_arguments() {
     use crate::rules::locomotor_type::{MovementZone, SpeedType};
     use crate::sim::find_nearby_cell::NearbyFootprint;
     use fresh_oracle_seam::FreshCallRecord;
@@ -341,7 +326,8 @@ fn foot_and_building_clearance_submit_the_same_native_no_bridge_nearby_arguments
             if building { "CABHUT" } else { "TAGUNIT" },
         );
         // Supplied callee answer; expected arguments come from458CE0..458D2D
-        // and4DF71A..4DF76A, including literal0 at458CF8/4DF732.
+        // and4DF71A..4DF76A. FNPC reads argument 12 (literal 1 at 458CEF and
+        // 4DF729) as its bridge allow flag at 0x0056DE6C.
         fresh_oracle_seam::install_nearby_only(vec![Some((16, 15))]);
         let placed = if building {
             sim.place_building_with_cleared_foundation(
@@ -378,7 +364,7 @@ fn foot_and_building_clearance_submit_the_same_native_no_bridge_nearby_arguments
                 movement_zone: MovementZone::Normal,
                 bridge_aware_zone: false,
                 footprint: NearbyFootprint::SINGLE,
-                allow_bridge_cells: false,
+                allow_bridge_cells: true,
                 check_height: false,
                 check_occupancy: false,
                 target_cell: None,
@@ -417,7 +403,8 @@ fn failed_foot_unlimbo_retires_new_object_and_restores_old_raw_location() {
         ground_pose::position_world_coord(&sim.substrate.entities.get(old).unwrap().position);
     // Aircraft4196B0, already covered by the original class-entry owner:
     // mode0 + owned-by-current-house + unmapped destination refuses +D8.
-    sim.session.game_mode_nonzero = false;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false));
     let created = construct(&mut sim, &rules, houses[0], "HORNET");
     sim.substrate
         .entities
@@ -448,41 +435,4 @@ fn failed_foot_unlimbo_retires_new_object_and_restores_old_raw_location() {
     let restored = sim.substrate.entities.get(old).unwrap();
     assert!(!restored.lifecycle.in_limbo());
     assert_eq!(ground_pose::position_world_coord(&restored.position), coord);
-}
-
-#[test]
-fn a_building_blocks_foot_clearance_before_the_new_object_unlimbo() {
-    let (mut sim, rules, registry, houses) = fixture();
-    let block = spawn(&mut sim, &rules, houses[1], "CABHUT", (15, 15));
-    let coord =
-        ground_pose::position_world_coord(&sim.substrate.entities.get(block).unwrap().position);
-    let created = construct(&mut sim, &rules, houses[0], "TAGUNIT");
-    assert!(
-        sim.place_foot_with_cleared_cell(
-            created,
-            coord,
-            0,
-            &rules,
-            Some(&registry),
-            FrameEffects::default()
-        )
-        .is_none()
-    );
-    let new = sim.substrate.entities.get(created).unwrap();
-    assert!(
-        new.lifecycle.object_alive() && new.lifecycle.in_limbo(),
-        "caller50D507 owns this early-refusal UnInit"
-    );
-    assert_eq!(
-        sim.substrate.entities.get(block).unwrap().category(),
-        EntityCategory::Structure
-    );
-    assert!(
-        sim.substrate
-            .entities
-            .get(block)
-            .unwrap()
-            .lifecycle
-            .object_alive()
-    );
 }

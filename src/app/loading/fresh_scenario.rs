@@ -41,6 +41,8 @@ pub(crate) enum FreshScenarioFamily {
 pub(crate) enum FreshStartupProvenance {
     Accepted,
     ResolvedLegacy,
+    NetworkAccepted,
+    Replay,
     CampaignCatalog,
 }
 
@@ -146,6 +148,14 @@ impl FreshScenarioLoadContextDescriptor {
                 prepared.seed.value,
                 FreshStartupProvenance::Accepted,
             ),
+            LoadingStartup::Network(prepared) => (
+                prepared.launch_session().clone(),
+                prepared.seed.value,
+                FreshStartupProvenance::NetworkAccepted,
+            ),
+            LoadingStartup::Replay { session, seed, .. } => {
+                (session.clone(), seed.value, FreshStartupProvenance::Replay)
+            }
             LoadingStartup::UnverifiedLegacy { session, seed } => (
                 session.clone(),
                 seed.value,
@@ -156,8 +166,13 @@ impl FreshScenarioLoadContextDescriptor {
             }
             LoadingStartup::Campaign(_) => unreachable!("campaign admitted above"),
         };
-        let launch = MatchLaunchDescriptor::from_resolved(session.clone())
+        let mut launch = MatchLaunchDescriptor::from_resolved(session.clone())
             .map_err(|err| anyhow::anyhow!("fresh stock-offline launch is unresolved: {err}"))?;
+        if let LoadingStartup::Network(prepared) = startup
+            && prepared.wol_start().quick_coop
+        {
+            launch = launch.with_quick_coop_starts();
+        }
         let selected_map = session
             .selected_map_file
             .as_deref()
@@ -169,9 +184,6 @@ impl FreshScenarioLoadContextDescriptor {
         {
             anyhow::bail!("stock offline launch has no exact selected map record");
         }
-        // Validate the complete stock callback row before the accepted staging
-        // token can move. Numeric mode IDs alone are not sufficient authority.
-        crate::sim::scenario_bootstrap::stock_offline_start_callback_family(&session)?;
         let (materialization, staged_waypoints) = match physical_source {
             LoadedMapSource::Generated { seed_name, .. } => {
                 if !crate::map::rmg::is_seed_selection(selected_map)
@@ -335,6 +347,14 @@ impl FreshScenarioLoadContextDescriptor {
                 prepared.seed.value,
                 prepared.session.launch_session(),
             ),
+            LoadingStartup::Network(prepared) => (
+                FreshStartupProvenance::NetworkAccepted,
+                prepared.seed.value,
+                prepared.launch_session(),
+            ),
+            LoadingStartup::Replay { session, seed, .. } => {
+                (FreshStartupProvenance::Replay, seed.value, session)
+            }
             LoadingStartup::UnverifiedLegacy { session, seed } => {
                 (FreshStartupProvenance::ResolvedLegacy, seed.value, session)
             }

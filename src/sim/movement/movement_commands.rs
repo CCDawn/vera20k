@@ -76,11 +76,8 @@ impl DestinationTiming {
         }
     }
 
-    pub fn from_rules(binary_frame: u32, rules: Option<&crate::rules::ruleset::RuleSet>) -> Self {
-        Self::new(
-            binary_frame,
-            rules.map_or(60, |r| r.general.blockage_path_delay_ticks),
-        )
+    pub fn from_rules(binary_frame: u32, rules: &crate::rules::ruleset::RuleSet) -> Self {
+        Self::new(binary_frame, rules.general.blockage_path_delay_ticks)
     }
 
     /// Set_Destination_Internal 0x004D94B0 tail 0x4D96C2..0x4D9707: +6B7 = 0,
@@ -88,10 +85,10 @@ impl DestinationTiming {
     /// setter. The setter never writes +64C; the no-head Process FindPath
     /// success continuation 0x75B2E2 owns that reset.
     pub(crate) fn accept(self, entity: &mut crate::sim::game_entity::GameEntity) {
-        let path = &mut entity.navigation.path_runtime;
-        path.start_movement(self.binary_frame, 0);
-        path.start_blocked(self.binary_frame, self.blockage_path_delay_ticks);
-        path.set_path_blocked(false);
+        entity
+            .navigation
+            .path_runtime_mut()
+            .accept_destination(self.binary_frame, self.blockage_path_delay_ticks);
     }
 }
 
@@ -147,6 +144,6 @@ pub(crate) fn enter_without_contact(entity: &GameEntity) -> bool {
 /// NavQueue, suffix and reference survive.
 pub(crate) fn clear_destination_path_head(entity: &mut GameEntity) {
     if !enter_without_contact(entity) {
-        entity.navigation.path_replay.clear_live_head();
+        entity.navigation.path_replay_mut().clear_live_head();
     }
 }

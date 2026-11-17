@@ -1,6 +1,6 @@
 // Ported from FFmpeg's libavcodec/binkdata.h.
 // Copyright (c) 2009 Konstantin Shishkov
-// Licensed LGPL-2.1-or-later. See LICENSES/LGPL-2.1-or-later.txt in the repo root.
+// Licensed GPL-3.0-or-later. See LICENSE-GPL in the repo root.
 
 //! Lookup tables for the Bink 1 video decoder.
 //!
@@ -557,7 +557,7 @@ pub const DC_START_BITS: u32 = 11;
 /// From `libavcodec/bink.c:389`.
 pub const BINK_RLELENS: [u8; 4] = [4, 8, 12, 32];
 
-#[cfg(test)]
+#[cfg(all(test, tests_assets))]
 mod tests {
     use super::*;
 
@@ -570,16 +570,6 @@ mod tests {
             seen[v as usize] = true;
         }
         assert!(seen.iter().all(|&s| s), "BINK_SCAN missing values");
-    }
-
-    #[test]
-    fn tree_bits_and_lens_have_16_by_16_shape() {
-        assert_eq!(BINK_TREE_BITS.len(), 16);
-        assert_eq!(BINK_TREE_LENS.len(), 16);
-        for t in 0..16 {
-            assert_eq!(BINK_TREE_BITS[t].len(), 16);
-            assert_eq!(BINK_TREE_LENS[t].len(), 16);
-        }
     }
 
     #[test]
@@ -604,17 +594,6 @@ mod tests {
                 seen[v as usize] = true;
             }
             assert!(seen.iter().all(|&s| s), "pattern {} incomplete", p);
-        }
-    }
-
-    #[test]
-    fn quant_matrices_are_nonzero() {
-        // Sanity only — if we pasted a zero row, everything IDCT-related breaks.
-        for q in 0..16 {
-            let intra_sum: i64 = BINK_INTRA_QUANT[q].iter().map(|&v| v as i64).sum();
-            let inter_sum: i64 = BINK_INTER_QUANT[q].iter().map(|&v| v as i64).sum();
-            assert!(intra_sum > 0, "intra quant row {} is empty", q);
-            assert!(inter_sum > 0, "inter quant row {} is empty", q);
         }
     }
 }

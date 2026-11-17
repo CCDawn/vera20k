@@ -5,7 +5,7 @@ use crate::sim::scenario_session::ScenarioDescriptor;
 fn action(sim: &mut Simulation, kind: i32, value: i32) -> Vec<TriggerEffect> {
     let ini = IniFile::from_str(&format!("[Actions]\nA=1,{kind},0,{value},0,0,0,0,Z\n"));
     let entry = crate::map::actions::parse_actions(&ini)["A"].entries()[0].clone();
-    let action = RuntimeDefinitions::default().resolve_action(entry, None, None);
+    let action = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
     let mut effects = Vec::new();
     assert!(sim.apply_live_trigger_action(
         &action,
@@ -15,7 +15,7 @@ fn action(sim: &mut Simulation, kind: i32, value: i32) -> Vec<TriggerEffect> {
             input: TagEventInput::default()
         },
         &mut effects,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         FrameEffects::default(),
     ));
@@ -36,7 +36,7 @@ fn pause_action_preserves_ordered_raw_duration_and_owns_input_lock() {
     }
     assert_ne!(sim.state_hash(), hash);
     assert_eq!(sim.scenario_rng.native_state_hex(), draws);
-    assert_eq!(sim.session.tick, 0);
+    assert_eq!(sim.session.tick(), 0);
 }
 
 #[test]
@@ -102,16 +102,16 @@ fn basic_vein_growth_uses_native_bool_reader_and_fresh_true_default() {
 fn paused_chrono_clock_finishes_without_a_world_frame_or_rng_draw() {
     let mut sim = Simulation::with_seed(0);
     let mut start = Vec::new();
-    sim.start_chrono_screen_effect(3, &mut start);
+    sim.session.start_chrono_screen_effect(3, &mut start);
     let initial = (
-        sim.session.tick,
-        sim.session.binary_frame,
+        sim.session.tick(),
+        sim.session.binary_frame(),
         sim.scenario_rng.native_state_hex(),
     );
     let mut saw_pause = false;
     let mut saw_finish = false;
     for _ in 0..60 {
-        for effect in sim.process_chrono_screen_effect() {
+        for effect in sim.session.process_chrono_screen_effect() {
             if let TriggerEffect::ChronoScreen { command } = effect {
                 saw_pause |=
                     command == crate::sim::superweapon::chrono_screen::ChronoScreenCommand::Pause;
@@ -123,8 +123,8 @@ fn paused_chrono_clock_finishes_without_a_world_frame_or_rng_draw() {
     assert!(saw_pause && saw_finish);
     assert_eq!(
         (
-            sim.session.tick,
-            sim.session.binary_frame,
+            sim.session.tick(),
+            sim.session.binary_frame(),
             sim.scenario_rng.native_state_hex()
         ),
         initial
@@ -141,10 +141,15 @@ fn counted_logic_tag_emits_pause_requests_in_authored_order() {
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
         None,
         None,
+        None,
     );
-    sim.classify_map_triggers(None);
-    sim.session.set_started(true);
-    let effects = sim.advance_triggers(None, None, FrameEffects::default());
+    sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
+    sim.session.publish_started();
+    let effects = sim.advance_triggers(
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        None,
+        FrameEffects::default(),
+    );
     assert_eq!(
         effects,
         [
@@ -173,14 +178,14 @@ fn pause_lock_is_synchronous_and_explicit_unlock_keeps_native_prior_gate() {
     assert!(sim.session.input_locked());
     action(&mut sim, 47, 0);
     assert!(!sim.session.input_locked());
-    sim.expire_scenario_pause();
+    sim.session.expire_scenario_pause();
     assert!(!sim.session.input_locked());
 
     action(&mut sim, 46, 0);
     action(&mut sim, 110, 2);
     action(&mut sim, 47, 0);
     // B054CC=1 skips the restore write; it does not force35A2 back to1.
-    sim.expire_scenario_pause();
+    sim.session.expire_scenario_pause();
     assert!(!sim.session.input_locked());
     assert!(!sim.session.scenario_paused());
 }
@@ -191,23 +196,29 @@ fn chrono_and_timed_trigger_share_one_counter_and_preserve_the_outer_lock() {
     action(&mut sim, 110, 10);
     assert!(sim.session.input_locked());
     let mut effects = Vec::new();
-    sim.start_chrono_screen_effect(1, &mut effects);
+    sim.session.start_chrono_screen_effect(1, &mut effects);
     let mut finish = false;
     for _ in 0..50 {
-        finish |= sim.process_chrono_screen_effect().iter().any(|effect| {
-            matches!(
-                effect,
-                TriggerEffect::ChronoScreen {
-                    command: crate::sim::superweapon::chrono_screen::ChronoScreenCommand::Finish
-                }
-            )
-        });
+        finish |= sim
+            .session
+            .process_chrono_screen_effect()
+            .iter()
+            .any(|effect| {
+                matches!(
+                    effect,
+                    TriggerEffect::ChronoScreen {
+                        command:
+                            crate::sim::superweapon::chrono_screen::ChronoScreenCommand::Finish
+                    }
+                )
+            });
     }
     assert!(finish);
     assert!(sim.session.scenario_paused());
     assert!(sim.session.input_locked());
     assert!(
-        sim.expire_scenario_pause()
+        sim.session
+            .expire_scenario_pause()
             .contains(&TriggerEffect::ScenarioResume)
     );
     assert!(!sim.session.scenario_paused());
@@ -227,19 +238,19 @@ fn scenario_services_replay_between_production_frames() {
         let map = crate::map::map_file::MapFile::from_bytes(text.as_bytes()).unwrap();
         let runtime = || {
             let mut sim = Simulation::with_seed(0);
-            sim.initialize_trigger_definitions(&map, &Default::default(), None, None);
-            sim.classify_map_triggers(None);
-            sim.session.set_started(true);
+            sim.initialize_trigger_definitions(&map, &Default::default(), None, None, None);
+            sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
+            sim.session.publish_started();
             sim.hash_state_every(std::num::NonZeroU64::MIN);
             SimRuntime::from_simulation(sim)
         };
         let mut live = runtime();
         let mut replay = ReplayLog::new(ReplayHeader {
-            pixel_conversion_bounds: live.simulation.session.pixel_conversion_bounds,
-            version: 2,
+            pixel_conversion_bounds: live.simulation.session.pixel_conversion_bounds(),
+            version: crate::sim::replay::REPLAY_VERSION,
             tick_hz: 15,
             seed: 0,
-            map_name: String::new(),
+            map_name: live.simulation.session().map_name().to_owned(),
             rules_hash: 0,
         });
         // Movie service may precede the first world frame. Its ordering survives JSON.
@@ -255,7 +266,7 @@ fn scenario_services_replay_between_production_frames() {
             }
         }
         assert!(live.simulation.session.scenario_paused(), "action {kind}");
-        let paused_tick = live.simulation.session.tick;
+        let paused_tick = live.simulation.session.tick();
         if kind == 110 {
             replay.apply_scenario_service(
                 &mut live.simulation,
@@ -273,7 +284,7 @@ fn scenario_services_replay_between_production_frames() {
             }
         }
         assert!(!live.simulation.session.scenario_paused());
-        assert_eq!(live.simulation.session.tick, paused_tick);
+        assert_eq!(live.simulation.session.tick(), paused_tick);
         let resumed = live
             .advance_frame(&[], 67, TickLane::Ordinary, FrameEffects::default())
             .unwrap();

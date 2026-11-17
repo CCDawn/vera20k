@@ -11,7 +11,8 @@
 
 use crate::ui::score_shell::ScoreScreenModel;
 
-/// `VolumeInterp` is constructed with a 1000-ms ramp in `0x00401000`.
+/// `VolumeInterp__WaitUntilDone @ 0x004070B0` gives up once the interp's
+/// max step (1000 ms, set by its constructor `0x00401000`) has passed.
 const AUDIO_FADE_MS: u64 = 1_000;
 /// Once `SavourDelay` expires, HouseClass waits at most 0x78 16-ms wall
 /// buckets for the outcome EVA before raising the session-end global.
@@ -24,44 +25,62 @@ fn wall_bucket(wall_ms: u64) -> u64 {
     wall_ms >> 4
 }
 
-pub(crate) fn outcome_title(kind: crate::sim::house_state::HouseOutcomeKind) -> &'static str {
-    match kind {
-        crate::sim::house_state::HouseOutcomeKind::Victory => "You are Victorious!",
-        crate::sim::house_state::HouseOutcomeKind::Defeat => "You have Lost",
-    }
+pub(crate) fn outcome_title(kind: crate::sim::house_state::HouseOutcomeKind) -> String {
+    crate::i18n::tr(match kind {
+        crate::sim::house_state::HouseOutcomeKind::Victory => "VERA:YouAreVictorious",
+        crate::sim::house_state::HouseOutcomeKind::Defeat => "VERA:YouHaveLost",
+    })
 }
 
-pub(crate) fn outcome_detail(kind: crate::sim::house_state::HouseOutcomeKind) -> &'static str {
-    match kind {
-        crate::sim::house_state::HouseOutcomeKind::Victory => {
-            "All enemy forces have been defeated."
-        }
-        crate::sim::house_state::HouseOutcomeKind::Defeat => "Your forces have been eliminated.",
-    }
+pub(crate) fn outcome_detail(kind: crate::sim::house_state::HouseOutcomeKind) -> String {
+    crate::i18n::tr(match kind {
+        crate::sim::house_state::HouseOutcomeKind::Victory => "VERA:EnemyForcesDefeated",
+        crate::sim::house_state::HouseOutcomeKind::Defeat => "VERA:YourForcesEliminated",
+    })
 }
 
-/// Front-end route selected after consuming an executed EXIT event.
+/// The termination bytes Main_Game samples once per loop: the local House's
+/// admitted victory/loss (`0x00A83D49`/`0x00A8ECD0`), the campaign restart
+/// request (`0x008B41C0`) and an executed EXIT
+/// (`0x00A83D48`). Main_Tick `0x0055DE4F..0x0055DE71` advances no frame while
+/// any is set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TerminationRequests {
+    pub outcome_ready: bool,
+    pub restart: bool,
+    pub exit: bool,
+}
+
+/// The one route `Main_Game__Route_Scenario_Termination 0x0055CFD0` takes.
+/// Every taken route clears all four bytes, so a lower-priority request
+/// raised in the same pass is dropped, not deferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExecutedExitDisposition {
+pub(crate) enum TerminationRoute {
+    /// GameExit::Victory `0x00685670` or GameExit::Defeat `0x00685DC0`.
     Outcome,
-    Abort,
+    /// `0x006863E0`: Start_Scenario on the same map, no movie, prompt or score.
+    Restart,
+    /// GameExit::BattleControlTerminated `0x00686570`.
+    Exit,
 }
 
-/// Preserve Main_Game's terminal-route priority when House expiry and EXIT
-/// execute in the same late frame. `FUN_0055CFD0` tests victory/loss before
-/// the EXIT termination byte, so the already-ready House result owns teardown.
-pub(crate) const fn arbitrate_executed_exit(
-    local_outcome_exit_ready: bool,
-) -> ExecutedExitDisposition {
-    if local_outcome_exit_ready {
-        ExecutedExitDisposition::Outcome
+/// Priority victory > defeat > restart > exit, as `0x0055CFD0` tests them.
+pub(crate) const fn route_scenario_termination(
+    requests: TerminationRequests,
+) -> Option<TerminationRoute> {
+    if requests.outcome_ready {
+        Some(TerminationRoute::Outcome)
+    } else if requests.restart {
+        Some(TerminationRoute::Restart)
+    } else if requests.exit {
+        Some(TerminationRoute::Exit)
     } else {
-        ExecutedExitDisposition::Abort
+        None
     }
 }
 
-/// App-owned wall-clock Vox drain entered only after the serialized HouseClass
-/// SavourDelay state reaches its terminal late-frame boundary.
+/// App-owned wall-clock Vox drain at HouseClass's expired SavourDelay head.
+/// The simulation resumes that House only after this wait finishes.
 #[derive(Debug, Clone)]
 pub(crate) struct ScenarioOutcomeVoiceWait {
     kind: crate::sim::house_state::HouseOutcomeKind,
@@ -87,6 +106,28 @@ impl ScenarioOutcomeVoiceWait {
             || wall_bucket(wall_ms).saturating_sub(self.started_bucket)
                 >= OUTCOME_VOICE_WAIT_BUCKETS
     }
+
+    /// One wait owner across suspended visits. Native4F860B/4F8732 anchor the
+    /// 0x78-bucket timer once, then poll Vox before continuing the same House.
+    pub(crate) fn poll_pending(
+        pending: &mut Option<Self>,
+        kind: crate::sim::house_state::HouseOutcomeKind,
+        wall_ms: u64,
+        voices_active: bool,
+    ) -> bool {
+        let wait = pending.get_or_insert_with(|| Self::start(wall_ms, kind));
+        assert_eq!(
+            wait.kind(),
+            kind,
+            "suspended House outcome changed during its wait"
+        );
+        if wait.tick(wall_ms, voices_active) {
+            *pending = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,11 +146,14 @@ pub(crate) enum ScenarioExitDestination {
     },
     /// Campaign victory with `[Basic] SkipScore=yes` continues directly.
     CampaignVictoryContinue,
-    /// Campaign defeat bypasses `0x108`; its native retry prompt remains a
-    /// separate route from the campaign victory score page.
-    CampaignDefeat {
-        title: String,
-        detail: String,
+    /// Campaign defeat bypasses `0x108`: GameExit::Defeat plays the Lose
+    /// movie and asks `TXT_TO_REPLAY` instead (`0x00686060..0x006860F6`).
+    CampaignDefeat,
+    /// A network Cooperative mission: GameExit's mode vt+8 arm draws the
+    /// empty backdrop instead of `0x108` (`0x00685851..0x0068586A`), then
+    /// runs `+0xA8`, the result dialog BC6.
+    CooperativeResult {
+        victory: bool,
     },
     MainMenu,
 }
@@ -141,6 +185,9 @@ pub(crate) fn campaign_outcome_route(
     })
 }
 
+/// gamemd's literal score theme name, the string at `0x0082FEBC`.
+pub(crate) const SCORE_THEME: &str = "SCORE";
+
 /// Commit the route selected for a terminal outcome. Model builders are lazy:
 /// campaign SkipScore and defeat paths do not construct either score model,
 /// and a campaign result never evaluates the multiplayer score owner.
@@ -148,6 +195,7 @@ pub(crate) fn scenario_exit_destination(
     mode: super::session::SessionMode,
     outcome: crate::sim::house_state::HouseOutcomeKind,
     skip_score: bool,
+    cooperative: bool,
     title: String,
     detail: String,
     campaign_score: impl FnOnce() -> crate::ui::campaign_score_shell::CampaignScoreScreenModel,
@@ -162,9 +210,10 @@ pub(crate) fn scenario_exit_destination(
         Some(CampaignOutcomeRoute::VictoryContinue) => {
             ScenarioExitDestination::CampaignVictoryContinue
         }
-        Some(CampaignOutcomeRoute::DefeatPrompt) => {
-            ScenarioExitDestination::CampaignDefeat { title, detail }
-        }
+        Some(CampaignOutcomeRoute::DefeatPrompt) => ScenarioExitDestination::CampaignDefeat,
+        None if cooperative => ScenarioExitDestination::CooperativeResult {
+            victory: outcome == crate::sim::house_state::HouseOutcomeKind::Victory,
+        },
         None => ScenarioExitDestination::Score {
             title,
             detail,
@@ -175,26 +224,31 @@ pub(crate) fn scenario_exit_destination(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScenarioExitPhase {
+    /// The verdict is on screen and the teardown is waiting for it to be read.
+    HoldBanner,
     FadeAudio,
     WaitForVoices,
     Done,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct ScenarioExitTick {
-    /// The audio master's multiplier over live music, SFX and voices. On abort
-    /// the music also carries Theme's own fade, which the Theme owner runs.
-    pub master_output_scale: Option<f64>,
-    /// One-shot hard-stop/queue-clear edge before committing the destination.
-    pub stop_audio: bool,
-    /// One-shot audio action issued after hard-stop and scale restoration.
-    pub after_stop: Option<ScenarioExitAudioAction>,
+    /// Glide the effects master `[0x0087E758]` to zero (`0x00407070`). It is
+    /// chained into Voc channels only; Theme keeps playing (on abort it runs
+    /// its own `Stop(1)` fade, which the Theme owner owns).
+    pub fade_sound_master: bool,
+    /// One-shot speech/SFX stop and queue clear; Theme keeps its own lifecycle.
+    pub clear_sounds: bool,
+    /// One-shot audio action after speech/SFX cleanup and master restoration.
+    pub after_cleanup: Option<ScenarioExitAudioAction>,
     pub finished: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScenarioExitAudioAction {
-    PlayTheme(&'static str),
+    /// The theme the score dialog starts: the side's own name under Ares,
+    /// gamemd's literal `SCORE` otherwise.
+    PlayTheme(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,22 +260,100 @@ pub(crate) enum ScenarioExitVoiceAction {
 pub(crate) struct ScenarioExitCascade {
     phase: ScenarioExitPhase,
     started_at_ms: u64,
+    fade_requested: bool,
     voice_wait_started_bucket: Option<u64>,
     start_voice_action: Option<ScenarioExitVoiceAction>,
     destination: Option<ScenarioExitDestination>,
+    /// The verdict this router is presenting, held the way native holds its
+    /// screen text: `Tactical SetScreenText 6D4DB0` is fed once at Flag time
+    /// and the text object outlives the rest of the sequence. The House flag
+    /// does not — `House4F8657` clears Won the instant the whole-Vox wait ends
+    /// (`house_defeat.rs` `complete_outcome`), which is before `Main_Game
+    /// 55CFD0` routes the result, so re-deriving the half from `has_won` at
+    /// draw time answers nothing for a victory (`4F8780..4F87BB` deliberately
+    /// retains Lost, which is why only the defeat half ever looked alive).
+    verdict: Option<crate::sim::house_state::HouseOutcomeKind>,
+    /// When the win/lose card has had its beat and the retail fade may start.
+    banner_hold_until_ms: u64,
 }
+
+/// How long the verdict stays up before the score page replaces it.
+///
+/// The card is the verdict, and the clip that explains it has already played
+/// (the router takes the result only after that clip ends). Without the beat
+/// the teardown's own 1000 ms fade would be all the player gets of the picture
+/// they asked for.
+pub(crate) const BANNER_HOLD_MS: u64 = 3_000;
 
 impl ScenarioExitCascade {
     pub(crate) fn start(wall_ms: u64, destination: ScenarioExitDestination) -> Self {
+        Self::start_holding_banner(wall_ms, destination, false)
+    }
+
+    /// `hold_banner` gives the verdict its beat before the retail fade starts.
+    /// It is set for a match whose own win/lose card is on screen
+    /// (`[EndGameScreens]` behind the player's switch); every other exit —
+    /// campaign, abort, no card — is the retail one.
+    pub(crate) fn start_holding_banner(
+        wall_ms: u64,
+        destination: ScenarioExitDestination,
+        hold_banner: bool,
+    ) -> Self {
         let start_voice_action = matches!(&destination, ScenarioExitDestination::MainMenu)
             .then_some(ScenarioExitVoiceAction::InterruptBattleControlTerminated);
         Self {
-            phase: ScenarioExitPhase::FadeAudio,
+            phase: if hold_banner {
+                ScenarioExitPhase::HoldBanner
+            } else {
+                ScenarioExitPhase::FadeAudio
+            },
             started_at_ms: wall_ms,
+            fade_requested: false,
             voice_wait_started_bucket: None,
             start_voice_action,
             destination: Some(destination),
+            verdict: None,
+            banner_hold_until_ms: wall_ms.saturating_add(BANNER_HOLD_MS),
         }
+    }
+
+    /// Mark this exit as the battle-abort path, whatever destination it ends
+    /// at. `0x00686570` says `EVA_BattleControlTerminated` as an INTERRUPT
+    /// before waiting for the master fade; a skirmish that leaves through the
+    /// score page keeps the cue its main-menu exit would have had.
+    pub(crate) fn with_battle_control_terminated(mut self) -> Self {
+        self.start_voice_action = Some(ScenarioExitVoiceAction::InterruptBattleControlTerminated);
+        self
+    }
+
+    /// Record the verdict the router took, for the beat's own picture and the
+    /// retail text that replaces it. [`Self::verdict`] is the only reader.
+    pub(crate) fn with_verdict(mut self, kind: crate::sim::house_state::HouseOutcomeKind) -> Self {
+        self.verdict = Some(kind);
+        self
+    }
+
+    /// Move the beat's deadline. The card goes up when the result is
+    /// published, not when the router finally takes it, so a clip that played
+    /// under the card has already given the player the beat [`BANNER_HOLD_MS`]
+    /// exists for. Charging the deadline against the card's own first frame
+    /// keeps the beat for a verdict with no clip and removes it for one that
+    /// had a clip — no extra three seconds after the movie.
+    pub(crate) fn with_banner_hold_until(mut self, until_ms: u64) -> Self {
+        self.banner_hold_until_ms = until_ms;
+        self
+    }
+
+    /// The verdict this cascade is presenting. `None` for an exit that has no
+    /// House result behind it — a campaign prompt, an abort, a restart.
+    pub(crate) fn verdict(&self) -> Option<crate::sim::house_state::HouseOutcomeKind> {
+        self.verdict
+    }
+
+    /// Whether the finished match is showing its verdict and has not started
+    /// tearing down yet.
+    pub(crate) fn holding_banner(&self) -> bool {
+        self.phase == ScenarioExitPhase::HoldBanner
     }
 
     /// One-shot voice-channel action owned by the route entry. Native abort
@@ -232,29 +364,59 @@ impl ScenarioExitCascade {
 
     /// Native does not start the explicit EVA queue pump until the master fade
     /// has completed. Audio already playing continues naturally during it.
-    pub(crate) fn needs_voice_poll(&self, wall_ms: u64) -> bool {
+    pub(crate) fn needs_voice_poll(&self, wall_ms: u64, master_moving: bool) -> bool {
         self.phase == ScenarioExitPhase::WaitForVoices
             || (self.phase == ScenarioExitPhase::FadeAudio
-                && wall_ms.saturating_sub(self.started_at_ms) >= AUDIO_FADE_MS)
+                && self.fade_done(wall_ms, master_moving))
+    }
+
+    /// `VolumeInterp__WaitUntilDone @ 0x004070B0` after the target-zero
+    /// request: the master stopped moving, or the 1000-ms max step passed. A
+    /// master already gliding (a radar hold just released) ends early.
+    fn fade_done(&self, wall_ms: u64, master_moving: bool) -> bool {
+        self.fade_requested
+            && (!master_moving || wall_ms.saturating_sub(self.started_at_ms) >= AUDIO_FADE_MS)
     }
 
     /// gamemd provenance: ordinary offline scenario exit; verified
     /// `0x00685670` and `0x00685DC0` both run master target-zero + wait, then
-    /// pump voices for at most 300 16-ms buckets, then stop audio before the
-    /// score dialog. `0x00686570` first starts Theme's own fade
-    /// (`ThemeClass::Stop(1)` @ `0x006865FA`, which the route entry hands to
-    /// the Theme owner) and then this independent master fade
-    /// (`[0x0087E758]` @ `0x00686605`), so abort music receives the product
-    /// of both.
-    pub(crate) fn tick(&mut self, wall_ms: u64, voices_active: bool) -> ScenarioExitTick {
-        let fade_elapsed_ms = wall_ms.saturating_sub(self.started_at_ms);
+    /// pump voices for at most 300 16-ms buckets, then clear speech/SFX before the
+    /// score dialog. Neither touches Theme, so the mission music plays on until
+    /// the score dialog selects SCORE. `0x00686570` first starts Theme's own
+    /// fade (`ThemeClass::Stop(1)` @ `0x006865FA`, which the route entry hands
+    /// to the Theme owner) and then this independent master fade
+    /// (`[0x0087E758]` @ `0x00686605`).
+    pub(crate) fn tick(
+        &mut self,
+        wall_ms: u64,
+        master_moving: bool,
+        voices_active: bool,
+    ) -> ScenarioExitTick {
         match self.phase {
-            ScenarioExitPhase::FadeAudio if fade_elapsed_ms < AUDIO_FADE_MS => ScenarioExitTick {
-                master_output_scale: Some(
-                    (1.0 - fade_elapsed_ms as f64 / AUDIO_FADE_MS as f64).max(0.0),
-                ),
-                ..Default::default()
-            },
+            // The card has the screen; the match is already decided and the
+            // battlefield behind it is frozen. Nothing teardown-related moves
+            // until the beat is over, so the verdict is readable before the
+            // score page takes it away.
+            ScenarioExitPhase::HoldBanner => {
+                if wall_ms < self.banner_hold_until_ms {
+                    return ScenarioExitTick::default();
+                }
+                log::info!("The verdict beat is over; the retail teardown starts");
+                self.phase = ScenarioExitPhase::FadeAudio;
+                self.started_at_ms = wall_ms;
+                self.fade_requested = true;
+                ScenarioExitTick {
+                    fade_sound_master: true,
+                    ..Default::default()
+                }
+            }
+            ScenarioExitPhase::FadeAudio if !self.fade_done(wall_ms, master_moving) => {
+                self.fade_requested = true;
+                ScenarioExitTick {
+                    fade_sound_master: true,
+                    ..Default::default()
+                }
+            }
             ScenarioExitPhase::FadeAudio => {
                 self.phase = ScenarioExitPhase::WaitForVoices;
                 // Native takes a fresh timer reading only after its blocking
@@ -281,23 +443,20 @@ impl ScenarioExitCascade {
         if !voices_active || elapsed_buckets >= VOICE_WAIT_BUCKETS {
             self.phase = ScenarioExitPhase::Done;
             ScenarioExitTick {
-                master_output_scale: Some(0.0),
-                stop_audio: true,
-                after_stop: matches!(
-                    self.destination.as_ref(),
-                    Some(
-                        ScenarioExitDestination::Score { .. }
-                            | ScenarioExitDestination::CampaignScore { .. }
-                    )
-                )
-                .then_some(ScenarioExitAudioAction::PlayTheme("SCORE")),
+                clear_sounds: true,
+                after_cleanup: match self.destination.as_ref() {
+                    Some(ScenarioExitDestination::Score { model, .. }) => {
+                        Some(ScenarioExitAudioAction::PlayTheme(
+                            model.theme.clone().unwrap_or_else(|| SCORE_THEME.into()),
+                        ))
+                    }
+                    _ => None,
+                },
                 finished: true,
-            }
-        } else {
-            ScenarioExitTick {
-                master_output_scale: Some(0.0),
                 ..Default::default()
             }
+        } else {
+            ScenarioExitTick::default()
         }
     }
 
@@ -308,7 +467,7 @@ impl ScenarioExitCascade {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_match))]
 mod tests {
     use super::*;
 
@@ -331,32 +490,28 @@ mod tests {
         }
     }
 
+    /// `Global_DrawScoreScreen_ScoreTheme` (body 0x1002F4B0, patch site
+    /// 0x5C9B75) replaces the literal the dialog pushes with the side's own
+    /// theme, so the cascade must carry that name instead.
     #[test]
-    fn campaign_outcome_routes_follow_mode_and_skip_score() {
-        use crate::app::match_runtime::session::SessionMode;
-        use crate::sim::house_state::HouseOutcomeKind::{Defeat, Victory};
-
-        assert_eq!(
-            campaign_outcome_route(SessionMode::Campaign, Victory, false),
-            Some(CampaignOutcomeRoute::VictoryScore)
+    fn ares_score_exit_carries_the_side_theme_name() {
+        let mut exit = ScenarioExitCascade::start(
+            15,
+            ScenarioExitDestination::Score {
+                title: "won".to_string(),
+                detail: "done".to_string(),
+                model: ScoreScreenModel {
+                    theme: Some("MYLOSE".to_owned()),
+                    ..Default::default()
+                },
+            },
         );
+        exit.tick(515, true, false);
+        exit.tick(1_015, true, true);
+        let done = exit.tick(1_016, false, false);
         assert_eq!(
-            campaign_outcome_route(SessionMode::Campaign, Victory, true),
-            Some(CampaignOutcomeRoute::VictoryContinue)
-        );
-        assert_eq!(
-            campaign_outcome_route(SessionMode::Campaign, Defeat, false),
-            Some(CampaignOutcomeRoute::DefeatPrompt)
-        );
-        // A restored Campaign session is classified without consulting the
-        // optional campaign bootstrap token used by next-mission progression.
-        assert_eq!(
-            campaign_outcome_route(SessionMode::Campaign, Victory, false),
-            Some(CampaignOutcomeRoute::VictoryScore)
-        );
-        assert_eq!(
-            campaign_outcome_route(SessionMode::Skirmish, Victory, false),
-            None
+            done.after_cleanup,
+            Some(ScenarioExitAudioAction::PlayTheme("MYLOSE".to_owned()))
         );
     }
 
@@ -372,15 +527,25 @@ mod tests {
             enemies_destroyed: "8".into(),
             rank: "fast".into(),
             commendation: "well done".into(),
+            ..Default::default()
         };
         let victory = scenario_exit_destination(
             SessionMode::Campaign,
             Victory,
             false,
+            false,
             "victory".into(),
             "detail".into(),
             || campaign_model.clone(),
             || panic!("campaign victory must not build multiplayer score"),
+        );
+        let mut exit = ScenarioExitCascade::start(0, victory.clone());
+        exit.tick(0, true, false);
+        let finished = exit.tick(1_000, false, false);
+        assert!(finished.finished);
+        assert_eq!(
+            finished.after_cleanup, None,
+            "the campaign's Win movie precedes the score dialog's SCORE request"
         );
         assert!(matches!(
             victory,
@@ -392,6 +557,7 @@ mod tests {
             SessionMode::Campaign,
             Victory,
             true,
+            false,
             "victory".into(),
             "detail".into(),
             || panic!("SkipScore must continue without a score model"),
@@ -406,19 +572,18 @@ mod tests {
             SessionMode::Campaign,
             Defeat,
             false,
+            false,
             "defeat".into(),
             "detail".into(),
             || panic!("campaign defeat does not build a score model"),
             || panic!("campaign defeat must not build multiplayer score"),
         );
-        assert!(matches!(
-            defeat,
-            ScenarioExitDestination::CampaignDefeat { .. }
-        ));
+        assert!(matches!(defeat, ScenarioExitDestination::CampaignDefeat));
 
         let skirmish = scenario_exit_destination(
             SessionMode::Skirmish,
             Victory,
+            false,
             false,
             "victory".into(),
             "detail".into(),
@@ -432,6 +597,40 @@ mod tests {
             skirmish,
             ScenarioExitDestination::Score { model, .. } if model.side == 3
         ));
+
+        let cooperative = scenario_exit_destination(
+            SessionMode::Lan,
+            Defeat,
+            false,
+            true,
+            "defeat".into(),
+            "detail".into(),
+            || panic!("co-op must not build campaign score"),
+            || panic!("co-op skips the multiplayer score dialog"),
+        );
+        assert!(matches!(
+            cooperative,
+            ScenarioExitDestination::CooperativeResult { victory: false }
+        ));
+    }
+
+    /// `0x0055CFD0` routes victory/defeat before restart and restart before
+    /// EXIT; the taken route clears the others.
+    #[test]
+    fn termination_router_takes_outcome_then_restart_then_exit() {
+        let route = |outcome_ready, restart, exit| {
+            route_scenario_termination(TerminationRequests {
+                outcome_ready,
+                restart,
+                exit,
+            })
+        };
+        assert_eq!(route(false, false, false), None);
+        assert_eq!(route(true, true, true), Some(TerminationRoute::Outcome));
+        assert_eq!(route(true, false, true), Some(TerminationRoute::Outcome));
+        assert_eq!(route(false, true, true), Some(TerminationRoute::Restart));
+        assert_eq!(route(false, true, false), Some(TerminationRoute::Restart));
+        assert_eq!(route(false, false, true), Some(TerminationRoute::Exit));
     }
 
     #[test]
@@ -439,53 +638,27 @@ mod tests {
         let mut exit = ScenarioExitCascade::start(15, score_destination());
         assert_eq!(exit.take_start_voice_action(), None);
 
-        let half = exit.tick(515, false);
-        assert_eq!(half.master_output_scale, Some(0.5));
-        assert!(!half.stop_audio && !half.finished);
+        let half = exit.tick(515, true, false);
+        assert!(half.fade_sound_master);
+        assert!(!half.clear_sounds && !half.finished);
         assert!(exit.take_destination().is_none());
 
-        let fade_edge = exit.tick(1_015, true);
-        assert_eq!(fade_edge.master_output_scale, Some(0.0));
-        assert!(!fade_edge.stop_audio && !fade_edge.finished);
+        // The native stepper is still 824/65536 short of zero at 1000 ms;
+        // WaitUntilDone's max step ends the wait.
+        let fade_edge = exit.tick(1_015, true, true);
+        assert!(!fade_edge.fade_sound_master);
+        assert!(!fade_edge.clear_sounds && !fade_edge.finished);
         assert!(exit.take_destination().is_none());
 
-        let voice_done = exit.tick(1_016, false);
-        assert!(voice_done.stop_audio && voice_done.finished);
+        let voice_done = exit.tick(1_016, false, false);
+        assert!(voice_done.clear_sounds && voice_done.finished);
         assert_eq!(
-            voice_done.after_stop,
-            Some(ScenarioExitAudioAction::PlayTheme("SCORE"))
+            voice_done.after_cleanup,
+            Some(ScenarioExitAudioAction::PlayTheme("SCORE".to_owned()))
         );
         assert!(matches!(
             exit.take_destination(),
             Some(ScenarioExitDestination::Score { .. })
-        ));
-    }
-
-    #[test]
-    fn campaign_score_destination_starts_the_same_score_theme() {
-        // Dialog 0x103's WM_INIT (`0x006C92F6`) plays ThemeClass "SCORE", so
-        // the campaign page is not silent while only 0x108 was wired here.
-        let model = crate::ui::campaign_score_shell::CampaignScoreScreenModel {
-            side: 0,
-            ..Default::default()
-        };
-        let mut exit = ScenarioExitCascade::start(
-            15,
-            ScenarioExitDestination::CampaignScore {
-                title: "won".into(),
-                detail: "done".into(),
-                model,
-            },
-        );
-        let done = exit.tick(1_016, false);
-        assert!(done.stop_audio && done.finished);
-        assert_eq!(
-            done.after_stop,
-            Some(ScenarioExitAudioAction::PlayTheme("SCORE"))
-        );
-        assert!(matches!(
-            exit.take_destination(),
-            Some(ScenarioExitDestination::CampaignScore { .. })
         ));
     }
 
@@ -500,25 +673,38 @@ mod tests {
 
         // Theme's own fade is the Theme owner's; the master fade is the
         // same as an outcome's.
-        let half = exit.tick(515, true);
-        assert_eq!(half.master_output_scale, Some(0.5));
-        assert!(!exit.needs_voice_poll(1_014));
-        assert!(exit.needs_voice_poll(1_015));
+        let half = exit.tick(515, true, true);
+        assert!(half.fade_sound_master);
+        assert!(!exit.needs_voice_poll(1_014, true));
+        assert!(exit.needs_voice_poll(1_015, true));
 
         // Fade completion is observed in absolute bucket 63.
-        let fade_edge = exit.tick(1_015, true);
-        assert!(!fade_edge.stop_audio && !fade_edge.finished);
+        let fade_edge = exit.tick(1_015, true, true);
+        assert!(!fade_edge.clear_sounds && !fade_edge.finished);
 
-        let before_ceiling = exit.tick(5_807, true); // bucket 362, delta 299
-        assert!(!before_ceiling.stop_audio && !before_ceiling.finished);
+        let before_ceiling = exit.tick(5_807, false, true); // bucket 362, delta 299
+        assert!(!before_ceiling.clear_sounds && !before_ceiling.finished);
 
-        let ceiling = exit.tick(5_808, true); // bucket 363, delta 300
-        assert!(ceiling.stop_audio && ceiling.finished);
-        assert_eq!(ceiling.after_stop, None);
+        let ceiling = exit.tick(5_808, false, true); // bucket 363, delta 300
+        assert!(ceiling.clear_sounds && ceiling.finished);
+        assert_eq!(ceiling.after_cleanup, None);
         assert!(matches!(
             exit.take_destination(),
             Some(ScenarioExitDestination::MainMenu)
         ));
+    }
+
+    /// An exit during a radar hold finds the master gliding from 0x2000
+    /// (`0x005BF450` released it first), so it reaches zero in about 500 ms
+    /// and `WaitUntilDone` returns then, not at the 1000-ms max step.
+    #[test]
+    fn exit_fade_ends_when_the_master_stops_moving() {
+        let mut exit = ScenarioExitCascade::start(0, score_destination());
+        assert!(exit.tick(0, true, false).fade_sound_master);
+        assert!(!exit.needs_voice_poll(500, true));
+        assert!(exit.tick(500, true, false).fade_sound_master);
+        assert!(exit.needs_voice_poll(516, false));
+        assert!(exit.tick(516, false, false).finished);
     }
 
     #[test]
@@ -527,16 +713,91 @@ mod tests {
 
         // Delayed observation anchors in absolute bucket 188, not at the
         // nominal 1015-ms fade boundary.
-        let late_fade_completion = exit.tick(3_015, true);
-        assert!(!late_fade_completion.finished);
+        assert!(exit.tick(3_015, false, true).fade_sound_master);
+        let late_fade_completion = exit.tick(3_015, true, true);
+        assert!(!late_fade_completion.fade_sound_master && !late_fade_completion.finished);
 
-        let old_nominal_ceiling = exit.tick(5_815, true);
+        let old_nominal_ceiling = exit.tick(5_815, false, true);
         assert!(!old_nominal_ceiling.finished);
 
-        let before_fresh_ceiling = exit.tick(7_807, true); // bucket 487
+        let before_fresh_ceiling = exit.tick(7_807, false, true); // bucket 487
         assert!(!before_fresh_ceiling.finished);
 
-        let fresh_ceiling = exit.tick(7_808, true); // bucket 488
-        assert!(fresh_ceiling.stop_audio && fresh_ceiling.finished);
+        let fresh_ceiling = exit.tick(7_808, false, true); // bucket 488
+        assert!(fresh_ceiling.clear_sounds && fresh_ceiling.finished);
+    }
+
+    /// The verdict gets its own beat: the card is up, the teardown does not
+    /// move, and the fade's 1000 ms ceiling starts only after that beat, not
+    /// when the outcome was admitted.
+    #[test]
+    fn the_verdict_beat_holds_the_teardown() {
+        let mut exit = ScenarioExitCascade::start_holding_banner(0, score_destination(), true);
+        assert!(exit.holding_banner());
+        for wall_ms in [0, 500, BANNER_HOLD_MS - 1] {
+            let tick = exit.tick(wall_ms, false, false);
+            assert!(
+                !tick.fade_sound_master && !tick.clear_sounds && !tick.finished,
+                "{wall_ms} ms must not start the teardown"
+            );
+            assert!(!tick.clear_sounds);
+            assert!(exit.take_destination().is_none());
+        }
+        let tick = exit.tick(BANNER_HOLD_MS, true, false);
+        assert!(
+            tick.fade_sound_master,
+            "the master fade starts after the verdict's beat"
+        );
+        assert!(!exit.holding_banner());
+        assert!(exit.take_destination().is_none());
+    }
+
+    /// A card that was up through the losing commander's clip has already had
+    /// its beat: the deadline is anchored to the frame the card appeared, so
+    /// the teardown starts on the first tick after the router takes the result
+    /// instead of holding the player for three more seconds.
+    #[test]
+    fn a_card_that_played_under_a_clip_has_no_extra_beat() {
+        let card_at = 10_000;
+        let router_at = card_at + 12_000;
+        let mut exit =
+            ScenarioExitCascade::start_holding_banner(router_at, score_destination(), true)
+                .with_banner_hold_until(card_at + BANNER_HOLD_MS);
+        assert!(exit.holding_banner());
+        let tick = exit.tick(router_at, false, false);
+        assert!(
+            tick.fade_sound_master,
+            "the card's own beat is spent by the clip under it"
+        );
+        assert!(!exit.holding_banner());
+    }
+
+    /// The same deadline still gives a verdict with no clip its full beat,
+    /// counted from the frame its card appeared rather than from the router.
+    #[test]
+    fn a_card_with_no_clip_keeps_its_beat_from_the_flag() {
+        let card_at = 10_000;
+        let mut exit =
+            ScenarioExitCascade::start_holding_banner(card_at, score_destination(), true)
+                .with_banner_hold_until(card_at + BANNER_HOLD_MS);
+        assert!(exit.holding_banner());
+        assert!(
+            !exit
+                .tick(card_at + BANNER_HOLD_MS - 1, false, false)
+                .fade_sound_master
+        );
+        assert!(
+            exit.tick(card_at + BANNER_HOLD_MS, false, false)
+                .fade_sound_master
+        );
+    }
+
+    /// An exit with no card to show is exactly the retail one: no beat, no
+    /// phase, the fade starts on the first tick.
+    #[test]
+    fn an_unheld_exit_starts_the_retail_teardown() {
+        let mut exit = ScenarioExitCascade::start_holding_banner(0, score_destination(), false);
+        assert!(!exit.holding_banner());
+        assert!(exit.tick(0, true, false).fade_sound_master);
     }
 }

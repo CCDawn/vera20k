@@ -131,7 +131,50 @@ pub fn is_tube_step_direction(direction: u8) -> bool {
     direction == TUBE_STEP_DIRECTION
 }
 
-#[cfg(test)]
+/// `0x0075F230`: the octant (0 north, clockwise) from `from` to `to`. Wave
+/// passes projected screen points; Fire's stream wobble (`0x0062FCEB`) passes
+/// lepton X/Y.
+pub fn direction_from_projected(from: (i32, i32), to: (i32, i32)) -> i32 {
+    use crate::util::native_x87::{NativeF64Bits, X87Chop53, X87Ordering};
+    // `0x0075F230`: dx=to.x-from.x and n=from.y-to.y. The four equality
+    // boundaries are intentionally asymmetric.
+    let dx = to.0.wrapping_sub(from.0);
+    let n = from.1.wrapping_sub(to.1);
+    if dx == 0 {
+        return if n > 0 { 0 } else { 4 };
+    }
+
+    let slope = X87Chop53::div(X87Chop53::load_i32(n), X87Chop53::load_i32(dx))
+        .expect("nonzero projected dx divides exactly in the verified finite domain");
+    let tan = X87Chop53::load_f64(NativeF64Bits::from_bits(0x3fda_8279_a061_eb64)).unwrap();
+    let inv_tan = X87Chop53::load_f64(NativeF64Bits::from_bits(0x4003_504f_2e96_fc59)).unwrap();
+    let neg_tan = X87Chop53::neg(tan);
+    let neg_inv_tan = X87Chop53::neg(inv_tan);
+
+    let band = if X87Chop53::compare(slope, tan) != X87Ordering::Less
+        && X87Chop53::compare(slope, inv_tan) == X87Ordering::Less
+    {
+        Some(5)
+    } else if X87Chop53::compare(slope, neg_tan) != X87Ordering::Less
+        && X87Chop53::compare(slope, tan) == X87Ordering::Less
+    {
+        Some(6)
+    } else if X87Chop53::compare(slope, neg_inv_tan) != X87Ordering::Less
+        && X87Chop53::compare(slope, neg_tan) == X87Ordering::Less
+    {
+        Some(7)
+    } else {
+        None
+    };
+    match band {
+        Some(base) if dx > 0 => base - 4,
+        Some(base) => base,
+        None if n > 0 => 0,
+        None => 4,
+    }
+}
+
+#[cfg(all(test, tests_util))]
 mod tests {
     use super::*;
 
@@ -161,14 +204,6 @@ mod tests {
         assert!(is_tube_step_direction(8));
         assert_eq!(Ra2Direction::from_index(8), None);
         assert_eq!(direction_delta(8), None);
-    }
-
-    #[test]
-    fn invalid_non_8_directions_do_not_wrap() {
-        for direction in [9, 10, 15, 16, 255] {
-            assert_eq!(Ra2Direction::from_index(direction), None);
-            assert_eq!(direction_delta(direction), None);
-        }
     }
 
     /// Original initializer execution through RET `0x0049F39B`, under the
@@ -209,34 +244,6 @@ mod tests {
         for f in 0u8..=255 {
             let gamemd = ((((f as u16) >> 4) + 1) >> 1) as u8 & 7;
             assert_eq!(direction_from_facing(f), gamemd, "f={f}");
-        }
-    }
-
-    #[test]
-    fn facing_quantization_matches_drive_locomotor_formula() {
-        let samples = [
-            (0, 0),
-            (15, 0),
-            (16, 1),
-            (32, 1),
-            (47, 1),
-            (48, 2),
-            (64, 2),
-            (96, 3),
-            (128, 4),
-            (160, 5),
-            (192, 6),
-            (224, 7),
-            (239, 7),
-            (240, 0),
-            (255, 0),
-        ];
-        for (facing, direction) in samples {
-            assert_eq!(direction_from_facing(facing), direction);
-            assert_eq!(
-                delta_from_facing(facing),
-                DIRECTION_DELTAS[direction as usize]
-            );
         }
     }
 

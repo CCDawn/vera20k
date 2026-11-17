@@ -4,6 +4,8 @@
 use super::*;
 use crate::sim::anim_class::AnimWorldCoord;
 use crate::sim::components::AnimClassSpawnDescriptor;
+use crate::sim::scenario_session::ScenarioSession;
+use crate::sim::world::ObjectSubstrate;
 use crate::util::fixed_math::SimFixed;
 use crate::util::native_x87::{NativeF32Bits, NativeF64Bits, X87Chop53 as X, X87Value};
 use crate::util::retail_trig::TrigTable;
@@ -11,13 +13,31 @@ use crate::util::retail_trig::TrigTable;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct GrappleState {
     /// +44, cleared synchronously by the dedicated Anim expiry callback.
-    pub(super) anim: Option<u64>,
+    /// Only [`GrappleState::begin`] stores an Anim here.
+    anim: Option<u64>,
     /// +48: entry0, initial animation1, roll2/3, impact4.
     phase: i32,
     stage: i32,
     delay: i32,
     /// +54: the held animation expired; not an independent liveness query.
     invalidated: bool,
+}
+
+impl GrappleState {
+    /// +44, the held Anim.
+    pub(super) fn anim(&self) -> Option<u64> {
+        self.anim
+    }
+
+    /// UpdateSquidGrapple6297F0's entry phase publishes its Anim at +44
+    /// (none when the type is absent) and starts phase 1, through
+    /// [`EntityStore::write_held_anim`](crate::sim::entity_store::EntityStore::write_held_anim).
+    fn begin(&mut self, anim: Option<u64>, _: crate::sim::entity_store::AnimHolderAuthority) {
+        self.anim = anim;
+        self.phase = 1;
+        self.stage = 0;
+        self.delay = 0;
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -38,23 +58,9 @@ impl ParasiteState {
 }
 
 impl Simulation {
-    /// PointerExpired62A484..62A490, reached by Anim's dedicated subscribers.
-    pub(crate) fn parasite_anim_pointer_expired(&mut self, owner: u64, expired: u64) {
-        if let Some(state) = self
-            .substrate
-            .entities
-            .get_mut(owner)
-            .and_then(|entity| entity.parasite.class_mut())
-            && state.grapple.anim == Some(expired)
-        {
-            state.grapple.anim = None;
-            state.grapple.invalidated = true;
-        }
-    }
-
     /// Shared AttachTo/ExitUnit/grapple cleanup. Delete broadcasts expiry before
     /// the held pointer and invalidation latch clear (62A7E0..62A84B).
-    pub(crate) fn reset_parasite_grapple(&mut self, owner: u64, rules: Option<&RuleSet>) {
+    pub(crate) fn reset_parasite_grapple(&mut self, owner: u64, rules: &RuleSet) {
         let anim = self
             .substrate
             .entities
@@ -82,12 +88,16 @@ impl Simulation {
     /// Helper629720: only a stage advance writes the Anim frame/timer.
     /// Reaching stage10 returns before writing; the new phase gets its own
     /// immediate helper visit in the caller.
-    fn advance_grapple_stage(&mut self, owner: u64, victim: u64) -> bool {
-        let facing = self.substrate.entities.get(victim).map_or(0, |entity| {
-            entity.body_facing_current(self.session.binary_frame)
+    fn advance_grapple_stage(
+        session: &ScenarioSession,
+        substrate: &mut ObjectSubstrate,
+        owner: u64,
+        victim: u64,
+    ) -> bool {
+        let facing = substrate.entities.get(victim).map_or(0, |entity| {
+            entity.body_facing_current(session.binary_frame())
         });
-        let Some(state) = self
-            .substrate
+        let Some(state) = substrate
             .entities
             .get_mut(owner)
             .and_then(|entity| entity.parasite.class_mut())
@@ -110,7 +120,7 @@ impl Simulation {
         }
         let frame = base + i32::from(dir_from_facing16(facing)) * 10 + state.grapple.stage;
         if let Some(anim) = state.grapple.anim {
-            self.set_anim_manual_frame(anim, frame, 128);
+            Self::set_anim_manual_frame(session, substrate, anim, frame, 128);
         }
         false
     }
@@ -133,7 +143,7 @@ impl Simulation {
             state.grapple.stage = 0;
             state.grapple.delay = 0;
         }
-        self.advance_grapple_stage(owner, victim);
+        Self::advance_grapple_stage(&self.session, &mut self.substrate, owner, victim);
         self.grapple_wakes(victim, origin, rules);
     }
 
@@ -157,7 +167,7 @@ impl Simulation {
         let Some(warhead_name) = weapon.warhead.as_deref() else {
             return;
         };
-        let Some(warhead) = rules.warhead(warhead_name) else {
+        let Some(warhead) = rules.weapon_warhead(weapon) else {
             return;
         };
         let Some(target) = self.substrate.entities.get(victim) else {
@@ -181,7 +191,7 @@ impl Simulation {
         }) {
             self.parasite_exit_unit(owner, rules, effects);
             if let Some(source) = self.substrate.entities.get_mut(owner) {
-                source.parasite.end_paralysis(self.session.binary_frame);
+                source.parasite.end_paralysis(self.session.binary_frame());
             }
             return;
         }
@@ -190,7 +200,7 @@ impl Simulation {
             .get_mut(victim)
             .unwrap()
             .parasite
-            .paralysis = CdTimer::started(self.session.binary_frame as i32, warhead.paralyzes);
+            .paralysis = CdTimer::started(self.session.binary_frame() as i32, warhead.paralyzes);
         let phase = self
             .substrate
             .entities
@@ -203,7 +213,7 @@ impl Simulation {
             .phase;
         match phase {
             0 => {
-                self.write_grapple_roll(victim, SimFixed::ZERO);
+                self.substrate.write_grapple_roll(victim, SimFixed::ZERO);
                 let name = crate::rules::effect_asset_catalog::SQUID_GRAPPLE_ANIM;
                 // Lookup-only427CB0, not a factory creating an unknown type.
                 let anim = if rules.anim_type_names.contains(name) {
@@ -217,27 +227,26 @@ impl Simulation {
                 } else {
                     None
                 };
-                let state = self
-                    .substrate
+                self.substrate
                     .entities
-                    .get_mut(owner)
-                    .unwrap()
-                    .parasite
-                    .class_mut()
+                    .write_held_anim(owner, |entity, authority| {
+                        entity
+                            .parasite
+                            .class_mut()
+                            .unwrap()
+                            .grapple
+                            .begin(anim, authority)
+                    })
                     .unwrap();
-                state.grapple.anim = anim;
-                state.grapple.phase = 1;
-                state.grapple.stage = 0;
-                state.grapple.delay = 0;
-                self.advance_grapple_stage(owner, victim);
+                Self::advance_grapple_stage(&self.session, &mut self.substrate, owner, victim);
             }
             1 => {
-                if self.advance_grapple_stage(owner, victim) {
+                if Self::advance_grapple_stage(&self.session, &mut self.substrate, owner, victim) {
                     self.start_grapple_roll(owner, victim, origin, rules);
                 }
             }
             2 | 3 => {
-                if self.advance_grapple_stage(owner, victim) {
+                if Self::advance_grapple_stage(&self.session, &mut self.substrate, owner, victim) {
                     let state = self
                         .substrate
                         .entities
@@ -249,7 +258,7 @@ impl Simulation {
                     state.grapple.phase = 4;
                     state.grapple.stage = 0;
                     state.grapple.delay = 0;
-                    self.advance_grapple_stage(owner, victim);
+                    Self::advance_grapple_stage(&self.session, &mut self.substrate, owner, victim);
                 }
                 let state = &self
                     .substrate
@@ -260,12 +269,13 @@ impl Simulation {
                     .class()
                     .unwrap()
                     .grapple;
-                self.write_grapple_roll(victim, grapple_roll(state.stage, phase == 2));
+                self.substrate
+                    .write_grapple_roll(victim, grapple_roll(state.stage, phase == 2));
             }
             4 => {
-                self.write_grapple_roll(victim, SimFixed::ZERO);
+                self.substrate.write_grapple_roll(victim, SimFixed::ZERO);
                 self.grapple_splashes(victim, origin, rules);
-                if warhead.culling && self.grapple_cull_admitted(owner, victim, rules) {
+                if warhead.culling && self.grapple_cull_admitted(owner, victim, warhead, rules) {
                     self.grapple_cull(owner, victim, rules, effects);
                     return;
                 }
@@ -292,12 +302,12 @@ impl Simulation {
                 {
                     self.start_grapple_roll(owner, victim, origin, rules);
                 } else {
-                    self.reset_parasite_grapple(owner, Some(rules));
+                    self.reset_parasite_grapple(owner, rules);
                 }
             }
             _ => self.parasite_exit_unit(owner, rules, effects),
         }
-        //629D97: attachment/remap/Z-adjust only when the Anim changes owner.
+        //629D97: attachment/remap only when the Anim changes owner.
         let Some(anim) = self
             .substrate
             .entities
@@ -309,40 +319,24 @@ impl Simulation {
         };
         if self
             .anim(anim)
-            .is_some_and(|anim| anim.owner_entity != Some(victim))
+            .is_some_and(|anim| anim.owner_entity() != Some(victim))
         {
             self.set_anim_owner_object(anim, Some(victim), rules);
             if let Some(source) = self.substrate.entities.get(owner) {
-                self.set_anim_house_remap(anim, source.owner());
+                self.substrate
+                    .anims
+                    .set_anim_house_remap(anim, source.owner());
             }
-            if let Some(target) = self.substrate.entities.get(victim)
-                && let Some(cell) = self
-                    .resolved_terrain
-                    .as_ref()
-                    .and_then(|terrain| terrain.cell(target.position.rx(), target.position.ry()))
-            {
-                let frame = self.anim(anim).unwrap().runtime.current_frame;
-                self.set_anim_frame_and_z_adjust(
-                    anim,
-                    frame,
-                    crate::map::lighting::cell_ground_z_adjust(
-                        self.session.lighting.normal.into(),
-                        cell.level,
-                    ),
-                );
+            // Original ParasiteUpdateSquidGrapple629DE5 copies Cell+10A
+            // into Anim+FC only at this owner-change edge, not on later ticks.
+            let cell = self
+                .substrate
+                .entities
+                .get(victim)
+                .map(|entity| (entity.position.rx(), entity.position.ry()));
+            if let Some(cell) = cell {
+                self.retain_anim_cell_light(anim, Some(cell));
             }
-        }
-    }
-
-    fn write_grapple_roll(&mut self, victim: u64, angle: SimFixed) {
-        if let Some(entity) = self.substrate.entities.get_mut(victim) {
-            // Native Techno6F2EB0..6F2EC2 initializes these inline fields to zero.
-            // Rust stores them sparsely until a producer first writes them;
-            // an ordinary admitted ship has no crash-created component yet.
-            entity
-                .rocking
-                .get_or_insert_with(Default::default)
-                .set_angle_sideways(angle);
         }
     }
 
@@ -352,7 +346,7 @@ impl Simulation {
             .entities
             .get(victim)
             .unwrap()
-            .body_facing_current(self.session.binary_frame);
+            .body_facing_current(self.session.binary_frame());
         for _ in 0..3 {
             let offset = [
                 self.scenario_rng.next_range_i32_inclusive(-180, 180),
@@ -374,7 +368,7 @@ impl Simulation {
             .entities
             .get(victim)
             .unwrap()
-            .body_facing_current(self.session.binary_frame);
+            .body_facing_current(self.session.binary_frame());
         for index in 0..3 {
             let lateral = if self.scenario_rng.next_range_i32_inclusive(0, 1) == 0 {
                 64
@@ -417,25 +411,55 @@ impl Simulation {
         }
     }
 
-    fn grapple_cull_admitted(&self, owner: u64, victim: u64, rules: &RuleSet) -> bool {
+    fn grapple_cull_admitted(
+        &mut self,
+        owner: u64,
+        victim: u64,
+        warhead: &crate::rules::warhead_type::WarheadType,
+        rules: &RuleSet,
+    ) -> bool {
         let Some(target) = self.substrate.entities.get(victim) else {
             return false;
         };
         let Some(kind) = self.object_type(target.type_ref(), rules) else {
             return false;
         };
-        match crate::sim::combat::health_category(
-            target.health.current(),
-            kind.strength,
-            rules.general.condition_red,
-            rules.general.condition_yellow,
-        ) {
-            0 => true,
-            1 => self.substrate.entities.get(owner).is_some_and(|source| {
-                super::super::veterancy::raw_is_elite(source.veterancy.raw())
-            }),
-            _ => false,
-        }
+        // Ares ParasiteClass_UpdateSquiddy_Culling (10053AC0, hook 0x629BC0)
+        // replaces the red/elite-at-yellow test with CanCull 10052590.
+        let admitted = if rules.ares() {
+            let (health, strength) = (target.health, kind.strength);
+            let Some(veterancy) = self
+                .substrate
+                .entities
+                .get(owner)
+                .map(|source| source.veterancy.raw())
+            else {
+                return false;
+            };
+            crate::sim::combat::object_health::ares_can_cull(
+                warhead,
+                veterancy,
+                health,
+                strength,
+                rules.general.condition_red,
+                rules.general.condition_yellow,
+                &mut self.scenario_rng,
+            )
+        } else {
+            match crate::sim::combat::health_category(
+                target.health.current(),
+                kind.strength,
+                rules.general.condition_red,
+                rules.general.condition_yellow,
+            ) {
+                0 => true,
+                1 => self.substrate.entities.get(owner).is_some_and(|source| {
+                    super::super::veterancy::raw_is_elite(source.veterancy.raw())
+                }),
+                _ => false,
+            }
+        };
+        admitted
     }
 
     fn grapple_cull(
@@ -459,7 +483,14 @@ impl Simulation {
         };
         let source_cost = self.cost_of(source.owner(), source_type, rules);
         let target_cost = self.cost_of(target.owner(), target_type, rules);
-        if source_type.trainable {
+        // Ares 10053AC0 resumes past this experience block (0x629C5D) when
+        // the victim's house counts the squid's house an ally (the owner
+        // itself included), else at the block (0x629BF3).
+        let gains = !rules.ares()
+            || !self
+                .house_alliances
+                .is_allied(&self.interner, target.owner(), source.owner());
+        if gains && source_type.trainable {
             self.substrate
                 .entities
                 .get_mut(owner)
@@ -480,9 +511,32 @@ impl Simulation {
             rules,
             effects,
         );
-        self.reset_parasite_grapple(owner, Some(rules));
+        self.reset_parasite_grapple(owner, rules);
         if let Some(source) = self.substrate.entities.get_mut(owner) {
-            source.parasite.end_paralysis(self.session.binary_frame);
+            source.parasite.end_paralysis(self.session.binary_frame());
+        }
+    }
+}
+
+impl crate::sim::world::ObjectSubstrate {
+    /// PointerExpired62A484..62A490, reached by Anim's dedicated subscribers.
+    pub(crate) fn parasite_anim_pointer_expired(&mut self, owner: u64, expired: u64) {
+        if let Some(state) = self
+            .entities
+            .get_mut(owner)
+            .and_then(|entity| entity.parasite.class_mut())
+            && state.grapple.anim == Some(expired)
+        {
+            state.grapple.anim = None;
+            state.grapple.invalidated = true;
+        }
+    }
+    fn write_grapple_roll(&mut self, victim: u64, angle: SimFixed) {
+        if let Some(entity) = self.entities.get_mut(victim) {
+            // Native Techno6F2EB0..6F2EC2 initializes these inline fields to zero.
+            // Rust stores them sparsely until a producer first writes them;
+            // an ordinary admitted ship has no crash-created component yet.
+            entity.rocking_mut().set_angle_sideways(angle);
         }
     }
 }

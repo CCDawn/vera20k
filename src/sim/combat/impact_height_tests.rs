@@ -3,6 +3,7 @@ use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid};
 use crate::rules::ini_parser::IniFile;
 use crate::sim::intern::test_interner;
 use crate::sim::world::Simulation;
+use std::collections::BTreeMap;
 
 const TEST_GRID: u16 = 16;
 /// Terrain floor used by every raised-ground case here. Chosen because two
@@ -16,12 +17,12 @@ fn gsi_04_11_refinery_survivor_cells_follow_native_sentinel_offsets() {
         foundation_w,
         foundation_h,
         ..
-    } = building_center_smudge_request(10, 20, 3, "3x3Refinery")
+    } = building_center_smudge_request(10, 20, 3, &"3x3Refinery".into())
     else {
         panic!("the destruction-center mark");
     };
     assert_eq!((foundation_w, foundation_h), (3, 3));
-    let survivor_cells = crate::sim::crew_survival::foundation_cells(10, 20, "3x3Refinery");
+    let survivor_cells = crate::sim::crew_survival::foundation_cells(10, 20, &"3x3Refinery".into());
     assert_eq!(
         survivor_cells,
         vec![
@@ -114,7 +115,7 @@ fn debris_pieces_construct_between_picks_as_the_original() {
             sim.substrate
                 .anims
                 .iter()
-                .map(|(_, anim)| sim.interner.resolve(anim.type_id).to_string())
+                .map(|(_, anim)| sim.interner.resolve(anim.type_id()).to_string())
                 .collect::<Vec<_>>(),
             names,
             "{input}"
@@ -132,23 +133,27 @@ fn debris_pieces_construct_between_picks_as_the_original() {
         {
             let location = native["location"].as_array().unwrap();
             assert_eq!(
-                [anim.world_coord.x, anim.world_coord.y, anim.world_coord.z],
+                [
+                    anim.world_coord().x,
+                    anim.world_coord().y,
+                    anim.world_coord().z
+                ],
                 std::array::from_fn(|i| location[i].as_i64().unwrap() as i32),
                 "{input}"
             );
             if native["is_bouncing"].as_u64().unwrap() == 0 {
                 assert!(
-                    anim.bounce.is_none(),
+                    anim.bounce().is_none(),
                     "unread retail D is not a Bouncer: {input}"
                 );
                 assert_eq!(native["type"], "D");
                 continue;
             }
-            let body = anim.bounce.expect("an ART-read bouncing chunk");
+            let body = anim.bounce().expect("an ART-read bouncing chunk");
             let bits = |key: &str, i: usize| native["bounce"][key][i].as_u64().unwrap() as u32;
             for axis in 0..3 {
-                assert_eq!(body.position[axis].bits(), bits("position_bits", axis));
-                assert_eq!(body.velocity[axis].bits(), bits("velocity_bits", axis));
+                assert_eq!(body.position()[axis].bits(), bits("position_bits", axis));
+                assert_eq!(body.velocity()[axis].bits(), bits("velocity_bits", axis));
             }
         }
     }
@@ -179,6 +184,7 @@ fn impact_rules() -> RuleSet {
 [AircraftTypes]\n\n\
 [BuildingTypes]\n\n\
 [Warheads]\n0=AP\n\n\
+[Animations]\n0=TWLT070\n\n\
 [MTNK]\nStrength=300\nArmor=heavy\nSpeed=6\nPrimary=105mm\n\n\
 [105mm]\nDamage=65\nROF=50\nRange=6\nWarhead=AP\n\n\
 [AP]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\nAnimList=TWLT070\n",

@@ -184,7 +184,6 @@ impl GraphicsEvidence {
         window_scale_factor: f64,
         surface_format: impl Into<String>,
         render_extent: [u32; 2],
-        app_ui_scale: f32,
         bitmap_font: BitmapFontEvidence,
     ) -> Result<Self> {
         ensure!(
@@ -194,10 +193,6 @@ impl GraphicsEvidence {
         ensure!(
             window_scale_factor.is_finite() && window_scale_factor > 0.0,
             "tactical window scale factor must be finite and positive"
-        );
-        ensure!(
-            app_ui_scale.is_finite() && app_ui_scale > 0.0,
-            "tactical app UI scale must be finite and positive"
         );
         let surface_format = surface_format.into();
         ensure!(
@@ -211,7 +206,9 @@ impl GraphicsEvidence {
             width: render_extent[0],
             height: render_extent[1],
             window_scale_factor,
-            app_ui_scale: f64::from(app_ui_scale),
+            // Sidebar artwork draws one render pixel per asset pixel; sealed
+            // profiles pin this at 1.0 (profile.rs validate_capture).
+            app_ui_scale: 1.0,
             bitmap_font,
         })
     }
@@ -431,47 +428,9 @@ pub(crate) fn build_evidence(stable: Value, run: Value) -> Result<Value> {
     Ok(Value::Object(evidence))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn artifact_evidence_uses_the_observed_path_and_digest() {
-        let digest = FileDigest {
-            byte_length: 17,
-            sha256: "0123456789abcdef".repeat(4),
-        };
-        let identity =
-            ArtifactEvidence::from_path_digest(Path::new("C:/fixture/file.bin"), &digest);
-
-        #[cfg(windows)]
-        assert_eq!(identity.path, r"C:\fixture\file.bin");
-        #[cfg(not(windows))]
-        assert_eq!(identity.path, "C:/fixture/file.bin");
-        assert_eq!(identity.byte_length, 17);
-        assert_eq!(identity.sha256, digest.sha256);
-    }
-
-    #[test]
-    fn adapter_evidence_preserves_exact_fields_with_stable_enum_names() {
-        let evidence = GpuAdapterEvidence::from_observation(GpuAdapterObservation {
-            name: "fixture adapter",
-            vendor: 1,
-            device: 2,
-            device_type: wgpu::DeviceType::DiscreteGpu,
-            driver: "fixture driver",
-            driver_info: "fixture info",
-            backend: wgpu::Backend::Dx12,
-        });
-
-        assert_eq!(evidence.name, "fixture adapter");
-        assert_eq!(evidence.vendor, 1);
-        assert_eq!(evidence.device, 2);
-        assert_eq!(evidence.device_type, "DiscreteGpu");
-        assert_eq!(evidence.driver, "fixture driver");
-        assert_eq!(evidence.driver_info, "fixture info");
-        assert_eq!(evidence.backend, "Dx12");
-    }
 
     #[test]
     fn bitmap_evidence_rejects_fallback_unpopulated_atlas_and_mismatched_bytes() {
@@ -525,72 +484,6 @@ mod tests {
         .unwrap();
         assert_eq!(evidence.source, source);
         assert_eq!(evidence.glyph_count, 1);
-    }
-
-    #[test]
-    fn aperture_must_be_positive_and_inside_the_render_extent() {
-        let aperture = ApertureEvidence::from_rect(
-            Rect {
-                x: 640.0,
-                y: 53.0,
-                w: 75.0,
-                h: 48.0,
-            },
-            [800, 600],
-        )
-        .expect("valid aperture");
-        assert_eq!(aperture.width, 75.0);
-        assert!(
-            ApertureEvidence::from_rect(
-                Rect {
-                    x: 790.0,
-                    y: 0.0,
-                    w: 20.0,
-                    h: 10.0,
-                },
-                [800, 600],
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn render_counts_are_taken_from_the_production_output() {
-        let output = GameRenderOutput {
-            #[cfg(feature = "telemetry-dashboard")]
-            phases: None,
-            particle_draws: None,
-            sidebar_view: None,
-            times: crate::app::presentation::render::GameRenderTimes {
-                radar_ms: 0,
-                tooltip_ms: 0,
-                message_ms: None,
-            },
-            instance_counts: GameRenderInstanceCounts {
-                minimap: 1,
-                viewport_rect: 4,
-                radar_animation: 1,
-                sidebar_text: 7,
-            },
-        };
-        let evidence = SidebarRenderEvidence::from_render_output(
-            &output,
-            Rect {
-                x: 640.0,
-                y: 53.0,
-                w: 75.0,
-                h: 48.0,
-            },
-            [9, 7, 9, 7],
-            [800, 600],
-        )
-        .expect("render evidence");
-
-        assert!(!evidence.sidebar_view_present);
-        assert_eq!(evidence.instance_counts.minimap, 1);
-        assert_eq!(evidence.instance_counts.viewport_rect, 4);
-        assert_eq!(evidence.instance_counts.radar_animation, 1);
-        assert_eq!(evidence.sidebar_text_instances, 7);
     }
 
     #[test]

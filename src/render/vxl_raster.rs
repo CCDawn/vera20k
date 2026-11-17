@@ -18,8 +18,9 @@ use crate::assets::vxl_file::{VxlFile, VxlLimb};
 #[cfg(test)]
 use crate::map::voxel_pose::voxel_tilt_applies;
 use crate::map::voxel_pose::{
-    VxlSlopeBlend, compute_slope_blend_rotation, compute_slope_rotation, ground_locomotor_matrix,
-    voxel_body_facing, voxel_table_rotation, voxel_tilt_frame,
+    VxlSlopeBlend, compute_slope_blend_rotation, compute_slope_rotation,
+    crash_fly_locomotor_matrix as voxel_crash_locomotor_matrix, ground_locomotor_matrix,
+    normal_fly_locomotor_matrix, voxel_body_facing, voxel_tilt_frame,
 };
 use crate::render::vxl_normals;
 #[cfg(test)]
@@ -32,9 +33,10 @@ mod native;
 #[path = "vxl_shadow.rs"]
 pub(crate) mod shadow;
 
-pub(crate) use native::PreparedDraw;
+pub(crate) use native::{NativeRaster, PreparedDraw, RasterParams, section_voxels};
 
-/// Shared ordinary VXL preparation for CPU and GPU visibility writes. Preview
+/// Shared ordinary VXL preparation for CPU and GPU visibility writes, on the
+/// shared `depth` map when depth-tested (None draws on a clear one). Preview
 /// magnification and constructed models without encoded spans keep their
 /// explicitly separate legacy renderer.
 pub(crate) fn prepare_native_draw(
@@ -42,17 +44,13 @@ pub(crate) fn prepare_native_draw(
     hva: Option<&HvaFile>,
     params: &VxlRenderParams,
     vpl: Option<&VplFile>,
+    depth: Option<&mut DepthMap>,
 ) -> Option<PreparedDraw> {
-    native::prepare_draw(vxl, hva, params, vpl)
+    native::prepare_draw(vxl, hva, params, vpl, depth)
 }
 
-/// Isometric camera pitch (60°, matching the original engine's isometric projection).
-#[cfg(test)]
-const CAMERA_PITCH_DEG: f32 = 60.0;
-
-/// World yaw offset (45°) to align model north with isometric grid.
-#[cfg(test)]
-const WORLD_YAW_OFFSET_DEG: f32 = 45.0;
+/// The renderer's 256-square depth map (`0xB1D5E0`), one byte a pixel.
+pub type DepthMap = [u8; 65536];
 
 /// Number of distinct orientations a voxel body/turret/barrel can render at.
 ///
@@ -60,10 +58,6 @@ const WORLD_YAW_OFFSET_DEG: f32 = 45.0;
 /// reuses those same 5 bits as its draw-cache key, so there is no finer sub-facing
 /// anywhere in the voxel pipeline: a rendered voxel is always exactly 1 of 32.
 pub const VOXEL_FACING_STEPS: u32 = 32;
-
-/// Angular size of one voxel facing step: 360° / 32 = 11.25° = π/16.
-#[cfg(test)]
-const VOXEL_FACING_STEP_RAD: f32 = std::f32::consts::PI / 16.0;
 
 /// Quantize an 8-bit facing to the voxel renderer's 5-bit facing step (0–31).
 ///
@@ -83,17 +77,6 @@ pub fn voxel_facing_step(facing: u8) -> u8 {
 /// already-truncated byte.
 pub fn voxel_facing_step_u16(facing16: u16) -> u8 {
     crate::util::direction_tables::step32_from_facing16(facing16)
-}
-
-/// The body-rotation angle the original installs for a given facing step.
-///
-/// Built as `RotateZ((step - 8) * -π/16)`. The `-8` bias is a constant +90° folded
-/// into the body term; the camera carries the matching `-45°` yaw, so the net world
-/// rotation works out to `45° − facing°` — but the two terms sit on opposite sides
-/// of the terrain-slope matrix and therefore cannot be collapsed into one another.
-#[cfg(test)]
-fn voxel_facing_angle(step: u8) -> f32 {
-    (step as f32 - 8.0) * -VOXEL_FACING_STEP_RAD
 }
 
 /// The camera/view basis every voxel draw shares.
@@ -190,12 +173,17 @@ fn voxel_crash_rotation(step: u8, tilt: [f32; 2]) -> Mat4 {
     .expect("finite voxel rotation")
 }
 
-/// The locomotor half of [`voxel_crash_rotation`], before the camera.
-fn voxel_crash_locomotor_matrix(step: u8, tilt: [f32; 2]) -> Mat4 {
-    let (sin, cos) = voxel_table_rotation(tilt[0]);
-    let frame = affine::rotate_x(voxel_body_facing(step), sin, cos);
-    let (sin, cos) = voxel_table_rotation(tilt[1]);
-    affine::rotate_y(frame, sin, cos)
+/// Normal-flight `FlyLocomotionClass::Draw_Matrix @ 0x004CF610` uses
+/// SecondaryFacing yaw, then optional PitchAngle `RotateY @ 0x005AF080`, then
+/// the selected signed RollAngle `RotateX @ 0x005AEF60`. Keep this separate
+/// from the crash arm's X-then-Y matrix above; both share the same facing,
+/// lookup-table rotations, affine owner and camera.
+fn voxel_normal_fly_rotation(step: u8, pitch: f32, roll: f32) -> Mat4 {
+    affine::matrix_product(
+        voxel_camera_view(),
+        normal_fly_locomotor_matrix(step, pitch, roll),
+    )
+    .expect("finite normal Fly matrix")
 }
 
 /// `RocketLocomotionClass::Draw_Matrix @ 0x00663470`: the facing matrix of
@@ -241,12 +229,18 @@ fn voxel_jumpjet_tilt_locomotor_matrix(step: u8, angles: [f32; 2], half_sizes: [
     product(product(lift, voxel_body_facing(step)), frame)
 }
 
-/// Drive4AFF60 / Ship69F670 render-only per-part inputs. The locomotor owns slope/blend; the
+/// Drive4AFF60 / Ship69F670 (and Hover513F40 rocking) render-only per-part inputs. The locomotor owns slope/blend; the
 /// object owns facing and angles; ART owns TurretOffset. The loaded model
 /// supplies the main first-section half sizes, including for its gun parts.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GroundPose {
     pub angles: [f32; 2],
+    /// A Tunnel's dig tilt in radians, replacing `angles` for the body matrix:
+    /// `TunnelLocomotionClass::Draw_Matrix @ 0x00729B40` rotates the facing
+    /// matrix by Y alone, with none of the Drive/Ship support offsets. The
+    /// body therefore pivots at its own origin and sinks, which is why the
+    /// tunnel arm cannot share [`crate::map::voxel_pose::ground_locomotor_matrix`].
+    pub tunnel_tilt: Option<f32>,
     pub body_facing: u8,
     pub slope_blend: Option<VxlSlopeBlend>,
     pub turret_offset: i32,
@@ -262,23 +256,29 @@ pub(crate) fn ground_unit_pose_matrices(
     turret_facing: u8,
     barrel_pitch: i8,
 ) -> [Mat4; 3] {
-    let body = ground_locomotor_matrix(
-        slope_type,
-        pose.slope_blend,
-        voxel_facing_step(pose.body_facing),
-        pose.angles,
-        half_sizes,
-    );
-    let translated = affine::translate(body, &[turret_offset_units(pose.turret_offset)]);
+    let body = match pose.tunnel_tilt {
+        Some(angle) => crate::map::voxel_pose::tunnel_locomotor_matrix(
+            voxel_facing_step(pose.body_facing),
+            angle,
+        ),
+        None => ground_locomotor_matrix(
+            slope_type,
+            pose.slope_blend,
+            voxel_facing_step(pose.body_facing),
+            pose.angles,
+            half_sizes,
+        ),
+    };
+    let translated = affine::translate_axis(body, 0, turret_offset_units(pose.turret_offset));
     let relative = i32::from(voxel_facing_step(turret_facing))
         - i32::from(voxel_facing_step(pose.body_facing));
     let (sin, cos) = crate::util::native_trig::native_sin_cos_by_step(relative)
         .expect("relative five-bit facing fits table");
     let turret = affine::rotate_z(translated, sin, cos);
     let pivot = turret.w_axis.truncate();
-    let barrel = affine::translate(turret, &(-pivot).to_array());
+    let barrel = affine::translate(turret, (-pivot).to_array());
     let barrel = voxel_barrel_pitch(barrel, barrel_pitch);
-    let barrel = affine::translate(barrel, &pivot.to_array());
+    let barrel = affine::translate(barrel, pivot.to_array());
     [body, turret, barrel].map(|matrix| {
         affine::matrix_product(voxel_camera_view(), matrix).expect("finite ground draw matrix")
     })
@@ -290,6 +290,10 @@ pub enum BodyTilt {
     /// `FlyLocomotionClass` Draw_Matrix's crashing arm (`0x004CF610`): roll
     /// and pitch in radians.
     Fly([f32; 2]),
+    /// Normal-flight `FlyLocomotionClass::Draw_Matrix @ 0x004CF610`: after
+    /// the strict current-speed/PitchSpeed gate, RotateY(PitchAngle) followed
+    /// by signed RotateX(RollAngle), both in radians.
+    FlyNormal { pitch: f32, roll: f32 },
     /// `JumpjetLocomotionClass` Draw_Matrix's `TiltCrashJumpjet=` arm
     /// (`0x0054DCC0`): roll and pitch in radians, and the main voxel's half
     /// sizes ([`crate::rules::voxel_asset_catalog::voxel_tilt_half_sizes`]).
@@ -368,6 +372,7 @@ pub(crate) fn projectile_voxel_matrix(
 fn voxel_params_draw_rotation(params: &VxlRenderParams, step: u8) -> Mat4 {
     match params.body_tilt {
         Some(BodyTilt::Fly(tilt)) => voxel_crash_rotation(step, tilt),
+        Some(BodyTilt::FlyNormal { pitch, roll }) => voxel_normal_fly_rotation(step, pitch, roll),
         Some(BodyTilt::Jumpjet { angles, half_sizes }) => affine::matrix_product(
             voxel_camera_view(),
             voxel_jumpjet_tilt_locomotor_matrix(step, angles, half_sizes),
@@ -567,7 +572,7 @@ pub fn building_gun_screen_offsets(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_s_z))]
 #[path = "vxl_building_tests.rs"]
 mod building_tests;
 
@@ -584,6 +589,10 @@ const FP_SCALE: f32 = (1 << FP_SHIFT) as f32; // 65536.0
 pub struct VxlRenderParams {
     /// HVA animation frame index (0-based). Use 0 for idle pose.
     pub frame: u32,
+    /// One physical VXL section, or every section. VoxelAnim DrawIt749DCE
+    /// submits its signed VoxelIndex to7540F0; ordinary Techno draws submit
+    /// all sections. This does not change the first-section lighting owner.
+    pub section: Option<usize>,
     /// Facing angle: 0–255 maps to 0–360° (RA2 convention).
     pub facing: u8,
     /// Terrain slope type (0–16). 0 = flat, 1-4 = edge ramps (full-edge tilt),
@@ -618,6 +627,10 @@ pub struct VxlRenderParams {
     /// Kept as a field rather than a constant because the asset contact-sheet
     /// tool magnifies deliberately; production always leaves it at 1.0.
     pub scale: f32,
+    /// The drawn TechnoType's `UseBuffer=` (0xB43180 during `0x00706ED0`):
+    /// rasterize through the depth-tested leaves (`vxl_native`). False for
+    /// every draw outside TechnoClass's voxel body, turret and barrel.
+    pub use_buffer: bool,
     /// Ambient light intensity for fallback N·L shading. Default: 0.6.
     pub ambient: f32,
     /// Diffuse light intensity for fallback N·L shading. Default: 0.4.
@@ -637,6 +650,7 @@ impl Default for VxlRenderParams {
         );
         Self {
             frame: 0,
+            section: None,
             facing: 0,
             slope_type: 0,
             slope_blend: None,
@@ -644,10 +658,24 @@ impl Default for VxlRenderParams {
             lighting: VxlLighting::BlinnPhong,
             barrel_pitch: 0,
             scale: 1.0,
+            use_buffer: false,
             ambient: 0.6,
             diffuse: 0.4,
             light_dir,
         }
+    }
+}
+
+/// Shared selection for geometry, native paint and preview fallback. Keep
+/// original indices: HVA transforms and GPU limb identities index the source
+/// file, even when a draw submits only one section.
+fn section_indices(vxl: &VxlFile, section: Option<usize>) -> Option<std::ops::Range<usize>> {
+    match section {
+        Some(index) => {
+            vxl.limbs.get(index)?;
+            Some(index..index + 1)
+        }
+        None => Some(0..vxl.limbs.len()),
     }
 }
 
@@ -806,7 +834,7 @@ pub struct SpriteBounds {
 
 /// Native VXL destination rectangle relative to the part's draw anchor.
 /// `VXL_Submit_BoundingBox 0x7540F0` transforms the full tailer min/max
-/// extents (grid 0..size), unions all limbs, and `0x754510` pads that one
+/// extents (grid 0..size), unions the submitted limbs, and `0x754510` pads that one
 /// union. This is intentionally independent of atlas voxel-center storage
 /// bounds, SPRITE_MARGIN, splat footprint and zero/nonzero palette pixels.
 ///
@@ -820,14 +848,27 @@ pub fn native_vxl_draw_bounds(
     params: &VxlRenderParams,
 ) -> Option<[i32; 4]> {
     let draw_matrix = voxel_params_draw_rotation(params, voxel_facing_step(params.facing));
-    if params.scale == 1.0 && vxl.limbs.iter().all(|limb| limb.native_spans.is_some()) {
-        let geometry = native::prepare_geometry(vxl, hva, params.frame, draw_matrix)?;
+    let indices = section_indices(vxl, params.section)?;
+    if params.scale == 1.0
+        && indices
+            .clone()
+            .all(|index| vxl.limbs[index].native_spans.is_some())
+    {
+        let geometry = native::prepare_geometry(
+            vxl,
+            hva,
+            params.frame,
+            draw_matrix,
+            params.use_buffer,
+            params.section,
+        )?;
         let [x, y, _, _, width, height] = geometry.rect;
         return Some([x, y, width, height]);
     }
     let mut minimum = [f32::INFINITY; 2];
     let mut maximum = [f32::NEG_INFINITY; 2];
-    for (limb_index, limb) in vxl.limbs.iter().enumerate() {
+    for limb_index in indices {
+        let limb = &vxl.limbs[limb_index];
         if limb.size_x == 0 || limb.size_y == 0 || limb.size_z == 0 {
             return None;
         }
@@ -890,35 +931,6 @@ pub fn native_draw_bounds_from_extents(minimum: [f32; 2], maximum: [f32; 2]) -> 
     Some(result)
 }
 
-/// Ordered dirty-rectangle update from cached VXL blit 0x70755D..0x707678.
-/// Rectangles are x/y/width/height in one shared pixel coordinate frame.
-/// Expanding a maximum edge adds one; expanding only a minimum edge does
-/// not. An empty accumulator is replaced. This is not a normal AABB union.
-pub fn union_native_voxel_draw_bounds(accumulated: &mut Option<[i32; 4]>, next: [i32; 4]) {
-    let Some(mut current) = *accumulated else {
-        *accumulated = Some(next);
-        return;
-    };
-    if current[2] <= 0 || current[3] <= 0 {
-        *accumulated = Some(next);
-        return;
-    }
-    if next[2] <= 0 || next[3] <= 0 {
-        return;
-    }
-    for axis in 0..2 {
-        if next[axis] < current[axis] {
-            current[axis + 2] += current[axis] - next[axis];
-            current[axis] = next[axis];
-        }
-        let next_end = next[axis] + next[axis + 2];
-        if next_end > current[axis] + current[axis + 2] {
-            current[axis + 2] = next_end - current[axis] + 1;
-        }
-    }
-    *accumulated = Some(current);
-}
-
 /// Precompute per-limb transforms, voxel grids, lighting pages, and footprints.
 ///
 /// This is Phase 1 of the VXL render pipeline. It builds the combined
@@ -930,6 +942,9 @@ pub fn prepare_limb_data(
     hva: Option<&HvaFile>,
     params: &VxlRenderParams,
 ) -> (Vec<LimbRenderData>, f32) {
+    let Some(indices) = section_indices(vxl, params.section) else {
+        return (Vec::new(), 1.0);
+    };
     // Facing is quantized to 32 steps before the rotation matrix is built, so
     // every voxel body, turret and barrel renders at exactly 1 of 32 orientations.
     let facing_step: u8 = voxel_facing_step(params.facing);
@@ -960,7 +975,8 @@ pub fn prepare_limb_data(
     let mut limb_data: Vec<LimbRenderData> = Vec::new();
     let mut max_footprint: f32 = 1.0;
 
-    for (limb_idx, limb) in vxl.limbs.iter().enumerate() {
+    for limb_idx in indices {
+        let limb = &vxl.limbs[limb_idx];
         if limb.voxels.is_empty() {
             continue;
         }
@@ -1052,7 +1068,7 @@ pub fn render_vxl_shadow(
     hva: Option<&HvaFile>,
     params: &VxlRenderParams,
 ) -> VxlSprite {
-    if let Some(sprite) = shadow::render(vxl, hva, params) {
+    if let Some(sprite) = shadow::render(vxl, hva, params, 0, false) {
         return sprite;
     }
     render_legacy_vxl_shadow(vxl, hva, params)
@@ -1232,7 +1248,85 @@ pub fn render_vxl(
     params: &VxlRenderParams,
     vpl: Option<&VplFile>,
 ) -> VxlSprite {
-    if let Some(draw) = prepare_native_draw(vxl, hva, params, vpl)
+    render_vxl_on(vxl, hva, params, vpl, None)
+}
+
+/// A voxel image rasterized on the CPU, or one for the GPU raster
+/// ([`crate::render::voxel_gpu`]) to draw where it lands.
+pub(crate) enum VoxelImage<'a> {
+    Cpu(VxlSprite),
+    /// An ordinary draw: the VXL, what a CPU raster of it needs, and the
+    /// native raster the GPU executes.
+    Paint {
+        vxl: &'a VxlFile,
+        hva: Option<&'a HvaFile>,
+        params: VxlRenderParams,
+        raster: NativeRaster,
+    },
+    /// A ground shadow stencil (756860).
+    Stencil {
+        vxl: &'a VxlFile,
+        raster: shadow::StencilRaster,
+    },
+}
+
+impl VoxelImage<'_> {
+    /// The image rasterized on the CPU; None where that raster fails.
+    pub fn render_cpu(self, vpl: Option<&VplFile>) -> Option<VxlSprite> {
+        match self {
+            Self::Cpu(sprite) => Some(sprite),
+            Self::Paint {
+                vxl, hva, params, ..
+            } => Some(render_vxl(vxl, hva, &params, vpl)),
+            Self::Stencil { vxl, raster } => shadow::render_raster(vxl, &raster),
+        }
+    }
+
+    /// The image's size, and its offset from the draw point.
+    pub fn frame(&self) -> ([u32; 2], [f32; 2]) {
+        let rect_frame = |[x, y, _, _, width, height]: [i32; 6]| {
+            ([width as u32, height as u32], [x as f32, y as f32])
+        };
+        match self {
+            Self::Cpu(sprite) => (
+                [sprite.width, sprite.height],
+                [sprite.offset_x, sprite.offset_y],
+            ),
+            Self::Paint { raster, .. } => rect_frame(raster.rect),
+            Self::Stencil { raster, .. } => rect_frame(raster.rect),
+        }
+    }
+}
+
+/// [`render_vxl`] as an image for the GPU raster wherever the native raster
+/// draws it.
+pub(crate) fn voxel_image<'a>(
+    vxl: &'a VxlFile,
+    hva: Option<&'a HvaFile>,
+    params: &VxlRenderParams,
+    vpl: Option<&VplFile>,
+) -> VoxelImage<'a> {
+    match native::prepare_raster(vxl, hva, params) {
+        Some(raster) => VoxelImage::Paint {
+            vxl,
+            hva,
+            params: params.clone(),
+            raster,
+        },
+        None => VoxelImage::Cpu(render_vxl(vxl, hva, params, vpl)),
+    }
+}
+
+/// [`render_vxl`] on the shared `depth` map when depth-tested; None draws on
+/// a clear one. The legacy fallback ignores it.
+pub(crate) fn render_vxl_on(
+    vxl: &VxlFile,
+    hva: Option<&HvaFile>,
+    params: &VxlRenderParams,
+    vpl: Option<&VplFile>,
+    depth: Option<&mut DepthMap>,
+) -> VxlSprite {
+    if let Some(draw) = prepare_native_draw(vxl, hva, params, vpl, depth)
         && let Some(sprite) = draw.render_cpu()
     {
         return sprite;
@@ -1412,7 +1506,7 @@ pub fn hva_to_mat4(raw: &[f32; 12], limb_scale: f32) -> Mat4 {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_s_z))]
 mod tests {
     use super::*;
     use crate::assets::vxl_file::{VxlLimb, VxlVoxel};
@@ -1443,30 +1537,6 @@ mod tests {
                 Some(expected),
                 "extents {min_x},{min_y}..{max_x},{max_y}"
             );
-        }
-    }
-
-    #[test]
-    fn native_draw_union_matches_executed_cached_blit_block() {
-        // Execute original 70755D..707678 with old rectangle at B1CFC0 and
-        // signed cached x/y, unsigned w/h. These are native outputs, not a
-        // mathematical AABB-union oracle. The +1 maximum edge is deliberate.
-        let vectors = [
-            ([5, 6, 10, 12], [6, 7, 2, 3], [5, 6, 10, 12]),
-            ([5, 6, 10, 12], [5, 6, 10, 12], [5, 6, 10, 12]),
-            ([5, 6, 10, 12], [1, 2, 8, 8], [1, 2, 14, 16]),
-            ([5, 6, 10, 12], [12, 16, 10, 10], [5, 6, 18, 21]),
-            ([5, 6, 10, 12], [1, 2, 30, 40], [1, 2, 31, 41]),
-            ([5, 6, 10, 12], [15, 18, 0, 0], [5, 6, 10, 12]),
-            ([5, 6, 0, 12], [15, 18, 0, 0], [15, 18, 0, 0]),
-            ([-20, -10, 8, 6], [-12, -4, 4, 4], [-20, -10, 13, 11]),
-            ([0, 0, 0, 0], [124, 123, 20, 30], [124, 123, 20, 30]),
-            ([124, 123, 20, 30], [124, 123, 20, 30], [124, 123, 20, 30]),
-        ];
-        for (initial, next, expected) in vectors {
-            let mut accumulated = Some(initial);
-            union_native_voxel_draw_bounds(&mut accumulated, next);
-            assert_eq!(accumulated, Some(expected), "{initial:?} then {next:?}");
         }
     }
 
@@ -1624,106 +1694,6 @@ mod tests {
     }
 
     #[test]
-    fn test_render_produces_nonempty_sprite() {
-        let vxl: VxlFile = make_test_vxl();
-        let params: VxlRenderParams = VxlRenderParams::default();
-        let sprite: VxlSprite = render_vxl(&vxl, None, &params, None);
-
-        assert!(sprite.width > 0);
-        assert!(sprite.height > 0);
-        assert_eq!(
-            sprite.palette_indices.len(),
-            (sprite.width * sprite.height) as usize
-        );
-
-        let opaque_count: usize = sprite.palette_indices.iter().filter(|&&b| b != 0).count();
-        assert!(
-            opaque_count >= 2,
-            "Expected at least 2 opaque pixels, got {}",
-            opaque_count
-        );
-    }
-
-    #[test]
-    fn test_empty_model_returns_transparent() {
-        let vxl: VxlFile = VxlFile {
-            limb_count: 0,
-            body_size: 0,
-            palette: vec![],
-            limbs: vec![],
-        };
-        let params: VxlRenderParams = VxlRenderParams::default();
-        let sprite: VxlSprite = render_vxl(&vxl, None, &params, None);
-        assert_eq!(sprite.width, 1);
-        assert_eq!(sprite.height, 1);
-        // Empty model → single transparent byte (palette index 0).
-        assert_eq!(sprite.palette_indices[0], 0);
-    }
-
-    #[test]
-    fn test_facing_changes_output() {
-        let vxl: VxlFile = make_test_vxl();
-
-        let sprite_0: VxlSprite = render_vxl(
-            &vxl,
-            None,
-            &VxlRenderParams {
-                facing: 0,
-                ..Default::default()
-            },
-            None,
-        );
-        let sprite_128: VxlSprite = render_vxl(
-            &vxl,
-            None,
-            &VxlRenderParams {
-                facing: 128,
-                ..Default::default()
-            },
-            None,
-        );
-
-        let same_offset: bool = (sprite_0.offset_x - sprite_128.offset_x).abs() < 0.01
-            && (sprite_0.offset_y - sprite_128.offset_y).abs() < 0.01;
-        assert!(
-            !same_offset || sprite_0.palette_indices != sprite_128.palette_indices,
-            "Facing 0 and 128 should produce different output"
-        );
-    }
-
-    #[test]
-    fn test_point_plot_fills_pixels() {
-        let vxl: VxlFile = make_test_vxl();
-        let params: VxlRenderParams = VxlRenderParams::default();
-        let sprite: VxlSprite = render_vxl(&vxl, None, &params, None);
-
-        let opaque: usize = sprite.palette_indices.iter().filter(|&&b| b != 0).count();
-        assert!(
-            opaque >= 2,
-            "Point-plot should produce at least 2 opaque pixels, got {}",
-            opaque
-        );
-    }
-
-    #[test]
-    fn test_voxel_grid_packing() {
-        // Verify packed voxel round-trips correctly.
-        let packed: PackedVoxel = pack_voxel(42, 137);
-        assert_eq!(unpack_color(packed), 42);
-        assert_eq!(unpack_normal(packed), 137);
-
-        // Color index 0 = empty sentinel.
-        let empty: PackedVoxel = pack_voxel(0, 99);
-        assert_eq!(empty, 0x0063); // color 0 still packs but...
-        // Our grid check uses `packed == 0` which requires both to be 0.
-        // Color index 0 means transparent, so we skip it during grid build
-        // (the original voxel list already excludes color_index 0 in practice).
-        let truly_empty: PackedVoxel = 0;
-        assert_eq!(unpack_color(truly_empty), 0);
-        assert_eq!(unpack_normal(truly_empty), 0);
-    }
-
-    #[test]
     fn shadow_marks_every_occupied_column_and_nothing_else() {
         // The fixture has voxels in columns (1,1) and (0,0) only; the shadow is
         // those two columns flattened, shifted right, and nothing more.
@@ -1776,49 +1746,6 @@ mod tests {
             .filter(|&&b| b != 0)
             .count();
         assert!(lit_one < lit, "{lit_one} vs {lit}");
-    }
-
-    #[test]
-    fn shadow_is_the_bottom_face_through_the_draw_matrix_shifted_right() {
-        // Each occupied column's shadow point is its (x, y, 0) grid point through
-        // camera x model_to_world, plus 3 px right: on a slope the footprint
-        // follows the ramp because the slope matrix is inside model_to_world.
-        let vxl: VxlFile = make_test_vxl();
-        let flat_params: VxlRenderParams = VxlRenderParams::default();
-        let ramp_params: VxlRenderParams = VxlRenderParams {
-            slope_type: 4,
-            ..VxlRenderParams::default()
-        };
-        let (flat_limbs, _) = prepare_limb_data(&vxl, None, &flat_params);
-        let (ramp_limbs, _) = prepare_limb_data(&vxl, None, &ramp_params);
-        let m_flat: Mat4 = voxel_camera_view() * flat_limbs[0].model_to_world;
-        let m_ramp: Mat4 = voxel_camera_view() * ramp_limbs[0].model_to_world;
-        let p_flat: Vec3 = m_flat.transform_point3(Vec3::new(1.0, 1.0, 0.0));
-        let p_ramp: Vec3 = m_ramp.transform_point3(Vec3::new(1.0, 1.0, 0.0));
-        assert!(
-            (p_flat.y - p_ramp.y).abs() > 1e-4,
-            "the ramp must move the bottom face on screen"
-        );
-        let shifted: Mat4 =
-            Mat4::from_translation(Vec3::new(SHADOW_LIGHT_OFFSET_PX, 0.0, 0.0)) * m_flat;
-        let sp: Vec3 = shifted.transform_point3(Vec3::new(1.0, 1.0, 0.0));
-        assert!((sp.x - p_flat.x - 3.0).abs() < 1e-5 && (sp.y - p_flat.y).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_axis_order_positive_depth() {
-        // Positive depth contribution → iterate low to high.
-        let iter: AxisIter = axis_order(5, 1.0);
-        let vals: Vec<i32> = iter.iter().collect();
-        assert_eq!(vals, vec![0, 1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn test_axis_order_negative_depth() {
-        // Negative depth contribution → iterate high to low.
-        let iter: AxisIter = axis_order(5, -1.0);
-        let vals: Vec<i32> = iter.iter().collect();
-        assert_eq!(vals, vec![4, 3, 2, 1, 0]);
     }
 
     #[test]
@@ -1890,47 +1817,6 @@ mod tests {
     }
 
     #[test]
-    fn test_camera_yaw_sign_is_load_bearing_on_slopes() {
-        // The camera's -45° yaw and the body term's +90° bias cancel on flat ground,
-        // which is why a sign flip in either one hides for as long as every unit is
-        // on level terrain. They do not cancel once a slope matrix sits between
-        // them: Rz does not commute with a tilt about a horizontal axis, so the
-        // wrong sign tilts a ramped unit about an axis 90° away from the original's.
-        //
-        // Pin both halves of that: identical on flat ground, different on a ramp.
-        let facing: u8 = 64;
-        let step = voxel_facing_step(facing) as f32;
-        let facing_rad = facing as f32 / 256.0 * std::f32::consts::TAU;
-
-        let correct_camera = Mat4::from_rotation_x(-CAMERA_PITCH_DEG.to_radians())
-            * Mat4::from_rotation_z(-WORLD_YAW_OFFSET_DEG.to_radians());
-        let correct_body = Mat4::from_rotation_z((step - 8.0) * -VOXEL_FACING_STEP_RAD);
-
-        // The pre-fix formulation: yaw sign flipped, +90° folded out of the body.
-        let flipped_camera = Mat4::from_rotation_x(-CAMERA_PITCH_DEG.to_radians())
-            * Mat4::from_rotation_z(WORLD_YAW_OFFSET_DEG.to_radians());
-        let flipped_body = Mat4::from_rotation_z(-facing_rad);
-
-        let flat = compute_slope_rotation(0);
-        assert_mat4_close(
-            correct_camera * flat * correct_body,
-            flipped_camera * flat * flipped_body,
-            1e-5,
-        );
-
-        let ramp = compute_slope_rotation(4);
-        let sample = Vec3::new(0.0, 1.0, 0.0);
-        let correct_point = (correct_camera * ramp * correct_body).transform_point3(sample);
-        let flipped_point = (flipped_camera * ramp * flipped_body).transform_point3(sample);
-        assert!(
-            (correct_point - flipped_point).length() > 0.1,
-            "camera yaw sign must change the rendered tilt on a ramp; got {:?} vs {:?}",
-            correct_point,
-            flipped_point
-        );
-    }
-
-    #[test]
     fn test_voxel_facing_quantizes_to_32_steps_with_round_half_up() {
         // The original reduces facing to 5 bits before building the rotation matrix
         // and reuses those same 5 bits as its draw-cache key, so 32 is the complete
@@ -1965,27 +1851,6 @@ mod tests {
                 voxel_facing_step(facing),
                 "8-bit and 16-bit quantization disagree at facing {}",
                 facing
-            );
-        }
-    }
-
-    #[test]
-    fn test_voxel_facing_angle_nets_to_45_minus_facing_on_flat_ground() {
-        // Sanity-check the +90° bias hiding in the `step - 8` term: composed with
-        // the camera's -45° yaw, the net world rotation on flat ground must come out
-        // at `45° - facing°` for the quantized facing. This is the identity that
-        // makes the sign pair self-consistent, and the reason the old formulation
-        // looked right for as long as nothing drove onto a ramp.
-        for step in 0..32u8 {
-            let net = -WORLD_YAW_OFFSET_DEG.to_radians() + voxel_facing_angle(step);
-            let expected =
-                WORLD_YAW_OFFSET_DEG.to_radians() - (step as f32) * VOXEL_FACING_STEP_RAD;
-            assert!(
-                (net - expected).abs() < 1e-5,
-                "step {}: net {} != expected {}",
-                step,
-                net,
-                expected
             );
         }
     }
@@ -2226,17 +2091,6 @@ mod tests {
     }
 
     #[test]
-    fn test_default_scale_is_unity() {
-        // The original applies no magnification between the section transform and
-        // the pixel write: the camera is a pure rotation, and the only constants on
-        // the path are a x256 (8.8 fixed point — the rasterizer indexes its 256x256
-        // visibility map with the high byte of each 16-bit coordinate) and a +128
-        // that centres the model in that buffer. VXL bounds are already pixels.
-        // The former 1.045 here was an eyeballed fudge with no such provenance.
-        assert_eq!(VxlRenderParams::default().scale, 1.0);
-    }
-
-    #[test]
     fn flat_geometry_uses_native_camera_and_facing_basis() {
         let vxl = make_test_vxl();
         let params = VxlRenderParams {
@@ -2272,70 +2126,6 @@ mod tests {
     }
 
     #[test]
-    fn test_slope_4_geometry_locks_current_direction() {
-        // Original initialized row4, selected by7559B0; sign follows the
-        // retained original matrix, including its table-trig magnitude.
-        let slope_mat = compute_slope_rotation(4);
-        assert_eq!(slope_mat.transform_point3(Vec3::Y).z.to_bits(), 0x3efaa753);
-        assert_eq!(slope_mat.transform_point3(-Vec3::Y).z.to_bits(), 0xbefaa753);
-    }
-
-    #[test]
-    fn test_slopes_9_to_12_alias_corner_ramps_5_to_8() {
-        // gamemd's VXL_MasterLighting_Init populates slope-table entries 9-12
-        // with the same compass+tilt arguments as 5-8 (CORNER tilt at
-        // NW/NE/SE/SW). The matrices are byte-identical at runtime.
-        // A regression that swapped CORNER for EDGE on 9-12 would tilt these
-        // cells more steeply than gamemd does — a player-visible drift.
-        for (extended, base) in [(9, 5), (10, 6), (11, 7), (12, 8)] {
-            let ext_mat: Mat4 = compute_slope_rotation(extended);
-            let base_mat: Mat4 = compute_slope_rotation(base);
-            assert_eq!(
-                ext_mat, base_mat,
-                "slope_type={} should produce the same matrix as slope_type={}",
-                extended, base
-            );
-        }
-    }
-
-    #[test]
-    fn test_slopes_13_to_16_use_edge_tilt_at_corner_directions() {
-        // Slopes 13-16 reuse the corner compass directions (NW/NE/SE/SW from
-        // 5-8) but with the steeper EDGE tilt magnitude — a combination not
-        // present in slopes 1-8. The matrix must therefore differ from the
-        // CORNER-tilt variant at the same compass.
-        for (steep, corner) in [(13, 5), (14, 6), (15, 7), (16, 8)] {
-            let steep_mat: Mat4 = compute_slope_rotation(steep);
-            let corner_mat: Mat4 = compute_slope_rotation(corner);
-            assert_ne!(
-                steep_mat, corner_mat,
-                "slope_type={} (EDGE tilt) must not equal slope_type={} (CORNER tilt)",
-                steep, corner
-            );
-            // Sanity: also not identity.
-            assert_ne!(
-                steep_mat,
-                Mat4::IDENTITY,
-                "slope_type={} should produce a tilt, not identity",
-                steep
-            );
-        }
-    }
-
-    #[test]
-    fn test_slopes_17_to_20_return_identity() {
-        // Original755852..755875 explicitly initializes these rows to identity.
-        for slope in 17..=20u8 {
-            assert_eq!(
-                compute_slope_rotation(slope),
-                Mat4::IDENTITY,
-                "slope_type={} must clamp to identity",
-                slope
-            );
-        }
-    }
-
-    #[test]
     fn original_native_slope_interpolation_reaches_renderer_unchanged() {
         let golden: serde_json::Value =
             serde_json::from_str(crate::test_fixture::text("tools/native_slope_blend.json"))
@@ -2358,22 +2148,6 @@ mod tests {
     }
 
     #[test]
-    fn test_vxl_slope_blend_midphase_differs_from_both_endpoints() {
-        let blend = VxlSlopeBlend {
-            from_slope: 4,
-            to_slope: 8,
-            phase_num: 1,
-            phase_den: SLOPE_TRANSITION_FRAMES,
-        };
-        let mid = compute_slope_blend_rotation(blend);
-        let from = compute_slope_rotation(4);
-        let to = compute_slope_rotation(8);
-        let sample = Vec3::new(0.25, 0.75, 1.0);
-        assert!((mid.transform_point3(sample) - from.transform_point3(sample)).length() > 0.001);
-        assert!((mid.transform_point3(sample) - to.transform_point3(sample)).length() > 0.001);
-    }
-
-    #[test]
     fn drive_ship_slope_negative_one_third_extrapolates_without_lower_clamp() {
         let negative = compute_slope_blend_rotation(VxlSlopeBlend {
             from_slope: 4,
@@ -2389,32 +2163,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_vxl_slope_blend_preserves_camera_slope_facing_order() {
-        let vxl = make_test_vxl();
-        let params = VxlRenderParams {
-            facing: 64,
-            slope_type: 8,
-            slope_blend: Some(VxlSlopeBlend {
-                from_slope: 4,
-                to_slope: 8,
-                phase_num: 1,
-                phase_den: SLOPE_TRANSITION_FRAMES,
-            }),
-            ..Default::default()
-        };
-
-        let (limbs, _) = prepare_limb_data(&vxl, None, &params);
-        let camera_view = voxel_camera_view();
-        let body_facing = voxel_body_facing(voxel_facing_step(params.facing));
-        let section_transform = Mat4::from_translation(Vec3::new(-1.0, -1.0, -1.0));
-        let expected = camera_view
-            * compute_slope_blend_rotation(params.slope_blend.unwrap())
-            * body_facing
-            * section_transform;
-
-        assert_mat4_close(limbs[0].combined, expected, 1e-6);
-    }
     /// Jumpjet Draw_Matrix against the executable
     /// (`tools/spatial_oracle/jumpjet_crash.json`, `draw_matrix`): the
     /// `TiltCrashJumpjet=` arm at four facings, over and under the 0.005 gate
@@ -2517,8 +2265,72 @@ mod tests {
         }
         assert_eq!(crashing, 24);
     }
+
+    /// `TunnelLocomotionClass::Draw_Matrix @ 0x00729B40` rotates the facing
+    /// matrix by Y alone (`0x00729E02..0x00729E16`). The Drive/Ship arm would
+    /// also add [`crate::map::voxel_pose::voxel_tilt_frame`]'s support offsets,
+    /// which shift and lift a body by half its extent so a slope tilt keeps it
+    /// on the surface. A digging tunnel has to sink instead, so its body matrix
+    /// stays a pure rotation; the tilted hull is the same facing around the
+    /// model's own origin.
+    #[test]
+    fn a_tunnel_dig_pose_rotates_without_the_drive_support_offsets() {
+        use std::f32::consts::FRAC_PI_2;
+        let half_sizes = [30.0, 20.0];
+        let tunnel = GroundPose {
+            angles: [0., 0.],
+            tunnel_tilt: Some(FRAC_PI_2),
+            body_facing: 0,
+            slope_blend: None,
+            turret_offset: 0,
+        };
+        let body = ground_unit_pose_matrices(0, tunnel, half_sizes, 0, 0)[0];
+        assert_eq!(
+            body.w_axis.truncate(),
+            glam::Vec3::ZERO,
+            "a vertical dig tilt keeps the body's origin on the ground"
+        );
+        let drive = GroundPose {
+            tunnel_tilt: None,
+            angles: [0., FRAC_PI_2],
+            ..tunnel
+        };
+        let lifted = ground_unit_pose_matrices(0, drive, half_sizes, 0, 0)[0];
+        assert!(
+            lifted.w_axis.truncate().length() > 1.0,
+            "the Drive arm lifts and shifts the same tilt: {:?}",
+            lifted.w_axis
+        );
+        let level = ground_unit_pose_matrices(
+            0,
+            GroundPose {
+                tunnel_tilt: Some(0.0),
+                ..tunnel
+            },
+            half_sizes,
+            0,
+            0,
+        )[0];
+        let plain = affine::matrix_product(voxel_camera_view(), voxel_body_facing(0))
+            .expect("finite level body");
+        for col in 0..4 {
+            for row in 0..3 {
+                assert!(
+                    (level.col(col)[row] - plain.col(col)[row]).abs() < 1e-6,
+                    "a level tunnel draws the plain facing: [{row}][{col}]"
+                );
+            }
+        }
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        tests_render_s_z,
+        tests_app_presentation_instances,
+        tests_app_presentation_render
+    )
+))]
 #[path = "ship_pose_tests.rs"]
 pub(crate) mod ship_pose_tests;

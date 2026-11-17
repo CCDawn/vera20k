@@ -1,6 +1,6 @@
 //! Retained initial Techno records and House50D320/50D440 restoration (130/126).
 //!
-//! Original Steam SHA2563e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600.
+//! Original Steam gamemd.
 //! Native producer/repair execution and original bodies: time-warp-records-plan
 //! and time-warp-restore-placement-native in the local ALL01 evidence packet.
 //! Creation/458A80 placement is instruction-backed, not a rendered parity claim.
@@ -13,8 +13,10 @@ use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat::{EntityDamageEvent, ReceiverCallFlags};
 use crate::sim::components::DriveCoord;
+use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
 use crate::sim::movement::{ground_pose, locomotor::MovementLayer};
+use crate::sim::world::ObjectSubstrate;
 
 impl Simulation {
     /// Execute1186E2C20 -> Map588AC0. Clear footprint identities in the
@@ -31,29 +33,43 @@ impl Simulation {
             if let (Some(grid), Some(terrain)) =
                 (self.smudge_grid.as_mut(), self.resolved_terrain.as_ref())
                 && grid
-                    .clear_footprint_identity_at(source, &rules.smudge_types, terrain)
+                    .clear_footprint_identity_at(
+                        (source.0 as i16, source.1 as i16),
+                        &rules.smudge_types,
+                        terrain,
+                        |identity, at, changed| {
+                            if changed
+                                && matches!(
+                                    identity,
+                                    crate::map::cell_index::NativeCellIdentity::Real(_)
+                                )
+                            {
+                                self.dirty_cells.mark_cell((at.0 as u16, at.1 as u16));
+                            }
+                        },
+                    )
                     .is_none()
             {
                 log::debug!("Map588AC0 source has an unavailable SmudgeType");
-                self.flush_smudge_dirty();
+                Self::flush_smudge_dirty(&mut self.smudge_grid, &mut self.dirty_cells);
                 return false;
             }
         }
-        self.flush_smudge_dirty();
+        Self::flush_smudge_dirty(&mut self.smudge_grid, &mut self.dirty_cells);
         true
     }
 
     /// Successful ReadScenario684C05..684C1B: reverse House array, then
     /// House50D610's reverse full Techno registry. No alive/limbo/class gate.
     /// Repeated calls append duplicates; saved-world restoration never calls it.
-    pub(crate) fn retain_initial_house_technos(&mut self) {
-        for house_index in (0..self.session.house_order.len()).rev() {
-            let owner = self.session.house_order[house_index];
-            for index in (0..self.substrate.entities.techno_registry_len()).rev() {
-                let Some(id) = self.substrate.entities.techno_registry_at(index) else {
+    pub(crate) fn retain_initial_house_technos(substrate: &ObjectSubstrate, houses: &mut Houses) {
+        for house_index in (0..houses.order().len()).rev() {
+            let owner = houses.order()[house_index];
+            for index in (0..substrate.entities.techno_registry_len()).rev() {
+                let Some(id) = substrate.entities.techno_registry_at(index) else {
                     continue;
                 };
-                let Some(entity) = self.substrate.entities.get(id) else {
+                let Some(entity) = substrate.entities.get(id) else {
                     continue;
                 };
                 if entity.owner() != owner {
@@ -69,7 +85,7 @@ impl Simulation {
                         crate::util::lepton::lepton_to_cell_packed(y),
                     ),
                 );
-                if let Some(house) = self.houses.get_mut(&owner) {
+                if let Some(house) = houses.get_mut(&owner) {
                     house.retain_initial_techno(record.0, record.1);
                 }
             }
@@ -195,7 +211,7 @@ impl Simulation {
             let Some(coord) = coord else {
                 self.uninit_with_context(
                     created,
-                    UninitContext::new(Some(rules), overlay_registry).with_effects(frame_effects),
+                    UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
                 );
                 return false;
             };
@@ -226,7 +242,7 @@ impl Simulation {
                 // the shared owner's repeated lifecycle/queue semantics.
                 self.uninit_with_context(
                     created,
-                    UninitContext::new(Some(rules), overlay_registry).with_effects(frame_effects),
+                    UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
                 );
             }
         }
@@ -234,7 +250,7 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_t_z))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -252,8 +268,7 @@ mod tests {
         let foreign = sim.interner.intern("British");
         for (id, name) in [(owner, "Confederation"), (foreign, "British")] {
             sim.houses
-                .insert(id, HouseState::new(id, 0, Some(id), false, 0, 0));
-            sim.session.house_order.push(id);
+                .register(HouseState::new(id, 0, Some(id), false, 0, 0));
             assert_eq!(sim.interner.resolve(id), name);
         }
         for (cell, name) in [
@@ -286,7 +301,7 @@ mod tests {
         }
         let type_id = sim.interner.get("NANRCT").unwrap();
         let rng = sim.scenario_rng.native_state_hex();
-        sim.retain_initial_house_technos();
+        Simulation::retain_initial_house_technos(&sim.substrate, &mut sim.houses);
         // Native50D610 executed controls observe12,12 then10,10 for these
         // original constructor/owner/location inputs. GetCoords' Building
         // center would differ; limbo and foreign identity remain independent.
@@ -297,7 +312,7 @@ mod tests {
             assert_eq!(house.initial_techno_record(index), Some(record));
         }
         let before_append = sim.state_hash();
-        sim.retain_initial_house_technos();
+        Simulation::retain_initial_house_technos(&sim.substrate, &mut sim.houses);
         assert_ne!(sim.state_hash(), before_append);
         assert_eq!(sim.scenario_rng.native_state_hex(), rng);
         let bytes = GameSnapshot::save(&sim, 0, 0, "initial-Techno-history", 0);

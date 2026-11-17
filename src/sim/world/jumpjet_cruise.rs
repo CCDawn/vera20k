@@ -7,9 +7,9 @@
 //! to Foot, and XYZ/Mark/raw occupation use their existing shared owners.
 //!
 //! Native composed controls and coverage: tools/spatial_oracle/jumpjet_states.md.
-//! Other large mechanisms remain bounded: target-facing hold, radio/tag
-//! arrival side effects beyond the existing per-cell owner. The
-//! Magnetron's callbacks run through `sim::locomotor_lift`.
+//! Radio and tag arrival side effects beyond the existing per-cell owner
+//! remain bounded. The Magnetron's callbacks run through
+//! `sim::locomotor_lift`.
 //! Native Unit touchdown calls Cell PickupCrate481A00 at54C9F6 after phase0;
 //! the touchdown asks `Simulation::pickup_crate_at` after the tracker removal
 //! (54C9DC) as native does. The no-crate native controls do not establish
@@ -42,7 +42,7 @@ struct CruiseHost<'a> {
     sim: &'a mut Simulation,
     frame: u32,
     trig: &'a TrigTable,
-    rules: Option<&'a RuleSet>,
+    rules: &'a RuleSet,
     registry: Option<&'a OverlayTypeRegistry>,
     frame_effects: FrameEffects<'a>,
     stable_id: u64,
@@ -67,11 +67,9 @@ impl CruiseHost<'_> {
     }
 
     fn object_type(&self) -> Option<&crate::rules::object_type::ObjectType> {
-        self.rules.and_then(|rules| {
-            self.sim
-                .interner
-                .object_type(self.owner().type_ref(), rules)
-        })
+        self.sim
+            .interner
+            .object_type(self.owner().type_ref(), self.rules)
     }
 
     fn slot_holder(&self, cell: (i16, i16)) -> Option<u64> {
@@ -111,12 +109,38 @@ impl JumpjetFlightHost for CruiseHost<'_> {
     fn is_object_alive(&self) -> bool {
         self.owner().is_object_alive()
     }
+    fn has_installed_jumpjet(&self) -> bool {
+        self.sim
+            .substrate
+            .entities
+            .get(self.stable_id)
+            .is_some_and(jumpjet_locomotor)
+    }
+    fn visibility_tail(&mut self, runtime: &mut JumpjetRuntime) {
+        let id = self.stable_id;
+        // 0x0054B07D..0x0054B10C: the owner test compares PlayerPtr directly.
+        self.sim.deselect_over_player_shroud(id, |sim, owner| {
+            sim.session.current_house() == Some(owner)
+        });
+        for player in self.sim.jumpjet_discovery_due(id) {
+            let context = super::UninitContext::new(self.rules, self.registry)
+                .with_effects(self.frame_effects);
+            runtime.with_owner_call(self.sim, id, |sim| {
+                sim.discover_techno(id, player, context);
+            });
+            if !self.has_installed_jumpjet() {
+                break;
+            }
+        }
+    }
     /// `Object+0x74`, Marked.
     fn marked(&self) -> bool {
         self.owner().lifecycle.cell_marked()
     }
     fn replace_marked_byte(&mut self, marked: bool) -> bool {
-        self.sim.replace_foot_marked_byte(self.stable_id, marked)
+        self.sim
+            .substrate
+            .replace_foot_marked_byte(self.stable_id, marked)
     }
     /// `Object+0x9C`, Location.
     fn location(&self) -> [i32; 3] {
@@ -126,6 +150,34 @@ impl JumpjetFlightHost for CruiseHost<'_> {
         [xy[0], xy[1], z]
     }
     fn set_location(&mut self, coord: [i32; 3]) {
+        // VERA-only deviation. The hold and the cruise write Location with
+        // +0x74 clear and no Mark pair (Update's step `0x0054D55A..D607`, and
+        // State3_Translate's arrival snap, `0x0054BFF0`), so a cell-list link
+        // that a Mark pair from outside the locomotor gave the owner stays in
+        // the cell it leaves. Trigger: `TechnoClass::ChangeOwner`'s pair
+        // (`0x00701674`, `0x00701691`) when mind control takes a Jumpjet
+        // cruising below two levels; rare. In gamemd that cell keeps the link
+        // and its raw 0x20, a blocker nothing occupies, while the Jumpjet lives
+        // and after it dies; here the next entry walk of that cell would then
+        // fail the frame. So the owner leaves that cell through
+        // `MapClass::Pick_Up` (`0x005687F0`) first, and the blocker goes with
+        // it. Lifted phases, touchdown and the crash relocation unlink first.
+        // RESIDUAL: Pick_Up picks the raw plane by height, so one that climbed
+        // to deck height before leaving keeps the ground 0x20, as gamemd does;
+        // and an OnBridge change since the capture misses the linked list.
+        let position = &self.owner().position;
+        let here = (position.rx(), position.ry());
+        let there = self.cell_of([coord[0], coord[1]]);
+        if (i32::from(here.0), i32::from(here.1)) != (i32::from(there.0), i32::from(there.1))
+            && self
+                .sim
+                .substrate
+                .occupancy
+                .contains_entity(here.0, here.1, self.stable_id)
+        {
+            self.sim
+                .foot_pick_up(self.stable_id, self.rules, self.registry);
+        }
         foot_set_location(
             &mut self.sim.substrate.entities,
             self.stable_id,
@@ -157,7 +209,10 @@ impl JumpjetFlightHost for CruiseHost<'_> {
     /// OnBridge cleared (`0x0054D438`).
     fn grounded_reset(&mut self) {
         let location = self.location();
-        self.sim.object_raw_receiver_at(
+        Simulation::object_raw_receiver_at(
+            &mut self.sim.substrate,
+            &self.sim.path_grid,
+            &self.sim.resolved_terrain,
             self.stable_id,
             DriveCoord {
                 x: location[0],
@@ -165,6 +220,7 @@ impl JumpjetFlightHost for CruiseHost<'_> {
                 z: location[2],
             },
             false,
+            self.rules.ares_form(),
         );
         self.sim
             .substrate
@@ -202,12 +258,11 @@ impl JumpjetFlightHost for CruiseHost<'_> {
                     .substrate
                     .entities
                     .get(id)
-                    .zip(self.rules)
-                    .and_then(|(building, rules)| {
+                    .and_then(|building| {
                         self.sim
                             .interner
-                            .object_type(building.type_ref(), rules)
-                            .map(|object| rules.building_dimensions(object)[2])
+                            .object_type(building.type_ref(), self.rules)
+                            .map(|object| self.rules.building_dimensions(object)[2])
                     })
                     .unwrap_or(0)
             });
@@ -222,7 +277,7 @@ impl JumpjetFlightHost for CruiseHost<'_> {
     fn cell_land_type(&self, xy: [i32; 2]) -> u8 {
         self.terrain().map_or(0, |terrain| {
             match terrain.native_cell_identity(self.cell_of(xy)) {
-                NativeCellIdentity::Real(index) => terrain.cells()[index].land_type(),
+                NativeCellIdentity::Real(index) => terrain.cells()[index].land_type,
                 NativeCellIdentity::Dummy => 0,
             }
         })
@@ -273,9 +328,21 @@ impl JumpjetFlightHost for CruiseHost<'_> {
         // Jumpjet arrival705D60 ->6385C0, at the state transition sites
         //54BE2F/54BE97/54BEDB and54C28C/54C2D2/54C2F0. The path owner
         //queues Wait before publishing the next event; it does not land here.
-        self.sim.planning_start_actor(self.stable_id);
+        self.sim.planning_start_actor(self.stable_id, self.rules);
     }
     /// `FacingClass::UpdateFacing @ 0x004C9300` on the body facing (`+0x388`).
+    fn smooth_facing(&self) -> bool {
+        self.rules.general.jumpjet_smooth_facing
+    }
+    fn land_nearby_range(&self) -> i32 {
+        self.rules.general.jumpjet_land_nearby
+    }
+    fn owner_id(&self) -> u64 {
+        self.stable_id
+    }
+    fn landing_cell_claimed_by(&self, cell: (i16, i16)) -> Option<u64> {
+        self.sim.airborne_jumpjet_bound_for(cell, self.stable_id)
+    }
     fn snap_body_facing(&mut self, facing: u16) {
         self.sim
             .substrate
@@ -285,8 +352,18 @@ impl JumpjetFlightHost for CruiseHost<'_> {
             .body_facing
             .snap(facing, self.frame);
     }
+    /// `0x0054D636..0x0054D684`: only a type with `JumpJetTurn=` (`+0xECB`)
+    /// and a TarCom aims. Its answer is DirectionToTarget (`0x005F3DB0`).
     fn hold_target_facing(&self) -> Option<u16> {
-        None
+        let owner = self.owner();
+        self.sim
+            .object_type(owner.type_ref(), self.rules)
+            .filter(|object| object.jumpjet_turn)?;
+        crate::sim::movement::turret::facing_toward_target(
+            owner,
+            &owner.attack_target.target()?,
+            self.sim,
+        )
     }
     fn cell_of(&self, xy: [i32; 2]) -> (i16, i16) {
         (lepton_to_cell_packed(xy[0]), lepton_to_cell_packed(xy[1]))
@@ -311,16 +388,27 @@ impl JumpjetFlightHost for CruiseHost<'_> {
         self.owner().air_tracker_cell()
     }
     fn tracker_add(&mut self) {
-        self.sim.aircraft_tracker_add(self.stable_id);
+        Simulation::aircraft_tracker_add(
+            &self.sim.session,
+            &mut self.sim.substrate,
+            self.stable_id,
+        );
     }
     fn tracker_update(&mut self, cell: (i16, i16)) {
-        self.sim.aircraft_tracker_update_cell(self.stable_id, cell);
+        Simulation::aircraft_tracker_update_cell(
+            &self.sim.session,
+            &mut self.sim.substrate,
+            self.stable_id,
+            cell,
+        );
     }
     fn claim_air_slot_at(&mut self, cell: (i16, i16)) {
-        self.sim.set_cell_air_slot(cell, Some(self.stable_id));
+        self.sim
+            .substrate
+            .set_cell_air_slot(cell, Some(self.stable_id));
     }
     fn release_air_slot_at(&mut self, cell: (i16, i16)) {
-        self.sim.set_cell_air_slot(cell, None);
+        self.sim.substrate.set_cell_air_slot(cell, None);
     }
     fn set_destination_cell(&mut self, cell: (i16, i16), runtime: &mut JumpjetRuntime) {
         let id = self.stable_id;
@@ -341,20 +429,17 @@ impl JumpjetFlightHost for CruiseHost<'_> {
         });
     }
     fn can_enter_cell(&self, cell: (i16, i16)) -> i32 {
-        let answer = match self.rules {
-            Some(rules) => self.sim.mover_can_enter(
-                self.stable_id,
-                cell,
-                InfantryEntryArgs::REPAIR,
-                crate::sim::movement::infantry_entry::EntryQueryMode::CheckLocomotor,
-                rules,
-                self.registry,
-            ),
-            None => Err("no rules".into()),
-        };
+        let answer = self.sim.mover_can_enter(
+            self.stable_id,
+            cell,
+            InfantryEntryArgs::REPAIR,
+            crate::sim::movement::infantry_entry::EntryQueryMode::CheckLocomotor,
+            self.rules,
+            self.registry,
+        );
         answer.map_or_else(
             |error| {
-                // Existing no-rules/type/map fallback; native always has an answer.
+                // Existing type/map fallback; native always has an answer.
                 log::warn!("Jumpjet {} landing entry: {error}", self.stable_id);
                 0
             },
@@ -389,9 +474,7 @@ impl JumpjetFlightHost for CruiseHost<'_> {
     fn factory_contact_notify(&mut self, runtime: &mut JumpjetRuntime) {
         //54BC59 reads Contacts[0];54BC6D..54BCA1 wants a Building of one of
         // the four factory classes before the owner's Notify at54BCB3.
-        let Some(rules) = self.rules else {
-            return;
-        };
+        let rules = self.rules;
         let factory_contact = self
             .owner()
             .radio_contacts
@@ -421,7 +504,10 @@ impl JumpjetFlightHost for CruiseHost<'_> {
         })
     }
     fn begin_landing(&mut self, destination: [i32; 3]) {
-        self.sim.object_raw_receiver_at(
+        Simulation::object_raw_receiver_at(
+            &mut self.sim.substrate,
+            &self.sim.path_grid,
+            &self.sim.resolved_terrain,
             self.stable_id,
             DriveCoord {
                 x: destination[0],
@@ -429,14 +515,27 @@ impl JumpjetFlightHost for CruiseHost<'_> {
                 z: destination[2],
             },
             true,
+            self.rules.ares_form(),
         );
     }
     fn deploy_latched(&self) -> bool {
         self.owner().landing_for_deploy()
     }
     fn deploy_facing(&self) -> Option<u16> {
-        self.rules
-            .map(|rules| u16::from(rules.general.deploy_dir as u8) << 8)
+        // Ares 3.0 JumpjetLocomotionClass_State4_54C550_DeployDir (100499F0,
+        // hook 0x54C767): only a type with a `DeployingAnim=` turns, to its
+        // own `DeployDir` (eighth turns, << 13) when set.
+        if self.rules.ares() {
+            let object = self
+                .sim
+                .interner
+                .object_type(self.owner().type_ref(), self.rules)?;
+            object.deploying_anim.as_ref()?;
+            if let Some(dir) = object.techno_combat().movement().deploy_dir() {
+                return Some(u16::from(dir) << 13);
+            }
+        }
+        Some(u16::from(self.rules.general.deploy_dir as u8) << 8)
     }
     fn touchdown(&mut self, runtime: &mut JumpjetRuntime) -> bool {
         self.touched_down = true;
@@ -472,14 +571,21 @@ impl JumpjetFlightHost for CruiseHost<'_> {
         }) {
             return false;
         }
-        self.sim.refresh_object_sight(id, rules, 0);
+        self.sim
+            .refresh_object_sight(id, rules, 0, self.frame_effects);
         let location = self.location();
         let here = self.cell_of([location[0], location[1]]);
         if self.holds_air_slot_at(here) {
             self.release_air_slot_at(here);
         }
-        self.sim.aircraft_tracker_remove(id);
-        true
+        self.sim.substrate.aircraft_tracker_remove(id);
+        // A callback above can end a Magnetron lift: Change House reaches
+        // Foot Enter_Idle_Mode's End_Piggyback (0x004D8347..0x004D8373) and
+        // the Drive returns. gamemd crashes on this path: the released
+        // Jumpjet's destructor zeroes its owner (0x0055A6FD) and
+        // State4_Descend reads through it at 0x0054C8FD. VERA takes the Foot
+        // out of the air, as above, and ends the landing here.
+        self.has_installed_jumpjet()
     }
     fn finish_touchdown(&mut self, runtime: &mut JumpjetRuntime) {
         let id = self.stable_id;
@@ -495,6 +601,9 @@ impl JumpjetFlightHost for CruiseHost<'_> {
         runtime.with_owner_call(self.sim, id, |sim| {
             let _ = sim.pickup_crate_at(id, here, rules, registry, frame_effects);
         });
+        if !self.has_installed_jumpjet() {
+            return;
+        }
         let deploy_to_land = self.owner_kind() == FlightOwnerKind::Unit && self.type_flag_6ad();
         let owner = self.sim.substrate.entities.get_mut(id).unwrap();
         owner.lift.allow_end();
@@ -516,8 +625,15 @@ impl JumpjetFlightHost for CruiseHost<'_> {
         self.mark(false);
         self.set_location(coord);
         self.mark(true);
-        self.sim
-            .submit_entity_display(self.stable_id, self.rules, None);
+        Simulation::submit_entity_display(
+            &self.sim.interner,
+            &self.sim.terrain_objects,
+            &mut self.sim.substrate,
+            &self.sim.resolved_terrain,
+            self.stable_id,
+            self.rules,
+            None,
+        );
     }
     fn mark(&mut self, put: bool) {
         if put {
@@ -557,9 +673,7 @@ impl JumpjetFlightHost for CruiseHost<'_> {
         self.owner().drop_credit.being_manipulated()
     }
     fn crush_below(&mut self, runtime: &mut JumpjetRuntime) -> bool {
-        let Some(rules) = self.rules else {
-            return false;
-        };
+        let rules = self.rules;
         let id = self.stable_id;
         let registry = self.registry;
         let frame_effects = self.frame_effects;
@@ -596,9 +710,7 @@ impl JumpjetFlightHost for CruiseHost<'_> {
         })
     }
     fn sink(&mut self, runtime: &mut JumpjetRuntime) {
-        let Some(rules) = self.rules else {
-            return;
-        };
+        let rules = self.rules;
         let id = self.stable_id;
         let registry = self.registry;
         let frame_effects = self.frame_effects;
@@ -640,6 +752,34 @@ fn jumpjet_locomotor(entity: &crate::sim::game_entity::GameEntity) -> bool {
 }
 
 impl Simulation {
+    /// Process's discovery probe (`0x0054B112..0x0054B166`): the player
+    /// (`0x00A83D4C`) discovers (vt+0x198, [`Self::discover_techno`]) another
+    /// house's object it has not discovered (`+0x41B`) whose Location is not
+    /// shrouded on its map (`MapClass::IsShrouded @ 0x00586360`). So an enemy
+    /// jumpjet flying into ground the player has mapped is discovered there;
+    /// a Jumpjet's PerCell runs only at touchdown. Outside a campaign a Cell
+    /// put (`0x0047E953..0x0047E9DC`, [`Self::discover_by_player`]) has
+    /// already discovered every object it puts down, so the probe only acts
+    /// in a campaign. Answers the player when the probe discovers.
+    fn jumpjet_discovery_due(&self, id: u64) -> Vec<crate::sim::intern::InternedId> {
+        let Some(terrain) = self.resolved_terrain.as_ref() else {
+            return Vec::new();
+        };
+        let Some(entity) = self.substrate.entities.get(id) else {
+            return Vec::new();
+        };
+        let location = crate::sim::movement::ground_pose::object_location(entity, Some(terrain));
+        let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+        self.represented_player_maps()
+            .into_iter()
+            .filter(|&player| {
+                !self.techno_discovered_by_viewer(id, player)
+                    && entity.owner() != player
+                    && !crate::sim::vision::point_is_shrouded(&self.fog, &cells, player, location)
+            })
+            .collect()
+    }
+
     /// `INotifyProc::Notify(0x117B)` of a `BalloonHover=` or `JumpJet=` owner
     /// (Infantry `0x00522A60..0x00522AF4`, Unit `0x00746100..0x00746194`),
     /// which Jumpjet State 1 raises while the owner climbs in contact with its
@@ -671,7 +811,7 @@ impl Simulation {
             self,
             id,
             crate::sim::radio::RadioMessage::RequestClearance,
-            Some(rules),
+            rules,
             frame_effects,
         );
         let Some(owner) = self.substrate.entities.get(id) else {
@@ -690,7 +830,7 @@ impl Simulation {
             let _ = self.assign_destination_represented(
                 id,
                 Some(crate::sim::components::NavTargetRef::from(archive)),
-                Some(rules),
+                rules,
                 registry,
                 frame_effects,
             );
@@ -711,11 +851,38 @@ impl Simulation {
         }
     }
 
+    /// VERA `[JumpjetControls] LandNearby=`: the lowest id among the airborne
+    /// Jumpjets other than `except` whose destination is `cell`. The landing
+    /// search, the approach check and the group spread ask it.
+    pub(crate) fn airborne_jumpjet_bound_for(&self, cell: (i16, i16), except: u64) -> Option<u64> {
+        let entities = &self.substrate.entities;
+        entities
+            .airborne_ids()
+            .filter(|&id| id != except)
+            .filter_map(|id| entities.get(id))
+            .filter(|entity| {
+                entity
+                    .locomotor
+                    .as_ref()
+                    .and_then(|locomotor| locomotor.jumpjet_runtime())
+                    .is_some_and(|runtime| {
+                        let destination = runtime.destination();
+                        runtime.phase() != jumpjet_flight::STATE_GROUND
+                            && (
+                                lepton_to_cell_packed(destination.x),
+                                lepton_to_cell_packed(destination.y),
+                            ) == cell
+                    })
+            })
+            .map(|entity| entity.stable_id())
+            .min()
+    }
+
     /// Process54AEC0 through the one private instance and live owner callbacks.
     pub(crate) fn tick_jumpjet_cruise_one(
         &mut self,
         stable_id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> Result<Option<AirMovementTickStats>, super::FrameAdvanceError> {
@@ -727,7 +894,7 @@ impl Simulation {
         {
             return Ok(None);
         }
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         let trig = TrigTable::embedded();
         let stats = self.with_jumpjet_process(stable_id, |runtime, sim| {
             let entry_state = runtime.phase();
@@ -751,10 +918,9 @@ impl Simulation {
             }
             let ended_cruise =
                 entry_state == STATE_TRANSLATE && matches!(state, STATE_HOLD | STATE_DESCEND);
-            let entity = host.sim.substrate.entities.get_mut(stable_id).unwrap();
             if host.crash_latched
-                && entity.category() == EntityCategory::Infantry
-                && let Some(rules) = rules
+                && host.has_installed_jumpjet()
+                && host.owner_kind() == FlightOwnerKind::Infantry
                 && let Err(cause) = host.sim.infantry_do_action(
                     stable_id,
                     crate::sim::movement::infantry_action::DO_AIR_DEATH_START,
@@ -776,11 +942,19 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_c_o))]
 #[path = "jumpjet_cruise_native_tests.rs"]
 mod native_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_c_o))]
+#[path = "jumpjet_smooth_facing_tests.rs"]
+mod smooth_facing_tests;
+
+#[cfg(all(test, tests_sim_world_c_o))]
+#[path = "jumpjet_land_nearby_tests.rs"]
+mod land_nearby_tests;
+
+#[cfg(all(test, tests_sim_world_c_o))]
 mod tests {
     use super::*;
     use crate::rules::jumpjet_params::JumpjetParams;
@@ -826,7 +1000,7 @@ mod tests {
             let cell = sim
                 .resolved_terrain
                 .as_mut()
-                .and_then(|terrain| terrain.cell_mut(9, 10))
+                .and_then(|terrain| terrain.cell_mut_for_test(9, 10))
                 .expect("fixture cell");
             cell.level = 2;
             cell.slope_type = 1;
@@ -859,7 +1033,7 @@ mod tests {
             // doubles and the bob zero, `+0x80` at `JumpjetHeight=`).
             let mut flight = runtime.flight();
             flight.facing_mut().snap(u16::from(body_facing) << 8, 0);
-            flight.set_target_height(500);
+            flight.set_target_height_for_test(500);
             *runtime = runtime
                 .clone()
                 .with_phase_for_test(STATE_TRANSLATE)
@@ -868,7 +1042,8 @@ mod tests {
         }
         entity.locomotor = Some(locomotor);
         sim.substrate.entities.insert(entity);
-        sim.set_object_height_unmarked(1, 500);
+        sim.interner = crate::sim::intern::test_interner();
+        Simulation::set_object_height_unmarked(&mut sim.substrate, &sim.resolved_terrain, 1, 500);
         sim
     }
 
@@ -876,7 +1051,7 @@ mod tests {
     /// gives it: the Cell NavCom (`0x004D9510`), then the Jumpjet's `Move_To`
     /// with the cell's coordinate (`0x004D965D`).
     fn order_east(sim: &mut Simulation) {
-        sim.session.binary_frame = 1001;
+        sim.session.set_binary_frame_for_test(1001);
         let request = crate::sim::movement::target_cell_coord(
             16,
             10,
@@ -891,7 +1066,7 @@ mod tests {
             .expect("jumpjet")
             .navigation
             .set_nav_com_for_test(Some(crate::sim::components::NavTargetRef::cell(16, 10)));
-        sim.jumpjet_move_to(1, request, None)
+        sim.jumpjet_move_to(1, request, crate::rules::ruleset::RuleSet::empty_for_test())
             .expect("Move_To on the fixture map");
     }
 
@@ -907,15 +1082,15 @@ mod tests {
             .place_overlay(10, 10, wood, 0);
         let owner = sim.interner.intern("Americans");
         let type_ref = sim.interner.intern("JUMPJETUNIT");
-        sim.houses.insert(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10),
-        );
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                owner, 0, None, true, 0, 10,
+            ));
         let e = sim.substrate.entities.get_mut(1).unwrap();
         e.set_owner_for_test(owner);
         e.set_type_ref_for_test(type_ref);
         e.lifecycle.set_in_limbo_for_test(false);
-        e.lifecycle.set_cell_marked(true);
+        e.lifecycle.set_cell_marked_for_test(true);
         e.position.put_z(0);
         let runtime = e.locomotor.as_mut().unwrap().jumpjet_runtime_mut().unwrap();
         *runtime = runtime
@@ -924,7 +1099,7 @@ mod tests {
             .with_moving_for_test(true)
             .with_landing_latched_for_test(true)
             .with_destination_for_test(DriveCoord::cell(10, 10, 0));
-        sim.aircraft_tracker_add(1);
+        Simulation::aircraft_tracker_add(&sim.session, &mut sim.substrate, 1);
         sim.substrate.air_slots.set_holder((10, 10), Some(1));
         (sim, rules, registry)
     }
@@ -937,7 +1112,7 @@ mod tests {
                 sim,
                 frame: 0,
                 trig: TrigTable::embedded(),
-                rules: Some(rules),
+                rules,
                 registry: Some(registry),
                 frame_effects: FrameEffects::default(),
                 stable_id: 1,
@@ -986,6 +1161,21 @@ mod tests {
             e.air_spatial_bucket().is_some(),
             "the landing did not remove its tracker"
         );
+    }
+
+    #[test]
+    fn a_jumpjet_callback_can_remove_its_owner() {
+        let mut sim = hovering_jumpjet(0x40);
+        let result = sim.with_jumpjet_process(1, |runtime, sim| {
+            runtime.with_owner_call(sim, 1, |sim| {
+                sim.uninit(1);
+                sim.process_pending_delete();
+                "callback completed"
+            })
+        });
+
+        assert_eq!(result, Some("callback completed"));
+        assert!(sim.substrate.entities.get(1).is_none());
     }
 
     /// Supplied flags exercise each native54C905 gate independently; zero HP
@@ -1074,10 +1264,10 @@ mod tests {
              [OverlayTypes]\n239=WOOD\n[WOOD]\nCrate=yes\n",
         );
         let owner = sim.interner.intern("Americans");
-        sim.houses.insert(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10),
-        );
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                owner, 0, None, true, 0, 10,
+            ));
         let building = sim
             .spawn_object("TESTG", "Americans", 15, 15, 0, &rules)
             .unwrap();
@@ -1096,7 +1286,7 @@ mod tests {
             .set_nav_com_for_test(Some(NavTargetRef::object(building)));
         let runtime = e.locomotor.as_mut().unwrap().jumpjet_runtime_mut().unwrap();
         let mut flight = runtime.flight();
-        flight.set_target_height(0);
+        flight.set_target_height_for_test(0);
         *runtime = runtime
             .clone()
             .with_phase_for_test(STATE_DESCEND)
@@ -1106,7 +1296,7 @@ mod tests {
             .with_destination_for_test(DriveCoord::cell(15, 15, 0));
         sim.process_active_locomotor(
             id,
-            Some(&rules),
+            &rules,
             super::super::techno_ai::ObjectAiCtx {
                 overlay_registry: Some(&registry),
                 ..Default::default()
@@ -1129,9 +1319,8 @@ mod tests {
                 .get(building)
                 .unwrap()
                 .passenger_role
-                .cargo()
-                .unwrap()
-                .passengers(),
+                .occupants()
+                .ids(),
             &[id]
         );
     }
@@ -1151,13 +1340,13 @@ mod tests {
                 .with_destination_for_test(JumpjetRuntime::NULL);
         }
         if state == jumpjet_flight::STATE_GROUND {
-            sim.set_object_height_unmarked(1, 0);
+            Simulation::set_object_height_unmarked(&mut sim.substrate, &sim.resolved_terrain, 1, 0);
         }
         for frame in 0..frames {
-            sim.session.binary_frame = 1001 + frame;
+            sim.session.set_binary_frame_for_test(1001 + frame);
             sim.tick_air_movement_with_cell_lists_one(
                 1,
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
                 None,
                 crate::sim::world::FrameEffects::default(),
             )
@@ -1191,10 +1380,10 @@ mod tests {
         assert_eq!(sim.substrate.raw_cell_occupation.ground_bits(10, 10), 0x20);
         order_east(&mut sim);
         for frame in 0..80 {
-            sim.session.binary_frame = 1001 + frame;
+            sim.session.set_binary_frame_for_test(1001 + frame);
             sim.tick_air_movement_with_cell_lists_one(
                 1,
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
                 None,
                 crate::sim::world::FrameEffects::default(),
             )
@@ -1207,6 +1396,55 @@ mod tests {
             assert!(!sim.substrate.occupancy.contains_entity(rx, ry, 1));
             assert_eq!(sim.substrate.raw_cell_occupation.ground_bits(rx, ry), 0);
         }
+    }
+
+    /// Mind control taking a Jumpjet unit that cruises below two levels:
+    /// `TechnoClass::ChangeOwner`'s Mark pair (`0x00701674`, `0x00701691`)
+    /// links it in its cell's ground list, and the cruise then moves it with
+    /// no Mark pair (`0x0054D134`). The cell it leaves keeps no link, which
+    /// would outlive the Jumpjet.
+    #[test]
+    fn a_cruising_jumpjet_linked_by_a_capture_leaves_no_link_behind() {
+        let mut sim = hovering_jumpjet(0x40);
+        let russians = sim.interner.intern("Russians");
+        for (house, side) in [(sim.interner.intern("Americans"), 0), (russians, 1)] {
+            sim.houses
+                .register(crate::sim::house_state::HouseState::new(
+                    house, side, None, true, 0, 10,
+                ));
+        }
+        {
+            let entity = sim.substrate.entities.get_mut(1).expect("jumpjet");
+            entity.set_foot_occupation_enabled(true);
+            entity.lifecycle.set_in_limbo_for_test(false);
+            entity.lifecycle.set_cell_marked_for_test(true);
+            // Unlimbo's threat publication, which ChangeOwner withdraws.
+            entity.cached_spatial_threat.publish(0);
+        }
+        Simulation::set_object_height_unmarked(&mut sim.substrate, &sim.resolved_terrain, 1, 100);
+        assert!(!sim.substrate.occupancy.contains_entity(10, 10, 1));
+
+        sim.change_owner(1, russians);
+        assert!(
+            sim.substrate.occupancy.contains_entity(10, 10, 1),
+            "the capture's Mark(PUT) links it"
+        );
+        // Its new owner sends it on.
+        order_east(&mut sim);
+        for frame in 0..80 {
+            sim.session.set_binary_frame_for_test(1001 + frame);
+            sim.tick_air_movement_with_cell_lists_one(
+                1,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
+                None,
+                crate::sim::world::FrameEffects::default(),
+            )
+            .unwrap();
+        }
+        let position = sim.substrate.entities.get(1).expect("jumpjet").position;
+        assert_ne!((position.rx(), position.ry()), (10, 10), "it flew on");
+        assert!(!sim.substrate.occupancy.contains_entity(10, 10, 1));
+        assert_eq!(sim.substrate.raw_cell_occupation.ground_bits(10, 10), 0);
     }
 
     /// Before the locomotor owned this tick, VERA's air adapter cycled an idle
@@ -1249,7 +1487,7 @@ mod tests {
     fn re_opening_a_cruise_drops_a_drifted_slot() {
         let mut sim = hovering_jumpjet(0x40);
         // The owner holds (13,10) but sits at (10,10) — the drift case.
-        assert!(sim.set_cell_air_slot((13, 10), Some(1)));
+        assert!(sim.substrate.set_cell_air_slot((13, 10), Some(1)));
         let actor = sim.substrate.entities.get_mut(1).unwrap();
         *actor = actor.clone().with_air_tracker_cell_for_test((13, 10));
         {
@@ -1268,7 +1506,7 @@ mod tests {
         order_east(&mut sim);
         sim.tick_air_movement_with_cell_lists_one(
             1,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -1313,11 +1551,11 @@ mod tests {
         let mut sim = hovering_jumpjet(body_facing);
         order_east(&mut sim);
         for (index, expected) in frames.iter().enumerate() {
-            sim.session.binary_frame = 1001 + index as u32;
+            sim.session.set_binary_frame_for_test(1001 + index as u32);
             let stats = sim
                 .tick_air_movement_with_cell_lists_one(
                     1,
-                    None,
+                    crate::rules::ruleset::RuleSet::empty_for_test(),
                     None,
                     crate::sim::world::FrameEffects::default(),
                 )
@@ -1336,7 +1574,7 @@ mod tests {
                 "{name}: frame {index}"
             );
             assert_eq!(
-                u32::from(entity.body_facing_byte(sim.session.binary_frame)),
+                u32::from(entity.body_facing_byte(sim.session.binary_frame())),
                 (expected["body_facing"].as_u64().expect("body facing") >> 8) as u32,
                 "{name}: body facing, frame {index}"
             );
@@ -1382,7 +1620,7 @@ mod tests {
         {
             let jumpjet = sim.substrate.entities.get_mut(1).expect("jumpjet");
             jumpjet.lifecycle.set_in_limbo_for_test(false);
-            jumpjet.lifecycle.set_cell_marked(true);
+            jumpjet.lifecycle.set_cell_marked_for_test(true);
             jumpjet.position.set_sub_x_for_test(SimFixed::from_num(250));
             let runtime = jumpjet
                 .locomotor
@@ -1396,12 +1634,12 @@ mod tests {
                 .with_phase_for_test(jumpjet_flight::STATE_CRASH)
                 .with_flight_for_test(flight);
         }
-        sim.aircraft_tracker_add(1);
-        sim.session.binary_frame = 1001;
+        Simulation::aircraft_tracker_add(&sim.session, &mut sim.substrate, 1);
+        sim.session.set_binary_frame_for_test(1001);
         let stats = sim
             .tick_air_movement_with_cell_lists_one(
                 1,
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
                 None,
                 crate::sim::world::FrameEffects::default(),
             )
@@ -1444,10 +1682,10 @@ mod tests {
         entity.lifecycle.set_in_limbo_for_test(false);
         order_east(&mut sim);
         for frame in 0..20 {
-            sim.session.binary_frame = 1001 + frame;
+            sim.session.set_binary_frame_for_test(1001 + frame);
             sim.tick_air_movement_with_cell_lists_one(
                 1,
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
                 None,
                 crate::sim::world::FrameEffects::default(),
             )
@@ -1477,12 +1715,17 @@ mod tests {
         assert!(entity.navigation.nav_com().is_some());
         let here = (entity.position.rx(), entity.position.ry());
         assert!(here.0 < 16, "still on its way");
-        sim.assign_null_destination(1, None, None, crate::sim::world::FrameEffects::default());
+        sim.assign_null_destination(
+            1,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            None,
+            crate::sim::world::FrameEffects::default(),
+        );
 
-        sim.session.binary_frame = 1021;
+        sim.session.set_binary_frame_for_test(1021);
         sim.tick_air_movement_with_cell_lists_one(
             1,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -1501,10 +1744,10 @@ mod tests {
         assert!(entity.navigation.nav_com().is_none());
 
         for frame in 0..400 {
-            sim.session.binary_frame = 1022 + frame;
+            sim.session.set_binary_frame_for_test(1022 + frame);
             sim.tick_air_movement_with_cell_lists_one(
                 1,
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
                 None,
                 crate::sim::world::FrameEffects::default(),
             )
@@ -1562,11 +1805,11 @@ mod tests {
                         z: 0,
                     });
             }
-            sim.session.binary_frame = 1001;
+            sim.session.set_binary_frame_for_test(1001);
             fresh_oracle_seam::install(vec![code], Vec::new());
             sim.tick_air_movement_with_cell_lists_one(
                 1,
-                Some(&rules),
+                &rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
             )
@@ -1674,7 +1917,7 @@ mod tests {
         let sim = &scenario.runtime.simulation;
         let mut orders = vec![CommandEnvelope::new(
             sim.interner.get("Americans").expect("house"),
-            sim.session.tick + 1,
+            sim.session.tick() + 1,
             Command::Move {
                 entity_id: hawk,
                 target_rx: landing.0,
@@ -1712,7 +1955,7 @@ mod tests {
 
         let mut orders = vec![CommandEnvelope::new(
             sim.interner.get("Americans").expect("house"),
-            sim.session.tick + 1,
+            sim.session.tick() + 1,
             Command::Move {
                 entity_id: tank,
                 target_rx: x + 12,
@@ -1789,7 +2032,7 @@ mod tests {
         );
         let mut orders = vec![CommandEnvelope::new(
             sim.interner.get("Americans").expect("house"),
-            sim.session.tick + 1,
+            sim.session.tick() + 1,
             Command::Attack {
                 attacker_id: kirov,
                 target_id: reactor,
@@ -1814,8 +2057,8 @@ mod tests {
                 destroyed_at = Some((frame, off));
             }
             for (&id, bomb) in sim.projectiles.iter() {
-                if bomb.source_id == kirov {
-                    let here = [bomb.position.x, bomb.position.y];
+                if bomb.source_id() == kirov {
+                    let here = [bomb.position().x, bomb.position().y];
                     bombs.entry(id).or_insert_with(Vec::new).push(here);
                 }
             }
@@ -1830,23 +2073,56 @@ mod tests {
         }
     }
 
-    /// A computer's Kirov on Hunt on retail Dustbowl flies at what its scan
-    /// picks: Mission_Hunt approaches what the scan holds (`0x004D54DD`), and
-    /// the BalloonHover arm makes the target the destination, so the Kirov
-    /// closes past its bomb's range instead of stopping there, and stays on
-    /// Hunt. A production witness, not a native comparison.
+    /// A computer's Kirov on Hunt on retail Dustbowl approaches a fixed
+    /// ground target and drops real bombs, without another combatant changing
+    /// its target or mission. A production witness, not a native comparison.
     #[test]
     #[ignore = "requires a retail RA2/YR install (RA2_DIR or config.toml)"]
     fn retail_dustbowl_hunting_kirov_flies_at_its_target_and_stays_on_hunt() {
         use super::super::jumpjet_infantry_tests::{retail_dustbowl_rocketeer, retail_frame};
         use crate::sim::mission::{MissionId, MissionType};
 
-        let (mut scenario, _, x, y) = retail_dustbowl_rocketeer();
-        let kirov = {
+        let (mut scenario, rocketeer, x, y) = retail_dustbowl_rocketeer();
+        let (kirov, plant) = {
             let crate::sim::runtime::SimRuntime {
                 simulation: sim,
                 resources,
             } = &mut scenario.runtime;
+            // The shared flight fixture supplies an armed enemy Rocketeer.
+            // Leaving it active lets Hunt pick it while grounded, then drop
+            // it when airborne; its return fire can also replace Hunt with
+            // Attack. Keep it off-map for this stationary-target witness.
+            assert_eq!(
+                sim.techno_limbo_with_rules(
+                    rocketeer,
+                    &resources.rules,
+                    Some(&resources.overlay_registry),
+                ),
+                crate::sim::world::ConcealOutcome::Concealed,
+            );
+            let owner = sim.interner.intern("Americans");
+            let plant_type = resources.rules.object("GAPOWR").unwrap();
+            // Both fixture houses already have plants far from the flight.
+            // Supply a nearer target inside the same checked level corridor,
+            // so 900 frames bounds an approach rather than an arbitrary trek
+            // across the whole map after a target change.
+            let plant = (x + 1..=x + 7)
+                .flat_map(|px| (y - 1..=y).map(move |py| (px, py)))
+                .find_map(|(px, py)| {
+                    crate::sim::build_site::can_place_building_at(
+                        sim,
+                        &resources.rules,
+                        Some(&resources.overlay_registry),
+                        plant_type,
+                        (px as i16, py as i16),
+                        Some(owner),
+                        None,
+                        None,
+                    )
+                    .then(|| sim.spawn_object("GAPOWR", "Americans", px, py, 0, &resources.rules))
+                    .flatten()
+                })
+                .expect("a nearby power plant fits the flight corridor");
             let kirov = sim
                 .spawn_object_with_overlay_registry(
                     "ZEP",
@@ -1859,10 +2135,11 @@ mod tests {
                 )
                 .expect("Kirov spawns");
             sim.resolve_type_handles(&resources.rules);
-            let now = sim.session.binary_frame;
-            sim.mission_assign_exact(kirov, MissionId::from_known(MissionType::Hunt), now)
+            let now = sim.session.binary_frame();
+            sim.substrate
+                .mission_assign_exact(kirov, MissionId::from_known(MissionType::Hunt), now)
                 .unwrap();
-            kirov
+            (kirov, plant)
         };
         let center = |sim: &crate::sim::world::Simulation, id: u64| {
             let entity = sim.substrate.entities.get(id).unwrap();
@@ -1871,9 +2148,20 @@ mod tests {
                 sim.resolved_terrain.as_ref(),
             )
         };
-        // Each target whose cell the Kirov takes as its NavCom, and how close
-        // it comes to that target while holding it.
-        let mut approached = std::collections::BTreeMap::new();
+        let goal = center(&scenario.runtime.simulation, plant);
+        let initial_health = scenario
+            .runtime
+            .simulation
+            .substrate
+            .entities
+            .get(plant)
+            .unwrap()
+            .health
+            .current();
+        let mut closest = i32::MAX;
+        let mut held_target = false;
+        let mut fired = false;
+        let mut damaged = false;
         for frame in 0..900u32 {
             retail_frame(&mut scenario, Vec::new());
             let sim = &scenario.runtime.simulation;
@@ -1883,30 +2171,22 @@ mod tests {
                 MissionId::from_known(MissionType::Hunt),
                 "frame {frame}"
             );
-            let Some(crate::sim::combat::TargetKind::Entity(target)) =
-                entity.attack_target.target()
-            else {
-                continue;
-            };
-            let goal = center(sim, target);
-            let goal_cell = crate::sim::components::NavTargetRef::cell(
-                (goal.x / 256) as u16,
-                (goal.y / 256) as u16,
-            );
-            if entity.navigation.nav_com() == Some(goal_cell) {
-                approached.entry(target).or_insert(i32::MAX);
-            }
-            if let Some(closest) = approached.get_mut(&target) {
-                let at = center(sim, kirov);
-                let off = ((at.x - goal.x) as f64).hypot((at.y - goal.y) as f64) as i32;
-                *closest = (*closest).min(off);
+            held_target |= entity.attack_target.target()
+                == Some(crate::sim::combat::TargetKind::Entity(plant));
+            fired |= entity.rearm_timer.duration() > 0;
+            let at = center(sim, kirov);
+            closest = closest.min(((at.x - goal.x) as f64).hypot((at.y - goal.y) as f64) as i32);
+            damaged |= sim
+                .substrate
+                .entities
+                .get(plant)
+                .is_none_or(|target| target.health.current() < initial_health);
+            if held_target && fired && damaged && closest < 256 {
+                return;
             }
         }
-        // BlimpBomb's range is 1.5 cells (384 leptons): the Kirov closes past
-        // it.
-        assert!(
-            approached.values().any(|&closest| closest < 256),
-            "{approached:?}"
+        panic!(
+            "Hunt did not finish its fixed-target bombing approach: closest={closest}, held_target={held_target}, fired={fired}, damaged={damaged}"
         );
     }
 
@@ -1965,7 +2245,7 @@ mod tests {
         let strength = sim.substrate.entities.get(tank).unwrap().health.current();
         let mut orders = vec![CommandEnvelope::new(
             sim.interner.get("Americans").expect("house"),
-            sim.session.tick + 1,
+            sim.session.tick() + 1,
             Command::Attack {
                 attacker_id: disc,
                 target_id: tank,

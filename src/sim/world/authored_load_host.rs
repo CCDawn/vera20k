@@ -8,7 +8,6 @@ use crate::map::overlay_mark::OverlayCellAnim;
 use crate::map::resolved_terrain::{
     AutomaticTubeAllocation, AutomaticTubeRequest, ResolvedTerrainGrid, TerrainTileAnimation,
 };
-use crate::rules::art_data::AnimAssetBindError;
 use crate::sim::anim_class::{
     AnimConstructorInput, AnimDrawRuntime, AnimSpawnError, AnimWorldCoord,
 };
@@ -28,8 +27,6 @@ pub enum SimulationAuthoredLoadError {
     OverlayLifecycle(#[from] LoadOverlayLifecycleError),
     #[error(transparent)]
     Anim(#[from] AnimSpawnError),
-    #[error(transparent)]
-    AnimAsset(#[from] AnimAssetBindError),
 }
 
 /// Narrow host over the one staged Simulation. Geometry, overlay identity, and
@@ -83,7 +80,7 @@ impl<'a> SimulationAuthoredLoadHost<'a> {
             self.assets,
             self.theater_ext,
             self.theater_name,
-        )?;
+        );
         descriptor.type_name = self.sim.interner.intern(anim_name);
         let native_unique_id = self.next_native_id()?;
         self.sim
@@ -92,6 +89,7 @@ impl<'a> SimulationAuthoredLoadHost<'a> {
                 descriptor,
                 world,
                 AnimConstructorInput::AssignedIdentity(native_unique_id),
+                crate::sim::world::FrameEffects::default(),
             )
             .map_err(Into::into)
     }
@@ -100,6 +98,7 @@ impl<'a> SimulationAuthoredLoadHost<'a> {
 impl AuthoredOverlayLoadHost for SimulationAuthoredLoadHost<'_> {
     type Handle = LoadOverlayHandle;
     type Error = SimulationAuthoredLoadError;
+    type CellAnim = crate::sim::overlay_mark_host::OverlayCellAnimHandle;
 
     fn try_construct_overlay(
         &mut self,
@@ -109,7 +108,7 @@ impl AuthoredOverlayLoadHost for SimulationAuthoredLoadHost<'_> {
         if self.sim.native_unique_ids.is_none() {
             return Err(SimulationAuthoredLoadError::MissingNativeIdentity);
         }
-        let stable_id = self.sim.allocate_stable_id();
+        let stable_id = self.sim.substrate.allocate_stable_id();
         let (objects, cursor) = (
             &mut self.sim.load_objects,
             self.sim
@@ -156,9 +155,9 @@ impl AuthoredOverlayLoadHost for SimulationAuthoredLoadHost<'_> {
         };
         match kind {
             MapLoadDirtyKind::BaseMarkTactical | MapLoadDirtyKind::WallTactical => {
-                self.sim.tactical_dirty_cells.push(coord);
+                self.sim.dirty_cells.mark_tactical(coord);
             }
-            MapLoadDirtyKind::WallRadar => self.sim.mark_radar_terrain_dirty_cells([coord]),
+            MapLoadDirtyKind::WallRadar => self.sim.dirty_cells.mark_radar([coord]),
         }
         Ok(())
     }
@@ -208,6 +207,7 @@ impl AuthoredOverlayLoadHost for SimulationAuthoredLoadHost<'_> {
         )?;
         let applied = self
             .sim
+            .substrate
             .set_terrain_anim_z_adjust_after_construction(id, request.z_adjust);
         debug_assert!(applied);
         Ok(())
@@ -232,33 +232,32 @@ impl AuthoredOverlayLoadHost for SimulationAuthoredLoadHost<'_> {
         _handle: Self::Handle,
         request: OverlayCellAnim<'_>,
         terrain: &ResolvedTerrainGrid,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<Self::CellAnim, Self::Error> {
         self.rules.bind_authored_load_anim(
             request.anim,
             self.assets,
             self.theater_ext,
             self.theater_name,
-        )?;
+        );
         let ground = OverlayCellAnimGround::read(terrain, &request);
         let native_unique_id = self.next_native_id()?;
-        // Residual: the load-time CellClass+0x10A the tint copies is read
-        // from the Normal profile; its initialization order against
-        // ReadMapOverlayPacks is unverified. Retail OverlayTypes declare no
-        // CellAnim.
-        let lighting = self
-            .sim
-            .session
-            .lighting
-            .profile(crate::sim::scenario_session::ScenarioLightingProfile::Normal)
-            .into();
-        self.sim.construct_overlay_cell_anim(
+        // The common constructor publishes the original cell's light read
+        // into the same ordered initialization timeline as later buildings.
+        Ok(self.sim.construct_overlay_cell_anim(
             self.rules,
             request,
             ground,
-            lighting,
             AnimConstructorInput::AssignedIdentity(native_unique_id),
-        )?;
-        Ok(())
+            super::FrameEffects::default(),
+        )?)
+    }
+
+    fn tint_cell_anim(
+        &mut self,
+        anim: Self::CellAnim,
+        tiberium: crate::rules::tiberium_type::TiberiumTypeId,
+    ) {
+        self.sim.tint_overlay_cell_anim(self.rules, anim, tiberium);
     }
 
     fn finish_common(&mut self, handle: Self::Handle) -> Result<(), Self::Error> {
@@ -275,7 +274,7 @@ impl AuthoredOverlayLoadHost for SimulationAuthoredLoadHost<'_> {
 
     fn drain_deferred(&mut self) -> Result<(), Self::Error> {
         self.sim.process_pending_delete_with(
-            Some(self.rules),
+            self.rules,
             None,
             crate::sim::world::FrameEffects::default(),
             0,
@@ -285,7 +284,7 @@ impl AuthoredOverlayLoadHost for SimulationAuthoredLoadHost<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 mod tests {
     use super::*;
     use crate::map::source::test_support::TestDirectory;
@@ -297,14 +296,16 @@ mod tests {
     use crate::sim::{native_identity::NativeUniqueIdCursor, snapshot::GameSnapshot};
 
     fn load_rules() -> RuleSet {
-        let art_ini = IniFile::from_str(
-            "[LATE]\nLayer=ground\nShadow=no\nRate=900\nStartSound=TileStart\n\
-             [MISSING]\nImage=ABSENT\n",
-        );
-        let processed =
-            RulesLayerStack::new(IniFile::from_str("[Animations]\n0=LATE\n1=MISSING\n"))
-                .process_with_fixed_art(&art_ini)
-                .expect("process canonical ART read admission");
+        let art_ini =
+            IniFile::from_str("[LATE]\nLayer=ground\nShadow=no\nRate=900\nStartSound=TileStart\n");
+        let processed = RulesLayerStack::new(IniFile::from_str("[Animations]\n0=LATE\n"))
+            .process_with_fixed_art_and_sounds(
+                &art_ini,
+                &crate::rules::sound_ini::SoundRegistry::from_ini(&IniFile::from_str(
+                    "[SoundList]\n0=TileStart\n",
+                )),
+            )
+            .expect("process canonical ART read admission");
         let mut rules = RuleSet::from_processed_rules(&processed).unwrap();
         rules.install_art_data(ArtRegistry::from_ini(&art_ini));
         rules
@@ -341,7 +342,8 @@ mod tests {
         // consumes no Scenario draws, so use that seed to compare the full
         // world across the ordinary in-scenario restore handoff.
         let mut sim = Simulation::with_seed(0);
-        sim.session.map_name = "authored ART owner".into();
+        sim.session
+            .set_map_name_for_test("authored ART owner".into());
         sim.native_unique_ids = Some(NativeUniqueIdCursor::test_at_current_value(700));
         let before_rng = sim.rng_state();
         SimulationAuthoredLoadHost::new(&mut sim, &mut rules, &assets, "TEM", "TEMPERATE")
@@ -350,12 +352,12 @@ mod tests {
 
         let (&id, anim) = sim.anims().next().expect("one constructed terrain Anim");
         assert_eq!(sim.anims().count(), 1);
-        assert_eq!(anim.native_unique_id, 701);
-        assert_eq!(anim.effective_end, 2);
-        assert_eq!(anim.z_adjust, -7);
-        assert!(anim.terrain_attached && anim.use_cell_drawer && anim.start_sound_active);
+        assert_eq!(anim.native_unique_id(), 701);
+        assert_eq!(anim.effective_end(), 2);
+        assert_eq!(anim.z_adjust(), -7);
+        assert!(anim.terrain_attached() && anim.use_cell_drawer() && anim.start_sound_active());
         assert_eq!(
-            sim.anim_display_layer(id, Some(&rules)),
+            sim.anim_display_layer(id, &rules),
             Some(DisplayLayer::GROUND)
         );
         assert_eq!(sim.substrate.display.members(DisplayLayer::GROUND), &[id]);
@@ -397,31 +399,16 @@ mod tests {
         assert_eq!(restored.rng_state(), sim.rng_state());
         assert_eq!(restored.state_hash(), sim.state_hash());
         assert_eq!(
-            restored.anim_display_layer(id, Some(&rules)),
+            restored.anim_display_layer(id, &rules),
             Some(DisplayLayer::GROUND)
         );
-
-        let before_failure = sim.state_hash();
-        let mut missing = request.clone();
-        missing.anim_name = "MISSING".into();
-        assert!(
-            SimulationAuthoredLoadHost::new(&mut sim, &mut rules, &assets, "TEM", "TEMPERATE")
-                .construct_terrain_attached_anim(&missing)
-                .is_err()
-        );
-        assert_eq!(
-            sim.native_unique_ids.as_ref().unwrap().current_raw(),
-            701,
-            "strict load failure precedes native ID allocation, unlike runtime spawn"
-        );
-        assert_eq!(sim.state_hash(), before_failure);
-        assert_eq!(sim.rng_state(), before_rng);
-        assert_eq!(rules.simulation_config_hash(), bound_rules_hash);
 
         // A fresh staged load does not inherit the previous match's bound set.
         let mut reload_rules = load_rules();
         let mut reload = Simulation::with_seed(0);
-        reload.session.map_name = "authored ART owner".into();
+        reload
+            .session
+            .set_map_name_for_test("authored ART owner".into());
         reload.native_unique_ids = Some(NativeUniqueIdCursor::test_at_current_value(700));
         SimulationAuthoredLoadHost::new(
             &mut reload,

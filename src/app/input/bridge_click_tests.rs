@@ -19,13 +19,20 @@ fn click_cell(
     camera: (f32, f32),
     zoom: f32,
     heights: &BTreeMap<(u16, u16), u8>,
-    bridges: &dyn crate::map::terrain::TacticalBridgeLookup,
+    bridges: &BTreeMap<(u16, u16), TacticalBridgeCell>,
 ) -> (u16, u16) {
     // Only the test's forward view transform is local. Its inverse and the
     // world -> cell resolution are the same owners used by tactical orders.
     let screen = ((point.0 - camera.0) * zoom, (point.1 - camera.1) * zoom);
     let world = screen_point_to_world_with_camera(screen, camera, zoom);
-    world_point_to_cell(world.0, world.1, heights, Some(bridges))
+    world_point_to_cell(
+        world.0,
+        world.1,
+        Some(&crate::map::terrain::TacticalCellFixture {
+            levels: heights,
+            bridges: Some(bridges),
+        }),
+    )
 }
 
 fn ordinary_move(
@@ -36,7 +43,7 @@ fn ordinary_move(
 ) -> CommandEnvelope {
     let issued = CommandEnvelope::new(
         owner,
-        sim.session.tick,
+        sim.session().tick(),
         Command::Move {
             entity_id,
             target_rx: goal.0,
@@ -78,16 +85,15 @@ fn commandable_movers() -> (Simulation, crate::sim::intern::InternedId, [u64; 2]
     use crate::sim::house_state::HouseState;
 
     let mut sim = Simulation::new();
-    let owner = sim.interner.intern("Americans");
-    sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, false, 0, 10));
-    sim.session.house_order = vec![owner];
-    sim.session.tick = 123;
+    let owner = sim.intern("Americans");
+    sim.houses_mut_for_test()
+        .register(HouseState::new(owner, 0, None, false, 0, 10));
+    sim.session_mut_for_test().set_tick_for_test(123);
     for (id, type_name, category) in [
         (42, "MTNK", EntityCategory::Unit),
         (43, "E1", EntityCategory::Infantry),
     ] {
-        let type_ref = sim.interner.intern(type_name);
+        let type_ref = sim.intern(type_name);
         let mut entity = GameEntity::new_at_frame_zero_for_test(
             id,
             60,
@@ -103,7 +109,7 @@ fn commandable_movers() -> (Simulation, crate::sim::intern::InternedId, [u64; 2]
             false,
         );
         entity.lifecycle.set_in_limbo_for_test(false);
-        sim.entities_mut().insert(entity);
+        sim.entities_mut_for_test().insert(entity);
     }
     (sim, owner, [42, 43])
 }
@@ -197,7 +203,7 @@ fn native_bridge_destinations_survive_camera_zoom_and_ordinary_move_records() {
                     for mover in movers {
                         let command = ordinary_move(&sim, owner, mover, goal);
                         sim.queue_command(command.clone());
-                        assert_eq!(sim.take_due_commands(), vec![command]);
+                        assert_eq!(sim.take_frame_commands_for_test(), vec![command]);
                     }
                 }
             }
@@ -242,21 +248,21 @@ fn spawn_retail_mover(
         simulation: sim,
         resources,
     } = &mut scenario.runtime;
-    let owner = sim.interner.intern("Americans");
-    let house = sim.houses.entry(owner).or_insert_with(|| {
-        crate::sim::house_state::HouseState::new(owner, 0, None, true, 10_000, 10)
-    });
+    let owner = sim.intern("Americans");
+    let house = sim
+        .houses_mut_for_test()
+        .get_or_register_for_test(owner, || {
+            crate::sim::house_state::HouseState::new(owner, 0, None, true, 10_000, 10)
+        });
     // This is an authored local input fixture. A headless retail scenario
     // does not bind its Americans house to the local player; supply the
     // controller prior read by House50B6F0/50B730 before spawning the mover.
-    house.is_human = true;
-    house.player_control = true;
-    sim.session.current_house = Some(owner);
-    for house in sim.houses.values_mut() {
-        house.multiplay_passive = true;
-    }
-    if !sim.session.house_order.contains(&owner) {
-        sim.session.house_order.push(owner);
+    house.set_is_human_for_test(true);
+    house.set_player_control_for_test(true);
+    sim.session_mut_for_test()
+        .set_current_house_for_test(Some(owner));
+    for house in sim.houses_mut_for_test().values_mut() {
+        house.set_multiplay_passive_for_test(true);
     }
     let entity = sim
         .spawn_object(
@@ -280,21 +286,14 @@ fn follow_clicked_goal(
     expected: (u16, u16),
     expected_on_bridge: bool,
 ) {
-    let bridges = crate::app::match_runtime::sim_tick::tactical_bridge_cells(scenario.sim())
+    let bridges = crate::app::match_runtime::sim_tick::tactical_cells(scenario.sim())
         .expect("retail terrain");
     // Noninteger camera coordinates and zoom exercise the production adapter.
-    let goal = click_cell(
-        point,
-        (-100.25, 1800.5),
-        1.25,
-        &scenario
-            .sim()
-            .resolved_terrain
-            .as_ref()
-            .unwrap()
-            .build_height_map(),
-        bridges,
-    );
+    let camera = (-100.25, 1800.5);
+    let zoom = 1.25;
+    let screen = ((point.0 - camera.0) * zoom, (point.1 - camera.1) * zoom);
+    let world = screen_point_to_world_with_camera(screen, camera, zoom);
+    let goal = world_point_to_cell(world.0, world.1, Some(bridges));
     assert_eq!(goal, expected, "retail click {point:?}");
     let facts = scenario
         .sim()
@@ -455,7 +454,7 @@ fn advance_input_fixture(sim: &mut Simulation, rules: &crate::rules::ruleset::Ru
 #[test]
 fn shift_walk_cell_input_uses_ordinary_resolver_and_move_record() {
     let (sim, rules, actor) = Simulation::walk_cell_input_test_scene(false);
-    let owner = sim.interner.get("Local").unwrap();
+    let owner = sim.interner().get("Local").unwrap();
     let clicked = (11, 5);
     let ordinary =
         super::commands::ordinary_cell_move_goal(&sim, &rules, None, owner, actor, clicked, false)
@@ -475,7 +474,7 @@ fn shift_walk_cell_input_uses_ordinary_resolver_and_move_record() {
     assert_ne!(shifted, clicked, "the resolver must choose the near bank");
     let issued = CommandEnvelope::new(
         owner,
-        sim.session.tick,
+        sim.session().tick(),
         Command::Move {
             entity_id: actor,
             target_rx: shifted.0,
@@ -492,7 +491,7 @@ fn shift_walk_cell_input_uses_ordinary_resolver_and_move_record() {
 fn ordinary_walk_cell_input_reaches_near_bank_and_valid_high_bridge() {
     for bridge in [false, true] {
         let (mut sim, rules, actor) = Simulation::walk_cell_input_test_scene(bridge);
-        let owner = sim.interner.get("Local").unwrap();
+        let owner = sim.interner().get("Local").unwrap();
         let clicked = if bridge { (9, 6) } else { (11, 5) };
         let chosen = super::commands::ordinary_cell_move_goal(
             &sim, &rules, None, owner, actor, clicked, false,
@@ -519,7 +518,7 @@ fn ordinary_walk_cell_input_reaches_near_bank_and_valid_high_bridge() {
             })
         );
         assert!(
-            e.navigation.path_replay.remaining_directions().is_empty(),
+            e.navigation.path_replay().remaining_directions().is_empty(),
             "command accepts before Process search"
         );
         for _ in 0..250 {
@@ -548,7 +547,7 @@ fn ordinary_walk_cell_input_reaches_near_bank_and_valid_high_bridge() {
 #[test]
 fn encoded_walk_destination_survives_topology_change_before_due_frame() {
     let (mut sim, rules, actor) = Simulation::walk_cell_input_test_scene(true);
-    let owner = sim.interner.get("Local").unwrap();
+    let owner = sim.interner().get("Local").unwrap();
     let clicked = (9, 6);
     let chosen =
         super::commands::ordinary_cell_move_goal(&sim, &rules, None, owner, actor, clicked, false)
@@ -557,7 +556,7 @@ fn encoded_walk_destination_survives_topology_change_before_due_frame() {
     let mut order = ordinary_move(&sim, owner, actor, chosen);
     // The scheduler drains commands for the NEXT frame. Leave one full
     // object turn before this already-encoded destination becomes due.
-    order.execute_tick = sim.session.tick + 2;
+    order.execute_tick = sim.session().tick() + 2;
     sim.queue_command(order.clone());
     sim.close_walk_input_test_bridge(&rules);
     assert_ne!(
@@ -577,7 +576,7 @@ fn encoded_walk_destination_survives_topology_change_before_due_frame() {
         e.locomotor.as_ref().unwrap().walk_destination_cell(),
         Some(clicked)
     );
-    assert!(e.navigation.path_replay.remaining_directions().is_empty());
+    assert!(e.navigation.path_replay().remaining_directions().is_empty());
     // This proves exact event installation. The following failed-Process and
     // same-slot Move restart remain the separately documented open increment.
 }
@@ -585,14 +584,14 @@ fn encoded_walk_destination_survives_topology_change_before_due_frame() {
 #[test]
 fn direct_simulation_walk_move_is_an_already_resolved_destination() {
     let (mut sim, rules, actor) = Simulation::walk_cell_input_test_scene(false);
-    let owner = sim.interner.get("Local").unwrap();
+    let owner = sim.interner().get("Local").unwrap();
     assert_ne!(
         super::commands::ordinary_cell_move_goal(&sim, &rules, None, owner, actor, (9, 5), false),
         Some((9, 5))
     );
     sim.queue_command(CommandEnvelope::new(
         owner,
-        sim.session.tick,
+        sim.session().tick(),
         Command::Move {
             entity_id: actor,
             target_rx: 9,

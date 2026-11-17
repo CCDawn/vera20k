@@ -36,7 +36,7 @@ impl Simulation {
         &mut self,
         id: u64,
         family: TrackFamily,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         frame_effects: FrameEffects<'_>,
     ) -> Result<bool, String> {
         let Some(entity) = self.substrate.entities.get(id) else {
@@ -67,7 +67,7 @@ impl Simulation {
         if !super::motion_query::is_moving(entity).unwrap_or(false)
             && entity
                 .navigation
-                .path_replay
+                .path_replay()
                 .remaining_directions()
                 .is_empty()
         {
@@ -92,11 +92,7 @@ impl Simulation {
     /// Infantry object (What_Am_I 0xF at 0x4B05F3)
     /// asks it for its coordinate (vt+0x4C with the Foot as requester) and
     /// calls the locomotor Move_To only when that differs from +34.
-    fn reaim_drive_infantry_navcom(
-        &mut self,
-        id: u64,
-        rules: Option<&RuleSet>,
-    ) -> Result<(), String> {
+    fn reaim_drive_infantry_navcom(&mut self, id: u64, rules: &RuleSet) -> Result<(), String> {
         let entities = &self.substrate.entities;
         let Some(entity) = entities.get(id) else {
             return Ok(());
@@ -118,7 +114,7 @@ impl Simulation {
             Some(id),
             self,
             self.resolved_terrain.as_ref(),
-            rules.map(|rules| (rules, &self.interner)),
+            Some((rules, &self.interner)),
         )?;
         let terrain = self.resolved_terrain.as_ref();
         if let Some(entity) = self.substrate.entities.get_mut(id) {
@@ -126,7 +122,7 @@ impl Simulation {
                 entity,
                 coord,
                 terrain,
-                self.session.binary_frame,
+                self.session.binary_frame(),
             );
         }
         Ok(())

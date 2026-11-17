@@ -29,19 +29,19 @@
 //! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
 use super::TargetKind;
-use super::armor_index;
 use super::veterancy::RANK_ELITE_U16;
 use crate::map::entities::EntityCategory;
-use crate::map::houses::{HouseAllianceMap, is_allied_with};
 use crate::map::resolved_terrain::{NativeCellQuery, ResolvedTerrainGrid};
+use crate::rules::armor::ArmorId;
 use crate::rules::locomotor_type::SpeedType;
-use crate::rules::object_type::{ObjectType, WEAPON_SLOT_COUNT};
+use crate::rules::object_type::{ObjectType, WEAPON_SLOT_SECONDARY};
 use crate::rules::ruleset::RuleSet;
 use crate::rules::terrain_rules::LandType;
 use crate::rules::warhead_type::WarheadType;
 use crate::rules::weapon_type::WeaponType;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::game_entity::GameEntity;
+use crate::sim::house_diplomacy::HouseAlliances;
 use crate::sim::intern::{InternedId, StringInterner};
 use crate::sim::mission::MissionType;
 use crate::sim::world::Simulation;
@@ -54,6 +54,25 @@ use crate::sim::world::Simulation;
 pub enum WeaponSlot {
     Primary,
     Secondary,
+}
+
+/// The modeled fields of a native WeaponStruct, borrowed at the query point.
+/// An existing record may have no WeaponType and still retain its FLH.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WeaponRecord<'a> {
+    pub weapon_id: Option<&'a str>,
+    pub flh: crate::rules::flh::Flh,
+    /// `weapon_id` as the type's RuleSet resolved it.
+    resolved: crate::rules::ruleset::ResolvedWeapon,
+}
+
+impl WeaponRecord<'_> {
+    /// The record's WeaponType pointer: `rules.weapon(self.weapon_id?)`,
+    /// read through the handle the type resolved when `rules` built it.
+    #[inline]
+    pub(crate) fn weapon<'r>(&self, rules: &'r RuleSet) -> Option<&'r WeaponType> {
+        rules.resolved_weapon(self.weapon_id?, self.resolved)
+    }
 }
 
 /// Result of weapon selection: the chosen weapon and its warhead.
@@ -120,6 +139,8 @@ pub struct AttackerFacts {
     /// `AircraftClass+0x6CA` spawn retreat/collision flag
     /// (`SpawnRetreat__Push 0x0054E47D`).
     pub aircraft_spawn_collision: bool,
+    /// `TechnoClass+0x2FC` Ammo, which Ares' NoAmmoWeapon arm reads.
+    pub ammo: i32,
 }
 
 /// Flight virtuals are queried only where the selection ladder asks them.
@@ -304,15 +325,21 @@ pub fn weapon_damage_value(
 
 /// The house (`+0x21C`) of whoever mind-controls (`+0x2C0`) the
 /// `OpenTopped=` transport (`+0x11C`, TechnoType `+0x5E4`) `rider` rides:
-/// the threat scan's (`0x006F7EA2..0x006F7ED8`, `0x006F89D1..0x006F8A0A`)
-/// and the allied-target drop's (`0x006FA30C..0x006FA342`).
+/// the threat scan's (`0x006F7EA2..0x006F7ED8`, `0x006F89D1..0x006F8A0A`),
+/// `Greatest_Threat`'s global walk (`0x006F8FA8..0x006F8FD7`) and the
+/// allied-target drop's (`0x006FA30C..0x006FA342`).
+///
+/// These reads use `TechnoClass+0x11C` Transporter, not VERA's wider carrier
+/// relation: a garrison occupant or a `CargoClass::AddPassenger` cargo rider
+/// stores a carrier without setting Transporter (vera20k#3838), so it has no
+/// controlled-transport house.
 pub(crate) fn controlled_transport_house(
     entities: &EntityStore,
     rules: &RuleSet,
     interner: &StringInterner,
     rider: &GameEntity,
 ) -> Option<InternedId> {
-    let transport = entities.get(rider.passenger_role.inside_transport_id()?)?;
+    let transport = entities.get(rider.passenger_role.transporter()?)?;
     let open_topped = interner
         .object_type(transport.type_ref(), rules)
         .is_some_and(|obj| obj.open_topped);
@@ -332,25 +359,58 @@ pub(crate) fn weapon_for_index(
     obj: &ObjectType,
     veterancy: u16,
     index: i32,
-) -> Option<(&str, WeaponSlot)> {
+) -> Option<WeaponRecord<'_>> {
     if index < 0 {
         return None;
     }
     let slot_index = usize::try_from(index).ok()?;
-    if slot_index >= WEAPON_SLOT_COUNT {
+    // Ares7177C0/7177E0 ->1003DBC0 exposes the extension WeaponStruct
+    // vectors beyond the original eighteen (TechnoTypeClass_GetWeapon
+    // 10042510, TechnoTypeClass_GetEliteWeapon 100424E0). The type owns
+    // their lifetime.
+    let slot_count = obj.weapon_record_count();
+    if slot_index >= slot_count {
         return None;
     }
-    let weapon_id = if uses_elite_weapon(obj, veterancy, slot_index) {
+    let elite = uses_elite_weapon(obj, veterancy, slot_index);
+    let weapon_id = if elite {
         obj.elite_weapon_at(slot_index)
     } else {
         obj.weapon_at(slot_index)
-    }?;
-    let slot = if slot_index == 1 {
-        WeaponSlot::Secondary
-    } else {
-        WeaponSlot::Primary
     };
-    Some((weapon_id, slot))
+    Some(WeaponRecord {
+        weapon_id,
+        flh: obj.weapon_flh(index, elite),
+        resolved: obj.resolved_weapons().slot(slot_index, elite),
+    })
+}
+
+/// `TechnoClass::IsNotSprayAttack @ 0x0070DD70`: the type's `SprayAttack`
+/// byte at `+0x691`, negated. `GetDeployWeapon @ 0x0070E120` consumes this
+/// full 0/1 result as its `GetWeapon @ 0x0070E140` index.
+pub(crate) fn is_not_spray_attack(obj: &ObjectType) -> bool {
+    !obj.spray_attack
+}
+
+/// `TechnoClass::GetDeployWeapon @ 0x0070E120`: choose slot 1 unless the type
+/// is `SprayAttack`, then forward that index through the sole `GetWeapon`
+/// owner above. The index remains available when the selected WeaponStruct's
+/// WeaponType pointer is null, as it is in native's fixed slot array.
+pub(crate) fn deploy_weapon(obj: &ObjectType, veterancy: u16) -> (i32, Option<(&str, WeaponSlot)>) {
+    let index = if is_not_spray_attack(obj) { 1 } else { 0 };
+    let weapon = weapon_for_index(obj, veterancy, index)
+        .and_then(|record| record.weapon_id)
+        .map(|id| {
+            (
+                id,
+                if index == 1 {
+                    WeaponSlot::Secondary
+                } else {
+                    WeaponSlot::Primary
+                },
+            )
+        });
+    (index, weapon)
 }
 
 /// Whether `TechnoClass::GetWeapon @ 0x0070E140` answers slot `index` with the
@@ -363,12 +423,28 @@ pub(crate) fn uses_elite_weapon(obj: &ObjectType, veterancy: u16, index: usize) 
 
 /// `GetWeapon(0)` weapon id at the given veterancy.
 pub(crate) fn primary_for_tier(obj: &ObjectType, veterancy: u16) -> Option<&str> {
-    weapon_for_index(obj, veterancy, 0).map(|(weapon_id, _)| weapon_id)
+    weapon_for_index(obj, veterancy, 0).and_then(|record| record.weapon_id)
+}
+
+/// TechnoType query `0x00712130`: normal primary is required; either the
+/// two records share a WeaponType or one has signed `Burst > 1`.
+/// Building Mission_Attack44B2D0 asks the first installed upgrade's type,
+/// independently of the host's rank, selected index and actual GetWeapon.
+pub(crate) fn has_shared_or_bursting_weapons(obj: &ObjectType, rules: &RuleSet) -> bool {
+    let Some(primary) = obj.primary() else {
+        return false;
+    };
+    let secondary = obj.weapon_at(WEAPON_SLOT_SECONDARY);
+    secondary == Some(primary)
+        || rules.weapon(primary).is_some_and(|weapon| weapon.burst > 1)
+        || secondary
+            .and_then(|id| rules.weapon(id))
+            .is_some_and(|weapon| weapon.burst > 1)
 }
 
 /// `GetWeapon(1)` weapon id at the given veterancy.
 pub(crate) fn secondary_for_tier(obj: &ObjectType, veterancy: u16) -> Option<&str> {
-    weapon_for_index(obj, veterancy, 1).map(|(weapon_id, _)| weapon_id)
+    weapon_for_index(obj, veterancy, 1).and_then(|record| record.weapon_id)
 }
 
 /// The native "does this object have a weapon" predicate. **Exactly one weapon
@@ -386,12 +462,12 @@ pub(crate) fn secondary_for_tier(obj: &ObjectType, veterancy: u16) -> Option<&st
 /// (`vt+0x400`, `BuildingClass::IsOccupied 0x00458DD0`) is armed
 /// unconditionally, otherwise it falls through to the Techno test.
 ///
-/// So the `Secondary` slot never makes an object armed, and a `TurretCount>0`
-/// type is armed only through its *current gunner* slot — which is why this is
+/// A non-turret type is armed only through slot 0; a `TurretCount>0`
+/// type is armed only through its current gunner slot — which is why this is
 /// still a distinct predicate from reading `obj.primary()`, even now that
 /// `obj.primary()` is the native `Primary` field for every type (see
 /// `native_processing::WeaponSlots`). The elite tier is applied by `GetWeapon`,
-/// so the read goes through `weapon_for_index`.
+/// so the read goes through the live [`current_weapon`] query.
 ///
 /// Verified call sites of this predicate, all reached in ordinary play:
 /// - `TechnoClass::CanAcquireTarget @ 0x007091D0` ends with
@@ -405,16 +481,16 @@ pub(crate) fn secondary_for_tier(obj: &ObjectType, veterancy: u16) -> Option<&st
 ///   `FootClass::Evaluate_Target_Threat @ 0x004D97A0`.
 /// - `UnitClass::Can_Enter_Cell @ 0x0073F0A0` wall-overlay and enemy-gate arms.
 ///
-/// RESIDUAL (UNCHECKED, zero stock frequency): `BuildingClass::GetWeapon
-/// @ 0x004526F0` resolves a non-occupied building's slot through an upgrade
-/// loop (`count [+0x702]` over `[+0x5EC]`) that VERA does not model. No stock
-/// section pairs a weaponised upgrade with a building; only `[GAPOWR]`/
-/// `[YAPOWR]` declare `Upgrades=`, and those are capacity upgrades. Native also
-/// tests the resolved `WeaponType` pointer where VERA tests whether the slot
-/// names an id, so a type naming a weapon absent from `[WeaponTypes]` is armed
-/// here and unarmed in gamemd — a data-error-only divergence.
-pub fn is_armed(entity: &GameEntity, obj: &ObjectType) -> bool {
-    is_armed_from_facts(obj, attacker_facts(entity, obj))
+pub fn is_armed(
+    entity: &GameEntity,
+    obj: &ObjectType,
+    entities: &EntityStore,
+    rules: &RuleSet,
+    interner: &StringInterner,
+) -> bool {
+    // Building458DB0 returns true before GetCurrentWeapon for an occupied
+    // host, even when the current firing occupant has no weapon.
+    is_occupied(entity, obj) || current_weapon(entity, obj, entities, rules, interner).is_some()
 }
 
 /// Aircraft auxiliary+18/41B7F0: the primary projectile selects the attack
@@ -422,8 +498,7 @@ pub fn is_armed(entity: &GameEntity, obj: &ObjectType) -> bool {
 pub(crate) fn aircraft_strafes(rules: &RuleSet, obj: &ObjectType, veterancy: u16) -> bool {
     primary_for_tier(obj, veterancy)
         .and_then(|name| rules.weapon(name))
-        .and_then(|weapon| weapon.projectile.as_deref())
-        .and_then(|name| rules.projectile(name))
+        .and_then(|weapon| rules.weapon_projectile(weapon))
         .is_some_and(|projectile| projectile.rot <= 1 && !projectile.inviso)
 }
 
@@ -444,7 +519,14 @@ pub(crate) fn weapon_range(
     let Some(weapon) = get_weapon(entity, obj, index, entities, rules, interner) else {
         return 0;
     };
-    let range = weapon.range_leptons;
+    let source =
+        crate::sim::attach_effect::range_modifier_source(entity, Some(entities), rules, interner);
+    let range = crate::sim::attach_effect::range_with_attach_effects(
+        source,
+        &weapon.id,
+        weapon.range_leptons,
+        rules,
+    );
     open_topped_cargo_range(entity, obj, entities, rules, interner)
         .map_or(range, |cargo| range.min(cargo))
 }
@@ -475,9 +557,19 @@ pub(crate) fn open_topped_cargo_range(
             continue;
         };
         if let Some(weapon) = current_weapon(passenger, kind, entities, rules, interner) {
-            shortest = Some(shortest.map_or(weapon.range_leptons, |range: i32| {
-                range.min(weapon.range_leptons)
-            }));
+            let source = crate::sim::attach_effect::range_modifier_source(
+                passenger,
+                Some(entities),
+                rules,
+                interner,
+            );
+            let range = crate::sim::attach_effect::range_with_attach_effects(
+                source,
+                &weapon.id,
+                weapon.range_leptons,
+                rules,
+            );
+            shortest = Some(shortest.map_or(range, |shortest: i32| shortest.min(range)));
         }
     }
     shortest
@@ -507,14 +599,15 @@ pub fn current_weapon<'r>(
     get_weapon(entity, obj, index, entities, rules, interner)
 }
 
-pub(crate) fn is_armed_from_facts(obj: &ObjectType, facts: AttackerFacts) -> bool {
-    // `BuildingClass::Is_Armed 0x00458DB0`: `IsOccupied() → 1`.
-    if facts.is_occupied_building {
-        return true;
-    }
-    // `GetCurrentWeapon 0x0070E1A0`: gunner slot iff `HasTurrets`, else slot 0.
-    let index = current_weapon_index(obj, facts);
-    weapon_for_index(obj, facts.veterancy, index).is_some()
+/// [`current_weapon`] of a freshly constructed object that is not on the map,
+/// such as the building being placed (`Display+0x11A4`). It has no upgrades,
+/// occupants or elite rank, and every retail building has `TurretCount=0`, so
+/// `GetCurrentWeapon @ 0x0070E1A0` reads weapon slot 0.
+pub fn fresh_object_current_weapon<'r>(
+    obj: &'r ObjectType,
+    rules: &'r RuleSet,
+) -> Option<&'r WeaponType> {
+    weapon_for_index(obj, 0, 0)?.weapon(rules)
 }
 
 /// `TechnoClass::SelectNavalTargetingWeapon @ 0x006F3820` (vtable `+0x2E8`,
@@ -566,10 +659,8 @@ pub(crate) fn select_naval_targeting_weapon(obj: &ObjectType, target: Option<&Ta
 }
 
 fn projectile_aa(rules: &RuleSet, weapon: &WeaponType) -> bool {
-    weapon
-        .projectile
-        .as_ref()
-        .and_then(|id| rules.projectile(id))
+    rules
+        .weapon_projectile(weapon)
         .is_some_and(|projectile| projectile.aa)
 }
 
@@ -579,10 +670,8 @@ fn projectile_aa(rules: &RuleSet, weapon: &WeaponType) -> bool {
 /// defaults (AA=no, AG=yes), as weapon selection does; retail weapons always
 /// name one.
 fn weapon_class_bits(rules: &RuleSet, weapon: &WeaponType) -> u32 {
-    let (aa, ag) = weapon
-        .projectile
-        .as_ref()
-        .and_then(|id| rules.projectile(id))
+    let (aa, ag) = rules
+        .weapon_projectile(weapon)
         .map_or((false, true), |projectile| (projectile.aa, projectile.ag));
     let mut bits = 0;
     if aa {
@@ -601,10 +690,6 @@ fn weapon_class_bits(rules: &RuleSet, weapon: &WeaponType) -> u32 {
 /// 0x0051E2C7..0x0051E319` and `BuildingClass @ 0x00445F00` take slots 0
 /// and 1. Each slot is the scanner's GetWeapon ([`get_weapon`]), so an
 /// occupied building answers its firing occupant's weapon for either index.
-///
-/// Building4526F0's installed-upgrade substitution remains unrepresented:
-/// the audited 184 stock maps have no authored upgrade selectors, and the
-/// existing installer is authored-only. This is not generic upgrade parity.
 pub(crate) fn passive_scan_class_bits<'r>(
     rules: &'r RuleSet,
     obj: &ObjectType,
@@ -622,6 +707,8 @@ pub(crate) fn passive_scan_class_bits<'r>(
 /// Warhead `+0x149`, which the Verses parse sets (`0x0075DE5A..0x0075DE9A`)
 /// when the exact doubles `Verses[4]` and `Verses[6]` are both `0.0`, read
 /// through slot 0's weapon at the live tier (`0x0051E329..0x0051E343`).
+/// Ares3.0 reader hook75DDCC ->10054410 skips that derivation and clears
+/// the flag at75DE98. The rule owner retains this distinction from its table.
 pub(crate) fn primary_warhead_spares_medium_and_wood(
     rules: &RuleSet,
     obj: &ObjectType,
@@ -629,22 +716,17 @@ pub(crate) fn primary_warhead_spares_medium_and_wood(
 ) -> bool {
     let warhead = primary_for_tier(obj, veterancy)
         .and_then(|id| rules.weapon(id))
-        .and_then(|weapon| warhead_of(rules, weapon));
-    verses_is_zero(warhead, 4) && verses_is_zero(warhead, 6)
-}
-
-pub(crate) fn warhead_of<'a>(rules: &'a RuleSet, weapon: &WeaponType) -> Option<&'a WarheadType> {
-    weapon.warhead.as_ref().and_then(|id| rules.warhead(id))
+        .and_then(|weapon| rules.weapon_warhead(weapon));
+    warhead.is_some_and(WarheadType::uses_medium_wood_target_mask)
 }
 
 /// Native `FCOMP Verses[armor], 0.0` (`0x006F3705` / `0x006F3738`): the
 /// double is compared for exact equality with zero.
-fn verses_is_zero(warhead: Option<&WarheadType>, armor: usize) -> bool {
+fn verses_is_zero(warhead: Option<&WarheadType>, armor: ArmorId) -> bool {
     warhead.is_some_and(|warhead| {
-        warhead
-            .verses_f64
-            .get(armor)
-            .is_some_and(|verses| *verses == 0.0)
+        // Ares 3.0 hook10054360 retains numeric zero and secondary-first
+        // ordering. Its independent fire/acquisition flags do not select slots.
+        f64::from_bits(warhead.interaction(armor).multiplier().bits()) == 0.0
     })
 }
 
@@ -657,11 +739,12 @@ fn verses_is_zero(warhead: Option<&WarheadType>, armor: usize) -> bool {
 ///   `OpenTransportWeapon` inside an open-topped transport, otherwise slot 0.
 /// - `UnitClass @ 0x00746CD0`: a deployed (`+0x6E0`) `DeployFire=yes` vehicle
 ///   fires `DeployFireWeapon`; everything else runs the ladder.
-pub(crate) fn what_weapon_should_i_use(
-    rules: &RuleSet,
+pub(crate) fn what_weapon_should_i_use<'r>(
+    rules: &'r RuleSet,
     obj: &ObjectType,
     attacker: &AttackerFacts,
     target: Option<&TargetFacts>,
+    get_weapon: impl Fn(i32) -> Option<&'r WeaponType>,
 ) -> i32 {
     match attacker.kind {
         TechnoKind::Infantry if obj.deploy_fire => {
@@ -675,16 +758,51 @@ pub(crate) fn what_weapon_should_i_use(
         }
         _ => {}
     }
-    techno_what_weapon_should_i_use(rules, obj, attacker, target)
+    techno_what_weapon_should_i_use(rules, obj, attacker, target, get_weapon)
+}
+
+/// Whether the airstrike secondary is selected for a techno target.
+///
+/// Phobos gates it twice (`TechnoClass_WhatWeaponShouldIUse_Airstrike`,
+/// `0x6F348F`): the warhead's `AirstrikeTargets` must admit the kind, and the
+/// target type's `AllowAirstrike` must permit the type, defaulting to `CanC4`
+/// for a building and to targetable for every other kind. Without the feature
+/// this is the vanilla arm: a C4-able building that is not both a resource
+/// destination and a resource gatherer.
+fn airstrike_secondary_selected(
+    warhead: &WarheadType,
+    target_obj: &ObjectType,
+    kind: TechnoKind,
+) -> bool {
+    #[cfg(feature = "phobos")]
+    {
+        use crate::rules::airstrike_targets::AirstrikeKind;
+        let target_kind = match kind {
+            TechnoKind::Infantry => AirstrikeKind::Infantry,
+            TechnoKind::Unit => AirstrikeKind::Unit,
+            TechnoKind::Aircraft => AirstrikeKind::Aircraft,
+            TechnoKind::Building => AirstrikeKind::Building,
+        };
+        warhead.airstrike_targets.allows(target_kind)
+            && target_obj.allows_airstrike_weapon(kind == TechnoKind::Building)
+    }
+    #[cfg(not(feature = "phobos"))]
+    {
+        let _ = warhead;
+        kind == TechnoKind::Building
+            && target_obj.can_c4
+            && (!target_obj.resource_destination || !target_obj.resource_gatherer)
+    }
 }
 
 /// `TechnoClass::What_Weapon_Should_I_Use @ 0x006F3330`, arm by arm in native
 /// order. Addresses name the first instruction of each arm.
-fn techno_what_weapon_should_i_use(
-    rules: &RuleSet,
+fn techno_what_weapon_should_i_use<'r>(
+    rules: &'r RuleSet,
     obj: &ObjectType,
     attacker: &AttackerFacts,
     target: Option<&TargetFacts>,
+    get_weapon: impl Fn(i32) -> Option<&'r WeaponType>,
 ) -> i32 {
     // A @ 0x006F333B: turreted non-gattling types fire the gunner slot,
     // unconditionally (`-1` collapses to 0).
@@ -701,13 +819,10 @@ fn techno_what_weapon_should_i_use(
         return 0;
     }
     // C @ 0x006F3391 / D @ 0x006F33AB: both slots must resolve to a weapon.
-    let Some(secondary) =
-        secondary_for_tier(obj, attacker.veterancy).and_then(|id| rules.weapon(id))
-    else {
+    let Some(secondary) = get_weapon(1) else {
         return 0;
     };
-    let Some(primary) = primary_for_tier(obj, attacker.veterancy).and_then(|id| rules.weapon(id))
-    else {
+    let Some(primary) = get_weapon(0) else {
         return 0;
     };
     // E @ 0x006F33BF.
@@ -722,10 +837,19 @@ fn techno_what_weapon_should_i_use(
     if let Some(slot) = attacker.open_transport_weapon {
         return slot;
     }
+    // Ares TechnoClass_SelectWeapon_NoAmmoWeapon (Ares.dll 10047AE0, hook
+    // 0x6F3410, before H): a type with `Ammo= >= 0` fires `NoAmmoWeapon`
+    // once its count is at or below `NoAmmoAmount`.
+    if rules.ares()
+        && obj.ammo >= 0
+        && let Some(slot) = obj.techno_combat().ammo().no_ammo_weapon(attacker.ammo)
+    {
+        return slot;
+    }
     let techno = target.techno();
     let secondary_aa = projectile_aa(rules, secondary);
-    let secondary_warhead = warhead_of(rules, secondary);
-    let primary_warhead = warhead_of(rules, primary);
+    let secondary_warhead = rules.weapon_warhead(secondary);
+    let primary_warhead = rules.weapon_warhead(primary);
     // H @ 0x006F3422: gattling stage pair. Note the AA test reads
     // `GetWeapon(1)`'s projectile regardless of the current stage.
     if obj.is_gattling {
@@ -736,27 +860,18 @@ fn techno_what_weapon_should_i_use(
         }
         return stage.wrapping_mul(2);
     }
-    // I @ 0x006F3477: Airstrike secondary — only against a C4-able building
-    // that is not BOTH a resource gatherer and a resource destination.
-    if secondary_warhead.is_some_and(|warhead| warhead.airstrike) {
+    // I @ 0x006F3477: Airstrike secondary. Phobos adds two gates here
+    // (`TechnoClass_WhatWeaponShouldIUse_Airstrike`, `0x6F348F`).
+    if let Some(warhead) = secondary_warhead.filter(|warhead| warhead.airstrike) {
         let TargetFacts::Techno {
             obj: target_obj,
-            kind: TechnoKind::Building,
+            kind,
             ..
         } = target
         else {
             return 0;
         };
-        if !target_obj.can_c4 {
-            return 0;
-        }
-        if !target_obj.resource_destination {
-            return 1;
-        }
-        if !target_obj.resource_gatherer {
-            return 1;
-        }
-        return 0;
+        return i32::from(airstrike_secondary_selected(warhead, target_obj, *kind));
     }
     // J @ 0x006F3528: IsLocomotor primary (Magnetron) vs a building.
     if primary_warhead.is_some_and(|warhead| warhead.is_locomotor)
@@ -827,7 +942,7 @@ fn techno_what_weapon_should_i_use(
     else {
         return 0;
     };
-    let armor = armor_index(&target_obj.armor);
+    let armor = target_obj.armor_id();
     // R @ 0x006F36E3 / S @ 0x006F3716: the only Verses reads, both `== 0.0`.
     if verses_is_zero(secondary_warhead, armor) {
         return 0;
@@ -875,7 +990,9 @@ pub(crate) fn resolve_selected_weapon<'a>(
     entities: &EntityStore,
     interner: &StringInterner,
 ) -> Option<SelectedWeapon<'a>> {
-    let index = what_weapon_should_i_use(rules, obj, attacker, target);
+    let index = what_weapon_should_i_use(rules, obj, attacker, target, |index| {
+        get_weapon(entity, obj, index, entities, rules, interner)
+    });
     resolve_weapon_index(rules, entity, obj, index, entities, interner)
 }
 
@@ -895,7 +1012,7 @@ pub(crate) fn resolve_weapon_index<'a>(
     Some(SelectedWeapon {
         weapon_id: &weapon.id,
         weapon,
-        warhead: warhead_of(rules, weapon)?,
+        warhead: rules.weapon_warhead(weapon)?,
         slot: if index == 1 {
             WeaponSlot::Secondary
         } else {
@@ -909,15 +1026,12 @@ pub(crate) fn resolve_weapon_index<'a>(
 /// same house, or the asker's alliance bit for the other house. Without an
 /// alliance map only the same-house case is knowable.
 pub fn is_ally_by_object(
-    alliances: Option<&HouseAllianceMap>,
+    alliances: Option<&HouseAlliances>,
     interner: &StringInterner,
     asker: InternedId,
     other: InternedId,
 ) -> bool {
-    asker == other
-        || alliances.is_some_and(|map| {
-            is_allied_with(map, interner.resolve(asker), interner.resolve(other))
-        })
+    asker == other || alliances.is_some_and(|alliances| alliances.is_allied(interner, asker, other))
 }
 
 /// Arm G's pair (`0x006F33D9`) and the DeployFire infantry arm's
@@ -962,8 +1076,9 @@ pub fn attacker_facts(entity: &GameEntity, obj: &ObjectType) -> AttackerFacts {
         drain_target_active: entity.drain.target().is_some(),
         // `MissionClass::GetCurrentMission @ 0x005B3040`: current, else queued.
         mission_is_unload: entity.mission.effective().known() == Some(MissionType::Unload),
-        is_overpowered_building: entity.tesla_charge.is_overpowered(),
+        is_overpowered_building: entity.building.tesla_charge.is_overpowered(),
         aircraft_spawn_collision: false,
+        ammo: entity.ammo().map_or(-1, |ammo| ammo.current()),
     }
 }
 
@@ -979,7 +1094,7 @@ pub(crate) fn techno_target_facts<'a>(
 ) -> TargetFacts<'a> {
     let cell = terrain.and_then(|grid| grid.cell(target.position.rx(), target.position.ry()));
     let cell_land_type = cell
-        .map(|cell| cell.land_type())
+        .map(|cell| cell.land_type)
         .unwrap_or(LandType::Clear.as_index());
     TargetFacts::Techno {
         obj: target_obj,
@@ -1008,7 +1123,7 @@ pub(crate) fn cell_target_facts(
 ) -> TargetFacts<'static> {
     match terrain.and_then(|grid| grid.cell(rx, ry).map(|cell| (grid, cell))) {
         Some((grid, cell)) => TargetFacts::Cell {
-            land_type: cell.land_type(),
+            land_type: cell.land_type,
             tile_in_water_set: grid.tile_is_water_set(cell.final_tile_index),
             bridge_flag: cell.bridge_facts.has_structural_bridge(),
         },
@@ -1035,7 +1150,7 @@ pub(crate) fn select_weapon_against<'a>(
     world: &Simulation,
     interner: &StringInterner,
     terrain: Option<&ResolvedTerrainGrid>,
-    alliances: Option<&HouseAllianceMap>,
+    alliances: Option<&HouseAlliances>,
 ) -> Option<(i32, Option<SelectedWeapon<'a>>)> {
     let cells = terrain.map(NativeCellQuery::canonical);
     select_weapon_against_in_query(
@@ -1062,7 +1177,7 @@ pub fn select_weapon_against_in_query<'a>(
     world: &Simulation,
     interner: &StringInterner,
     cells: Option<&NativeCellQuery<'_>>,
-    alliances: Option<&HouseAllianceMap>,
+    alliances: Option<&HouseAlliances>,
 ) -> Option<(i32, Option<SelectedWeapon<'a>>)> {
     let index = select_weapon_index_against_in_query(
         rules,
@@ -1101,7 +1216,7 @@ pub(crate) fn select_weapon_index_against_in_query(
     world: &Simulation,
     interner: &StringInterner,
     cells: Option<&NativeCellQuery<'_>>,
-    alliances: Option<&HouseAllianceMap>,
+    alliances: Option<&HouseAlliances>,
 ) -> Option<i32> {
     let terrain = cells.map(NativeCellQuery::terrain);
     let target_facts = match target.copied() {
@@ -1137,7 +1252,7 @@ pub(crate) fn select_weapon_index_against_in_query(
                 }
                 Some(facts)
             } else {
-                world.production.terrain_objects.get(&target_id)?;
+                world.terrain_objects.objects().get(&target_id)?;
                 Some(TargetFacts::Terrain)
             }
         }
@@ -1149,6 +1264,16 @@ pub(crate) fn select_weapon_index_against_in_query(
         attacker_obj,
         attacker,
         target_facts.as_ref(),
+        |index| {
+            get_weapon(
+                attacker_entity,
+                attacker_obj,
+                index,
+                &world.substrate.entities,
+                rules,
+                interner,
+            )
+        },
     ))
 }
 
@@ -1159,17 +1284,24 @@ pub(crate) fn select_weapon_index_against_in_query(
 /// elite occupant without `EliteOccupyWeapon=` therefore fires its elite
 /// primary, never the normal `OccupyWeapon`. No target is read; whether the
 /// weapon may fire is GetFireError's.
-pub(crate) fn occupant_weapon<'a>(
-    rules: &'a RuleSet,
-    occupant: &ObjectType,
-    veterancy: u16,
-) -> Option<&'a WeaponType> {
-    let occupy = if veterancy >= RANK_ELITE_U16 {
+fn occupant_weapon_record(occupant: &ObjectType, veterancy: u16) -> Option<WeaponRecord<'_>> {
+    let elite = veterancy >= RANK_ELITE_U16;
+    let occupy = if elite {
         occupant.elite_occupy_weapon.as_deref()
     } else {
         occupant.occupy_weapon.as_deref()
     };
-    rules.weapon(occupy.or_else(|| primary_for_tier(occupant, veterancy))?)
+    if let Some(weapon_id) = occupy {
+        // InfantryType5236A0 clears E08/E0C/E10 and E24/E28/E2C;
+        // ReadINI5240A0 writes only the E04/E20 WeaponType pointers.
+        Some(WeaponRecord {
+            weapon_id: Some(weapon_id),
+            flh: crate::rules::flh::Flh::default(),
+            resolved: occupant.resolved_weapons().occupy(elite),
+        })
+    } else {
+        weapon_for_index(occupant, veterancy, 0)
+    }
 }
 
 /// `BuildingClass::IsOccupied @ 0x00458DD0` (vt+0x400; every other class
@@ -1180,16 +1312,13 @@ pub(crate) fn is_occupied(entity: &GameEntity, obj: &ObjectType) -> bool {
     entity.category() == EntityCategory::Structure
         && obj.can_be_occupied
         && obj.can_occupy_fire
-        && entity
-            .passenger_role
-            .cargo()
-            .is_some_and(|cargo| !cargo.is_empty())
+        && entity.passenger_role.occupants().count() > 0
 }
 
 /// `BuildingClass @ 0x00458E00` (vt+0x404): half the shorter side of the
 /// type's foundation (width `0x0045EC90`, height `0x0045ECA0(0)`), truncated.
 pub(crate) fn half_foundation(obj: &ObjectType) -> i32 {
-    let (width, height) = crate::rules::foundation::foundation_dimensions(&obj.foundation);
+    let (width, height) = obj.foundation.dimensions();
     i32::from(width.min(height)) / 2
 }
 
@@ -1209,38 +1338,17 @@ pub(crate) fn firing_occupant_id(entity: &GameEntity, obj: &ObjectType) -> Optio
     if !is_occupied(entity, obj) {
         return None;
     }
-    let cargo = entity.passenger_role.cargo()?;
-    cargo
-        .passengers()
-        .get(usize::from(cargo.garrison_fire_index()))
+    let occupants = entity.passenger_role.occupants();
+    // Native452742 uses signed DWORD. Unsafe negative/stale slots are not
+    // representable object references; do not narrow a valid index to u8.
+    occupants
+        .ids()
+        .get(usize::try_from(occupants.fire_index()).ok()?)
         .copied()
 }
 
-/// `BuildingClass::GetWeapon @ 0x004526F0`'s occupied arm, which answers every
-/// index: `Some` with the [`firing_occupant_id`]'s [`occupant_weapon`] (itself
-/// `None` when the occupant has no weapon), or `None` when the object's own
-/// slots answer, as for every class but an occupied building.
-fn occupied_weapon<'r>(
-    entity: &GameEntity,
-    obj: &ObjectType,
-    entities: &EntityStore,
-    rules: &'r RuleSet,
-    interner: &StringInterner,
-) -> Option<Option<&'r WeaponType>> {
-    let occupant = entities.get(firing_occupant_id(entity, obj)?);
-    Some(occupant.and_then(|occupant| {
-        interner
-            .object_type(occupant.type_ref(), rules)
-            .and_then(|kind| occupant_weapon(rules, kind, occupant.veterancy.rank()))
-    }))
-}
-
-/// GetWeapon (vt+0x3F8) of a live object at `index`: an occupied building's
-/// firing occupant's weapon for every index (`BuildingClass::GetWeapon @
-/// 0x004526F0`), otherwise the object's own slot at its rank
-/// (`TechnoClass::GetWeapon @ 0x0070E140`, [`weapon_for_index`]). Only
-/// `BuildingClass` overrides the slot. The upgrade loop that precedes the
-/// occupied arm is not modelled; see [`is_armed`].
+/// GetWeapon's WeaponType projection. Record metadata is resolved by the
+/// same owner that GetFLH consumes, [`get_weapon_record`].
 pub fn get_weapon<'r>(
     entity: &GameEntity,
     obj: &'r ObjectType,
@@ -1249,16 +1357,274 @@ pub fn get_weapon<'r>(
     rules: &'r RuleSet,
     interner: &StringInterner,
 ) -> Option<&'r WeaponType> {
-    occupied_weapon(entity, obj, entities, rules, interner).unwrap_or_else(|| {
-        weapon_for_index(obj, entity.veterancy.rank(), index).and_then(|(id, _)| rules.weapon(id))
-    })
+    get_weapon_record(entity, obj, index, entities, rules, interner)?.weapon(rules)
 }
 
-#[cfg(test)]
+/// `BuildingClass::GetWeapon4526F0`: first armed normal upgrade record in
+/// the installed prefix, then the firing occupant's record, then the host's
+/// own base/elite record (`Techno70E140`). GetFLH6F3B28 reads this same
+/// record's FLH. The host still owns its pose, pixel offsets and garrison gates.
+pub(crate) fn get_weapon_record<'r>(
+    entity: &GameEntity,
+    obj: &'r ObjectType,
+    index: i32,
+    entities: &EntityStore,
+    rules: &'r RuleSet,
+    interner: &StringInterner,
+) -> Option<WeaponRecord<'r>> {
+    if entity.category() == EntityCategory::Structure {
+        let upgrades = entity.building_upgrades();
+        for &kind in upgrades
+            .types()
+            .iter()
+            .take(upgrades.count().max(0) as usize)
+            .flatten()
+        {
+            let Some(upgrade) = interner.object_type_in_category(
+                kind,
+                crate::rules::object_type::ObjectCategory::Building,
+                rules,
+            ) else {
+                continue;
+            };
+            // TypeGetWeapon7177C0 always selects the NORMAL upgrade record,
+            // with the original caller index; host veterancy is irrelevant.
+            if let Some(record) = weapon_for_index(upgrade, 0, index)
+                && record.weapon_id.is_some()
+            {
+                return Some(record);
+            }
+        }
+    }
+    if let Some(id) = firing_occupant_id(entity, obj) {
+        let occupant = entities.get(id)?;
+        let kind = interner.object_type_in_category(
+            occupant.type_ref(),
+            crate::rules::object_type::ObjectCategory::Infantry,
+            rules,
+        )?;
+        return occupant_weapon_record(kind, occupant.veterancy.rank());
+    }
+    weapon_for_index(obj, entity.veterancy.rank(), index)
+}
+
+#[cfg(all(test, tests_sim_combat_a_c))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
-    use crate::sim::passenger::PassengerRole;
+
+    #[test]
+    fn installed_upgrade_records_select_per_index_and_follow_removal() {
+        let ini = IniFile::from_str(
+            "[BuildingTypes]\n0=BASE\n1=UP1\n2=UP2\n\
+             [BASE]\nStrength=500\nUpgrades=3\nPrimary=HOST\nElitePrimary=ELITE\nLandTargeting=2\n\
+             [UP1]\nStrength=100\nPowersUpBuilding=BASE\nPowersUpToLevel=2\nPrimary=FIRST\nElitePrimary=WRONG\n\
+             [UP2]\nStrength=100\nPowersUpBuilding=BASE\nPrimary=SECOND\nSecondary=SECOND\n\
+             [HOST]\nWarhead=WH\n[ELITE]\nWarhead=WH\n[FIRST]\nWarhead=WH\n\
+             [WRONG]\nWarhead=WH\n[SECOND]\nWarhead=WH\n[WH]\n\
+             [Structures]\n0=Americans,BASE,256,10,12,0,None,1,0,1,2,0,UP1,UP2,None,0,1\n",
+        );
+        let rules = RuleSet::from_ini(&ini).unwrap();
+        let mut world = Simulation::new();
+        assert_eq!(
+            world.spawn_from_map(
+                &crate::map::entities::parse_map_entities(&ini, 4),
+                Some(&rules)
+            ),
+            3
+        );
+        world
+            .substrate
+            .entities
+            .get_mut(1)
+            .unwrap()
+            .veterancy
+            .set_elite();
+        let obj = rules.object("BASE").unwrap();
+        let host = world.substrate.entities.get(1).unwrap();
+        assert_eq!(host.building_upgrades().count(), 3);
+        assert_eq!(host.building_upgrades().types()[0], None);
+        assert_eq!(
+            get_weapon(
+                host,
+                obj,
+                0,
+                &world.substrate.entities,
+                &rules,
+                &world.interner
+            )
+            .unwrap()
+            .id,
+            "FIRST"
+        );
+        assert_eq!(
+            get_weapon(
+                host,
+                obj,
+                1,
+                &world.substrate.entities,
+                &rules,
+                &world.interner
+            )
+            .unwrap()
+            .id,
+            "SECOND"
+        );
+        let selected = resolve_selected_weapon(
+            &rules,
+            host,
+            obj,
+            &attacker_facts(host, obj),
+            Some(&TargetFacts::Cell {
+                land_type: 0,
+                tile_in_water_set: false,
+                bridge_flag: false,
+            }),
+            &world.substrate.entities,
+            &world.interner,
+        )
+        .unwrap();
+        assert_eq!((selected.index, selected.weapon_id), (1, "SECOND"));
+        assert_eq!(
+            world.power_down_building_upgrade(1, &rules),
+            world.interner.get("UP2")
+        );
+        let host = world.substrate.entities.get(1).unwrap();
+        assert!(
+            get_weapon(
+                host,
+                obj,
+                1,
+                &world.substrate.entities,
+                &rules,
+                &world.interner
+            )
+            .is_none()
+        );
+        assert_eq!(
+            world.power_down_building_upgrade(1, &rules),
+            world.interner.get("UP1")
+        );
+        let host = world.substrate.entities.get(1).unwrap();
+        assert_eq!(
+            current_weapon(
+                host,
+                obj,
+                &world.substrate.entities,
+                &rules,
+                &world.interner
+            )
+            .unwrap()
+            .id,
+            "ELITE"
+        );
+    }
+
+    #[test]
+    fn occupied_record_keeps_dedicated_and_primary_fallback_offsets_distinct() {
+        let rules = RuleSet::from_ini_with_fixed_art_for_test(
+            &IniFile::from_str(
+                "[BuildingTypes]\n0=HOUSE\n[InfantryTypes]\n0=GI\n\
+             [HOUSE]\nCanBeOccupied=yes\nCanOccupyFire=yes\n\
+             [GI]\nPrimary=PRIMARY\nElitePrimary=ELITE\nOccupyWeapon=OCCUPY\n",
+            ),
+            &IniFile::from_str(
+                "[GI]\nPrimaryFireFLH=1,2,3\nElitePrimaryFireFLH=4,5,6\n\
+             [HOUSE]\nSecondaryFireFLH=7,8,9\n",
+            ),
+        )
+        .unwrap();
+        let mut world = Simulation::new();
+        let mut host = GameEntity::test_default_of_category(
+            1,
+            "HOUSE",
+            "Americans",
+            5,
+            5,
+            EntityCategory::Structure,
+        );
+        host.passenger_role.occupants_mut().add(2);
+        world.substrate.entities.insert(host);
+        world
+            .substrate
+            .entities
+            .insert(GameEntity::test_default_of_category(
+                2,
+                "GI",
+                "Americans",
+                5,
+                5,
+                EntityCategory::Infantry,
+            ));
+        world.interner = crate::sim::intern::test_interner();
+        let obj = rules.object("HOUSE").unwrap();
+        let read = |world: &Simulation| {
+            get_weapon_record(
+                world.substrate.entities.get(1).unwrap(),
+                obj,
+                1,
+                &world.substrate.entities,
+                &rules,
+                &world.interner,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            (read(&world).weapon_id, read(&world).flh.height),
+            (Some("OCCUPY"), 0)
+        );
+        world
+            .substrate
+            .entities
+            .get_mut(2)
+            .unwrap()
+            .veterancy
+            .set_elite();
+        assert_eq!(
+            (read(&world).weapon_id, read(&world).flh.height),
+            (Some("ELITE"), 6)
+        );
+        // No WeaponType in a valid own slot does not erase its retained FLH.
+        let empty = weapon_for_index(obj, 0, 1).unwrap();
+        assert_eq!((empty.weapon_id, empty.flh.height), (None, 9));
+    }
+
+    #[test]
+    fn records_answer_as_their_weapon_names_in_any_rule_set() {
+        let gi = "[GI]\nStrength=100\nPrimary=GUN\nElitePrimary=EGUN\n\
+                  OccupyWeapon=OGUN\nEliteOccupyWeapon=EOGUN\n\
+                  [GUN]\nWarhead=WH\n[EGUN]\nWarhead=WH\n[OGUN]\nWarhead=WH\n\
+                  [EOGUN]\nWarhead=WH\n[WH]\n";
+        let rules =
+            RuleSet::from_ini(&IniFile::from_str(&format!("[InfantryTypes]\n0=GI\n{gi}"))).unwrap();
+        // FIRST allocates the same weapons in another order, so a handle
+        // read in the wrong set names another weapon.
+        let other = RuleSet::from_ini(&IniFile::from_str(&format!(
+            "[InfantryTypes]\n0=FIRST\n1=GI\n\
+             [FIRST]\nStrength=100\nPrimary=EOGUN\nSecondary=OGUN\nElitePrimary=EGUN\n{gi}"
+        )))
+        .unwrap();
+        assert_ne!(rules.weapon_handle("GUN"), other.weapon_handle("GUN"));
+        let copy = rules.clone().with_fresh_serial();
+        for owner in [&rules, &copy] {
+            let gi = owner.object("GI").unwrap();
+            for set in [&rules, &other, &copy] {
+                for (record, name) in [
+                    (weapon_for_index(gi, 0, 0), "GUN"),
+                    (weapon_for_index(gi, RANK_ELITE_U16, 0), "EGUN"),
+                    (occupant_weapon_record(gi, 0), "OGUN"),
+                    (occupant_weapon_record(gi, RANK_ELITE_U16), "EOGUN"),
+                ] {
+                    let record = record.unwrap();
+                    assert_eq!(record.weapon_id, Some(name));
+                    assert!(
+                        std::ptr::eq(record.weapon(set).unwrap(), set.weapon(name).unwrap()),
+                        "{name}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn passive_scan_occupied_building_uses_weapon_identity_without_target_fallback() {
@@ -1294,9 +1660,7 @@ mod tests {
                 );
                 inside.veterancy.set_rank_for_test(veterancy);
                 entities.insert(inside);
-                let mut cargo = crate::sim::passenger::PassengerCargo::new(5, 0.0);
-                cargo.board_forced_chain(&[(2, 1.0)]);
-                building.passenger_role = PassengerRole::transport(cargo);
+                building.passenger_role.occupants_mut().add(2);
             }
             entities.insert(building);
             let interner = crate::sim::intern::test_interner();
@@ -1325,35 +1689,38 @@ mod tests {
 
     #[test]
     fn slot_zero_warhead_flag_reads_the_exact_medium_and_wood_verses_at_the_live_tier() {
-        for medium in ["0%", "0.1%", "0.001"] {
-            let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
-                "[InfantryTypes]\n0=DOG\n[DOG]\nPrimary=BITE\nSecondary=SCANNER\nElitePrimary=ELITEBITE\n\
-                 [WeaponTypes]\n0=BITE\n1=SCANNER\n2=ELITEBITE\n\
-                 [BITE]\nProjectile=AG\nWarhead=SOFT\n[ELITEBITE]\nProjectile=AG\nWarhead=FULL\n\
-                 [SCANNER]\nProjectile=AA\nWarhead=FULL\n[AG]\nAA=no\nAG=yes\n[AA]\nAA=yes\nAG=yes\n\
-                 [SOFT]\nVerses=100%,100%,100%,100%,{medium},100%,0%,100%,100%,100%,100%\n\
-                 [FULL]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n"
-            ))).unwrap();
-            let obj = rules.object("DOG").unwrap();
-            let mut dog = GameEntity::test_default(1, "DOG", "Americans", 5, 5);
-            dog.set_category_for_test(EntityCategory::Infantry);
-            let entities = EntityStore::new();
-            let interner = crate::sim::intern::test_interner();
-            assert_eq!(
-                passive_scan_class_bits(&rules, obj, attacker_facts(&dog, obj), |index| {
-                    get_weapon(&dog, obj, index, &entities, &rules, &interner)
-                }),
-                0xBC,
-                "slot 0 AG and slot 1 AA+AG"
-            );
-            assert_eq!(
-                primary_warhead_spares_medium_and_wood(&rules, obj, 0),
-                medium != "0.001"
-            );
-            assert!(
-                !primary_warhead_spares_medium_and_wood(&rules, obj, 200),
-                "elite primary is resolved first"
-            );
+        for ares_way in [false, true] {
+            let _ares = crate::rules::ares_switch::read_ares_way(ares_way);
+            for medium in ["0%", "0.1%", "0.001"] {
+                let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
+                    "[InfantryTypes]\n0=DOG\n[DOG]\nPrimary=BITE\nSecondary=SCANNER\nElitePrimary=ELITEBITE\n\
+                     [WeaponTypes]\n0=BITE\n1=SCANNER\n2=ELITEBITE\n\
+                     [BITE]\nProjectile=AG\nWarhead=SOFT\n[ELITEBITE]\nProjectile=AG\nWarhead=FULL\n\
+                     [SCANNER]\nProjectile=AA\nWarhead=FULL\n[AG]\nAA=no\nAG=yes\n[AA]\nAA=yes\nAG=yes\n\
+                     [SOFT]\nVerses=100%,100%,100%,100%,{medium},100%,0%,100%,100%,100%,100%\n\
+                     [FULL]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n"
+                ))).unwrap();
+                let obj = rules.object("DOG").unwrap();
+                let mut dog = GameEntity::test_default(1, "DOG", "Americans", 5, 5);
+                dog.set_category_for_test(EntityCategory::Infantry);
+                let entities = EntityStore::new();
+                let interner = crate::sim::intern::test_interner();
+                assert_eq!(
+                    passive_scan_class_bits(&rules, obj, attacker_facts(&dog, obj), |index| {
+                        get_weapon(&dog, obj, index, &entities, &rules, &interner)
+                    }),
+                    0xBC,
+                    "slot 0 AG and slot 1 AA+AG"
+                );
+                assert_eq!(
+                    primary_warhead_spares_medium_and_wood(&rules, obj, 0),
+                    !ares_way && medium != "0.001"
+                );
+                assert!(
+                    !primary_warhead_spares_medium_and_wood(&rules, obj, 200),
+                    "elite primary is resolved first"
+                );
+            }
         }
     }
 
@@ -1370,6 +1737,7 @@ mod tests {
             mission_is_unload: false,
             is_overpowered_building: false,
             aircraft_spawn_collision: false,
+            ammo: -1,
         }
     }
 
@@ -1593,7 +1961,9 @@ mod tests {
                     &rules,
                     gat,
                     &attacker,
-                    target.as_ref()
+                    target.as_ref(),
+                    |index| rules
+                        .weapon(weapon_for_index(gat, attacker.veterancy, index)?.weapon_id?),
                 )),
                 row["index"].as_i64().unwrap(),
                 "{name}"
@@ -1601,11 +1971,100 @@ mod tests {
         }
     }
 
+    /// Ares NoAmmoWeapon (Ares.dll 10047AE0, hook 0x6F3410): once Ammo is
+    /// at or below `NoAmmoAmount` the ladder answers `NoAmmoWeapon` right
+    /// after the open-topped arm; above it the ladder runs on to slot 0.
+    #[test]
+    fn ares_no_ammo_weapon_answers_at_low_ammo() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[VehicleTypes]\n0=LAUNCH\n1=TGT\n[LAUNCH]\nStrength=100\nAmmo=4\n\
+             NoAmmoAmount=1\nNoAmmoWeapon=1\nPrimary=W0\nSecondary=W1\n\
+             [TGT]\nStrength=100\n[W0]\nDamage=10\nWarhead=WH\nProjectile=P\n\
+             [W1]\nDamage=10\nWarhead=WH\nProjectile=P\n[P]\nAG=yes\n[WH]\nVerses=100%\n",
+        ))
+        .unwrap();
+        let launcher = rules.object("LAUNCH").unwrap();
+        let target = techno(rules.object("TGT").unwrap(), TechnoKind::Unit);
+        let select = |ammo| {
+            let mut attacker = facts(TechnoKind::Unit);
+            attacker.ammo = ammo;
+            what_weapon_should_i_use(&rules, launcher, &attacker, Some(&target), |index| {
+                rules.weapon(weapon_for_index(launcher, 0, index)?.weapon_id?)
+            })
+        };
+        assert_eq!((select(2), select(1), select(0)), (0, 1, 1));
+    }
+
     // ---- Class overrides ---------------------------------------------------
 
     // ---- GetWeapon of the selected slot ------------------------------------
 
     // ---- Facts builders ----------------------------------------------------
+
+    /// The threat scan and allied-target drop read `TechnoClass+0x11C`
+    /// (`0x006F7EA2`, `0x006F89D1`, `0x006F8FA8`, `0x006FA30C`): a garrison
+    /// occupant or a `CargoClass::AddPassenger` rider stores a carrier
+    /// relation without setting Transporter (vera20k#3838), so it has no
+    /// controlled-transport house.
+    #[test]
+    fn a_cargo_rider_has_no_controlled_transport_house() {
+        use crate::sim::capture_manager::MindControlLink;
+        use crate::sim::passenger::PassengerRole;
+        let ini = IniFile::from_str(
+            "[VehicleTypes]\n0=CARRIER\n[InfantryTypes]\n0=RIDER\n\
+             [BuildingTypes]\n[AircraftTypes]\n\
+             [CARRIER]\nStrength=200\nPassengers=1\nOpenTopped=yes\n\
+             [RIDER]\nStrength=100\n",
+        );
+        let rules = RuleSet::from_ini(&ini).unwrap();
+        assert!(rules.object("CARRIER").unwrap().open_topped);
+        let mut sim = Simulation::with_seed(0x3838);
+        sim.substrate
+            .entities
+            .insert(GameEntity::test_default(1, "CARRIER", "Americans", 10, 10));
+        sim.substrate
+            .entities
+            .insert(GameEntity::test_default_of_category(
+                2,
+                "RIDER",
+                "Americans",
+                11,
+                10,
+                EntityCategory::Infantry,
+            ));
+        sim.substrate
+            .entities
+            .insert(GameEntity::test_default_of_category(
+                3,
+                "RIDER",
+                "Soviet",
+                12,
+                10,
+                EntityCategory::Infantry,
+            ));
+        // The fixture entities' names were interned by `test_default`.
+        sim.interner = crate::sim::intern::test_interner();
+        sim.substrate.entities.get_mut(1).unwrap().mind_control =
+            MindControlLink::controlled_by_for_test(3);
+        sim.substrate.entities.get_mut(2).unwrap().passenger_role =
+            PassengerRole::inside_for_test(1, false);
+        let rider = sim.substrate.entities.get(2).unwrap();
+        assert_eq!(
+            controlled_transport_house(&sim.substrate.entities, &rules, &sim.interner, rider),
+            None,
+            "a garrison occupant or cargo rider stores no Transporter"
+        );
+        sim.substrate.entities.get_mut(2).unwrap().passenger_role =
+            PassengerRole::boarded_for_test(1, true);
+        let expected = sim.substrate.entities.get(3).unwrap().owner();
+        let rider = sim.substrate.entities.get(2).unwrap();
+        assert_eq!(
+            controlled_transport_house(&sim.substrate.entities, &rules, &sim.interner, rider),
+            Some(expected),
+            "a transport-arm rider reaches its OpenTopped carrier's controller"
+        );
+    }
 
     // ---- Garrison ----------------------------------------------------------
 }

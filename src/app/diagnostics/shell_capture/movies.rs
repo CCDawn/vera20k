@@ -8,8 +8,25 @@ use crate::app::App;
 use crate::ui::campaign_shell::CampaignSide;
 use serde_json::{Value, json};
 
+mod abort_return;
+mod campaign_restart;
+pub(super) use campaign_restart::RestartTarget;
+mod lan;
+pub(crate) use lan::{LAN_CHECKPOINTS, LanTarget};
+mod wol;
+pub(crate) use wol::{WOL_CHECKPOINTS, WolTarget};
 mod opening;
 pub(super) use opening::OpeningTarget;
+
+/// Native control corpus read from this checkout's `tools/` at capture time.
+/// Diagnostics run from a development checkout, so the release binary does
+/// not embed the corpus (`architecture_guards` keeps fixtures out of builds).
+fn native_corpus(path: &str) -> Result<Value> {
+    let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+    let text = std::fs::read_to_string(&full)
+        .with_context(|| format!("cannot read native corpus {}", full.display()))?;
+    Ok(serde_json::from_str(&text)?)
+}
 
 /// Row-0 press point for the selected-list checkpoint (inside `0x744`).
 const LIST_ROW0_POINT: (f32, f32) = (150.0, 137.0);
@@ -18,6 +35,37 @@ const LIST_DOWN_ARROW_POINT: (f32, f32) = (509.0, 420.0);
 /// Frames to present after the route settles, so reveals and pending state
 /// changes show before the readback.
 const SETTLE_FRAMES: u32 = 4;
+
+/// The 14 retail Yuri's Revenge campaign missions a trigger trace may run.
+pub(super) const RETAIL_CAMPAIGN_MAPS: [&str; 14] = [
+    "ALL01UMD.MAP",
+    "ALL02UMD.MAP",
+    "ALL03UMD.MAP",
+    "ALL04DMD.MAP",
+    "ALL05UMD.MAP",
+    "ALL06UMD.MAP",
+    "ALL07SMD.MAP",
+    "SOV01UMD.MAP",
+    "SOV02SMD.MAP",
+    "SOV03UMD.MAP",
+    "SOV04DMD.MAP",
+    "SOV05UMD.MAP",
+    "SOV06LMD.MAP",
+    "SOV07TMD.MAP",
+];
+
+/// What a Mods capture presses once the page has settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ModsPress {
+    Nothing,
+    /// A row the run does not play, then Use This Mod.
+    Use,
+    /// A mod's row, then Check Files.
+    Check,
+    /// New Mod, which makes a folder in the run's `Mods`: run it from a
+    /// settings folder of its own.
+    New,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MoviesTarget {
@@ -37,6 +85,10 @@ pub(super) enum MoviesTarget {
     },
     /// Exit Game through the production teardown slide, then state 6.
     ExitConfirm,
+    /// Main Menu -> Options -> Mods: VERA's page settled, then `press`.
+    Mods {
+        press: ModsPress,
+    },
     /// A teardown slide held at `tick`: Exit Game on `0xE2` or Back on
     /// `0x129`.
     SlideOut {
@@ -73,13 +125,19 @@ pub(super) enum MoviesTarget {
         entry_tick: Option<u32>,
         /// Rest the pointer here instead of at the neutral point.
         hover: Option<(i32, i32)>,
+        /// The page captured. Another page is reached by pressing its
+        /// column button on the settled dialog.
+        category: crate::ui::main_menu_dialogs::options::Category,
     },
     /// Network on `0xE2`: its teardown slide, then a new `0xE2` with its
     /// own entry slide, captured once settled.
     NetworkBounce,
+    Lan(LanTarget),
+    Wol(WolTarget),
     /// Main Menu -> Internet: `0x10E` settled (pointer at `hover` or
     /// neutral), held at `entry_tick`, or after one of its buttons.
     WolWelcome {
+        provider: crate::app::shell_wol::WolProvider,
         entry_tick: Option<u32>,
         hover: Option<(i32, i32)>,
         press: WolPress,
@@ -90,8 +148,31 @@ pub(super) enum MoviesTarget {
 pub(super) enum CampaignStartTarget {
     LoadingFirst,
     FirstLive,
+    InitialSaved,
+    /// Explicit-map CnCNet admission, without playing preceding missions.
+    ExplicitFirstLive(&'static str),
     AbortReturn,
     Opening(OpeningTarget),
+    Restart(RestartTarget),
+}
+
+impl CampaignStartTarget {
+    fn explicit_scenario(self) -> Option<&'static str> {
+        match self {
+            Self::ExplicitFirstLive(scenario) => Some(scenario),
+            Self::Opening(
+                OpeningTarget::RadarAlert
+                | OpeningTarget::RadarRestored
+                | OpeningTarget::SovietFortresses(_),
+            ) => Some("SOV02SMD.MAP"),
+            Self::Opening(OpeningTarget::SovietGroups(_)) => Some("SOV07TMD.MAP"),
+            Self::Opening(OpeningTarget::TriggerTrace { scenario, .. }) => Some(scenario),
+            Self::Restart(RestartTarget::ObjectiveExpiry) => Some("SOV02SMD.MAP"),
+            Self::Restart(RestartTarget::AlternateHomeVictory) => Some("SOV06LMD.MAP"),
+            Self::Restart(RestartTarget::InheritedTimerVictory) => Some("SOV01UMD.MAP"),
+            _ => None,
+        }
+    }
 }
 
 /// A `0x10E` button the capture presses once the page has settled.
@@ -114,6 +195,10 @@ enum Phase {
     MainMenu,
     Page,
     List,
+    /// Options is opening on the way to the Mods page: its Mods button is
+    /// pressed once it has settled.
+    ModsOptions,
+    Mods,
     Credits,
     Movie,
     Exit,
@@ -123,12 +208,12 @@ enum Phase {
     /// The emblem press has been presented; the next frame releases it.
     CampaignPressed,
     CampaignStarting,
+    CampaignInitialSaved,
     CampaignReturning,
     CampaignAbortMenu,
-    CampaignAbortPressed,
-    CampaignAbortModal,
-    CampaignLeavePressed,
     CampaignLeaving,
+    /// The restart driver owns the route from the first live frame.
+    CampaignRestart,
     LoadSavedGame,
     Options,
     /// Network pressed: waiting for the teardown to commit.
@@ -153,18 +238,57 @@ pub(super) struct MoviesCapture {
     /// Abort-return observes the installed owners once before opening B5.
     observed_campaign_runtime: Option<Value>,
     observed_exit_cascade: bool,
+    abort_input: Option<abort_return::AbortReturnInput>,
+    restart: Option<campaign_restart::RestartCapture>,
+    restart_save_directory: PathBuf,
+    saves_isolated: bool,
     opening: Option<opening::OpeningCapture>,
+    lan: Option<lan::LanCapture>,
+    wol: Option<wol::WolCapture>,
 }
 
 impl MoviesCapture {
-    pub(super) fn new(target: MoviesTarget, output: &Path) -> Self {
+    pub(super) fn new(
+        target: MoviesTarget,
+        output: &Path,
+        live_lan: Option<super::LiveLanConfig>,
+        live_online: Option<super::LiveOnlineConfig>,
+    ) -> Self {
         Self {
             target,
+            lan: if let MoviesTarget::Lan(target) = target {
+                let mut capture = lan::LanCapture::new(target);
+                capture.configure_live(live_lan, live_online);
+                Some(capture)
+            } else {
+                None
+            },
+            wol: if let MoviesTarget::Wol(target) = target {
+                Some(wol::WolCapture::new(target))
+            } else {
+                None
+            },
             phase: Phase::MainMenu,
             route: Vec::new(),
             observed_campaign_startup: None,
             observed_campaign_runtime: None,
             observed_exit_cascade: false,
+            abort_input: None,
+            restart: None,
+            restart_save_directory: output.with_extension(
+                if matches!(
+                    target,
+                    MoviesTarget::CampaignStart {
+                        target: CampaignStartTarget::Opening(_),
+                        ..
+                    }
+                ) {
+                    "opening-saves"
+                } else {
+                    "restart-saves"
+                },
+            ),
+            saves_isolated: false,
             opening: match target {
                 MoviesTarget::CampaignStart {
                     target: CampaignStartTarget::Opening(target),
@@ -179,6 +303,19 @@ impl MoviesCapture {
     }
 
     pub(super) fn timeout(&self) -> Duration {
+        if let Some(lan) = &self.lan {
+            return lan.timeout();
+        }
+        if let Some(wol) = &self.wol {
+            return wol.timeout();
+        }
+        if let MoviesTarget::CampaignStart {
+            target: CampaignStartTarget::Restart(target),
+            ..
+        } = self.target
+        {
+            return target.timeout();
+        }
         self.opening
             .as_ref()
             .map_or(Duration::from_secs(60), opening::OpeningCapture::timeout)
@@ -189,9 +326,88 @@ impl MoviesCapture {
             && state.frontend.shell_slide_active_shell == Some(kind)
     }
 
+    /// Through the page's own pointer handlers: a press on the first row in
+    /// view that the run does not play and can, then on Use This Mod, which
+    /// asks.
+    /// The Mods page's row and button for `press`, through the ordinary
+    /// pointer handlers. Check Files then waits for its reading thread.
+    fn press_mod_row_and(state: &mut AppState, press: ModsPress) -> Result<()> {
+        let layout = crate::app::frontend::shell_layout::mods_layout(state);
+        let mods = &state.frontend.mods;
+        let page = mods.page.as_ref().context("the Mods page has no list")?;
+        let geometry = page.geometry(
+            layout.list,
+            crate::ui::shell::list::ListMetrics::scaled(layout.page.scale),
+        );
+        // The list opens with the row in use in view: pick from what shows.
+        // New Mod needs no row.
+        let row = (press != ModsPress::New)
+            .then(|| {
+                page.rows
+                    .iter()
+                    .skip(page.top)
+                    .take(geometry.visible_rows)
+                    .position(|row| match press {
+                        ModsPress::Check => row.folder.is_some(),
+                        _ => !mods.in_use(row) && row.needs.is_none(),
+                    })
+                    .map(|visible| geometry.row(visible))
+                    .context("the Mods list shows no row to pick")
+            })
+            .transpose()?;
+        let button = layout
+            .page
+            .button_rect(match press {
+                ModsPress::Check => crate::ui::mods_shell::CHECK,
+                ModsPress::New => crate::ui::mods_shell::NEW,
+                _ => crate::ui::mods_shell::USE,
+            })
+            .context("the Mods page lacks the button to press")?;
+        for rect in row.into_iter().chain([button]) {
+            state.match_state.input.cursor_x = (rect.x + rect.w / 2) as f32;
+            state.match_state.input.cursor_y = (rect.y + rect.h / 2) as f32;
+            App::handle_mods_mouse_down(state);
+            App::handle_mods_mouse_up(state);
+        }
+        ensure!(
+            state.frontend.shell_message_box.is_some(),
+            "the Mods page's button opened no box"
+        );
+        if press == ModsPress::Check {
+            use crate::app::frontend::state::{ModFilesBox, ShellMessageBoxPurpose};
+            let reading = |state: &AppState| {
+                state
+                    .frontend
+                    .shell_message_box
+                    .as_ref()
+                    .is_some_and(|open| {
+                        matches!(
+                            open.purpose,
+                            ShellMessageBoxPurpose::ModFiles(ModFilesBox::Reading)
+                        )
+                    })
+            };
+            let started = std::time::Instant::now();
+            while reading(state) && started.elapsed() < std::time::Duration::from_secs(60) {
+                App::poll_mod_files(state);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            ensure!(!reading(state), "Check Files did not answer in a minute");
+        }
+        Ok(())
+    }
+
     fn restore_neutral_pointer(state: &mut AppState) {
-        state.match_state.input.cursor_x = EXPECTED_CURSOR_X as f32;
-        state.match_state.input.cursor_y = EXPECTED_CURSOR_Y as f32;
+        let config = &state.renderer.gpu.config;
+        // A scaled window (VERA's room's capture) rests it at its centre.
+        let (x, y) = match (config.width, config.height) {
+            (EXPECTED_WIDTH, EXPECTED_HEIGHT) | (640, 480) => {
+                (EXPECTED_CURSOR_X, EXPECTED_CURSOR_Y)
+            }
+            (width, height) => (width / 2, height / 2),
+        };
+        state.match_state.input.cursor_x = x as f32;
+        state.match_state.input.cursor_y = y as f32;
     }
 
     pub(super) fn after_present(
@@ -200,6 +416,68 @@ impl MoviesCapture {
         rendered: PresentedShell,
         frame: u32,
     ) -> Result<()> {
+        if matches!(self.target, MoviesTarget::CampaignStart { .. }) && !self.saves_isolated {
+            state
+                .persistence
+                .isolate_capture_saves(&self.restart_save_directory)?;
+            self.saves_isolated = true;
+        }
+        if let Some(lan) = self.lan.as_mut() {
+            return lan.after_present(state, rendered, frame);
+        }
+        if let Some(wol) = self.wol.as_mut() {
+            return wol.after_present(state, rendered, frame);
+        }
+        if let Some(restart) = self.restart.as_mut() {
+            return restart.after_present(state, rendered, &mut self.route, frame);
+        }
+        if matches!(
+            self.target,
+            MoviesTarget::CampaignStart {
+                target: CampaignStartTarget::InitialSaved,
+                ..
+            }
+        ) && self.phase == Phase::CampaignStarting
+            && state.frontend.screen == GameScreen::InGame
+        {
+            self.observed_campaign_runtime = Some(campaign_runtime_receipt(state)?);
+            let owner = crate::app::input::commands::preferred_local_owner_name(state)
+                .context("initial save control has no local player")?;
+            // The ordinary Options producer queues this before the admitted
+            // frame. The automatic file must contain its consumed value.
+            crate::app::input::commands::schedule_command(
+                state,
+                &owner,
+                crate::sim::command::Command::SetGameSpeed { speed: 2 },
+            );
+            crate::app::match_runtime::sim_tick::advance_in_game_runtime_exact_step(state)?;
+            self.route.push(
+                json!({"frame": frame, "action": "initial campaign Logic step",
+                "input": "ordinary Options SetGameSpeed producer", "speed": 2}),
+            );
+            let entries = state.persistence.repository.browser_entries();
+            ensure!(entries.len() == 1, "initial save did not create one slot");
+            let path = entries[0].0.path.clone();
+            let bytes = state.persistence.repository.read(&path)?;
+            let modified = std::fs::metadata(&path)?.modified()?;
+            crate::app::persistence::commands::try_load_save_file(state, &path)
+                .context("load the initial automatic save through the ordinary loader")?;
+            crate::app::match_runtime::sim_tick::advance_in_game_runtime_exact_step(state)?;
+            ensure!(
+                state.persistence.repository.read(&path)? == bytes
+                    && std::fs::metadata(&path)?.modified()? == modified,
+                "loading the initial save rewrote it on the next Logic step"
+            );
+            self.route.push(
+                json!({"frame": frame, "action": "initial save loaded and resumed",
+                "save_file_unchanged": true}),
+            );
+            self.phase = Phase::CampaignInitialSaved;
+            return Ok(());
+        }
+        if self.phase == Phase::CampaignInitialSaved {
+            return Ok(());
+        }
         let starting_campaign = matches!(self.target, MoviesTarget::CampaignStart { .. })
             && self.phase == Phase::CampaignStarting;
         let aborting_campaign = matches!(
@@ -210,11 +488,7 @@ impl MoviesCapture {
             }
         ) && matches!(
             self.phase,
-            Phase::CampaignAbortMenu
-                | Phase::CampaignAbortPressed
-                | Phase::CampaignAbortModal
-                | Phase::CampaignLeavePressed
-                | Phase::CampaignLeaving
+            Phase::CampaignAbortMenu | Phase::CampaignLeaving
         );
         ensure!(
             state.frontend.screen == GameScreen::MainMenu
@@ -277,33 +551,32 @@ impl MoviesCapture {
                 self.observed_campaign_runtime = Some(campaign_runtime_receipt(state)?);
                 self.route
                     .push(json!({"frame": frame, "action": "first live observed", "tick": 0}));
-                // Ordinary world Escape resolves the actual binding before
-                // Options enters B5, exactly as the window handler does.
-                ensure!(
-                    state.platform.live_modifiers.is_empty(),
-                    "pause menu requires bare Escape"
-                );
-                let escape = winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape);
-                crate::app::input::keyboard::in_game_key_edge(
+                self.abort_input = Some(abort_return::AbortReturnInput::begin(
                     state,
-                    crate::app::input::keyboard::InGameKeyEdge {
-                        physical: winit::keyboard::KeyCode::Escape,
-                        logical: &escape,
-                        unmodified: &escape,
-                        location: winit::keyboard::KeyLocation::Standard,
-                        state: winit::event::ElementState::Pressed,
-                        repeat: false,
-                    },
-                    false,
-                );
-                ensure!(
-                    state.match_state.match_presentation.in_game_menu
-                        == crate::ui::pause_menu::InGameMenuState::Menu,
-                    "ordinary Escape did not open B5"
-                );
-                self.route
-                    .push(json!({"frame": frame, "action": "Escape press", "dialog": 0xb5}));
+                    &mut self.route,
+                    frame,
+                )?);
                 self.phase = Phase::CampaignAbortMenu;
+            }
+            if let MoviesTarget::CampaignStart {
+                target: CampaignStartTarget::Restart(target),
+                ..
+            } = self.target
+                && state.frontend.screen == GameScreen::InGame
+            {
+                ensure!(
+                    self.observed_campaign_startup.is_some(),
+                    "installed campaign was not observed loading"
+                );
+                self.observed_campaign_runtime = Some(campaign_runtime_receipt(state)?);
+                self.restart = Some(campaign_restart::RestartCapture::begin(
+                    target,
+                    state,
+                    &mut self.route,
+                    frame,
+                    &self.restart_save_directory,
+                )?);
+                self.phase = Phase::CampaignRestart;
             }
             if state.frontend.screen == GameScreen::InGame
                 && let Some(opening) = self.opening.as_mut()
@@ -321,7 +594,10 @@ impl MoviesCapture {
         }
         match (self.phase, rendered) {
             (Phase::MainMenu, PresentedShell::MainMenu) => {
-                if steady_main_menu_capture_ready(MainMenuCaptureSnapshot::from_state(state))? {
+                // Only VERA's room's capture runs in a scaled window
+                // (`parse_launch_args`).
+                let snapshot = MainMenuCaptureSnapshot::from_state(state).scaled_as_reference();
+                if steady_main_menu_capture_ready(snapshot)? {
                     let exit_phase = match self.target {
                         MoviesTarget::ExitConfirm => Some(Phase::Exit),
                         MoviesTarget::SlideOut {
@@ -356,6 +632,16 @@ impl MoviesCapture {
                             "Network did not start the 0xE2 teardown slide"
                         );
                         self.phase = Phase::NetworkLeaving;
+                        return Ok(());
+                    }
+                    if matches!(self.target, MoviesTarget::Mods { .. }) {
+                        self.route
+                            .push(json!({"dialog": 0xe2, "frame": frame, "action": "Options"}));
+                        App::handle_main_menu_shell_action(
+                            state,
+                            crate::ui::main_menu_shell::MainMenuShellAction::Options,
+                        );
+                        self.phase = Phase::ModsOptions;
                         return Ok(());
                     }
                     if matches!(self.target, MoviesTarget::Options0xD5 { .. }) {
@@ -444,12 +730,15 @@ impl MoviesCapture {
                             crate::ui::movies_credits_shell::MoviesCreditsAction::SneakPeeks
                         }
                         MoviesTarget::ExitConfirm
+                        | MoviesTarget::Mods { .. }
                         | MoviesTarget::SlideOut { .. }
                         | MoviesTarget::Campaign0x94 { .. }
                         | MoviesTarget::CampaignStart { .. }
                         | MoviesTarget::CampaignBack
                         | MoviesTarget::LoadSavedGame0xB7 { .. }
                         | MoviesTarget::Options0xD5 { .. }
+                        | MoviesTarget::Lan(_)
+                        | MoviesTarget::Wol(_)
                         | MoviesTarget::NetworkBounce
                         | MoviesTarget::WolWelcome { .. } => {
                             bail!("{:?} capture reached the 0x101 page", self.target)
@@ -562,9 +851,20 @@ impl MoviesCapture {
                 }
             }
             (Phase::Options, PresentedShell::Other | PresentedShell::Options) => {
-                let MoviesTarget::Options0xD5 { entry_tick, hover } = self.target else {
+                use crate::ui::main_menu_dialogs::options::LauncherButton;
+                let MoviesTarget::Options0xD5 {
+                    entry_tick,
+                    hover,
+                    category,
+                } = self.target
+                else {
                     bail!("options phase without an options target");
                 };
+                let showing = state
+                    .frontend
+                    .options_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.category());
                 if let Some(target) = entry_tick {
                     let tick = state
                         .frontend
@@ -586,6 +886,41 @@ impl MoviesCapture {
                         }
                     }
                 } else if rendered == PresentedShell::Options
+                    && let Some(showing) = showing.filter(|&showing| showing != category)
+                    && state.frontend.shell_exit.is_none()
+                    && Self::slide_settled(state, ShellSlideKind::Options)
+                {
+                    // The page buttons stay in the column: pressing another
+                    // swaps the controls in place, with no slide.
+                    let layout =
+                        crate::app::frontend::shell_layout::launcher_options_layout(state, showing);
+                    let rect = layout
+                        .buttons
+                        .iter()
+                        .find(|(button, _)| *button == LauncherButton::Category(category))
+                        .map(|(_, rect)| *rect)
+                        .context("D5 page button")?;
+                    state.match_state.input.cursor_x = (rect.x + rect.w / 2) as f32;
+                    state.match_state.input.cursor_y = (rect.y + rect.h / 2) as f32;
+                    App::handle_launcher_options_mouse(state, None);
+                    App::handle_launcher_options_mouse(state, Some(true));
+                    App::handle_launcher_options_mouse(state, Some(false));
+                    ensure!(
+                        state.frontend.shell_exit.is_none(),
+                        "a page button swaps the controls in place; it must not run the teardown slide"
+                    );
+                    let swapped = state
+                        .frontend
+                        .options_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.category() == category);
+                    ensure!(swapped, "the page must be showing after the press");
+                    self.route.push(json!({"dialog": 0xd5, "frame": frame,
+                        "action": "page button through ordinary pointer handler",
+                        "page": format!("{category:?}")}));
+                } else if rendered == PresentedShell::Options
+                    && showing == Some(category)
+                    && state.frontend.shell_exit.is_none()
                     && Self::slide_settled(state, ShellSlideKind::Options)
                 {
                     Self::restore_neutral_pointer(state);
@@ -602,6 +937,25 @@ impl MoviesCapture {
             }
             (Phase::Campaign, PresentedShell::Campaign) => {
                 if Self::slide_settled(state, ShellSlideKind::Campaign) {
+                    if let MoviesTarget::CampaignStart { side, target } = self.target
+                        && let Some(scenario) = target.explicit_scenario()
+                    {
+                        let side = match side {
+                            crate::ui::campaign_shell::CampaignSide::Allied => 0,
+                            crate::ui::campaign_shell::CampaignSide::Soviet => 1,
+                        };
+                        let request = crate::app::frontend::cncnet_spawn::SpawnRequest::parse(
+                            &format!(
+                                "[Settings]\nIsSinglePlayer=Yes\nScenario={scenario}\nSide={side}\nDifficultyModeHuman=1\nDifficultyModeComputer=1\nGameSpeed=2\nSeed=1\n"
+                            ),
+                        )?;
+                        App::start_spawn_session(state, request)?;
+                        self.route.push(json!({"frame": frame,
+                            "action": "explicit campaign spawn", "scenario": scenario,
+                            "difficulty": 1, "seed": 1}));
+                        self.phase = Phase::CampaignStarting;
+                        return Ok(());
+                    }
                     let layout = crate::ui::campaign_shell::compute_layout(
                         state.renderer.gpu.config.width,
                         state.renderer.gpu.config.height,
@@ -719,6 +1073,60 @@ impl MoviesCapture {
                     self.phase = Phase::Settling(SETTLE_FRAMES);
                 }
             }
+            (Phase::ModsOptions, PresentedShell::Options) => {
+                use crate::ui::main_menu_dialogs::options::{LauncherButton, LauncherParentResult};
+                let showing = state
+                    .frontend
+                    .options_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.category());
+                if let Some(showing) = showing
+                    && state.frontend.shell_exit.is_none()
+                    && Self::slide_settled(state, ShellSlideKind::Options)
+                {
+                    let layout =
+                        crate::app::frontend::shell_layout::launcher_options_layout(state, showing);
+                    let rect = layout
+                        .buttons
+                        .iter()
+                        .find(|(button, _)| {
+                            *button == LauncherButton::Exit(LauncherParentResult::Mods)
+                        })
+                        .map(|(_, rect)| *rect)
+                        .context("D5 Mods button")?;
+                    state.match_state.input.cursor_x = (rect.x + rect.w / 2) as f32;
+                    state.match_state.input.cursor_y = (rect.y + rect.h / 2) as f32;
+                    App::handle_launcher_options_mouse(state, None);
+                    App::handle_launcher_options_mouse(state, Some(true));
+                    App::handle_launcher_options_mouse(state, Some(false));
+                    ensure!(
+                        state.frontend.shell_exit.is_some(),
+                        "Mods did not start the 0xD5 teardown slide"
+                    );
+                    self.route.push(json!({"dialog": 0xd5, "frame": frame,
+                        "action": "Mods through ordinary pointer handler"}));
+                    self.phase = Phase::Mods;
+                }
+            }
+            (Phase::Mods, PresentedShell::Mods) => {
+                if Self::slide_settled(state, ShellSlideKind::Mods) {
+                    if let MoviesTarget::Mods {
+                        press: press @ (ModsPress::Use | ModsPress::Check | ModsPress::New),
+                    } = self.target
+                    {
+                        Self::press_mod_row_and(state, press)?;
+                        self.route
+                            .push(json!({"dialog": crate::ui::mods_shell::DIALOG.0,
+                            "frame": frame, "action": "press a row, then the page's button"}));
+                        Self::restore_neutral_pointer(state);
+                    } else {
+                        // Hover over the list writes its status help.
+                        Self::restore_neutral_pointer(state);
+                        App::handle_mods_mouse_move(state);
+                    }
+                    self.phase = Phase::Settling(SETTLE_FRAMES);
+                }
+            }
             (Phase::List, PresentedShell::MovieList) => {
                 if Self::slide_settled(state, ShellSlideKind::MovieList) {
                     if let MoviesTarget::FullList { down_presses } = self.target {
@@ -795,6 +1203,7 @@ impl MoviesCapture {
                     entry_tick,
                     hover,
                     press,
+                    ..
                 } = self.target
                 else {
                     bail!("WOL phase without a WOL target");
@@ -869,11 +1278,7 @@ impl MoviesCapture {
                 match press {
                     WolPress::MyInformation => {
                         ensure!(
-                            state
-                                .frontend
-                                .wol_welcome
-                                .as_ref()
-                                .is_some_and(|wol| wol.api_missing.is_some()),
+                            wol_api_missing_shown(state),
                             "the WOL action did not show TXT_APIMISSING"
                         );
                         Self::restore_neutral_pointer(state);
@@ -957,8 +1362,7 @@ impl MoviesCapture {
                 self.phase = Phase::Settling(SETTLE_FRAMES);
             }
             (Phase::Exit, PresentedShell::MainMenu) => {
-                if state.frontend.exit_confirm_modal.is_some()
-                    && state.frontend.shell_exit.is_none()
+                if state.frontend.shell_message_box.is_some() && state.frontend.shell_exit.is_none()
                 {
                     self.route
                         .push(json!({"state": 6, "frame": frame, "action": "confirmation shown"}));
@@ -974,211 +1378,18 @@ impl MoviesCapture {
     }
 
     fn campaign_abort_after_present(&mut self, state: &mut AppState, frame: u32) -> Result<()> {
-        use crate::ui::pause_menu::InGameMenuState;
-        use crate::ui::shell::abort::AbortButton;
-        use crate::ui::shell::pause_menu::PauseMenuButton;
-        use winit::event::{ElementState, MouseButton};
-        match self.phase {
-            Phase::CampaignAbortMenu => {
-                ensure!(
-                    state.match_state.match_presentation.in_game_menu == InGameMenuState::Menu
-                        && crate::app::frontend::skirmish_shell_render::native_in_game_shell_active(
-                            state
-                        ),
-                    "campaign B5 did not present with its required loaded artwork"
-                );
-                // The window handler's modal branch consumes the press. Its
-                // paused Escape release reaches this existing KeyEdge owner.
-                let escape = winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape);
-                let paused_at_event = state.match_state.paused();
-                crate::app::input::keyboard::in_game_key_edge(
-                    state,
-                    crate::app::input::keyboard::InGameKeyEdge {
-                        physical: winit::keyboard::KeyCode::Escape,
-                        logical: &escape,
-                        unmodified: &escape,
-                        location: winit::keyboard::KeyLocation::Standard,
-                        state: ElementState::Released,
-                        repeat: false,
-                    },
-                    paused_at_event,
-                );
-                self.route
-                    .push(json!({"frame": frame, "action": "Escape release", "dialog": 0xb5}));
-                self.route.push(
-                    json!({"frame": frame, "action": "pause menu presented", "dialog": 0xb5}),
-                );
-                let shell =
-                    crate::app::frontend::skirmish_shell_render::current_in_game_shell_layout(
-                        state,
-                    )
-                    .context("campaign B5 has no loaded hit geometry")?;
-                let layout = crate::ui::shell::pause_menu::pause_menu_layout(
-                    shell.width,
-                    shell.height,
-                    shell.layout,
-                    shell.button_size,
-                );
-                let rect = layout.buttons[PauseMenuButton::Abort as usize];
-                let point = set_window_pointer_to_rect_center(state, rect);
-                crate::app::input::dispatch::handle_cursor_moved_in_game(state);
-                crate::app::input::dispatch::handle_mouse_input(
-                    state,
-                    MouseButton::Left,
-                    ElementState::Pressed,
-                );
-                ensure!(
-                    state
-                        .match_state
-                        .match_presentation
-                        .pause_menu_interaction
-                        .is_pressed(PauseMenuButton::Abort),
-                    "physical B5 Abort press missed its loaded control"
-                );
-                self.route.push(
-                    json!({"frame": frame, "action": "Abort press", "dialog": 0xb5,
-                    "point": point, "rect": [rect.x, rect.y, rect.w, rect.h]}),
-                );
-                self.phase = Phase::CampaignAbortPressed;
-            }
-            Phase::CampaignAbortPressed => {
-                ensure!(
-                    state.match_state.match_presentation.in_game_menu == InGameMenuState::Menu
-                        && state
-                            .match_state
-                            .match_presentation
-                            .pause_menu_interaction
-                            .is_pressed(PauseMenuButton::Abort),
-                    "B5 Abort capture changed before its presented press/release"
-                );
-                crate::app::input::dispatch::handle_mouse_input(
-                    state,
-                    MouseButton::Left,
-                    ElementState::Released,
-                );
-                ensure!(
-                    state.match_state.match_presentation.in_game_menu
-                        == InGameMenuState::AbortConfirm,
-                    "physical B5 Abort release did not open B6"
-                );
-                self.route
-                    .push(json!({"frame": frame, "action": "Abort release", "dialog": 0xb5}));
-                self.phase = Phase::CampaignAbortModal;
-            }
-            Phase::CampaignAbortModal => {
-                ensure!(
-                    state.match_state.match_presentation.in_game_menu
-                        == InGameMenuState::AbortConfirm
-                        && crate::app::frontend::skirmish_shell_render::native_in_game_shell_active(
-                            state
-                        ),
-                    "campaign B6 did not present with its required loaded artwork"
-                );
-                self.route.push(
-                    json!({"frame": frame, "action": "abort modal presented", "dialog": 0xb6}),
-                );
-                let shell =
-                    crate::app::frontend::skirmish_shell_render::current_in_game_shell_layout(
-                        state,
-                    )
-                    .context("campaign B6 has no loaded hit geometry")?;
-                let layout = crate::ui::shell::abort::abort_layout(
-                    shell.width,
-                    shell.height,
-                    shell.layout,
-                    shell.button_size,
-                );
-                let rect = layout.button(AbortButton::Leave);
-                let point = set_window_pointer_to_rect_center(state, rect);
-                crate::app::input::dispatch::handle_cursor_moved_in_game(state);
-                crate::app::input::dispatch::handle_mouse_input(
-                    state,
-                    MouseButton::Left,
-                    ElementState::Pressed,
-                );
-                ensure!(
-                    state
-                        .match_state
-                        .match_presentation
-                        .abort_buttons
-                        .is_pressed(AbortButton::Leave),
-                    "physical B6 Leave press missed its loaded control"
-                );
-                self.route.push(
-                    json!({"frame": frame, "action": "Leave press", "dialog": 0xb6,
-                    "point": point, "rect": [rect.x, rect.y, rect.w, rect.h]}),
-                );
-                self.phase = Phase::CampaignLeavePressed;
-            }
-            Phase::CampaignLeavePressed => {
-                ensure!(
-                    state.match_state.match_presentation.in_game_menu
-                        == InGameMenuState::AbortConfirm
-                        && state
-                            .match_state
-                            .match_presentation
-                            .abort_buttons
-                            .is_pressed(AbortButton::Leave),
-                    "B6 Leave capture changed before its presented press/release"
-                );
-                let runtime = state
-                    .match_state
-                    .sim_runtime
-                    .as_ref()
-                    .context("B6 lost its installed runtime")?;
-                ensure!(
-                    !runtime
-                        .simulation
-                        .pending_command_snapshot()
-                        .iter()
-                        .any(|command| matches!(
-                            command.payload,
-                            crate::sim::command::Command::ExitMatch
-                        )),
-                    "an EXIT was already queued before physical Leave release"
-                );
-                crate::app::input::dispatch::handle_mouse_input(
-                    state,
-                    MouseButton::Left,
-                    ElementState::Released,
-                );
-                ensure!(
-                    state.match_state.match_presentation.in_game_menu == InGameMenuState::Closed
-                        && !state.match_state.paused(),
-                    "physical Leave did not release the ordinary modal pause"
-                );
-                let sim = &state
-                    .match_state
-                    .sim_runtime
-                    .as_ref()
-                    .context("Leave lost its installed runtime")?
-                    .simulation;
-                let exits = sim
-                    .pending_command_snapshot()
-                    .into_iter()
-                    .filter(|command| {
-                        matches!(command.payload, crate::sim::command::Command::ExitMatch)
-                    })
-                    .collect::<Vec<_>>();
-                ensure!(
-                    exits.len() == 1 && Some(exits[0].owner) == sim.session.current_house(),
-                    "physical Leave did not queue exactly the current House's EXIT"
-                );
-                let exit = &exits[0];
-                ensure!(
-                    !sim.quit_requested,
-                    "Leave confirmation executed EXIT instead of only queueing it"
-                );
-                self.route
-                    .push(json!({"frame": frame, "action": "Leave release", "dialog": 0xb6}));
-                self.route.push(json!({"frame": frame, "action": "EXIT queued", "queued_at_tick": sim.session.tick,
-                    "execute_tick": exit.execute_tick, "owner": sim.interner.resolve(exit.owner),
-                    "owner_native_unique_id": sim.houses.get(&exit.owner).and_then(|house| house.native_unique_id()),
-                    "modal_closed": !state.match_state.paused(), "diagnostic_simulation_freeze": false,
-                    "quit_requested": sim.quit_requested}));
-                Self::restore_neutral_pointer(state);
+        if self.phase == Phase::CampaignAbortMenu {
+            if self
+                .abort_input
+                .as_mut()
+                .context("abort input owner")?
+                .after_present(state, &mut self.route, frame)?
+            {
                 self.phase = Phase::CampaignLeaving;
             }
+            return Ok(());
+        }
+        match self.phase {
             Phase::CampaignLeaving => {
                 if state.match_state.scenario_exit.is_some() && !self.observed_exit_cascade {
                     ensure!(
@@ -1188,11 +1399,11 @@ impl MoviesCapture {
                     let sim = &state
                         .match_state
                         .sim_runtime
-                        .as_ref()
+                        .runtime()
                         .context("EXIT lost its installed runtime")?
                         .simulation;
                     ensure!(
-                        sim.quit_requested
+                        sim.quit_requested()
                             && !sim
                                 .pending_command_snapshot()
                                 .iter()
@@ -1203,9 +1414,9 @@ impl MoviesCapture {
                         "exit cascade began before the queued EXIT was consumed"
                     );
                     self.route.push(
-                        json!({"frame": frame, "action": "EXIT consumed", "tick": sim.session.tick,
+                        json!({"frame": frame, "action": "EXIT consumed", "tick": sim.session().tick(),
                         "scenario_exit_present": true, "scenario_outcome_present": false,
-                        "quit_requested": sim.quit_requested}),
+                        "quit_requested": sim.quit_requested()}),
                     );
                     self.observed_exit_cascade = true;
                 }
@@ -1229,6 +1440,12 @@ impl MoviesCapture {
     }
 
     pub(super) fn ready(&self, state: &AppState) -> Result<bool> {
+        if let Some(lan) = self.lan.as_ref() {
+            return lan.ready(state);
+        }
+        if let Some(wol) = self.wol.as_ref() {
+            return wol.ready(state);
+        }
         if matches!(
             self.target,
             MoviesTarget::CampaignStart {
@@ -1246,11 +1463,22 @@ impl MoviesCapture {
             campaign_abort_cleanup_receipt(state)?;
             return steady_main_menu_capture_ready(MainMenuCaptureSnapshot::from_state(state));
         }
+        if let Some(restart) = self.restart.as_ref() {
+            return restart.ready(state);
+        }
         if let MoviesTarget::CampaignStart { side, target } = self.target {
+            if target == CampaignStartTarget::InitialSaved
+                && self.phase == Phase::CampaignInitialSaved
+            {
+                initial_save_receipt(state, &self.restart_save_directory)?;
+                return Ok(true);
+            }
             if self.phase != Phase::CampaignStarting {
                 return Ok(false);
             }
-            if let Some(startup) = crate::app::loading::pump::loading_campaign_startup(state) {
+            if target.explicit_scenario().is_none()
+                && let Some(startup) = crate::app::loading::pump::loading_campaign_startup(state)
+            {
                 ensure!(
                     startup
                         .campaign()
@@ -1272,7 +1500,7 @@ impl MoviesCapture {
                     }
                     Ok(ready)
                 }
-                CampaignStartTarget::FirstLive => {
+                CampaignStartTarget::FirstLive | CampaignStartTarget::ExplicitFirstLive(_) => {
                     if state.frontend.screen != GameScreen::InGame {
                         return Ok(false);
                     }
@@ -1283,6 +1511,7 @@ impl MoviesCapture {
                     campaign_runtime_receipt(state)?;
                     Ok(true)
                 }
+                CampaignStartTarget::InitialSaved => Ok(false),
                 CampaignStartTarget::Opening(_) => {
                     if state.frontend.screen != GameScreen::InGame {
                         return Ok(false);
@@ -1293,6 +1522,8 @@ impl MoviesCapture {
                         .ready(state)
                 }
                 CampaignStartTarget::AbortReturn => unreachable!("handled above"),
+                // The restart driver takes over at the first live frame.
+                CampaignStartTarget::Restart(_) => Ok(false),
             };
         }
         if self.target == MoviesTarget::ListBackFirstFrame {
@@ -1320,7 +1551,14 @@ impl MoviesCapture {
         // Steady page frames wait for the heading's and the status line's
         // kind-1 reveals to finish.
         let heading_settled = match self.target {
+            // The box covers the page's statics.
+            MoviesTarget::Mods {
+                press: ModsPress::Use | ModsPress::Check | ModsPress::New,
+            } => true,
             MoviesTarget::Page0x101
+            | MoviesTarget::Mods {
+                press: ModsPress::Nothing,
+            }
             | MoviesTarget::List0x129
             | MoviesTarget::List0x129Selected
             | MoviesTarget::FullList { .. }
@@ -1364,6 +1602,8 @@ impl MoviesCapture {
                 press: WolPress::MyInformation | WolPress::MainMenu,
                 ..
             } => true,
+            MoviesTarget::Lan(_) => unreachable!("LAN driver handled above"),
+            MoviesTarget::Wol(_) => unreachable!("WOL driver handled above"),
             MoviesTarget::WolWelcome { .. } => {
                 state.frontend.shell_page_title.is_terminal()
                     && state.frontend.shell_status_line.is_terminal()
@@ -1374,6 +1614,11 @@ impl MoviesCapture {
         }
         let expected = match self.target {
             MoviesTarget::Page0x101 => state.frontend.shell_route.movies_and_credits(),
+            MoviesTarget::Mods { press } => {
+                state.frontend.shell_route.mods()
+                    && state.frontend.mods.page.is_some()
+                    && state.frontend.shell_message_box.is_some() == (press != ModsPress::Nothing)
+            }
             MoviesTarget::List0x129
             | MoviesTarget::List0x129Selected
             | MoviesTarget::FullList { .. } => {
@@ -1381,7 +1626,7 @@ impl MoviesCapture {
             }
             MoviesTarget::Credits { .. } => state.frontend.credits_roll.is_some(),
             MoviesTarget::SneakPeek { .. } => state.frontend.fullscreen_movie.is_some(),
-            MoviesTarget::ExitConfirm => state.frontend.exit_confirm_modal.is_some(),
+            MoviesTarget::ExitConfirm => state.frontend.shell_message_box.is_some(),
             MoviesTarget::NetworkBounce
             | MoviesTarget::WolWelcome {
                 press: WolPress::MainMenu,
@@ -1394,13 +1639,9 @@ impl MoviesCapture {
             MoviesTarget::WolWelcome {
                 press: WolPress::MyInformation,
                 ..
-            } => state
-                .frontend
-                .wol_welcome
-                .as_ref()
-                .is_some_and(|wol| wol.api_missing.is_some()),
+            } => wol_api_missing_shown(state),
             MoviesTarget::WolWelcome { entry_tick, .. } => {
-                state.frontend.shell_route.wol_welcome()
+                state.frontend.shell_route.wol()
                     && entry_tick.is_none_or(|target| {
                         state
                             .frontend
@@ -1439,8 +1680,18 @@ impl MoviesCapture {
                             == Some(target)
                     })
             }
-            MoviesTarget::Options0xD5 { entry_tick, .. } => {
-                state.frontend.options_dialog.is_some()
+            MoviesTarget::Lan(_) => unreachable!("LAN driver handled above"),
+            MoviesTarget::Wol(_) => unreachable!("WOL driver handled above"),
+            MoviesTarget::Options0xD5 {
+                entry_tick,
+                category,
+                ..
+            } => {
+                state
+                    .frontend
+                    .options_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.category() == category)
                     && entry_tick.is_none_or(|target| {
                         state
                             .frontend
@@ -1484,6 +1735,26 @@ impl MoviesCapture {
             "frame": {"path": FRAME_FILE_NAME, "byte_length": pixels.len(),
                 "sha256": crate::util::sha256::sha256_hex(pixels)}
         });
+        if let MoviesTarget::WolWelcome {
+            provider,
+            press: WolPress::None,
+            ..
+        } = self.target
+        {
+            let visit = state.frontend.wol.as_ref().context("captured WOL visit")?;
+            ensure!(
+                !visit.modern_ui(),
+                "captured WOL welcome lost its native page"
+            );
+            let button_ids: Vec<_> = crate::ui::wol_shell::WOL_WELCOME_PAGE
+                .buttons()
+                .map(|button| button.id)
+                .collect();
+            manifest["wol_welcome"] = json!({
+                "provider": format!("{provider:?}"),
+                "button_ids": button_ids
+            });
+        }
         if let MoviesTarget::CampaignStart { target, .. } = self.target {
             let startup = crate::app::loading::pump::loading_campaign_startup(state)
                 .map(campaign_startup_receipt)
@@ -1494,8 +1765,11 @@ impl MoviesCapture {
                     crate::app::loading::pump::loading_map_source(state)
                 }
                 CampaignStartTarget::FirstLive
+                | CampaignStartTarget::InitialSaved
+                | CampaignStartTarget::ExplicitFirstLive(_)
                 | CampaignStartTarget::AbortReturn
-                | CampaignStartTarget::Opening(_) => state.match_state.loaded_map_source.as_ref(),
+                | CampaignStartTarget::Opening(_)
+                | CampaignStartTarget::Restart(_) => state.match_state.loaded_map_source.as_ref(),
             }
             .context("campaign selected map source missing at readback")?;
             // Readiness is queried before the first loading render prepares
@@ -1517,21 +1791,75 @@ impl MoviesCapture {
             manifest["checkpoint_phase"] = json!(match target {
                 CampaignStartTarget::LoadingFirst => "loading-first-frame",
                 CampaignStartTarget::FirstLive => "first-live-frame",
+                CampaignStartTarget::InitialSaved => "initial-save",
+                CampaignStartTarget::ExplicitFirstLive(_) => "explicit-first-live-frame",
                 CampaignStartTarget::AbortReturn => "abort-return",
                 CampaignStartTarget::Opening(target) => target.phase(),
+                CampaignStartTarget::Restart(RestartTarget::AbortShown) => "abort-restart-shown",
+                CampaignStartTarget::Restart(RestartTarget::AbortRestarted) => "abort-restarted",
+                CampaignStartTarget::Restart(RestartTarget::DefeatPrompt) => "defeat-replay-prompt",
+                CampaignStartTarget::Restart(RestartTarget::DefeatReplayed) => "defeat-replayed",
+                CampaignStartTarget::Restart(RestartTarget::DefeatReturned) => "defeat-returned",
+                CampaignStartTarget::Restart(RestartTarget::DefeatReturnedEnter) =>
+                    "defeat-returned-enter",
+                CampaignStartTarget::Restart(RestartTarget::DefeatReturnedNumpadEnter) =>
+                    "defeat-returned-numpad-enter",
+                CampaignStartTarget::Restart(RestartTarget::DefeatReturnedEscape) =>
+                    "defeat-returned-escape",
+                CampaignStartTarget::Restart(RestartTarget::DefeatReturnedRepeatedEnter) =>
+                    "defeat-returned-repeated-enter",
+                CampaignStartTarget::Restart(RestartTarget::Restate) => "restate",
+                CampaignStartTarget::Restart(RestartTarget::ObjectiveExpiry) =>
+                    "objective-expired-after-menu",
+                CampaignStartTarget::Restart(RestartTarget::SavedVictory) =>
+                    "saved-victory-next-mission",
+                CampaignStartTarget::Restart(RestartTarget::AlternateHomeVictory) =>
+                    "alternate-home-victory-next-mission",
+                CampaignStartTarget::Restart(RestartTarget::InheritedTimerVictory) =>
+                    "inherited-timer-victory-next-mission",
+                CampaignStartTarget::Restart(RestartTarget::MapSelectFailurePrompt) =>
+                    "mapsel-failure-prompt",
+                CampaignStartTarget::Restart(RestartTarget::MapSelectFailureReplayed) =>
+                    "mapsel-failure-replayed",
+                CampaignStartTarget::Restart(RestartTarget::MapSelectFailureEscape) =>
+                    "mapsel-failure-escape",
+                CampaignStartTarget::Restart(RestartTarget::SavedAbortRestarted) =>
+                    "saved-abort-restarted",
+                CampaignStartTarget::Restart(RestartTarget::MenuDefeatReplayed) =>
+                    "menu-defeat-replayed",
             });
             manifest["runtime"] = match target {
                 CampaignStartTarget::LoadingFirst => Value::Null,
-                CampaignStartTarget::FirstLive => campaign_runtime_receipt(state)?,
-                CampaignStartTarget::AbortReturn => self
+                CampaignStartTarget::FirstLive | CampaignStartTarget::ExplicitFirstLive(_) => {
+                    campaign_runtime_receipt(state)?
+                }
+                CampaignStartTarget::InitialSaved => installed_campaign_runtime_receipt(state)?,
+                CampaignStartTarget::AbortReturn | CampaignStartTarget::Restart(_) => self
                     .observed_campaign_runtime
                     .clone()
-                    .context("campaign abort has no pre-Escape runtime observation")?,
+                    .context("campaign route has no first-live runtime observation")?,
                 CampaignStartTarget::Opening(_) => installed_campaign_runtime_receipt(state)?,
             };
+            if matches!(target, CampaignStartTarget::Restart(target) if target.next_scenario().is_some())
+            {
+                // This readback presents the next mission. The restart receipt
+                // separately retains the initial and loaded mission identities.
+                manifest["startup"] = campaign_startup_receipt(
+                    state
+                        .match_state
+                        .startup
+                        .installed_campaign()
+                        .context("continued mission has no campaign admission")?,
+                );
+                manifest["runtime"] = campaign_runtime_receipt(state)?;
+            }
             if target == CampaignStartTarget::AbortReturn {
                 manifest["runtime_observation"] = json!("first-live-frame-before-Escape-press");
                 manifest["cleanup"] = campaign_abort_cleanup_receipt(state)?;
+            }
+            if target == CampaignStartTarget::InitialSaved {
+                manifest["initial_save"] =
+                    initial_save_receipt(state, &self.restart_save_directory)?;
             }
             manifest["coverage"] = json!({
                 "loading_readback": "first presented loading screen only; later synchronous milestones are not captured",
@@ -1553,7 +1881,10 @@ impl MoviesCapture {
                 manifest["coverage"]["abort_audio"] =
                     json!("ordinary exit cascade observed; device audio output is not captured");
                 manifest["coverage"]["campaign_b6_restart"] =
-                    json!("not implemented by the existing abort owner; selected Leave path only");
+                    json!("selected Leave path only; Restart has its own targets");
+            }
+            if let Some(restart) = &self.restart {
+                manifest["restart"] = restart.receipt();
             }
         } else if self.target == MoviesTarget::CampaignBack {
             manifest["schema_version"] = json!("vera20k.campaign-start-capture.v1");
@@ -1563,21 +1894,79 @@ impl MoviesCapture {
                 "campaign_page_present": state.frontend.campaign.is_some(),
                 "loading_session_present": state.frontend.loading_session.is_some()});
         }
+        if let Some(lan) = self.lan.as_ref() {
+            manifest["lan"] = lan.receipt(state)?;
+        }
+        if let Some(wol) = self.wol.as_ref() {
+            manifest["wol"] = wol.receipt(state);
+        }
         Ok(manifest)
     }
 
+    pub(super) fn cleanup(&mut self) -> Result<()> {
+        if let Some(lan) = self.lan.as_mut() {
+            lan.cleanup()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn measurement_failure(&self) -> Option<String> {
+        self.lan.as_ref()?.measurement_failure()
+    }
+
+    pub(super) fn observes_every_frame(&self) -> bool {
+        self.lan
+            .as_ref()
+            .is_some_and(|lan| lan.observes_every_frame())
+    }
+
     pub(super) fn owns_simulation_steps(&self, state: &AppState) -> bool {
+        if let Some(lan) = self.lan.as_ref() {
+            return lan.owns_simulation_steps(state);
+        }
+        if let Some(wol) = self.wol.as_ref() {
+            return wol.owns_simulation_steps(state);
+        }
+        if let Some(restart) = self.restart.as_ref() {
+            return restart.owns_simulation_steps(state);
+        }
+        if matches!(
+            self.target,
+            MoviesTarget::CampaignStart {
+                target: CampaignStartTarget::Opening(opening::OpeningTarget::RealtimeUnlocked),
+                ..
+            }
+        ) {
+            return false;
+        }
+
         matches!(
             self.target,
             MoviesTarget::CampaignStart {
                 target: CampaignStartTarget::FirstLive
+                    | CampaignStartTarget::InitialSaved
+                    | CampaignStartTarget::ExplicitFirstLive(_)
                     | CampaignStartTarget::AbortReturn
-                    | CampaignStartTarget::Opening(_),
+                    | CampaignStartTarget::Opening(_)
+                    | CampaignStartTarget::Restart(_),
                 ..
             }
-        ) && self.phase == Phase::CampaignStarting
-            && state.frontend.screen == GameScreen::InGame
+        ) && matches!(
+            self.phase,
+            Phase::CampaignStarting | Phase::CampaignInitialSaved
+        ) && state.frontend.screen == GameScreen::InGame
     }
+}
+
+/// The visit shows `0xD0` with `TXT_APIMISSING` over the backdrop.
+fn wol_api_missing_shown(state: &AppState) -> bool {
+    let expected = App::csf_label(state, "TXT_APIMISSING", "TXT_APIMISSING");
+    state
+        .frontend
+        .wol
+        .as_ref()
+        .and_then(|visit| visit.message())
+        .is_some_and(|message| message.body == expected)
 }
 
 /// Same physical-window to retained-render coordinates as CursorMoved in the
@@ -1601,6 +1990,7 @@ fn campaign_startup_receipt(
     json!({
         "campaign": {"id": campaign.id(), "index": startup.campaign_index(), "cd": campaign.cd(),
             "scenario": campaign.scenario(), "final_movie": campaign.final_movie()},
+        "scenario": startup.scenario(),
         "difficulty": startup.difficulty(),
         "seed": {"value": startup.seed.value, "source": format!("{:?}", startup.seed.source),
             "seed_authority_certifying": startup.seed.seed_authority_certifying},
@@ -1648,11 +2038,11 @@ fn campaign_abort_cleanup_receipt(state: &AppState) -> Result<Value> {
     let sim = &state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .context("ordinary return unexpectedly discarded the retained campaign runtime")?
         .simulation;
     let mission_counter = sim
-        .session
+        .session()
         .campaign_mission_counter()
         .context("retained runtime lost campaign state")?;
     let pending_exit_commands = sim
@@ -1662,9 +2052,9 @@ fn campaign_abort_cleanup_receipt(state: &AppState) -> Result<Value> {
         .count();
     ensure!(
         mission_counter == 1
-            && sim.quit_requested
+            && sim.quit_requested()
             && pending_exit_commands == 0
-            && !sim.session.started(),
+            && !sim.session().started(),
         "campaign return did not consume EXIT/reset the retained Session counter/retire started"
     );
     Ok(json!({
@@ -1678,9 +2068,9 @@ fn campaign_abort_cleanup_receipt(state: &AppState) -> Result<Value> {
         "campaign_page_present": state.frontend.campaign.is_some(), "fullscreen_movie_present": state.frontend.fullscreen_movie.is_some(),
         "scenario_exit_present": state.match_state.scenario_exit.is_some(), "scenario_outcome_present": state.match_state.scenario_outcome.is_some(),
         "in_game_menu": format!("{:?}", state.match_state.match_presentation.in_game_menu),
-        "retained_runtime_present": state.match_state.sim_runtime.is_some(), "retained_tick": sim.session.tick,
-        "retained_quit_requested": sim.quit_requested,
-        "retained_scenario_started": sim.session.started(),
+        "retained_runtime_present": state.match_state.sim_runtime.is_installed(), "retained_tick": sim.session().tick(),
+        "retained_quit_requested": sim.quit_requested(),
+        "retained_scenario_started": sim.session().started(),
         "campaign_mission_counter": mission_counter, "pending_exit_commands": pending_exit_commands,
     }))
 }
@@ -1692,60 +2082,121 @@ fn campaign_runtime_receipt(state: &AppState) -> Result<Value> {
         state
             .match_state
             .sim_runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.simulation.session.tick == 0),
+            .runtime()
+            .is_some_and(|runtime| runtime.simulation.session().tick() == 0),
         "first live capture passed simulation tick zero"
     );
     installed_campaign_runtime_receipt(state)
+}
+
+fn initial_save_receipt(state: &AppState, directory: &Path) -> Result<Value> {
+    let runtime = state
+        .match_state
+        .sim_runtime
+        .runtime()
+        .context("initial save has no world")?;
+    ensure!(
+        runtime.simulation.session().tick() == 1,
+        "initial save capture passed its first Logic step"
+    );
+    let entries = state.persistence.repository.browser_entries();
+    ensure!(
+        entries.len() == 1,
+        "initial save capture expected one automatic file, got {}",
+        entries.len()
+    );
+    let entry = &entries[0].0;
+    ensure!(
+        entry.path.parent() == Some(directory),
+        "initial save escaped capture directory"
+    );
+    ensure!(
+        entry.header.tick == 0,
+        "automatic save was written after Logic"
+    );
+    let saved = crate::sim::snapshot::GameSnapshot::load_with_resources(
+        &state.persistence.repository.read(&entry.path)?,
+    )?;
+    ensure!(
+        saved.sim.session().game_options().game_speed == 2,
+        "automatic save preceded the Options input"
+    );
+    let pending_speed = saved.sim.pending_command_snapshot().iter().any(|command| {
+        matches!(
+            command.payload,
+            crate::sim::command::Command::SetGameSpeed { .. }
+        )
+    });
+    ensure!(
+        !pending_speed,
+        "automatic save retained already-consumed Options input"
+    );
+    let browser =
+        App::open_saved_game_rows(state, crate::ui::skirmish_shell::SavedSeedMode::Save, 8);
+    ensure!(
+        browser
+            .selected_entry()
+            .is_some_and(|row| row.file_name.is_none()),
+        "Save did not select its new slot"
+    );
+    Ok(json!({
+        "filename": entry.path.file_name().unwrap().to_string_lossy(),
+        "description": entry.header.description, "tick": entry.header.tick,
+        "map_name": entry.header.map_name,
+        "game_speed": saved.sim.session().game_options().game_speed,
+        "pending_speed_input": pending_speed,
+        "new_save_description": browser.description_edit.display_text(),
+        "observation": "ordinary save browser model; dialog not opened",
+    }))
 }
 
 fn installed_campaign_runtime_receipt(state: &AppState) -> Result<Value> {
     let runtime = state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .context("first live frame has no runtime")?;
     let sim = &runtime.simulation;
     ensure!(
-        !sim.session.game_mode_nonzero,
+        !sim.session().game_mode_nonzero(),
         "campaign capture admitted a multiplayer session"
     );
     let mission_counter = sim
-        .session
+        .session()
         .campaign_mission_counter()
         .context("runtime has no campaign mission counter")?;
     let (player_difficulty, computer_difficulty) = sim
-        .session
+        .session()
         .campaign_house_difficulties()
         .context("runtime has no campaign difficulty rows")?;
     let current = sim
-        .session
+        .session()
         .current_house()
         .context("campaign has no current House")?;
     let current_house = sim
-        .houses
+        .houses()
         .get(&current)
         .context("current House is not in the live roster")?;
     let current_native_id = current_house
         .native_unique_id()
         .context("current House has no native identity")?;
-    let roster = sim.session.house_order.iter().map(|id| {
-        let house = sim.houses.get(id).context("registered House missing from live roster")?;
+    let roster = sim.houses().order().iter().map(|id| {
+        let house = sim.houses().get(id).context("registered House missing from live roster")?;
         let native_id = house.native_unique_id().context("registered House has no native identity")?;
-        let team_timer = house.team_creation.timer();
+        let team_timer = house.team_creation().timer();
         let attack_timer = house.native_attack_timer().map(|(timer, value)| json!({
             "start_frame": timer.start_frame(), "duration": timer.duration(), "value": value}));
-        Ok(json!({"name": sim.interner.resolve(*id), "native_unique_id": native_id,
-            "house_type": sim.interner.resolve(house.house_type_id()),
-            "country": house.country.map(|country| sim.interner.resolve(country)),
-            "side_index": house.side_index, "is_human": house.is_human,
-            "player_control": house.player_control, "difficulty": house.difficulty as i32,
-            "credits": house.economy.credits(), "scenario_credits": house.economy.scenario_credits(),
-            "tech_level": house.tech_level, "authored_iq": house.authored_iq, "current_iq": house.current_iq,
+        Ok(json!({"name": sim.interner().resolve(*id), "native_unique_id": native_id,
+            "house_type": sim.interner().resolve(house.house_type_id()),
+            "country": house.country().map(|country| sim.interner().resolve(country)),
+            "side_index": house.side_index(), "is_human": house.is_human(),
+            "player_control": house.player_control(), "difficulty": house.difficulty() as i32,
+            "credits": house.economy().credits(), "scenario_credits": house.economy().scenario_credits(),
+            "tech_level": house.tech_level(), "authored_iq": house.authored_iq(), "current_iq": house.current_iq(),
             "authored_edge": house.authored_edge(), "scenario_team_ratios": house.scenario_team_ratios(),
             "scalar_difficulty_bits": house.scalar_difficulty_biases().map(|value| format!("{:016x}", value.bits())),
             "attack_timer": attack_timer,
-            "team_creation": {"ratio": house.team_creation.ratio(),
+            "team_creation": {"ratio": house.team_creation().ratio(),
                 "start_frame": team_timer.start_frame(), "duration": team_timer.duration()},
         }))
     }).collect::<Result<Vec<_>>>()?;
@@ -1758,23 +2209,57 @@ fn installed_campaign_runtime_receipt(state: &AppState) -> Result<Value> {
         })
     };
     let rules = &runtime.resources.rules;
+    let player_buildings: Vec<_> = sim.entities().iter_sorted().filter_map(|(id, entity)| {
+        (entity.owner() == current && entity.category() == crate::map::entities::EntityCategory::Structure)
+            .then(|| json!({
+                "id": id, "type": sim.interner().resolve(entity.type_ref()),
+                "cell": [entity.position.rx(), entity.position.ry()],
+                "in_playfield": entity.in_playfield(),
+                "discovered": entity.discovery.discovered_by_current_house(),
+                "opened": entity.building_art.actually_placed(),
+                "ready": entity.building_ready_latch(),
+                "mission": entity.mission.current().raw(), "queued": entity.mission.queued().raw(),
+            }))
+    }).collect();
     Ok(json!({
-        "tick": sim.session.tick, "binary_frame": sim.session.binary_frame,
-        "scenario_started": sim.session.started(),
+        "tick": sim.session().tick(), "binary_frame": sim.session().binary_frame(),
+        "scenario_started": sim.session().started(),
         "startup_admission": {"accepted_rust_l0": state.match_state.startup.accepted().is_some(),
             "campaign_installation": state.match_state.startup.campaign_installed(),
             "saved_world_restored": state.match_state.startup.restored()},
-        "seed": sim.session.seed, "map_name": sim.session.map_name, "theater": sim.session.theater,
-        "game_mode_nonzero": sim.session.game_mode_nonzero, "campaign_mission_counter": mission_counter,
+        "seed": sim.session().seed(), "map_name": sim.session().map_name(), "theater": sim.session().theater(),
+        "game_mode_nonzero": sim.session().game_mode_nonzero(), "campaign_mission_counter": mission_counter,
+        "destinations": {"next": state.match_state.map_basic.next_scenario,
+            "alternate": state.match_state.map_basic.alt_next_scenario},
         "campaign_difficulty_rows": {"player": player_difficulty as i32, "computer": computer_difficulty as i32},
-        "current_house": {"name": sim.interner.resolve(current), "native_unique_id": current_native_id},
+        "current_house": {"name": sim.interner().resolve(current), "native_unique_id": current_native_id},
+        "fog": {"enabled": sim.session().game_options().fog_of_war,
+            "shroud_growth": {"enabled": rules.general.shroud_grow,
+                "interval": rules.general.shroud_growth_interval_frames(),
+                "start": sim.session().shroud_growth_timer().start_frame(),
+                "duration": sim.session().shroud_growth_timer().duration()},
+            "regrow_timer": {"start": sim.session().fog_regrow_timer().start_frame(),
+                "duration": sim.session().fog_regrow_timer().duration()},
+            "snapshots": sim.fog().fogged_objects().values().filter_map(|record| {
+                let drawing = record.drawing.as_ref()?;
+                Some(json!({"id": record.id, "viewer": sim.interner().resolve(record.viewer),
+                    "source": record.source_entity_id, "owner": sim.interner().resolve(drawing.owner),
+                    "location": drawing.location, "records": drawing.records.iter().map(|row| {
+                        json!({"type": sim.interner().resolve(row.type_ref), "frame": row.frame})
+                    }).collect::<Vec<_>>()}))
+            }).collect::<Vec<_>>()},
         "flags": {"inert": flags.inert, "tiberium_grows": flags.tiberium_grows,
             "tiberium_spreads": flags.tiberium_spreads, "destroyable_bridges": flags.destroyable_bridges,
-            "free_radar": sim.session.free_radar, "ignore_global_ai_triggers": sim.session.ignore_global_ai_triggers()},
+            "free_radar": sim.session().free_radar(), "ignore_global_ai_triggers": sim.session().ignore_global_ai_triggers()},
         "active_rules": {"source_ini_hash": format!("{:016x}", rules.source_ini_hash()),
             "simulation_config_hash": format!("{:016x}", rules.simulation_config_hash()),
             "domain": "parsed Rules projection and semantic config; not retail byte SHA256"},
         "house_roster": roster,
+        "campaign_names": {"name_utf16": state.match_state.campaign_names.name_units(),
+            "ui_name": state.match_state.campaign_names.ui_name(),
+            "save_title_utf16": state.match_state.campaign_names.save_title_units(),
+            "save_title": state.match_state.campaign_names.save_title()},
+        "player_buildings": player_buildings,
         "scalar_difficulty_order": ["Firepower", "Groundspeed", "Airspeed", "Armor", "ROF", "Cost", "BuildTime", "RepairDelay", "BuildDelay"],
         "native_identity_cursor": sim.native_identity_cursor(),
         "rng": {"main": rng_receipt(&rng.main), "scenario": rng_receipt(&rng.scenario), "mapgen": rng_receipt(&rng.mapgen)},

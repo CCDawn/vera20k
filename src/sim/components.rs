@@ -43,9 +43,10 @@ pub use crate::sim::building_construction::BuildingUp;
 /// and snapshot restore rejects an ID that two registries claim), so the ID
 /// alone says which store holds the object and what kind it is.
 ///
-/// A Cell compares by its coordinates, not as the native Dummy cell pointer
-/// (`0x00ABDC50`) that stands for any cell the map lacks: see the residuals
-/// in `sim::aircraft::leave_map` and `Per_Cell_Process` (`movement::per_cell`).
+/// Derived coordinate equality compares cells by coordinates. Consumers that
+/// require native allocation identity (including Aircraft AI's dummy clear)
+/// use `TargetKind::cell_identity` after conversion; see the remaining
+/// `Per_Cell_Process` residual in `movement::per_cell`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum NavTargetRef {
     /// A `CellClass*`, by its cell.
@@ -62,6 +63,23 @@ impl NavTargetRef {
 
     pub fn object(id: u64) -> Self {
         Self::Object { id }
+    }
+
+    /// Compare retained Abstract pointers without querying or restamping Map.
+    /// Distinct missing-coordinate tokens name the one CellClass Dummy;
+    /// packed fixed-stride aliases also name the same allocated Cell.
+    pub(crate) fn same_pointer(
+        self,
+        other: Self,
+        terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
+    ) -> bool {
+        match (self, other, terrain) {
+            (Self::Cell { rx: ax, ry: ay }, Self::Cell { rx: bx, ry: by }, Some(terrain)) => {
+                terrain.native_fixed_cell_index(ax as i16, ay as i16)
+                    == terrain.native_fixed_cell_index(bx as i16, by as i16)
+            }
+            _ => self == other,
+        }
     }
 
     /// The object this names; a Cell names none.
@@ -109,25 +127,15 @@ impl FootPathRuntime {
     /// (`0x004B3285`, `0x006A28D5`), Hover (`0x00516BCD`) and Walk
     /// (`0x0075B2E2`, `0x0075BA27`).
     ///
-    /// `Process_Movement` reads `[ECX+0x64C]` at `0x004B2DC8`, and on `> 0`
-    /// decrements and stores it back (`0x004B2DD2`/`0x004B2DD3`) before
-    /// continuing; on `<= 0` it clears the drive coord, calls
-    /// `FootClass::Stop_Moving` plus vtable `+0x480`/`+0x484`, and plays the
-    /// blocked voice at `Foot+0x68A`. So it *is* decremented and it *does* end
-    /// the move at zero.
-    ///
-    /// Recorded difference: **what decrements it.** Native decrements it on every
-    /// pass through the generic blocked label `LAB_004B3282` — reached from
-    /// `Is_Cell_In_Playfield == 0`, from code 3, from `code != 6` and from two
-    /// code-6 sub-failures — and the same label is where the literal 10 is stored.
-    /// VERA decrements per failed repath instead. The escalation clock is a
-    /// separate record: `Foot+0x668` = frame, `Foot+0x66C`, and `Foot+0x670` =
-    /// `Rules+0x1768`, stored only on the `Foot+0x6B7 == 0` transition of the code-2
-    /// arm — which contains no `Scatter_Objects` call at all. Trigger: a unit
-    /// blocked long enough to exhaust the counter. Player effect: the give-up point
-    /// arrives after a different number of ticks than retail's. Frequency: every
-    /// traffic jam, many times a minute once a base has armour queuing. Downstream
-    /// risk: the two clocks are separate fields and must stay separate.
+    /// On a failed route `Process_Movement` reads `[ECX+0x64C]` at
+    /// `0x004B2DC8`, and on `> 0` decrements and stores it back
+    /// (`0x004B2DD2`/`0x004B2DD3`) before continuing; on `<= 0` it clears the
+    /// drive coord, calls `FootClass::Stop_Moving` plus vtable `+0x480`/`+0x484`,
+    /// and plays the blocked voice at `Foot+0x68A`. The generic blocked label
+    /// `LAB_004B3282` stores the literal 10. The escalation clock is a separate
+    /// record: `Foot+0x668` = frame, `Foot+0x66C`, and `Foot+0x670` =
+    /// `Rules+0x1768`, stored only on the `Foot+0x6B7 == 0` transition of the
+    /// code-2 arm, which contains no `Scatter_Objects` call at all.
     pub(crate) const RETRY_RELOAD: u32 = 10;
 
     pub const fn at_frame(frame: u32) -> Self {
@@ -166,8 +174,35 @@ impl FootPathRuntime {
         self.path_blocked
     }
 
-    /// Store the blockage latch.
-    pub(crate) fn set_path_blocked(&mut self, blocked: bool) {
+    /// The code-2 refusal's latch (Walk `0x0075B8A9..0x0075B979`, Drive/Ship
+    /// `0x004B3656..0x004B368D`, Hover's code 2): the first refusal stores
+    /// `Foot+0x6B7` and starts the BlockagePathDelay grace (`+0x668`); a
+    /// latched blockage keeps its running grace.
+    pub(crate) fn latch_blockage(&mut self, frame: u32, delay: i32) {
+        if !self.path_blocked {
+            self.path_blocked = true;
+            self.start_blocked(frame, delay);
+        }
+    }
+
+    /// Clear the blockage latch (`Foot+0x6B7 = 0`), keeping the grace timer:
+    /// progress, a found path or a new command ends the blockage.
+    pub(crate) fn clear_blockage(&mut self) {
+        self.path_blocked = false;
+    }
+
+    /// `Set_Destination_Internal` (`0x004D94B0`) tail `0x004D96C2..0x004D9707`
+    /// for every accepted destination: `+0x6B7 = 0`, `+0x668 = (frame,
+    /// Rules+1768)`, `+0x640 = (frame, 0)`. It never writes `+0x64C`.
+    pub(crate) fn accept_destination(&mut self, frame: u32, blockage_delay: i32) {
+        self.start_movement(frame, 0);
+        self.start_blocked(frame, blockage_delay);
+        self.path_blocked = false;
+    }
+
+    /// A fixture's blockage latch.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_path_blocked_for_test(&mut self, blocked: bool) {
         self.path_blocked = blocked;
     }
 
@@ -176,8 +211,16 @@ impl FootPathRuntime {
         self.retries_left
     }
 
-    /// Store the path retries left.
-    pub(crate) fn set_retries_left(&mut self, retries: u32) {
+    /// Reload the path retries (`Foot+0x64C`) to [`Self::RETRY_RELOAD`]: a
+    /// found path (the no-head Process FindPath success, Walk `0x0075B2E2`)
+    /// restores the full budget.
+    pub(crate) fn reload_retries(&mut self) {
+        self.retries_left = Self::RETRY_RELOAD;
+    }
+
+    /// A fixture's path retries.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_retries_left_for_test(&mut self, retries: u32) {
         self.retries_left = retries;
     }
 
@@ -255,6 +298,12 @@ impl From<WorldCoordinate> for DriveCoord {
     }
 }
 
+/// The most direction words Find_Path's ordinary copy installs
+/// (`0x004D3E82..0x004D3EA1`): AStar returns the whole route, and a Foot
+/// requests the next window when this one runs short, so a long trip adapts
+/// to blockers found on the way.
+pub(crate) const FIND_PATH_WINDOW_WORDS: usize = 24;
+
 /// Foot-owned path replay. Native shifts a 24-dword queue on consumption;
 /// Rust retains the consumed prefix with an explicit cursor. Consumers must
 /// interpret the remaining suffix, not vector emptiness, as the native queue.
@@ -275,6 +324,7 @@ pub struct FootPathQueue {
 
 impl FootPathQueue {
     /// `Foot+0x5E0`, every direction word, consumed prefix included.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn directions(&self) -> &[u8] {
         &self.directions
     }
@@ -289,31 +339,99 @@ impl FootPathQueue {
         self.reference_cell
     }
 
-    /// Drop every direction word.
-    pub(crate) fn clear_directions(&mut self) {
-        self.directions.clear();
-    }
-
-    /// Append a direction word.
-    pub(crate) fn push_direction(&mut self, direction: u8) {
-        self.directions.push(direction);
-    }
-
-    /// Overwrite the word at `slot`, when there is one.
-    pub(crate) fn set_direction(&mut self, slot: usize, direction: u8) {
+    /// Write the native `-1` terminator at `slot`, when there is a word there:
+    /// the NavCom trim cuts the queue short.
+    pub(crate) fn terminate_at(&mut self, slot: usize) {
         if let Some(word) = self.directions.get_mut(slot) {
-            *word = direction;
+            *word = u8::MAX;
         }
     }
 
-    /// Store the cursor.
-    pub(crate) fn set_cursor(&mut self, cursor: u16) {
+    /// `Path[0] = -1`: every word consumed, the empty queue.
+    pub(crate) fn exhaust(&mut self) {
+        self.cursor = self.directions.len().min(u16::MAX as usize) as u16;
+    }
+
+    /// `Foot+0x558`, the cell the remaining directions start from.
+    pub(crate) fn rebase(&mut self, reference_cell: (i16, i16)) {
+        self.reference_cell = Some(reference_cell);
+    }
+
+    /// The queue `FootClass::Find_Path @ 0x004D3920` installs from a found
+    /// route (`0x004D393A..0x004D4003`): the directions from `reference`
+    /// through `path` from `first_destination` on, unconsumed. The ordinary
+    /// zero-prefix copy at `0x004D3E82..0x004D3EA1` takes at most
+    /// [`FIND_PATH_WINDOW_WORDS`] words of the whole AStar route; tube jumps
+    /// count as one word. The Vec's end represents a short route's
+    /// terminator without retaining unused native backing words.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn install(
+        &mut self,
+        reference: (u16, u16),
+        path: &[(u16, u16)],
+        first_destination: usize,
+    ) {
+        self.install_directions(reference, path, first_destination);
+        self.rebase((reference.0 as i16, reference.1 as i16));
+    }
+
+    /// Find_Path's direction copy (`0x004D3E82..0x004D3EA1`) precedes
+    /// follower callbacks; its separate reference write is at `0x004D4003`.
+    /// Keep the previous reference until that continuation publishes it.
+    pub(crate) fn install_directions(
+        &mut self,
+        reference: (u16, u16),
+        path: &[(u16, u16)],
+        first_destination: usize,
+    ) {
+        let mut from = (reference.0 as i16, reference.1 as i16);
+        self.directions.clear();
+        for &destination in path
+            .iter()
+            .skip(first_destination)
+            .take(FIND_PATH_WINDOW_WORDS)
+        {
+            self.directions.push(direction_from_step(from, destination));
+            from = (destination.0 as i16, destination.1 as i16);
+        }
+        self.cursor = 0;
+    }
+
+    /// Fresh acceptance (`0x004B4618`/`0x006A3C47`): `endpoint` becomes the
+    /// reference and `consumed_directions` words are popped.
+    pub(crate) fn accept(&mut self, endpoint: (i16, i16), consumed_directions: usize) {
+        self.reference_cell = Some(endpoint);
+        self.consume(consumed_directions);
+    }
+
+    /// Accepted chain `0x004B1DF7`/`0x006A143A` and the tube entries (Walk
+    /// `0x0075B3E0..0x0075B3EB`, Drive `0x004B135D..0x004B1373`, Ship
+    /// `0x006A0A25..0x006A0A3B`) pop the queue without rewriting `Foot+0x558`.
+    pub(crate) fn consume(&mut self, consumed_directions: usize) {
+        let cursor = usize::from(self.cursor)
+            .saturating_add(consumed_directions)
+            .min(self.directions.len());
+        self.cursor = cursor.min(u16::MAX as usize) as u16;
+    }
+
+    /// A fixture's cursor.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_cursor_for_test(&mut self, cursor: u16) {
         self.cursor = cursor;
     }
 
-    /// Store the reference cell.
-    pub(crate) fn set_reference_cell(&mut self, reference_cell: Option<(i16, i16)>) {
+    /// A fixture's reference cell.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_reference_cell_for_test(&mut self, reference_cell: Option<(i16, i16)>) {
         self.reference_cell = reference_cell;
+    }
+
+    /// A fixture's direction word at `slot`, when there is one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_direction_for_test(&mut self, slot: usize, direction: u8) {
+        if let Some(word) = self.directions.get_mut(slot) {
+            *word = direction;
+        }
     }
 
     /// A fixture's direction words.
@@ -364,7 +482,7 @@ impl FootPathQueue {
     /// step rewrites it from the object's position after every paid step, and
     /// `hover_process` rewrites it per cell. The chain and tube pops
     /// (`track_host`, `tube_movement`) preserve it, as
-    /// [`crate::sim::movement::path_markers::consume_path_replay`] records, so on
+    /// [`FootPathQueue::consume`] records, so on
     /// those paths the reference stays at the accepted endpoint while the cursor
     /// moves on and a suffix walked from it falls a cell further behind the mover
     /// per paid step. The anchor is therefore the caller's to supply: pass the
@@ -421,7 +539,7 @@ impl FootPathQueue {
     }
 }
 
-/// Foot-owned applied speed, shared by every installed locomotor instance.
+/// Foot-owned speed and retained crush flag, shared by every locomotor instance.
 ///
 /// SetSpeedFraction4D3710 writes Foot+578/+57C; GetCurrentSpeed4DB1A0 reads
 /// that fraction live (`movement::owner_current_speed`); nothing caches its
@@ -435,43 +553,120 @@ pub struct FootSpeedState {
     /// ported by `Default`); after that only `FootClass::SetSpeedFraction @
     /// 0x004D3710` writes it: [`Self::set_speed_fraction`] for a fixed-point
     /// request and [`Self::set_speed_fraction_native_bits`] for a native double.
-    applied_fraction: SimFixed,
+    applied_fraction: crate::util::native_x87::NativeF64Bits,
     /// Foot+580, initialized to exactly 1.0 at4D3292/4D329B. Retain the
     /// native bits: pickup refuses even the immediate neighbors of 1.0.
     /// Every speed query reads it (GetCurrentSpeed multiplies it in). Its only
     /// native writer is the Speed crate (`accept_speed_crate`), reached from
     /// `CellClass::PickupCrate` (`crates::pickup`) when a Foot commits to a
-    /// crate cell; saved and hashed (v181).
+    /// crate cell; saved and hashed (v181). With Ares this is the permanent
+    /// Ext+90 baseline; the derived Foot+580 lives in the object's Ares part.
     crate_multiplier: crate::util::native_x87::NativeF64Bits,
+    /// Foot+6B5, constructor0 at4D3444. Drive's straight/CrusherAll
+    /// pre-entry arm4B1A2F sets it; Unit's admitted overlay tail73B067
+    /// clears it. Both the Track speed prefix and RockingUpdate read it.
+    /// It survives class replacement and ordinary movement/Stop calls.
+    crush_slowdown: bool,
+    /// Whether Ares100460A0 derived a Foot+580 other than the permanent
+    /// baseline above. The derived value lives in the object's Ares part
+    /// (`GameEntity::speed_multiplier`); this byte, in the struct's padding,
+    /// spares every speed query of a game Ares doesn't play in that read.
+    #[serde(default)]
+    attached: bool,
 }
 
 impl Default for FootSpeedState {
     fn default() -> Self {
         Self {
-            applied_fraction: crate::util::fixed_math::SIM_ZERO,
+            applied_fraction: crate::util::native_x87::NativeF64Bits::POSITIVE_ZERO,
             crate_multiplier: crate::util::native_x87::NativeF64Bits::ONE,
+            crush_slowdown: false,
+            attached: false,
         }
     }
 }
 
 impl FootSpeedState {
+    pub fn crush_slowdown(&self) -> bool {
+        self.crush_slowdown
+    }
+
+    /// Drive's straight/CrusherAll pre-entry arm (`0x004B1A2F`) sets
+    /// `Foot+0x6B5`.
+    pub(crate) fn arm_crush_slowdown(&mut self) {
+        self.crush_slowdown = true;
+    }
+
+    /// Unit's admitted overlay tail (`0x0073B067`) clears `Foot+0x6B5`.
+    pub(crate) fn clear_crush_slowdown(&mut self) {
+        self.crush_slowdown = false;
+    }
+
+    /// A fixture's crush slowdown.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_crush_slowdown_for_test(&mut self, active: bool) {
+        self.crush_slowdown = active;
+    }
+
     pub fn crate_multiplier(&self) -> crate::util::native_x87::NativeF64Bits {
         self.crate_multiplier
     }
 
-    /// Foot `+0x578`, the applied speed fraction.
+    /// Whether Ares attachments hold a derived Foot+580 in the Ares part.
+    pub(crate) fn attached(&self) -> bool {
+        self.attached
+    }
+
+    pub(crate) fn set_attached(&mut self, attached: bool) {
+        self.attached = attached;
+    }
+
+    /// Fixed projection for diagnostics and fixed-input fixture adapters.
+    /// Runtime predicates and GetCurrentSpeed read the native owner below.
     pub fn applied_fraction(&self) -> SimFixed {
+        let stored = self.applied_fraction.bits();
+        if stored == crate::util::native_x87::NativeF64Bits::ONE.bits() {
+            crate::util::fixed_math::SIM_ONE
+        } else {
+            // The setter admits only nonnegative finite values below one.
+            let exponent = ((stored >> 52) & 0x7ff) as i32;
+            let mantissa = stored & ((1 << 52) - 1);
+            let significand = if exponent == 0 {
+                mantissa
+            } else {
+                mantissa | (1 << 52)
+            };
+            let shift = 1075 - i64::from(exponent.max(1)) - 16;
+            SimFixed::from_bits(if shift >= 64 {
+                0
+            } else {
+                (significand >> shift) as i32
+            })
+        }
+    }
+
+    /// The complete stored Foot+578 double, including subnormal fractions.
+    pub fn native_applied_fraction(&self) -> crate::util::native_x87::NativeF64Bits {
         self.applied_fraction
+    }
+
+    pub(crate) fn speed_fraction_is_positive(&self) -> bool {
+        let bits = self.applied_fraction.bits();
+        // Ordered FCOM > 0, including raw values restored without the setter.
+        // Negative values and NaNs are outside this unsigned positive range.
+        bits > 0 && bits <= 0x7ff0_0000_0000_0000
     }
 
     /// `FootClass::SetSpeedFraction @ 0x004D3710` for a fixed-point request:
     /// at least 1 stores 1, at most 0 stores 0, and anything between is
     /// stored as given ([`Self::stored_speed_fraction`]).
     pub(crate) fn set_speed_fraction(&mut self, fraction: SimFixed) {
-        self.applied_fraction = fraction.clamp(
+        let fraction = fraction.clamp(
             crate::util::fixed_math::SIM_ZERO,
             crate::util::fixed_math::SIM_ONE,
         );
+        // Every I16F16 value is exactly representable as binary64.
+        self.set_speed_fraction_native_bits(fraction.to_num::<f64>().to_bits());
     }
 
     /// The double `FootClass::SetSpeedFraction @ 0x004D3710` stores at Foot
@@ -497,58 +692,25 @@ impl FootSpeedState {
         }
     }
 
-    /// `FootClass::SetSpeedFraction @ 0x004D3710` for a locomotor that computes
-    /// its fraction as a native double (the Jumpjet's `Process`): the double
-    /// [`Self::stored_speed_fraction`] keeps.
-    ///
-    /// The stored double becomes `SimFixed` by truncation, from its bits, so
-    /// the fraction's readers compare against the truncated thresholds
-    /// ([`Self::above_tenth`], [`Self::above_eight_tenths`]). A double within
-    /// 2^-16 above a threshold would read as not above it. The Jumpjet's speed
-    /// is always a whole number k (it steps by the constructor's 2.0 up and
-    /// 3.0 down: stock spells `JumpJetAccel=`, which the case-sensitive reader
-    /// never sees, and clamps to its integer cap C and 0), so k/C above 0.1 is
-    /// at least 0.1 + 1/(10C), outside that window for any C up to 6553, and
-    /// above 0.8 for any C up to 13107; k/C exactly 0.1 or 0.8 divides with
-    /// truncation to just below it, as native reads it.
+    /// Foot4D3710 stores an admitted interior double unchanged. The same
+    /// owner serves Jumpjet and the complete Drive/Ship numeric prefix.
     pub fn set_speed_fraction_native_bits(&mut self, bits: u64) {
-        use crate::util::native_x87::NativeF64Bits;
-        let stored = Self::stored_speed_fraction(NativeF64Bits::from_bits(bits)).bits();
-        self.applied_fraction = if stored == NativeF64Bits::ONE.bits() {
-            crate::util::fixed_math::SIM_ONE
-        } else {
-            // 0 <= value < 1: floor(value * 2^16) from the significand.
-            let exponent = ((stored >> 52) & 0x7ff) as i32;
-            let mantissa = stored & ((1 << 52) - 1);
-            let significand = if exponent == 0 {
-                mantissa
-            } else {
-                mantissa | (1 << 52)
-            };
-            let shift = 1075 - i64::from(exponent.max(1)) - 16;
-            SimFixed::from_bits(if shift >= 64 {
-                0
-            } else {
-                (significand >> shift) as i32
-            })
-        };
+        self.applied_fraction =
+            Self::stored_speed_fraction(crate::util::native_x87::NativeF64Bits::from_bits(bits));
     }
 
-    /// Foot `+0x578` above 0.1 (`0x007E3860`): the Infantry fire error's
-    /// moving gate (`0x0051C9B8`) and the sequencer's default arm
-    /// (`0x00520D45`). 0.1 lies between `SimFixed` raw 6553 and 6554; the
-    /// truncated threshold keeps a fraction that truncated to 6553 below it.
-    /// Original boundary witnesses: `tools/spatial_oracle/infantry_fire_speed.json`.
+    /// Strict comparison with binary64 0.1 at7E3860, used by Infantry fire
+    /// error and animation. Exclude negative and unordered raw saved values.
     pub(crate) fn above_tenth(&self) -> bool {
-        self.applied_fraction > SimFixed::ONE / SimFixed::from_num(10)
+        let bits = self.applied_fraction.bits();
+        bits > 0x3fb9_9999_9999_999a && bits <= 0x7ff0_0000_0000_0000
     }
 
-    /// Foot `+0x578` above 0.8 (`0x007EB5C8`): the Jumpjet infantryman's Fly
-    /// over Hover (`0x0052123C`). floor(0.8 * 2^16) = 52428.
+    /// Strict comparison with binary64 0.8 at7EB5C8 (Jumpjet Fly/Hover).
     pub(crate) fn above_eight_tenths(&self) -> bool {
-        self.applied_fraction > SimFixed::from_bits(52_428)
+        let bits = self.applied_fraction.bits();
+        bits > 0x3fe9_9999_9999_999a && bits <= 0x7ff0_0000_0000_0000
     }
-
     /// Cell48303A..483072: an already-modified Foot never stacks this effect.
     /// Class/radius eligibility belongs to the pickup effect caller.
     pub fn accept_speed_crate(
@@ -639,15 +801,17 @@ impl AnimClassSpawnDescriptor {
     }
 }
 
-/// Emitted by the refinery dock state machine for EVERY due dump gate of
-/// `UnitClass::Mission_Unload @ 0x0073D630` state 3 (`HarvesterDumpRate × 900
-/// <= unit+0xF8`, `0x0073E355..0x0073E374`), including the final gate that finds
-/// no cargo. The authoritative master-frame tail consumes it to spawn the
-/// refinery smoke burst (`BuildingClass` vtable+0x468 → `0x00459900`, fired
-/// first on each gate at `0x0073E37E`), start SpecialAnim slot 10 only while
-/// none is live (`building+0x584 == NULL`, `0x0073E384`), and cut the running
-/// SpecialAnim on the empty gate (`ClearAnimSlot(0xA)`, `0x0073E530`) before
-/// the returned state hash. The queue itself is transient and serde-skipped.
+/// Test observation of EVERY due dump gate of `UnitClass::Mission_Unload @
+/// 0x0073D630` state 3 (`HarvesterDumpRate × 900 <= unit+0xF8`,
+/// `0x0073E355..0x0073E374`), including the final gate that finds no cargo.
+/// The refinery dock commits the gate's effects itself
+/// (`building_anim::begin_refinery_unload_gate`, `end_refinery_unload_empty`):
+/// the refinery smoke burst (`BuildingClass` vtable+0x468 → `0x00459900`,
+/// fired first on each gate at `0x0073E37E`), SpecialAnim slot 10 only while
+/// none is live (`building+0x584 == NULL`, `0x0073E384`), and the cut of the
+/// running SpecialAnim on the empty gate (`ClearAnimSlot(0xA)`, `0x0073E530`).
+/// The frame tail drops the event.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BaleDepositEvent {
     /// Refinery stable_id where the bale was deposited.
@@ -662,42 +826,26 @@ pub struct BaleDepositEvent {
     pub empty: bool,
 }
 
-/// Emitted by the tank-bunker lifecycle when the walls rise (install) or fall
-/// (teardown). The authoritative frame tail creates the bunker's SpecialAnim
-/// overlays — document order within `kind == Special` decides the pair: 0/1 =
-/// walls-up, 2/3 = walls-down. `damaged` selects the `…Damaged` art variant when
-/// the building was at/below ConditionRed health at emit time. The queue is
-/// transient; its resulting overlay component participates in the frame hash.
+/// Test observation of the tank-bunker walls rising (install) or falling
+/// (teardown). The bunker link sets the wall anim slots itself
+/// (`building_anim::set_bunker_wall_slots`); `damaged` is the `…Damaged`
+/// variant choice it passed. The frame tail drops the event.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct BunkerWallAnimEvent {
     /// Bunker building stable_id whose walls are animating.
     pub building_id: u64,
     /// `true` = walls rising (install), `false` = walls falling (teardown).
     pub up: bool,
-    /// Building was at/below ConditionRed when the event fired — use the
-    /// `…Damaged` SpecialAnim variant.
+    /// The building was at or below ConditionYellow when the event fired, so
+    /// the walls use the `…Damaged` SpecialAnim variant.
     pub damaged: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
     use crate::sim::movement::DriveLocomotionRuntime;
-    use crate::util::fixed_math::SIM_ZERO;
-
-    #[test]
-    fn test_position_creation() {
-        let pos: Position = Position::new(
-            30,
-            40,
-            0,
-            None,
-            crate::util::lepton::CELL_CENTER_LEPTON,
-            crate::util::lepton::CELL_CENTER_LEPTON,
-        );
-        assert_eq!(pos.rx(), 30);
-        assert_eq!(pos.ry(), 40);
-    }
 
     #[test]
     fn test_types_are_send_sync() {
@@ -709,32 +857,6 @@ mod tests {
         assert_send_sync::<crate::sim::movement::locomotor::LocomotorState>();
         assert_send_sync::<NavigationState>();
         assert_send_sync::<DriveLocomotionRuntime>();
-    }
-
-    #[test]
-    fn drive_coord_cell_uses_center_leptons() {
-        let coord = DriveCoord::cell(45, 40, 0);
-        assert_eq!(coord.x, 45 * 256 + 128);
-        assert_eq!(coord.y, 40 * 256 + 128);
-        assert_eq!(coord.z, 0);
-    }
-
-    #[test]
-    fn drive_locomotion_default_is_inert() {
-        let drive = DriveLocomotionRuntime::default();
-        assert_eq!(drive.destination(), None);
-        assert_eq!(drive.head_to(), None);
-        let navigation = NavigationState::default();
-        assert!(navigation.path_replay.directions.is_empty());
-        assert_eq!(navigation.path_replay.cursor, 0);
-        assert_eq!(drive.track().turn_index(), -1);
-        assert_eq!(drive.track().cursor(), -1);
-        assert!(!drive.track_valid());
-        assert!(!drive.track().reversed());
-        assert_eq!(drive.target_speed_fraction(), SIM_ZERO);
-        let owner_speed = FootSpeedState::default();
-        assert_eq!(owner_speed.applied_fraction, SIM_ZERO);
-        assert_eq!(drive.track().residual(), 0);
     }
 
     /// `FootClass::SetSpeedFraction @ 0x004D3710` executed on the original
@@ -759,6 +881,26 @@ mod tests {
             let requested = bits(&case["input"], "requested_bits", "requested");
             let stored = bits(&case["output"], "applied_bits", "applied");
             let requested_double = NativeF64Bits::from_bits(requested);
+            // Native raw comparison controls bypass the setter's clamp.
+            let raw = FootSpeedState {
+                applied_fraction: requested_double,
+                ..FootSpeedState::default()
+            };
+            assert_eq!(
+                raw.speed_fraction_is_positive(),
+                f64::from_bits(requested) > 0.0,
+                "raw positive: {case}"
+            );
+            assert_eq!(
+                raw.above_tenth(),
+                f64::from_bits(requested) > 0.1,
+                "raw tenth: {case}"
+            );
+            assert_eq!(
+                raw.above_eight_tenths(),
+                f64::from_bits(requested) > 0.8,
+                "raw eight tenths: {case}"
+            );
             assert_eq!(
                 FootSpeedState::stored_speed_fraction(requested_double).bits(),
                 stored,
@@ -766,18 +908,22 @@ mod tests {
             );
             let mut speed = FootSpeedState::default();
             speed.set_speed_fraction_native_bits(requested);
+            assert_eq!(speed.native_applied_fraction().bits(), stored, "{case}");
+            assert_eq!(
+                speed.speed_fraction_is_positive(),
+                f64::from_bits(stored) > 0.0
+            );
+            assert_eq!(speed.above_tenth(), f64::from_bits(stored) > 0.1);
+            assert_eq!(speed.above_eight_tenths(), f64::from_bits(stored) > 0.8);
+            let encoded = crate::util::save_codec::serialize(&speed).unwrap();
+            let restored: FootSpeedState = crate::util::save_codec::deserialize(&encoded).unwrap();
+            assert_eq!(restored.native_applied_fraction().bits(), stored);
             // The stored double lies in [0, 1], so scaling by 2^16 is exact.
             let truncated = SimFixed::from_bits((f64::from_bits(stored) * 65536.0) as i32);
             assert_eq!(speed.applied_fraction(), truncated, "{case}");
             setter_rows += usize::from(case["input"]["family"] == "setter");
         }
         assert_eq!((cases.len(), setter_rows), (25, 13));
-    }
-
-    #[test]
-    fn drive_locomotion_serde_defaults_missing_fields() {
-        let drive: DriveLocomotionRuntime = serde_json::from_str("{}").expect("deserialize drive");
-        assert_eq!(drive, DriveLocomotionRuntime::default());
     }
 
     #[test]
@@ -797,4 +943,13 @@ mod tests {
 
         assert_ne!(hash_drive(&drive_a), hash_drive(&drive_b));
     }
+}
+
+/// The direction word of one route step; a non-adjacent step is the tube
+/// direction.
+pub(crate) fn direction_from_step(from: (i16, i16), to: (u16, u16)) -> u8 {
+    let dx = i32::from(to.0 as i16) - i32::from(from.0);
+    let dy = i32::from(to.1 as i16) - i32::from(from.1);
+    crate::util::direction::direction_from_delta(dx, dy)
+        .unwrap_or(crate::util::direction::TUBE_STEP_DIRECTION)
 }

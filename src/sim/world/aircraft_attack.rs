@@ -7,19 +7,18 @@
 use super::{FrameEffects, Simulation};
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::aircraft::{attack_mission, enter_idle_mode_for};
+use crate::sim::aircraft::attack_mission;
 use crate::sim::combat::TargetKind;
 use crate::sim::combat::{combat_weapon, fire_coord};
 use crate::sim::components::NavTargetRef;
 use crate::sim::mission::{MissionId, MissionType};
-use crate::sim::movement::air_movement;
 use crate::sim::world::edge_cell::Edge;
 
 impl Simulation {
     ///418006..418030: raw Target presence chooses1/10, preserving pending ammo.
     /// The caller already cleared readiness. Search belongs to the next visit.
     /// Each visit returns Mission+0xBC and the frames it returns.
-    pub(crate) fn aircraft_begin_attack(&mut self, id: u64) -> (u8, i32) {
+    pub(crate) fn aircraft_begin_attack(&self, id: u64) -> (u8, i32) {
         let present = crate::sim::combat::target_present(
             self.substrate
                 .entities
@@ -72,7 +71,11 @@ impl Simulation {
         // when there was no target/ammo or when the destination was refused.
         (
             state,
-            self.mission_rate_epilogue(rules, MissionType::Attack),
+            crate::sim::mission::authority::rate_epilogue(
+                rules,
+                MissionType::Attack,
+                &mut self.scenario_rng,
+            ),
         )
     }
 
@@ -117,8 +120,9 @@ impl Simulation {
             let weapon = combat_weapon::primary_for_tier(object, entity.veterancy.rank())
                 .and_then(|name| rules.weapon(name))
                 .expect("strafe classifier's weapon");
-            let distance = crate::sim::combat::object_distance_to(entity, &target, self)
-                .expect("live aircraft Target");
+            let distance =
+                crate::sim::combat::object_distance_to(entity.stable_id(), &target, self)
+                    .expect("live aircraft Target");
             if distance < weapon.range_leptons {
                 return 4;
             }
@@ -126,8 +130,8 @@ impl Simulation {
         } else if object.fighter
             || !crate::sim::movement::motion_query::is_moving_now(
                 entity,
-                None,
-                self.session.binary_frame,
+                crate::sim::movement::SpeedRules::new(rules, &self.interner, &self.houses),
+                self.session.binary_frame(),
             )
         {
             // The locomotor's Is_Moving_Now: Fly `0x004CCAC0` reads the speed
@@ -138,8 +142,12 @@ impl Simulation {
         let Some(nav) = entity.navigation.nav_com() else {
             return 1;
         };
-        let distance = crate::sim::combat::object_distance_to(entity, &TargetKind::from(nav), self)
-            .expect("live aircraft NavCom");
+        let distance = crate::sim::combat::object_distance_to(
+            entity.stable_id(),
+            &TargetKind::from(nav),
+            self,
+        )
+        .expect("live aircraft NavCom");
         let facing = if distance < 512 {
             crate::sim::movement::turret::facing_toward_target(entity, &target, self)
                 .expect("live approach Target")
@@ -167,12 +175,12 @@ impl Simulation {
             )
         };
         let entity = self.substrate.entities.get_mut(id).unwrap();
-        air_movement::ensure_fly_secondary_facing(entity);
+        entity.ensure_fly_secondary_facing();
         entity
             .barrel_facing
             .as_mut()
             .unwrap()
-            .set(facing, self.session.binary_frame);
+            .set(facing, self.session.binary_frame());
         if distance < 16 {
             self.assign_aircraft_destination(id, None, rules, effects);
             4
@@ -229,13 +237,7 @@ struct WorldExit<'a> {
 impl attack_mission::ExitHost for WorldExit<'_> {
     fn clear_target(&mut self) {
         self.sim
-            .assign_target_represented(
-                self.id,
-                None,
-                Some(self.rules),
-                None,
-                FrameEffects::default(),
-            )
+            .assign_target_represented(self.id, None, self.rules, None, FrameEffects::default())
             .expect("aircraft dispatch");
     }
 
@@ -262,6 +264,12 @@ impl attack_mission::ExitHost for WorldExit<'_> {
     }
 
     fn enter_idle_mode(&mut self) {
-        enter_idle_mode_for(self.sim, self.id, self.rules, self.registry, self.effects);
+        crate::sim::aircraft::enter_idle_mode_after_attack(
+            self.sim,
+            self.id,
+            self.rules,
+            self.registry,
+            self.effects,
+        );
     }
 }

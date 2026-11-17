@@ -22,9 +22,9 @@
 //! RESIDUALS: two setters insert their destination at the list's front, and
 //! neither is ported. Both are dormant on retail data.
 //! - Unit Assign_Destination (`0x00741E8E..0x00741F97`), for a moving Unit
-//!   whose type has `Subterranean=` (`+0xD2C`) and whose active locomotor is
-//!   Drive (CLSID `0x007E9A30`). Retail `rulesmd.ini` sets no
-//!   `Subterranean=`.
+//!   whose type's `MovementZone=` is `Subterannean` (TechnoType `+0xD2C`,
+//!   set at `0x0071608A`) and whose active locomotor is Drive (CLSID
+//!   `0x007E9A30`). No retail rules, mode or map file names that zone.
 //! - Infantry Assign_Destination (`0x0051AD17..0x0051AE23`), for a walking
 //!   `JumpJet=` infantryman (see `assign_infantry_destination`). Retail sets
 //!   `HoverAttack=` on each such type.
@@ -81,7 +81,7 @@ impl Simulation {
     pub(crate) fn handle_navigation_list(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) {
@@ -116,7 +116,7 @@ impl Simulation {
         let computer = self
             .houses
             .get(&entity.owner())
-            .is_some_and(|house| !house.is_controlled_by_human(self.session.game_mode_nonzero));
+            .is_some_and(|house| !house.is_controlled_by_human(self.session.game_mode_nonzero()));
         if !computer || entity.navigation.nav_com().is_some() {
             return;
         }
@@ -126,7 +126,7 @@ impl Simulation {
         if entity.archive_target() != Some(TargetKind::from(head)) {
             return;
         }
-        self.send_to_navigation_head(id, head, Some(rules), registry, effects);
+        self.send_to_navigation_head(id, head, rules, registry, effects);
     }
 
     /// The send both consumers make: vt+0x480(head, 1) (`0x004DA062`,
@@ -138,7 +138,7 @@ impl Simulation {
         &mut self,
         id: u64,
         head: NavTargetRef,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) {
@@ -153,6 +153,6 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "nav_list_tests.rs"]
 mod tests;

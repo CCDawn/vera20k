@@ -21,7 +21,7 @@
 
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat::TargetKind;
-use crate::sim::mission::authority::{EntityReadyInputProvider, LiveReadyInputProvider};
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::world::{FrameEffects, ObjectAiCtx, Simulation};
 
@@ -174,7 +174,7 @@ impl Simulation {
         mission: MissionType,
         target: Option<TargetKind>,
         destination: Option<TargetKind>,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
     ) -> MissionType {
         let foot = self.substrate.entities.get(id).is_some_and(|entity| {
             entity.category() != crate::map::entities::EntityCategory::Structure
@@ -183,18 +183,19 @@ impl Simulation {
             return mission;
         }
         if mission != MissionType::AttackMove {
-            self.foot_clear_all_tarcom(id);
+            self.substrate.foot_clear_all_tarcom(id);
             return mission;
         }
-        if !rules.is_some_and(|rules| self.techno_can_attack_move(id, rules)) {
+        if !self.techno_can_attack_move(id, rules) {
             return if target.is_some() {
                 MissionType::Attack
             } else {
                 MissionType::Move
             };
         }
-        let resolved_target = self.resolve_event_token(target);
-        let resolved_destination = self.resolve_event_token(destination);
+        // Only the token stored is converted: the destination
+        // (`0x004DF141`), else the target (`0x004DF15F`).
+        let resolved = self.resolve_event_token(destination.or(target));
         let Some(entity) = self.substrate.entities.get_mut(id) else {
             return mission;
         };
@@ -202,23 +203,15 @@ impl Simulation {
         mega.have_attack_move_target = false;
         mega.attack_move = true;
         if destination.is_some() {
-            mega.destination = resolved_destination;
+            mega.destination = resolved;
             return MissionType::Move;
         }
         if target.is_some() {
-            mega.target = resolved_target;
+            mega.target = resolved;
             return MissionType::Attack;
         }
-        self.foot_clear_all_tarcom(id);
+        self.substrate.foot_clear_all_tarcom(id);
         MissionType::AttackMove
-    }
-
-    /// `FootClass::Clear_All_TarCom @ 0x004DF1A0` (vt+0x4A8): MegaMission
-    /// NONE, no MegaDestination or MegaTarget, HaveAttackMoveTarget clear.
-    pub(crate) fn foot_clear_all_tarcom(&mut self, id: u64) {
-        if let Some(entity) = self.substrate.entities.get_mut(id) {
-            entity.mega_mission = MegaMission::default();
-        }
     }
 
     /// `FootClass::ContinueMegaMission @ 0x004DF320` (vt+0x4C8):
@@ -229,7 +222,7 @@ impl Simulation {
     pub(crate) fn foot_continue_mega_mission(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> bool {
@@ -264,7 +257,7 @@ impl Simulation {
             }
             return true;
         }
-        self.foot_clear_all_tarcom(id);
+        self.substrate.foot_clear_all_tarcom(id);
         false
     }
 
@@ -277,7 +270,7 @@ impl Simulation {
     pub(crate) fn foot_refresh_mega_mission(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> bool {
@@ -290,7 +283,7 @@ impl Simulation {
         if entity.mega_mission.have_attack_move_target {
             entity.mega_mission.have_attack_move_target = false;
         } else if entity.mission.effective().known() != Some(MissionType::Guard) {
-            self.foot_clear_all_tarcom(id);
+            self.substrate.foot_clear_all_tarcom(id);
             return false;
         }
         self.foot_continue_mega_mission(id, rules, registry, effects)
@@ -346,7 +339,7 @@ impl Simulation {
             }
             return;
         }
-        self.foot_queue_mission_now(id, MissionType::Attack, Some(rules));
+        self.foot_queue_mission_now(id, MissionType::Attack, rules);
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             entity.mega_mission.have_attack_move_target = true;
         }
@@ -389,15 +382,10 @@ impl Simulation {
 
     /// `Queue_Mission(mission, 1)` (vt+0x1E8): queued, and committed at once
     /// when the object is ready ([`Self::mission_queue_exact`]).
-    fn foot_queue_mission_now(&mut self, id: u64, mission: MissionType, rules: Option<&RuleSet>) {
+    fn foot_queue_mission_now(&mut self, id: u64, mission: MissionType, rules: &RuleSet) {
         let mission = MissionId::from_known(mission);
-        let now = self.session.binary_frame;
-        let _ = match rules {
-            Some(rules) => {
-                self.mission_queue_exact(id, mission, 1, now, &LiveReadyInputProvider { rules })
-            }
-            None => self.mission_queue_exact(id, mission, 1, now, &EntityReadyInputProvider),
-        };
+        let now = self.session.binary_frame();
+        let _ = self.mission_queue_exact(id, mission, 1, now, &LiveReadyInputProvider { rules });
     }
 
     /// `TechnoClass::InAuxiliarySearchRange @ 0x006F78D0` (vt+0x3B4), whose
@@ -426,6 +414,16 @@ impl Simulation {
     }
 }
 
+impl crate::sim::world::ObjectSubstrate {
+    /// `FootClass::Clear_All_TarCom @ 0x004DF1A0` (vt+0x4A8): MegaMission
+    /// NONE, no MegaDestination or MegaTarget, HaveAttackMoveTarget clear.
+    pub(crate) fn foot_clear_all_tarcom(&mut self, id: u64) {
+        if let Some(entity) = self.entities.get_mut(id) {
+            entity.mega_mission = MegaMission::default();
+        }
+    }
+}
+
 /// What Arrival_Target_Handler (`0x004DF3A0`) does with an attack-mover
 /// ([`Simulation::foot_arrival_step`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,6 +439,6 @@ pub(crate) enum ArrivalStep {
     },
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "mega_mission_tests.rs"]
 mod tests;

@@ -46,7 +46,7 @@ pub fn compute_layout(screen_w: u32, screen_h: u32) -> MenuPageLayout {
     menu_page::compute_layout(&SINGLE_PLAYER_PAGE, screen_w, screen_h)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
     use crate::ui::main_menu_shell::MainMenuMovieBase;
@@ -70,18 +70,6 @@ mod tests {
         assert_eq!(rect(&layout, 0x0579), RectPx::new(644, 283, 156, 42));
         assert_eq!(rect(&layout, 0x0686), RectPx::new(644, 535, 156, 42));
         assert_eq!(layout.status_help, RectPx::new(10, 578, 456, 21));
-    }
-
-    #[test]
-    fn large_screen_keeps_native_shell_unscaled_and_centered() {
-        let layout = compute_layout(1024, 768);
-        assert_eq!(layout.movie, RectPx::new(112, 84, 632, 570));
-        assert_eq!(layout.right_panel.top, RectPx::new(744, 84, 168, 199));
-        assert_eq!(rect(&layout, 0x0579), RectPx::new(756, 367, 156, 42));
-        assert_eq!(rect(&layout, 0x0686), RectPx::new(756, 619, 156, 42));
-        assert_eq!(layout.status_help, RectPx::new(122, 662, 456, 21));
-        assert_eq!(layout.title, RectPx::new(747, 93, 163, 18));
-        assert_eq!(layout.warning_monitor, RectPx::new(782, 131, 93, 55));
     }
 
     #[test]

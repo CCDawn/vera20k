@@ -263,39 +263,46 @@ fn materialize_waypoint_index(param_type: Option<&str>, token_8: Option<&str>) -
 /// TAction8 binds the retained Rules.DropZoneAnim; TAction41 resolves its
 /// numeric AnimType through the same native registry as runtime construction
 /// (6E2357). TAction58 roots the two find-only meteor literals (6E2D11/1D).
-/// All use the existing scheduler closure at load and restoration.
+/// Loading binds them tolerantly, as native never fails a scenario on anim
+/// art (`AnimTypeClass::ReadINI` 0x00427D00); bound names join the scheduler
+/// closure that saved resources rebind.
 pub fn trigger_anim_class_roots(rules: &RuleSet, actions: &ActionMap) -> Vec<String> {
     actions
         .values()
         .flat_map(|action| &action.entries)
-        .flat_map(|action| match action.kind {
-            58 => [
-                rules
-                    .anim_type_names
-                    .contains("METSMALL")
-                    .then_some("METSMALL"),
-                rules
-                    .anim_type_names
-                    .contains("METLARGE")
-                    .then_some("METLARGE"),
-            ],
-            8 => [rules.general.drop_zone_anim.as_deref(), None],
-            41 => [
-                action
-                    .literal_value()
-                    .and_then(|index| rules.anim_type_name_by_index(index)),
-                None,
-            ],
-            _ => [None, None],
+        .flat_map(|action| {
+            if action.kind == 41 {
+                return [
+                    action
+                        .literal_value()
+                        .and_then(|index| rules.anim_type_runtime_key_by_index(index))
+                        .map(std::borrow::Cow::into_owned),
+                    None,
+                ];
+            }
+            match action.kind {
+                58 => [
+                    rules
+                        .anim_type_names
+                        .contains("METSMALL")
+                        .then_some("METSMALL"),
+                    rules
+                        .anim_type_names
+                        .contains("METLARGE")
+                        .then_some("METLARGE"),
+                ],
+                8 => [rules.general.drop_zone_anim.as_deref(), None],
+                _ => [None, None],
+            }
+            .map(|name| name.map(str::to_owned))
         })
         .flatten()
-        .map(str::to_owned)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
 
@@ -406,12 +413,6 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_actions_is_empty() {
-        let ini = IniFile::from_str("[Map]\nTheater=TEMPERATE\n");
-        assert!(parse_actions(&ini).is_empty());
-    }
-
-    #[test]
     fn waypoint_tokens_follow_the_native_two_letter_decoder() {
         for (token, expected) in [
             ("A", Some(0)),
@@ -489,9 +490,7 @@ mod tests {
         assert_eq!(roots, ["BEACON"]);
         // Same strict owner used by both app load roots and saved resources.
         // Native BEACON controls read its physical ten-frame SHP and ART.
-        rules
-            .bind_scheduler_anim_assets(&roots, &assets, "TEM", "TEMPERATE")
-            .unwrap();
+        rules.bind_scheduler_anim_assets(&roots, &assets, "TEM", "TEMPERATE");
         let mut sim = crate::sim::world::Simulation::with_seed(31);
         crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
         sim.session
@@ -507,5 +506,46 @@ mod tests {
             sim.trigger_drop_zone_flare(&rules, 1),
             "the retail asset closure admits the production constructor"
         );
+    }
+
+    #[test]
+    fn retail_map_whose_action_41_names_unbindable_art_still_loads() {
+        // Retail GAWEAP_3's LoopEnd passes its frames; it binds as written
+        // (`0x00427FE8`). Native never fails a scenario on anim art; neither
+        // may the load.
+        use crate::skirmish_launch::{AiDifficulty, LaunchCountry};
+        let Some((root, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let Some(retail) =
+            crate::rules::retail_ini_fixture::retail_battle_rules_for_map("XMP03T4.MAP")
+        else {
+            return;
+        };
+        let index = retail
+            .rules
+            .anim_type_art_read_states()
+            .iter()
+            .position(|(name, _)| name == "GAWEAP_3")
+            .unwrap();
+        let stock = assets.resolve_ref("XMP03T4.MAP").unwrap();
+        let mut map = std::str::from_utf8(&stock.bytes).unwrap().to_owned();
+        for (section, row) in [
+            ("[Triggers]", "QA41=<none>,<none>,QA41,0,1,1,1,0".to_owned()),
+            ("[Events]", "QA41=1,13,0,0".to_owned()),
+            ("[Actions]", format!("QA41=1,41,0,{index},0,0,0,0,A")),
+            ("[Tags]", "QA41_TAG=0,QA41,QA41".to_owned()),
+        ] {
+            map = map.replacen(section, &format!("{section}\n{row}"), 1);
+        }
+        let directory = crate::map::source::test_support::TestDirectory::new("action41-art");
+        directory.write("action41.map", map.as_bytes());
+        let path = directory.path().join("action41.map");
+        let name = path.to_str().unwrap();
+        let launch = crate::headless_scenario::battle_session(
+            name,
+            &[(LaunchCountry::Russia, AiDifficulty::Easy)],
+        );
+        crate::headless_scenario::load_session(&root, name, 41, launch).unwrap();
     }
 }

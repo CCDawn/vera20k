@@ -8,6 +8,7 @@ use super::build::{TileMetadata, merge_tmp_file_metadata, ordinary_variant_selec
 use super::tubes::auto_tube_direction_from_bases;
 use super::*;
 use crate::map::tile_variant_selector::TileVariantSelector;
+use crate::util::lookup_hash::LookupMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum BridgeRecalcCatalogError {
@@ -125,8 +126,10 @@ fn read_resident_tmp(
 
 #[derive(Debug, Clone)]
 pub(crate) struct BridgeRecalcCatalog {
-    heads: HashMap<u16, ResidentTmp>,
-    files: HashMap<u16, Box<[ResidentTmp]>>,
+    // Lookup-only by tile: the tactical draw reads `files` for every visible
+    // cell, where the standard SipHash dominated the terrain instance build.
+    heads: LookupMap<u16, ResidentTmp>,
+    files: LookupMap<u16, Box<[ResidentTmp]>>,
     selector: TileVariantSelector,
     permissions: Vec<(bool, bool)>,
     registered_names: Vec<Vec<u8>>,
@@ -146,12 +149,35 @@ impl BridgeRecalcCatalog {
                 tile: i32::from(tile),
             })?
             .get(usize::from(variant))
-            .ok_or(BridgeRecalcCatalogError::Unavailable {
+            .ok_or_else(|| BridgeRecalcCatalogError::Unavailable {
                 tile,
                 reason: format!("missing registered TMP file {variant}"),
             })?
             .as_deref()
             .map_err(Clone::clone)
+    }
+
+    /// A save's cached variant, held inside this session's registered files.
+    /// The saving session can have registered more files for the tile than
+    /// this one (a mod map loaded with other assets). The variant selects only
+    /// radar colours and draw offsets, so the pristine file 0 stands in rather
+    /// than the whole save being refused; file 1 can be a damaged picture.
+    /// VERA load hardening, no native counterpart.
+    fn saved_variant(&self, tile: u16, variant: u8) -> u8 {
+        match self.files.get(&tile) {
+            Some(files) if usize::from(variant) >= files.len() => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    log::warn!(
+                        "saved terrain: tile {tile} variant {variant} exceeds its {} registered \
+                         TMP files; drawing such cells with the first file",
+                        files.len()
+                    );
+                });
+                0
+            }
+            _ => variant,
+        }
     }
 
     pub(super) fn tactical_metadata(
@@ -247,7 +273,7 @@ impl BridgeRecalcCatalog {
         self
     }
 
-    pub(super) fn for_runtime_bridges(
+    pub(super) fn for_runtime_terrain(
         theater: &TheaterData,
         assets: &crate::assets::asset_manager::AssetManager,
         rules: &TerrainRules,
@@ -258,14 +284,16 @@ impl BridgeRecalcCatalog {
         // Span construction and the queued Recalc rectangle have no family
         // gate. Registered ordinary sources and later LAT replacements must
         // remain available after TheaterData/AssetManager leave scope.
-        let has_bridge_family = theater.bridge_set.is_some() || theater.wood_bridge_set.is_some();
+        // The same registered TMPs serve tactical480350, independently of
+        // whether this theater declares a bridge family. LAT can replace the
+        // cell's original type after its cached variant was selected.
         let mut catalog = Self::for_tiles(
             theater,
             assets,
             rules,
             lat_enabled,
             cliff_back_impassability,
-            (0..theater.lookup.len() as i32).filter(|_| has_bridge_family),
+            0..theater.lookup.len() as i32,
         );
         catalog.selector = selector;
         catalog
@@ -297,9 +325,8 @@ impl BridgeRecalcCatalog {
                 )
             })
             .collect();
-        let ini = crate::rules::ini_parser::IniFile::from_bytes(&theater.ini_data);
-        let mut heads = HashMap::new();
-        let mut files = HashMap::new();
+        let mut heads = LookupMap::default();
+        let mut files = LookupMap::default();
         for id in ids {
             let Ok(tile) = u16::try_from(id) else {
                 continue;
@@ -318,26 +345,11 @@ impl BridgeRecalcCatalog {
                 .and_then(|filename| read_resident_tmp(assets, rules, tile, filename, set))
                 .map(Arc::new);
             let result = (|| {
-                let ini = ini
-                    .as_ref()
-                    .map_err(|error| BridgeRecalcCatalogError::Unavailable {
-                        tile,
-                        reason: format!("theater INI: {error}"),
-                    })?;
-                let set = theater.lookup.tileset_index(tile);
-                let set_name = set.and_then(|set| theater.lookup.set_name(set));
-                let set_section = set.map(|set| format!("TileSet{set:04}"));
-                // This narrow adapter supports the independently proved
-                // absence of shadow policy. It does not interpret TS shadow
-                // options or silently suppress a declared native callback.
-                if [set_section.as_deref(), set_name]
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|name| ini.section(name))
-                    .any(|section| {
-                        section.is_present("ShadowCaster") || section.is_present("ShadowTiles")
-                    })
-                {
+                // RecalcAttributes `0x0047DAA2` applies GetShadowCellOffsets
+                // (`0x00547C80`) only for a +0x2E1 tile type. This adapter
+                // does not port that walk, so it rejects such tiles instead
+                // of silently dropping the native callback.
+                if theater.lookup.casts_tile_shadow(tile) {
                     return Err(BridgeRecalcCatalogError::Unsupported {
                         tile,
                         effect: "declared shadow policy",
@@ -420,17 +432,11 @@ impl BridgeRecalcCatalog {
         clear_tile: u16,
         selector: &mut TileVariantSelectionContext<'_, '_>,
     ) -> Result<u8, BridgeRecalcCatalogError> {
-        let fallback = cell.final_tile_index == 0xffff
-            || cell.final_tile_index >= self.permissions.len() as i32;
-        let tile = if fallback {
-            clear_tile
-        } else {
-            u16::try_from(cell.final_tile_index).map_err(|_| {
-                BridgeRecalcCatalogError::Uncached {
-                    tile: cell.final_tile_index,
-                }
-            })?
-        };
+        // ProcessTileVariantsAndCullUnusedTMPs546DA0, branch546DF1..546E7C,
+        // selects ClearTile for native FFFF (CellCtor47BC11). RMG emission
+        // retains that semantic no-tile value as Rust -1; share presentation's
+        // resolution without rewriting saved cells or skipping the selector.
+        let (tile, fallback) = self.presentation_tile(cell, clear_tile);
         let pristine = self.file(tile, 0)?;
         let count = self.files[&tile].len() as u8;
         if !fallback && count <= 1 {
@@ -497,6 +503,49 @@ struct BridgePresentation {
 }
 
 impl ResolvedTerrainGrid {
+    /// Cell480389..4803FA selects the CURRENT TMP's file count/damaged gate
+    /// before calling the shared4814F0 coordinate selector. LAT47CA80 may have
+    /// replaced the type since `cell.variant` was cached during authored Fill.
+    /// Keep that simulation/saved value untouched; rendering reads the retained
+    /// process table and never initializes it or consumes Main RNG.
+    /// Native caller/file controls: bridge_recalc_presentation.json and
+    /// tmp_clear_render.json; raw instructions480389..480499.
+    pub fn tactical_draw_variant(&self, rx: u16, ry: u16) -> Option<u8> {
+        let cell = self.cell(rx, ry)?;
+        if self.tile_registry_len.is_none() {
+            // Explicit from_cells/synthetic authority has no physical registry.
+            return Some(if cell.has_damaged_data {
+                u8::from(self.pavement_damaged_at(rx, ry))
+            } else {
+                cell.variant
+            });
+        }
+        let catalog = self.bridge_recalc_catalog.as_ref()?;
+        let (tile, fallback) = catalog.presentation_tile(cell, self.clear_tile_id);
+        let files = catalog.files.get(&tile)?;
+        let pristine = files.first()?.as_deref().ok()?;
+        let count = u8::try_from(files.len()).ok()?;
+        if count < 2 {
+            return Some(0);
+        }
+        let source = pristine.tactical(cell.final_sub_tile);
+        if !fallback && source.has_damaged_data {
+            return Some(u8::from(self.pavement_damaged_at(rx, ry)));
+        }
+        catalog.selector.select_initialized_variant(
+            (i32::from(cell.rx), i32::from(cell.ry)),
+            cell.final_sub_tile,
+            (source.template_width_cells, source.template_height_cells),
+            count,
+        ).or_else(|| {
+            // Retail load's original Fill/registered-file selection initializes
+            // this shared table before drawing. Preserve explicit cold/synthetic
+            // fixtures instead of introducing a render-thread RNG mutation.
+            log::error!("tactical TMP selector is cold at ({rx},{ry}) tile {tile}; retaining cached variant");
+            Some(cell.variant)
+        })
+    }
+
     /// Unit73F12E..73F1D9 reads the CURRENT registered type's pristine
     /// dimensions, even when that type is not admitted by the runtime Recalc
     /// effect adapter. Registration546B46/546B50 stores the header low bytes.
@@ -648,7 +697,7 @@ impl ResolvedTerrainGrid {
                 cell.final_sub_tile,
                 draw_sub,
                 clear_fallback,
-                cell.variant,
+                catalog.saved_variant(tile, cell.variant),
             ),
         }
         .map_err(LoadCellRecalcError::ResidentInput)?;
@@ -685,7 +734,7 @@ impl ResolvedTerrainGrid {
                 cell.final_sub_tile,
                 if fallback { 0 } else { cell.final_sub_tile },
                 fallback,
-                cell.variant,
+                catalog.saved_variant(tile, cell.variant),
             )?;
             self.damaged_radar_metadata[index] = metadata.damaged_radar;
         }

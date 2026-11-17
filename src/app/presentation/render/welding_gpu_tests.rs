@@ -11,7 +11,7 @@ use crate::app::presentation::detail::DetailState;
 use crate::render::combat_light::CombatLightRenderer;
 use crate::render::surface_line::{SurfaceDraw, SurfaceLineViewport};
 use crate::render::tactical_compat::{
-    SparkPointPlanes, SparkPointPreparation, prepare_spark_point, welding_tests as fixture,
+    SparkPointPreparation, prepare_spark_point, welding_tests as fixture,
 };
 use crate::render::tactical_draw_plan::SpriteEncoding;
 use crate::render::terrain_draw::TerrainDrawRenderer;
@@ -20,6 +20,8 @@ use crate::rules::ruleset::DetailRules;
 use crate::sim::projectile::ProjectileCoord;
 use crate::sim::world::display_layers::{DisplayLayer, DisplayLayers};
 
+// Ares simulates WeldingSys itself (hooks 0x62DF05, 0x62FD60) and builds no
+// ParticleClass children for this stock draw path.
 #[test]
 #[ignore = "requires retail assets and GPU; ordinary Engineer IFV children through the canonical builder, Detail traversal and shared composition"]
 fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_mutating_simulation() {
@@ -80,11 +82,11 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
     assert!(
         sim.particle_systems()
             .iter()
-            .all(|(&id, system)| id == system_id || system.particles.is_empty()),
+            .all(|(&id, system)| id == system_id || system.particles().is_empty()),
         "the selected fixture has no unrelated Particle queries"
     );
     let system = sim.particle_systems().get(system_id).unwrap();
-    let at = system.coords;
+    let at = system.coords();
     let child_ids: Vec<_> = sim
         .display_layers()
         .members(DisplayLayer::AIR)
@@ -92,18 +94,18 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
         .copied()
         .filter(|id| {
             system
-                .particles
+                .particles()
                 .iter()
                 .any(|particle| particle.stable_id() == *id)
         })
         .collect();
-    assert_eq!(child_ids.len(), system.particles.len());
+    assert_eq!(child_ids.len(), system.particles().len());
     assert!(!child_ids.is_empty());
     assert_eq!(
         sim.display_layers().layer_of(system_id),
         Some(DisplayLayer::GROUND)
     );
-    let type_id = sim.interner.intern(&anim_type);
+    let type_id = sim.intern(&anim_type);
     let anim = sim
         .spawn_anim_at_world(
             &rules,
@@ -143,6 +145,7 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
         build_display_effect_instances(
             &DisplayEffectInputs {
                 sim: &sim,
+                frame: &crate::app::presentation::frame::PresentationFrame::of_test(&sim, &rules),
                 rules: &rules,
                 camera: view_camera,
                 render_size: size,
@@ -153,14 +156,16 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
                 detail,
                 detail_level: 2,
                 lighting: &lighting,
+                retained_anim_intensities: None,
                 house_colors: &house_colors,
                 hidden_super_anims: &hidden,
                 show_hidden: false,
-                local_owner: sim.session.current_house,
+                local_owner: sim.session().current_house(),
                 observe_particles: false,
             },
             &mut parents,
             &order,
+            Default::default(),
         );
         assert_eq!(
             sim.state_hash(),
@@ -183,7 +188,13 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
         RefCell::new(detail)
     };
     let normal = build(&normal_detail(), Some(&atlas));
+    let empty_anim = normal
+        .iter()
+        .find(|parent| parent.parent.id == anim)
+        .expect("the admitted Anim retains its parent without either image frame");
+    assert!(empty_anim.pieces.is_empty() && empty_anim.body_draw.is_none());
     let expected: Vec<_> = std::iter::once(system_id)
+        .chain(std::iter::once(anim))
         .chain(child_ids.iter().copied())
         .collect();
     assert_eq!(
@@ -192,7 +203,7 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
             .map(|parent| parent.parent.id)
             .collect::<Vec<_>>(),
         expected,
-        "actual retained System and child slots feed lowering"
+        "actual retained System, empty Anim and child slots feed lowering"
     );
     // Whole ParticleDraw's three-query overflow control supplies the expected
     // shared55AF60 outcomes. An Anim after System must take the middle query;
@@ -289,6 +300,7 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
                 &dv,
                 batch.camera_uniform(),
             );
+            terrain.bind_surface_line_a(&gpu.device, Some(&a));
             terrain.begin_surface_lines();
             for layer in &mut layers {
                 layer.line_batches = layer
@@ -310,17 +322,6 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
                                 zoom: 1.,
                             },
                             |_| false,
-                            |[x, y]| {
-                                u16::from(
-                                    a.sample_world(
-                                        x as f32 + view_camera[0].floor(),
-                                        y as f32 + view_camera[1].floor(),
-                                        view_camera[0],
-                                        view_camera[1],
-                                    )
-                                    .unwrap(),
-                                )
-                            },
                         )
                     })
                     .collect();
@@ -352,6 +353,7 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
             for layer in &layers {
                 draw_native_object_pass(
                     &mut encoder,
+                    crate::app::render::merge_passes::ObjectDrawPhase::Display,
                     &cv,
                     &dv,
                     &mut terrain,
@@ -492,7 +494,6 @@ fn retained_welding_system_then_particles_matches_original_shared_destination() 
                     fixture::command(point, draw, index),
                     &colors,
                     fixture::viewport(particles),
-                    SparkPointPlanes::Deferred,
                 )
                 .unwrap()
                 {
@@ -541,6 +542,9 @@ fn retained_welding_system_then_particles_matches_original_shared_destination() 
             );
             let a = fixture::plane(particles, "a");
             let z = fixture::plane(particles, "z");
+            terrain.bind_surface_line_a_fixture(&gpu.device, &gpu.queue, size, |[x, y]| {
+                a[(y as u32 * size[0] + x as u32) as usize]
+            });
             terrain.begin_surface_lines();
             for layer in &mut layers {
                 layer.line_batches = layer
@@ -562,7 +566,6 @@ fn retained_welding_system_then_particles_matches_original_shared_destination() 
                                 zoom: 1.,
                             },
                             |_| false,
-                            |[x, y]| a[(y as u32 * size[0] + x as u32) as usize],
                         )
                     })
                     .collect();
@@ -595,6 +598,7 @@ fn retained_welding_system_then_particles_matches_original_shared_destination() 
             for index in replay {
                 draw_native_object_pass(
                     &mut encoder,
+                    crate::app::render::merge_passes::ObjectDrawPhase::Display,
                     &cv,
                     &dv,
                     &mut terrain,

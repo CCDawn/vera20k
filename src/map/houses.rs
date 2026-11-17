@@ -59,6 +59,10 @@ pub struct HouseDefinition {
     pub player_control: Option<bool>,
     /// Scenario-authored `IQ=` read into HouseClass CurrentIQ (ReadInt over 0).
     pub iq: i32,
+    /// `UIName=`, the CSF key Read_Scenario_INI reads into +0x16009
+    /// (`0x00500C5D..0x00500C77`, 0x20 bytes, defaulting to the zeroed field).
+    #[serde(default)]
+    pub ui_name: Option<String>,
     /// ReadHousesList475260 result, resolved against the complete exact-name
     /// roster. Unknown tokens set bit31; the graph projection admits only
     /// present, non-self House indices.
@@ -158,25 +162,11 @@ impl HouseRoster {
     }
 }
 
-/// Returns true when two house names should be treated as friendly.
-pub fn are_houses_friendly(alliances: &HouseAllianceMap, a: &str, b: &str) -> bool {
-    if a.eq_ignore_ascii_case(b) {
-        return true;
-    }
-    with_house_key(a, |a| {
-        with_house_key(b, |b| {
-            alliances.get(a).is_some_and(|set| set.contains(b))
-                || alliances.get(b).is_some_and(|set| set.contains(a))
-        })
-    })
-}
-
 /// Directional alliance test: does `asker` consider `other` an ally?
 ///
 /// gamemd's `HouseClass::IsAlliedWith` reads only the *asker's* own ally
 /// bitfield, so alliance is one-way until both sides set their bit; a house is
-/// always allied with itself. [`are_houses_friendly`] keeps its symmetric OR
-/// for the call sites not yet traced to their native asker (#582).
+/// always allied with itself. Each caller names its native asker.
 pub fn is_allied_with(alliances: &HouseAllianceMap, asker: &str, other: &str) -> bool {
     ally_test(alliances, asker)(other)
 }
@@ -197,8 +187,8 @@ pub fn ally_test<'a>(
 /// Mutual-alliance test — both houses must name each other.
 ///
 /// This is the pairwise predicate the native game-over scan applies to every
-/// surviving house pair, and it is strictly stronger than
-/// [`are_houses_friendly`]: a one-way alliance does not end the match.
+/// surviving house pair, and it is strictly stronger than either house's
+/// [`is_allied_with`]: a one-way alliance does not end the match.
 pub fn are_houses_mutually_allied(alliances: &HouseAllianceMap, a: &str, b: &str) -> bool {
     is_allied_with(alliances, a, b) && is_allied_with(alliances, b, a)
 }
@@ -211,27 +201,8 @@ pub(crate) fn normalize_house_name(name: &str) -> String {
 /// `f` applied to `name`'s ally-graph key ([`normalize_house_name`]), built
 /// on the stack when it fits. The alliance tests run for every path-search
 /// blocker and fog viewer, where a heap key per test showed in profiles.
-fn with_house_key<R>(name: &str, f: impl FnOnce(&str) -> R) -> R {
-    let name = name.trim();
-    let mut buffer = [0u8; 64];
-    match buffer.get_mut(..name.len()) {
-        Some(key) => {
-            key.copy_from_slice(name.as_bytes());
-            key.make_ascii_uppercase();
-            f(std::str::from_utf8(key).expect("ASCII uppercasing keeps UTF-8"))
-        }
-        None => f(&normalize_house_name(name)),
-    }
-}
-
-/// Parse house color assignments from a map's INI data.
-///
-/// This remains as a compatibility helper for systems that only need color.
-/// `schemes` is the parsed `[Colors]` list used to resolve each house's
-/// `Color=<name>` to a `[Colors]` entry index.
-#[cfg(any(test, feature = "test-support"))]
-pub fn parse_house_colors(ini: &IniFile, schemes: &[ColorSchemeEntry]) -> HouseColorMap {
-    parse_house_roster(ini, schemes, None).color_map()
+pub(crate) fn with_house_key<R>(name: &str, f: impl FnOnce(&str) -> R) -> R {
+    crate::util::native_string::with_ascii_uppercase(name.trim(), f)
 }
 
 /// Parse the ordered active-house roster from a map's INI data.
@@ -293,6 +264,7 @@ pub fn parse_house_roster(
         let side = fields.read_name("Side", 0x80).map(str::to_string);
         let player_control = fields.read_bool_value("PlayerControl");
         let iq = fields.read_int("IQ", 0);
+        let ui_name = fields.read_name("UIName", 0x20).map(str::to_string);
         let base_plan = parse_scenario_base_plan(section, rules);
 
         houses.push(HouseDefinition {
@@ -302,6 +274,7 @@ pub fn parse_house_roster(
             side,
             player_control,
             iq,
+            ui_name,
             allies: 0,
             base_plan,
         });
@@ -382,7 +355,7 @@ fn parse_scenario_base_plan(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
 
@@ -442,13 +415,16 @@ mod tests {
         assert_eq!(roster.houses[0].iq, 0);
         assert_eq!(roster.houses[1].allies, 1 << 31);
         let alliances = roster.alliance_map();
-        assert!(!are_houses_friendly(
-            &alliances,
-            "Russians",
-            "Confederation"
-        ));
-        assert!(!are_houses_friendly(&alliances, "YuriCountry", "Russians"));
-        assert!(!are_houses_friendly(&alliances, "Americans", "Russians"));
+        for (a, b) in [
+            ("Russians", "Confederation"),
+            ("YuriCountry", "Russians"),
+            ("Americans", "Russians"),
+        ] {
+            assert!(
+                !is_allied_with(&alliances, a, b) && !is_allied_with(&alliances, b, a),
+                "{a} {b}"
+            );
+        }
     }
 
     #[test]
@@ -470,8 +446,6 @@ mod tests {
             "Americans",
             "Russians"
         ));
-        // The symmetric helper still answers "friendly" for the same pair.
-        assert!(are_houses_friendly(&alliances, "Russians", "Americans"));
 
         alliances
             .entry("RUSSIANS".to_string())
@@ -484,6 +458,52 @@ mod tests {
         ));
     }
 
+    /// Ares47527C/475297 preserves late allies in a long authored list.
+    /// Equal Country never creates an edge; the ordinary roster/graph owns
+    /// both the long-list result and the deliberately one-way control.
+    #[test]
+    fn long_house_allies_keep_late_members_only_with_ares() {
+        for ares_way in [false, true] {
+            let _ares = crate::rules::ares_switch::read_ares_way(ares_way);
+            let names: Vec<_> = (0..19).map(|i| format!("Guard{i:02} House")).collect();
+            let mut source = String::from("[Houses]\n");
+            for (index, name) in names.iter().enumerate() {
+                source.push_str(&format!("{index}={name}\n"));
+            }
+            let list = names[..18].join(",");
+            assert!(list.len() > 127 && list.len() < 511);
+            for (index, name) in names.iter().enumerate() {
+                source.push_str(&format!("[{name}]\nCountry=Russians\n"));
+                if index == 0 {
+                    source.push_str(&format!("Allies={list}\n"));
+                } else if index == 17 {
+                    source.push_str(&format!("Allies={}\n", names[0]));
+                }
+            }
+            let roster = parse_house_roster(&IniFile::from_str(&source), &[], None);
+            assert_eq!(roster.houses.len(), 19);
+            let alliances = roster.alliance_map();
+            assert_eq!(is_allied_with(&alliances, &names[0], &names[17]), ares_way);
+            assert!(is_allied_with(&alliances, &names[17], &names[0]));
+            assert!(is_allied_with(&alliances, &names[0], &names[1]));
+            assert!(!is_allied_with(&alliances, &names[1], &names[0]));
+            assert!(!is_allied_with(&alliances, &names[0], &names[18]));
+            assert!(!is_allied_with(&alliances, &names[18], &names[0]));
+        }
+    }
+
+    #[test]
+    fn ui_name_reads_at_most_31_bytes_and_empty_is_absent() {
+        // 500C5D..500C77: ReadString into a 0x20-byte buffer.
+        let long = "K".repeat(40);
+        let ini = IniFile::from_str(&format!(
+            "[Houses]\n0=A\n1=B\n[A]\nUIName={long}\n[B]\nUIName=\n"
+        ));
+        let roster = parse_house_roster(&ini, &test_schemes(), None);
+        assert_eq!(roster.houses[0].ui_name.as_deref(), Some(&long[..31]));
+        assert_eq!(roster.houses[1].ui_name, None);
+    }
+
     #[test]
     fn test_missing_color_defaults_to_default_scheme() {
         let ini: IniFile = IniFile::from_str("[Houses]\n0=Neutral\n[Neutral]\nIQ=5\n");
@@ -493,14 +513,6 @@ mod tests {
         assert_eq!(roster.houses[0].iq, 5);
         assert_eq!(roster.houses[0].scenario_current_iq(5), 5);
         assert_eq!(roster.houses[0].scenario_current_iq(4), 1);
-    }
-
-    #[test]
-    fn test_unknown_color_defaults_to_default_scheme() {
-        let ini: IniFile =
-            IniFile::from_str("[Houses]\n0=Neutral\n[Neutral]\nColor=PinkPolkaDot\n");
-        let map = parse_house_colors(&ini, &test_schemes());
-        assert_eq!(map["Neutral"], HouseColorIndex(DEFAULT_SCHEME_ENTRY as u8));
     }
 
     #[test]
@@ -543,20 +555,6 @@ mod tests {
             let roster = parse_house_roster(&map, &rules.color_schemes, Some(&rules));
             assert_eq!(roster.houses[0].color, expected, "map Color={color:?}");
         }
-    }
-
-    #[test]
-    fn test_missing_houses_section() {
-        let ini: IniFile = IniFile::from_str("[General]\nKey=Value\n");
-        let roster = parse_house_roster(&ini, &test_schemes(), None);
-        assert!(roster.houses.is_empty());
-    }
-
-    #[test]
-    fn test_house_without_section() {
-        let ini: IniFile = IniFile::from_str("[Houses]\n0=Ghost\n");
-        let map = parse_house_colors(&ini, &test_schemes());
-        assert_eq!(map["Ghost"], HouseColorIndex(DEFAULT_SCHEME_ENTRY as u8));
     }
 
     #[test]
@@ -692,6 +690,5 @@ mod tests {
             .insert("BRITISH".into());
         assert!(is_allied_with(&alliances, " americans", "British "));
         assert!(!is_allied_with(&alliances, "British", "Americans"));
-        assert!(are_houses_friendly(&alliances, "british", "AMERICANS "));
     }
 }

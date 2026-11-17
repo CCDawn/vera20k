@@ -5,8 +5,8 @@
 //! Native callers run it right after the dying building's UnInit (`vt+0xF8`):
 //! `BuildingClass::ReceiveDamage` (`0x004426A2`) when DestructionEffects
 //! armed a running death timer, and `BuildingClass::Update` (`0x004400E5`)
-//! when that timer expires. VERA UnInits every dying building at once (see
-//! `crew_survival`), so it runs here from the fatal lifecycle's
+//! when that timer expires (an `Explodes=` type or a building dying while
+//! Selling, whose timer is zero). Both run it from the fatal lifecycle's
 //! AfterDeathEffects stage, after `uninit_with_context`.
 //!
 //! Rubble: when the type's rubble art answers
@@ -49,7 +49,7 @@ use std::collections::BTreeSet;
 
 use crate::sim::intern::InternedId;
 
-use super::{FrameEffects, Simulation, mark_wall_radar_dirty_cell};
+use super::{FrameEffects, Simulation};
 
 impl Simulation {
     /// `BuildingClass::AfterDestruction @ 0x00441F60` for a building of
@@ -82,13 +82,16 @@ impl Simulation {
             let powerup = object
                 .crate_beneath_is_money
                 .then_some(crate::rules::powerups::POWERUP_MONEY as u8);
-            crate::sim::crates::place_crate(
+            if let Err(error) = crate::sim::crates::place_crate(
                 self,
                 rules,
                 registry,
                 (origin.0 as i16, origin.1 as i16),
                 powerup,
-            );
+                effects,
+            ) {
+                log::error!("CrateBeneath placement failed: {error}");
+            }
         }
     }
 
@@ -98,7 +101,7 @@ impl Simulation {
         rules: &RuleSet,
         registry: &OverlayTypeRegistry,
         type_id: InternedId,
-        foundation: &str,
+        foundation: &crate::rules::foundation::Foundation,
         origin: (u16, u16),
         effects: FrameEffects<'_>,
     ) {
@@ -118,12 +121,8 @@ impl Simulation {
             BTreeSet::new()
         };
         for cell in cells {
-            mark_wall_radar_dirty_cell(
-                &mut self.radar_terrain_dirty_cells,
-                &mut self.radar_terrain_dirty_generation,
-                cell,
-            );
-            self.tactical_dirty_cells.push(cell);
+            self.dirty_cells.mark_radar([cell]);
+            self.dirty_cells.mark_tactical(cell);
             let (Some(grid), Some(terrain)) =
                 (self.overlay_grid.as_mut(), self.resolved_terrain.as_mut())
             else {
@@ -134,9 +133,9 @@ impl Simulation {
             }
             grid.recalculate_runtime_cell(terrain, registry, cell);
             if navigation_installed {
-                self.publish_cell_and_assign_orphaned_zone(rules, cell, &blocked);
+                self.publish_cell_and_assign_orphaned_zone(rules, cell, Some(&blocked));
             }
-            self.stop_all_targeting_cell(cell.0, cell.1, Some(rules), Some(registry), effects);
+            self.stop_all_targeting_cell(cell.0, cell.1, rules, Some(registry), effects);
         }
         if let Some(grid) = self.overlay_grid.as_mut() {
             grid.set_rubble_building_type(origin.0, origin.1, type_id);

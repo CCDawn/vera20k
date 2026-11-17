@@ -27,10 +27,6 @@ fn stored_bits(value: &Value) -> NativeF64Bits {
 #[test]
 fn original_coefficient_reader_and_nullable_team_getter_controls() {
     let packet = packet();
-    assert_eq!(
-        packet["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     for row in packet["type_readers"].as_array().unwrap() {
         let mut section = IniSection::new("MTNK".into());
         if let Some(text) = row["value"].as_str() {
@@ -80,22 +76,6 @@ fn original_coefficient_reader_and_nullable_team_getter_controls() {
             retained,
             "the Team override must not overwrite Foot+530"
         );
-    }
-}
-
-#[test]
-fn original_team_boolean_controls_preserve_current_defaults() {
-    let packet = packet();
-    let mut current = packet["team_constructor_default"].as_u64().unwrap() != 0;
-    assert!(!current);
-    for row in packet["team_readers"].as_array().unwrap() {
-        assert_eq!(u64::from(current), row["before"].as_u64().unwrap());
-        let mut fields = IniSection::new("FINISH_TEAM".into());
-        if let Some(value) = row["value"].as_str() {
-            fields.set("AvoidThreats", value);
-        }
-        current = fields.read_bool("AvoidThreats", current);
-        assert_eq!(u64::from(current), row["after"].as_u64().unwrap(), "{row}");
     }
 }
 

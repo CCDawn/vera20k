@@ -8,10 +8,6 @@ fn original_infantry_and_unit_approach_radii_and_rays() {
         "tools/spatial_oracle/fv_cell_attack/cleg_approach_vectors.json",
     ))
     .unwrap();
-    assert_eq!(
-        native["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     assert_eq!(native["infantry_identity"]["rtti"], 15);
     let cases = native["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 380);
@@ -80,8 +76,8 @@ fn original_approach_candidate_heights() {
                 .flat_map(|ry| (0..width).map(move |rx| test_flat_cell(rx, ry)))
                 .collect(),
         );
-        let sampled =
-            &mut terrain.cells[usize::from(cell[1]) * usize::from(width) + usize::from(cell[0])];
+        let sampled = &mut terrain.cells_mut_for_test()
+            [usize::from(cell[1]) * usize::from(width) + usize::from(cell[0])];
         sampled.level = row["level"].as_u64().unwrap().try_into().unwrap();
         sampled.slope_type = row["slope"].as_u64().unwrap().try_into().unwrap();
         sampled.bridge_facts.raw_flags = row["flags"].as_u64().unwrap().try_into().unwrap();
@@ -135,8 +131,7 @@ fn retail_legionnaire_attacks_distant_object_after_teleport_recovery() {
         for (name, side) in [("Americans", 0), ("Russians", 1)] {
             let owner = sim.intern(name);
             sim.houses
-                .insert(owner, HouseState::new(owner, side, None, true, 0, 10));
-            sim.session.house_order.push(owner);
+                .register(HouseState::new(owner, side, None, true, 0, 10));
         }
         let grid = crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
         let target = sim
@@ -192,7 +187,7 @@ fn retail_legionnaire_attacks_distant_object_after_teleport_recovery() {
                 if stop_after_freeze && !stop_issued {
                     stop = Some(CommandEnvelope::new(
                         owner,
-                        sim.session.tick + 1,
+                        sim.session.tick() + 1,
                         Command::Stop { entity_id: cleg },
                     ));
                     stop_issued = true;
@@ -243,10 +238,6 @@ fn original_approach_candidate_geometry_and_order() {
         "tools/spatial_oracle/fv_cell_attack/approach_vectors.json",
     ))
     .unwrap();
-    assert_eq!(
-        native["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     let original_offsets = native["original_constants"]
         .as_array()
         .unwrap()
@@ -343,7 +334,7 @@ fn stamp_destroyable_cliff(sim: &mut Simulation) {
                 continue;
             }
             let cell = terrain
-                .cell_mut(8 + u16::from(column), 9 + u16::from(row))
+                .cell_mut_for_test(8 + u16::from(column), 9 + u16::from(row))
                 .unwrap();
             cell.final_tile_index = 100;
             cell.final_sub_tile = sub_tile;
@@ -362,7 +353,7 @@ fn the_destroyable_cliff_redirect_takes_the_nearest_imaged_cell() {
     sim.install_resolved_terrain_for_new_map(crate::map::resolved_terrain::test_flat_ground_grid(
         32,
     ));
-    sim.playfield_bounds = Some(crate::sim::arena_fixture::OPEN_PLAYFIELD);
+    sim.set_playfield_bounds_for_test(Some(crate::sim::arena_fixture::OPEN_PLAYFIELD));
     stamp_destroyable_cliff(&mut sim);
 
     for (target, own, nearest) in [

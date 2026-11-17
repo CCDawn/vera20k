@@ -94,7 +94,7 @@ impl ZoneBatchHost for LivePublication<'_> {
             .ok_or("zone batch has no live zone owner")?;
         let (base, hierarchy) = zones.base_and_hierarchy_mut();
         hierarchy.levels_mut()[0]
-            .set_native_zone_at(coord, base.native_bridge_source_size, 0)
+            .set_native_zone_at(coord, base.native_bridge_source_size(), 0)
             .ok_or_else(|| "zone batch coordinate has no native zone storage".into())
     }
 
@@ -105,7 +105,10 @@ impl ZoneBatchHost for LivePublication<'_> {
         self.recalc_cell(cell, -1)
     }
 
-    fn fine_zone(&self, coord: CellCoord) -> Result<u16, String> {
+    fn fine_zone(
+        &self,
+        coord: CellCoord,
+    ) -> Result<crate::sim::pathfinding::zone_map::ZoneId, String> {
         self.sim
             .zone_grid
             .as_ref()
@@ -138,7 +141,7 @@ impl ZoneBatchHost for LivePublication<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 mod tests {
     use super::*;
     include!("bridge_batch_native_tests.rs");
@@ -147,7 +150,9 @@ mod tests {
     use crate::sim::pathfinding::{PathGrid, zone_map::ZoneGrid};
     use std::sync::Arc;
 
-    fn edge_state(sim: &Simulation) -> Vec<Vec<Vec<(u16, u8)>>> {
+    fn edge_state(
+        sim: &Simulation,
+    ) -> Vec<Vec<Vec<(crate::sim::pathfinding::zone_map::ZoneId, u8)>>> {
         let hierarchy = sim
             .zone_grid
             .as_ref()
@@ -160,7 +165,7 @@ mod tests {
                 (0..graph.record_slot_count())
                     .map(|zone| {
                         graph
-                            .edges(zone as u16)
+                            .edges(zone as crate::sim::pathfinding::zone_map::ZoneId)
                             .iter()
                             .map(|edge| (edge.neighbor, edge.flag))
                             .collect()
@@ -186,7 +191,7 @@ mod tests {
         );
         terrain.test_set_high_bridge_set_starts(Some(100), Some(200));
         for (x, y) in [(5, 5), (10, 5)] {
-            let cell = terrain.cell_mut(x, y).unwrap();
+            let cell = terrain.cell_mut_for_test(x, y).unwrap();
             cell.final_tile_index = 106;
             cell.final_sub_tile = 4;
         }
@@ -196,7 +201,7 @@ mod tests {
         assert_eq!(bridges.endpoint_records().len(), 1);
         assert!(!bridges.endpoint_records()[0].active);
         bridges.test_set_endpoint_records(Vec::new());
-        let mut path = PathGrid::from_resolved_terrain_with_bridges(&terrain);
+        let mut path = PathGrid::from_resolved_terrain_with_bridges(&terrain, None);
         path.set_blocked(7, 7, true); // Retained structure blocking.
         let mut sim = Simulation::with_seed(31);
         sim.install_resolved_terrain_for_new_map(terrain);
@@ -207,14 +212,17 @@ mod tests {
             off_104: 8,
             off_108: 8,
         });
-        sim.zone_grid = Some(ZoneGrid::build_with_native_bridge_geometry(
-            &path,
-            sim.resolved_terrain.as_ref().unwrap(),
-            bridges.endpoint_records(),
-            16,
-            16,
-            Some((8, 8)),
-        ));
+        sim.zone_grid = Some(
+            ZoneGrid::build_with_native_bridge_geometry(
+                &path,
+                sim.resolved_terrain.as_ref().unwrap(),
+                bridges.endpoint_records(),
+                16,
+                16,
+                Some((8, 8)),
+            )
+            .into(),
+        );
         sim.bridge_state = Some(bridges);
         sim.path_grid = Some(Arc::new(path.clone()));
         let before = edge_state(&sim);
@@ -228,8 +236,9 @@ mod tests {
         assert!(!host.validate_bridge_zones((5, 5)).unwrap());
         assert!(sim.bridge_state.as_ref().unwrap().endpoint_records()[0].active);
         let after = edge_state(&sim);
-        let count =
-            |state: &Vec<Vec<Vec<(u16, u8)>>>| state.iter().flatten().map(Vec::len).sum::<usize>();
+        let count = |state: &Vec<Vec<Vec<(crate::sim::pathfinding::zone_map::ZoneId, u8)>>>| {
+            state.iter().flatten().map(Vec::len).sum::<usize>()
+        };
         assert_eq!(count(&after), count(&before) + 18);
         let mut host = LivePublication {
             frame_effects: crate::sim::world::FrameEffects::default(),

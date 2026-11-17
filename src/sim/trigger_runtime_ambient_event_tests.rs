@@ -1,6 +1,5 @@
 //! Logic-polled ambient threshold events, native71EAE7 /71EB06.
-//! Original gamemd.exe SHA256:
-//! 3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600.
+//! Original gamemd.exe.
 //! Instruction-established signed <= / >=; these are production regressions,
 //! not a capture or exhaustive native execution comparison.
 use super::*;
@@ -47,11 +46,12 @@ fn fixture(threshold: i32, target_action: bool) -> Simulation {
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
         None,
         None,
+        None,
     );
-    sim.classify_map_triggers(None);
-    sim.session.set_started(true);
-    sim.session.map_width = 32;
-    sim.session.map_height = 32;
+    sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
+    sim.session.publish_started();
+    sim.session.set_map_width_for_test(32);
+    sim.session.set_map_height_for_test(32);
     sim.resolved_terrain = Some(crate::map::resolved_terrain::test_grid(
         32,
         32,
@@ -75,16 +75,25 @@ fn ambient_events_poll_current_signed_scalar_and_include_equality() {
     ] {
         let mut sim = fixture(threshold, false);
         // Different normal and target values expose accidental profile reads.
-        sim.session.lighting.normal.ambient_percent = 777;
-        sim.session.lighting.target_ambient = -888;
-        sim.session.lighting.current_ambient = current;
-        let prior = sim.session.lighting;
+        sim.session
+            .lighting_mut()
+            .normal_mut_for_test()
+            .ambient_percent = 777;
+        sim.session.lighting_mut().set_target_ambient_for_test(-888);
+        sim.session
+            .lighting_mut()
+            .set_current_ambient_for_test(current);
+        let prior = *sim.session.lighting();
         let rng = (
             sim.main_rng.native_state_hex(),
             sim.scenario_rng.native_state_hex(),
             sim.mapgen_rng.native_state_hex(),
         );
-        sim.advance_triggers(None, None, FrameEffects::default());
+        sim.advance_triggers(
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            None,
+            FrameEffects::default(),
+        );
         assert_eq!(
             sim.trigger_local_is_set_for_test(0),
             below,
@@ -95,7 +104,7 @@ fn ambient_events_poll_current_signed_scalar_and_include_equality() {
             above,
             "46: {current}, {threshold}"
         );
-        assert_eq!(sim.session.lighting, prior);
+        assert_eq!(*sim.session.lighting(), prior);
         assert_eq!(
             (
                 sim.main_rng.native_state_hex(),
@@ -114,7 +123,7 @@ fn saved_pending_ambient_event_fires_after_the_production_frame_fade() {
     let first = original
         .advance_app_frame(
             &[],
-            Some(&rules),
+            &rules,
             None,
             67,
             TickLane::Ordinary,
@@ -125,8 +134,8 @@ fn saved_pending_ambient_event_fires_after_the_production_frame_fade() {
     // Logic polls before this frame's fade. The target action changes 100
     // to 80, then the fade reaches 90; Below waits for the next Logic poll.
     assert!(!original.trigger_local_is_set_for_test(0));
-    assert_eq!(original.session.lighting.current_ambient, 90);
-    assert_eq!(original.session.lighting.target_ambient, 80);
+    assert_eq!(original.session.lighting().current_ambient(), 90);
+    assert_eq!(original.session.lighting().target_ambient(), 80);
     let saved_hash = original.state_hash();
     let bytes = GameSnapshot::save(&original, 0, 0, "Ambient events", 0);
     let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
@@ -135,12 +144,13 @@ fn saved_pending_ambient_event_fires_after_the_production_frame_fade() {
     restored.resolved_terrain = original.resolved_terrain.clone();
     // A8ED5C is process admission state, not saved. The committed app load
     // republishes it before resuming frames (app/persistence/mod.rs).
-    restored.session.set_started(true);
+    restored.session.publish_started();
     for sim in [&mut original, &mut restored] {
+        sim.record_trigger_springs(true);
         let frame = sim
             .advance_app_frame(
                 &[],
-                Some(&rules),
+                &rules,
                 None,
                 67,
                 TickLane::Ordinary,
@@ -148,10 +158,25 @@ fn saved_pending_ambient_event_fires_after_the_production_frame_fade() {
             )
             .unwrap();
         assert!(frame.tick.frame_committed);
-        assert_eq!(sim.session.lighting.current_ambient, 90);
+        assert_eq!(sim.session.lighting().current_ambient(), 90);
+        assert!(
+            !sim.trigger_runtime.dirty[2],
+            "a frame whose fade does not step leaves 34AB clear"
+        );
         assert!(
             sim.trigger_local_is_set_for_test(0),
             "Logic sees the preceding frame's fade value"
+        );
+        // The fade's step set Scenario+34AB (0x0055B4BA), saved with the
+        // game, so this poll raises event 45 before event 13.
+        let (springs, _) = sim.take_trigger_trace();
+        assert_eq!(
+            springs
+                .iter()
+                .filter(|spring| spring.trigger == "BELOW")
+                .map(|spring| spring.raised_kind)
+                .collect::<Vec<_>>(),
+            [45]
         );
         assert!(
             sim.trigger_runtime.logic_tags.is_empty(),

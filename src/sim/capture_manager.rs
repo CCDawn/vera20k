@@ -11,6 +11,15 @@
 //! (`TechnoClass+0x2C0` MindControlledBy, `+0x2C8` its ring anim); the
 //! controller owns the ordered nodes and every state change.
 //!
+//! Phobos extends this owner with `MindControlSize=`,
+//! `MindControl.IgnoreSize=`, `MultiMindControl.ReleaseVictim=`,
+//! `MindControlLink.VisibleToHouse=`, `MindControlRangeLimit=` and the
+//! warhead `MindControl.Anim=`. Its `GetControlledCount` (`0x4722D0`)
+//! replacement sums victim sizes when `IgnoreSize=` is off;
+//! `CanCapture`/`CaptureUnit` (`src/Ext/CaptureManager/Body.cpp`) use that
+//! size for the capacity gate and release-first block, and
+//! `TechnoExt::OnEarlyUpdate` frees a victim outside the controller's range.
+//!
 //! Releases (`FreeUnit @ 0x00471FF0`, through `FreeAll @ 0x00472140`): the
 //! controller's death arm (`TechnoClass::ReceiveDamage @ 0x00702112`; the
 //! later `BuildingClass::ReceiveDamage` FreeAll at `0x004424F9` finds the
@@ -56,21 +65,10 @@
 //! state. Tactical presentation consumes the shared GetFLH/live coordinates.
 //!
 //! RESIDUALS:
-//! - An expired ring anim clears the victim's `+0x2C8` natively
-//!   (`TechnoClass::PointerExpired @ 0x00707946`, `0x0071043D`); VERA clears
-//!   the link only in FreeUnit, so a ring that ran out of loops leaves a
-//!   stale anim id in the persisted and hashed link. Harmless while stable
-//!   ids are never reused.
-//! - A type's `MindClearedSound=` naming an unknown sound is -1 natively and
-//!   FreeUnit falls back to the global (`0x00472057`); VERA keeps the name
-//!   and plays nothing. No stock type authors the key.
 //! - `AICaptureWoundedMark=` is read natively as a double and stored with
 //!   `FSTP float` under the process chop control word (`0x00670504..
 //!   0x00670509`); VERA parses to the nearest `f32`. Equal for stock `.25`;
 //!   an authored mark can differ by one ulp.
-//! - A crushed controller frees its victims at the crush call (`0x007418E5`,
-//!   before Record_The_Kill); VERA frees them in the crushed object's UnInit
-//!   a moment later in the same frame.
 
 use crate::sim::world::FrameEffects;
 use serde::{Deserialize, Serialize};
@@ -84,6 +82,7 @@ use crate::sim::anim_class::{AnimId, AnimWorldCoord};
 use crate::sim::game_entity::GameEntity;
 use crate::sim::intern::InternedId;
 use crate::sim::mission::{MissionId, MissionType};
+use crate::sim::projectile::{ProjectileDetonation, ProjectileTarget};
 use crate::sim::world::{SimSoundEvent, Simulation};
 
 /// The manager constructor's overload check countdown (`+0x4C = 30`).
@@ -140,8 +139,10 @@ impl CaptureManagerState {
 
     /// `IsFull @ 0x004722A0`: a finite manager at its limit. Gates
     /// `ShouldRetaliate` (`0x0070882F`) and `CanAcquireTarget` (`0x00709230`).
-    pub fn is_full(&self) -> bool {
-        !self.infinite && self.count() >= self.max_control
+    /// Phobos replaces the native count with `GetControlledCount`: the sum of
+    /// `MindControlSize=` when `MindControl.IgnoreSize=` is false.
+    pub fn is_full(&self, effective_count: i32) -> bool {
+        !self.infinite && effective_count >= self.max_control
     }
 
     /// `HasAny @ 0x004722C0`.
@@ -149,26 +150,36 @@ impl CaptureManagerState {
         !self.nodes.is_empty()
     }
 
-    /// `GetControlledCount @ 0x004722D0`.
+    /// The raw `ControlNodes` count. Phobos' `GetControlledCount` (`0x004722D0`)
+    /// replacement lives in [`Simulation::capture_effective_count`], which
+    /// sums `MindControlSize=` when `MindControl.IgnoreSize=` is false.
     pub fn count(&self) -> i32 {
         i32::try_from(self.nodes.len()).unwrap_or(i32::MAX)
+    }
+
+    /// `+0x3C MaxControlNodes`, the native display maximum.
+    pub fn max_control(&self) -> i32 {
+        self.max_control
     }
 
     /// `IsOverloading @ 0x004726C0`: no extra pip unless an infinite
     /// manager exceeds its retained capacity. The returned bool is the
     /// native out-parameter (`+0x44 > 0`), which selects the active frame.
     /// The base strip's maximum comes from the current type's weapon;
-    /// this method owns only the manager's overload decision.
-    pub fn overload_pip_state(&self) -> Option<bool> {
-        (self.infinite && self.count() > self.max_control)
+    /// this method owns only the manager's overload decision. Phobos'
+    /// `GetControlledCount` replacement supplies `effective_count`.
+    pub fn overload_pip_state(&self, effective_count: i32) -> Option<bool> {
+        (self.infinite && effective_count > self.max_control)
             .then_some(self.overload_pip_countdown > 0)
     }
 
-    /// CanCapture's capacity gate (`0x00471C90`, gate 8): a finite manager
-    /// below its limit, or one limited to a single victim, which CaptureUnit
-    /// replaces.
-    fn admits_another(&self) -> bool {
-        self.infinite || self.count() < self.max_control || self.max_control == 1
+    /// Phobos `GetControlledTotalSize`: the sum of the live nodes'
+    /// `MindControlSize=`. A missing victim contributes 0, like a null node.
+    #[cfg(feature = "phobos")]
+    pub(crate) fn controlled_total_size(&self, mut size_of: impl FnMut(u64) -> i32) -> i32 {
+        self.nodes.iter().fold(0_i32, |total, node| {
+            total.wrapping_add(size_of(node.victim))
+        })
     }
 
     /// The controlled objects, in node order.
@@ -207,7 +218,7 @@ impl CaptureManagerState {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn with_victims_for_test(max_control: i32, infinite: bool, victims: &[u64]) -> Self {
+    pub fn with_victims_for_test(max_control: i32, infinite: bool, victims: &[u64]) -> Self {
         let mut state = Self::constructed(max_control, infinite);
         state.nodes = victims
             .iter()
@@ -245,9 +256,16 @@ impl CaptureManagerState {
 /// without a second FLH, selection or timer owner. Colors use `owner`'s House.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureLinkCoordinates {
+    /// Stable target identity lets presentation sample this endpoint without
+    /// guessing which overlapping actor supplied the coordinate.
+    pub victim: u64,
     pub from: crate::sim::components::DriveCoord,
     pub to: crate::sim::components::DriveCoord,
     pub owner: InternedId,
+    /// Phobos `MindControlLink.VisibleToHouse=` resolved for the controller
+    /// type; presentation compares it with the local viewer.
+    #[cfg(feature = "phobos")]
+    pub visible_to: crate::rules::phobos_shields::AffectedHouse,
 }
 
 impl Simulation {
@@ -272,6 +290,8 @@ impl Simulation {
             return Vec::new();
         };
         let selected = controller.selection.is_selected();
+        #[cfg(feature = "phobos")]
+        let visible_to = rules.mind_control_link_visible_to_house_for(object);
         // Rendering queries isolate the canonical fallback CellClass.
         self.effective_shared_cell_dummy().detached(|| {
             manager
@@ -283,7 +303,10 @@ impl Simulation {
                     let victim = self.substrate.entities.get(node.victim)?;
                     if !selected
                         && !victim.selection.is_selected()
-                        && node.line_timer.remaining(self.session.binary_frame as i32) <= 0
+                        && node
+                            .line_timer
+                            .remaining(self.session.binary_frame() as i32)
+                            <= 0
                     {
                         return None;
                     }
@@ -301,6 +324,7 @@ impl Simulation {
                     )
                     .coord;
                     Some(CaptureLinkCoordinates {
+                        victim: node.victim,
                         from: crate::sim::components::DriveCoord {
                             x: from.x,
                             y: from.y,
@@ -308,6 +332,8 @@ impl Simulation {
                         },
                         to,
                         owner: controller.owner(),
+                        #[cfg(feature = "phobos")]
+                        visible_to,
                     })
                 })
                 .collect()
@@ -355,6 +381,14 @@ impl std::hash::Hash for MindControlLink {
 }
 
 impl MindControlLink {
+    /// Retail gamemd.exe TechnoClass::Detach710435..71043D clears only the
+    /// matching ring; the controller and permanent-control flag survive.
+    pub(crate) fn anim_pointer_expired(&mut self, animation: AnimId) {
+        if self.ring_anim == Some(animation) {
+            self.ring_anim = None;
+        }
+    }
+
     /// `TechnoClass::IsMindControlled @ 0x007105E0`: a controller (`+0x2C0`)
     /// or the Dominator's permanent control (`+0x2C4`).
     pub fn is_mind_controlled(&self) -> bool {
@@ -376,6 +410,12 @@ impl MindControlLink {
         self.house_controller
     }
 
+    /// Installed Ares KillDriver10045892 clears Techno+2CC explicitly;
+    /// ordinary ChangeOwner deliberately preserves this separate controller.
+    pub(crate) fn clear_house_controller(&mut self) {
+        self.house_controller = None;
+    }
+
     pub(crate) fn house_original_owner(&self) -> Option<InternedId> {
         self.house_original_owner
     }
@@ -387,9 +427,21 @@ impl MindControlLink {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn controlled_by_for_test(controller: u64) -> Self {
+    pub fn controlled_by_for_test(controller: u64) -> Self {
         Self {
             controller: Some(controller),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn controlled_by_house_for_test(
+        controller: InternedId,
+        original: InternedId,
+    ) -> Self {
+        Self {
+            house_controller: Some(controller),
+            house_original_owner: Some(original),
             ..Self::default()
         }
     }
@@ -410,12 +462,15 @@ impl MindControlLink {
 pub(crate) struct CaptureVictimFacts {
     owner: InternedId,
     capturable: bool,
+    /// Phobos `MindControlSize=`; 1 in non-Phobos builds.
+    #[cfg_attr(not(feature = "phobos"), allow(dead_code))]
+    mind_control_size: i32,
 }
 
 impl CaptureVictimFacts {
     /// `frame` evaluates gate 7 (vt+0x160, an active Iron Curtain or Force
-    /// Shield).
-    pub(crate) fn of(target: &GameEntity, target_obj: &ObjectType, frame: u32) -> Self {
+    /// Shield). `ares` is the game's `RuleSet::ares_form`.
+    pub(crate) fn of(target: &GameEntity, target_obj: &ObjectType, frame: u32, ares: bool) -> Self {
         // 3: `ImmuneToPsionics=` (`+0xD35`); 4: a Unit in a tank bunker
         // (`+0x2E4`); 5: already controlled; 6: a trigger transfer (+0x2CC,
         // 471CF0); 7: the Iron Curtain; 9: Selling or Construction.
@@ -428,32 +483,83 @@ impl CaptureVictimFacts {
                 target.invulnerability.as_ref(),
                 frame,
             )
-            // CanCapture's gate 9 (`0x00471D1E..0x00471D2C`).
-            || target.constructing_or_selling();
+            // CanCapture471D1E..471D2C reads raw current +AC for every
+            // Techno. A queued Construction is still capturable until it
+            // commences; GetFireError repeats this gate at discharge.
+            || matches!(
+                target.mission.current().known(),
+                Some(MissionType::Construction | MissionType::Selling)
+            );
+        // Ares CanCapture10048FB8 refuses a killed driver for every consumer.
+        let refused = refused || (ares && target.driver_killed());
+        #[cfg(feature = "phobos")]
+        let mind_control_size = target_obj.mind_control_size;
+        #[cfg(not(feature = "phobos"))]
+        let mind_control_size = 1;
         Self {
             owner: target.owner(),
             capturable: !refused,
+            mind_control_size,
         }
     }
 }
 
-/// CanCapture's manager side: the controller's house and whether its
-/// capacity admits another victim.
+/// CanCapture's manager side: the controller's house and the effective
+/// capacity facts Phobos reads for `MindControl.IgnoreSize=` and
+/// `MultiMindControl.ReleaseVictim=`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CaptureControllerFacts {
     owner: InternedId,
-    admits_another: bool,
+    max_control: i32,
+    #[cfg_attr(not(feature = "phobos"), allow(dead_code))]
+    count: i32,
+    #[cfg_attr(not(feature = "phobos"), allow(dead_code))]
+    total_size: i32,
+    infinite: bool,
+    #[cfg_attr(not(feature = "phobos"), allow(dead_code))]
+    ignore_size: bool,
+    #[cfg_attr(not(feature = "phobos"), allow(dead_code))]
+    release_victim: bool,
 }
 
 impl CaptureControllerFacts {
-    /// `None` without a manager. GetFireError dereferences the manager
-    /// unconditionally for a MindControl warhead (`0x006FCB3B`); a type whose
-    /// weapon 0 is not MindControl but whose other weapon is would crash
-    /// there, which no stock type authors.
-    pub(crate) fn of(controller: &GameEntity) -> Option<Self> {
-        controller.capture_manager.as_ref().map(|manager| Self {
+    /// `None` without a manager or resolvable owner type. GetFireError
+    /// dereferences the manager unconditionally for a MindControl warhead
+    /// (`0x006FCB3B`); a type whose weapon 0 is not MindControl but whose
+    /// other weapon is would crash there, which no stock type authors.
+    pub(crate) fn of(world: &Simulation, controller: &GameEntity, rules: &RuleSet) -> Option<Self> {
+        let manager = controller.capture_manager.as_ref()?;
+        #[cfg(feature = "phobos")]
+        let (ignore_size, release_victim) = {
+            let object = world.object_type(controller.type_ref(), rules)?;
+            (
+                rules.mind_control_ignore_size_for(object),
+                rules.multi_mind_control_release_victim_for(object),
+            )
+        };
+        #[cfg(not(feature = "phobos"))]
+        let (ignore_size, release_victim) = {
+            let _ = (world, rules);
+            (true, false)
+        };
+        // Phobos sums sizes only in CanCapture's finite multi-slot
+        // `IgnoreSize=no` branch.
+        #[cfg(feature = "phobos")]
+        let total_size = if manager.infinite || manager.max_control == 1 || ignore_size {
+            0
+        } else {
+            manager.controlled_total_size(|victim| world.mind_control_size_of(victim, rules))
+        };
+        #[cfg(not(feature = "phobos"))]
+        let total_size = 0;
+        Some(Self {
             owner: controller.owner(),
-            admits_another: manager.admits_another(),
+            max_control: manager.max_control,
+            count: manager.count(),
+            total_size,
+            infinite: manager.infinite,
+            ignore_size,
+            release_victim,
         })
     }
 }
@@ -461,7 +567,37 @@ impl CaptureControllerFacts {
 /// `CaptureManagerClass::CanCapture @ 0x00471C90` (gate 1, a null target, is
 /// the caller's). Allies are not refused: only the controller's own house is.
 pub(crate) fn can_capture(controller: CaptureControllerFacts, victim: CaptureVictimFacts) -> bool {
-    victim.owner != controller.owner && victim.capturable && controller.admits_another
+    victim.owner != controller.owner && victim.capturable && capacity_admits(controller, victim)
+}
+
+/// Phobos `CanCapture`'s capacity gate: `MaxControlNodes <= 0` refuses;
+/// infinite or single-slot managers skip it; otherwise `MindControlSize=`
+/// decides when `IgnoreSize=false`, and node count otherwise.
+#[cfg(feature = "phobos")]
+fn capacity_admits(controller: CaptureControllerFacts, victim: CaptureVictimFacts) -> bool {
+    if controller.max_control <= 0 {
+        return false;
+    }
+    if controller.infinite || controller.max_control == 1 {
+        return true;
+    }
+    if controller.ignore_size {
+        !(controller.count >= controller.max_control && !controller.release_victim)
+    } else {
+        let available = if controller.release_victim {
+            controller.max_control
+        } else {
+            controller.max_control - controller.total_size
+        };
+        victim.mind_control_size <= available
+    }
+}
+
+/// Stock capacity gate: a finite manager below its limit, or one limited to a
+/// single victim, which CaptureUnit replaces.
+#[cfg(not(feature = "phobos"))]
+fn capacity_admits(controller: CaptureControllerFacts, _victim: CaptureVictimFacts) -> bool {
+    controller.infinite || controller.count < controller.max_control || controller.max_control == 1
 }
 
 /// `TechnoClass::Init_Managers @ 0x006F3F40` (`0x006F4090..0x006F40F2`): a
@@ -474,9 +610,10 @@ pub(crate) fn init_capture_manager(
     object_type: &ObjectType,
     rules: &RuleSet,
 ) -> Option<CaptureManagerState> {
-    let (weapon_name, _) = crate::sim::combat::combat_weapon::weapon_for_index(object_type, 0, 0)?;
+    let weapon_name =
+        crate::sim::combat::combat_weapon::weapon_for_index(object_type, 0, 0)?.weapon_id?;
     let weapon = rules.weapon(weapon_name)?;
-    let warhead = rules.warhead(weapon.warhead.as_deref()?)?;
+    let warhead = rules.weapon_warhead(weapon)?;
     warhead
         .mind_control
         .then(|| CaptureManagerState::constructed(weapon.damage, weapon.infinite_mind_control))
@@ -484,7 +621,7 @@ pub(crate) fn init_capture_manager(
 
 impl Simulation {
     /// House50D290 /50D2D0, reached by active TAction123/124 through
-    /// 6E0CA0/6E0D00 (Steam gamemd3e81a617..08600). Walk the current House
+    /// 6E0CA0/6E0D00 (Steam gamemd). Walk the current House
     /// building list backwards; ChangeOwner callbacks mutate that same list.
     /// No health/limbo/type filter and no independent ownership copy.
     pub(crate) fn control_house_buildings(
@@ -501,13 +638,13 @@ impl Simulation {
         let mut count = self
             .houses
             .get(&source)
-            .map_or(0, |house| house.base_projection.buildings().len());
+            .map_or(0, |house| house.base_projection().buildings().len());
         while count != 0 {
             count -= 1;
             let Some(id) = self
                 .houses
                 .get(&source)
-                .and_then(|house| house.base_projection.buildings().get(count))
+                .and_then(|house| house.base_projection().buildings().get(count))
                 .copied()
             else {
                 continue;
@@ -531,14 +668,104 @@ impl Simulation {
         }
     }
 
-    /// CanCapture for the live pair.
-    pub(crate) fn can_capture(&self, controller_id: u64, target_id: u64, rules: &RuleSet) -> bool {
-        let Some(controller) = self
+    /// Phobos `GetControlledTotalSize` for one live victim.
+    #[cfg(feature = "phobos")]
+    fn mind_control_size_of(&self, victim: u64, rules: &RuleSet) -> i32 {
+        self.substrate
+            .entities
+            .get(victim)
+            .and_then(|entity| self.object_type(entity.type_ref(), rules))
+            .map_or(0, |object| object.mind_control_size)
+    }
+
+    /// Phobos `GetControlledCount` (`0x004722D0`): node count unless the
+    /// controller type's `MindControl.IgnoreSize=` is false, then the sum of
+    /// the victims' `MindControlSize=`.
+    #[cfg(feature = "phobos")]
+    pub fn capture_effective_count(&self, controller_id: u64, rules: &RuleSet) -> Option<i32> {
+        let controller = self.substrate.entities.get(controller_id)?;
+        let object = self.object_type(controller.type_ref(), rules)?;
+        let manager = controller.capture_manager.as_ref()?;
+        Some(if rules.mind_control_ignore_size_for(object) {
+            manager.count()
+        } else {
+            manager.controlled_total_size(|victim| self.mind_control_size_of(victim, rules))
+        })
+    }
+
+    /// Non-Phobos builds keep the stock node count for shared callers.
+    #[cfg(not(feature = "phobos"))]
+    pub fn capture_effective_count(&self, controller_id: u64, _rules: &RuleSet) -> Option<i32> {
+        self.substrate
+            .entities
+            .get(controller_id)?
+            .capture_manager
+            .as_deref()
+            .map(CaptureManagerState::count)
+    }
+
+    /// `IsFull`/`CannotControlAnyMore` over the effective count.
+    pub(crate) fn capture_manager_is_full(&self, controller_id: u64, rules: &RuleSet) -> bool {
+        let Some(manager) = self
             .substrate
             .entities
             .get(controller_id)
-            .and_then(CaptureControllerFacts::of)
+            .and_then(|controller| controller.capture_manager.as_ref())
         else {
+            return false;
+        };
+        let count = self
+            .capture_effective_count(controller_id, rules)
+            .unwrap_or_else(|| manager.count());
+        manager.is_full(count)
+    }
+
+    /// Phobos `TechnoExt::ApplyMindControlRangeLimit` (`OnEarlyUpdate`): a
+    /// victim farther than its controller's type's `MindControlRangeLimit=`
+    /// is freed. The distance is `ObjectClass::Distance_To` (`0x005F6440`),
+    /// which has no altitude term.
+    #[cfg(feature = "phobos")]
+    pub(crate) fn apply_mind_control_range_limit(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) {
+        let Some(controller_id) = self
+            .substrate
+            .entities
+            .get(id)
+            .and_then(|victim| victim.mind_control.controller)
+        else {
+            return;
+        };
+        let Some(controller) = self.substrate.entities.get(controller_id) else {
+            return;
+        };
+        let Some(object) = self.object_type(controller.type_ref(), rules) else {
+            return;
+        };
+        let limit = object.mind_control_range_limit;
+        if limit <= 0 {
+            return;
+        }
+        let distance = crate::sim::combat::object_distance_to(
+            controller_id,
+            &crate::sim::combat::TargetKind::Entity(id),
+            self,
+        );
+        if distance.is_some_and(|distance| distance > limit) {
+            self.free_unit(controller_id, id, rules, registry, frame_effects);
+        }
+    }
+
+    /// CanCapture for the live pair.
+    pub(crate) fn can_capture(&self, controller_id: u64, target_id: u64, rules: &RuleSet) -> bool {
+        let Some(controller) = self.substrate.entities.get(controller_id) else {
+            return false;
+        };
+        let Some(controller) = CaptureControllerFacts::of(self, controller, rules) else {
             return false;
         };
         let Some(target) = self.substrate.entities.get(target_id) else {
@@ -549,8 +776,34 @@ impl Simulation {
         };
         can_capture(
             controller,
-            CaptureVictimFacts::of(target, target_obj, self.session.binary_frame),
+            CaptureVictimFacts::of(
+                target,
+                target_obj,
+                self.session.binary_frame(),
+                rules.ares_form(),
+            ),
         )
+    }
+
+    /// The announce=1 that CaptureUnit (`0x00471DAE`) and FreeUnit
+    /// (`0x004720D5`) pass to the target's ChangeOwner (vt+0x3D4). Only
+    /// `BuildingClass::ChangeOwner @ 0x00448260` reads it: radar event 10 and
+    /// `EVA_BuildingCaptured` for the player on either side. Run before the
+    /// owner swap, as that block reads the old owner.
+    fn announce_controlled_building(
+        &mut self,
+        target_id: u64,
+        new_owner: InternedId,
+        rules: &RuleSet,
+    ) {
+        if self
+            .substrate
+            .entities
+            .get(target_id)
+            .is_some_and(|target| target.category() == EntityCategory::Structure)
+        {
+            self.announce_building_capture(target_id, new_owner, rules);
+        }
     }
 
     /// `CaptureManagerClass::CaptureUnit @ 0x00471D40`.
@@ -562,20 +815,127 @@ impl Simulation {
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
+        self.capture_unit_with_ring(
+            controller_id,
+            target_id,
+            None,
+            rules,
+            registry,
+            frame_effects,
+        )
+    }
+
+    /// Phobos `CaptureUnit`'s release-first block
+    /// (`src/Ext/CaptureManager/Body.cpp`): only a finite manager releases.
+    /// A single-slot one replaces its victim; a multi-slot one frees the
+    /// oldest node only with `MultiMindControl.ReleaseVictim=`, and with
+    /// `MindControl.IgnoreSize=no` keeps freeing until the target's
+    /// `MindControlSize=` fits. `false` when the pair cannot be resolved.
+    #[cfg(feature = "phobos")]
+    fn phobos_release_before_capture(
+        &mut self,
+        controller_id: u64,
+        target_id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) -> bool {
+        let Some(controller) = self.substrate.entities.get(controller_id) else {
+            return false;
+        };
+        let (Some(controller_object), Some(manager)) = (
+            self.object_type(controller.type_ref(), rules),
+            controller.capture_manager.as_ref(),
+        ) else {
+            return false;
+        };
+        let ignore_size = rules.mind_control_ignore_size_for(controller_object);
+        let release_victim = rules.multi_mind_control_release_victim_for(controller_object);
+        let (max_control, infinite) = (manager.max_control, manager.infinite);
+        let Some(target_size) = self
+            .substrate
+            .entities
+            .get(target_id)
+            .and_then(|target| self.object_type(target.type_ref(), rules))
+            .map(|object| object.mind_control_size)
+        else {
+            return false;
+        };
+        if infinite {
+            return true;
+        }
+        loop {
+            let Some(manager) = self
+                .substrate
+                .entities
+                .get(controller_id)
+                .and_then(|controller| controller.capture_manager.as_ref())
+            else {
+                break;
+            };
+            let count = manager.count();
+            let Some(first) = manager.nodes.first().map(|node| node.victim) else {
+                break;
+            };
+            let should_release = if max_control == 1 {
+                count == 1
+            } else if !release_victim {
+                false
+            } else if ignore_size {
+                count == max_control
+            } else {
+                let total = manager
+                    .controlled_total_size(|victim| self.mind_control_size_of(victim, rules));
+                target_size > max_control - total
+            };
+            if !should_release
+                || !self.free_unit(controller_id, first, rules, registry, frame_effects)
+            {
+                break;
+            }
+        }
+        true
+    }
+
+    /// [`Self::capture_unit`] with the warhead's `MindControl.Anim` override;
+    /// a missing or unknown name falls back to `ControlledAnimationType=`.
+    pub(crate) fn capture_unit_with_ring(
+        &mut self,
+        controller_id: u64,
+        target_id: u64,
+        ring_anim: Option<&str>,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) -> bool {
         if !self.can_capture(controller_id, target_id, rules) {
             return false;
         }
-        // 0x00471D8A: a single-victim manager releases its victim first.
-        let released: Vec<u64> = self
-            .substrate
-            .entities
-            .get(controller_id)
-            .and_then(|controller| controller.capture_manager.as_ref())
-            .filter(|manager| manager.max_control == 1)
-            .map(|manager| manager.victims().rev().collect())
-            .unwrap_or_default();
-        for victim in released {
-            self.free_unit(controller_id, victim, rules, registry, frame_effects);
+        #[cfg(feature = "phobos")]
+        if !self.phobos_release_before_capture(
+            controller_id,
+            target_id,
+            rules,
+            registry,
+            frame_effects,
+        ) {
+            return false;
+        }
+        // 0x00471D8A: a single-victim manager releases its victim first,
+        // infinite or not.
+        #[cfg(not(feature = "phobos"))]
+        {
+            let released: Vec<u64> = self
+                .substrate
+                .entities
+                .get(controller_id)
+                .and_then(|controller| controller.capture_manager.as_ref())
+                .filter(|manager| manager.max_control == 1)
+                .map(|manager| manager.victims().rev().collect())
+                .unwrap_or_default();
+            for victim in released {
+                self.free_unit(controller_id, victim, rules, registry, frame_effects);
+            }
         }
         let (Some(controller_owner), Some(original_owner)) = (
             self.substrate
@@ -591,6 +951,7 @@ impl Simulation {
         };
         // 0x00471DB8: ChangeOwner(controller's house, 1). It refuses only an
         // unchanged house, which CanCapture already excluded.
+        self.announce_controlled_building(target_id, controller_owner, rules);
         self.change_owner_with_rules(target_id, controller_owner, rules, registry, frame_effects);
         if let Some(manager) = self
             .substrate
@@ -602,7 +963,7 @@ impl Simulation {
                 victim: target_id,
                 original_owner,
                 line_timer: crate::sim::timer::CdTimer::started(
-                    self.session.binary_frame as i32,
+                    self.session.binary_frame() as i32,
                     rules.mind_control.attack_line_frames,
                 ),
             });
@@ -612,7 +973,13 @@ impl Simulation {
         }
         self.reset_captured_orders(target_id, rules, frame_effects);
         self.decide_unit_fate(controller_id, target_id, rules, registry, frame_effects);
-        if let Some(ring) = rules.mind_control.controlled_anim.as_deref() {
+        let ring = ring_anim
+            .filter(|name| {
+                let upper = name.to_ascii_uppercase();
+                rules.anim_type_names.contains(&upper)
+            })
+            .or(rules.mind_control.controlled_anim.as_deref());
+        if let Some(ring) = ring {
             self.attach_control_ring(target_id, ring, rules);
         }
         true
@@ -628,6 +995,10 @@ impl Simulation {
         let Some(object) = self.substrate.entities.get(id) else {
             return false;
         };
+        // Ares CanBePermaMindControlled10049E54 shares the driverless refusal.
+        if rules.ares_form() && object.driver_killed() {
+            return false;
+        }
         if object.category() == EntityCategory::Structure {
             return false;
         }
@@ -637,7 +1008,7 @@ impl Simulation {
         !object_type.immune_to_psionics
             && !crate::sim::superweapon::invulnerability::is_invulnerable(
                 object.invulnerability.as_ref(),
-                self.session.binary_frame,
+                self.session.binary_frame(),
             )
             && !object_type.balloon_hover
             && !crate::sim::movement::air_movement::is_high_flying(
@@ -677,6 +1048,107 @@ impl Simulation {
         }
     }
 
+    /// Ares TechnoExt::ApplyPermaMC (installed 10045E30), the body of a
+    /// `MindControl.Permanent=yes` warhead's applyPermaMC (10052CD0): a type
+    /// that is `ImmuneToPsionics=` or has the rank's `PSIONICSIMMUNE` ability
+    /// refuses. Otherwise, like the Dominator's [`Self::perma_capture`], its
+    /// controller lets it go and it joins `house` with its `+0x2C4` set; then
+    /// it queues Guard (vt+0x1E8 `(Guard, 0)`), the ring it wears is UnInit
+    /// (vt+0xF8) and `PermaControlledAnimationType=` rings it
+    /// (CreateMindControlRingAnim 10043F90 inlined: a building's ring at its
+    /// height with ZAdjust -1024). Buildings are not refused.
+    pub(crate) fn ares_apply_perma_mc(
+        &mut self,
+        id: u64,
+        house: InternedId,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) -> bool {
+        let Some(object) = self.substrate.entities.get(id) else {
+            return false;
+        };
+        let Some(object_type) = self.object_type(object.type_ref(), rules) else {
+            return false;
+        };
+        if object_type.immune_to_psionics
+            || object_type
+                .promotion_abilities()
+                .is_some_and(|abilities| abilities.psionics_immune(object.veterancy.raw()))
+        {
+            return false;
+        }
+        if let Some(controller) = object.mind_control.controller {
+            self.free_unit(controller, id, rules, registry, frame_effects);
+        }
+        self.change_owner_with_rules(id, house, rules, registry, frame_effects);
+        let ring = self.substrate.entities.get_mut(id).and_then(|object| {
+            object.mind_control.permanent = true;
+            crate::sim::mission::authority::queue_entity_mission_deferred(
+                object,
+                MissionId::from_known(MissionType::Guard),
+            );
+            object.mind_control.ring_anim.take()
+        });
+        if let Some(ring) = ring {
+            self.destroy_anim(ring, rules);
+        }
+        if let Some(ring) = rules.mind_control.perma_controlled_anim.as_deref() {
+            self.attach_control_ring(id, ring, rules);
+        }
+        true
+    }
+
+    /// The capture of SW_PsychicDominator's Dominate lambda (Ares 3.0
+    /// `10035FE0`, from the PsyDom_Fire hook 53B080): a controller lets the
+    /// object go (FreeUnit), it joins `house` (SetOwningHouse), its `+0x2C4`
+    /// takes `permanent` (`Dominator.PermanentCapture`), the ring it wears is
+    /// UnInit and `ring` (`Dominator.ControlAnim`, else
+    /// `PermaControlledAnimationType=`) rings it through
+    /// CreateMindControlRingAnim. Unlike ApplyPermaMC it queues nothing.
+    pub(crate) fn ares_dominate(
+        &mut self,
+        id: u64,
+        house: InternedId,
+        permanent: bool,
+        ring: Option<&str>,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) {
+        if let Some(controller) = self
+            .substrate
+            .entities
+            .get(id)
+            .and_then(|object| object.mind_control.controller)
+        {
+            self.free_unit(controller, id, rules, registry, frame_effects);
+        }
+        self.change_owner_with_rules(id, house, rules, registry, frame_effects);
+        let old_ring = self.substrate.entities.get_mut(id).and_then(|object| {
+            object.mind_control.permanent = permanent;
+            object.mind_control.ring_anim.take()
+        });
+        if let Some(old_ring) = old_ring {
+            self.destroy_anim(old_ring, rules);
+        }
+        if let Some(ring) = ring {
+            self.attach_control_ring(id, ring, rules);
+        }
+    }
+
+    /// Installed Ares capture10045C03..10045C1C clears permanent control
+    /// and UnInit's the ring after any controller's FreeUnit has finished.
+    pub(crate) fn clear_permanent_control_and_ring(&mut self, id: u64, rules: &RuleSet) {
+        let ring = self.substrate.entities.get_mut(id).and_then(|object| {
+            object.mind_control.permanent = false;
+            object.mind_control.ring_anim.take()
+        });
+        if let Some(ring) = ring {
+            self.destroy_anim(ring, rules);
+        }
+    }
+
     /// The MindControl arm of `BulletClass::DetonateAtCoord` (`0x0046920B..
     /// 0x0046933E`): no firer or no manager ends it; otherwise the firer's
     /// manager captures the bullet's own target (a cell or none fails), and a
@@ -684,49 +1156,149 @@ impl Simulation {
     /// house or the target's house before the capture passes
     /// `HouseClass::IsHumanPlayer @ 0x0050B6F0` (the local player in skirmish;
     /// the app resolves it from the two houses on the event).
-    /// RESIDUAL: the two object-tag events raised before the attempt (6 and
-    /// 0x2C, `0x0046929D`/`0x004692B8`) need object Tag attachment, which VERA
-    /// does not have.
+    /// An alive Object target raises attached-object events 6 and 44 before
+    /// the capture attempt (`0x0046929D`/`0x004692B8`). Their synchronous
+    /// actions can change the Tag, bullet source/target and capture admission.
     pub(crate) fn mind_control_detonation(
         &mut self,
-        firer_id: u64,
-        target: Option<u64>,
+        detonation: ProjectileDetonation,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) {
-        let Some(firer) = self.substrate.entities.get(firer_id) else {
+        let initial = self.projectiles.current_detonation(detonation);
+        let Some(firer) = self.substrate.entities.get(initial.source_id) else {
             return;
         };
         if firer.capture_manager.is_none() {
             return;
         }
-        let firer_owner = firer.owner();
-        let Some(target_id) = target else {
+        // 469249 casts to Object, not Techno. Terrain can raise the events
+        // even though CaptureUnit's later Techno cast rejects it.
+        let (actor, target_owner) = match initial.target {
+            ProjectileTarget::Entity(id) => self
+                .substrate
+                .entities
+                .get(id)
+                .map_or((None, None), |target| {
+                    (Some((id, target.is_object_alive())), Some(target.owner()))
+                }),
+            ProjectileTarget::Terrain(id) => (
+                self.terrain_objects
+                    .objects()
+                    .get(&id)
+                    .map(|target| (id, target.object_alive())),
+                None,
+            ),
+            ProjectileTarget::Cell { .. }
+            | ProjectileTarget::DummyCell
+            | ProjectileTarget::None => (None, None),
+        };
+        // 46927A reads Object+90, not HP. EDI retains this original actor;
+        // neither a changed bullet target nor an Alive reread replaces it.
+        if let Some((actor, true)) = actor {
+            let context =
+                crate::sim::world::UninitContext::new(rules, registry).with_effects(frame_effects);
+            if self.dispatch_object_tag_event(
+                actor,
+                6,
+                Some(actor),
+                Some(initial.source_id),
+                context,
+            ) {
+                // 4692A2 rereads Bullet+B0 after event 6. PointerExpired
+                // may have cleared it; the dispatcher also rereads the Tag.
+                let current = self.projectiles.current_detonation(detonation);
+                self.dispatch_object_tag_event(
+                    actor,
+                    44,
+                    Some(actor),
+                    (current.source_id != crate::sim::combat::RAD_NO_ATTACKER)
+                        .then_some(current.source_id),
+                    context,
+                );
+            }
+        }
+        // 4692BD..4692D0 rereads source, target and the source's manager.
+        // CaptureUnit owns all Techno admission; no HP/Alive filter belongs
+        // here. A non-Techno target fails its cast before CanCapture.
+        let current = self.projectiles.current_detonation(detonation);
+        let ProjectileTarget::Entity(target_id) = current.target else {
             return;
         };
-        let Some(target_owner) = self
-            .substrate
-            .entities
-            .get(target_id)
-            .map(GameEntity::owner)
-        else {
-            return;
-        };
-        if !self.capture_unit(firer_id, target_id, rules, registry, frame_effects) {
+        // Phobos `BulletClass_Detonate` uses
+        // `pWHExt->MindControl_Anim.Get(ControlledAnimationType)`.
+        #[cfg(feature = "phobos")]
+        let ring_anim = self
+            .interner
+            .warhead_type(current.payload.warhead, rules)
+            .and_then(|warhead| warhead.mind_control_anim.as_deref());
+        #[cfg(not(feature = "phobos"))]
+        let ring_anim: Option<&str> = None;
+        if !self.capture_unit_with_ring(
+            current.source_id,
+            target_id,
+            ring_anim,
+            rules,
+            registry,
+            frame_effects,
+        ) {
             return;
         }
         let Some(sound) = rules.mind_control.mind_control_sound.clone() else {
             return;
         };
-        if let Some(target) = self.substrate.entities.get(target_id) {
-            let event = SimSoundEvent::voc_at_for(
-                sound,
-                Some([firer_owner, target_owner]),
-                &target.position,
-            );
-            self.sound_events.push(event);
-        }
+        // 4692F0 rereads the bullet source after CaptureUnit's callbacks.
+        // The target-house candidate was saved before either Tag call;
+        // 46930D still takes Location from the original Object in EDI.
+        let current = self.projectiles.current_detonation(detonation);
+        let Some(firer_owner) = self
+            .substrate
+            .entities
+            .get(current.source_id)
+            .map(GameEntity::owner)
+        else {
+            return;
+        };
+        let location = match initial.target {
+            ProjectileTarget::Entity(id) => self.substrate.entities.get(id).map(|target| {
+                let location = crate::sim::movement::ground_pose::object_location(
+                    target,
+                    self.resolved_terrain.as_ref(),
+                );
+                AnimWorldCoord {
+                    x: location.x,
+                    y: location.y,
+                    z: location.z,
+                }
+            }),
+            ProjectileTarget::Terrain(id) => {
+                self.terrain_objects.objects().get(&id).map(|target| {
+                    let location = target.world_coord();
+                    AnimWorldCoord {
+                        x: location.x,
+                        y: location.y,
+                        z: location.z,
+                    }
+                })
+            }
+            ProjectileTarget::Cell { .. }
+            | ProjectileTarget::DummyCell
+            | ProjectileTarget::None => None,
+        };
+        let Some(location) = location else {
+            return;
+        };
+        let (rx, ry, sub_x, sub_y, _) = location.to_cell_sub_z();
+        self.sound_events.emit(SimSoundEvent::VocAt {
+            sound_id: sound,
+            audible_to: Some([firer_owner, target_owner.unwrap_or(firer_owner)]),
+            rx,
+            ry,
+            sub_x,
+            sub_y,
+            world_z_leptons: location.z,
+        });
     }
 
     /// Gate `0x00471E55..0x00471E9F`, then `vt+0x3D0` at471EA5: unless a Simple Deployer
@@ -812,13 +1384,16 @@ impl Simulation {
             target.mind_control.ring_anim = Some(anim_id);
         }
         if building {
-            self.set_anim_z_adjust(anim_id, BUILDING_RING_Z_ADJUST);
+            self.substrate
+                .set_anim_z_adjust(anim_id, BUILDING_RING_Z_ADJUST);
         }
     }
 
     /// Unit UpdateDisguise's attached-ring tail746A9C..746B19. Read the
     /// capture owner's existing +2C8 link and the shared House50B6F0 predicate;
     /// neither allocation nor controller/owner identity changes here.
+    /// In a network game House50B6F0 is each client's own PlayerPtr test, so
+    /// a disguised unit's ring is hidden per viewer: only its owner sees it.
     pub(crate) fn update_disguise_ring_visibility(&mut self, id: u64) {
         let Some(entity) = self.substrate.entities.get(id) else {
             return;
@@ -826,9 +1401,15 @@ impl Simulation {
         let Some(ring) = entity.mind_control.ring_anim else {
             return;
         };
-        let hidden = entity.disguise.as_ref().is_some_and(|d| d.is_disguised())
-            && !self.house_is_human_player(entity.owner());
-        self.set_anim_hidden(ring, hidden);
+        let owner = entity.owner();
+        let disguised = entity.disguise.as_ref().is_some_and(|d| d.is_disguised());
+        if disguised && self.session.game_mode().is_network() {
+            self.substrate
+                .set_anim_viewer_hidden(ring, vec![(owner, false)], true);
+            return;
+        }
+        let hidden = disguised && !self.house_is_human_player(owner);
+        self.substrate.set_anim_hidden(ring, hidden);
     }
 
     /// `CaptureManagerClass::FreeUnit @ 0x00471FF0`: every node of `victim`,
@@ -875,9 +1456,11 @@ impl Simulation {
                     .or_else(|| rules.mind_control.mind_cleared_sound.clone());
                 if let Some(sound) = sound {
                     let event = SimSoundEvent::voc_at(sound, &victim.position);
-                    self.sound_events.push(event);
+                    self.sound_events.emit(event);
                 }
             }
+            // 0x004720D5..0x004720DA: ChangeOwner(original house, 1).
+            self.announce_controlled_building(victim_id, original_owner, rules);
             self.change_owner_with_rules(victim_id, original_owner, rules, registry, frame_effects);
             // DecideUnitFate runs while `+0x2C0` still names the controller.
             // Back with its own house, the unit cannot join the controller's
@@ -944,10 +1527,16 @@ impl Simulation {
         };
         let unit_is_foot = unit.category() != EntityCategory::Structure;
         if unit_is_foot {
-            self.leave_team(unit_id, false, Some(rules), frame_effects);
+            self.leave_team(unit_id, false, rules, frame_effects);
         }
         // 0x004723E4..0x004723F3: a unit holding a Temporal target lets go.
-        self.temporal_release_if_warping(unit_id);
+        Self::temporal_release_if_warping(
+            &mut self.substrate,
+            &mut self.houses,
+            &mut self.power_states,
+            unit_id,
+            rules.ares_form(),
+        );
         let Some(unit) = self.substrate.entities.get(unit_id) else {
             return;
         };
@@ -966,8 +1555,22 @@ impl Simulation {
         if self
             .houses
             .get(&unit_owner)
-            .is_none_or(|house| house.is_human)
+            .is_none_or(|house| house.is_human())
         {
+            return;
+        }
+        // Ares 3.0 CaptureManagerClass_DecideUnitFate_BuildingFate
+        // (1005C680, hook 0x47243F): a building queues Guard, with no roll;
+        // the other fates do nothing for a building.
+        if rules.ares_form() && !unit_is_foot {
+            let now = self.session.binary_frame();
+            let _ = self.mission_queue_exact(
+                unit_id,
+                MissionId::from_known(MissionType::Guard),
+                0,
+                now,
+                &crate::sim::mission::authority::LiveReadyInputProvider { rules },
+            );
             return;
         }
         let Some(controller_owner) = self
@@ -1027,7 +1630,7 @@ impl Simulation {
         {
             return;
         }
-        let now = self.session.binary_frame;
+        let now = self.session.binary_frame();
         let readiness = crate::sim::mission::authority::LiveReadyInputProvider { rules };
         let _ = self.mission_queue_exact(
             unit_id,
@@ -1051,7 +1654,7 @@ impl Simulation {
         rules: &RuleSet,
     ) -> CaptureReason {
         let mind_control = &rules.mind_control;
-        if crate::sim::credit_income::available_money(self, controller_owner)
+        if crate::sim::credit_income::available_money(&self.houses, controller_owner)
             < mind_control.ai_capture_low_money_mark
         {
             return CaptureReason::LowMoney;
@@ -1093,15 +1696,28 @@ impl Simulation {
         frame_effects: FrameEffects<'_>,
     ) {
         let table = &rules.mind_control;
+        // Only an infinite manager overloads; checking it before the
+        // effective-count lookup keeps finite managers off the size scan.
+        let Some(infinite) = self
+            .substrate
+            .entities
+            .get(controller_id)
+            .and_then(|controller| controller.capture_manager.as_ref())
+            .map(|manager| manager.infinite)
+        else {
+            return;
+        };
+        if !infinite {
+            return;
+        }
+        // Phobos `GetControlledCount`: size-aware when IgnoreSize=false.
+        let effective_count = self.capture_effective_count(controller_id, rules);
         let Some(entity) = self.substrate.entities.get_mut(controller_id) else {
             return;
         };
         let Some(manager) = entity.capture_manager.as_mut() else {
             return;
         };
-        if !manager.infinite {
-            return;
-        }
         // `0x00471A64..0x00471A6C`: this precedes the overload-check
         // countdown's early return, so the pip also expires on quiet visits.
         if manager.overload_pip_countdown > 0 {
@@ -1116,7 +1732,7 @@ impl Simulation {
         let Some(&first) = table.overload_count.first() else {
             return;
         };
-        let count = manager.count();
+        let count = effective_count.unwrap_or_else(|| manager.count());
         let mut index = 0;
         if count > first {
             while index + 1 < table.overload_count.len() {
@@ -1157,7 +1773,7 @@ impl Simulation {
         if !sound_played {
             if let Some(sound) = rules.mind_control.overload_sound.clone() {
                 self.sound_events
-                    .push(SimSoundEvent::voc_at(sound, &position));
+                    .emit(SimSoundEvent::voc_at(sound, &position));
             }
             if let Some(manager) = self
                 .substrate
@@ -1215,8 +1831,7 @@ impl Simulation {
                 .entities
                 .get_mut(controller_id)
                 .expect("live overload controller remains represented")
-                .rocking
-                .get_or_insert_with(Default::default)
+                .rocking_mut()
                 .set_vel_sideways_native(velocity);
         }
     }
@@ -1241,6 +1856,6 @@ fn capture_decision(table: &[i32], roll: i32) -> Option<u8> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 #[path = "capture_manager_tests.rs"]
 mod tests;

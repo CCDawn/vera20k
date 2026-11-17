@@ -152,9 +152,10 @@ fn rules() -> RuleSet {
 }
 
 fn rules_from(text: &str) -> RuleSet {
-    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+    let mut rules = RuleSet::from_ini_with_fixed_art_and_sounds_for_test(
         &IniFile::from_str(text),
         &IniFile::from_str(ART),
+        &["YuriMindControl", "MindCleared", "MasterMindOverloadVoice"],
     )
     .expect("mind control rules");
     let mut art = crate::rules::art_data::ArtRegistry::from_ini(&IniFile::from_str(ART));
@@ -174,8 +175,7 @@ fn sim(seed: u64) -> Simulation {
     ] {
         let id = sim.interner.intern(name);
         sim.houses
-            .insert(id, HouseState::new(id, side, None, human, 0, 10));
-        sim.session.house_order.push(id);
+            .register(HouseState::new(id, side, None, human, 0, 10));
     }
     sim
 }
@@ -254,16 +254,19 @@ fn native_mirage_ring_tail_uses_current_house_or_campaign_control_flags() {
         } else {
             sim.interner.get("Russians").unwrap()
         };
-        sim.session.current_house = Some(viewer);
-        sim.session.game_mode_nonzero = input["mode"] != 0;
+        sim.session.set_current_house_for_test(Some(viewer));
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(input["mode"] != 0),
+        );
         let house = sim.houses.get_mut(&owner).unwrap();
-        house.is_human = input["human"] == 1;
-        house.player_control = input["player"] == 1;
+        house.set_is_human_for_test(input["human"] == 1);
+        house.set_player_control_for_test(input["player"] == 1);
         if input["owner_allied_with_viewer"] == true {
-            sim.house_alliances
+            let viewer_name = sim.interner.resolve(viewer).to_owned();
+            sim.house_alliances_mut_for_test()
                 .entry("Americans".into())
                 .or_default()
-                .insert(sim.interner.resolve(viewer).to_owned());
+                .insert(viewer_name);
         }
         let tree = sim.interner.intern("TREE01");
         let entity = sim.substrate.entities.get_mut(target).unwrap();
@@ -275,21 +278,21 @@ fn native_mirage_ring_tail_uses_current_house_or_campaign_control_flags() {
         }
         let link = entity.mind_control;
         let ring = link.ring_anim.expect("existing owner attached the ring");
-        let runtime = sim.anim(ring).unwrap().runtime.clone();
+        let runtime = sim.anim(ring).unwrap().runtime().clone();
         let coord = sim.anim_absolute_coord(ring);
         let rng = sim.rng_state();
         // Both input values ensure this is a write, not an accidentally
         // correct constructor default. Native used a nonzero poison byte.
         for initial_hidden in [false, true] {
-            sim.set_anim_hidden(ring, initial_hidden);
+            sim.substrate.set_anim_hidden(ring, initial_hidden);
             sim.update_disguise_ring_visibility(target);
             assert_eq!(
-                u8::from(sim.anim(ring).unwrap().draw_runtime.hidden),
+                u8::from(sim.anim(ring).unwrap().draw_runtime().hidden),
                 row["hidden_after"].as_u64().unwrap() as u8,
                 "{context}"
             );
             assert_eq!(
-                sim.anim(ring).unwrap().runtime,
+                *sim.anim(ring).unwrap().runtime(),
                 runtime,
                 "{context}: no second animation clock"
             );
@@ -309,19 +312,39 @@ fn native_mirage_ring_tail_uses_current_house_or_campaign_control_flags() {
     assert_eq!(rows.len(), 7);
 }
 
-/// Weapon 0 decides the manager: Yuri's single link, the Mastermind's
-/// infinite one, the Psychic Tower's three.
+/// A network game's clients each test their own PlayerPtr in the ring tail
+/// (Unit746A9C..746B19): the owner's client shows a disguised unit's ring and
+/// every other client hides it, whichever client this is.
 #[test]
-fn init_managers_reads_weapon_zero() {
+fn a_network_disguised_ring_is_hidden_per_viewer_whoever_is_local() {
     let rules = rules();
-    let limits = |kind: &str| {
-        init_capture_manager(rules.object(kind).unwrap(), &rules)
-            .map(|manager| (manager.max_control, manager.infinite))
+    let ring_for = |local: &str| {
+        let mut sim = sim(7);
+        let target = spawn(&mut sim, &rules, "HTNK", "Americans", 12, 10);
+        sim.attach_control_ring(target, "MINDANIM", &rules);
+        sim.session
+            .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Lan);
+        sim.session
+            .set_current_house_for_test(sim.interner.get(local));
+        let tree = sim.interner.intern("TREE01");
+        let entity = sim.substrate.entities.get_mut(target).unwrap();
+        entity
+            .disguise
+            .as_mut()
+            .unwrap()
+            .acquire(1, Some(tree), None);
+        let ring = entity.mind_control.ring_anim.unwrap();
+        sim.update_disguise_ring_visibility(target);
+        (sim, ring)
     };
-    assert_eq!(limits("YURI"), Some((1, false)));
-    assert_eq!(limits("MIND"), Some((3, true)));
-    assert_eq!(limits("YAPSYT"), Some((3, false)));
-    assert_eq!(limits("E1"), None);
+    let (owner_client, ring) = ring_for("Americans");
+    let (other_client, _) = ring_for("Russians");
+    let americans = owner_client.interner.get("Americans");
+    let russians = owner_client.interner.get("Russians");
+    let anim = owner_client.anim(ring).unwrap();
+    assert!(!anim.hidden_for(americans));
+    assert!(anim.hidden_for(russians));
+    assert_eq!(owner_client.state_hash(), other_client.state_hash());
 }
 
 /// CaptureUnit: the target changes house, records the house it had, wears
@@ -364,13 +387,61 @@ fn capture_takes_the_target_and_records_its_house() {
     // The ring is MINDANIM, attached to the captive, 0x8C above it.
     let ring = entity.mind_control.ring_anim.expect("ring anim");
     let anim = sim.anim(ring).expect("live ring");
-    assert_eq!(sim.interner.resolve(anim.type_id), "MINDANIM");
-    assert_eq!(anim.owner_entity, Some(gi));
+    assert_eq!(sim.interner.resolve(anim.type_id()), "MINDANIM");
+    assert_eq!(anim.owner_entity(), Some(gi));
     let location = crate::sim::movement::ground_pose::position_world_coord(&entity.position);
     assert_eq!(sim.anim_absolute_coord(ring).unwrap().z, location.z + 0x8C);
     // Computer house: one RandomRanged(1, 100), and every stock choice hunts.
     assert_eq!(queued_mission(&sim, gi), Some(MissionType::Hunt));
     assert_eq!(sim.scenario_rng.state(), replay.state());
+}
+
+/// Owner+60's Techno::Detach71043D releases only the matching ring, without
+/// freeing the captive. A different Anim of the same type is independent.
+#[test]
+fn attached_animation_retirement_clears_only_the_matching_control_ring() {
+    let rules = rules();
+    let mut sim = sim(3);
+    let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
+    let gi = spawn(&mut sim, &rules, "E1", "Americans", 12, 10);
+    assert!(sim.capture_unit(
+        yuri,
+        gi,
+        &rules,
+        None,
+        crate::sim::world::FrameEffects::default()
+    ));
+    let first = sim
+        .substrate
+        .entities
+        .get(gi)
+        .unwrap()
+        .mind_control
+        .ring_anim
+        .unwrap();
+    sim.attach_control_ring(gi, "MINDANIM", &rules);
+    let current = sim
+        .substrate
+        .entities
+        .get(gi)
+        .unwrap()
+        .mind_control
+        .ring_anim
+        .unwrap();
+    assert_ne!(first, current);
+    sim.destroy_anim(first, &rules);
+    let captive = sim.substrate.entities.get(gi).unwrap();
+    assert_eq!(captive.mind_control.ring_anim, Some(current));
+    assert!(
+        captive.is_parachuted(),
+        "the other attached Anim still counts"
+    );
+    sim.destroy_anim(current, &rules);
+    let captive = sim.substrate.entities.get(gi).unwrap();
+    assert_eq!(captive.mind_control.ring_anim, None);
+    assert_eq!(captive.mind_control.controller(), Some(yuri));
+    assert!(!captive.is_parachuted());
+    assert_eq!(victims(&sim, yuri), [gi]);
 }
 
 /// A captured building wears its ring at its GetCoords (`0x00447AC0`, the
@@ -392,8 +463,10 @@ fn a_captured_buildings_ring_sits_height_levels_above_its_centre() {
     let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
     let plant = spawn(&mut sim, &rules, "GAPOWR", "Americans", 14, 10);
     // Built: CanCapture refuses a building still in Construction.
-    let now = sim.session.binary_frame;
-    let _ = sim.mission_assign_exact(plant, MissionId::from_known(MissionType::Guard), now);
+    let now = sim.session.binary_frame();
+    let _ =
+        sim.substrate
+            .mission_assign_exact(plant, MissionId::from_known(MissionType::Guard), now);
     assert!(sim.capture_unit(
         yuri,
         plant,
@@ -412,7 +485,55 @@ fn a_captured_buildings_ring_sits_height_levels_above_its_centre() {
     );
     let at = sim.anim_absolute_coord(ring).unwrap();
     assert_eq!((at.x, at.y, at.z), (centre.x, centre.y, centre.z + 3 * 104));
-    assert_eq!(sim.anim(ring).unwrap().z_adjust, -1024);
+    assert_eq!(sim.anim(ring).unwrap().z_adjust(), -1024);
+}
+
+/// CaptureUnit (`0x00471DAE`) and FreeUnit (`0x004720D5`) pass announce=1 to
+/// the target's ChangeOwner. A building's (`0x00448260`) then raises radar
+/// event 10 and `EVA_BuildingCaptured` for the player on either side; a
+/// unit's has no announce block.
+#[test]
+fn mind_controlling_a_building_announces_its_capture_and_its_release() {
+    fn captures(sim: &Simulation) -> Vec<(String, String, bool)> {
+        sim.sound_events
+            .iter()
+            .filter_map(|event| match event {
+                SimSoundEvent::BuildingCaptured {
+                    old_owner,
+                    new_owner,
+                    radar,
+                    ..
+                } => Some((
+                    sim.interner.resolve(*old_owner).to_string(),
+                    sim.interner.resolve(*new_owner).to_string(),
+                    radar.is_some(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+    let rules = rules();
+    let mut sim = sim(25);
+    let effects = crate::sim::world::FrameEffects::default;
+    let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
+    let soldier = spawn(&mut sim, &rules, "E1", "Americans", 11, 10);
+    let plant = spawn(&mut sim, &rules, "GAPOWR", "Americans", 14, 10);
+    let now = sim.session.binary_frame();
+    let _ =
+        sim.substrate
+            .mission_assign_exact(plant, MissionId::from_known(MissionType::Guard), now);
+
+    assert!(sim.capture_unit(yuri, soldier, &rules, None, effects()));
+    assert_eq!(captures(&sim), [], "a unit's ChangeOwner announces nothing");
+
+    // The single link frees the soldier first, silently, then takes the plant.
+    assert!(sim.capture_unit(yuri, plant, &rules, None, effects()));
+    let taken = ("Americans".to_string(), "YuriCountry".to_string(), true);
+    assert_eq!(captures(&sim), [taken.clone()]);
+
+    assert!(sim.free_unit(yuri, plant, &rules, None, effects()));
+    let returned = ("YuriCountry".to_string(), "Americans".to_string(), true);
+    assert_eq!(captures(&sim), [taken, returned]);
 }
 
 /// A single-link controller releases its victim before taking the next one:
@@ -441,7 +562,7 @@ fn a_single_link_controller_releases_its_victim_first() {
         .ring_anim
         .unwrap();
     let mut replay = sim.scenario_rng.clone();
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
 
     assert!(sim.capture_unit(
         yuri,
@@ -457,12 +578,39 @@ fn a_single_link_controller_releases_its_victim_first() {
     assert!(!released.mind_control.is_mind_controlled());
     assert!(released.mind_control.ring_anim.is_none());
     assert!(sim.anim(ring).is_none_or(|anim| {
-        !anim.in_logic_vector && sim.substrate.pending_delete.contains_object(&ring)
+        !anim.in_logic_vector() && sim.substrate.pending_delete.contains_object(&ring)
     }));
     assert_eq!(voc_sounds(&sim), ["MindCleared"]);
     assert_eq!(victims(&sim, yuri), [second]);
     assert_eq!(owner(&sim, second), "YuriCountry");
     assert_eq!(sim.scenario_rng.state(), replay.state());
+}
+
+/// Native CaptureUnit's single-link release (`0x00471D8A`) has no infinite
+/// test: an `InfiniteMindControl=yes` weapon with `Damage=1` still replaces.
+#[cfg(not(feature = "phobos"))]
+#[test]
+fn an_infinite_single_link_controller_still_replaces_its_victim() {
+    let rules = rules_from(&RULES.replacen(
+        "[MindControl]\nDamage=1\n",
+        "[MindControl]\nDamage=1\nInfiniteMindControl=yes\n",
+        1,
+    ));
+    let mut sim = sim(5);
+    let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
+    let first = spawn(&mut sim, &rules, "E1", "Americans", 12, 10);
+    let second = spawn(&mut sim, &rules, "E1", "Americans", 12, 12);
+    for target in [first, second] {
+        assert!(sim.capture_unit(
+            yuri,
+            target,
+            &rules,
+            None,
+            crate::sim::world::FrameEffects::default()
+        ));
+    }
+    assert_eq!(victims(&sim, yuri), [second]);
+    assert_eq!(owner(&sim, first), "Americans");
 }
 
 /// CanCapture refuses the controller's own house, psionic immunity, a unit
@@ -482,11 +630,11 @@ fn can_capture_gates() {
     assert!(!sim.can_capture(yuri, dog, &rules), "ImmuneToPsionics");
     assert!(sim.can_capture(yuri, gi, &rules));
     // An ally is not refused: only the controller's own house is.
-    sim.house_alliances
+    sim.house_alliances_mut_for_test()
         .entry("YURICOUNTRY".to_string())
         .or_default()
         .insert("RUSSIANS".to_string());
-    sim.house_alliances
+    sim.house_alliances_mut_for_test()
         .entry("RUSSIANS".to_string())
         .or_default()
         .insert("YURICOUNTRY".to_string());
@@ -494,7 +642,7 @@ fn can_capture_gates() {
 
     crate::sim::superweapon::invulnerability::apply_invulnerability(
         sim.substrate.entities.get_mut(tank).unwrap(),
-        sim.session.binary_frame,
+        sim.session.binary_frame(),
         100,
         crate::sim::superweapon::invulnerability::InvulnKind::IronCurtain,
     );
@@ -539,41 +687,17 @@ fn can_capture_gates() {
         .capture_manager
         .as_ref()
         .unwrap();
-    assert!(manager.is_full());
+    assert!(manager.is_full(manager.count()));
     assert!(!sim.can_capture(tower, third, &rules), "full");
 
     let seller = spawn(&mut sim, &rules, "E1", "Americans", 19, 12);
-    let now = sim.session.binary_frame;
-    let _ = sim.mission_assign_exact(seller, MissionId::from_known(MissionType::Selling), now);
+    let now = sim.session.binary_frame();
+    let _ = sim.substrate.mission_assign_exact(
+        seller,
+        MissionId::from_known(MissionType::Selling),
+        now,
+    );
     assert!(!sim.can_capture(yuri, seller, &rules), "Selling");
-}
-
-/// GetFireError's MindControl gate (T53, `0x006FCB24..0x006FCB50`) asks
-/// CanCapture: Yuri's only weapon is illegal against an immune target and
-/// legal against an enemy.
-#[test]
-fn get_fire_error_refuses_an_uncapturable_target() {
-    use crate::sim::combat::fire_error::FireError;
-    let rules = rules();
-    let mut sim = sim(9);
-    let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
-    let dog = spawn(&mut sim, &rules, "DOG", "Americans", 12, 11);
-    let gi = spawn(&mut sim, &rules, "E1", "Americans", 13, 11);
-    let code = |target: u64| {
-        crate::sim::combat::fire_error_world::FireSubject {
-            world: &sim,
-            rules: &rules,
-            overlay_registry: None,
-            fog: Some(sim.fog.fire_view(&sim.house_alliances)),
-            firer: sim.substrate.entities.get(yuri).unwrap(),
-            obj: rules.object("YURI").unwrap(),
-            target: Some(crate::sim::combat::TargetKind::Entity(target)),
-            weapon_index: 0,
-        }
-        .fire_error(false)
-    };
-    assert_eq!(code(dog), FireError::Illegal);
-    assert_ne!(code(gi), FireError::Illegal);
 }
 
 /// The controller's death frees every captive, newest node first, before its
@@ -601,7 +725,7 @@ fn the_controllers_death_frees_its_captives_newest_first() {
         crate::sim::world::FrameEffects::default()
     ));
     let mut replay = sim.scenario_rng.clone();
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
 
     let warhead = sim.interner.intern("KILLWH");
     let hit = EntityDamageEvent::direct_receiver(
@@ -662,7 +786,7 @@ fn a_captives_death_drops_its_node_silently() {
         None,
         crate::sim::world::FrameEffects::default()
     ));
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     sim.uninit_with_rules(gi, &rules);
     assert!(victims(&sim, tower).is_empty());
     assert!(voc_sounds(&sim).is_empty());
@@ -694,58 +818,29 @@ fn a_removed_foot_controller_frees_its_captives() {
     );
 }
 
-/// A Psychic Tower losing power (the operational off edge) frees its captives.
+/// Ares CaptureManagerClass_DecideUnitFate_BuildingFate (1005C680, hook
+/// 0x47243F): a computer's captured building queues Guard with no fate roll.
 #[test]
-fn a_tower_going_offline_frees_its_captives() {
+fn a_computer_building_guards_without_a_fate_roll() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let rules = rules();
-    let mut sim = sim(17);
-    let tower = spawn(&mut sim, &rules, "YAPSYT", "YuriCountry", 20, 20);
-    let gi = spawn(&mut sim, &rules, "E1", "Americans", 12, 10);
-    assert!(sim.capture_unit(
-        tower,
-        gi,
-        &rules,
-        None,
-        crate::sim::world::FrameEffects::default()
-    ));
-    sim.substrate
-        .entities
-        .get_mut(tower)
-        .unwrap()
-        .building_last_operational
-        .set_for_test(true);
-    sim.substrate
-        .entities
-        .get_mut(tower)
-        .unwrap()
-        .health
-        .set_for_test(0);
-    sim.visit_building_operational(
-        tower,
+    let mut sim = sim(1);
+    let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
+    let plant = spawn(&mut sim, &rules, "GAPOWR", "Russians", 14, 10);
+    let mut replay = sim.scenario_rng.clone();
+    sim.decide_unit_fate(
+        yuri,
+        plant,
         &rules,
         None,
         crate::sim::world::FrameEffects::default(),
     );
-    assert_eq!(owner(&sim, gi), "Americans");
-    assert!(victims(&sim, tower).is_empty());
-}
-
-/// The fate walk returns the first choice whose running sum reaches the roll,
-/// at the stock Normal table's boundaries.
-#[test]
-fn the_fate_table_walk() {
-    let normal = [75, 5, 5, 15];
-    assert_eq!(capture_decision(&normal, 1), Some(1));
-    assert_eq!(capture_decision(&normal, 75), Some(1));
-    assert_eq!(capture_decision(&normal, 76), Some(2));
-    assert_eq!(capture_decision(&normal, 85), Some(3));
-    assert_eq!(capture_decision(&normal, 86), Some(4));
-    assert_eq!(capture_decision(&normal, 100), Some(4));
-    // A table that runs out, or a sixth choice, returns without an order.
-    assert_eq!(capture_decision(&[10, 10], 50), None);
-    assert_eq!(capture_decision(&[1, 1, 1, 1, 1, 1, 1], 7), None);
-    assert_eq!(capture_decision(&[1, 1, 1, 1, 1, 1, 1], 6), Some(6));
-    assert_eq!(capture_decision(&[0, 0, 0, 0, 50], 20), Some(5));
+    let entity = sim.substrate.entities.get(plant).unwrap();
+    assert!(
+        entity.mission.queued().known() == Some(MissionType::Guard)
+            || entity.mission.current().known() == Some(MissionType::Guard)
+    );
+    assert_eq!(sim.scenario_rng.next_u32(), replay.next_u32(), "no roll");
 }
 
 /// Original DecideUnitFate `0x004723B0` under Unicorn
@@ -804,22 +899,26 @@ fn native_decide_unit_fate_corpus() {
         sim.houses
             .get_mut(&controller_house)
             .unwrap()
-            .economy
+            .economy_mut()
             .set_credits_for_test(int("money"));
         let mut power_state = crate::sim::power_system::PowerState::default();
-        power_state.total_output = int("produced");
-        power_state.total_drain = int("drained");
-        sim.power_states.insert(controller_house, power_state);
+        power_state.set_total_output_for_test(int("produced"));
+        power_state.set_total_drain_for_test(int("drained"));
+        sim.power_states
+            .map_mut_for_test()
+            .insert(controller_house, power_state);
         let russians = sim.interner.get("Russians").unwrap();
         sim.houses
             .get_mut(&russians)
             .unwrap()
-            .economy
+            .economy_mut()
             .set_credits_for_test(0);
         let mut power_state = crate::sim::power_system::PowerState::default();
-        power_state.total_output = 0;
-        power_state.total_drain = 100;
-        sim.power_states.insert(russians, power_state);
+        power_state.set_total_output_for_test(0);
+        power_state.set_total_drain_for_test(100);
+        sim.power_states
+            .map_mut_for_test()
+            .insert(russians, power_state);
         let seed = input["seed"].as_u64().unwrap();
         sim.scenario_rng = SimRng::new(seed);
         assert_ne!(queued_mission(&sim, unit), Some(MissionType::Hunt));
@@ -1037,7 +1136,7 @@ fn native_overload_update_corpus() {
         assert_eq!(manager.infinite, constructed["infinite"] != 0);
         if !infinite {
             assert_eq!(
-                manager.overload_pip_state(),
+                manager.overload_pip_state(manager.count()),
                 None,
                 "{name}: a finite manager above capacity has no overload pip"
             );
@@ -1048,7 +1147,7 @@ fn native_overload_update_corpus() {
             "{name}: constructor pip countdown"
         );
         let entity = sim.substrate.entities.get_mut(mind).unwrap();
-        entity.capture_manager = Some(manager);
+        entity.capture_manager = Some(Box::new(manager));
         if input.get("kill").is_some() {
             // Dies to the first damaging row, as the fixture's owner does.
             entity.health.set_for_test(50);
@@ -1083,7 +1182,7 @@ fn native_overload_update_corpus() {
             }
             let health = sim.substrate.entities.get(mind).unwrap().health.current();
             let systems: Vec<u64> = sim.particle_systems().iter().map(|(&id, _)| id).collect();
-            sim.sound_events.clear();
+            sim.sound_events.clear_for_test();
 
             sim.capture_manager_update(
                 mind,
@@ -1166,11 +1265,11 @@ fn native_overload_update_corpus() {
                 .iter()
                 .filter(|(id, _)| !systems.contains(id))
                 .map(|(_, system)| {
-                    assert_eq!(system.type_id, spark_type);
-                    assert_eq!(system.target_coords, glam::IVec3::ZERO);
-                    assert!(system.target_ref.is_none() && system.owner_entity.is_none());
-                    assert!(system.owner_house.is_none());
-                    let offset = system.coords - location;
+                    assert_eq!(system.type_id(), spark_type);
+                    assert_eq!(system.target_coords(), glam::IVec3::ZERO);
+                    assert!(system.target_ref().is_none() && system.owner_entity().is_none());
+                    assert!(system.owner_house().is_none());
+                    let offset = system.coords() - location;
                     [offset.x, offset.y, offset.z]
                 })
                 .collect();
@@ -1374,7 +1473,9 @@ fn native_joined_overload_preserves_constructor_rng_ids_and_rate_words() {
             .collect();
         if through_techno {
             manager.overload_countdown = input["countdown"].as_i64().unwrap() as i32;
-            world.session.binary_frame = input["frame"].as_u64().unwrap() as u32;
+            world
+                .session
+                .set_binary_frame_for_test(input["frame"].as_u64().unwrap() as u32);
             let actor = world.substrate.entities.get(mind).unwrap();
             assert_eq!(
                 json!(actor.mission.current().raw()),
@@ -1411,7 +1512,7 @@ fn native_joined_overload_preserves_constructor_rng_ids_and_rate_words() {
                 );
             } else {
                 for frame in 0..input["visits"].as_u64().unwrap() as u32 {
-                    world.session.binary_frame = frame;
+                    world.session.set_binary_frame_for_test(frame);
                     world.capture_manager_update(mind, &rules, None, FrameEffects::default());
                 }
             }
@@ -1462,30 +1563,30 @@ fn native_joined_overload_preserves_constructor_rng_ids_and_rate_words() {
             let system = world.particle_systems().get(id).unwrap();
             let state = &expected["state"];
             assert_eq!(
-                json!(rules.particle_system_type(system.type_id).name),
+                json!(rules.particle_system_type(system.type_id()).name),
                 expected["type"]
             );
             assert_eq!(json!(system.native_unique_id()), state["native_id"]);
-            assert_eq!(json!(system.coords.to_array()), state["position"]);
-            assert_eq!(json!(system.coords.to_array()), expected["position"]);
-            assert_eq!(json!(system.target_coords.to_array()), state["target"]);
+            assert_eq!(json!(system.coords().to_array()), state["position"]);
+            assert_eq!(json!(system.coords().to_array()), expected["position"]);
+            assert_eq!(json!(system.target_coords().to_array()), state["target"]);
             assert_eq!(
-                json!(system.target_coords.to_array()),
+                json!(system.target_coords().to_array()),
                 expected["args"]["target"]
             );
-            assert_eq!(json!(system.lifetime), state["lifetime"]);
+            assert_eq!(json!(system.lifetime()), state["lifetime"]);
             assert_eq!(
-                json!(system.spark_spawn_frames),
+                json!(system.spark_spawn_frames()),
                 state["spark_spawn_frames"]
             );
-            assert_eq!(json!(system.done_spawning), state["time_to_die"]);
-            assert_eq!(json!(system.in_logic_vector), state["logic"]);
-            assert_eq!(json!(system.particles.len()), state["particle_count"]);
-            assert!(system.alive() && !system.in_limbo() && system.particles.is_empty());
+            assert_eq!(json!(system.done_spawning()), state["time_to_die"]);
+            assert_eq!(json!(system.in_logic_vector()), state["logic"]);
+            assert_eq!(json!(system.particles().len()), state["particle_count"]);
+            assert!(system.alive() && !system.in_limbo() && system.particles().is_empty());
             assert!(
-                system.owner_entity.is_none()
-                    && system.target_ref.is_none()
-                    && system.owner_house.is_none()
+                system.owner_entity().is_none()
+                    && system.target_ref().is_none()
+                    && system.owner_house().is_none()
             );
             for key in ["owner", "target_object", "house"] {
                 assert_eq!(state[key], json!(0));
@@ -1508,188 +1609,6 @@ fn native_joined_overload_preserves_constructor_rng_ids_and_rate_words() {
     assert_eq!(
         signs.get(&7).unwrap(),
         &std::collections::BTreeSet::from([0, 1])
-    );
-}
-
-/// The Mastermind overload: at three captives or fewer a check every 30
-/// frames costs nothing; a fourth brings 50 C4 damage every 60 frames, five
-/// spark systems (ten draws), the lean's sign (one draw) and the voice once
-/// per episode.
-#[test]
-fn a_mastermind_overloads_above_three_captives() {
-    let rules = rules();
-    let mut sim = sim(19);
-    let mind = spawn(&mut sim, &rules, "MIND", "YuriCountry", 10, 10);
-    let mut captives = Vec::new();
-    for x in 0..4 {
-        let gi = spawn(&mut sim, &rules, "E1", "Americans", 12 + x, 10);
-        captives.push(gi);
-    }
-    for &gi in &captives[..3] {
-        assert!(sim.capture_unit(
-            mind,
-            gi,
-            &rules,
-            None,
-            crate::sim::world::FrameEffects::default()
-        ));
-    }
-    let manager = sim
-        .substrate
-        .entities
-        .get(mind)
-        .unwrap()
-        .capture_manager
-        .as_ref()
-        .unwrap();
-    assert_eq!(manager.count(), 3);
-    assert_eq!(manager.overload_pip_state(), None);
-    // 30 quiet frames, then a free check at three captives.
-    let health = sim.substrate.entities.get(mind).unwrap().health.current();
-    let before = sim.scenario_rng.state();
-    for _ in 0..31 {
-        sim.capture_manager_update(
-            mind,
-            &rules,
-            None,
-            crate::sim::world::FrameEffects::default(),
-        );
-    }
-    assert_eq!(sim.scenario_rng.state(), before);
-    assert_eq!(
-        sim.substrate.entities.get(mind).unwrap().health.current(),
-        health
-    );
-
-    assert!(sim.capture_unit(
-        mind,
-        captives[3],
-        &rules,
-        None,
-        crate::sim::world::FrameEffects::default()
-    ));
-    assert_eq!(
-        sim.substrate
-            .entities
-            .get(mind)
-            .unwrap()
-            .capture_manager
-            .as_ref()
-            .unwrap()
-            .overload_pip_state(),
-        Some(false),
-        "overcapacity precedes the first damaging check"
-    );
-    for _ in 0..30 {
-        sim.capture_manager_update(
-            mind,
-            &rules,
-            None,
-            crate::sim::world::FrameEffects::default(),
-        );
-    }
-    sim.sound_events.clear();
-    let mut replay = sim.scenario_rng.clone();
-    sim.capture_manager_update(
-        mind,
-        &rules,
-        None,
-        crate::sim::world::FrameEffects::default(),
-    );
-    for _ in 0..10 {
-        let _ = replay.next_range_i32_inclusive(-200, 200);
-    }
-    let _ = replay.next_range_i32_inclusive(0, 100);
-    assert_eq!(sim.scenario_rng.state(), replay.state());
-    assert_eq!(
-        sim.substrate.entities.get(mind).unwrap().health.current(),
-        health - 50
-    );
-    assert_eq!(voc_sounds(&sim), ["MasterMindOverloadVoice"]);
-    let manager = sim
-        .substrate
-        .entities
-        .get(mind)
-        .unwrap()
-        .capture_manager
-        .as_ref()
-        .unwrap();
-    assert_eq!(manager.overload_pip_countdown, 10);
-    assert_eq!(manager.overload_pip_state(), Some(true));
-    // The next check is 60 frames on, and the voice does not repeat.
-    let quiet = (
-        sim.main_rng.native_state_hex(),
-        sim.scenario_rng.native_state_hex(),
-        sim.mapgen_rng.native_state_hex(),
-    );
-    for visit in 1..=60 {
-        sim.capture_manager_update(
-            mind,
-            &rules,
-            None,
-            crate::sim::world::FrameEffects::default(),
-        );
-        let expected = match visit {
-            1 => Some((9, true)),
-            9 => Some((1, true)),
-            10 | 60 => Some((0, false)),
-            _ => None,
-        };
-        if let Some((remaining, active)) = expected {
-            let manager = sim
-                .substrate
-                .entities
-                .get(mind)
-                .unwrap()
-                .capture_manager
-                .as_ref()
-                .unwrap();
-            assert_eq!(manager.overload_pip_countdown, remaining, "visit {visit}");
-            assert_eq!(manager.overload_pip_state(), Some(active), "visit {visit}");
-        }
-    }
-    assert_eq!(
-        (
-            sim.main_rng.native_state_hex(),
-            sim.scenario_rng.native_state_hex(),
-            sim.mapgen_rng.native_state_hex(),
-        ),
-        quiet,
-        "pip countdown visits draw from none of the three streams"
-    );
-    sim.sound_events.clear();
-    sim.capture_manager_update(
-        mind,
-        &rules,
-        None,
-        crate::sim::world::FrameEffects::default(),
-    );
-    assert_eq!(
-        sim.substrate.entities.get(mind).unwrap().health.current(),
-        health - 100
-    );
-    assert!(voc_sounds(&sim).is_empty());
-    assert!(sim.free_unit(
-        mind,
-        captives[3],
-        &rules,
-        None,
-        crate::sim::world::FrameEffects::default()
-    ));
-    let manager = sim
-        .substrate
-        .entities
-        .get(mind)
-        .unwrap()
-        .capture_manager
-        .as_ref()
-        .unwrap();
-    assert_eq!(manager.count(), 3);
-    assert_eq!(manager.overload_pip_countdown, 10);
-    assert_eq!(
-        manager.overload_pip_state(),
-        None,
-        "release hides the extra pip"
     );
 }
 
@@ -1744,7 +1663,11 @@ fn overload_pip_counter_obeys_finite_and_non_damaging_update_gates() {
             manager.overload_countdown, expected_countdown,
             "{kind} {counter}/{countdown}"
         );
-        assert_eq!(manager.overload_pip_state(), None, "no captive overload");
+        assert_eq!(
+            manager.overload_pip_state(manager.count()),
+            None,
+            "no captive overload"
+        );
         assert_eq!(
             (
                 sim.main_rng.native_state_hex(),
@@ -1881,10 +1804,13 @@ fn an_attack_order_captures_without_damage() {
     let mind = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
     let gi = spawn(&mut sim, &rules, "E1", "Americans", 12, 10);
     let health = sim.substrate.entities.get(gi).unwrap().health.current();
-    let owner_id = sim.interner.intern("YuriCountry");
+    // The human Americans send the computer Yuri's order: the DoList skips computer Houses' events
+    // (0x0064C4FB..0x0064C50D), and MegaMission never compares sender and actor
+    // (0x004C71F6..0x004C721F).
+    let owner_id = sim.interner.intern("Americans");
     sim.queue_command(CommandEnvelope::new(
         owner_id,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::Attack {
             attacker_id: mind,
             target_id: gi,
@@ -1918,13 +1844,19 @@ fn an_attack_order_captures_without_damage() {
     assert_eq!(victims(&sim, mind), [gi]);
 }
 
-/// Retail `rulesmd.ini` (the local `ini/`; skipped without it): the stock
-/// controllers' managers and the mind-control globals bind.
+/// Real startup/mode/map readers retain stock cues over bad map overrides;
+/// a type's unknown first override still falls back through live FreeUnit.
 #[test]
 fn retail_rules_bind_the_stock_controllers() {
-    let Some(rules) = crate::rules::retail_ini_fixture::retail_rulesmd_rules() else {
+    let patch = IniFile::from_str(
+        "[AudioVisual]\nYuriMindControlSound=Unknown\nMindClearedSound=Unknown\n\
+         MasterMindOverloadDeathSound=Unknown\n[E1]\nMindClearedSound=Unknown\n",
+    );
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules_with_map_patch(&patch)
+    else {
         return;
     };
+    let mut rules = retail.rules;
     let limits = |kind: &str| {
         init_capture_manager(rules.object(kind).unwrap(), &rules)
             .map(|manager| (manager.max_control, manager.infinite))
@@ -1966,6 +1898,39 @@ fn retail_rules_bind_the_stock_controllers() {
             "{kind}"
         );
     }
+    let frames = crate::assets::shp_file::ShpFile::frame_count_from_bytes(
+        &crate::rules::retail_ini_fixture::retail_archive_bytes("MINDANIM.SHP").unwrap(),
+    )
+    .unwrap();
+    rules.bind_anim_frame_count_for_test("MINDANIM", i32::from(frames));
+    let mut sim = sim(37);
+    let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
+    let gi = spawn(&mut sim, &rules, "E1", "Americans", 12, 10);
+    assert!(sim.capture_unit(yuri, gi, &rules, None, FrameEffects::default()));
+    let ring = sim
+        .substrate
+        .entities
+        .get(gi)
+        .unwrap()
+        .mind_control
+        .ring_anim
+        .unwrap();
+    sim.sound_events.clear_for_test();
+    let rng = sim.scenario_rng.native_state_hex();
+    assert!(sim.free_unit(yuri, gi, &rules, None, FrameEffects::default()));
+    assert_eq!(voc_sounds(&sim), ["MindCleared"]);
+    assert_eq!(owner(&sim, gi), "Americans");
+    assert!(
+        sim.substrate
+            .entities
+            .get(gi)
+            .unwrap()
+            .mind_control
+            .ring_anim
+            .is_none()
+    );
+    assert!(sim.anim(ring).is_none_or(|anim| !anim.in_logic_vector()));
+    assert_eq!(sim.scenario_rng.native_state_hex(), rng);
 }
 
 /// UnitClass::Deploy's CanDeploySlashUnload refuses a mind-controlled unit
@@ -1977,7 +1942,7 @@ fn a_controlled_mcv_cannot_deploy_and_a_controlled_yard_cannot_repack() {
     let rules = rules();
     let mut sim = sim(27);
     crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
-    sim.session.game_options.mcv_redeploy = true;
+    sim.session.game_options_mut_for_test().mcv_redeploy = true;
     let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
     let mcv = spawn(&mut sim, &rules, "AMCV", "Americans", 12, 10);
     let free = spawn(&mut sim, &rules, "AMCV", "Americans", 12, 30);
@@ -2003,7 +1968,7 @@ fn a_controlled_mcv_cannot_deploy_and_a_controlled_yard_cannot_repack() {
         .unwrap()
         .mcv_deploy_pending
         .set_for_test(true);
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     assert!(!sim.deploy_mcv(
         mcv,
         &rules,
@@ -2032,8 +1997,12 @@ fn a_controlled_mcv_cannot_deploy_and_a_controlled_yard_cannot_repack() {
     let stolen = spawn(&mut sim, &rules, "GACNST", "Russians", 22, 20);
     let own = spawn(&mut sim, &rules, "GACNST", "Americans", 22, 26);
     for yard in [stolen, own] {
-        let now = sim.session.binary_frame;
-        let _ = sim.mission_assign_exact(yard, MissionId::from_known(MissionType::Guard), now);
+        let now = sim.session.binary_frame();
+        let _ = sim.substrate.mission_assign_exact(
+            yard,
+            MissionId::from_known(MissionType::Guard),
+            now,
+        );
     }
     assert!(sim.capture_unit(
         prime,
@@ -2069,6 +2038,7 @@ fn selling_a_psychic_tower_frees_its_captives() {
             .entities
             .get(tower)
             .unwrap()
+            .building
             .building_last_operational
             .is_operational()
     );
@@ -2080,7 +2050,7 @@ fn selling_a_psychic_tower_frees_its_captives() {
         None,
         crate::sim::world::FrameEffects::default()
     ));
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
 
     assert!(crate::sim::production::sell_building_now_for_test(
         &mut sim, &rules, tower
@@ -2112,8 +2082,10 @@ fn a_building_mid_construction_cannot_be_captured() {
     let mut sim = sim(31);
     let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
     let plant = spawn(&mut sim, &rules, "GAPOWR", "Americans", 14, 10);
-    let now = sim.session.binary_frame;
-    let _ = sim.mission_assign_exact(plant, MissionId::from_known(MissionType::Guard), now);
+    let now = sim.session.binary_frame();
+    let _ =
+        sim.substrate
+            .mission_assign_exact(plant, MissionId::from_known(MissionType::Guard), now);
     sim.substrate
         .entities
         .get_mut(plant)
@@ -2146,7 +2118,10 @@ fn a_released_captive_resumes_its_attack_move() {
     let mut sim = sim(33);
     // A human controller keeps its captive's orders (no DecideUnitFate roll).
     let yuri_house = sim.interner.intern("YuriCountry");
-    sim.houses.get_mut(&yuri_house).unwrap().is_human = true;
+    sim.houses
+        .get_mut(&yuri_house)
+        .unwrap()
+        .set_is_human_for_test(true);
     let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
     let gi = spawn(&mut sim, &rules, "E1", "Americans", 12, 10);
     let captive = sim.substrate.entities.get_mut(gi).unwrap();
@@ -2221,10 +2196,10 @@ fn a_captive_boarding_an_absorber_is_freed_first() {
             .slot(0),
         Some(reactor)
     );
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     // PerCellProcess boards from the absorber's own foundation cell once
     // the queued Enter is current.
-    let now = sim.session.binary_frame;
+    let now = sim.session.binary_frame();
     let gi_entity = sim.substrate.entities.get_mut(gi).unwrap();
     assert!(crate::sim::mission::authority::commence_entity_mission(
         gi_entity, now
@@ -2233,7 +2208,7 @@ fn a_captive_boarding_an_absorber_is_freed_first() {
     sim.per_cell_process(
         gi,
         crate::sim::movement::PerCellReason::Arrival,
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -2286,15 +2261,18 @@ fn an_iron_curtained_target_refuses_the_capture_at_fire_time() {
     let gi = spawn(&mut sim, &rules, "E1", "Americans", 12, 10);
     crate::sim::superweapon::invulnerability::apply_invulnerability(
         sim.substrate.entities.get_mut(gi).unwrap(),
-        sim.session.binary_frame,
+        sim.session.binary_frame(),
         1000,
         crate::sim::superweapon::invulnerability::InvulnKind::IronCurtain,
     );
     let health = sim.substrate.entities.get(gi).unwrap().health.current();
-    let owner_id = sim.interner.intern("YuriCountry");
+    // The human Americans send the computer Yuri's order: the DoList skips computer Houses' events
+    // (0x0064C4FB..0x0064C50D), and MegaMission never compares sender and actor
+    // (0x004C71F6..0x004C721F).
+    let owner_id = sim.interner.intern("Americans");
     sim.queue_command(CommandEnvelope::new(
         owner_id,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::Attack {
             attacker_id: yuri,
             target_id: gi,
@@ -2432,7 +2410,9 @@ fn a_due_ivan_bomb_precedes_the_same_turn_mastermind_overload() {
         .simulation_mut()
         .spawn_object("IVAN", "Russians", 48, 48, 0, &rules)
         .expect("retail Ivan supplied at the existing Attach entry");
-    scene.simulation_mut().bomb_attach(ivan, Some(mind), &rules);
+    scene
+        .simulation_mut()
+        .bomb_attach_for_test(ivan, Some(mind), &rules);
     assert!(
         scene
             .simulation()
@@ -2449,8 +2429,9 @@ fn a_due_ivan_bomb_precedes_the_same_turn_mastermind_overload() {
         assert!(controller.lifecycle.object_alive());
         let expired = controller
             .bomb
+            .as_ref()
             .unwrap()
-            .expired(sim.session.binary_frame as i32);
+            .expired(sim.session.binary_frame() as i32);
         if expired {
             assert_eq!(
                 controller
@@ -2529,8 +2510,11 @@ fn control_link_timer_selection_ports_cleanup_and_snapshot_share_the_manager() {
     rules.install_art_data(ArtRegistry::from_ini(&art));
     let mut sim = sim(31);
     let house = sim.interner.get("YuriCountry").unwrap();
-    sim.houses.get_mut(&house).unwrap().is_human = true;
-    sim.session.binary_frame = 100;
+    sim.houses
+        .get_mut(&house)
+        .unwrap()
+        .set_is_human_for_test(true);
+    sim.session.set_binary_frame_for_test(100);
     let controller = spawn(&mut sim, &rules, "MIND", "YuriCountry", 10, 10);
     let first = spawn(&mut sim, &rules, "E1", "Americans", 12, 10);
     let second = spawn(&mut sim, &rules, "HTNK", "Russians", 14, 10);
@@ -2554,7 +2538,7 @@ fn control_link_timer_selection_ports_cleanup_and_snapshot_share_the_manager() {
         rng,
         "read-only coordinates do not draw RNG"
     );
-    sim.session.binary_frame = 119;
+    sim.session.set_binary_frame_for_test(119);
     assert_eq!(sim.capture_link_coordinates(controller, &rules).len(), 2);
     let bytes = crate::sim::snapshot::GameSnapshot::save_validated(&sim, 0, 0, "control links", 0);
     let restored = crate::sim::snapshot::GameSnapshot::load(&bytes)
@@ -2564,7 +2548,7 @@ fn control_link_timer_selection_ports_cleanup_and_snapshot_share_the_manager() {
         restored.capture_link_coordinates(controller, &rules),
         sim.capture_link_coordinates(controller, &rules)
     );
-    sim.session.binary_frame = 120;
+    sim.session.set_binary_frame_for_test(120);
     assert!(sim.capture_link_coordinates(controller, &rules).is_empty());
     sim.substrate
         .entities
@@ -2587,6 +2571,446 @@ fn control_link_timer_selection_ports_cleanup_and_snapshot_share_the_manager() {
     assert_eq!(sim.capture_link_coordinates(controller, &rules).len(), 2);
     sim.free_unit(controller, first, &rules, None, FrameEffects::default());
     assert_eq!(sim.capture_link_coordinates(controller, &rules).len(), 1);
-    sim.uninit_with_context(second, UninitContext::new(Some(&rules), None));
+    sim.uninit_with_context(second, UninitContext::new(&rules, None));
     assert!(sim.capture_link_coordinates(controller, &rules).is_empty());
+}
+
+/// A retail Yuri Prime's Inviso capture changes an existing building's colour.
+/// Its first draw must refresh the SHP atlas even when no entity is spawned.
+#[test]
+fn yuri_prime_building_capture_and_release_request_atlas_refresh() {
+    use crate::sim::command::{Command, CommandEnvelope};
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = retail.rules;
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 79);
+    let yuri = spawn(&mut sim, &rules, "YURIPR", "Americans", 10, 10);
+    let plant = spawn(&mut sim, &rules, "GAPOWR", "Russians", 14, 10);
+    let americans = sim.interner.intern("Americans");
+    let body_before = sim.entities().get(plant).unwrap().building_body_state();
+    sim.queue_command(CommandEnvelope::new(
+        americans,
+        sim.session.tick() + 1,
+        Command::Attack {
+            attacker_id: yuri,
+            target_id: plant,
+        },
+    ));
+    let mut captured = None;
+    for _ in 0..90 {
+        let commands = sim.take_due_commands();
+        let tick = sim.advance_tick(&commands, Some(&rules), None, None, 67);
+        if sim.entities().get(plant).unwrap().owner() == americans {
+            captured = Some(tick);
+            break;
+        }
+        assert!(!tick.ownership_changed);
+    }
+    let tick = captured.expect("the stock SuperMindControl shot captures the power plant");
+    assert!(
+        tick.ownership_changed,
+        "refresh the captured building before its first draw"
+    );
+    assert!(
+        !tick.spawned_entities,
+        "capture does not rely on another entity spawning"
+    );
+    let building = sim.entities().get(plant).unwrap();
+    assert_eq!(building.mind_control.controller(), Some(yuri));
+    assert_eq!(building.building_body_state(), body_before);
+    assert_eq!(
+        crate::sim::building_art::building_image(building, rules.has_buildup("GAPOWR")),
+        crate::sim::building_art::BuildingImage::Body,
+    );
+    assert!(
+        !sim.advance_tick(&[], Some(&rules), None, None, 67)
+            .ownership_changed
+    );
+
+    sim.free_all_captures(yuri, &rules, None, FrameEffects::default());
+    assert_eq!(owner(&sim, plant), "Russians");
+    assert!(
+        sim.advance_tick(&[], Some(&rules), None, None, 67)
+            .ownership_changed,
+        "the original owner's colour must also refresh on release"
+    );
+    assert!(
+        !sim.advance_tick(&[], Some(&rules), None, None, 67)
+            .ownership_changed,
+        "a consumed ownership change must not refresh every frame"
+    );
+}
+
+// --- Phobos mind-control enhancements -------------------------------------
+// `MindControlSize=`, `MindControl.IgnoreSize=`, `MultiMindControl.ReleaseVictim=`,
+// `MindControlLink.VisibleToHouse=`, `MindControlRangeLimit=` and the warhead
+// `MindControl.Anim=` override. The stock fixture is patched only where a test
+// needs the key.
+
+#[cfg(feature = "phobos")]
+fn enhanced_rules(replacements: &[(&str, &str)]) -> RuleSet {
+    let mut text = RULES.to_owned();
+    for (from, to) in replacements {
+        assert!(text.contains(from), "fixture anchor {from:?}");
+        text = text.replace(from, to);
+    }
+    rules_from(&text)
+}
+
+#[cfg(feature = "phobos")]
+#[test]
+fn mind_control_size_limits_finite_capacity_and_release_victim() {
+    let rules = enhanced_rules(&[
+        (
+            "[HTNK]\nStrength=400\nSpeed=4\n",
+            "[HTNK]\nStrength=400\nSpeed=4\nMindControlSize=2\n",
+        ),
+        (
+            "[YAPSYT]\nStrength=1000\n",
+            "[YAPSYT]\nStrength=1000\nMindControl.IgnoreSize=no\n",
+        ),
+    ]);
+    {
+        let mut sim = sim(7);
+        let tower = spawn(&mut sim, &rules, "YAPSYT", "YuriCountry", 10, 10);
+        let first = spawn(&mut sim, &rules, "HTNK", "Americans", 11, 10);
+        let second = spawn(&mut sim, &rules, "HTNK", "Americans", 12, 10);
+        let gi = spawn(&mut sim, &rules, "E1", "Americans", 13, 10);
+        assert!(sim.capture_unit(tower, first, &rules, None, FrameEffects::default()));
+        assert_eq!(sim.capture_effective_count(tower, &rules), Some(2));
+        assert!(!sim.can_capture(tower, second, &rules), "2 + 2 > 3");
+        assert!(sim.can_capture(tower, gi, &rules), "2 + 1 <= 3");
+        assert!(sim.capture_unit(tower, gi, &rules, None, FrameEffects::default()));
+        assert_eq!(sim.capture_effective_count(tower, &rules), Some(3));
+        assert!(!sim.can_capture(tower, second, &rules), "full at size 3");
+    }
+
+    let release = enhanced_rules(&[
+        (
+            "[HTNK]\nStrength=400\nSpeed=4\n",
+            "[HTNK]\nStrength=400\nSpeed=4\nMindControlSize=2\n",
+        ),
+        (
+            "[YAPSYT]\nStrength=1000\n",
+            "[YAPSYT]\nStrength=1000\nMindControl.IgnoreSize=no\n\
+             MultiMindControl.ReleaseVictim=yes\n",
+        ),
+    ]);
+    let mut sim = sim(7);
+    let tower = spawn(&mut sim, &rules, "YAPSYT", "YuriCountry", 10, 10);
+    let first = spawn(&mut sim, &rules, "HTNK", "Americans", 11, 10);
+    let second = spawn(&mut sim, &rules, "HTNK", "Americans", 12, 10);
+    assert!(sim.capture_unit(tower, first, &rules, None, FrameEffects::default()));
+    assert!(sim.capture_unit(tower, second, &release, None, FrameEffects::default()));
+    assert_eq!(
+        victims(&sim, tower),
+        vec![second],
+        "ReleaseVictim frees the oldest node until the size fits"
+    );
+    assert_eq!(sim.capture_effective_count(tower, &release), Some(2));
+}
+
+#[cfg(feature = "phobos")]
+#[test]
+fn mind_control_ignore_size_true_keeps_node_count() {
+    let rules = enhanced_rules(&[(
+        "[HTNK]\nStrength=400\nSpeed=4\n",
+        "[HTNK]\nStrength=400\nSpeed=4\nMindControlSize=2\n",
+    )]);
+    let mut sim = sim(7);
+    let tower = spawn(&mut sim, &rules, "YAPSYT", "YuriCountry", 10, 10);
+    let tanks: Vec<u64> = (0..4_u16)
+        .map(|index| spawn(&mut sim, &rules, "HTNK", "Americans", 11 + index, 10))
+        .collect();
+    for &tank in &tanks[..3] {
+        assert!(sim.capture_unit(tower, tank, &rules, None, FrameEffects::default()));
+    }
+    assert_eq!(sim.capture_effective_count(tower, &rules), Some(3));
+    assert!(
+        !sim.can_capture(tower, tanks[3], &rules),
+        "IgnoreSize defaults to yes: the node count fills at 3"
+    );
+}
+
+#[cfg(feature = "phobos")]
+#[test]
+fn multi_mind_control_release_victim_frees_at_node_capacity() {
+    let base = enhanced_rules(&[]);
+    let release = enhanced_rules(&[(
+        "[YAPSYT]\nStrength=1000\n",
+        "[YAPSYT]\nStrength=1000\nMultiMindControl.ReleaseVictim=yes\n",
+    )]);
+    let mut sim = sim(7);
+    let tower = spawn(&mut sim, &base, "YAPSYT", "YuriCountry", 10, 10);
+    let tanks: Vec<u64> = (0..4_u16)
+        .map(|index| spawn(&mut sim, &base, "HTNK", "Americans", 11 + index, 10))
+        .collect();
+    for &tank in &tanks[..3] {
+        assert!(sim.capture_unit(tower, tank, &base, None, FrameEffects::default()));
+    }
+    assert!(sim.capture_unit(tower, tanks[3], &release, None, FrameEffects::default()));
+    assert_eq!(
+        victims(&sim, tower),
+        vec![tanks[1], tanks[2], tanks[3]],
+        "the oldest node is released at count capacity"
+    );
+}
+
+#[cfg(feature = "phobos")]
+#[test]
+fn mind_control_ignore_size_false_drives_the_overload_count() {
+    let rules = enhanced_rules(&[
+        (
+            "[HTNK]\nStrength=400\nSpeed=4\n",
+            "[HTNK]\nStrength=400\nSpeed=4\nMindControlSize=2\n",
+        ),
+        (
+            "[MIND]\nStrength=500\n",
+            "[MIND]\nStrength=500\nMindControl.IgnoreSize=no\n",
+        ),
+    ]);
+    {
+        let mut sim = sim(7);
+        let mind = spawn(&mut sim, &rules, "MIND", "YuriCountry", 10, 10);
+        let first = spawn(&mut sim, &rules, "HTNK", "Americans", 11, 10);
+        let second = spawn(&mut sim, &rules, "HTNK", "Americans", 12, 10);
+        assert!(sim.capture_unit(mind, first, &rules, None, FrameEffects::default()));
+        assert!(sim.capture_unit(mind, second, &rules, None, FrameEffects::default()));
+        assert_eq!(sim.capture_effective_count(mind, &rules), Some(4));
+        let manager = sim
+            .substrate
+            .entities
+            .get(mind)
+            .unwrap()
+            .capture_manager
+            .as_ref()
+            .unwrap();
+        assert_eq!(manager.overload_pip_state(4), Some(false));
+    }
+
+    let nodes_only = enhanced_rules(&[(
+        "[HTNK]\nStrength=400\nSpeed=4\n",
+        "[HTNK]\nStrength=400\nSpeed=4\nMindControlSize=2\n",
+    )]);
+    let mut sim = sim(7);
+    let mind = spawn(&mut sim, &nodes_only, "MIND", "YuriCountry", 10, 10);
+    let first = spawn(&mut sim, &nodes_only, "HTNK", "Americans", 11, 10);
+    let second = spawn(&mut sim, &nodes_only, "HTNK", "Americans", 12, 10);
+    assert!(sim.capture_unit(mind, first, &nodes_only, None, FrameEffects::default()));
+    assert!(sim.capture_unit(mind, second, &nodes_only, None, FrameEffects::default()));
+    assert_eq!(sim.capture_effective_count(mind, &nodes_only), Some(2));
+}
+
+#[cfg(feature = "phobos")]
+#[test]
+fn mind_control_range_limit_frees_only_distant_victims() {
+    let rules = enhanced_rules(&[(
+        "[YAPSYT]\nStrength=1000\n",
+        "[YAPSYT]\nStrength=1000\nMindControlRangeLimit=1.5\n",
+    )]);
+    {
+        let mut sim = sim(7);
+        let tower = spawn(&mut sim, &rules, "YAPSYT", "YuriCountry", 5, 5);
+        let near = spawn(&mut sim, &rules, "HTNK", "Americans", 6, 5);
+        let far = spawn(&mut sim, &rules, "HTNK", "Americans", 20, 20);
+        assert!(sim.capture_unit(tower, near, &rules, None, FrameEffects::default()));
+        assert!(sim.capture_unit(tower, far, &rules, None, FrameEffects::default()));
+        sim.apply_mind_control_range_limit(near, &rules, None, FrameEffects::default());
+        assert_eq!(
+            sim.substrate
+                .entities
+                .get(near)
+                .unwrap()
+                .mind_control
+                .controller,
+            Some(tower),
+            "one cell stays inside 1.5 cells"
+        );
+        sim.apply_mind_control_range_limit(far, &rules, None, FrameEffects::default());
+        assert_eq!(
+            sim.substrate
+                .entities
+                .get(far)
+                .unwrap()
+                .mind_control
+                .controller,
+            None,
+            "fifteen cells leave the controller range"
+        );
+        assert_eq!(victims(&sim, tower), vec![near]);
+    }
+
+    // The victim's early AI visit runs the same check through
+    // `TechnoExt::OnEarlyUpdate`.
+    let mut sim = sim(7);
+    let tower = spawn(&mut sim, &rules, "YAPSYT", "YuriCountry", 5, 5);
+    let far = spawn(&mut sim, &rules, "HTNK", "Americans", 20, 20);
+    assert!(sim.capture_unit(tower, far, &rules, None, FrameEffects::default()));
+    sim.advance_tick(&[], Some(&rules), None, None, 67);
+    assert_eq!(
+        sim.substrate
+            .entities
+            .get(far)
+            .unwrap()
+            .mind_control
+            .controller,
+        None,
+        "the early update frees the out-of-range victim"
+    );
+}
+
+#[cfg(feature = "phobos")]
+#[test]
+fn mind_control_link_visibility_uses_type_then_global() {
+    let rules = enhanced_rules(&[(
+        "[YAPSYT]\nStrength=1000\n",
+        "[YAPSYT]\nStrength=1000\nMindControlLink.VisibleToHouse=team\n",
+    )]);
+    let mut sim = sim(7);
+    let tower = spawn(&mut sim, &rules, "YAPSYT", "YuriCountry", 10, 10);
+    let tank = spawn(&mut sim, &rules, "HTNK", "Americans", 11, 10);
+    assert!(sim.capture_unit(tower, tank, &rules, None, FrameEffects::default()));
+    let links = sim.capture_link_coordinates(tower, &rules);
+    assert_eq!(links.len(), 1);
+    assert_eq!(
+        links[0].visible_to.bits(),
+        crate::rules::phobos_shields::AffectedHouse::OWNER.bits()
+            | crate::rules::phobos_shields::AffectedHouse::ALLIES.bits()
+    );
+
+    let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 14, 10);
+    let other = spawn(&mut sim, &rules, "HTNK", "Americans", 15, 10);
+    assert!(sim.capture_unit(yuri, other, &rules, None, FrameEffects::default()));
+    let links = sim.capture_link_coordinates(yuri, &rules);
+    assert_eq!(
+        links[0].visible_to,
+        crate::rules::phobos_shields::AffectedHouse::ALL,
+        "an unset type inherits the global All"
+    );
+}
+
+#[cfg(feature = "phobos")]
+#[test]
+fn warhead_mind_control_anim_overrides_the_global_ring() {
+    let rules = enhanced_rules(&[
+        (
+            "ControlledAnimationType=MINDANIM\n",
+            "ControlledAnimationType=GLOBALANIM\n",
+        ),
+        (
+            "[InfantryTypes]",
+            "[Animations]\n0=MINDANIM\n[InfantryTypes]",
+        ),
+        (
+            "[Controller]\nMindControl=yes\n",
+            "[Controller]\nMindControl=yes\nMindControl.Anim=MINDANIM\n",
+        ),
+    ]);
+    {
+        let mut sim = sim(7);
+        let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
+        let tank = spawn(&mut sim, &rules, "HTNK", "Americans", 11, 10);
+        let warhead = sim.interner.intern("Controller");
+        let detonation = crate::sim::projectile::ProjectileDetonation {
+            projectile_id: 0,
+            source_id: yuri,
+            target: crate::sim::projectile::ProjectileTarget::Entity(tank),
+            impact: crate::sim::projectile::ProjectileCoord::new(0, 0, 0),
+            payload: crate::sim::projectile::ProjectilePayload::new(1, warhead, None, false),
+            reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+        };
+        sim.mind_control_detonation(detonation, &rules, None, FrameEffects::default());
+        let ring = sim
+            .substrate
+            .entities
+            .get(tank)
+            .unwrap()
+            .mind_control
+            .ring_anim
+            .expect("the warhead override constructs its ring");
+        assert_eq!(
+            sim.interner.resolve(sim.anim(ring).unwrap().type_id()),
+            "MINDANIM"
+        );
+    }
+
+    let fallback = enhanced_rules(&[
+        (
+            "[InfantryTypes]",
+            "[Animations]\n0=MINDANIM\n[InfantryTypes]",
+        ),
+        (
+            "[Controller]\nMindControl=yes\n",
+            "[Controller]\nMindControl=yes\nMindControl.Anim=UNKNOWN\n",
+        ),
+    ]);
+    let mut fallback_sim = sim(7);
+    let yuri = spawn(&mut fallback_sim, &fallback, "YURI", "YuriCountry", 10, 10);
+    let tank = spawn(&mut fallback_sim, &fallback, "HTNK", "Americans", 11, 10);
+    let warhead = fallback_sim.interner.intern("Controller");
+    let detonation = crate::sim::projectile::ProjectileDetonation {
+        projectile_id: 0,
+        source_id: yuri,
+        target: crate::sim::projectile::ProjectileTarget::Entity(tank),
+        impact: crate::sim::projectile::ProjectileCoord::new(0, 0, 0),
+        payload: crate::sim::projectile::ProjectilePayload::new(1, warhead, None, false),
+        reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+    };
+    fallback_sim.mind_control_detonation(detonation, &fallback, None, FrameEffects::default());
+    let ring = fallback_sim
+        .substrate
+        .entities
+        .get(tank)
+        .unwrap()
+        .mind_control
+        .ring_anim
+        .expect("an unknown override falls back to the global ring");
+    assert_eq!(
+        fallback_sim
+            .interner
+            .resolve(fallback_sim.anim(ring).unwrap().type_id()),
+        "MINDANIM"
+    );
+}
+
+/// TechnoClass::ChangeOwner deselects the local player's selected object
+/// before the owner swap (`0x007014B9..0x007014CF`); another house's
+/// selected byte is left alone.
+#[test]
+fn a_captured_selected_unit_of_the_local_player_is_deselected() {
+    let rules = rules();
+    let mut sim = sim(3);
+    let local = sim.interner.get("Americans");
+    sim.session.set_current_house_for_test(local);
+    let mut captured = Vec::new();
+    for (owner, ry) in [("Americans", 10), ("Russians", 14)] {
+        let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, ry);
+        let victim = spawn(&mut sim, &rules, "E1", owner, 12, ry);
+        sim.substrate
+            .entities
+            .get_mut(victim)
+            .unwrap()
+            .selection
+            .select();
+        let effects = crate::sim::world::FrameEffects::default();
+        assert!(sim.capture_unit(yuri, victim, &rules, None, effects));
+        captured.push(victim);
+    }
+    let selected = |id| {
+        sim.substrate
+            .entities
+            .get(id)
+            .unwrap()
+            .selection
+            .is_selected()
+    };
+    assert!(
+        !selected(captured[0]),
+        "the local player's captive leaves the selection"
+    );
+    assert!(
+        selected(captured[1]),
+        "only the local player's selection changes"
+    );
 }

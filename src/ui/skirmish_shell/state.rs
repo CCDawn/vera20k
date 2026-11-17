@@ -4,58 +4,79 @@ mod choose_map;
 mod combos;
 mod hit_test;
 mod launch;
+mod opponent_scroll;
 mod player_name;
+mod random_map_extras;
 mod random_map_setup;
 mod saved_seed_browser;
+mod saved_setup;
+mod team_starts;
 mod trackbars;
 
 #[cfg(test)]
 use self::combos::{combo_dropdown_max_top_index, top_index_from_scrollbar_track_click};
-use self::combos::{handle_combo_mouse_down, set_open_combo_top_index, top_index_from_thumb_y};
+use self::combos::{
+    handle_combo_mouse_down, handle_combo_mouse_move, set_open_combo_top_index,
+    top_index_from_thumb_y,
+};
 
 pub use combos::{
-    combo_dropdown_content_rect, combo_dropdown_needs_scrollbar, combo_dropdown_rect,
-    combo_dropdown_scroll_thumb_rect, combo_dropdown_scrollbar_rect,
-    combo_dropdown_visible_row_count, combo_enabled, combo_items, combo_rect, selected_combo_item,
-    selected_combo_item_index,
+    available_color_choices, available_start_choices, combo_dropdown_content_rect,
+    combo_dropdown_needs_scrollbar, combo_dropdown_rect, combo_dropdown_scroll_thumb_rect,
+    combo_dropdown_scrollbar_rect, combo_dropdown_visible_row_count, combo_enabled, combo_items,
+    combo_rect, country_choices, selected_combo_item, selected_combo_item_index, team_choices,
 };
+pub(crate) use hit_test::status_help_key_for_hover_with_catalog;
 pub use hit_test::{
     action_for_owner_draw_button, apply_action, hit_test, hit_test_owner_draw_button,
     hovered_choose_map_modal_control, hovered_shell_control, status_help_key_for_choose_map_hover,
     status_help_key_for_hover, status_help_key_for_random_map_setup,
 };
 pub use launch::{launch_session, pack_launch_session_without_start_validation};
+pub use opponent_scroll::{
+    opponent_scroll_deadline, opponent_scroll_geometry, opponent_scroll_held, poll_opponent_scroll,
+};
 
 pub use choose_map::{
-    ChooseMapListPress, ChooseMapModalState, ChooseMapSelection, EjectPrompt, EjectPromptButton,
-    ai_rows_beyond_limit_occupied,
+    ChooseMapContext, ChooseMapListPress, ChooseMapModalState, ChooseMapPrompt,
+    ChooseMapPromptAnswer, ChooseMapPromptButton, ChooseMapPromptKind, ChooseMapSelection,
+    FAVORITES_ROW, ONLINE_MAPS_ROW, SEARCH_MAX_CHARS, ai_rows_beyond_limit_occupied, favorite_key,
 };
+pub(crate) use player_name::CountryMenuCatalog;
 pub use player_name::{
     PLAYER_NAME_CARET_MARGIN_PX, PLAYER_NAME_DEFAULT, PLAYER_NAME_EDIT_LIMIT_BYTES,
     PlayerNameEditState, SkirmishShellDialog, SkirmishShellState, accept_selected_map,
-    blur_player_name_edit, clear_status_help_text, combo_dropdown_open, dismiss_validation_modal,
-    drain_pending_ui_sounds, focus_player_name_edit, handle_player_name_backspace,
-    handle_player_name_delete, handle_player_name_end, handle_player_name_home,
-    handle_player_name_left, handle_player_name_right, handle_player_name_tab,
-    initialize_rows_for_selected_map, insert_player_name_text, player_name_caret_prefix,
-    player_name_edit_rect_hit, player_row_visible, repair_teams_for_selected_mode,
-    set_status_help_text, update_player_name_scroll_for_caret,
+    blur_player_name_edit, clear_status_help_text, close_combo_dropdown, combo_dropdown_open,
+    dismiss_validation_modal, drain_pending_ui_sounds, focus_player_name_edit,
+    handle_player_name_backspace, handle_player_name_delete, handle_player_name_end,
+    handle_player_name_home, handle_player_name_left, handle_player_name_right,
+    handle_player_name_tab, initialize_rows_for_selected_map, insert_player_name_text,
+    player_name_caret_prefix, player_name_edit_rect_hit, player_row_visible,
+    repair_teams_for_selected_mode, selected_player_rows, set_status_help_text,
+    update_player_name_scroll_for_caret,
+};
+pub use random_map_extras::{
+    EXTRAS_ROWS, ExtrasAction, ExtrasOutcome, ExtrasRow, ExtrasValue, extras_page_count,
 };
 pub use random_map_setup::{
-    AcceptOutcome, MainRngRanged, PLAYERS_RANGE, RandomMapSetupModalState, SETUP_COMBO_ROWS,
-    SetupCombo, SetupComboItem, setup_combo_items,
+    ADVANCED_RANGE, AcceptOutcome, CUSTOM_PRESET_SLOTS, MainRngRanged, PLAYERS_RANGE,
+    RandomMapPreset, RandomMapSetupModalState,
+    SETUP_COMBO_ROWS, SetupCombo, SetupComboItem, setup_combo_items,
 };
 pub use saved_seed_browser::{
-    SAVED_SEED_DESCRIPTION_MAX_UNITS, SavedSeedBrowserRow, SavedSeedBrowserState, SavedSeedOutcome,
-    SavedSeedPrompt, SavedSeedPromptPurpose,
+    SAVED_SEED_DESCRIPTION_MAX_UNITS, SavedSeedBrowserRow, SavedSeedBrowserState,
+    SavedSeedDescriptionEdit, SavedSeedOutcome, SavedSeedPrompt, SavedSeedPromptPurpose,
 };
+pub use saved_setup::{SkirmishSavedSetup, SkirmishSetupComputer, SkirmishSetupSeat};
+pub use team_starts::starts_by_team;
 pub use trackbars::{
-    SkirmishTrackbarBounds, game_speed_from_visual_position, game_speed_visual_position,
-    handle_option_mouse_down, handle_option_mouse_move, handle_option_mouse_up,
-    handle_option_mouse_wheel, trackbar_visual_value,
+    SkirmishTrackbarBounds, handle_option_mouse_down, handle_option_mouse_move,
+    handle_option_mouse_up, handle_option_mouse_wheel, trackbar_visual_value,
 };
 
-use crate::skirmish_launch::{AiDifficulty, HOUSE_COLOR_COUNT, LaunchCountry, LaunchStartPosition};
+use crate::skirmish_launch::{
+    AiDifficulty, HOUSE_COLOR_COUNT, LaunchCountry, LaunchStartPosition, NETWORK_PLAYER_SLOT_COUNT,
+};
 
 use self::player_name::inactive_ai_team_default;
 #[cfg(test)]
@@ -66,6 +87,8 @@ use super::layout::{ChooseMapModalButton, ColorComboId, SkirmishCheckboxId, Skir
 pub enum OwnerDrawButton {
     StartGame0x617,
     ChooseMap0x5aa,
+    /// VERA's Game Options ([`super::game_options`]).
+    GameOptions,
     Back0x5c0,
 }
 
@@ -75,6 +98,8 @@ pub enum SkirmishShellAction {
     StartGame,
     BackOrExit,
     ChooseMap,
+    /// The app opens the box on the rules the profile keeps.
+    GameOptions,
     SelectColor(ColorComboId),
     SelectMap(usize),
 }
@@ -85,6 +110,15 @@ pub enum SkirmishShellUiSound {
     GenericClick,
     GuiComboOpenSound,
     GuiComboCloseSound,
+}
+
+impl SkirmishShellUiSound {
+    pub(crate) fn combo(cue: crate::ui::shell::combobox::ComboCue) -> Self {
+        match cue {
+            crate::ui::shell::combobox::ComboCue::Open => Self::GuiComboOpenSound,
+            crate::ui::shell::combobox::ComboCue::Close => Self::GuiComboCloseSound,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +165,8 @@ pub enum SkirmishHoverTarget {
     FlagPicture,
     GameTypeLabel0x6ec,
     ScenarioLabel0x5a8,
+    /// A control of the open Game Options box, which covers the page.
+    GameOptions(super::game_options::GameOptionsControl),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,12 +183,13 @@ pub enum ChooseMapHoverTarget {
 pub struct OpenComboDropdown {
     pub id: SkirmishComboId,
     pub top_index: usize,
+    /// The popup's preview row; the saved choice changes only on a click.
+    pub hot_row: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DropdownScrollDragState {
     pub id: SkirmishComboId,
-    pub grab_offset_y: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +229,13 @@ pub enum SkirmishAiRowType {
     Easy,
     Normal,
     Hard,
+    /// Fork-only Super AI row ([`crate::super_ai`]): no native counterpart,
+    /// so every native identity below mirrors the Hard row it builds on.
+    SuperAI,
+    /// Fork-only spectacle row: the Super treatment plus the Unlimited
+    /// tier's per-tick wallet floor (`UNLIMITED_WALLET_FLOOR`) — the AI
+    /// spends without an economy. Strength claims never cite it.
+    SuperAIUnlimited,
 }
 
 impl SkirmishAiRowType {
@@ -201,11 +245,15 @@ impl SkirmishAiRowType {
             Self::Easy => 2,
             Self::Normal => 1,
             Self::Hard => 0,
+            Self::SuperAI | Self::SuperAIUnlimited => 0,
         }
     }
 
     pub const fn is_active(self) -> bool {
-        matches!(self, Self::Easy | Self::Normal | Self::Hard)
+        matches!(
+            self,
+            Self::Easy | Self::Normal | Self::Hard | Self::SuperAI | Self::SuperAIUnlimited
+        )
     }
 
     pub const fn difficulty(self) -> Option<AiDifficulty> {
@@ -213,7 +261,7 @@ impl SkirmishAiRowType {
             Self::None => None,
             Self::Easy => Some(AiDifficulty::Easy),
             Self::Normal => Some(AiDifficulty::Normal),
-            Self::Hard => Some(AiDifficulty::Hard),
+            Self::Hard | Self::SuperAI | Self::SuperAIUnlimited => Some(AiDifficulty::Hard),
         }
     }
 
@@ -223,6 +271,20 @@ impl SkirmishAiRowType {
             Self::Easy => ("GUI:AIEasy", "Easy"),
             Self::Normal => ("GUI:AINormal", "Normal"),
             Self::Hard => ("GUI:AIHard", "Hard"),
+            // No retail CSF key exists for the fork-only rows; the empty key
+            // makes the label resolve to the English fallback.
+            Self::SuperAI => ("", "Super AI"),
+            Self::SuperAIUnlimited => ("", "Super AI MAX"),
+        }
+    }
+
+    /// The slot's Super-AI tier: the fork-only rows launch command-driven
+    /// instead of as native computers. `None` is a native computer row.
+    pub const fn super_tier(&self) -> Option<crate::super_ai::SuperAiDifficulty> {
+        match self {
+            Self::None | Self::Easy | Self::Normal | Self::Hard => None,
+            Self::SuperAI => Some(crate::super_ai::SuperAiDifficulty::Super),
+            Self::SuperAIUnlimited => Some(crate::super_ai::SuperAiDifficulty::Unlimited),
         }
     }
 }
@@ -264,6 +326,9 @@ impl SkirmishShellOpponent {
 /// opponent. When persisted slot reading is added, the per-row fallbacks must be
 /// the Easy code for row 1 and the None code for rows 2-7, mapped through the
 /// slot type-code table, not hardcoded all-None.
+///
+/// VERA: the rows go on past the retail seven to 29, for maps with up to
+/// thirty starts; each opens as None, as rows 2-7 do.
 fn default_opponents(first_country: LaunchCountry) -> Vec<SkirmishShellOpponent> {
     let countries = [
         first_country,
@@ -275,10 +340,9 @@ fn default_opponents(first_country: LaunchCountry) -> Vec<SkirmishShellOpponent>
         LaunchCountry::Germany,
     ];
 
-    countries
-        .into_iter()
-        .enumerate()
-        .map(|(idx, country)| {
+    (0..NETWORK_PLAYER_SLOT_COUNT - 1)
+        .map(|idx| {
+            let country = countries[idx % countries.len()];
             let row_type = if idx == 0 {
                 SkirmishAiRowType::Easy
             } else {
@@ -303,5 +367,5 @@ fn default_opponents(first_country: LaunchCountry) -> Vec<SkirmishShellOpponent>
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests;

@@ -35,6 +35,11 @@ pub(crate) struct OwnerChangeAuthority(());
 /// airborne set ([`EntityStore::airborne`]) changes with it.
 pub(crate) struct AirMembershipAuthority(());
 
+/// Only this module can store an Anim in a field [`GameEntity::held_anims`]
+/// names, so the anim-holder index notes the holder
+/// ([`EntityStore::write_held_anim`]).
+pub(crate) struct AnimHolderAuthority(());
+
 /// Container for all game entities, keyed by stable_id.
 ///
 /// All iteration methods return entities in ascending stable_id order, which
@@ -48,13 +53,24 @@ pub struct EntityStore {
     /// The stored ids in ascending order, one per slot. A removed entity's
     /// slot keeps its id, with no entity, until [`Self::compact`].
     ids: Vec<u64>,
-    /// The entity of each slot. Boxed: an entity is about 3 KB, so insert,
+    /// The entity of each slot. Boxed: an entity is about 2.2 KB, so insert,
     /// remove and compaction move pointers, not entities. serde writes a
     /// `Box<T>` as its `T`.
     entities: Vec<Option<Box<GameEntity>>>,
     /// stable_id -> slot, for every slot that holds an entity. Only looked
     /// up, never iterated, so its order cannot reach a result.
     slot_of: LookupMap<u64, u32>,
+    /// VERA-only: the id last given to [`Self::focus`] and its slot (`None`:
+    /// not stored), so an object's turn, which looks its own id up about a
+    /// hundred times, hashes it once ([`Self::slot`]). `slot_of` is the
+    /// source of truth: every function that writes it re-reads the focused
+    /// id's slot ([`Self::refocus`]), so a lookup answers the same with or
+    /// without it. Never saved or hashed.
+    focus: (u64, Option<u32>),
+    /// Lookups by id so far, and those of them the id index answered (test
+    /// builds only), for checks of what a turn looks up.
+    #[cfg(any(test, feature = "test-support"))]
+    lookups: [std::sync::atomic::AtomicU64; 2],
     /// VERA-only: each slot's owner, beside the boxed entities for walks that
     /// ask only whose an object is ([`Self::owner_of`]). The entity's own
     /// owner is the source of truth: [`Self::insert`] copies it and
@@ -67,6 +83,25 @@ pub struct EntityStore {
     /// stored entity's category never changes (a replacement comes through
     /// [`Self::insert`], which copies it). Kept and rebuilt as `owners` is.
     categories: Vec<EntityCategory>,
+    /// VERA-only: each slot's sleep mark and quiet flag ([`SleepCell`]),
+    /// beside the boxed entities so the live object pass passes a sleeping
+    /// object without loading it, and a quiet one's turn skips steps without
+    /// reading their state. Every route to a `&mut GameEntity` settles and
+    /// clears both first ([`Self::wake_slot`]), so a sleeping or quiet entity
+    /// is one nothing has written since its last turn. Kept through
+    /// compaction as `owners` is; a load starts every object awake and not
+    /// quiet. Never saved or hashed: the save form and the state hash read a
+    /// sleeping object as settled.
+    sleep: Vec<SleepCell>,
+    /// VERA-only: the stored ids of each owner's objects of each category,
+    /// ascending ([`Self::owned_ids`]), for walks that want one house's
+    /// objects of one class without loading the others. The entities' owners
+    /// and categories are the source of truth: [`Self::insert`] and
+    /// [`Self::remove`] keep it, [`Self::change_owner`], the owners' one live
+    /// writer, moves an id between lists, and compaction changes no id.
+    /// Rebuilt on load ([`Self::rebuild_class_registries`]), never saved or
+    /// hashed, and only looked up, never iterated as a map.
+    owned: LookupMap<(InternedId, EntityCategory), Vec<u64>>,
     /// Derived InfantryClass registry, in monotonic construction-ID order.
     /// Uninit retains an entry; remove compacts it. Class/category is immutable
     /// while stored, like indexed identity (replace through remove/insert).
@@ -97,10 +132,57 @@ pub struct EntityStore {
     /// membership's one live writer, writes both. Rebuilt on load, never
     /// saved or hashed.
     airborne: BTreeSet<(u16, u64, u64)>,
+    /// VERA-only: `(Anim, holder)` for each Anim a stored entity may hold in
+    /// a field [`GameEntity::held_anims`] names, so an Anim's expiry
+    /// (`Simulation::notify_anim_pointer_expired`, through
+    /// [`Self::take_anim_holders`]) visits those entities instead of
+    /// re-reading every entity handed out since the last expiry. A superset;
+    /// the entities' fields are the truth. [`Self::insert`] and
+    /// [`Self::write_held_anim`], the only route to storing an Anim in one of
+    /// those fields, add pairs; the expiry takes an Anim's pairs, its
+    /// callbacks clearing every field that names it; a removal drops the
+    /// removed entity's. A field cleared otherwise leaves its pair until
+    /// then. Rebuilt on load, never saved or hashed.
+    anim_holders: BTreeSet<(u64, u64)>,
     /// Which entities may have changed since each reader last took its log
     /// ([`Self::take_touched`]). Every route to a `&mut GameEntity` goes
-    /// through the store, so an entity missing from a log has not changed.
+    /// through the store, so an entity missing from a log has not changed,
+    /// but for the mission AI counter and a building's tint sample, which
+    /// change every frame and no reader derives from
+    /// ([`Self::count_mission_ai_visit`], [`Self::capture_building_tint_sample`]).
     touched: TouchLogs<{ TouchReader::COUNT }>,
+    /// Which entities may draw differently since the presentation last took
+    /// the log ([`Self::take_looks`]): stored, or given a new owner, type or
+    /// disguise. [`Self::insert`] and [`Self::change_owner`] note it, and the
+    /// in-place type and disguise writers call [`Self::note_look`]. The
+    /// simulation never reads it; never saved, compared or hashed.
+    looks: TouchLogs<1>,
+    /// The empty stand-in of a presentation copy of the world
+    /// ([`Self::detached`]), whose objects are in the presentation frame
+    /// instead. Debug builds refuse reads of it.
+    detached: bool,
+}
+
+/// One slot's sleep mark (sim-scale; results unchanged). An idle object's
+/// turn changes nothing but its per-visit counters until one of its timers
+/// comes due, so the live object pass may count the visit as owed instead of
+/// running it (`Simulation::advance_live_object_pass`).
+#[derive(Debug, Clone, Copy, Default)]
+struct SleepCell {
+    /// The first frame whose turn must run; 0 while awake.
+    wake_at: u32,
+    /// Visits the pass counted instead of running.
+    owed: u32,
+    /// What the sleeper's owner looked like when it fell asleep, for the
+    /// pass to compare (`world::idle_sleep`).
+    note: u8,
+    /// The frame after the last turn that left the object fit to sleep,
+    /// while awake; 0 for none ([`EntityStore::fit_to_sleep`]).
+    fit_until: u32,
+    /// The object is quiet (`world::quiet_units`): its last turn left every
+    /// state its quiet turn skips off, and nothing has been handed it for
+    /// writing since. Every mutable hand-out clears it, asleep or awake.
+    quiet: bool,
 }
 
 /// A product derived from the entities that re-derives from the touch log.
@@ -127,14 +209,22 @@ impl Clone for EntityStore {
             ids: self.ids.clone(),
             entities: self.entities.clone(),
             slot_of: self.slot_of.clone(),
+            focus: self.focus,
+            #[cfg(any(test, feature = "test-support"))]
+            lookups: Default::default(),
             owners: self.owners.clone(),
             categories: self.categories.clone(),
+            sleep: self.sleep.clone(),
+            owned: self.owned.clone(),
             infantry_registry: self.infantry_registry.clone(),
             foot_registry: self.foot_registry.clone(),
             techno_registry: self.techno_registry.clone(),
             building_registry: self.building_registry.clone(),
             airborne: self.airborne.clone(),
+            anim_holders: self.anim_holders.clone(),
             touched: TouchLogs::everything(),
+            looks: TouchLogs::everything(),
+            detached: self.detached,
         }
     }
 }
@@ -145,10 +235,169 @@ impl EntityStore {
         self.touched.take(reader as usize)
     }
 
+    /// Take the look log, leaving it empty.
+    pub(crate) fn take_looks(&mut self) -> Touched {
+        self.looks.take(0)
+    }
+
+    /// Note that an in-place write changed how `stable_id` draws: its type
+    /// or a disguise it puts on.
+    pub(crate) fn note_look(&mut self, stable_id: u64) {
+        self.looks.note(stable_id, self.slot_of.len());
+    }
+
+    /// Mark `stable_id` asleep until frame `wake_at` (above 0): the pass may
+    /// count its visits before that frame as owed. Any mutable hand-out wakes
+    /// it first.
+    pub(crate) fn sleep_until(&mut self, stable_id: u64, wake_at: u32, note: u8) {
+        debug_assert!(wake_at != 0, "wake frame 0 means awake");
+        if let Some(slot) = self.slot(stable_id) {
+            let cell = &mut self.sleep[slot as usize];
+            cell.wake_at = wake_at;
+            cell.note = note;
+        }
+    }
+
+    /// `stable_id`'s turn at `frame` left it fit to sleep. Answers whether
+    /// its turn the frame before did too: only then did this whole turn run
+    /// on a resting object, so its samplers hold what a next turn would
+    /// sample. Waking forgets it.
+    pub(crate) fn fit_to_sleep(&mut self, stable_id: u64, frame: u32) -> bool {
+        let Some(slot) = self.slot(stable_id) else {
+            return false;
+        };
+        let cell = &mut self.sleep[slot as usize];
+        let rested = cell.fit_until == frame;
+        cell.fit_until = frame.wrapping_add(1);
+        rested
+    }
+
+    /// `stable_id`'s turn at `frame` left something in progress.
+    pub(crate) fn unfit_to_sleep(&mut self, stable_id: u64) {
+        if let Some(slot) = self.slot(stable_id) {
+            self.sleep[slot as usize].fit_until = 0;
+        }
+    }
+
+    /// The frame `stable_id` sleeps until and its note, if it is asleep.
+    #[inline]
+    pub(crate) fn sleeps_until(&self, stable_id: u64) -> Option<(u32, u8)> {
+        let cell = self.sleep[self.slot(stable_id)? as usize];
+        (cell.wake_at != 0).then_some((cell.wake_at, cell.note))
+    }
+
+    /// Count the visit the pass makes to sleeping `stable_id` instead of
+    /// running its turn.
+    pub(crate) fn owe_visit(&mut self, stable_id: u64) {
+        if let Some(slot) = self.slot(stable_id) {
+            let cell = &mut self.sleep[slot as usize];
+            cell.owed = cell.owed.wrapping_add(1);
+        }
+    }
+
+    /// Drop the visits `stable_id` is owed without settling them: the sleep
+    /// check's, which counts one only to hash the skipped turn
+    /// (`world::idle_sleep`).
+    pub(crate) fn forget_owed(&mut self, stable_id: u64) {
+        if let Some(slot) = self.slot(stable_id) {
+            self.sleep[slot as usize].owed = 0;
+        }
+    }
+
+    /// The visits sleeping `stable_id` is owed, which its mission counter
+    /// does not hold yet ([`GameEntity::settle_sleep`]).
+    pub(crate) fn owed_visits(&self, stable_id: u64) -> u32 {
+        self.slot(stable_id)
+            .map_or(0, |slot| self.sleep[slot as usize].owed)
+    }
+
+    /// The visits each stored entity is owed, in [`Self::values`] order.
+    pub(crate) fn owed_in_value_order(&self) -> Vec<u32> {
+        self.entities
+            .iter()
+            .zip(&self.sleep)
+            .filter(|(entity, _)| entity.is_some())
+            .map(|(_, cell)| cell.owed)
+            .collect()
+    }
+
+    /// Wake `stable_id`, settling its owed visits.
+    pub(crate) fn wake(&mut self, stable_id: u64) {
+        if let Some(slot) = self.slot(stable_id) {
+            self.wake_slot(slot as usize);
+        }
+    }
+
+    /// Wake every object: for a change that sleeping objects read without
+    /// being written (a house's power, a cell's hidden state).
+    pub(crate) fn wake_all(&mut self) {
+        for slot in 0..self.sleep.len() {
+            self.wake_slot(slot);
+        }
+    }
+
+    /// Whether `stable_id` is quiet: its last turn left it so, and nothing
+    /// has been handed it for writing since (`world::quiet_units`).
+    #[inline]
+    pub(crate) fn is_quiet(&self, stable_id: u64) -> bool {
+        self.slot(stable_id)
+            .is_some_and(|slot| self.sleep[slot as usize].quiet)
+    }
+
+    /// `stable_id`'s entity and whether it is quiet, in one lookup.
+    pub(crate) fn get_and_quiet(&self, stable_id: u64) -> Option<(&GameEntity, bool)> {
+        let slot = self.slot(stable_id)? as usize;
+        Some((self.entities[slot].as_deref()?, self.sleep[slot].quiet))
+    }
+
+    /// Mark `stable_id` quiet until its next mutable hand-out.
+    pub(crate) fn set_quiet(&mut self, stable_id: u64) {
+        if let Some(slot) = self.slot(stable_id) {
+            self.sleep[slot as usize].quiet = true;
+        }
+    }
+
+    /// How many objects are asleep.
+    pub(crate) fn sleeping_count(&self) -> usize {
+        self.sleep.iter().filter(|cell| cell.wake_at != 0).count()
+    }
+
+    /// Clear `slot`'s sleep mark and quiet flag and give its entity the
+    /// visits it is owed, before anything writes it.
+    #[inline]
+    fn wake_slot(&mut self, slot: usize) {
+        let cell = self.sleep[slot];
+        if cell.wake_at == 0 {
+            if cell.quiet {
+                self.sleep[slot].quiet = false;
+            }
+            return;
+        }
+        self.sleep[slot] = SleepCell::default();
+        if cell.owed == 0 {
+            return;
+        }
+        // Through a shared reference, as the per-visit step does: waking is
+        // not a hand-out.
+        if let Some(entity) = self.entities[slot].as_deref() {
+            entity.settle_sleep(cell.owed);
+        }
+    }
+
     /// How many mutable hand-outs the store has made (test builds only).
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn hand_outs(&self) -> u64 {
         self.touched.hand_outs()
+    }
+
+    /// How many lookups by id the store has answered, and how many of them
+    /// through the id index rather than the focused slot (test builds only).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn lookups(&self) -> (u64, u64) {
+        let count = |counter: &std::sync::atomic::AtomicU64| {
+            counter.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        (count(&self.lookups[0]), count(&self.lookups[1]))
     }
 
     /// Create an empty store.
@@ -157,15 +406,44 @@ impl EntityStore {
             ids: Vec::new(),
             entities: Vec::new(),
             slot_of: HashMap::default(),
+            // An empty store holds no id.
+            focus: (0, None),
+            #[cfg(any(test, feature = "test-support"))]
+            lookups: Default::default(),
             owners: Vec::new(),
             categories: Vec::new(),
+            sleep: Vec::new(),
+            owned: LookupMap::default(),
             infantry_registry: Vec::new(),
             foot_registry: Vec::new(),
             techno_registry: Vec::new(),
             building_registry: Vec::new(),
             airborne: BTreeSet::new(),
+            anim_holders: BTreeSet::new(),
             touched: TouchLogs::everything(),
+            looks: TouchLogs::everything(),
+            detached: false,
         }
+    }
+
+    /// The empty store a presentation copy of the world holds in place of
+    /// the objects (`Simulation::presentation_copy`): drawing reads them
+    /// from its presentation frame. Debug builds panic on a read of it, so a
+    /// reader still reaching for the world's objects shows up in any draw.
+    pub(crate) fn detached() -> Self {
+        Self {
+            detached: true,
+            ..Self::new()
+        }
+    }
+
+    /// Debug builds: refuse a read of a [`Self::detached`] store.
+    #[inline]
+    fn check_attached(&self) {
+        debug_assert!(
+            !self.detached,
+            "read of the objects of a presentation copy of the world: read the presentation frame's records instead"
+        );
     }
 
     /// Insert an entity, replacing one of the same id (rare — stable_ids are
@@ -173,29 +451,44 @@ impl EntityStore {
     pub fn insert(&mut self, entity: GameEntity) -> u64 {
         let id = entity.stable_id();
         self.touched.note(id, self.len());
+        self.looks.note(id, self.len());
         let category = entity.category();
         let infantry = category == EntityCategory::Infantry;
         let owner = entity.owner();
         let foot = category.is_foot();
-        // A replaced entity leaves the airborne set; this one joins it if the
+        // A replaced entity leaves its owner's list and the airborne set;
+        // this one joins its owner's list, and the airborne set if the
         // tracker holds it.
-        if let Some(entry) = self.get(id).and_then(airborne_entry) {
-            self.airborne.remove(&entry);
+        if let Some((key, entry)) = self.get(id).map(|replaced| {
+            (
+                (replaced.owner(), replaced.category()),
+                airborne_entry(replaced),
+            )
+        }) {
+            self.unlist_owned(id, key);
+            if let Some(entry) = entry {
+                self.airborne.remove(&entry);
+            }
         }
+        self.list_owned(id, (owner, category));
         if let Some(entry) = airborne_entry(&entity) {
             self.airborne.insert(entry);
         }
+        self.anim_holders
+            .extend(entity.held_anims().map(|anim| (anim, id)));
         let entity = Some(Box::new(entity));
         if let Some(&slot) = self.slot_of.get(&id) {
             self.entities[slot as usize] = entity;
             self.owners[slot as usize] = owner;
             self.categories[slot as usize] = category;
+            self.sleep[slot as usize] = SleepCell::default();
         } else if self.ids.last().is_none_or(|&last| last < id) {
             self.slot_of.insert(id, self.ids.len() as u32);
             self.ids.push(id);
             self.entities.push(entity);
             self.owners.push(owner);
             self.categories.push(category);
+            self.sleep.push(SleepCell::default());
         } else {
             // An id below the newest: a fixture's, or a removed id stored again.
             let slot = self.ids.partition_point(|&stored| stored < id);
@@ -203,15 +496,18 @@ impl EntityStore {
                 self.entities[slot] = entity;
                 self.owners[slot] = owner;
                 self.categories[slot] = category;
+                self.sleep[slot] = SleepCell::default();
                 self.slot_of.insert(id, slot as u32);
             } else {
                 self.ids.insert(slot, id);
                 self.entities.insert(slot, entity);
                 self.owners.insert(slot, owner);
                 self.categories.insert(slot, category);
+                self.sleep.insert(slot, SleepCell::default());
                 self.reindex_from(slot);
             }
         }
+        self.refocus();
         if let Err(index) = self.techno_registry.binary_search(&id) {
             self.techno_registry.insert(index, id);
         }
@@ -245,10 +541,19 @@ impl EntityStore {
 
     /// Remove an entity by stable_id. Returns the removed entity if it existed.
     pub fn remove(&mut self, stable_id: u64) -> Option<GameEntity> {
-        let slot = self.slot_of.remove(&stable_id)? as usize;
+        let slot = *self.slot_of.get(&stable_id)? as usize;
+        self.wake_slot(slot);
+        self.slot_of.remove(&stable_id);
+        self.refocus();
         let removed = self.entities[slot].take().map(|entity| *entity);
-        if let Some(entry) = removed.as_ref().and_then(airborne_entry) {
-            self.airborne.remove(&entry);
+        if let Some(entity) = &removed {
+            self.unlist_owned(stable_id, (entity.owner(), entity.category()));
+            if let Some(entry) = airborne_entry(entity) {
+                self.airborne.remove(&entry);
+            }
+            for anim in entity.held_anims() {
+                self.anim_holders.remove(&(anim, stable_id));
+            }
         }
         self.touched.note(stable_id, self.len());
         self.remove_infantry_index(stable_id);
@@ -279,6 +584,7 @@ impl EntityStore {
                 self.entities.swap(kept, slot);
                 self.owners.swap(kept, slot);
                 self.categories.swap(kept, slot);
+                self.sleep.swap(kept, slot);
                 kept += 1;
             }
         }
@@ -286,6 +592,7 @@ impl EntityStore {
         self.entities.truncate(kept);
         self.owners.truncate(kept);
         self.categories.truncate(kept);
+        self.sleep.truncate(kept);
         self.reindex_from(0);
     }
 
@@ -296,10 +603,52 @@ impl EntityStore {
                 self.slot_of.insert(self.ids[slot], slot as u32);
             }
         }
+        self.refocus();
+    }
+
+    /// Remember `stable_id`'s slot, so lookups of it skip the id index until
+    /// another id is focused. For the object whose turn it is; an id the
+    /// store does not hold is remembered as absent. No lookup's answer
+    /// changes.
+    pub(crate) fn focus(&mut self, stable_id: u64) {
+        // Every writer of `slot_of` re-reads the focused slot, so focusing
+        // the same id again has nothing to look up.
+        if self.focus.0 == stable_id {
+            return;
+        }
+        self.focus.0 = stable_id;
+        self.refocus();
+    }
+
+    /// Re-read the focused id's slot after a write to `slot_of`.
+    fn refocus(&mut self) {
+        self.focus.1 = self.slot_of.get(&self.focus.0).copied();
+    }
+
+    /// `stable_id`'s slot, if it is stored: the focused id's without the id
+    /// index. Debug builds check the focused slot against the index (the
+    /// live-read check).
+    #[inline]
+    fn slot(&self, stable_id: u64) -> Option<u32> {
+        self.check_attached();
+        #[cfg(any(test, feature = "test-support"))]
+        self.lookups[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.focus.0 != stable_id {
+            #[cfg(any(test, feature = "test-support"))]
+            self.lookups[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return self.slot_of.get(&stable_id).copied();
+        }
+        debug_assert!(
+            !crate::sim::touch_log::live_read_check_enabled()
+                || self.focus.1 == self.slot_of.get(&stable_id).copied(),
+            "the focused slot disagrees with the id index for entity {stable_id}"
+        );
+        self.focus.1
     }
 
     /// The stored entities in ascending stable_id order, with their ids.
     fn stored(&self) -> Stored<'_> {
+        self.check_attached();
         Stored {
             ids: self.ids.iter(),
             entities: self.entities.iter(),
@@ -311,6 +660,8 @@ impl EntityStore {
     ///
     /// Idempotent. Safe if `stable_id` is absent.
     pub fn clear_radio_contacts_for(&mut self, stable_id: u64) {
+        // The walk below writes every entity.
+        self.wake_all();
         let stored = self.len();
         self.touched.note(stable_id, stored);
         for entity in self.entities.iter_mut().filter_map(Option::as_deref_mut) {
@@ -331,14 +682,14 @@ impl EntityStore {
 
     /// Look up an entity by stable_id (immutable).
     pub fn get(&self, stable_id: u64) -> Option<&GameEntity> {
-        let slot = *self.slot_of.get(&stable_id)?;
+        let slot = self.slot(stable_id)?;
         self.entities[slot as usize].as_deref()
     }
 
     /// `stable_id`'s owner, read from the owner column without touching the
     /// entity. Debug builds check it against the entity (the live-read check).
     pub(crate) fn owner_of(&self, stable_id: u64) -> Option<InternedId> {
-        let slot = *self.slot_of.get(&stable_id)? as usize;
+        let slot = self.slot(stable_id)? as usize;
         let owner = self.owners[slot];
         debug_assert!(
             !crate::sim::touch_log::live_read_check_enabled()
@@ -352,7 +703,7 @@ impl EntityStore {
     /// the entity. Debug builds check it against the entity (the live-read
     /// check).
     pub(crate) fn category_of(&self, stable_id: u64) -> Option<EntityCategory> {
-        let slot = *self.slot_of.get(&stable_id)? as usize;
+        let slot = self.slot(stable_id)? as usize;
         let category = self.categories[slot];
         debug_assert!(
             !crate::sim::touch_log::live_read_check_enabled()
@@ -366,7 +717,7 @@ impl EntityStore {
     /// while the store is borrowed, so tables built under one borrow may
     /// index by them; every slot is below [`Self::slot_count`].
     pub(crate) fn get_in_slot(&self, stable_id: u64) -> Option<(usize, &GameEntity)> {
-        let slot = *self.slot_of.get(&stable_id)? as usize;
+        let slot = self.slot(stable_id)? as usize;
         Some((slot, self.entities[slot].as_deref()?))
     }
 
@@ -380,8 +731,9 @@ impl EntityStore {
     /// Replacing a stored entity wholesale is unsupported: remove/insert through
     /// the owning lifecycle instead so its indexes and registrations are updated.
     pub fn get_mut(&mut self, stable_id: u64) -> Option<&mut GameEntity> {
-        let slot = *self.slot_of.get(&stable_id)?;
+        let slot = self.slot(stable_id)?;
         self.touched.note(stable_id, self.slot_of.len());
+        self.wake_slot(slot as usize);
         self.entities[slot as usize].as_deref_mut()
     }
 
@@ -393,27 +745,88 @@ impl EntityStore {
         stable_id: u64,
         admit: impl FnOnce(&GameEntity) -> bool,
     ) -> Option<&mut GameEntity> {
-        let slot = *self.slot_of.get(&stable_id)?;
-        let entity = self.entities[slot as usize].as_deref_mut()?;
-        if !admit(entity) {
+        let slot = self.slot(stable_id)? as usize;
+        // Read through a shared reference: only an admitted entity is
+        // handed out and noted in the touch logs.
+        if !admit(self.entities[slot].as_deref()?) {
             return None;
         }
         self.touched.note(stable_id, self.slot_of.len());
-        Some(entity)
+        self.wake_slot(slot);
+        self.entities[slot].as_deref_mut()
+    }
+
+    /// Step `stable_id`'s mission AI counter (`+0xC4`) for one AI visit
+    /// (`0x006FA646..0x006FA64F`) without a note in the touch logs: every
+    /// techno steps it every frame, and no product derived from the logs
+    /// reads it. No-op if the entity is absent.
+    pub(crate) fn count_mission_ai_visit(&mut self, stable_id: u64) {
+        // Through a shared reference: the counter steps without a mutable
+        // hand-out, which would wake the object and note it in the logs.
+        if let Some(entity) = self.get(stable_id) {
+            entity.mission.count_ai_visit();
+        }
+    }
+
+    /// Keep a building's relight light at `frame` for the draw
+    /// ([`crate::sim::building_art::BuildingArt::capture_tint_sample`]),
+    /// unless the kept one is current
+    /// ([`crate::sim::building_art::BuildingArt::tint_sample_is_current`]),
+    /// without a note in the touch logs: every building relights every
+    /// frame, and no product derived from the logs reads the sample. No-op
+    /// for an absent entity or one that is not a building.
+    pub(crate) fn capture_building_tint_sample(
+        &mut self,
+        stable_id: u64,
+        frame: u32,
+        airstrike_active: bool,
+    ) {
+        // Read first: a building whose sample already says what the draw
+        // would read is not handed out.
+        if self.get(stable_id).is_none_or(|entity| {
+            entity.category() != EntityCategory::Structure
+                || entity.building_art.tint_sample_is_current(
+                    entity.flashing.flashed(),
+                    entity.invulnerability.as_ref(),
+                    &entity.airstrike_tint,
+                    airstrike_active,
+                )
+        }) {
+            return;
+        }
+        if let Some(entity) = self.unlogged_mut(stable_id) {
+            entity.building_art.capture_tint_sample(
+                frame,
+                entity.flashing.flashed(),
+                entity.invulnerability.as_ref(),
+                &entity.airstrike_tint,
+                airstrike_active,
+            );
+        }
+    }
+
+    /// `stable_id`'s entity without a note: only for the writes the touch
+    /// log's contract excepts.
+    fn unlogged_mut(&mut self, stable_id: u64) -> Option<&mut GameEntity> {
+        let slot = *self.slot_of.get(&stable_id)?;
+        self.wake_slot(slot as usize);
+        self.entities[slot as usize].as_deref_mut()
     }
 
     /// Check if an entity exists.
     pub fn contains(&self, stable_id: u64) -> bool {
-        self.slot_of.contains_key(&stable_id)
+        self.slot(stable_id).is_some()
     }
 
     /// Number of entities in the store.
     pub fn len(&self) -> usize {
+        self.check_attached();
         self.slot_of.len()
     }
 
     /// Whether the store is empty.
     pub fn is_empty(&self) -> bool {
+        self.check_attached();
         self.slot_of.is_empty()
     }
 
@@ -430,6 +843,20 @@ impl EntityStore {
         self.stored().map(|(id, _)| id).collect()
     }
 
+    /// The stored ids of the entities whose category `keep` selects, in
+    /// ascending stable_id order, chosen by the category column without
+    /// loading an entity.
+    pub(crate) fn ids_of_categories(&self, keep: impl Fn(EntityCategory) -> bool) -> Vec<u64> {
+        self.check_attached();
+        self.ids
+            .iter()
+            .zip(&self.categories)
+            .zip(&self.entities)
+            .filter(|&((_, &category), entity)| entity.is_some() && keep(category))
+            .map(|((&id, _), _)| id)
+            .collect()
+    }
+
     /// The ids of the stored entities `keep` selects, in ascending stable_id
     /// order. `keep` runs on worker threads ([`crate::sim::parallel`]), so it
     /// only reads.
@@ -444,10 +871,26 @@ impl EntityStore {
         .collect()
     }
 
+    /// `work`'s answer for every stored entity, in ascending stable_id
+    /// order, each written in its place in the result. `work` runs on worker
+    /// threads ([`crate::sim::parallel`]), so it only reads.
+    pub fn par_map<'a, R: Send>(
+        &'a self,
+        work: impl Fn(u64, &'a GameEntity) -> R + Sync,
+    ) -> Vec<R> {
+        let stored: Vec<(u64, &GameEntity)> = self
+            .ids
+            .iter()
+            .zip(&self.entities)
+            .filter_map(|(&id, entity)| Some((id, entity.as_deref()?)))
+            .collect();
+        crate::sim::parallel::map(&stored, |&(id, entity)| work(id, entity))
+    }
+
     /// `pick`'s answers for the stored entities it answers, in ascending
     /// stable_id order. `pick` runs on worker threads
     /// ([`crate::sim::parallel`]), so it only reads.
-    pub(crate) fn par_filter_map<'a, R: Send>(
+    pub fn par_filter_map<'a, R: Send>(
         &'a self,
         pick: impl Fn(u64, &'a GameEntity) -> Option<R> + Sync,
     ) -> Vec<R> {
@@ -465,6 +908,16 @@ impl EntityStore {
     }
     pub(crate) fn techno_registry_len(&self) -> usize {
         self.techno_registry.len()
+    }
+
+    /// UnitClass::Array8B410C is the Unit subset of constructor registration
+    /// order. Derive this one-shot reader view from the existing registry;
+    /// there is no second class list to save or keep in sync.
+    pub(crate) fn unit_registry_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.techno_registry
+            .iter()
+            .copied()
+            .filter(|&id| self.category_of(id) == Some(EntityCategory::Unit))
     }
 
     pub(crate) fn building_registry_at(&self, index: usize) -> Option<u64> {
@@ -519,10 +972,11 @@ impl EntityStore {
 
     /// The entities of `category` in stable_id order, chosen by the category
     /// column without loading the others.
-    pub(crate) fn values_of_category(
+    pub fn values_of_category(
         &self,
         category: EntityCategory,
     ) -> impl Iterator<Item = &GameEntity> {
+        self.check_attached();
         self.categories
             .iter()
             .zip(&self.entities)
@@ -530,10 +984,91 @@ impl EntityStore {
             .filter_map(|(_, entity)| entity.as_deref())
     }
 
+    /// The entities `keep` selects by id and owner, in stable_id order,
+    /// chosen from the id and owner columns without loading the others.
+    /// Debug builds check each owner against its entity (the live-read
+    /// check).
+    pub(crate) fn values_of_owners(
+        &self,
+        keep: impl Fn(u64, InternedId) -> bool,
+    ) -> impl Iterator<Item = &GameEntity> {
+        self.ids
+            .iter()
+            .zip(&self.owners)
+            .zip(&self.entities)
+            .filter_map(move |((&id, &owner), entity)| {
+                let entity = entity.as_deref()?;
+                debug_assert!(
+                    !crate::sim::touch_log::live_read_check_enabled() || entity.owner() == owner,
+                    "the owner column disagrees with entity {id}"
+                );
+                keep(id, owner).then_some(entity)
+            })
+    }
+
     /// Iterate all entities mutably in stable_id order.
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut GameEntity> {
         self.touched.note_all();
+        self.looks.note_all();
+        self.wake_all();
         self.entities.iter_mut().filter_map(Option::as_deref_mut)
+    }
+
+    /// Store an Anim in one of `holder`'s fields [`GameEntity::held_anims`]
+    /// names through `write`, that field's own write, then note every Anim
+    /// the holder holds for [`Self::take_anim_holders`]. The only route to
+    /// such a store: those writes take an [`AnimHolderAuthority`], which
+    /// only this module makes. Clearing a field needs no note. `None` when
+    /// `holder` is not stored.
+    pub(crate) fn write_held_anim<R>(
+        &mut self,
+        holder: u64,
+        write: impl FnOnce(&mut GameEntity, AnimHolderAuthority) -> R,
+    ) -> Option<R> {
+        let slot = self.slot(holder)?;
+        self.touched.note(holder, self.slot_of.len());
+        self.wake_slot(slot as usize);
+        let entity = self.entities[slot as usize].as_deref_mut()?;
+        let written = write(entity, AnimHolderAuthority(()));
+        self.anim_holders
+            .extend(entity.held_anims().map(|anim| (anim, holder)));
+        Some(written)
+    }
+
+    /// The stored entities that may hold `anim` in a field
+    /// [`GameEntity::held_anims`] names, ascending, leaving none noted for
+    /// it: the caller, `Simulation::notify_anim_pointer_expired`, clears
+    /// every such field naming it. Debug builds check that every stored
+    /// entity holding it is among them (the live-read check).
+    pub(crate) fn take_anim_holders(&mut self, anim: u64) -> Vec<u64> {
+        let noted: Vec<u64> = self
+            .anim_holders
+            .range((anim, 0)..=(anim, u64::MAX))
+            .map(|&(_, holder)| holder)
+            .collect();
+        for &holder in &noted {
+            self.anim_holders.remove(&(anim, holder));
+        }
+        let holders: Vec<u64> = noted
+            .into_iter()
+            .filter(|&holder| self.contains(holder))
+            .collect();
+        debug_assert!(
+            !crate::sim::touch_log::live_read_check_enabled()
+                || self
+                    .par_select(|_, entity| entity.held_anims().any(|held| held == anim))
+                    .iter()
+                    .all(|holder| holders.binary_search(holder).is_ok()),
+            "an entity holds Anim {anim} without a noted pair"
+        );
+        holders
+    }
+
+    /// `(Anim, holder)` for every Anim a stored entity holds.
+    fn walk_anim_holders(&self) -> BTreeSet<(u64, u64)> {
+        self.stored()
+            .flat_map(|(id, entity)| entity.held_anims().map(move |anim| (anim, id)))
+            .collect()
     }
 
     /// Move an entity to a new owner. It does NOT touch the houses' tracking
@@ -542,12 +1077,57 @@ impl EntityStore {
     /// No-op if the entity is absent or already owned by `new_owner`.
     pub fn change_owner(&mut self, stable_id: u64, new_owner: crate::sim::intern::InternedId) {
         self.touched.note(stable_id, self.len());
-        if let Some(&slot) = self.slot_of.get(&stable_id)
+        if let Some(slot) = self.slot(stable_id) {
+            self.wake_slot(slot as usize);
+        }
+        if let Some(slot) = self.slot(stable_id)
             && let Some(e) = self.entities[slot as usize].as_deref_mut()
             && e.owner() != new_owner
         {
+            let (old_owner, category) = (e.owner(), e.category());
             e.set_owner_from_store(new_owner, OwnerChangeAuthority(()));
             self.owners[slot as usize] = new_owner;
+            self.unlist_owned(stable_id, (old_owner, category));
+            self.list_owned(stable_id, (new_owner, category));
+            self.looks.note(stable_id, self.slot_of.len());
+        }
+    }
+
+    /// The stored ids of `owner`'s objects of `category`, ascending: the ids
+    /// a walk of every entity in stable_id order keeps for that owner and
+    /// category, without loading the others. Debug builds check them against
+    /// that walk (the live-read check).
+    pub(crate) fn owned_ids(&self, owner: InternedId, category: EntityCategory) -> &[u64] {
+        let ids = self
+            .owned
+            .get(&(owner, category))
+            .map_or(&[][..], Vec::as_slice);
+        debug_assert!(
+            !crate::sim::touch_log::live_read_check_enabled()
+                || ids.iter().copied().eq(self
+                    .stored()
+                    .filter(|(_, entity)| entity.owner() == owner && entity.category() == category)
+                    .map(|(id, _)| id)),
+            "the owned index disagrees with the entities of {owner:?}'s {category:?}"
+        );
+        ids
+    }
+
+    /// Put `id` on the `key` owner's list, in order. Ids mostly arrive
+    /// ascending, so this mostly appends.
+    fn list_owned(&mut self, id: u64, key: (InternedId, EntityCategory)) {
+        let ids = self.owned.entry(key).or_default();
+        if let Err(index) = ids.binary_search(&id) {
+            ids.insert(index, id);
+        }
+    }
+
+    /// Take `id` off the `key` owner's list.
+    fn unlist_owned(&mut self, id: u64, key: (InternedId, EntityCategory)) {
+        if let Some(ids) = self.owned.get_mut(&key)
+            && let Ok(index) = ids.binary_search(&id)
+        {
+            ids.remove(index);
         }
     }
 
@@ -561,10 +1141,11 @@ impl EntityStore {
         bucket: Option<u16>,
         enter_order: u64,
     ) {
-        let Some(&slot) = self.slot_of.get(&stable_id) else {
+        let Some(slot) = self.slot(stable_id) else {
             return;
         };
         self.touched.note(stable_id, self.slot_of.len());
+        self.wake_slot(slot as usize);
         let Some(entity) = self.entities[slot as usize].as_deref_mut() else {
             return;
         };
@@ -575,6 +1156,11 @@ impl EntityStore {
         if let Some(bucket) = bucket {
             self.airborne.insert((bucket, enter_order, stable_id));
         }
+    }
+
+    /// The ids the AircraftTracker holds, in no order a caller may rely on.
+    pub(crate) fn airborne_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.airborne.iter().map(|&(_, _, id)| id)
     }
 
     /// The stored entities the AircraftTracker holds, by enter order and,
@@ -640,9 +1226,20 @@ impl EntityStore {
         self.values().filter_map(airborne_entry).collect()
     }
 
-    /// Rebuild class registries from primary storage. Owned by
-    /// Deserialize; synthetic fixtures may also rebuild after raw setup.
+    /// Rebuild class registries, and the owners' lists, from primary storage.
+    /// Owned by Deserialize; synthetic fixtures may also rebuild after raw
+    /// setup.
     pub(crate) fn rebuild_class_registries(&mut self) {
+        let mut owned: LookupMap<(InternedId, EntityCategory), Vec<u64>> = LookupMap::default();
+        // Storage iterates in ascending stable_id order, so each list comes
+        // out sorted.
+        for (id, entity) in self.stored() {
+            owned
+                .entry((entity.owner(), entity.category()))
+                .or_default()
+                .push(id);
+        }
+        self.owned = owned;
         let infantry: Vec<u64> = self
             .stored()
             .filter(|(_, entity)| entity.category() == EntityCategory::Infantry)
@@ -715,7 +1312,15 @@ impl serde::Serialize for EntityStore {
         // cannot give `collect_map`.
         let mut map = serializer.serialize_map(Some(self.len()))?;
         for (id, entity) in self.stored() {
-            map.serialize_entry(&id, entity)?;
+            // A sleeping entity is saved as its next turn would find it.
+            match self.owed_visits(id) {
+                0 => map.serialize_entry(&id, entity)?,
+                owed => {
+                    let settled = entity.clone();
+                    settled.settle_sleep(owed);
+                    map.serialize_entry(&id, &settled)?;
+                }
+            }
         }
         map.end()
     }
@@ -732,10 +1337,13 @@ impl<'de> serde::Deserialize<'de> for EntityStore {
             store.ids.push(id);
             store.owners.push(entity.owner());
             store.categories.push(entity.category());
+            store.sleep.push(SleepCell::default());
             store.entities.push(Some(entity));
         }
+        store.refocus();
         store.rebuild_class_registries();
         store.airborne = store.walk_airborne();
+        store.anim_holders = store.walk_anim_holders();
         Ok(store)
     }
 }
@@ -753,10 +1361,24 @@ fn airborne_entry(entity: &GameEntity) -> Option<(u16, u64, u64)> {
         .map(|bucket| (bucket, entity.air_spatial_enter_order(), entity.stable_id()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
     use crate::sim::game_entity::GameEntity;
+
+    /// An AI visit steps the counter without handing the entity out, and a
+    /// refused `get_mut_if` hands nothing out either.
+    #[test]
+    fn an_ai_visit_hands_nothing_out() {
+        let mut store = EntityStore::new();
+        store.insert(GameEntity::test_default(7, "MTNK", "Americans", 5, 5));
+        let handed_out = store.hand_outs();
+        store.count_mission_ai_visit(7);
+        store.count_mission_ai_visit(7);
+        assert!(store.get_mut_if(7, |_| false).is_none());
+        assert_eq!(store.hand_outs(), handed_out);
+        assert_eq!(store.get(7).unwrap().mission.ai_counter(), 2);
+    }
 
     /// Populated original412B40 ->4137A0 controls. Buckets hold opaque
     /// tokens; the last numeric row deliberately repeats a token in two
@@ -876,9 +1498,10 @@ mod tests {
     /// across compactions, re-stored ids and ids below the newest; the owner
     /// column follows every entity's owner through them and through
     /// `change_owner`, the category column every entity's category through
-    /// them (and walks of one category keep the stable_id order), and the
-    /// airborne set every entity's tracker membership through them and
-    /// through `set_air_membership`.
+    /// them (and walks of one category keep the stable_id order), each
+    /// owner's list of its objects of a category both, in stable_id order,
+    /// and the airborne set every entity's tracker membership through them
+    /// and through `set_air_membership`.
     #[test]
     fn storage_answers_as_an_ordered_map_through_compactions() {
         let mut store = EntityStore::new();
@@ -1025,6 +1648,16 @@ mod tests {
                             .map(|(&id, _)| id)
                             .collect::<Vec<_>>()
                     );
+                    for house in houses {
+                        assert_eq!(
+                            store.owned_ids(house, class),
+                            owners
+                                .iter()
+                                .filter(|&(id, &owner)| owner == house && categories[id] == class)
+                                .map(|(&id, _)| id)
+                                .collect::<Vec<_>>()
+                        );
+                    }
                 }
                 assert_eq!(
                     store.building_registry,
@@ -1104,6 +1737,14 @@ mod tests {
         assert_eq!(restored.techno_registry, [2, 4, 7]);
         for id in [2, 4, 7] {
             assert_eq!(restored.owner_of(id), Some(store.get(id).unwrap().owner()));
+        }
+        let (americans, russians) = (
+            crate::sim::intern::test_intern("Americans"),
+            crate::sim::intern::test_intern("Russians"),
+        );
+        for copy in [&restored, &store.clone()] {
+            assert_eq!(copy.owned_ids(americans, EntityCategory::Unit), [2, 4]);
+            assert_eq!(copy.owned_ids(russians, EntityCategory::Unit), [7]);
         }
         let airborne: Vec<u64> = restored.airborne().map(GameEntity::stable_id).collect();
         assert_eq!(
@@ -1196,63 +1837,84 @@ mod tests {
         assert_eq!(store.foot_registry, [2, 4]);
     }
 
+    /// An Anim's expiry reaches each stored entity holding the Anim, once
+    /// and ascending, whether a held-Anim write stored it, the entity was
+    /// stored holding it or a load restored it, and no removed holder.
     #[test]
-    fn test_insert_and_get() {
+    fn anim_holders_reach_every_holder_through_writes_inserts_and_loads() {
+        let hold = |entity: &mut GameEntity, authority: AnimHolderAuthority| {
+            entity.hold_parachute_animation(50, authority)
+        };
         let mut store = EntityStore::new();
-        store.insert(make_entity(1));
-        store.insert(make_entity(2));
-
-        assert_eq!(store.len(), 2);
-        assert!(!store.is_empty());
-        assert!(store.contains(1));
-        assert!(store.contains(2));
-        assert!(!store.contains(3));
-
-        let e = store.get(1).expect("entity 1 should exist");
-        assert_eq!(e.stable_id(), 1);
+        let mut stored_holding = make_entity(3);
+        hold(&mut stored_holding, AnimHolderAuthority(()));
+        store.insert(stored_holding);
+        for id in [1, 2, 4] {
+            store.insert(make_entity(id));
+        }
+        for id in [1, 4] {
+            store.write_held_anim(id, hold).unwrap();
+        }
+        store.remove(4);
+        let loaded: EntityStore = crate::util::save_codec::deserialize(
+            &crate::util::save_codec::serialize(&store).unwrap(),
+        )
+        .unwrap();
+        for mut copy in [store.clone(), loaded] {
+            assert_eq!(copy.take_anim_holders(50), [1, 3]);
+        }
     }
 
+    /// A focused id answers as the id index does while its slot moves under
+    /// it (an id stored below it, a compaction), when it is removed and
+    /// stored again, and when the store never held it; a load answers for
+    /// its own ids.
     #[test]
-    fn test_get_mut() {
+    fn a_focused_id_answers_as_the_id_index_does_while_its_slot_moves() {
         let mut store = EntityStore::new();
-        store.insert(make_entity(1));
-
-        let e = store.get_mut(1).expect("entity 1 should exist");
-        e.health.set_for_test(50);
-
-        let e = store.get(1).expect("entity 1 should exist");
-        assert_eq!(e.health.current(), 50);
-    }
-
-    #[test]
-    fn test_remove() {
-        let mut store = EntityStore::new();
-        store.insert(make_entity(1));
-        store.insert(make_entity(2));
-
-        let removed = store.remove(1);
-        assert!(removed.is_some());
-        assert_eq!(removed.expect("should be Some").stable_id(), 1);
-        assert_eq!(store.len(), 1);
-        assert!(!store.contains(1));
-        assert!(store.contains(2));
-
-        // Removing non-existent ID returns None.
-        assert!(store.remove(99).is_none());
-    }
-
-    #[test]
-    fn clear_radio_contacts_removes_one_sided_peer_contact() {
-        let mut store = EntityStore::new();
-        let mut entity = make_entity(1);
-        entity.mark_live_contact_with(2);
-        store.insert(entity);
-        store.insert(make_entity(2));
-
-        store.clear_radio_contacts_for(2);
-
-        assert!(store.get(1).unwrap().radio_contacts.is_empty());
-        assert!(store.get(2).unwrap().radio_contacts.is_empty());
+        for id in (10..=400).step_by(2) {
+            store.insert(make_entity(id));
+        }
+        let held = |store: &mut EntityStore, id: u64| {
+            let found = [
+                store.get(id).map(GameEntity::stable_id),
+                store.get_mut(id).map(|entity| entity.stable_id()),
+                store.get_in_slot(id).map(|(_, entity)| entity.stable_id()),
+            ];
+            assert_eq!(found, [store.contains(id).then_some(id); 3]);
+            assert_eq!(store.owner_of(id).is_some(), store.contains(id));
+            assert_eq!(store.category_of(id).is_some(), store.contains(id));
+            store.contains(id)
+        };
+        store.focus(300);
+        assert!(held(&mut store, 300));
+        // An id stored below it shifts its slot by one.
+        store.insert(make_entity(11));
+        assert!(held(&mut store, 300));
+        // The removal that compacts the store moves it again.
+        let slots = store.ids.len();
+        let mut below = (10..200).step_by(2);
+        while store.ids.len() == slots {
+            store.remove(below.next().expect("a removal compacts the store"));
+        }
+        assert!(held(&mut store, 300));
+        store.remove(300);
+        assert!(!held(&mut store, 300));
+        store.insert(make_entity(300));
+        assert!(held(&mut store, 300));
+        // An id the store never held is absent until it is stored.
+        store.focus(7);
+        assert!(!held(&mut store, 7));
+        store.insert(make_entity(7));
+        assert!(held(&mut store, 7) && held(&mut store, 300) && !held(&mut store, 10));
+        let mut loaded: EntityStore = crate::util::save_codec::deserialize(
+            &crate::util::save_codec::serialize(&store).unwrap(),
+        )
+        .unwrap();
+        let mut copy = store.clone();
+        for other in [&mut loaded, &mut copy] {
+            assert!(held(other, 7) && held(other, 300) && !held(other, 0));
+        }
     }
 
     #[test]
@@ -1269,22 +1931,6 @@ mod tests {
 
         assert!(store.get(1).unwrap().radio_contacts.is_empty());
         assert!(store.get(2).unwrap().radio_contacts.is_empty());
-    }
-
-    #[test]
-    fn clear_radio_contacts_missing_id_preserves_unrelated_contacts() {
-        let mut store = EntityStore::new();
-        let mut entity = make_entity(1);
-        entity.radio_contacts.set_capacity(4); // hold more than one contact
-        entity.mark_live_contact_with(2);
-        entity.mark_live_contact_with(3);
-        store.insert(entity);
-
-        store.clear_radio_contacts_for(99);
-
-        let contacts = &store.get(1).unwrap().radio_contacts;
-        assert_eq!(contacts.len(), 2);
-        assert!(contacts.contains(2) && contacts.contains(3));
     }
 
     #[test]
@@ -1306,129 +1952,5 @@ mod tests {
         assert!(contacts.contains(2) && contacts.contains(4) && !contacts.contains(3));
         assert_eq!(contacts.find_slot(2), Some(0));
         assert_eq!(contacts.find_slot(4), Some(2));
-    }
-
-    #[test]
-    fn test_deterministic_iteration_order() {
-        let mut store = EntityStore::new();
-        // Insert in non-sorted order.
-        store.insert(make_entity(5));
-        store.insert(make_entity(1));
-        store.insert(make_entity(3));
-        store.insert(make_entity(2));
-        store.insert(make_entity(4));
-
-        let keys: Vec<u64> = store.keys_sorted();
-        assert_eq!(keys, vec![1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn test_iter_sorted() {
-        let mut store = EntityStore::new();
-        store.insert(make_entity(3));
-        store.insert(make_entity(1));
-        store.insert(make_entity(2));
-
-        let ids: Vec<u64> = store.iter_sorted().map(|(id, _)| id).collect();
-        assert_eq!(ids, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn test_values_sorted() {
-        let mut store = EntityStore::new();
-        store.insert(make_entity(3));
-        store.insert(make_entity(1));
-        store.insert(make_entity(2));
-
-        let ids: Vec<u64> = store.values_sorted().map(|e| e.stable_id()).collect();
-        assert_eq!(ids, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn test_sorted_after_mutation() {
-        let mut store = EntityStore::new();
-        store.insert(make_entity(1));
-        store.insert(make_entity(3));
-
-        let keys: Vec<u64> = store.keys_sorted();
-        assert_eq!(keys, vec![1, 3]);
-
-        // Insert maintains order.
-        store.insert(make_entity(2));
-        let keys: Vec<u64> = store.keys_sorted();
-        assert_eq!(keys, vec![1, 2, 3]);
-
-        // Remove maintains order.
-        store.remove(1);
-        let keys: Vec<u64> = store.keys_sorted();
-        assert_eq!(keys, vec![2, 3]);
-    }
-
-    #[test]
-    fn test_empty_store() {
-        let store = EntityStore::new();
-        assert!(store.is_empty());
-        assert_eq!(store.len(), 0);
-        assert!(store.get(1).is_none());
-
-        let keys: Vec<u64> = store.keys_sorted();
-        assert!(keys.is_empty());
-    }
-
-    #[test]
-    fn test_mutable_iteration_pattern() {
-        let mut store = EntityStore::new();
-        store.insert(make_entity(1));
-        store.insert(make_entity(2));
-        store.insert(make_entity(3));
-
-        // The canonical pattern for mutating during iteration:
-        // collect keys, then get_mut each entity.
-        let keys = store.keys_sorted();
-        for &id in &keys {
-            if let Some(entity) = store.get_mut(id) {
-                entity
-                    .health
-                    .set_for_test(entity.health.current().saturating_sub(10));
-            }
-        }
-
-        // Verify all were mutated.
-        for &id in &[1u64, 2, 3] {
-            let e = store.get(id).expect("should exist");
-            assert_eq!(e.health.current(), 90);
-        }
-    }
-
-    #[test]
-    fn test_cross_entity_read_pattern() {
-        let mut store = EntityStore::new();
-        let mut e1 = make_entity(1);
-        e1.position.set_rx_for_test(10);
-        e1.position.set_ry_for_test(20);
-        store.insert(e1);
-
-        let mut e2 = make_entity(2);
-        e2.position.set_rx_for_test(30);
-        e2.position.set_ry_for_test(40);
-        store.insert(e2);
-
-        // Read target position first (immutable borrow ends).
-        let target_pos = store.get(2).map(|e| e.position);
-        // Then mutate attacker (no conflict).
-        if let (Some(attacker), Some(pos)) = (store.get_mut(1), target_pos) {
-            // In real code: compute firing direction, apply cooldown, etc.
-            assert_eq!(pos.rx(), 30);
-            attacker.body_facing.snap(0x8000, 0); // face toward target
-        }
-
-        assert_eq!(
-            store
-                .get(1)
-                .expect("should exist")
-                .body_facing
-                .destination(),
-            0x8000
-        );
     }
 }

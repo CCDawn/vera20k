@@ -1,7 +1,6 @@
 //! Paid stock Industrial Plant/HTNK history through the bound production runtime.
 //! Native: House50BF60/50BEB0, Factory4C9C70/4C9FF0, Selling449C30,
-//! HowManySurvivors451330, Rules667371/670C13, gamemd SHA256
-//! 1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c.
+//! HowManySurvivors451330, Rules667371/670C13, gamemd.
 //! Instruction/retail-derived expectations; this is a Rust regression, not
 //! original execution, a native charging timestamp or whole-game parity.
 
@@ -25,9 +24,9 @@ fn stock_scene(root: &std::path::Path) -> HeadlessScenario {
         "XMP03T4.MAP",
         &[(LaunchCountry::Russia, AiDifficulty::Easy)],
     );
-    launch.player_name = OWNER.to_owned();
-    launch.local.country = LaunchCountry::Russia;
-    launch.local.start_position = LaunchStartPosition::Position(0);
+    launch.local_player_mut().name = OWNER.to_owned();
+    launch.local_slot_mut().country = LaunchCountry::Russia;
+    launch.local_slot_mut().start_position = LaunchStartPosition::Position(0);
     launch.opponents[0].start_position = LaunchStartPosition::Position(1);
     launch.options = SkirmishLaunchOptions {
         starting_credits: 10_000,
@@ -48,13 +47,18 @@ fn stock_scene(root: &std::path::Path) -> HeadlessScenario {
         multi_engineer: false,
         harvester_truce: false,
         ally_change_allowed: true,
+        bans: Default::default(),
+        teams: None,
+        auto_balance: false,
+        queue: Vec::new(),
+        host_rules: Default::default(),
     };
     load_session(root, "XMP03T4.MAP", 0x1234_5678, launch).expect("stock Battle loads")
 }
 
 fn tank_factory(sim: &Simulation, owner: InternedId) -> &Factory {
     sim.production
-        .factories
+        .factories()
         .factory(FactoryHolder::House(owner, CATEGORY))
         .expect("the actual paid tank Factory")
 }
@@ -107,7 +111,7 @@ fn stock_plant_gain_and_sale_preserve_tank_debt_and_settle_current_price() {
         let owner = sim.interner.get(OWNER).unwrap();
         let tank = sim.interner.get("HTNK").unwrap();
         let plant_type = sim.interner.get("NAINDP").unwrap();
-        assert_eq!(sim.houses[&owner].side_index, 1);
+        assert_eq!(sim.houses[&owner].side_index(), 1);
         let local: Vec<_> = sim
             .entities()
             .iter_sorted()
@@ -152,7 +156,7 @@ fn stock_plant_gain_and_sale_preserve_tank_debt_and_settle_current_price() {
                 .and_then(|id| sim.entities().get(id))
                 .and_then(|entity| entity.miner.as_ref())
                 .is_some_and(|miner| !miner.cargo().is_empty());
-            let wallet = &sim.houses[&owner].economy;
+            let wallet = sim.houses[&owner].economy();
             let money_before = (wallet.credits(), wallet.spent_credits(), wallet.score());
             let gross_before = i64::from(money_before.0) + i64::from(money_before.1);
             if step == 11800 {
@@ -164,7 +168,7 @@ fn stock_plant_gain_and_sale_preserve_tank_debt_and_settle_current_price() {
                 assert!(sim.entities().get(id).unwrap().lifecycle.in_limbo());
                 assert!(
                     sim.houses[&owner]
-                        .base_projection
+                        .base_projection()
                         .factory_plants()
                         .is_empty()
                 );
@@ -201,10 +205,10 @@ fn stock_plant_gain_and_sale_preserve_tank_debt_and_settle_current_price() {
             }
             let cancel = matches!(step, 12100 | 12600).then(|| {
                 let factory = tank_factory(sim, owner);
-                assert!(factory.suspended && factory.progress > 0);
+                assert!(factory.suspended() && factory.progress() > 0);
                 (
-                    factory.object.as_ref().unwrap().entity_id.unwrap(),
-                    factory.balance,
+                    factory.object().unwrap().entity_id.unwrap(),
+                    factory.balance(),
                     sim.cost_of(owner, rules.object("HTNK").unwrap(), rules),
                 )
             });
@@ -228,15 +232,29 @@ fn stock_plant_gain_and_sale_preserve_tank_debt_and_settle_current_price() {
             });
             let commands: Vec<_> = command
                 .into_iter()
-                .map(|command| CommandEnvelope::new(owner, sim.session.tick, command))
+                .map(|command| CommandEnvelope::new(owner, sim.session.tick(), command))
                 .collect();
+            // Mobile completion belongs to the local Strip visit, which emits
+            // the ordinary PLACE record. A resource-bound headless frame alone
+            // has no sidebar and leaves a fully paid tank in its Factory.
+            let visits = scene
+                .runtime
+                .simulation
+                .production
+                .factories()
+                .strip_visits_for_test(owner);
             scene
                 .runtime
-                .advance_frame(&commands, 22, TickLane::Ordinary, FrameEffects::default())
+                .advance_frame(
+                    &commands,
+                    22,
+                    TickLane::Ordinary,
+                    FrameEffects::default().with_production_strip(&visits, &|_| {}),
+                )
                 .expect("ordinary bound-resource frame");
             let sim = scene.sim();
             let rules = &scene.runtime.resources.rules;
-            let wallet = &sim.houses[&owner].economy;
+            let wallet = sim.houses[&owner].economy();
             if step < 11800 && carrying_before {
                 earned_income |= miner
                     .and_then(|id| sim.entities().get(id))
@@ -252,8 +270,8 @@ fn stock_plant_gain_and_sale_preserve_tank_debt_and_settle_current_price() {
                     675
                 };
                 let factory = tank_factory(sim, owner);
-                assert_eq!((factory.progress, factory.balance), (0, price));
-                let id = factory.object.as_ref().unwrap().entity_id.unwrap();
+                assert_eq!((factory.progress(), factory.balance()), (0, price));
+                let id = factory.object().unwrap().entity_id.unwrap();
                 assert!(sim.entities().get(id).unwrap().lifecycle.in_limbo());
                 if step == 12700 {
                     delivered = Some(id);
@@ -261,14 +279,14 @@ fn stock_plant_gain_and_sale_preserve_tank_debt_and_settle_current_price() {
             }
             if matches!(step, 11890 | 12300) {
                 let factory = tank_factory(sim, owner);
-                assert!(factory.suspended && factory.progress > 0);
-                let id = factory.object.as_ref().unwrap().entity_id.unwrap();
+                assert!(factory.suspended() && factory.progress() > 0);
+                let id = factory.object().unwrap().entity_id.unwrap();
                 if step == 11890 {
-                    assert!((675..900).contains(&factory.balance));
-                    first = Some((id, factory.balance));
+                    assert!((675..900).contains(&factory.balance()));
+                    first = Some((id, factory.balance()));
                 } else {
-                    assert!((0..675).contains(&factory.balance));
-                    second = Some((id, factory.balance));
+                    assert!((0..675).contains(&factory.balance()));
+                    second = Some((id, factory.balance()));
                 }
             }
             if step == 12000 {
@@ -276,7 +294,7 @@ fn stock_plant_gain_and_sale_preserve_tank_debt_and_settle_current_price() {
                 let entity = sim.entities().get(id).unwrap();
                 assert!(!entity.lifecycle.in_limbo());
                 assert_eq!(entity.building_ready_latch(), 0);
-                assert_eq!(sim.houses[&owner].base_projection.factory_plants(), [id]);
+                assert_eq!(sim.houses[&owner].base_projection().factory_plants(), [id]);
                 assert_eq!(
                     sim.cost_of(owner, rules.object("HTNK").unwrap(), rules),
                     675
@@ -284,19 +302,13 @@ fn stock_plant_gain_and_sale_preserve_tank_debt_and_settle_current_price() {
             }
             if (11890..12100).contains(&step) {
                 let factory = tank_factory(sim, owner);
-                assert_eq!(
-                    factory.object.as_ref().unwrap().entity_id,
-                    Some(first.unwrap().0)
-                );
-                assert_eq!(factory.balance, first.unwrap().1);
+                assert_eq!(factory.object().unwrap().entity_id, Some(first.unwrap().0));
+                assert_eq!(factory.balance(), first.unwrap().1);
             }
             if (12300..12600).contains(&step) {
                 let factory = tank_factory(sim, owner);
-                assert_eq!(
-                    factory.object.as_ref().unwrap().entity_id,
-                    Some(second.unwrap().0)
-                );
-                assert_eq!(factory.balance, second.unwrap().1);
+                assert_eq!(factory.object().unwrap().entity_id, Some(second.unwrap().0));
+                assert_eq!(factory.balance(), second.unwrap().1);
             }
             if let Some((id, balance, price)) = cancel {
                 assert_eq!(wallet.credits(), money_before.0 + price - balance);
@@ -306,7 +318,9 @@ fn stock_plant_gain_and_sale_preserve_tank_debt_and_settle_current_price() {
                 );
                 assert!(sim.entities().get(id).is_none());
                 assert_eq!(
-                    sim.production.factories.count_total(owner, CATEGORY, tank),
+                    sim.production
+                        .factories()
+                        .count_total(owner, CATEGORY, tank),
                     0
                 );
                 if step == 12100 {
@@ -339,7 +353,7 @@ fn stock_plant_gain_and_sale_preserve_tank_debt_and_settle_current_price() {
                     assert_eq!(wallet.spent_credits(), money_before.1);
                     assert!(
                         sim.houses[&owner]
-                            .base_projection
+                            .base_projection()
                             .factory_plants()
                             .is_empty()
                     );
@@ -376,7 +390,13 @@ fn stock_plant_gain_and_sale_preserve_tank_debt_and_settle_current_price() {
             assert!(sim.entities().get(id).is_none());
         }
         let tank = sim.entities().get(delivered.unwrap()).unwrap();
-        assert!(tank.is_active() && tank.is_alive() && !tank.lifecycle.in_limbo());
+        assert!(
+            tank.is_active() && tank.is_alive() && !tank.lifecycle.in_limbo(),
+            "sell={sell}, factory={:?}",
+            sim.production
+                .factories()
+                .factory(FactoryHolder::House(owner, CATEGORY)),
+        );
         assert_eq!(sim.interner.resolve(tank.type_ref()), "HTNK");
         assert_eq!(tank.health.current(), 400);
         assert_eq!(sim.entities().get(plant.unwrap()).is_none(), sell);

@@ -4,7 +4,7 @@
 //! `paradrop_missions`, `drop_payload`, `spawn_parachuted`; `--check`
 //! regenerates them), and drops on retail rules through production frames.
 
-use super::{ParaDropKind, board_passengers, launch, retarget, send_planes};
+use super::{ParaDropKind, Payload, board_passengers, launch, retarget, send_planes};
 use crate::map::entities::EntityCategory;
 use crate::map::playfield::PlayfieldBounds;
 use crate::map::resolved_terrain::NativeCellQuery;
@@ -94,9 +94,9 @@ fn names_unallocated_type(lists: &Value) -> bool {
 /// A replay's rules: PDPLANE as retail authors it (unless `plane` is false),
 /// E1, E2 and INIT, both paradrop Supers, the `[General]` list keys and
 /// `ParadropRadius=radius`.
-fn rules(lists: &str, plane: bool, radius: i32) -> RuleSet {
+fn rules_text(lists: &str, plane: bool, radius: i32) -> String {
     let aircraft = if plane { "0=PDPLANE\n" } else { "" };
-    let ini = IniFile::from_str(&format!(
+    format!(
         "[General]\n{lists}FlightLevel=1500\nParadropRadius={radius}\n\
          [InfantryTypes]\n0=E1\n1=E2\n2=INIT\n[VehicleTypes]\n[AircraftTypes]\n{aircraft}\
          [BuildingTypes]\n[SuperWeaponTypes]\n0={PARADROP}\n1={AMER_PARADROP}\n\
@@ -104,8 +104,11 @@ fn rules(lists: &str, plane: bool, radius: i32) -> RuleSet {
          [E1]\nStrength=125\n[E2]\nStrength=125\n[INIT]\nStrength=125\n\
          [PDPLANE]\nStrength=400\nSpeed=15\nROT=2\nAmmo=100\nLandable=no\nSelectable=no\n\
          Spawned=yes\nSight=0\nLocomotor={FLY}\n",
-    ));
-    RuleSet::from_ini(&ini).unwrap()
+    )
+}
+
+fn rules(lists: &str, plane: bool, radius: i32) -> RuleSet {
+    RuleSet::from_ini(&IniFile::from_str(&rules_text(lists, plane, radius))).unwrap()
 }
 
 fn retail_list_rules(radius: i32) -> RuleSet {
@@ -128,7 +131,7 @@ fn set_tile(sim: &mut Simulation, cell: (u16, u16), offset: i32) {
     sim.resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(cell.0, cell.1)
+        .cell_mut_for_test(cell.0, cell.1)
         .unwrap()
         .final_tile_index = WATER_SET + offset;
 }
@@ -201,6 +204,7 @@ fn plane_at(sim: &mut Simulation, rules: &RuleSet, at: (u16, u16), passengers: u
         rules,
         id,
         "Americans",
+        crate::rules::object_type::ObjectCategory::Infantry,
         "E1",
         passengers,
         Default::default(),
@@ -218,7 +222,7 @@ fn plane_at(sim: &mut Simulation, rules: &RuleSet, at: (u16, u16), passengers: u
 /// finds none free.
 fn fill_spots(sim: &mut Simulation, cell: (u16, u16)) {
     for spot in [2, 3, 4] {
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         let mut blocker = GameEntity::test_default(id, "E1", "Americans", cell.0, cell.1);
         blocker.set_owner_for_test(sim.interner.intern("Americans"));
         blocker.set_type_ref_for_test(sim.interner.intern("E1"));
@@ -248,7 +252,10 @@ fn chute_sounds(sim: &Simulation) -> Vec<(u16, u16)> {
     sim.sound_events
         .iter()
         .filter_map(|event| match event {
-            SimSoundEvent::ChuteSound { rx, ry } => Some((*rx, *ry)),
+            SimSoundEvent::ChuteSound { world } => {
+                let (rx, ry, ..) = world.to_cell_sub_z();
+                Some((rx, ry))
+            }
             _ => None,
         })
         .collect()
@@ -341,7 +348,10 @@ fn launch_cases_five_and_six_match_native() {
         if let Some(tile) = tile {
             set_tile(&mut sim, TARGET, tile);
         }
-        sim.houses.get_mut(&americans).unwrap().side_index = int(&row["side"]) as u8;
+        sim.houses
+            .get_mut(&americans)
+            .unwrap()
+            .set_side_index_for_test(int(&row["side"]) as i32);
         let sw_type = if charged {
             charge_super(&mut sim, americans, name)
         } else {
@@ -464,12 +474,12 @@ fn a_water_click_sends_the_plane_to_land_beside_it() {
         .resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(TARGET.0, TARGET.1)
+        .cell_mut_for_test(TARGET.0, TARGET.1)
         .unwrap();
     // Water: Foot's speed there is 0.
     cell.land_type = 2;
-    cell.speed_costs.foot = Some(0);
-    cell.base_speed_costs.foot = Some(0);
+    cell.speed_costs.foot = Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO);
+    cell.base_speed_costs.foot = Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO);
     crate::sim::arena_fixture::supply_native_map(&mut sim);
     let sw_type = charge_super(&mut sim, americans, PARADROP);
 
@@ -572,7 +582,10 @@ fn send_paradrop_planes_matches_native() {
             authored_replayed += 1;
         }
         let waypoint_edge = u8::try_from(int(&row["waypoint_edge"])).unwrap_or(u8::MAX);
-        sim.houses.get_mut(&americans).unwrap().waypoint_edge = waypoint_edge;
+        sim.houses
+            .get_mut(&americans)
+            .unwrap()
+            .set_waypoint_edge_for_test(waypoint_edge);
         let own = edge(pick);
         if !(0..=3).contains(&house_edge) {
             assert_eq!(own, Edge::own_edge(waypoint_edge), "{row}");
@@ -595,7 +608,7 @@ fn send_paradrop_planes_matches_native() {
             "PDPLANE",
             MissionType::ParadropApproach,
             TARGET,
-            Some((infantry, num)),
+            Payload::Infantry(infantry, num),
             crate::sim::world::FrameEffects::default(),
         ));
 
@@ -623,7 +636,7 @@ fn send_paradrop_planes_matches_native() {
             (entity.position.sub_x(), entity.position.sub_y()),
             (SimFixed::from_num(128), SimFixed::from_num(128))
         );
-        assert_eq!(entity.body_facing_current(sim.session.binary_frame), 0);
+        assert_eq!(entity.body_facing_current(sim.session.binary_frame()), 0);
         let mut infantry: Vec<u64> = sim
             .substrate
             .entities
@@ -687,7 +700,9 @@ fn mission_plane(sim: &mut Simulation, rules: &RuleSet, row: &Value, target: (u1
                 .set_sub_y_for_test(SimFixed::from_num(y % 256));
             let entities = &sim.substrate.entities;
             let plane = entities.get(id).unwrap();
-            if crate::sim::combat::object_distance_to(plane, &goal, &sim) == Some(distance) {
+            if crate::sim::combat::object_distance_to(plane.stable_id(), &goal, &sim)
+                == Some(distance)
+            {
                 placed = true;
                 break 'search;
             }
@@ -747,7 +762,7 @@ fn paradrop_missions_match_native() {
         };
         let (rules, mut sim, _) = paradrop_world(retail_list_rules(int(&row["radius"])));
         let id = mission_plane(&mut sim, &rules, row, target);
-        let now = sim.session.binary_frame;
+        let now = sim.session.binary_frame();
 
         let (observed, records) = observe(7, || {
             crate::sim::aircraft::dispatch_mission(&mut sim, id, &rules, Default::default());
@@ -839,7 +854,7 @@ fn drop_payload_matches_native() {
             fill_spots(&mut sim, landing.unwrap());
         }
         if !flag(row, "spawned") {
-            sim.playfield_bounds = Some(NO_DROP_PLAYFIELD);
+            sim.set_playfield_bounds_for_test(Some(NO_DROP_PLAYFIELD));
         }
         let neighbours: Vec<(i16, i16)> = ids
             .iter()
@@ -849,12 +864,12 @@ fn drop_payload_matches_native() {
                     .get(id)
                     .unwrap()
                     .navigation
-                    .neighbor_state
+                    .neighbor_state()
                     .cell()
             })
             .collect();
-        sim.session.binary_frame = 4321;
-        sim.sound_events.clear();
+        sim.session.set_binary_frame_for_test(4321);
+        sim.sound_events.clear_for_test();
 
         let can_enter = int(&row["can_enter"]) as u8;
         let (observed, records) = observe(can_enter, || {
@@ -981,7 +996,7 @@ fn drop_payload_matches_native() {
                 .get(id)
                 .unwrap()
                 .navigation
-                .neighbor_state
+                .neighbor_state()
                 .cell();
             assert_eq!(cell, expected, "{row}");
         }
@@ -1006,11 +1021,15 @@ fn spawn_parachuted_matches_native() {
             panic!("one passenger");
         };
         let house = sim.houses.get_mut(&americans).unwrap();
-        house.is_human = flag(row, "human");
-        house.player_control = flag(row, "player_control");
-        sim.session.game_mode_nonzero = int(&row["game_mode"]) != 0;
+        house.set_is_human_for_test(flag(row, "human"));
+        house.set_player_control_for_test(flag(row, "player_control"));
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+                int(&row["game_mode"]) != 0,
+            ),
+        );
         if !flag(row, "paradropped") {
-            sim.playfield_bounds = Some(NO_DROP_PLAYFIELD);
+            sim.set_playfield_bounds_for_test(Some(NO_DROP_PLAYFIELD));
         }
 
         let (observed, _) = observe(0, || {
@@ -1087,7 +1106,7 @@ fn fly_out(
     };
     let mut frames = 0;
     while sim.substrate.entities.contains(plane) || busy(sim) {
-        sim.sound_events.clear();
+        sim.sound_events.clear_for_test();
         step(sim, rules);
         frames += 1;
         chutes += chute_sounds(sim).len();
@@ -1193,8 +1212,14 @@ fn retail_computer_paradrops_conscripts_past_the_enemy_base() {
     };
     let (rules, mut sim, americans) = paradrop_world(rules);
     let russians: InternedId = sim.interner.intern("Russians");
-    sim.houses.get_mut(&russians).unwrap().enemy_house = Some(americans);
-    sim.houses.get_mut(&americans).unwrap().base_center = Some(TARGET);
+    sim.houses
+        .get_mut(&russians)
+        .unwrap()
+        .set_enemy_house_for_test(Some(americans));
+    sim.houses
+        .get_mut(&americans)
+        .unwrap()
+        .set_base_center_for_test(Some(TARGET));
     let sw_type = charge_super(&mut sim, russians, PARADROP);
 
     super::super::ai_fire::try_fire(
@@ -1228,4 +1253,205 @@ fn retail_computer_paradrops_conscripts_past_the_enemy_base() {
 
     assert_eq!(chutes, 9);
     assert_landed(&sim, &passengers, &missions, target, MissionType::Hunt);
+}
+
+/// SW_ParaDrop::Activate (Ares.dll 10073CD0) for `owner`'s Super `sw_type`
+/// at [`TARGET`].
+fn ares_launch(
+    rules: &RuleSet,
+    sim: &mut Simulation,
+    owner: InternedId,
+    sw_type: InternedId,
+) -> bool {
+    let name = sim.interner.resolve(sw_type).to_owned();
+    super::ares_launch(
+        sim,
+        rules,
+        owner,
+        sw_type,
+        rules.super_weapon(&name).unwrap(),
+        TARGET,
+        crate::sim::world::FrameEffects::default(),
+    )
+}
+
+/// The type IDs aboard each plane, head first.
+fn cargo_types(sim: &Simulation) -> Vec<Vec<&str>> {
+    planes(sim)
+        .into_iter()
+        .map(|plane| {
+            cargo(sim, plane)
+                .into_iter()
+                .map(|id| {
+                    sim.interner
+                        .resolve(sim.substrate.entities.get(id).unwrap().type_ref())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// SW_ParaDrop's own planes (LoadFromINI 10073F70, SendParadrop 10074350,
+/// SendPDPlane 100741A0). `ParaDrop.Count=3` flies three planes. The default
+/// plane's AircraftType goes (`remove_non_paradroppables` 100768C0) before
+/// the count check, and the plane carries every type its count times, the
+/// last built at the cargo's head. A `.Plane2.Types` without `.Num` loses
+/// both lists, so plane 2 takes the default plane's; the Side's own plane 3
+/// beats both.
+#[test]
+fn ares_super_paradrop_planes_carry_every_type() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let text = rules_text("AllyParaDropInf=E1\nAllyParaDropNum=6\n", true, 1024)
+        .replacen("[VehicleTypes]\n", "[VehicleTypes]\n0=MTNK\n", 1)
+        .replacen(
+            "Type=ParaDrop\n",
+            "Type=ParaDrop\nParaDrop.Count=3\nParaDrop.Types=E1,PDPLANE,MTNK\n\
+             ParaDrop.Num=2,3\nParaDrop.Plane2.Types=INIT\n\
+             ParaDrop.GDI.Plane3.Types=E2\nParaDrop.GDI.Plane3.Num=1\n",
+            1,
+        )
+        + "[MTNK]\nStrength=300\n[Sides]\nGDI=x\nNod=x\n";
+    let processed = crate::rules::native_processing::RulesLayerStack::new(IniFile::from_str(&text))
+        .process()
+        .expect("per-Super paradrop rules process");
+    let rules = RuleSet::from_processed_rules(&processed).expect("per-Super paradrop projection");
+    let (rules, mut sim, owner) = paradrop_world(rules);
+    let sw_type = charge_super(&mut sim, owner, PARADROP);
+
+    assert!(ares_launch(&rules, &mut sim, owner, sw_type));
+
+    let full = ["MTNK", "MTNK", "MTNK", "E1", "E1"];
+    assert_eq!(cargo_types(&sim), [&full[..], &full[..], &["E2"][..]]);
+}
+
+/// Ares 3.0 `[Side] ParaDrop.Types/Num/Aircraft` for a fourth side. With no
+/// planes of its own the Super sends one plane of the fallback content,
+/// which is the Side's SideExt lists, and a `none` plane falls back to
+/// PDPLANE (`HouseTypeExt::GetParadropPlane @ 0x1001BCB0`) instead of
+/// cancelling.
+fn ares_fourth_side_rules(lists: &str, fourth: &str) -> RuleSet {
+    let text = format!(
+        "{}\n[Sides]\nGDI=x\nNod=x\nThirdSide=x\nFourth=x\n[Fourth]\n{fourth}\n",
+        rules_text(lists, true, 1024)
+    );
+    let processed = crate::rules::native_processing::RulesLayerStack::new(IniFile::from_str(&text))
+        .process()
+        .expect("fourth-side paradrop rules process");
+    RuleSet::from_processed_rules(&processed).expect("fourth-side paradrop projection")
+}
+
+#[test]
+fn ares_fourth_side_paradrop_uses_side_lists_and_none_plane_falls_back() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let (rules, mut sim, owner) = paradrop_world(ares_fourth_side_rules(
+        "AllyParaDropInf=E1\nAllyParaDropNum=6\n",
+        "ParaDrop.Types=E2\nParaDrop.Num=2\nParaDrop.Aircraft=none\n",
+    ));
+    sim.houses
+        .get_mut(&owner)
+        .unwrap()
+        .set_side_index_for_test(3);
+    let sw_type = charge_super(&mut sim, owner, PARADROP);
+    assert!(ares_launch(&rules, &mut sim, owner, sw_type));
+    let [plane] = planes(&sim)[..] else {
+        panic!("one plane");
+    };
+    let cargo = cargo(&sim, plane);
+    assert_eq!(cargo.len(), 2);
+    for id in cargo {
+        assert_eq!(
+            sim.interner
+                .resolve(sim.substrate.entities.get(id).unwrap().type_ref()),
+            "E2"
+        );
+    }
+}
+
+/// Ares 3.0 `[Country] ParaDrop.Types/Num=` for the acting house's country.
+/// `GetParadropContent @ 0x1001BC20` prefers it over the side's lists, and
+/// SendPDPlane (100741A0) sends nothing for types without counts. The
+/// country's side is the house's: the Super's list for it counts as many
+/// planes as its Side's (10073F70).
+fn ares_country_paradrop_rules(country: &str) -> RuleSet {
+    let text = format!(
+        "{}
+[Sides]
+GDI=x
+Nod=x
+ThirdSide=x
+Fourth=x
+         [Fourth]
+ParaDrop.Types=E2
+ParaDrop.Num=2
+ParaDrop.Aircraft=PDPLANE
+         [Countries]
+0=Greece
+[Greece]
+Side=Fourth
+{}
+",
+        rules_text(
+            "AllyParaDropInf=E1
+AllyParaDropNum=6
+",
+            true,
+            1024
+        ),
+        country
+    );
+    let processed = crate::rules::native_processing::RulesLayerStack::new(IniFile::from_str(&text))
+        .process()
+        .expect("country paradrop rules process");
+    RuleSet::from_processed_rules(&processed).expect("country paradrop projection")
+}
+
+fn ares_country_paradrop_world(country: &str) -> (RuleSet, Simulation, InternedId) {
+    let (rules, mut sim, owner) = paradrop_world(ares_country_paradrop_rules(country));
+    let country = sim.interner.intern("Greece");
+    let house = sim.houses.get_mut(&owner).unwrap();
+    house.set_side_index_for_test(3);
+    house.set_country_for_test(Some(country));
+    (rules, sim, owner)
+}
+
+#[test]
+fn ares_country_paradrop_lists_beat_the_side_lists() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let (rules, mut sim, owner) = ares_country_paradrop_world(
+        "ParaDrop.Types=E1
+ParaDrop.Num=5
+",
+    );
+    let sw_type = charge_super(&mut sim, owner, PARADROP);
+    assert!(ares_launch(&rules, &mut sim, owner, sw_type));
+    let [plane] = planes(&sim)[..] else {
+        panic!("the country list has one entry, so one plane");
+    };
+    let cargo = cargo(&sim, plane);
+    assert_eq!(cargo.len(), 5, "the country count replaces the side's two");
+    for id in cargo {
+        assert_eq!(
+            sim.interner
+                .resolve(sim.substrate.entities.get(id).unwrap().type_ref()),
+            "E1"
+        );
+    }
+}
+
+#[test]
+fn ares_country_types_without_counts_send_nothing() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let (rules, mut sim, owner) = ares_country_paradrop_world(
+        "ParaDrop.Types=E1
+",
+    );
+    let sw_type = charge_super(&mut sim, owner, PARADROP);
+    assert!(
+        ares_launch(&rules, &mut sim, owner, sw_type),
+        "the launch is still consumed"
+    );
+    assert!(
+        planes(&sim).is_empty(),
+        "no side fallback after a false resolver"
+    );
 }

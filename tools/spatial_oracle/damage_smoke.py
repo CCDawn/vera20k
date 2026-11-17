@@ -20,6 +20,7 @@ from tools.rules_oracle.weapon_laser import physical_layers
 from tools.sidebar_oracle.stock import mix, mix_hash
 from tools.spatial_oracle.building_body_rules import INI, RULES, SP
 from tools.spatial_oracle.building_prism import FRAME, TEXT_BEGIN, TEXT_SIZE
+from tools.native_oracle import require
 
 SYSTEM_NAMES = ('SmallGreySSys', 'BigGreySmokeSys')
 PARTICLE_NAMES = ('SmallGreySmoke', 'LargeGreySmoke')
@@ -236,7 +237,7 @@ class DamageSmoke(SparkBirth):
         self.invoke(0x62B5E0, pointer, (self.types[name], location, target, system))
         item = self.alloc(4)
         self.u.mem_write(item, words(pointer))
-        assert self.invoke(0x630250, system + 0xBC, (item,)) & 255
+        require(self.invoke(0x630250, system + 0xBC, (item,)) & 255, 'native 0x630250 returned an unexpected result')
         return pointer
 
     def prepared_raw_state(self, values):
@@ -424,8 +425,7 @@ def generate():
              dict(name='bridge_below_threshold', bridge=True, z=145),
              dict(name='bridge_threshold_equal', bridge=True, z=147),
              dict(name='above_deck', bridge=True, z=416)]
-    return dict(native_sha256=native.image_sha256(),
-        type_constructor=reader.smoke_constructor, wind_constructor=reader.wind_constructor,
+    return dict(type_constructor=reader.smoke_constructor, wind_constructor=reader.wind_constructor,
         physical_layers=reader.smoke_layers,
         constructors=[constructor(case) for case in constructors],
         particle_ticks=[particle_tick(case) for case in ticks],

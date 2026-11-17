@@ -9,11 +9,12 @@ use crate::sim::world::Simulation;
 fn frames(sim: &Simulation, rules: &RuleSet, id: u64, hover: Option<u64>) -> Vec<usize> {
     let before = sim.state_hash();
     let entity = sim.entities().get(id).expect("Harrier survives");
+    let frame = crate::app::presentation::frame::PresentationFrame::of_test(sim, rules);
     let result = super::ui_overlays::scale_pip_draws(
         sim,
-        entity,
+        frame.object(id).unwrap(),
         hover,
-        Some(sim.interner.resolve(entity.owner())),
+        Some(entity.owner()),
         rules,
     )
     .into_iter()
@@ -58,8 +59,11 @@ fn stock_harrier_ammo_pips_follow_real_strike_return_reload_and_selection() {
     let full = native_stage_frames("full_a127");
     let spent = native_stage_frames("depleted");
     let rearmed = native_stage_frames("rearmed");
-    let owner = runtime.simulation.interner.resolve(player).to_owned();
-    runtime.simulation.fog.reveal_all_for_owner(player);
+    let owner = runtime.simulation.interner().resolve(player).to_owned();
+    runtime
+        .simulation
+        .fog_mut_for_test()
+        .reveal_all_for_owner(player);
     assert!(runtime.simulation.apply_command(
         &owner,
         &Command::Select {
@@ -79,7 +83,7 @@ fn stock_harrier_ammo_pips_follow_real_strike_return_reload_and_selection() {
         .map(|attacker_id| {
             CommandEnvelope::new(
                 player,
-                runtime.simulation.session.tick + 1,
+                runtime.simulation.session().tick() + 1,
                 Command::Attack {
                     attacker_id,
                     target_id: target,
@@ -118,7 +122,7 @@ fn stock_harrier_ammo_pips_follow_real_strike_return_reload_and_selection() {
                     .contains(id);
             let height = crate::sim::movement::air_movement::current_fly_height(
                 entity,
-                sim.resolved_terrain.as_ref(),
+                sim.resolved_terrain(),
             );
             saw_landed[index] |= saw_spent[index] && linked && height == 0;
             if saw_landed[index] && ammo == 1 && !saw_rearm[index] {

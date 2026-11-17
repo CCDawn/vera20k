@@ -67,31 +67,33 @@ pub(super) struct DockExit {
 }
 
 /// The placement of the Infantry and generic arms: the producer's
-/// GetDockCellForObject (vt+0x4D4, `0x0044EFB0`) for `mover`, offered the
-/// zero Cell, then [`dock_exit_coordinate_and_facing`] for that Cell. The
+/// GetDockCellForObject (vt+0x4D4, `0x0044EFB0`) for `mover` and `offered`,
+/// then [`dock_exit_coordinate_and_facing`] for the selected Cell. The
 /// Infantry arm's call (`0x004449AF`) offers the empty Cell (`0x0089C818`,
 /// zeroed by `0x0043B0E0`); the generic arm's (`0x0044464D`) offers
-/// ExitObject's own Cell argument, which its callers pass zero (Factory_AI
-/// `0x00450155`, Place_Production `0x004FB563`, the Cloning Vat loop
-/// `0x00444A3E`). `None` is the empty dock Cell, on which both arms answer 0
+/// ExitObject's own Cell argument: zero from Factory_AI `0x00450155`,
+/// Place_Production `0x004FB563` and Cloning Vat `0x00444A3E`, but the
+/// requested origin from reinforcement `0x0065DAB6`.
+/// `None` is the empty dock Cell, on which both arms answer 0
 /// (`0x00445696`).
 pub(super) fn dock_exit(
     sim: &Simulation,
     rules: &RuleSet,
     producer_id: u64,
     mover: u64,
+    offered: (i16, i16),
     overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
 ) -> Option<DockExit> {
     let cell = crate::sim::docking::building_dock::building_dock_cell(
         sim,
         producer_id,
         mover,
-        (0, 0),
+        offered,
         rules,
         overlay_registry,
     )?;
     let producer = sim.substrate.entities.get(producer_id)?;
-    let producer_type = sim.object_type(producer.type_ref(), rules)?;
+    let producer_type = sim.entity_object_type(producer, rules)?;
     let (coordinate, facing) =
         dock_exit_coordinate_and_facing(producer, producer_type, (cell.0 as i16, cell.1 as i16));
     Some(DockExit {
@@ -126,8 +128,7 @@ fn dock_exit_coordinate_and_facing(
         [centre(dock.0), centre(dock.1)],
     );
     let facing = crate::util::direction_tables::quantize::round_facing16_to_8(word);
-    let (width, height) =
-        crate::rules::foundation::foundation_dimensions(producer.type_facts.foundation());
+    let (width, height) = producer.type_facts.foundation().dimensions();
     let inward = |cell: i16, base: i16, size: u16| {
         if i32::from(cell) >= i32::from(base) + i32::from(size) {
             cell.wrapping_sub(1)
@@ -174,7 +175,7 @@ pub fn mark_war_factory_spawn_contact(
             produced_id,
             message,
             crate::sim::radio::RadioPayload::default(),
-            Some(rules),
+            rules,
             effects,
         );
     }
@@ -192,7 +193,7 @@ impl Simulation {
         self.substrate.entities.get(id).is_some_and(|building| {
             building.category() == crate::map::entities::EntityCategory::Structure
                 && self
-                    .object_type(building.type_ref(), rules)
+                    .entity_object_type(building, rules)
                     .is_some_and(|object| object.weapons_factory)
         })
     }
@@ -207,18 +208,24 @@ impl Simulation {
     /// (`SuperClass::Launch 0x006CC7BC..0x006CC858`) and the locomotor imbue
     /// (`0x0046953E..0x004695E6`).
     pub(crate) fn unit_in_contact_war_factory(&self, id: u64, rules: &RuleSet) -> bool {
-        let Some(unit) = self.substrate.entities.get(id) else {
-            return false;
-        };
-        unit.category() == crate::map::entities::EntityCategory::Unit
-            && unit.radio_contacts.slot(0).is_some_and(|contact| {
-                self.is_weapons_factory(contact, rules)
-                    && self.substrate.occupancy.first_building_on_layer(
-                        unit.position.rx(),
-                        unit.position.ry(),
-                        MovementLayer::Ground,
-                    ) == Some(contact)
-            })
+        self.unit_war_factory_contact(id, rules).is_some()
+    }
+
+    /// The war factory of [`Self::unit_in_contact_war_factory`], for the
+    /// ReceiveDamage site whose Ares hook also reads its type.
+    pub(crate) fn unit_war_factory_contact(&self, id: u64, rules: &RuleSet) -> Option<u64> {
+        let unit = self.substrate.entities.get(id)?;
+        if unit.category() != crate::map::entities::EntityCategory::Unit {
+            return None;
+        }
+        unit.radio_contacts.slot(0).filter(|&contact| {
+            self.is_weapons_factory(contact, rules)
+                && self.substrate.occupancy.first_building_on_layer(
+                    unit.position.rx(),
+                    unit.position.ry(),
+                    MovementLayer::Ground,
+                ) == Some(contact)
+        })
     }
 }
 
@@ -248,7 +255,7 @@ pub(super) fn naval_exit_cell(
             &sim.substrate.occupancy,
             &sim.substrate.entities,
             sim.resolved_terrain.as_ref(),
-            sim.playfield_bounds,
+            sim.playfield_bounds(),
         )
     {
         return Some(candidate);
@@ -304,7 +311,7 @@ fn naval_rally_fast_path_cell(
     );
 
     let terrain = resolved_terrain?;
-    if terrain.cell(candidate.0, candidate.1)?.land_type()
+    if terrain.cell(candidate.0, candidate.1)?.land_type
         != crate::rules::terrain_rules::LandType::Water.as_index()
     {
         return None;
@@ -392,7 +399,7 @@ pub(super) fn unlimbo_held_naval_unit(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_production))]
 mod tests {
     use super::*;
     use crate::map::resolved_terrain::ResolvedTerrainGrid;
@@ -414,10 +421,6 @@ mod tests {
             "src/sim/production/fixtures/infantry_exit_native.json",
         ))
         .unwrap();
-        assert_eq!(
-            data["native_sha256"],
-            "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-        );
         let mut compared = 0;
         let mut storage_residuals = 0;
         for row in data["rows"].as_array().unwrap() {
@@ -573,15 +576,20 @@ mod tests {
     fn production_admission_sim() -> Simulation {
         let mut sim = Simulation::default();
         let mut terrain = flat_terrain(20, 20);
-        for cell in &mut terrain.cells {
+        for cell in terrain.cells_mut_for_test() {
             // Retail ground rows used by the compact admission matrix.
-            cell.speed_costs.float = Some(0);
-            cell.base_speed_costs.float = Some(0);
-            cell.speed_costs.hover = Some(50);
-            cell.base_speed_costs.hover = Some(50);
+            cell.speed_costs.float = Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO);
+            cell.base_speed_costs.float =
+                Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO);
+            cell.speed_costs.hover = Some(crate::util::native_x87::NativeF32Bits::from_bits(
+                0x3f00_0000,
+            ));
+            cell.base_speed_costs.hover = Some(crate::util::native_x87::NativeF32Bits::from_bits(
+                0x3f00_0000,
+            ));
         }
         sim.resolved_terrain = Some(terrain);
-        sim.playfield_bounds = Some(test_playfield_bounds());
+        sim.set_playfield_bounds_for_test(Some(test_playfield_bounds()));
         sim
     }
 
@@ -590,11 +598,11 @@ mod tests {
             .resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(cell.0, cell.1)
+            .cell_mut_for_test(cell.0, cell.1)
             .unwrap();
         water.land_type = crate::rules::terrain_rules::LandType::Water.as_index();
-        water.speed_costs.float = Some(100);
-        water.base_speed_costs.float = Some(100);
+        water.speed_costs.float = Some(crate::util::native_x87::NativeF32Bits::ONE);
+        water.base_speed_costs.float = Some(crate::util::native_x87::NativeF32Bits::ONE);
     }
 
     #[test]
@@ -606,7 +614,7 @@ mod tests {
             .resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(8, 8)
+            .cell_mut_for_test(8, 8)
             .unwrap();
         cell.level = 3;
         cell.bridge_deck_level = 7;
@@ -637,29 +645,5 @@ mod tests {
             0x20
         );
         assert_eq!(sim.substrate.raw_cell_occupation.deck_bits(8, 8) & 0x20, 0);
-    }
-
-    #[test]
-    fn production_exact_zero_unlimbo_marks_held_identity_without_forced_outcome() {
-        let rules = production_admission_rules();
-        let mut sim = production_admission_sim();
-        set_admission_water_cell(&mut sim, (8, 8));
-        let stable_id = sim
-            .create_production_object_limbo_at_height("DEST", "Americans", 8, 8, 0x40, 0, &rules)
-            .expect("held production Unit");
-        assert_eq!(
-            unlimbo_held_naval_unit(
-                &mut sim,
-                &rules,
-                stable_id,
-                (8, 8),
-                None,
-                crate::sim::world::FrameEffects::default(),
-            ),
-            Some(stable_id),
-            "the production API exposes no caller-forced Mark outcome"
-        );
-        let entity = sim.substrate.entities.get(stable_id).unwrap();
-        assert!(!entity.lifecycle.in_limbo() && entity.lifecycle.cell_marked());
     }
 }

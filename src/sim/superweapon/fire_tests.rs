@@ -67,9 +67,8 @@ fn sim(rules: &RuleSet, human: bool, levels: &[((u16, u16), u8)]) -> Simulation 
     sim.resolve_type_handles(rules);
     let owner = sim.interner.intern(OWNER);
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, human, 0, 10));
-    sim.session.house_order.push(owner);
-    sim.session.game_options.super_weapons = true;
+        .register(HouseState::new(owner, 0, None, human, 0, 10));
+    sim.session.game_options_mut_for_test().super_weapons = true;
     sim.resolved_terrain = Some(test_grid(64, 64, |x, y| ResolvedTerrainCell {
         level: levels
             .iter()
@@ -77,7 +76,7 @@ fn sim(rules: &RuleSet, human: bool, levels: &[((u16, u16), u8)]) -> Simulation 
             .map_or(0, |&(_, level)| level),
         ..test_terrain_cell(x, y)
     }));
-    sim.playfield_bounds = Some(test_playfield_bounds());
+    sim.set_playfield_bounds_for_test(Some(test_playfield_bounds()));
     crate::sim::arena_fixture::supply_native_map_keyed(&mut sim, ("fire sim", levels.to_vec()));
     sim
 }
@@ -108,7 +107,8 @@ fn click_fire_matches_native() {
         sw.post_click = flag(&row["post_click"]);
         sw.manual_control = flag(&row["manual"]);
         sw.recharge_time_frames = int(&row["recharge"]);
-        sim.session.binary_frame = u32::try_from(int(&row["frame"])).unwrap();
+        sim.session
+            .set_binary_frame_for_test(u32::try_from(int(&row["frame"])).unwrap());
         let mut instance = SuperWeaponInstance::new(sw_type_id, owner, 0);
         instance.is_active = flag(&row["granted"]);
         instance.is_ready = flag(&row["charged"]);
@@ -116,6 +116,7 @@ fn click_fire_matches_native() {
         instance.charge_start_tick = int(&row["start"]);
         instance.charge_duration = int(&row["left"]);
         sim.super_weapons
+            .map_mut_for_test()
             .entry(owner)
             .or_default()
             .insert(sw_type_id, instance);
@@ -142,6 +143,8 @@ fn click_fire_matches_native() {
             (33, 44),
             None,
             crate::sim::world::FrameEffects::default(),
+            None,
+            false,
         );
         let events = row["events"].as_array().unwrap();
         let called = |name: &str| events.iter().any(|event| event[0] == name);
@@ -167,6 +170,16 @@ fn click_fire_matches_native() {
             .filter_map(|event| match *event {
                 SimSoundEvent::LightningStormRefused { owner } => Some(("storm", owner)),
                 SimSoundEvent::PsychicDominatorRefused { owner } => Some(("dominator", owner)),
+                // Installed Ares: SW_LightningStorm::AbortFire (10072AB0)
+                // and SW_PsychicDominator::AbortFire (10070780).
+                SimSoundEvent::AresSuperWeaponAborted { owner, .. } => Some((
+                    if int(&row["kind"]) == 2 {
+                        "storm"
+                    } else {
+                        "dominator"
+                    },
+                    owner,
+                )),
                 _ => None,
             })
             .collect();
@@ -255,16 +268,22 @@ fn the_launch_alert_matches_native() {
                 [coords[0], coords[1], coords[2]],
                 "{row}"
             );
-            sim.houses.get_mut(&house_id).unwrap().build_const_order = vec![id];
+            sim.houses
+                .get_mut(&house_id)
+                .unwrap()
+                .set_build_const_order_for_test(vec![id]);
         }
         {
             let house = sim.houses.get_mut(&house_id).unwrap();
-            house.multiplay_passive = flag(&row["passive"]);
-            house.difficulty = HouseDifficulty::from_native(int(&row["difficulty"])).unwrap();
-            house.base_center = Some(cell(&row["base"]));
-            house.alternate_base_center = cell(&row["alternate"]);
+            house.set_multiplay_passive_for_test(flag(&row["passive"]));
+            house.set_difficulty_for_test(
+                HouseDifficulty::from_native(int(&row["difficulty"])).unwrap(),
+            );
+            house.set_base_center_for_test(Some(cell(&row["base"])));
+            house.set_alternate_base_center_for_test(cell(&row["alternate"]));
         }
-        sim.session.binary_frame = u32::try_from(int(&row["frame"])).unwrap();
+        sim.session
+            .set_binary_frame_for_test(u32::try_from(int(&row["frame"])).unwrap());
         sim.scenario_rng = SimRng::answering(0, 99, int(&row["answer"]));
         // RandomRanged's own retries draw more raw words; count its calls by
         // the cursor they leave.
@@ -279,7 +298,17 @@ fn the_launch_alert_matches_native() {
             drawn.next_range_i32_inclusive(0, 99);
         }
         let before = sim.houses[&house_id].super_weapon_defense();
-        alert_super_weapon_defense(&mut sim, &rules, house_id, &sw, cell(&row["cell"]));
+        alert_super_weapon_defense(
+            &sim.session,
+            &mut sim.scenario_rng,
+            &sim.substrate,
+            &mut sim.houses,
+            &sim.resolved_terrain,
+            &rules,
+            house_id,
+            &sw,
+            cell(&row["cell"]),
+        );
         assert_eq!(
             sim.scenario_rng.native_state_hex(),
             drawn.native_state_hex(),
@@ -298,56 +327,239 @@ fn the_launch_alert_matches_native() {
     }
 }
 
-/// `HouseClass @ 0x0050AF10` holds a charged powered Super while its house
-/// is short of power (`SuperClass::Suspend @ 0x006CB4D0` stops the timer),
-/// so ClickFire refuses it; restored power releases it.
-#[test]
-fn a_charged_nuke_held_for_low_power_does_not_launch() {
-    let rules = rules();
+fn default_build_scene(
+    kind: crate::rules::superweapon_type::SuperWeaponKind,
+) -> (
+    Simulation,
+    RuleSet,
+    crate::sim::intern::InternedId,
+    crate::sim::intern::InternedId,
+) {
+    use crate::rules::superweapon_type::{
+        DeliveryType, GenericWarheadSettings, SuperWeaponKind, UnitDeliveryRules,
+    };
+    let ini = crate::sim::arena_fixture::clear_ground_ini(&format!(
+        "{RULES}\n[Warheads]\n0=Payload\n[Payload]\nCellSpread=1\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n"
+    ));
+    let mut rules =
+        RuleSet::from_ini_with_fixed_art_for_test(&ini, &IniFile::from_str(ART)).unwrap();
+    let sw = rules.super_weapons.get_mut("SpyPlaneSpecial").unwrap();
+    sw.kind = kind;
+    match kind {
+        SuperWeaponKind::GenericWarhead => {
+            sw.generic_warhead = Some(GenericWarheadSettings {
+                warhead: Some("Payload".into()),
+                damage: 75,
+            });
+        }
+        SuperWeaponKind::UnitDelivery => {
+            sw.unit_delivery = Some(UnitDeliveryRules {
+                types: vec![DeliveryType {
+                    category: crate::rules::object_type::ObjectCategory::Building,
+                    id: "YARD".into(),
+                }],
+                deferment: 0,
+                ..UnitDeliveryRules::default()
+            })
+        }
+        _ => {}
+    }
     let mut sim = sim(&rules, true, &[]);
-    let owner = sim.interner.intern(OWNER);
-    sim.spawn_object_at_height("NAMISL", OWNER, 10, 10, 0, 0, &rules)
-        .unwrap();
-    let nuke = sim.interner.intern("NukeSpecial");
-    let sw = rules.super_weapon("NukeSpecial").unwrap();
-    let mut instance = SuperWeaponInstance::new(nuke, owner, 0);
+    sim.session.set_binary_frame_for_test(100);
+    let owner = sim.interner.get(OWNER).unwrap();
+    sim.houses
+        .get_mut(&owner)
+        .unwrap()
+        .set_preferred_super_weapon_target((20, 20));
+    let sw_type = sim.interner.get("SpyPlaneSpecial").unwrap();
+    let mut instance = SuperWeaponInstance::new(sw_type, owner, 0);
     instance.is_active = true;
-    instance.charge_start_tick = 0;
-    instance.charge_duration = 10;
     instance.is_ready = true;
     sim.super_weapons
+        .map_mut_for_test()
         .entry(owner)
         .or_default()
-        .insert(nuke, instance);
-    sim.session.binary_frame = 20;
-    sim.power_states.entry(owner).or_default().is_low_power = true;
-    super::super::update_owned_supers(&mut sim, &rules, owner);
-    let held = &sim.super_weapons[&owner][&nuke];
-    assert_eq!(
-        (held.is_ready, held.is_suspended, held.charge_start_tick),
-        (true, true, -1)
+        .insert(sw_type, instance);
+    (sim, rules, owner, sw_type)
+}
+
+#[test]
+fn default_build_refuses_forged_extension_launches_before_mutation_or_ai_rng() {
+    use crate::rules::superweapon_targeting::TargetReject;
+    use crate::rules::superweapon_type::SuperWeaponKind;
+    for kind in [
+        SuperWeaponKind::GenericWarhead,
+        SuperWeaponKind::UnitDelivery,
+    ] {
+        let (mut sim, rules, owner, sw_type) = default_build_scene(kind);
+        let before = sim.state_hash();
+        assert_eq!(
+            sim.super_weapon_target_check(&rules, owner, sw_type, (20, 20), false),
+            Err(TargetReject::InvalidPayload)
+        );
+        assert!(!sim.fire_super_weapon(
+            &rules,
+            owner,
+            sw_type,
+            (20, 20),
+            None,
+            crate::sim::world::FrameEffects::default(),
+            false,
+        ));
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .set_is_human_for_test(false);
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .set_player_control_for_test(false);
+        let before_ai = sim.state_hash();
+        crate::sim::superweapon::ai_fire::try_fire(
+            &mut sim,
+            &rules,
+            owner,
+            None,
+            crate::sim::world::FrameEffects::default(),
+        );
+        assert_eq!(before_ai, sim.state_hash(), "{kind:?}");
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .set_is_human_for_test(true);
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .set_player_control_for_test(true);
+        assert_eq!(before, sim.state_hash(), "{kind:?}");
+        assert!(sim.sound_events.is_empty());
+    }
+}
+
+#[test]
+fn default_build_stock_launch_ignores_extension_money_and_building_tags() {
+    use crate::rules::superweapon_type::{SuperWeaponBuildingRequirements, SuperWeaponKind};
+    let (mut sim, mut rules, owner, sw_type) = default_build_scene(SuperWeaponKind::PsychicReveal);
+    let sw = rules.super_weapons.get_mut("SpyPlaneSpecial").unwrap();
+    sw.money_amount = -5000;
+    sw.building_requirements = Some(SuperWeaponBuildingRequirements {
+        auxiliary: vec!["YARD".into()],
+        negative: Vec::new(),
+    });
+    assert!(crate::sim::superweapon::super_weapon_available(
+        &sim,
+        &rules,
+        owner,
+        "SpyPlaneSpecial"
+    ));
+    let wallet = sim.houses[&owner].economy().available_money();
+    assert!(
+        crate::sim::superweapon::superweapon_views_for_owner(&sim, &rules, &owner)[0].can_afford
     );
-    assert!(!click_fire(
-        &mut sim,
+    assert!(sim.fire_super_weapon(
         &rules,
         owner,
-        nuke,
-        sw,
-        (33, 44),
+        sw_type,
+        (20, 20),
         None,
-        crate::sim::world::FrameEffects::default()
+        crate::sim::world::FrameEffects::default(),
+        false,
     ));
-    sim.power_states.get_mut(&owner).unwrap().is_low_power = false;
-    sim.session.binary_frame = 30;
-    super::super::update_owned_supers(&mut sim, &rules, owner);
-    assert!(click_fire(
-        &mut sim,
+    assert_eq!(wallet, sim.houses[&owner].economy().available_money());
+    assert!(!sim.super_weapons[&owner][&sw_type].is_ready);
+    assert!(sim.sound_events.iter().any(|event| matches!(
+        event,
+        SimSoundEvent::SuperWeaponLaunched { sw_type: fired, .. } if *fired == sw_type
+    )));
+    rules
+        .super_weapons
+        .get_mut("SpyPlaneSpecial")
+        .unwrap()
+        .aux_building = Some("YARD".into());
+    assert!(!crate::sim::superweapon::super_weapon_available(
+        &sim,
         &rules,
         owner,
-        nuke,
-        sw,
-        (33, 44),
-        None,
-        crate::sim::world::FrameEffects::default()
+        "SpyPlaneSpecial"
     ));
+}
+
+#[test]
+fn default_build_refuses_forged_paid_commands_and_saved_selection_state() {
+    use crate::rules::superweapon_type::SuperWeaponKind;
+    use crate::sim::superweapon::PaidSuperWeaponSelection;
+    let (mut sim, rules, owner, sw_type) = default_build_scene(SuperWeaponKind::PsychicReveal);
+    let selection = PaidSuperWeaponSelection {
+        source: sw_type,
+        destination: sim.interner.get("NukeSpecial").unwrap(),
+        sequence: 7,
+    };
+    let instance = sim.super_weapons.instance_mut(&owner, &sw_type).unwrap();
+    instance.is_ready = false;
+    instance.paid_sequence = selection.sequence;
+    instance.paid_selection = Some(selection);
+    let before = sim.state_hash();
+    // The player load refuses the saved selection in a game without Ares;
+    // forged past it, no command it could produce is admitted below.
+    assert!(sim.validate_ares_state_for_load(rules.ares()).is_err());
+    assert_eq!(
+        sim.next_paid_super_weapon_selection(&rules, owner, sw_type),
+        None
+    );
+    assert!(!sim.fire_super_weapon_selected(
+        &rules,
+        owner,
+        sw_type,
+        (20, 20),
+        None,
+        crate::sim::world::FrameEffects::default(),
+        crate::sim::superweapon::SuperWeaponTargetSource::Manual,
+        Some(selection),
+    ));
+    assert!(!Simulation::cancel_paid_super_weapon_selection(
+        &mut sim.substrate,
+        &mut sim.sound_events,
+        &mut sim.super_weapons,
+        &rules,
+        owner,
+        selection,
+    ));
+    assert_eq!(before, sim.state_hash());
+    assert!(sim.sound_events.is_empty());
+}
+
+/// Ares 10034C70 (hook 0x4FAF2A): a Fire_SW whose ClickFire refused (the
+/// Super is still charged) alerts no computer house; one that launched does.
+#[test]
+fn ares_a_super_still_charged_after_fire_alerts_no_house() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let mut rules = rules();
+    rules.general.ai_super_defense_distance = 1_000_000;
+    rules.general.ai_super_defense_probability = vec![100, 100, 100];
+    for (granted, alerted) in [(false, false), (true, true)] {
+        let mut sim = sim(&rules, false, &[]);
+        let owner = sim.interner.intern(OWNER);
+        sim.spawn_object_at_height("NAMISL", OWNER, 10, 10, 0, 0, &rules)
+            .unwrap();
+        let sw_type_id = sim.interner.intern("NukeSpecial");
+        let mut instance = SuperWeaponInstance::new(sw_type_id, owner, 0);
+        instance.is_active = granted;
+        instance.is_ready = true;
+        sim.super_weapons
+            .map_mut_for_test()
+            .entry(owner)
+            .or_default()
+            .insert(sw_type_id, instance);
+        sim.fire_super_weapon(
+            &rules,
+            owner,
+            sw_type_id,
+            (33, 44),
+            None,
+            crate::sim::world::FrameEffects::default(),
+            false,
+        );
+        let (_, frame) = sim.houses[&owner].super_weapon_defense();
+        assert_eq!(frame != -100, alerted, "granted {granted}");
+    }
 }

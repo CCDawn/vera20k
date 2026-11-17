@@ -97,7 +97,7 @@ fn bullet_palette_context_ignores_animation_aliases_and_alt_palette() {
         projectile.firers_palette = firer;
         let key = projectile_key("Cannon", &projectile, 0, HouseColorIndex(4));
         assert_eq!(
-            sprite_palette_for_key(&key, Some(art), &effects, &cells),
+            sprite_palette_for_key(&key, Some(art), &effects, &cells, None),
             expected
         );
         assert_eq!(
@@ -161,7 +161,12 @@ fn bullet_frame_lookup_preserves_native_stencil_and_rejects_out_of_range() {
         .iter()
         .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
         .collect();
-    let source = ShpSource::decode(&bytes, "120MM.SHP".to_string(), (0, 0)).unwrap();
+    let source = ShpSource::decode(
+        std::sync::Arc::<[u8]>::from(bytes.as_slice()).into(),
+        "120MM.SHP".to_string(),
+        (0, 0),
+    )
+    .unwrap();
     let rules = simple_rules("");
     let projectile = rules.projectile("Cannon").unwrap();
     let key = projectile_key("Cannon", projectile, 0, HouseColorIndex(0));
@@ -173,7 +178,7 @@ fn bullet_frame_lookup_preserves_native_stencil_and_rejects_out_of_range() {
         }
     }
     let palette = Palette::from_bytes(&raw).unwrap();
-    let rendered = render_shp_frame(
+    let rendered = render_shp_key(
         &source,
         &palette,
         false,
@@ -187,7 +192,7 @@ fn bullet_frame_lookup_preserves_native_stencil_and_rejects_out_of_range() {
     assert_eq!([rendered.offset_x, rendered.offset_y], [-2.0, -2.0]);
     assert_eq!(rendered.canvas_rect, [-12.0, -12.0, 24.0, 24.0]);
     assert!(
-        render_shp_frame(
+        render_shp_key(
             &source,
             &palette,
             false,
@@ -328,12 +333,13 @@ fn retail_hills_projectile_assets_match_original_reader_and_physical_bytes() {
         "TEMPERATE",
         Some(rules),
         Some(art),
+        ShpImageKind::Object,
     )
     .unwrap();
     source.draw_offsets = (0, 0);
     let palette = Palette::from_bytes(assets.get_ref("palette.pal").unwrap()).unwrap();
     let mut palettes = ShpPalettes::default();
-    let sprite = render_shp_frame(
+    let sprite = render_shp_key(
         &source,
         &palette,
         false,
@@ -436,13 +442,13 @@ fn projectile_asset_binding_uses_native_last_load_not_current_image_text() {
             let candidates = projectile_shp_candidates(projectile, "tem", "TEMPERATE");
             let found = find_shp(&assets, &candidates);
             assert_eq!(
-                found.map(|(name, _)| name),
+                found.as_ref().map(|(name, _)| *name),
                 row["state"]["loaded_file"].as_str(),
                 "{} {}",
                 case["name"],
                 row["rules"]
             );
-            let count = found.map_or(0, |(_, bytes)| {
+            let count = found.as_ref().map_or(0, |(_, bytes)| {
                 ShpFile::frame_count_from_bytes(bytes).unwrap()
             });
             assert_eq!(
@@ -450,7 +456,7 @@ fn projectile_asset_binding_uses_native_last_load_not_current_image_text() {
                 row["state"]["frame_count"].as_u64().unwrap()
             );
             if let Some((_, bytes)) = found {
-                let shp = ShpFile::from_bytes(bytes).unwrap();
+                let shp = ShpFile::from_bytes(&bytes).unwrap();
                 assert_eq!(
                     serde_json::json!([shp.width, shp.height]),
                     row["state"]["canvas"]

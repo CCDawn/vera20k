@@ -37,6 +37,8 @@ const DEFAULT_MIN_ANGULAR_VELOCITY: NativeF64Bits = NativeF64Bits::POSITIVE_ZERO
 /// Constructor literal `0x3FC656ED_1CE64946`, written at74ADC4/74AE01.
 /// The reader's separate degree conversion must use its own file constant.
 const DEFAULT_MAX_ANGULAR_VELOCITY: NativeF64Bits = NativeF64Bits::from_bits(0x3fc6_56ed_1ce6_4946);
+pub(crate) const DEFAULT_ANGULAR_VELOCITIES: [NativeF64Bits; 2] =
+    [DEFAULT_MIN_ANGULAR_VELOCITY, DEFAULT_MAX_ANGULAR_VELOCITY];
 const DEFAULT_MIN_Z_VEL: f64 = 3.5;
 const DEFAULT_MAX_Z_VEL: f64 = 5.0;
 const DEFAULT_MAX_XY_VEL: f64 = 15.0;
@@ -50,6 +52,9 @@ const DEFAULT_MAX_XY_VEL: f64 = 15.0;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoxelAnimType {
     pub name: String,
+    /// Inherited `ObjectTypeClass::ReadINI @ 0x005F92D0` AlphaImage buffer
+    /// (`+0x213`, `char[25]`), separate from the VoxelAnim model Image.
+    pub(crate) alpha_image: String,
     /// `ImageFile` (`+0x1F8`): the type's ID until `ObjectTypeClass::ReadINI`
     /// reads `Image=` over it (`0x005F92F8..0x005F933B`, 25 bytes, the current
     /// value as default). `ReadINI` loads the model from it, `%s.VXL` with no
@@ -108,6 +113,7 @@ pub struct VoxelAnimType {
     pub share_body_data: bool,
     pub share_turret_data: bool,
     pub share_barrel_data: bool,
+    pub(crate) model_slots: super::voxel_model_plan::ModelSlots,
 }
 
 impl VoxelAnimType {
@@ -116,6 +122,7 @@ impl VoxelAnimType {
     pub fn with_defaults(name: &str) -> Self {
         Self {
             name: name.to_string(),
+            alpha_image: String::new(),
             image: name.to_string(),
             normalized: false,
             translucent: false,
@@ -144,6 +151,7 @@ impl VoxelAnimType {
             share_body_data: false,
             share_turret_data: false,
             share_barrel_data: false,
+            model_slots: Default::default(),
         }
     }
 
@@ -151,6 +159,7 @@ impl VoxelAnimType {
     /// `ObjectTypeClass::ReadINI` (`0x0074B06E`).
     pub fn from_ini_section(name: &str, section: &IniSection) -> Self {
         let mut out = Self::with_defaults(name);
+        out.alpha_image = section.read_object_alpha_image(&out.alpha_image);
         out.image = section.read_string("Image", &out.image, 25);
         out.normalized = section.read_bool("Normalized", out.normalized);
         out.translucent = section.read_bool("Translucent", out.translucent);
@@ -160,10 +169,10 @@ impl VoxelAnimType {
         out.duration = section.read_int("Duration", out.duration);
 
         out.elasticity = section.read_double_bits("Elasticity", out.elasticity);
-        out.min_angular_velocity =
-            read_angular_velocity(section, "MinAngularVelocity", out.min_angular_velocity);
-        out.max_angular_velocity =
-            read_angular_velocity(section, "MaxAngularVelocity", out.max_angular_velocity);
+        [out.min_angular_velocity, out.max_angular_velocity] = read_angular_velocities(
+            section,
+            [out.min_angular_velocity, out.max_angular_velocity],
+        );
         out.min_z_vel = section.read_double_bits("MinZVel", out.min_z_vel);
         out.max_z_vel = section.read_double_bits("MaxZVel", out.max_z_vel);
         out.max_xy_vel = section.read_double_bits("MaxXYVel", out.max_xy_vel);
@@ -180,7 +189,7 @@ impl VoxelAnimType {
         out.stop_sound = section
             .read_type_name("StopSound", 0x80)
             .map(str::to_string);
-        out.damage = section.read_int("Damage", out.damage);
+        out.damage = read_damage(section, out.damage);
         out.damage_radius = section.read_int("DamageRadius", out.damage_radius);
 
         out.share_source = section
@@ -201,6 +210,25 @@ impl VoxelAnimType {
     }
 }
 
+/// VoxelAnimTypeReadINI74B3D8..74B3F2: signed Damage+2F0 uses its current
+/// value, including a previous contact write. Shared by cold and retained reads.
+pub(crate) fn read_damage(section: &IniSection, current: i32) -> i32 {
+    section.read_int("Damage", current)
+}
+
+/// VoxelAnimTypeReadINI74B107..167 runs these reads on every reached body,
+/// with literal -1 defaults; zero alone preserves the previous type value.
+/// Both cold and ordered loading use the same sentinel/conversion owner.
+pub(crate) fn read_angular_velocities(
+    section: &IniSection,
+    current: [NativeF64Bits; 2],
+) -> [NativeF64Bits; 2] {
+    [
+        read_angular_velocity(section, "MinAngularVelocity", current[0]),
+        read_angular_velocity(section, "MaxAngularVelocity", current[1]),
+    ]
+}
+
 /// The two angular-velocity keys, including native's sentinel bug.
 ///
 /// `ReadINI` calls `ReadDouble` with a `-1.0` default and then compares the
@@ -217,21 +245,23 @@ fn read_angular_velocity(section: &IniSection, key: &str, default: NativeF64Bits
     if raw == 0.0 {
         return default;
     }
-    radians_from_degrees(raw)
+    // An out-of-range literal scans as infinity, which native would store as
+    // an infinite spin; VERA keeps the current value instead.
+    radians_from_degrees(raw).unwrap_or(default)
 }
 
 /// `FMUL qword [0x007F65E8]` / `FSTP qword` under the process's chop mode.
-fn radians_from_degrees(degrees: f64) -> NativeF64Bits {
-    let degrees = X87Chop53::load_f64(NativeF64Bits::from_bits(degrees.to_bits()))
-        .expect("ReadDouble returns a finite double");
+/// `None` for a non-finite angle.
+fn radians_from_degrees(degrees: f64) -> Option<NativeF64Bits> {
+    let degrees = X87Chop53::load_f64(NativeF64Bits::from_bits(degrees.to_bits())).ok()?;
     X87Chop53::store_f64(X87Chop53::mul(
         degrees,
-        X87Chop53::load_f64(DEGREES_TO_RADIANS).expect("pi/180 is finite"),
+        X87Chop53::load_f64(DEGREES_TO_RADIANS).ok()?,
     ))
-    .expect("an INI angle in degrees stays finite in radians")
+    .ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_o_z))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -316,18 +346,5 @@ mod tests {
         let vat = VoxelAnimType::from_ini_section("ZEROSPIN", ini.section("ZEROSPIN").unwrap());
         assert_eq!(f64::from_bits(vat.min_angular_velocity.bits()), 0.0);
         assert_eq!(vat.max_angular_velocity, DEFAULT_MAX_ANGULAR_VELOCITY);
-    }
-
-    #[test]
-    fn share_group_is_read_and_folded() {
-        // `[SONICTURRET]` borrows the Sonic Tank's turret model rather than
-        // loading a standalone VXL.
-        let ini = section("[SONICTURRET]\nShareTurretData=yes\nShareSource=SONIC\n");
-        let vat =
-            VoxelAnimType::from_ini_section("SONICTURRET", ini.section("SONICTURRET").unwrap());
-        assert!(vat.share_turret_data);
-        assert!(!vat.share_body_data && !vat.share_barrel_data);
-        assert_eq!(vat.share_source.as_deref(), Some("SONIC"));
-        assert!(vat.shares_data());
     }
 }

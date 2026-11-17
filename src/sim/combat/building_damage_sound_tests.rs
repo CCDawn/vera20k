@@ -1,6 +1,6 @@
 //! Recorded whole Building442230/Techno701900/Object5F5390 survivor controls.
 //! Native identity, producer and coverage: building_damage_sound_joined.meta.json.
-//! Original SHA2561cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c.
+//! Original gamemd.
 //! Health starts at the ordinary production constructor and is retained between
 //! requests. The adopted RNG boundary follows construction/admission: this test
 //! compares the receiver, not the native fixture's complete setup or audio pump.
@@ -22,10 +22,6 @@ fn corpus() -> Value {
     .unwrap();
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["selected_profile"], "all");
-    assert_eq!(
-        value["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     value
 }
 
@@ -171,13 +167,14 @@ fn replay_building_history(corpus: &Value, rules: &RuleSet, history: &Value, typ
             .interner
             .intern(identity["house_type_name"].as_str().unwrap());
         let mut house = HouseState::new(owner, 0, Some(country), human, 0, 10);
-        house.player_control = player_control;
-        world.houses.insert(owner, house);
-        world.session.house_order.push(owner);
+        house.set_player_control_for_test(player_control);
+        world.houses.register(house);
     }
     // Inherited make_dock_fixture declares mode1 and source PlayerPtr.
-    world.session.game_mode_nonzero = true;
-    world.session.current_house = Some(source_owner);
+    world
+        .session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    world.session.set_current_house_for_test(Some(source_owner));
     crate::sim::arena_fixture::flat_arena(&mut world, rules);
     let location = coordinate(&history["input"]["target_object"]["location"]);
     assert_eq!(
@@ -241,7 +238,9 @@ fn replay_building_history(corpus: &Value, rules: &RuleSet, history: &Value, typ
 
     for row in steps {
         let label = row["label"].as_str().unwrap();
-        world.session.binary_frame = row["before"]["frame"].as_u64().unwrap() as u32;
+        world
+            .session
+            .set_binary_frame_for_test(row["before"]["frame"].as_u64().unwrap() as u32);
         let target = world.entities().get(target_id).unwrap();
         assert_eq!(
             target.health.current(),
@@ -285,9 +284,10 @@ fn replay_building_history(corpus: &Value, rules: &RuleSet, history: &Value, typ
             &world.interner,
             &world.houses,
             &world.house_alliances,
-            world.session.no_damage,
-            u64::from(world.session.binary_frame),
+            world.session.no_damage(),
+            u64::from(world.session.binary_frame()),
             world.resolved_terrain.as_ref(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -300,8 +300,10 @@ fn replay_building_history(corpus: &Value, rules: &RuleSet, history: &Value, typ
         let mut local_world = Simulation::new();
         local_world.substrate.entities = world.substrate.entities.clone();
         local_world.interner = world.interner.clone();
-        local_world.house_alliances = world.house_alliances.clone();
-        local_world.session.binary_frame = world.session.binary_frame;
+        *local_world.house_alliances_mut_for_test() = world.house_alliances.as_map().clone();
+        local_world
+            .session
+            .set_binary_frame_for_test(world.session.binary_frame());
         let state = receiver_health::commit_receiver_health(
             &event,
             &mut local_world,

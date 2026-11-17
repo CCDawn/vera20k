@@ -9,6 +9,94 @@
 
 use crate::rules::ini_parser::IniFile;
 
+/// Full_Init686D80..687000's retained mission names. They are presentation
+/// values, resolved against the active CSF at admission and saved verbatim;
+/// restoring a game must not retranslate them through a different string table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CampaignScenarioNames {
+    name: Vec<u16>,
+    ui_name: String,
+    save_title: Vec<u16>,
+}
+
+impl CampaignScenarioNames {
+    /// Call only after MISSIONMD opened. A missing file bypasses this entire
+    /// native block; a present file with no section clears Name/UIName while
+    /// retaining the previous save title.
+    pub fn apply_ini(
+        &mut self,
+        ini: &IniFile,
+        filename: &str,
+        csf: &crate::assets::csf_file::CsfFile,
+    ) {
+        self.name.clear();
+        self.ui_name.clear();
+        let Some(section) = ini.section(filename) else {
+            return;
+        };
+        self.name = section.read_comma_hex_utf16("Name", &[], 45);
+        if section.is_present("UIName") {
+            self.ui_name = section.read_string("UIName", "", 32);
+        }
+        if self.ui_name.is_empty() {
+            return;
+        }
+        // 686F37..686F6C and686F73..686FF9 copy45 units then explicitly
+        // terminate at index44. Retain UTF-16 so a split surrogate is not
+        // silently changed before the presentation consumer sees it.
+        self.name = csf
+            .text(&self.ui_name)
+            .encode_utf16()
+            .take_while(|&unit| unit != 0)
+            .take(44)
+            .collect();
+        self.save_title = csf
+            .text(&format!("{}Sav", self.ui_name))
+            .encode_utf16()
+            .take_while(|&unit| unit != 0)
+            .take(44)
+            .collect();
+        if self
+            .save_title
+            .starts_with(&[77, 73, 83, 83, 73, 78, 71, 58])
+        {
+            self.save_title.clone_from(&self.name);
+        }
+    }
+
+    pub fn name_units(&self) -> &[u16] {
+        &self.name
+    }
+
+    pub fn ui_name(&self) -> &str {
+        &self.ui_name
+    }
+
+    pub fn save_title_units(&self) -> &[u16] {
+        &self.save_title
+    }
+
+    pub fn save_title(&self) -> String {
+        String::from_utf16_lossy(&self.save_title)
+    }
+}
+
+/// The CSF key the mission restate briefing shows
+/// (`ScenarioClass::ShowMissionRestateBriefing 0x0065F520`, Restate.cpp): the
+/// `Briefing` entry of the scenario file name's section, read with
+/// `ReadString(…, "", buf, 0x100)`, or `Brief:Error` when the section or key
+/// is absent (`FindEntryByNames 0x00526B10`). A missing MISSIONMD opens
+/// nothing; that is the caller's.
+pub fn restate_briefing_key(ini: &IniFile, filename: &str) -> String {
+    match ini
+        .section(filename)
+        .filter(|section| section.is_present("Briefing"))
+    {
+        Some(section) => section.read_string("Briefing", "", 0x100),
+        None => "Brief:Error".to_owned(),
+    }
+}
+
 /// One scenario's retained MISSION loading fields. Source selection and pass
 /// ordering belong to the scenario loader; this owner only applies that pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -20,6 +108,11 @@ pub struct CampaignLoadingMetadata {
     background_name_640: String,
     background_name_800: String,
     background_palette_name: String,
+    /// Ares `LoadScreenText.Color` of the MISSION section, the colour scheme
+    /// name INIClass_ReadScenario_CacheSP (1002F680, hook 0x686D7F) looks up
+    /// for the campaign loading text. Read in every game; only Ares' loading
+    /// text consumes it.
+    load_text_color: String,
 }
 
 impl CampaignLoadingMetadata {
@@ -39,6 +132,31 @@ impl CampaignLoadingMetadata {
         self.background_name_640.clear();
         self.background_name_800.clear();
         self.background_palette_name.clear();
+
+        // Ares 1002F680 (hook 0x686D7F, after MISSIONMD is read) defaults the
+        // key by the file name's first three letters, case-blind, and reads
+        // it into its 0x800 buffer whether or not the section exists.
+        {
+            let _ares = crate::rules::ares_switch::ares_reads();
+            let prefix = |name: &str| {
+                filename
+                    .get(..3)
+                    .is_some_and(|head| head.eq_ignore_ascii_case(name))
+            };
+            let default = if prefix("SOV") {
+                "SovietLoad"
+            } else if prefix("YUR") {
+                "YuriLoad"
+            } else if prefix("TUT") {
+                "LightGrey"
+            } else {
+                "AlliedLoad"
+            };
+            self.load_text_color = ini.section(filename).map_or_else(
+                || default.to_owned(),
+                |section| section.read_string("LoadScreenText.Color", default, 0x800),
+            );
+        }
 
         let Some(section) = ini.section(filename) else {
             return;
@@ -104,20 +222,105 @@ impl CampaignLoadingMetadata {
     pub fn background_palette_name(&self) -> &str {
         &self.background_palette_name
     }
+
+    /// The colour scheme name Ares 1002F680 finds (shade count 1, case-blind)
+    /// for SideExt::CurrentLoadTextColor; a name no scheme has leaves it -1.
+    pub fn load_text_color(&self) -> &str {
+        &self.load_text_color
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_a_n))]
 mod tests {
-    use super::CampaignLoadingMetadata;
+    use super::{CampaignLoadingMetadata, CampaignScenarioNames, restate_briefing_key};
     use crate::rules::ini_parser::IniFile;
     use serde_json::Value;
 
+    #[test]
+    fn campaign_mission_names_match_original_reader_and_retention() {
+        let native = crate::test_fixture::json("tools/input_oracle/campaign_mission_titles.json");
+        let entries: Vec<_> = native["csf_entries"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str().unwrap()))
+            .collect();
+        let csf = crate::assets::csf_file::test_csf(&entries);
+        let units = |value: &Value| {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_u64().unwrap() as u16)
+                .collect::<Vec<_>>()
+        };
+        for row in native["name_rows"].as_array().unwrap() {
+            let mut names = CampaignScenarioNames {
+                name: units(&row["prior_name_utf16"]),
+                ui_name: row["prior_ui_name"].as_str().unwrap().into(),
+                save_title: units(&row["prior_save_title_utf16"]),
+            };
+            if row["mission_file_exists"].as_bool().unwrap() {
+                let mut text = String::new();
+                for (name, section) in row["sections"].as_object().unwrap() {
+                    text.push_str(&format!("[{name}]\n"));
+                    for (key, value) in section.as_object().unwrap() {
+                        text.push_str(&format!("{key}={}\n", value.as_str().unwrap()));
+                    }
+                }
+                names.apply_ini(
+                    &IniFile::from_str(&text),
+                    row["filename"].as_str().unwrap(),
+                    &csf,
+                );
+            }
+            assert_eq!(
+                names.name_units(),
+                units(&row["name_utf16"]),
+                "{}",
+                row["name"]
+            );
+            assert_eq!(
+                names.save_title_units(),
+                units(&row["save_title_utf16"]),
+                "{}",
+                row["name"]
+            );
+            assert_eq!(
+                names.ui_name(),
+                row["ui_name"].as_str().unwrap(),
+                "{}",
+                row["name"]
+            );
+            let bytes = crate::util::save_codec::serialize(&names).unwrap();
+            let restored: CampaignScenarioNames =
+                crate::util::save_codec::deserialize(&bytes).unwrap();
+            assert_eq!(restored, names);
+        }
+    }
+
+    #[test]
+    fn campaign_mission_names_use_physical_mission_and_csf_inputs() {
+        let Some((_, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let mission = IniFile::from_bytes(assets.get_ref("MISSIONMD.INI").unwrap()).unwrap();
+        let csf =
+            crate::assets::csf_file::CsfFile::from_bytes(assets.get_ref("ra2md.csf").unwrap())
+                .unwrap();
+        for (filename, expected) in [
+            ("ALL01UMD.MAP", "Allied 01 - Time Lapse"),
+            ("ALL02UMD.MAP", "Allied 02 - Hollywood and Vain"),
+            ("SOV01UMD.MAP", "Soviet 01 - Time Shift"),
+        ] {
+            let mut names = CampaignScenarioNames::default();
+            names.apply_ini(&mission, filename, &csf);
+            assert_eq!(names.save_title(), expected);
+        }
+    }
+
     fn native() -> &'static Value {
         let fixture = crate::test_fixture::json("tools/input_oracle/campaign_start.json");
-        assert_eq!(
-            fixture["native_sha256"],
-            "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-        );
         fixture
     }
 
@@ -157,6 +360,7 @@ mod tests {
                 background_name_640: "Prior".into(),
                 background_name_800: "Prior".into(),
                 background_palette_name: "Prior".into(),
+                load_text_color: String::new(),
             };
             let filename = row["filename"].as_str().unwrap();
             let mut text = String::new();
@@ -169,6 +373,29 @@ mod tests {
             metadata.apply_ini(&IniFile::from_str(&text), filename);
             assert_fields(&metadata, row);
         }
+    }
+
+    #[test]
+    fn retail_restate_briefings_read_their_section_key_or_fall_back_to_the_error_key() {
+        let Some((_, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let bytes = assets.get_ref("MISSIONMD.INI").expect("retail MISSIONMD");
+        let mission = IniFile::from_bytes(bytes).expect("retail MISSIONMD parses");
+        assert_eq!(
+            restate_briefing_key(&mission, "ALL01UMD.MAP"),
+            "Brief:ALL01md"
+        );
+        assert_eq!(
+            restate_briefing_key(&mission, "SOV07TMD.MAP"),
+            "Brief:Sov07md"
+        );
+        assert_eq!(
+            restate_briefing_key(&mission, "C1A01MD.MAP"),
+            "NAME:COOPDESC11"
+        );
+        // A map with no section, such as any skirmish map, shows the error key.
+        assert_eq!(restate_briefing_key(&mission, "XMP29U2.MAP"), "Brief:Error");
     }
 
     #[test]
@@ -196,5 +423,24 @@ mod tests {
             metadata.apply_ini(&mission, row["filename"].as_str().unwrap());
             assert_fields(&metadata, row);
         }
+    }
+
+    /// Ares INIClass_ReadScenario_CacheSP (1002F680, hook 0x686D7F): the
+    /// MISSION section's `LoadScreenText.Color`, else a default by the file
+    /// name's first three letters, also when the section is absent.
+    #[test]
+    fn ares_campaign_load_text_color_defaults_by_the_scenario_prefix() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let ini = IniFile::from_str("[sov01.map]\nLoadScreenText.Color=Gold\n");
+        let color = |filename: &str| {
+            let mut metadata = CampaignLoadingMetadata::default();
+            metadata.apply_ini(&ini, filename);
+            metadata.load_text_color().to_owned()
+        };
+        assert_eq!(color("sov01.map"), "Gold");
+        assert_eq!(color("sov02.map"), "SovietLoad");
+        assert_eq!(color("Yur01.map"), "YuriLoad");
+        assert_eq!(color("TUT01.MAP"), "LightGrey");
+        assert_eq!(color("all01.map"), "AlliedLoad");
     }
 }

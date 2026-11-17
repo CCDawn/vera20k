@@ -2,6 +2,7 @@
 //! Simulation's ScenarioSession owns62C/630 and the input-lock transitions.
 //! This leaf supplies no gameplay clock, RNG or competing pause counter.
 use crate::app::AppState;
+use crate::app::match_runtime::sim_host::SimWrite;
 use crate::sim::replay::ScenarioServiceInput;
 use crate::sim::timer::CdTimer;
 
@@ -34,35 +35,88 @@ const fn bucket(wall_ms: u64) -> i32 {
     ((wall_ms as u32) >> 4) as i32
 }
 
+/// Main_Tick55D7C2..55D877 checks Scenario62C only in offline modes0/5.
+/// Share its admission with message Manage55DDA5; a radar flag alone misses
+/// timed Action110 and other consumers of the same Scenario pause owner.
+/// Source: original gamemd.exe instructions.
+pub(crate) fn blocks_main_tick(mode: super::session::SessionMode, paused: bool) -> bool {
+    paused
+        && matches!(
+            mode,
+            super::session::SessionMode::Campaign | super::session::SessionMode::Skirmish
+        )
+}
+
 pub(crate) fn enter(state: &mut AppState, duration: i32, outermost: bool, wall_ms: u64) {
-    state
-        .match_state
-        .match_presentation
-        .scenario_pause
-        .rearm(duration, wall_ms);
+    let mode = state.match_state.session_mode();
+    enter_with_owners(
+        &mut state.match_state.match_presentation.scenario_pause,
+        &mut state.match_state.scenario_elapsed_clock,
+        mode,
+        state.audio.sfx_player.as_mut(),
+        duration,
+        outermost,
+        wall_ms,
+    );
+}
+
+/// ScenarioPause684060's physical effects also run at an in-frame Action110
+/// boundary, before a following outcome cue can reach Vox. The same clocks
+/// and SFX owner serve both callers. Source: original gamemd.exe instructions.
+pub(crate) fn enter_with_owners(
+    clock: &mut ScenarioPauseClock,
+    elapsed: &mut super::frame_pacer::ScenarioElapsedClock,
+    mode: super::session::SessionMode,
+    sfx: Option<&mut crate::audio::sfx::SfxPlayer>,
+    duration: i32,
+    outermost: bool,
+    wall_ms: u64,
+) {
+    clock.rearm(duration, wall_ms);
     if !outermost {
         return;
     }
     if matches!(
-        state.match_state.session.mode(),
+        mode,
         super::session::SessionMode::Campaign | super::session::SessionMode::Skirmish
     ) {
-        state.match_state.scenario_elapsed_clock.pause(wall_ms);
+        elapsed.pause(wall_ms);
     }
-    if let Some(sfx) = state.audio.sfx_player.as_mut() {
+    if let Some(sfx) = sfx {
         sfx.set_paused(true, wall_ms);
     }
 }
 
 pub(crate) fn resume(state: &mut AppState, wall_ms: u64) {
-    let paused = state
+    let elapsed_paused = state
+        .match_state
+        .elapsed_clock_paused(&state.frontend.screen);
+    let audio_paused = state
         .match_state
         .presentation_paused(&state.frontend.screen);
-    if !paused {
-        state.match_state.scenario_elapsed_clock.resume(wall_ms);
+    resume_with_owners(
+        &mut state.match_state.scenario_elapsed_clock,
+        state.audio.sfx_player.as_mut(),
+        elapsed_paused,
+        audio_paused,
+        wall_ms,
+    );
+}
+
+/// ScenarioResume684180 releases this hold through the existing elapsed and
+/// SFX owners; another local pause remains effective at either caller.
+pub(crate) fn resume_with_owners(
+    elapsed: &mut super::frame_pacer::ScenarioElapsedClock,
+    sfx: Option<&mut crate::audio::sfx::SfxPlayer>,
+    elapsed_paused: bool,
+    audio_paused: bool,
+    wall_ms: u64,
+) {
+    if !elapsed_paused {
+        elapsed.resume(wall_ms);
     }
-    if let Some(sfx) = state.audio.sfx_player.as_mut() {
-        sfx.set_paused(paused, wall_ms);
+    if let Some(sfx) = sfx {
+        sfx.set_paused(audio_paused, wall_ms);
     }
 }
 
@@ -71,15 +125,15 @@ pub(crate) fn resume(state: &mut AppState, wall_ms: u64) {
 /// the first live poll, while untimed holds remain with their existing owner.
 pub(crate) fn poll(state: &mut AppState, wall_ms: u64) {
     if matches!(
-        state.match_state.session.mode(),
+        state.match_state.session_mode(),
         super::session::SessionMode::Campaign | super::session::SessionMode::Skirmish
     ) && state
         .match_state
         .match_presentation
         .scenario_pause
         .elapsed(wall_ms)
-        && let Some(rt) = state.match_state.sim_runtime.as_ref()
-        && rt.simulation.session.scenario_pause_timed()
+        && let Some(rt) = state.match_state.sim_runtime.runtime()
+        && rt.simulation.session().scenario_pause_timed()
     {
         apply_service(state, ScenarioServiceInput::ExpireTimedPause);
     }
@@ -88,7 +142,7 @@ pub(crate) fn poll(state: &mut AppState, wall_ms: u64) {
 /// Ordered external service ingress shared by timers, Chrono and Radar.
 /// Record the transition itself, never a wall clock or a second state owner.
 pub(crate) fn apply_service(state: &mut AppState, input: ScenarioServiceInput) {
-    let Some(rt) = state.match_state.sim_runtime.as_mut() else {
+    let Some(rt) = state.match_state.sim_runtime.write_sim(SimWrite::Tick) else {
         return;
     };
     let effects = match state.match_state.match_diagnostics.get_or_begin_replay(rt) {
@@ -108,6 +162,6 @@ pub(crate) fn reset_clock(state: &mut AppState) {
     state.match_state.match_presentation.scenario_pause = ScenarioPauseClock::default();
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_match))]
 #[path = "scenario_pause_tests.rs"]
 mod tests;

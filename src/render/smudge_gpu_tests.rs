@@ -11,7 +11,6 @@ use crate::render::shroud_buffer::ShroudBuffer;
 use crate::render::terrain_draw_gpu_tests::{
     Gpu, assert_native_color_and_depth, camera, clear, encoded, extent,
 };
-use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::sim::smudge_grid::SmudgeGrid;
 use serde_json::Value;
 
@@ -152,11 +151,16 @@ fn retail_crater11_matches_original_cell_raster() {
     let mode =
         crate::rules::ini_parser::IniFile::from_bytes(assets.get_ref("MPBattleMD.ini").unwrap())
             .unwrap();
-    let (mut rules, rules_ini, art, _) =
+    let (mut rules, _, art, _) =
         crate::app::loading::init_helpers::load_rules_with_merged_ini(&assets, Some(&mode), None)
             .unwrap();
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-    let registry = OverlayTypeRegistry::from_ini(&rules_ini, Some(&art));
+    rules.bind_terrain_assets(
+        &assets,
+        theater.extension,
+        crate::rules::terrain_asset_catalog::TerrainAssetLoadPhase::Fresh,
+    );
+    let registry = rules.overlay_registry().clone();
     for source in packet["inputs"]["sources"].as_array().unwrap() {
         let name = source["name"].as_str().unwrap();
         if let Some(outer) = source["outer"]
@@ -222,10 +226,7 @@ fn retail_crater11_matches_original_cell_raster() {
             theater.extension,
             "TEMPERATE",
             &registry,
-            &rules.tiberium_types,
-            &rules.crate_rules,
-            &rules_ini,
-            rules.art(),
+            &rules,
             Some(&rules.smudge_types),
             &[],
         )
@@ -307,6 +308,7 @@ fn retail_crater11_matches_original_cell_raster() {
                 &terrain,
                 &lights,
                 &lookup,
+                atlas.art_extent(),
                 camera.camera_pos[0],
                 camera.camera_pos[1],
                 size[0] as f32,
@@ -315,6 +317,130 @@ fn retail_crater11_matches_original_cell_raster() {
             assert_eq!(instances.len(), 1, "flat uniform composite emits once");
             let output = read_raster(&gpu, &mut batch, &atlas, &instances, row, format, size);
             assert_native_color_and_depth(&output, row, format, size);
+        }
+
+        // Smudge6B5623..5661 recenters from the stored byte and current signed
+        // Width, then 6B5665..56B4 retains the source cell's height and light.
+        // These authored dimensions produce the same shape arguments as the
+        // existing retail_xmp_clear capture, without inventing pixel goldens.
+        let row = packet["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "retail_xmp_clear")
+            .unwrap();
+        let input = &row["input"];
+        let anchor = coords(&input["coords"]);
+        let level = input["level"].as_u64().unwrap() as u8;
+        let camera = view(row, size);
+        for (width, height, origin, source) in [
+            (
+                257,
+                2,
+                (anchor.0 + 1, anchor.1 - 1),
+                (anchor.0 + 255, anchor.1),
+            ),
+            (1, 257, anchor, (anchor.0, anchor.1 + 255)),
+            // Byte wrapping also occurs with both dimensions below 256.
+            (17, 17, anchor, (anchor.0, anchor.1 + 15)),
+        ] {
+            let custom = crate::rules::smudge_type::SmudgeTypeRegistry::from_rules_ini(
+                &crate::rules::ini_parser::IniFile::from_str(&format!(
+                    "[SmudgeTypes]\n0=CRATER11\n[CRATER11]\nWidth={width}\nHeight={height}\n"
+                )),
+            );
+            let terrain = crate::map::resolved_terrain::test_grid(
+                origin.0 + u16::try_from(width).unwrap(),
+                origin.1 + u16::try_from(height).unwrap(),
+                |x, y| crate::map::resolved_terrain::ResolvedTerrainCell {
+                    level: if (x, y) == source { level } else { 0 },
+                    ..crate::map::resolved_terrain::test_smudge_cell(x, y)
+                },
+            );
+            let overlay =
+                crate::sim::overlay_grid::OverlayGrid::new(terrain.width(), terrain.height());
+            let placed = SmudgeGrid::from_map_entries(
+                &[MapSmudgeEntry {
+                    type_name: "CRATER11".into(),
+                    rx: origin.0,
+                    ry: origin.1,
+                }],
+                &custom,
+                &terrain,
+                &overlay,
+                terrain.width(),
+                terrain.height(),
+            );
+            let mark = *placed.cell(source.0, source.1);
+            assert_eq!(mark.frame_offset, 255);
+            assert!(mark.type_id.is_some());
+            // Keep one surviving source from the production placement. Raw
+            // per-cell clearing may leave precisely this retained state.
+            let mut retained = SmudgeGrid::new(terrain.width(), terrain.height());
+            retained.test_force_set(source.0, source.1, mark);
+            let lights = build_cell_light_grid_from_heights_and_units(
+                [(source, level), (anchor, 0)],
+                scene_profile(input),
+            );
+            let lookup = |type_id: u16, frame: u8| {
+                assert_eq!(frame, 0, "cell data is not an SHP frame");
+                let def = custom.get(type_id)?;
+                let entry = atlas.get(&smudge_key(&def.name))?;
+                Some(TilePlacement {
+                    uv_origin: entry.uv_origin,
+                    uv_size: entry.uv_size,
+                    pixel_size: entry.pixel_size,
+                    draw_offset: [entry.offset_x, entry.offset_y],
+                })
+            };
+            let build =
+                |grid: &SmudgeGrid, registry: &crate::rules::smudge_type::SmudgeTypeRegistry| {
+                    build_visible_instances(
+                        grid,
+                        registry,
+                        &terrain,
+                        &lights,
+                        &lookup,
+                        atlas.art_extent(),
+                        camera.camera_pos[0],
+                        camera.camera_pos[1],
+                        size[0] as f32,
+                        size[1] as f32,
+                    )
+                };
+            let instances = build(&retained, &custom);
+            assert_eq!(instances.len(), 1, "decoded {width}x{height} source");
+            assert_eq!(
+                instances[0].palette_light,
+                crate::render::palette_light::PaletteLight::cell(&lights, source, false)
+            );
+            assert_ne!(
+                instances[0].palette_light,
+                crate::render::palette_light::PaletteLight::cell(&lights, anchor, false)
+            );
+            let output = read_raster(&gpu, &mut batch, &atlas, &instances, row, format, size);
+            assert_native_color_and_depth(&output, row, format, size);
+            if width == 257 {
+                // Native6B5621 bypasses IDIV for data0 even with Width0.
+                // Nonzero data with that width safely refuses the draw.
+                let zero = crate::rules::smudge_type::SmudgeTypeRegistry::from_rules_ini(
+                    &crate::rules::ini_parser::IniFile::from_str(
+                        "[SmudgeTypes]\n0=CRATER11\n[CRATER11]\nWidth=0\nHeight=0\n",
+                    ),
+                );
+                retained.test_force_set(source.0, source.1, Default::default());
+                retained.test_force_set(
+                    anchor.0,
+                    anchor.1,
+                    crate::sim::smudge_grid::SmudgeCell {
+                        type_id: Some(0),
+                        frame_offset: 0,
+                    },
+                );
+                assert_eq!(build(&retained, &zero).len(), 1);
+                retained.test_force_set(anchor.0, anchor.1, mark);
+                assert!(build(&retained, &zero).is_empty());
+            }
         }
     }
 }
@@ -335,9 +461,9 @@ fn retail_paid_destruction_and_replacement_reach_smudge_rendering() {
         "Hills.mmx",
         &[(LaunchCountry::France, AiDifficulty::Easy)],
     );
-    launch.player_name = "VERA-OBSERVER".into();
-    launch.local.country = LaunchCountry::America;
-    launch.local.start_position = LaunchStartPosition::Position(0);
+    launch.local_player_mut().name = "VERA-OBSERVER".into();
+    launch.local_slot_mut().country = LaunchCountry::America;
+    launch.local_slot_mut().start_position = LaunchStartPosition::Position(0);
     launch.opponents[0].start_position = LaunchStartPosition::Position(1);
     launch.options.starting_credits = 50_000;
     launch.options.unit_count = 1;
@@ -347,14 +473,15 @@ fn retail_paid_destruction_and_replacement_reach_smudge_rendering() {
     launch.options.short_game = false;
     let mut scene =
         crate::headless_scenario::load_session(&root, "Hills.mmx", 0x1234_5678, launch).unwrap();
-    let owner = scene.sim().session.current_house.unwrap();
+    let owner = scene.sim().session().current_house().unwrap();
     let actor = |scene: &crate::headless_scenario::HeadlessScenario, name| {
         scene
             .sim()
             .entities()
             .iter_sorted()
             .find_map(|(id, entity)| {
-                (entity.owner() == owner && scene.sim().interner.resolve(entity.type_ref()) == name)
+                (entity.owner() == owner
+                    && scene.sim().interner().resolve(entity.type_ref()) == name)
                     .then_some(id)
             })
             .unwrap()
@@ -365,7 +492,7 @@ fn retail_paid_destruction_and_replacement_reach_smudge_rendering() {
                    command: Option<Command>| {
         let commands: Vec<_> = command
             .into_iter()
-            .map(|payload| CommandEnvelope::new(owner, scene.sim().session.tick, payload))
+            .map(|payload| CommandEnvelope::new(owner, scene.sim().session().tick(), payload))
             .collect();
         scene
             .runtime
@@ -377,7 +504,7 @@ fn retail_paid_destruction_and_replacement_reach_smudge_rendering() {
             )
             .unwrap();
     };
-    let power = scene.sim().interner.get("GAPOWR").unwrap();
+    let power = scene.sim().interner().get("GAPOWR").unwrap();
     for step in 0..1100 {
         advance(
             &mut scene,
@@ -398,7 +525,7 @@ fn retail_paid_destruction_and_replacement_reach_smudge_rendering() {
     let yard = actor(&scene, "GACNST");
     let yard = scene.sim().entities().get(yard).unwrap();
     let (base_x, base_y) = (yard.position.rx(), yard.position.ry());
-    let terrain = scene.sim().resolved_terrain.as_ref().unwrap();
+    let terrain = scene.sim().resolved_terrain().unwrap();
     // Choose an experiment input through live loader facts and the real ready
     // placement query. This adds no placement policy or mutable game state.
     let mut candidates = Vec::new();
@@ -421,16 +548,14 @@ fn retail_paid_destruction_and_replacement_reach_smudge_rendering() {
                         .is_some()
                     && scene
                         .sim()
-                        .overlay_grid
-                        .as_ref()
+                        .overlay_grid()
                         .unwrap()
                         .cell(cell.rx, cell.ry)
                         .overlay_id
                         .is_none()
                     && scene
                         .sim()
-                        .smudge_grid
-                        .as_ref()
+                        .smudge_grid()
                         .unwrap()
                         .cell(cell.rx, cell.ry)
                         .type_id
@@ -490,18 +615,30 @@ fn retail_paid_destruction_and_replacement_reach_smudge_rendering() {
         !scene.sim().entities().contains(held),
         "actual fatal cleanup removes the paid building"
     );
-    let grid = scene.sim().smudge_grid.as_ref().unwrap();
+    let grid = scene.sim().smudge_grid().unwrap();
     let mark = *grid.cell(rx, ry);
     let mark_id = mark
         .type_id
         .expect("the actual destruction leaves a persistent footprint");
-    let mark_origin = mark.footprint_origin.unwrap();
+    let rules = &scene.runtime.resources.rules;
+    let definition = rules.smudge_types.get(mark_id).unwrap();
+    let decoded_origin = |x: u16, y: u16, data: u8| {
+        definition.encoded_cell_offset(data).map(|(dx, dy)| {
+            (
+                (x as i16).wrapping_sub(dx as i16) as u16,
+                (y as i16).wrapping_sub(dy as i16) as u16,
+            )
+        })
+    };
+    let mark_origin = decoded_origin(rx, ry, mark.frame_offset).unwrap();
     let mark_cells: Vec<_> = grid
         .iter_occupied()
-        .filter(|(_, _, cell)| cell.footprint_origin == Some(mark_origin))
+        .filter(|(x, y, cell)| {
+            cell.type_id == Some(mark_id)
+                && decoded_origin(*x, *y, cell.frame_offset) == Some(mark_origin)
+        })
         .map(|(x, y, _)| (x, y))
         .collect();
-    let rules = &scene.runtime.resources.rules;
     eprintln!(
         "normal produced {} at {:?}, {}cells",
         rules.smudge_types.get(mark_id).unwrap().name,
@@ -511,15 +648,6 @@ fn retail_paid_destruction_and_replacement_reach_smudge_rendering() {
 
     let mut assets = AssetManager::new(&root, MediaArchiveMode::STOCK_DIGITAL).unwrap();
     let theater = crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
-    let mode =
-        crate::rules::ini_parser::IniFile::from_bytes(assets.get_ref("MPBattleMD.ini").unwrap())
-            .unwrap();
-    let (_, rules_ini, _, _) = crate::app::loading::init_helpers::load_rules_with_merged_ini(
-        &assets,
-        Some(&mode),
-        Some(&scene.map.ini),
-    )
-    .unwrap();
     let gpu = Gpu::new();
     let size = [192, 160];
     let format = wgpu::TextureFormat::Bgra8UnormSrgb;
@@ -538,10 +666,7 @@ fn retail_paid_destruction_and_replacement_reach_smudge_rendering() {
         theater.extension,
         "TEMPERATE",
         &scene.runtime.resources.overlay_registry,
-        &rules.tiberium_types,
-        &rules.crate_rules,
-        &rules_ini,
-        rules.art(),
+        rules,
         Some(&rules.smudge_types),
         &[],
     )
@@ -551,7 +676,8 @@ fn retail_paid_destruction_and_replacement_reach_smudge_rendering() {
         crate::map::lighting::CellLightGrid::new(),
         crate::map::lighting::parse_lighting(&scene.map.ini),
         2,
-        Some((scene.sim().resolved_terrain.as_ref().unwrap(), scene.sim())),
+        Some((scene.sim().resolved_terrain().unwrap(), scene.sim())),
+        None,
     );
     // Declared neutral-A viewport for the live producer, not a native whole-map
     // camera or a replacement for the actual App capture.
@@ -571,11 +697,12 @@ fn retail_paid_destruction_and_replacement_reach_smudge_rendering() {
             })
         };
         build_visible_instances(
-            scene.sim().smudge_grid.as_ref().unwrap(),
+            scene.sim().smudge_grid().unwrap(),
             &scene.runtime.resources.rules.smudge_types,
-            scene.sim().resolved_terrain.as_ref().unwrap(),
+            scene.sim().resolved_terrain().unwrap(),
             lights.grid(),
             &lookup,
+            atlas.art_extent(),
             camera.camera_pos[0],
             camera.camera_pos[1],
             size[0] as f32,
@@ -635,8 +762,7 @@ fn retail_paid_destruction_and_replacement_reach_smudge_rendering() {
     assert!(
         mark_cells.iter().all(|&(x, y)| scene
             .sim()
-            .smudge_grid
-            .as_ref()
+            .smudge_grid()
             .unwrap()
             .cell(x, y)
             .type_id

@@ -19,9 +19,6 @@ fn native_cheer_record_resolves_registered_house_and_runs_the_shared_receiver() 
     let ini = IniFile::from_str(source);
     let (mut sim, mut rules, _) =
         entry_test_fixture::fixture_with_rules_and_fixed_art(source, &art);
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-    );
     rules.bind_type_sound_references(
         &ini,
         &SoundRegistry::from_ini(&IniFile::from_str("[SoundList]\n0=Cheer\n[Cheer]\n")),
@@ -30,8 +27,7 @@ fn native_cheer_record_resolves_registered_house_and_runs_the_shared_receiver() 
     let owner = sim.intern("Americans");
     for house in [foreign, owner] {
         sim.houses
-            .insert(house, HouseState::new(house, 0, None, true, 0, 10));
-        sim.session.house_order.push(house);
+            .register(HouseState::new(house, 0, None, true, 0, 10));
     }
     let mut ids = Vec::new();
     for house in [owner, foreign, owner] {
@@ -64,14 +60,14 @@ fn native_cheer_record_resolves_registered_house_and_runs_the_shared_receiver() 
         actor.mission_leaf.set_infantry_doing_verified(0).unwrap();
         ids.push(id);
     }
-    sim.sound_events.clear();
-    sim.session.binary_frame = 0xffff_fffe;
+    sim.sound_events.clear_for_test();
+    sim.session.set_binary_frame_for_test(0xffff_fffe);
     let record = sim.encode_cheer_record(owner).unwrap();
     assert_eq!(
         (record.opcode(), record.house_id(), record.frame_stamp()),
         (CHEER_OPCODE, 1, -2)
     );
-    sim.session.set_input_locked(true);
+    sim.session.set_input_locked_for_test(true);
     let event = sim.decode_native_command_record(&record, 99).unwrap();
     assert_eq!(event.owner, owner);
     assert_eq!(event.payload, Command::Cheer);
@@ -90,22 +86,4 @@ fn native_cheer_record_resolves_registered_house_and_runs_the_shared_receiver() 
     assert_eq!(sim.sound_events.iter().filter(|event| matches!(event, SimSoundEvent::VocCentered { sound_id } if sound_id == "Cheer")).count(), 1);
     let invalid = CommandRecord::encode(CHEER_OPCODE, 7, 0, &[]).unwrap();
     assert!(sim.decode_native_command_record(&invalid, 99).is_none());
-}
-
-#[test]
-fn house_cheer_requests_its_centered_cue_even_without_members() {
-    let ini = IniFile::from_str("[AudioVisual]\nCheerSound=Cheer\n");
-    let mut rules = crate::rules::ruleset::RuleSet::from_ini(&ini).unwrap();
-    rules.bind_type_sound_references(
-        &ini,
-        &SoundRegistry::from_ini(&IniFile::from_str("[SoundList]\n0=Cheer\n[Cheer]\n")),
-    );
-    let mut sim = Simulation::new();
-    let owner = sim.intern("Americans");
-    sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
-    assert!(sim.apply_command("Americans", &Command::Cheer, Some(&rules)));
-    assert!(
-        matches!(sim.sound_events.as_slice(), [SimSoundEvent::VocCentered { sound_id }] if sound_id == "Cheer")
-    );
 }

@@ -50,7 +50,7 @@ fn native_fixture_terrain(vectors: &serde_json::Value) -> ResolvedTerrainGrid {
         .iter()
         .map(|row| {
             let (x, y) = native_pair(row);
-            let cell = terrain.cell_mut(x as u16, y as u16).unwrap();
+            let cell = terrain.cell_mut_for_test(x as u16, y as u16).unwrap();
             cell.level = row[2].as_i64().unwrap() as u8;
             cell.slope_type = row[3].as_u64().unwrap() as u8;
             (x as u16, y as u16)
@@ -194,11 +194,24 @@ fn map_localsize_normalization_matches_native_executed_prefix() {
              [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n",
             size.0, size.1, local[0], local[1], local[2], local[3],
         );
-        let map = crate::map::map_file::MapFile::from_bytes(text.as_bytes()).unwrap();
+        let parsed = crate::map::map_file::MapFile::from_bytes(text.as_bytes());
+        if size == (0, 0) {
+            // The native normalization kernel accepts this numeric control;
+            // full map admission requires a nonempty fixed-grid footprint.
+            assert!(matches!(
+                parsed,
+                Err(crate::map::map_file::MapError::InvalidDimensions {
+                    width: 0,
+                    height: 0
+                })
+            ));
+            continue;
+        }
+        let map = parsed.unwrap();
         let mut sim = crate::sim::world::Simulation::new();
         sim.install_playfield_from_map_header(&map.header);
         assert_eq!(
-            sim.playfield_bounds,
+            sim.playfield_bounds(),
             Some(actual),
             "physical map input: {row}"
         );

@@ -2,7 +2,7 @@
 //! Native list rows use GAME.FNT height 17 + 2; inner rectangles exclude borders.
 
 use super::geom::{RectPx, ShellScale};
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListScrollPart {
@@ -48,6 +48,18 @@ impl ListMetrics {
             scrollbar_w: grow(SCROLLBAR_WIDTH, scale.factor()),
             arrow_h: grow(ARROW_HEIGHT, scale.factor()),
             min_thumb_h: grow(MIN_THUMB_HEIGHT, scale.factor()),
+        }
+    }
+
+    /// [`Self::scaled`] with rows for text at `text` times the shell's size.
+    pub fn for_text(scale: ShellScale, text: f32) -> Self {
+        let metrics = Self::scaled(scale);
+        if text == 1.0 {
+            return metrics;
+        }
+        Self {
+            row_h: ((ROW_HEIGHT as f32 * scale.factor() * text).round() as i32).max(1),
+            ..metrics
         }
     }
 }
@@ -124,6 +136,10 @@ impl ListScrollInteraction {
     pub fn repeat_at(&self) -> Option<Instant> {
         self.repeat_at
     }
+    /// Whether a press holds the scrollbar's capture, until the release.
+    pub fn captured(&self) -> bool {
+        self.captured.is_some()
+    }
     pub fn cancel(&mut self) {
         *self = Self::default();
     }
@@ -141,8 +157,19 @@ pub struct ShellListGeometry {
 }
 impl ShellListGeometry {
     pub fn new(outer: RectPx, count: usize, top: usize, metrics: ListMetrics) -> Self {
+        let visible_rows = ((outer.h - 2).max(0) / metrics.row_h) as usize;
+        Self::with_visible_rows(outer, count, visible_rows, top, metrics)
+    }
+    /// A list whose rows its owner lays out, `visible_rows` of them showing:
+    /// the scrollbar ranges over the tops that keep them filled.
+    pub fn with_visible_rows(
+        outer: RectPx,
+        count: usize,
+        visible_rows: usize,
+        top: usize,
+        metrics: ListMetrics,
+    ) -> Self {
         let inner_height = (outer.h - 2).max(0);
-        let visible_rows = (inner_height / metrics.row_h) as usize;
         let max_top = count.saturating_sub(visible_rows);
         let scrollbar = (max_top > 0).then(|| {
             RectPx::new(
@@ -167,11 +194,9 @@ impl ShellListGeometry {
         );
         let thumb = scrollbar.map(|bar| {
             let height = thumb_height(bar.h, max_top, metrics);
-            let span = (bar.h - 2 - metrics.arrow_h * 2 - height).max(1);
-            let offset = (span as i64 * top.min(max_top) as i64 / max_top as i64) as i32;
             RectPx::new(
                 bar.x + 1,
-                bar.y + 1 + metrics.arrow_h + offset,
+                scrollbar_thumb_y(bar, height, top, max_top, metrics),
                 metrics.scrollbar_w - 2,
                 height,
             )
@@ -231,10 +256,154 @@ impl ShellListGeometry {
         let (Some(bar), Some(thumb)) = (self.scrollbar, self.thumb) else {
             return 0;
         };
-        let span = (bar.h - 2 - 44 - thumb.h).max(1);
-        let numerator = (y - bar.y - 22 - thumb.h / 2).clamp(0, span);
-        (numerator as i64 * self.max_top as i64 / span as i64) as usize
+        scrollbar_top_at_pointer(bar, thumb.h, self.max_top, y, self.metrics)
     }
+}
+
+/// One owner-draw list box of a family page (the movie list `0x129`, VERA's
+/// Mods list): its rows, the subclass selection and the scrollbar's state.
+#[derive(Debug, Clone)]
+pub struct ListBoxState<Row> {
+    pub rows: Vec<Row>,
+    /// Subclass current selection (`-1` = none). Its LB_SETCURSEL handler
+    /// (`0x0061A534..0x0061A5F5`) always returns 0, so the proc's fallback
+    /// `LB_SETCURSEL(0)` never runs: a fresh process opens with nothing
+    /// selected.
+    pub selected: Option<usize>,
+    pub top: usize,
+    /// Previous press for the ListBox class's `CS_DBLCLKS` detection.
+    pub last_press: Option<(Instant, i32, i32)>,
+    /// Scrollbar capture and arrow repeat (`0x0061C690`).
+    pub scroll: ListScrollInteraction,
+}
+
+impl<Row> ListBoxState<Row> {
+    pub fn new(rows: Vec<Row>, selected: Option<usize>) -> Self {
+        Self {
+            rows,
+            selected,
+            top: 0,
+            last_press: None,
+            scroll: ListScrollInteraction::default(),
+        }
+    }
+
+    /// List and scrollbar geometry. The shared geometry takes the paint
+    /// surface, one pixel wider and taller than the `0x744` window, which
+    /// reproduces the retail frames: a scrollbar only above 15 rows, at
+    /// `x + w - 20` and 20 wide, a 202 px thumb for 17 rows.
+    pub fn geometry(&self, list: RectPx, metrics: ListMetrics) -> ShellListGeometry {
+        ShellListGeometry::new(
+            RectPx::new(list.x, list.y, list.w + 1, list.h + 1),
+            self.rows.len(),
+            self.top,
+            metrics,
+        )
+    }
+
+    /// A press on the scrollbar child: capture it, step an arrow or jump the
+    /// track. Returns `false` when the press is not on the scrollbar.
+    pub fn scroll_press(
+        &mut self,
+        list: RectPx,
+        metrics: ListMetrics,
+        x: i32,
+        y: i32,
+        now: Instant,
+    ) -> bool {
+        let geometry = self.geometry(list, metrics);
+        let Some(part) = geometry.scroll_part_at(x, y) else {
+            return false;
+        };
+        self.scroll.press(part, geometry, &mut self.top, y, now);
+        true
+    }
+
+    /// Pointer motion while the scrollbar may hold capture (thumb drag).
+    pub fn scroll_pointer_moved(&mut self, list: RectPx, metrics: ListMetrics, x: i32, y: i32) {
+        let geometry = self.geometry(list, metrics);
+        self.scroll.pointer_moved(geometry, &mut self.top, x, y);
+    }
+
+    /// Arrow auto-repeat; returns whether the list changed.
+    pub fn scroll_poll(
+        &mut self,
+        list: RectPx,
+        metrics: ListMetrics,
+        x: i32,
+        y: i32,
+        now: Instant,
+    ) -> bool {
+        if self.scroll.repeat_at().is_none() {
+            return false;
+        }
+        let geometry = self.geometry(list, metrics);
+        self.scroll.poll(geometry, &mut self.top, x, y, now)
+    }
+
+    /// Whether a press is the second click of a double-click
+    /// ([`is_double_click`]).
+    pub fn is_double_click(
+        &mut self,
+        now: Instant,
+        x: i32,
+        y: i32,
+        limits: (Duration, i32, i32),
+    ) -> bool {
+        is_double_click(&mut self.last_press, now, x, y, limits)
+    }
+
+    /// Row under a pointer press (`0x0061A948`): `client_y / 19 + top`,
+    /// without a border correction, ignoring presses below the last row. The
+    /// scrollbar is its own child window, so presses on it never reach the
+    /// list.
+    pub fn row_at(&self, list: RectPx, metrics: ListMetrics, x: i32, y: i32) -> Option<usize> {
+        if !list.contains(x, y)
+            || self
+                .geometry(list, metrics)
+                .scrollbar
+                .is_some_and(|bar| bar.contains(x, y))
+        {
+            return None;
+        }
+        let row = ((y - list.y) / metrics.row_h) as usize + self.top;
+        (row < self.rows.len()).then_some(row)
+    }
+}
+
+/// Shared 0061C890..0061C8AA scrollbar placement. Both list boxes and
+/// ComboDropWin create the same 0061C690 child; its range is the maximum
+/// top index, not the item count. The paint origin includes the one-pixel inset.
+pub fn scrollbar_thumb_y(
+    bar: RectPx,
+    thumb_h: i32,
+    top: usize,
+    max_top: usize,
+    metrics: ListMetrics,
+) -> i32 {
+    let span = (bar.h - 2 - metrics.arrow_h * 2 - thumb_h).max(1);
+    let offset = if max_top == 0 {
+        0
+    } else {
+        (i64::from(span) * top.min(max_top) as i64 / max_top as i64) as i32
+    };
+    bar.y + 1 + metrics.arrow_h + offset
+}
+
+/// Shared 0061C8B3..0061C935 / 0061D4C4..0061D511 pointer projection.
+/// Native reads the pointer in window coordinates (before the paint inset),
+/// recenters the thumb on every drag update, and truncates signed division.
+/// The down event inside the thumb only captures; callers invoke this on move.
+pub fn scrollbar_top_at_pointer(
+    bar: RectPx,
+    thumb_h: i32,
+    max_top: usize,
+    pointer_y: i32,
+    metrics: ListMetrics,
+) -> usize {
+    let span = (bar.h - 2 - metrics.arrow_h * 2 - thumb_h).max(1);
+    let position = (pointer_y - bar.y - metrics.arrow_h - thumb_h / 2).clamp(0, span);
+    (i64::from(position) * max_top as i64 / i64::from(span)) as usize
 }
 
 /// A line tone of the owner-draw list frame (`0x00619230`).
@@ -368,7 +537,7 @@ pub fn thumb_height(height: i32, range: usize, metrics: ListMetrics) -> i32 {
     .max(metrics.min_thumb_h)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
     // Timer expectations are from the61C690 instructions cited above; geometry

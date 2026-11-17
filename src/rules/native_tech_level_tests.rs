@@ -1,7 +1,7 @@
 //! TechnoType identity, current-default reads and generation retirement.
 //!
 //! The native lifecycle controls execute real AircraftType construction,
-//! TAction106, Process and Reset on gamemd3e81a617..08600. The tests below
+//! TAction106, Process and Reset on gamemd. The tests below
 //! compare their bounded scalar/identity history, not whole Full_Init parity.
 
 use super::*;
@@ -164,6 +164,17 @@ fn native_techno_lookup_uses_exact_case_and_global_allocation_chronology() {
     .process()
     .unwrap();
     let rules = RuleSet::from_processed_rules(&lazy).unwrap();
+    let infantry = rules
+        .type_handle_in_category(ObjectCategory::Infantry, "SHARED")
+        .unwrap();
+    assert!(
+        rules
+            .animation_sequence_by_handle(infantry)
+            .unwrap()
+            .infantry_action(0)
+            .is_some(),
+        "a same-named Building cannot replace the InfantryType's bank"
+    );
     assert_eq!(
         rules.native_techno_type_exact("SHARED").unwrap().category,
         ObjectCategory::Building,
@@ -379,6 +390,8 @@ fn process_owner_accepts_retired_values_before_its_existing_full_init_reset() {
                     )
                 }),
             [None; 2],
+            [],
+            [],
         )
         .unwrap();
     assert!(

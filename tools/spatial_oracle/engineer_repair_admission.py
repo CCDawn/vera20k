@@ -13,6 +13,7 @@ import struct
 from unicorn import Uc, UC_ARCH_X86, UC_MODE_32, UC_HOOK_CODE
 from unicorn.x86_const import UC_X86_REG_EAX, UC_X86_REG_ECX, UC_X86_REG_ESI, UC_X86_REG_EDI, UC_X86_REG_ESP
 from tools.native_oracle import load_image, run_checked, STACK_BASE, STACK_SIZE, SCRATCH, RET_MAGIC, finish_vectors, provenance
+from tools.native_oracle import require
 from tools.spatial_oracle.map_queries import dwords
 
 ACTOR, HUT, OTHER, KIND, CELL = [SCRATCH + n * 0x2000 for n in range(1, 6)]
@@ -165,7 +166,6 @@ from tools.spatial_oracle.building_body_rules import INI, SP
 from tools.spatial_oracle.refinery_dock import HOUSE, HTYPE, BLD, OTHER as OTHER_BUILDING, BLD_ITEMS, OTHER_ITEMS, cell
 from tools.rules_oracle import bridge_child_sound
 from tools.rules_oracle.bridge_anim_lists import HEAP
-from tools.native_oracle import NATIVE_SHA256
 
 JOINED_ROOT = Path(os.environ.get('VERA20K_ENGINEER_REPAIR_ASSETS',
                                  str(Path(os.environ.get('CARGO_TARGET_DIR', 'target')) / 'asset/engineer-repair/extract')))
@@ -726,8 +726,9 @@ class EngineerJoinedFixture(construction.JoinedFixture):
         0x6F4960: 'techno_discovery',
     }
 
-    def __init__(self, inputs, *, seed=31, arena_size=0x200000):
+    def __init__(self, inputs, *, seed=31, arena_size=0x200000, live_tags=False):
         self.phase, self.trail, self.trace = 'setup', deque(maxlen=40), []
+        self.live_tags = live_tags
         self.platform_audio = None
         super().__init__(inputs, seed=seed, arena_size=arena_size)
         u = self.u
@@ -794,7 +795,7 @@ class EngineerJoinedFixture(construction.JoinedFixture):
         assert self.audio_parent and self.read32(self.audio_parent + 0xF0) == 16
         self.phase = 'audio_pools'
         u.reg_write(UC_X86_REG_EDX, inputs.audio_index)
-        assert construction.invoke(u, 0x403ED0, self.audio_parent) == 1
+        require(construction.invoke(u, 0x403ED0, self.audio_parent) == 1, 'native 0x403ED0 returned an unexpected result')
         # 403ED0 resets the type-list sentinel. The actual constructed Sound
         # objects remain valid prior input; original node insertion reinstalls
         # those same objects. No selected sound fields or samples are supplied.
@@ -873,7 +874,7 @@ class EngineerJoinedFixture(construction.JoinedFixture):
         if pc in (0x519B43, 0x51A015, 0x519F34):
             self.trace.append(dict(kind='null_tag_gate', phase=self.phase, pc=f'0x{pc:08X}',
                                    tag=u.reg_read(UC_X86_REG_ECX)))
-        if pc == 0x6E53A0:
+        if pc == 0x6E53A0 and not self.live_tags:
             raise AssertionError('Tag=NULL corpus unexpectedly entered live Tag receiver')
         sp = u.reg_read(UC_X86_REG_ESP)
         if pc in (0x7C978A, 0x6C8C40):
@@ -991,7 +992,7 @@ class EngineerJoinedFixture(construction.JoinedFixture):
         position = self.heap
         self.heap += 0x20
         u.mem_write(position, dwords(start[0] * 256 + 128, start[1] * 256 + 128, 0))
-        assert construction.invoke(u, 0x51DFF0, actor, position, 128) & 255 == 1
+        require(construction.invoke(u, 0x51DFF0, actor, position, 128) & 255 == 1, 'native 0x51DFF0 returned an unexpected result')
         assert self.read32(actor + 0x34) == 0
         return actor
 
@@ -1284,7 +1285,7 @@ def joined_generate():
     controls = action_controls(inputs)
     files = [dict(name=p.name, size=p.stat().st_size, sha256=hashlib.sha256(p.read_bytes()).hexdigest())
              for p in sorted(JOINED_ROOT.iterdir()) if p.is_file() and p.suffix.lower() != '.json']
-    return dict(schema_version=1, source='unicorn/gamemd.exe', native_sha256=NATIVE_SHA256,
+    return dict(schema_version=1, source='unicorn/gamemd.exe',
         retail_files=files, constructor_defaults=inputs.defaults,
         original_executable_sections=inputs.code_identity,
         constructor_repair_sound=inputs.constructor_repair_sound,

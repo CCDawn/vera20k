@@ -14,53 +14,156 @@ pub(crate) mod ai_fire;
 pub mod cell_grid;
 pub mod chrono_screen;
 mod chronosphere;
+pub(crate) use chronosphere::AresChronoWarps;
 pub use chronosphere::CHRONO_WARP_SELECTION_INDEX;
+pub use chronosphere::ares_chrono_warp_for;
 pub mod airstrike_tint;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_superweapon))]
+mod ares_charge_tests;
+#[cfg(all(test, tests_sim_superweapon))]
+mod ares_common_keys_tests;
+mod ares_presentation;
+pub use ares_presentation::ares_timer_visible;
+#[cfg(all(test, tests_sim_superweapon))]
+mod ares_stock_types_tests;
+#[cfg(all(test, tests_sim_superweapon))]
+mod ares_super_anims_tests;
+#[cfg(all(test, tests_sim_superweapon))]
+mod ares_target_policy_tests;
+mod battery;
+#[cfg(all(test, tests_sim_superweapon))]
+mod building_charges_tests;
+#[cfg(all(test, tests_sim_superweapon))]
+mod building_requirements_tests;
+#[cfg(all(test, tests_sim_superweapon))]
 mod can_fire_tests;
-#[cfg(test)]
-mod view_admission_tests;
 #[cfg(any(test, feature = "test-support"))]
 mod cell_receiver_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_superweapon))]
+mod charge_drain_tests;
+#[cfg(all(test, tests_sim_superweapon))]
 mod charge_native_tests;
-#[cfg(test)]
-mod building_requirements_tests;
 #[cfg(any(test, feature = "test-support"))]
 mod chronosphere_lunar_retail_tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod chronosphere_tests;
+pub(crate) mod drop_pod;
+#[cfg(all(test, tests_sim_superweapon))]
+mod drop_pod_tests;
+mod emp_pulse;
+#[cfg(all(test, tests_sim_superweapon))]
+mod emp_pulse_tests;
 mod fire;
-mod money;
+mod firewall;
+#[cfg(all(test, tests_sim_superweapon))]
+mod firewall_tests;
 pub mod force_shield;
 mod generic_warhead;
-mod targeting;
 pub mod genetic_converter;
+mod hunter_seeker;
+#[cfg(all(test, tests_sim_superweapon))]
+mod hunter_seeker_tests;
 pub mod invulnerability;
 pub mod iron_curtain;
 pub mod lightning_storm;
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_superweapon, tests_sim_trigger)))]
 pub(crate) mod lightning_storm_tests;
+mod money;
 pub(crate) mod nuke;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_superweapon))]
 mod nuke_tests;
 pub mod paradrop;
+#[cfg(all(test, tests_sim_superweapon, feature = "phobos"))]
+mod phobos_techno_requirements_tests;
+mod protect;
 pub mod psychic_dominator;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_superweapon))]
 mod psychic_dominator_tests;
 pub mod psychic_reveal;
+mod sonar_pulse;
 mod spy_plane;
-pub(crate) mod unit_delivery;
-#[cfg(test)]
+mod two_stage;
+pub use two_stage::PaidSuperWeaponSelection;
+
+/// A cell selected by the Ares selector has already followed its native
+/// CanFireAt/preference path. In particular preferred/no-target results are
+/// not passed through a second, different target-policy decision.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuperWeaponTargetSource {
+    Manual,
+    Automatic,
+    SelectedAutomatic,
+}
+#[cfg(all(test, tests_sim_superweapon))]
 mod spy_plane_tests;
+mod targeting;
+pub(crate) mod unit_delivery;
+#[cfg(all(test, tests_sim_superweapon))]
+mod view_admission_tests;
 
 use crate::rules::ruleset::RuleSet;
 use crate::rules::superweapon_type::SuperWeaponType;
+use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
+use crate::sim::intern::StringInterner;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::timer::CdTimer;
+use crate::sim::world::FrameChannel;
 use crate::sim::world::FrameEffects;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::{SimSoundEvent, Simulation};
-use crate::util::native_x87::{NativeF32Bits, X87Chop53, X87Ordering};
+use crate::util::native_x87::{
+    MaskedX87Chop53, NativeF32Bits, NativeF64Bits, X87Chop53, X87Ordering,
+};
+
+/// The `[SuperWeaponTypes]` entry at a type's `PreDependent=` index: the
+/// Super Fire_SW pairs a `PostClick=` type with (`HouseClass+0x258` indexed by
+/// `Type+0xF0`, `0x004FAE6C..0x004FAE7E`).
+pub fn pre_dependent<'r>(
+    rules: &'r RuleSet,
+    sw: &SuperWeaponType,
+) -> Option<(&'r str, &'r SuperWeaponType)> {
+    let name = rules
+        .super_weapon_order
+        .get(usize::try_from(sw.pre_dependent).ok()?)?;
+    Some((name.as_str(), rules.super_weapon(name)?))
+}
+
+/// The source of a paid two-stage pair (VERA extension, Ares settlement): a
+/// `PostClick=` type whose [`pre_dependent`] pair carries money on either
+/// side. Stock zero-cost pairs answer `None` and keep the native path, as
+/// every pair does in a game Ares doesn't play in.
+pub fn paid_pair_source<'r>(
+    rules: &'r RuleSet,
+    sw: &SuperWeaponType,
+) -> Option<(&'r str, &'r SuperWeaponType)> {
+    if !rules.ares_form() || !sw.post_click {
+        return None;
+    }
+    // A handler's PostClick type has no PreDependent (LoadFromINIFile
+    // writes -1); Fire_SW pairs it with the House's last Super. The
+    // ticket pairs it with the first ChronoSphere whose player click
+    // selects it (1006ED30), the source that click leaves last.
+    let source = if sw.kind.has_ares_handler() {
+        rules.super_weapon_order.iter().find_map(|name| {
+            let source = rules.super_weapon(name)?;
+            (source.kind == crate::rules::superweapon_type::SuperWeaponKind::ChronoSphere
+                && chronosphere::ares_chrono_warp_for(rules, source)
+                    .is_some_and(|warp| warp.eq_ignore_ascii_case(&sw.id)))
+            .then_some((name.as_str(), source))
+        })
+    } else {
+        pre_dependent(rules, sw)
+    };
+    source.filter(|(_, source)| source.money_amount != 0 || sw.money_amount != 0)
+}
+
+/// The type whose money/refusal settings final activation uses. PostClick
+/// borrows the source, including a zero source amount; it never adds its fee.
+/// Rule-only presentation and runtime views share this same interpretation.
+pub fn financial_type<'a>(rules: &'a RuleSet, sw: &'a SuperWeaponType) -> &'a SuperWeaponType {
+    paid_pair_source(rules, sw).map_or(sw, |(_, source)| source)
+}
 
 /// Leptons `SuperClass::Launch` raises an invoke animation above its cell.
 const INVOKE_ANIM_Z_LIFT_LEPTONS: i32 = 5;
@@ -165,18 +268,18 @@ pub(super) fn spawn_super_anim(
 /// (`0x004DEAF8..0x004DEB2B`) does neither. `None` for an object without a
 /// type.
 fn strength_receiver_event(
-    sim: &mut Simulation,
+    interner: &mut StringInterner,
+    substrate: &ObjectSubstrate,
     rules: &RuleSet,
     id: u64,
     warhead: &str,
     house: Option<InternedId>,
     ignore_defenses: bool,
 ) -> Option<crate::sim::combat::EntityDamageEvent> {
-    let strength = sim
-        .substrate
+    let strength = substrate
         .entities
         .get(id)
-        .and_then(|entity| sim.interner.object_type(entity.type_ref(), rules))
+        .and_then(|entity| interner.object_type(entity.type_ref(), rules))
         .map(|object| object.strength)?;
     Some(crate::sim::combat::EntityDamageEvent::direct_receiver(
         id,
@@ -184,12 +287,105 @@ fn strength_receiver_event(
         0,
         crate::sim::combat::RAD_NO_ATTACKER,
         house,
-        sim.interner.intern(warhead),
+        interner.intern(warhead),
         crate::sim::combat::ReceiverCallFlags {
             ignore_defenses,
             arg6: false,
         },
     ))
+}
+
+/// A House's super weapons, keyed by type.
+pub(crate) type HouseSuperWeapons = std::collections::BTreeMap<InternedId, SuperWeaponInstance>;
+
+/// Every House's super weapons. The HouseClass constructor's Supers vector
+/// ([`construct_house_supers`]) installs a House's set once; nothing adds or
+/// removes a type afterwards, and instances change only through their own
+/// operations.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct SuperWeapons {
+    by_house: std::collections::BTreeMap<InternedId, HouseSuperWeapons>,
+}
+
+impl SuperWeapons {
+    pub(crate) fn get(&self, house: &InternedId) -> Option<&HouseSuperWeapons> {
+        self.by_house.get(house)
+    }
+
+    pub(crate) fn instance_mut(
+        &mut self,
+        house: &InternedId,
+        ty: &InternedId,
+    ) -> Option<&mut SuperWeaponInstance> {
+        self.by_house.get_mut(house)?.get_mut(ty)
+    }
+
+    /// A House's instances in type order; the set itself stays fixed.
+    pub(crate) fn house_instances_mut(
+        &mut self,
+        house: &InternedId,
+    ) -> impl Iterator<Item = (&InternedId, &mut SuperWeaponInstance)> {
+        self.by_house
+            .get_mut(house)
+            .into_iter()
+            .flat_map(|supers| supers.iter_mut())
+    }
+
+    pub(crate) fn iter(
+        &self,
+    ) -> std::collections::btree_map::Iter<'_, InternedId, HouseSuperWeapons> {
+        self.by_house.iter()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_house.is_empty()
+    }
+
+    /// Native 100226D0 always writes the count and frame together. A restored
+    /// nonzero count cannot omit the frame used to hash that retained pair.
+    /// Signed counts may wrap; their sign is not an admission constraint.
+    pub(crate) fn validate_ares_launch_history(&self) -> Result<(), &'static str> {
+        if self
+            .by_house
+            .values()
+            .flat_map(|weapons| weapons.values())
+            .any(|instance| {
+                instance.ares_launch_count != 0 && instance.ares_charge_origin_frame.is_none()
+            })
+        {
+            return Err("nonzero successful-launch count without a last frame");
+        }
+        Ok(())
+    }
+
+    /// The HouseClass constructor's Supers vector: each House's set, once.
+    fn install_house(&mut self, house: InternedId, supers: HouseSuperWeapons) {
+        assert!(
+            self.by_house.insert(house, supers).is_none(),
+            "a House constructs its Supers once"
+        );
+    }
+
+    /// Read view for the app.
+    pub(crate) fn as_map(&self) -> &std::collections::BTreeMap<InternedId, HouseSuperWeapons> {
+        &self.by_house
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn map_mut_for_test(
+        &mut self,
+    ) -> &mut std::collections::BTreeMap<InternedId, HouseSuperWeapons> {
+        &mut self.by_house
+    }
+}
+
+impl std::ops::Index<&InternedId> for SuperWeapons {
+    type Output = HouseSuperWeapons;
+
+    fn index(&self, house: &InternedId) -> &HouseSuperWeapons {
+        &self.by_house[house]
+    }
 }
 
 /// Per-house, per-superweapon-type runtime state.
@@ -202,15 +398,15 @@ pub struct SuperWeaponInstance {
     #[serde(default)]
     native_unique_id: Option<i32>,
     /// Which SuperWeaponType this instance represents (interned ID of the INI section name).
-    pub type_id: InternedId,
+    type_id: InternedId,
     /// Which house owns this instance.
-    pub owner: InternedId,
+    owner: InternedId,
     /// Whether the SW is granted (owning building exists and is alive).
-    pub is_active: bool,
+    is_active: bool,
     /// Whether the SW is fully charged and ready to fire.
-    pub is_ready: bool,
+    is_ready: bool,
     /// Whether charging is paused due to low power.
-    pub is_suspended: bool,
+    is_suspended: bool,
     /// Super+6E: Grant6CB57D stores its one-time argument. ClickFire6CBB18
     /// consumes it after Launch; Deactivate deliberately leaves it retained.
     #[serde(default)]
@@ -220,18 +416,18 @@ pub struct SuperWeaponInstance {
     #[serde(default = "default_can_lose")]
     can_lose: bool,
     /// Native frame when charging began. -1 = timer stopped.
-    pub charge_start_tick: i32,
+    charge_start_tick: i32,
     /// Total charge duration in native frames (may be adjusted on suspend/resume).
-    pub charge_duration: i32,
+    charge_duration: i32,
     /// Super+24, initialized to -1 by 0x006CAFA7. Exactly -1 inherits the type's
     /// recharge time; every other signed value is retained verbatim.
     #[serde(default = "inherited_recharge_time")]
     custom_recharge_time: i32,
     /// Charge/drain state: -1=N/A, 0=empty, 1=charged, 2=draining.
-    /// Only used when UseChargeDrain=yes (Force Shield). -1 for all others.
-    pub charge_drain_state: i32,
+    /// Native authored UseChargeDrain branch; no stock type enables it.
+    charge_drain_state: i32,
     /// Native frame when the SW became ready. Construction uses -100.
-    pub ready_tick: i32,
+    ready_tick: i32,
     /// `SuperClass+0x62` (ChronoMapCoords): the cell a Chronosphere click
     /// stores (`0x006CC3D3`) and a PostClick Fire_SW copies from its
     /// PreDependent Super (`0x004FAE8F`). Construction copies the static
@@ -263,6 +459,26 @@ pub struct SuperWeaponInstance {
     /// new one. None when that grant did not list it.
     #[serde(default)]
     timer_place: Option<u32>,
+    #[serde(default)]
+    paid_sequence: u64,
+    #[serde(default)]
+    paid_selection: Option<PaidSuperWeaponSelection>,
+    /// HouseExt's per-definition launch pair (+88 vector), shared by grants
+    /// and launches. Grant10022710 records the first recharge origin; successful
+    /// Launch100226D0 replaces it. The existing Super remains the sole owner
+    /// across grant, revoke, snapshot restoration and charge changes. Only
+    /// Ares code writes the pair, so it stays 0 and unset in a game Ares
+    /// doesn't play in.
+    ares_launch_count: i32,
+    #[serde(rename = "ares_last_launch_frame")]
+    ares_charge_origin_frame: Option<i32>,
+    /// VERA's Superweapon Limit (`SuperWeaponPerBuilding=`,
+    /// `docs/superweapon-limit.md`): the frames left on each charge the
+    /// house's further such buildings hold, the Super's own timer charging the
+    /// first building's. gamemd has one charge per Super; this stays empty
+    /// unless the rules set the key.
+    #[serde(default)]
+    building_charges: Vec<i32>,
 }
 
 fn idle_fade() -> i32 {
@@ -278,6 +494,127 @@ fn default_can_lose() -> bool {
 }
 
 impl SuperWeaponInstance {
+    /// The timer arm of `10014A90` (`+0x30`/`+0x38`): GetTimeLeft less
+    /// `amount`, at least 0, restarts at `frame`. A draining Super's drain
+    /// ends sooner; a charging one charges sooner.
+    fn shorten_for_firestorm_hit(&mut self, frame: i32, amount: i32) {
+        let left = self.charge_timer().remaining(frame);
+        self.store_charge_timer(CdTimer::started(frame, left.wrapping_sub(amount).max(0)));
+    }
+
+    /// 100226D0: called only after an admitted Ares Activate returned true.
+    fn record_ares_launch(&mut self, frame: i32) {
+        self.ares_launch_count = self.ares_launch_count.wrapping_add(1);
+        self.ares_charge_origin_frame = Some(frame);
+    }
+
+    /// Folded only once Ares set the origin frame, so a game Ares doesn't
+    /// play in hashes as before.
+    pub(crate) fn hash_ares_launch_history(&self, hasher: &mut impl std::hash::Hasher) {
+        if let Some(frame) = self.ares_charge_origin_frame {
+            std::hash::Hash::hash(b"ares-super-launch-history-v1", hasher);
+            std::hash::Hash::hash(&(self.ares_launch_count, frame), hasher);
+        }
+    }
+    /// The SuperWeaponType this instance represents.
+    pub fn type_id(&self) -> InternedId {
+        self.type_id
+    }
+
+    pub fn owner(&self) -> InternedId {
+        self.owner
+    }
+
+    /// Granted (`SuperClass+0x6D`).
+    pub fn is_active(&self) -> bool {
+        self.is_active
+    }
+
+    /// Charged (`SuperClass+0x6F`).
+    pub fn is_ready(&self) -> bool {
+        self.is_ready
+    }
+
+    /// Held for low power or by the user ([`Self::suspend`]).
+    pub fn is_suspended(&self) -> bool {
+        self.is_suspended
+    }
+
+    pub fn charge_start_tick(&self) -> i32 {
+        self.charge_start_tick
+    }
+
+    pub fn charge_duration(&self) -> i32 {
+        self.charge_duration
+    }
+
+    pub fn charge_drain_state(&self) -> i32 {
+        self.charge_drain_state
+    }
+
+    pub fn ready_tick(&self) -> i32 {
+        self.ready_tick
+    }
+
+    /// `SuperClass::ShouldFlashTab @ 0x006CE1A0` gates the strip's Defense
+    /// flash on `+0x70` suspension, then type `+0xE5` selects charge state
+    /// `+0x7C != 0` or ready flag `+0x6F`. It then applies
+    /// `FlashSidebarTabFrames=` to ready frame `+0x74`. The native signed
+    /// add/comparison wraps at 32 bits before testing `ReadyFrame + N > frame`.
+    fn should_flash_tab(&self, sw: &SuperWeaponType, current_frame: i32) -> bool {
+        if self.is_suspended {
+            return false;
+        }
+        if sw.use_charge_drain {
+            if self.charge_drain_state == 0 {
+                return false;
+            }
+        } else if !self.is_ready {
+            return false;
+        }
+
+        let frames = sw.flash_sidebar_tab_frames;
+        if frames == -1 {
+            return true;
+        }
+        frames != 0 && self.ready_tick.wrapping_add(frames) > current_frame
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_charge_drain_state_for_test(&mut self, value: i32) {
+        self.charge_drain_state = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_charge_duration_for_test(&mut self, value: i32) {
+        self.charge_duration = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_charge_start_tick_for_test(&mut self, value: i32) {
+        self.charge_start_tick = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_is_active_for_test(&mut self, value: bool) {
+        self.is_active = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_is_ready_for_test(&mut self, value: bool) {
+        self.is_ready = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_is_suspended_for_test(&mut self, value: bool) {
+        self.is_suspended = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_ready_tick_for_test(&mut self, value: i32) {
+        self.ready_tick = value;
+    }
+
     #[inline]
     fn charge_timer(&self) -> CdTimer {
         CdTimer::from_raw(self.charge_start_tick, self.charge_duration)
@@ -337,6 +674,77 @@ impl SuperWeaponInstance {
         }
     }
 
+    /// Folded only while a building charge exists, so games without Ten
+    /// Superweapons keep their hashes.
+    pub(crate) fn hash_building_charges(&self, hasher: &mut impl std::hash::Hasher) {
+        if !self.building_charges.is_empty() {
+            std::hash::Hash::hash(b"super-building-charges-v1", hasher);
+            std::hash::Hash::hash(&self.building_charges, hasher);
+        }
+    }
+
+    /// The shots charged and waiting: the Super's own when it is ready, and
+    /// each building charge with no frames left (Superweapon Limit).
+    pub fn ready_shots(&self) -> usize {
+        usize::from(self.is_active && self.is_ready)
+            + self
+                .building_charges
+                .iter()
+                .filter(|&&left| left == 0)
+                .count()
+    }
+
+    /// Superweapon Limit: keep one building charge for each of `buildings`
+    /// past the first, whose charge is the Super's own timer. A new
+    /// building's starts empty, at `recharge` frames; a lost building takes
+    /// the emptiest charge with it, the Super's own included, so the house
+    /// keeps its fullest ones. The own timer keeps its hold.
+    fn set_building_count(&mut self, buildings: usize, recharge: i32, current_frame: u32) {
+        let wanted = buildings.saturating_sub(1);
+        let frame = current_frame as i32;
+        while self.building_charges.len() > wanted {
+            let emptiest = self
+                .building_charges
+                .iter()
+                .enumerate()
+                .max_by_key(|&(index, &left)| (left, std::cmp::Reverse(index)))
+                .map_or(0, |(index, _)| index);
+            let kept = self.building_charges.remove(emptiest);
+            if self.is_active && !self.is_ready && self.charge_remaining(frame) > kept {
+                let stopped = self.charge_start_tick == -1;
+                let mut timer = CdTimer::started(frame, kept);
+                if stopped {
+                    timer.pause(frame);
+                }
+                self.store_charge_timer(timer);
+            }
+        }
+        self.building_charges.resize(wanted, recharge.max(0));
+    }
+
+    /// One frame of the building charges, which run while the Super is
+    /// granted and not held, ready or not.
+    fn step_building_charges(&mut self) {
+        if self.is_active && !self.is_suspended {
+            for left in &mut self.building_charges {
+                *left = (*left - 1).max(0);
+            }
+        }
+    }
+
+    /// The recharge a launch restarts the Super's timer with: without
+    /// building charges [`Self::recharge_time`]; with them, the fullest
+    /// one's frames left, that building's charge starting over empty. So
+    /// each building charges its own shot, and a house with charged shots
+    /// waiting is ready again at once.
+    fn next_recharge(&mut self, sw: &SuperWeaponType) -> i32 {
+        let recharge = self.recharge_time(sw);
+        let Some(fullest) = self.building_charges.iter_mut().min_by_key(|left| **left) else {
+            return recharge;
+        };
+        std::mem::replace(fullest, recharge.max(0))
+    }
+
     /// SuperClass constructor6CAF90: its charge timer starts at currentFrame
     /// with duration0; flags6C..70 begin false. The House constructs all types
     /// before its own attack-timer draw. See campaign_start --houses receipts.
@@ -360,6 +768,11 @@ impl SuperWeaponInstance {
             fade_countdown: idle_fade(),
             fade_coords: [0; 3],
             timer_place: None,
+            paid_sequence: 0,
+            paid_selection: None,
+            ares_launch_count: 0,
+            ares_charge_origin_frame: None,
+            building_charges: Vec::new(),
         }
     }
 
@@ -417,6 +830,7 @@ impl SuperWeaponInstance {
     fn apply_grant_state(
         &mut self,
         sw: &SuperWeaponType,
+        rules: &RuleSet,
         current_frame: u32,
         one_time: bool,
         on_hold: bool,
@@ -446,6 +860,15 @@ impl SuperWeaponInstance {
             if sw.use_charge_drain {
                 self.charge_drain_state = 0;
             }
+            if rules.ares_form()
+                && sw.kind.has_ares_handler()
+                && let Some(metadata) = rules.super_weapon_metadata(&sw.id)
+            {
+                // These handlers already retain successful launch history.
+                // Stock redirects need their own success boundary before using
+                // initial/virtual charge; do not invent history for them.
+                self.apply_ares_grant_charge(sw, metadata.charge(), frame);
+            }
         }
         if on_hold && !one_time && !self.is_suspended && self.can_lose {
             let mut timer = self.charge_timer();
@@ -457,6 +880,46 @@ impl SuperWeaponInstance {
             self.set_charged(sw, current_frame);
         }
         true
+    }
+
+    /// Ares3.0 Grant hook100354E0 replaces original6CB70C..6CB74D,
+    /// before Grant's on-hold and one-time tails. HouseExt10021480 reads
+    /// (shots,origin);10022710 records an initial recharge origin if unset.
+    /// Launch100226D0 later updates this same pair. No second cooldown exists.
+    fn apply_ares_grant_charge(
+        &mut self,
+        sw: &SuperWeaponType,
+        charge: &crate::rules::superweapon_type::AresSuperWeaponCharge,
+        frame: i32,
+    ) {
+        if charge.initial_ready && self.ares_launch_count == 0 {
+            self.charge_duration = 0;
+        }
+        if charge.virtual_charge
+            && let Some(origin) = self.ares_charge_origin_frame.filter(|origin| *origin >= 0)
+        {
+            self.charge_start_tick = origin;
+        }
+        //1003556F..1003559C uses a signed wrapping (start-now)+duration,
+        // clamped to zero; it does not replace the retained timer with zero.
+        if self.charge_start_tick != -1
+            && self
+                .charge_start_tick
+                .wrapping_sub(frame)
+                .wrapping_add(self.charge_duration)
+                <= 0
+        {
+            self.mark_ready(frame as u32);
+            if sw.use_charge_drain {
+                self.charge_drain_state = 1;
+            }
+        }
+        if self
+            .ares_charge_origin_frame
+            .is_none_or(|origin| origin < 0)
+        {
+            self.ares_charge_origin_frame = Some(frame);
+        }
     }
 
     /// Silent SetCharged6CC080 as reached from Grant6CB791.
@@ -472,6 +935,22 @@ impl SuperWeaponInstance {
         self.ready_tick = current_frame as i32;
         if sw.use_charge_drain {
             self.charge_drain_state = 1;
+        }
+    }
+
+    /// SuperClass::AI's readiness edge: the charge is ready at `frame`.
+    fn mark_ready(&mut self, frame: u32) {
+        self.is_ready = true;
+        self.ready_tick = frame as i32;
+    }
+
+    /// The trainer's Superweapons Ready action on a granted, unheld
+    /// instance: [`Self::set_charge_percentage`] to 100, then the readiness
+    /// edge, without waiting for SuperClass::AI.
+    #[cfg(feature = "debug-tools")]
+    pub(crate) fn debug_charge_full(&mut self, sw: &SuperWeaponType, frame: u32) {
+        if self.is_active && !self.is_suspended && self.set_charge_percentage(100, sw, frame) {
+            self.mark_ready(frame);
         }
     }
 
@@ -508,8 +987,11 @@ impl SuperWeaponInstance {
     /// timer list; its timer and hold stay as they were. The entry stays; a
     /// later grant activates it again.
     pub fn deactivate(&mut self) {
+        self.paid_selection = None;
         self.is_active = false;
         self.is_ready = false;
+        // VERA: a Super no building provides holds no building charges.
+        self.building_charges.clear();
     }
 
     /// `SuperClass::Suspend @ 0x006CB4D0` for a granted Super that is not
@@ -530,7 +1012,35 @@ impl SuperWeaponInstance {
         }
         self.store_charge_timer(timer);
         self.is_suspended = on;
+        if on {
+            self.paid_selection = None;
+        }
         true
+    }
+
+    /// Ares SetOnHold10035750's charge-drain tail after the shared hold
+    /// change: holding clears the drain state (-1); releasing starts it
+    /// charging (0), readies a never-fired `SW.InitialReady` type at once
+    /// (state 1) and otherwise restarts the timer with the type's own
+    /// RechargeTime (+0xB0, not the Super's override). The caller runs the
+    /// draining type's Deactivate.
+    fn ares_drain_hold(&mut self, on: bool, sw: &SuperWeaponType, rules: &RuleSet, frame: u32) {
+        if on {
+            self.charge_drain_state = -1;
+            return;
+        }
+        self.charge_drain_state = 0;
+        if rules
+            .super_weapon_metadata(&sw.id)
+            .is_some_and(|metadata| metadata.charge().initial_ready)
+            && self.ares_launch_count == 0
+        {
+            self.mark_ready(frame);
+            self.charge_drain_state = 1;
+        }
+        if !self.is_ready {
+            self.store_charge_timer(CdTimer::started(frame as i32, sw.recharge_time_frames));
+        }
     }
 
     /// SuperClass::CanFire6CC360, used by Select6AAEEA before selecting a
@@ -559,8 +1069,9 @@ impl SuperWeaponInstance {
     /// type's timer starts with the recharge time and is paused at once,
     /// keeping all of it; any other type but `PreClick=`/`PostClick=`
     /// restarts the recharge of a granted Super that is not ready and not
-    /// held, for [`Self::recharge_time`]. `CameoChargeState`, -1 on both
-    /// restarts, is the sidebar's.
+    /// held, for [`Self::recharge_time`] (VERA: [`Self::next_recharge`],
+    /// which differs only with building charges). `CameoChargeState`, -1 on
+    /// both restarts, is the sidebar's.
     fn finish_click_fire(&mut self, sw: &SuperWeaponType, current_frame: u32) {
         let frame = current_frame as i32;
         if !sw.post_click {
@@ -581,13 +1092,14 @@ impl SuperWeaponInstance {
         }
         if !sw.pre_click && !sw.post_click && self.is_active && !self.is_ready && !self.is_suspended
         {
-            self.store_charge_timer(CdTimer::started(frame, self.recharge_time(sw)));
+            let recharge = self.next_recharge(sw);
+            self.store_charge_timer(CdTimer::started(frame, recharge));
         }
     }
 
     /// `SuperClass::StopPreclickAnim @ 0x006CB830` after its anim release
     /// ([`Simulation::release_super_anim`]): a granted Super without a
-    /// charge restarts its recharge, unless it holds a type that is not
+    /// charge restarts its recharge ([`Self::next_recharge`]), unless it holds a type that is not
     /// `PreClick=` (`0x006CB89F..0x006CB8FF`). `CameoChargeState` (`+0x78`,
     /// -1 here) is the sidebar's; a `UseChargeDrain=` type's drain state
     /// (`+0x7C`) returns to 0. Returns whether it restarted.
@@ -595,10 +1107,8 @@ impl SuperWeaponInstance {
         if !self.is_active || self.is_ready || (self.is_suspended && !sw.pre_click) {
             return false;
         }
-        self.store_charge_timer(CdTimer::started(
-            current_frame as i32,
-            self.recharge_time(sw),
-        ));
+        let recharge = self.next_recharge(sw);
+        self.store_charge_timer(CdTimer::started(current_frame as i32, recharge));
         if sw.use_charge_drain {
             self.charge_drain_state = 0;
         }
@@ -608,36 +1118,148 @@ impl SuperWeaponInstance {
     /// `SuperClass::Reset @ 0x006CE0B0` past its anim release
     /// ([`reset_super`]): the charge ends (`+0x6F`) and the recharge timer
     /// restarts with [`Self::recharge_time`]; a stopped timer is stopped again
-    /// at once, keeping all of it (`0x006CE12A..0x006CE18F`).
+    /// at once, keeping all of it (`0x006CE12A..0x006CE18F`). VERA: with Ten
+    /// Superweapons' building charges it restarts with
+    /// [`Self::next_recharge`], so a spy costs the house one shot, not all.
     /// `CameoChargeState` (`+0x78`, -1) is the sidebar's. The grant, the hold
     /// and the drain state stay.
     fn reset(&mut self, sw: &SuperWeaponType, current_frame: u32) {
+        self.paid_selection = None;
         let frame = current_frame as i32;
         let stopped = self.charge_start_tick == -1;
         self.is_ready = false;
-        let mut timer = CdTimer::started(frame, self.recharge_time(sw));
+        let mut timer = CdTimer::started(frame, self.next_recharge(sw));
         if stopped {
             timer.pause(frame);
         }
         self.store_charge_timer(timer);
     }
 
-    /// Compute charge progress as 0.0–1.0 for sidebar display.
-    /// Only valid when is_active and not is_ready.
-    ///
-    /// gamemd.exe parity: standard `SuperClass::AnimStage` at `0x006CBEE0`
-    /// (active caller `StripClass::Draw` at `0x006A99AC`) derives progress from
-    /// the instance's effective recharge time and the live `CDTimer` remainder.
-    pub fn charge_progress(&self, current_frame: u32, full_recharge_frames: i32) -> f32 {
-        if self.is_ready {
-            return 1.0;
+    /// ClickFire6CB954/6CB9D9: human stop/start. The timer/state writes
+    /// precede Launch and bypass the ordinary ready/one-time finish. The
+    /// Boolean reports whether to call Launch, not native AL (always zero).
+    /// `ares` is the game's switch (`RuleSet::ares`).
+    fn click_charge_drain(
+        &mut self,
+        sw: &SuperWeaponType,
+        current_frame: u32,
+        ratio: NativeF64Bits,
+        ares: bool,
+    ) -> bool {
+        use MaskedX87Chop53 as F;
+        let full = self.recharge_time(sw);
+        let frame = current_frame as i32;
+        let remaining = self.charge_timer().remaining(frame);
+        let q = F::load_f64(ratio);
+        let (duration, launch) = match self.charge_drain_state {
+            1 => {
+                self.charge_drain_state = 2;
+                //6CBA0E integer SUB precedes FILD/FMUL/ftol-low32.
+                (F::mul(F::load_i32(full.wrapping_sub(remaining)), q), true)
+            }
+            2 => {
+                self.charge_drain_state = 1;
+                //6CB995..6CB9B0: T - (R/q), no intermediate f64 store.
+                (
+                    F::sub(F::load_i32(full), F::div(F::load_i32(remaining), q)),
+                    false,
+                )
+            }
+            _ => return false,
+        };
+        // Ares ClickFire10035130 replaces both conversions with Game::F2I,
+        // CRT100772B0's signed32 store.
+        let duration = if ares {
+            F::fistp_i32_masked(duration)
+        } else {
+            F::ftol_i32_low_masked(duration)
+        };
+        self.store_charge_timer(CdTimer::started(frame, duration));
+        launch
+    }
+
+    /// AnimStage6CBEE0, including state2's original expression and masked
+    /// PC53/chop order. Only an upper cap follows ftol; signed lower stages
+    /// are admitted by the shared SHP clock owner. `ares` is the game's
+    /// switch (`RuleSet::ares`).
+    fn anim_stage(
+        &self,
+        sw: &SuperWeaponType,
+        frame: i32,
+        ratio: NativeF64Bits,
+        ares: bool,
+    ) -> i32 {
+        use MaskedX87Chop53 as F;
+        if !self.is_active {
+            return 0;
         }
-        if full_recharge_frames <= 0 {
-            return 0.0;
+        if !sw.use_charge_drain && self.is_ready {
+            return 54;
         }
-        let remaining = self.charge_timer().remaining(current_frame as i32);
-        let elapsed = full_recharge_frames.wrapping_sub(remaining) as f32;
-        (elapsed / full_recharge_frames as f32).clamp(0.0, 1.0)
+        let full = self.recharge_time(sw);
+        let remaining = self.charge_timer().remaining(frame);
+        // Ares3.0 10035420 (hook 6CBF5B) replaces the drain expression: the
+        // type's ratio, a zero fraction unless |T*q| exceeds 0.001
+        // (1009C870), and Game::F2I (CRT100772B0); its jump lands on the
+        // 54-step clamp of 100354C0 below.
+        if ares && sw.use_charge_drain && self.charge_drain_state == 2 {
+            use crate::util::native_x87::MaskedX87Ordering as O;
+            let total = F::mul(F::load_i32(full), F::load_f64(ratio));
+            let epsilon = F::load_f64(NativeF64Bits::from_bits(0.001_f64.to_bits()));
+            let fraction = if F::compare(total, epsilon) == O::Greater
+                || F::compare(total, F::neg(epsilon)) == O::Less
+            {
+                F::sub(
+                    F::load_i32(1),
+                    F::div(F::sub(total, F::load_i32(remaining)), total),
+                )
+            } else {
+                F::load_i32(0)
+            };
+            return F::fistp_i32_masked(F::mul(fraction, F::load_i32(54))).min(54);
+        }
+        let fraction = if sw.use_charge_drain && self.charge_drain_state == 2 {
+            let total = F::mul(F::load_i32(full), F::load_f64(ratio));
+            F::sub(
+                F::load_i32(1),
+                F::div(F::sub(total, F::load_i32(remaining)), total),
+            )
+        } else {
+            F::div(F::load_i32(full.wrapping_sub(remaining)), F::load_i32(full))
+        };
+        let stage = F::ftol_i32_low_masked(F::mul(fraction, F::load_i32(54)));
+        // Ares3.0 100354C0 (hook 6CC053) caps the stage at 54 instead of the
+        // stock 53, so a full charge clears the clock's last wedge.
+        let cap = if ares { 54 } else { 53 };
+        stage.min(cap)
+    }
+
+    fn sidebar_display(
+        &self,
+        sw: &SuperWeaponType,
+        frame: i32,
+        ratio: NativeF64Bits,
+        ares: bool,
+    ) -> SuperWeaponDisplay {
+        // NameReadiness6CC2B0: HOLD has priority, independently of rawReady.
+        let status = if self.is_suspended {
+            Some(SuperWeaponStatus::Hold)
+        } else if sw.use_charge_drain {
+            match self.charge_drain_state {
+                0 => Some(SuperWeaponStatus::Charging),
+                1 => Some(SuperWeaponStatus::Ready),
+                2 => Some(SuperWeaponStatus::Active),
+                _ => None,
+            }
+        } else {
+            self.is_ready.then_some(SuperWeaponStatus::Ready)
+        };
+        SuperWeaponDisplay {
+            stage: self.anim_stage(sw, frame, ratio, ares),
+            // ShouldDrawProgress6CDE90; draining still draws while rawReady.
+            draw_progress: sw.use_charge_drain || !self.is_ready,
+            status,
+        }
     }
 }
 
@@ -649,17 +1271,34 @@ impl SuperWeaponInstance {
 /// without grant, ready or hold admission. A missing constructed instance
 /// cannot be reset. Executed dispatch controls and signed timer boundaries:
 /// `tools/spatial_oracle/trigger_superweapon_reset.meta.json`.
-pub(crate) fn reset_super(sim: &mut Simulation, rules: &RuleSet, owner: InternedId, sw_type: &str) {
-    let (Some(type_id), Some(sw)) = (sim.interner.get(sw_type), rules.super_weapon(sw_type)) else {
+pub(crate) fn reset_super(
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    substrate: &mut ObjectSubstrate,
+    sound_events: &mut FrameChannel<SimSoundEvent>,
+    super_weapons: &mut SuperWeapons,
+    rules: &RuleSet,
+    owner: InternedId,
+    sw_type: &str,
+) {
+    let (Some(type_id), Some(sw)) = (interner.get(sw_type), rules.super_weapon(sw_type)) else {
         return;
     };
-    sim.release_super_anim(owner, type_id);
-    let frame = sim.session.binary_frame;
-    if let Some(instance) = sim
-        .super_weapons
-        .get_mut(&owner)
-        .and_then(|weapons| weapons.get_mut(&type_id))
+    if let Some(selection) = super_weapons.paid_selection(owner)
+        && (selection.source == type_id || selection.destination == type_id)
     {
+        Simulation::cancel_paid_super_weapon_selection(
+            substrate,
+            sound_events,
+            super_weapons,
+            rules,
+            owner,
+            selection,
+        );
+    }
+    Simulation::release_super_anim(substrate, super_weapons, owner, type_id);
+    let frame = session.binary_frame();
+    if let Some(instance) = super_weapons.instance_mut(&owner, &type_id) {
         instance.reset(sw, frame);
     }
 }
@@ -692,6 +1331,21 @@ pub(crate) fn super_types_with_type(
         .map(String::as_str)
 }
 
+/// `SuperWeaponTypeClass::FindFirstOfAction @ 0x006CEEB0`: the first
+/// `[SuperWeaponTypes]` entry whose `Action=` (`+0xBC`) is `action`
+/// ([`SuperWeaponType::has_action`]), or none.
+pub fn first_super_type_with_action<'a>(rules: &'a RuleSet, action: &str) -> Option<&'a str> {
+    rules
+        .super_weapon_order
+        .iter()
+        .find(|name| {
+            rules
+                .super_weapon(name)
+                .is_some_and(|sw| sw.has_action(action))
+        })
+        .map(String::as_str)
+}
+
 /// `owner`'s Super of `type_name` is granted (`+0x6D`) and, in PC53/chop, its
 /// remaining charge over its recharge time is not above `1.0f - [General]
 /// AIMinorSuperReadyPercent=` (`FCOMPP`, `TEST AH,0x1`, so an unordered
@@ -716,7 +1370,7 @@ pub(crate) fn super_nearly_ready(
     if !instance.is_active {
         return false;
     }
-    let remaining = instance.charge_remaining(sim.session.binary_frame as i32);
+    let remaining = instance.charge_remaining(sim.session.binary_frame() as i32);
     let recharge = rules
         .super_weapon(type_name)
         .map_or(0, |sw| instance.recharge_time(sw));
@@ -758,7 +1412,7 @@ pub(crate) fn supers_of_kind_remaining(
     owner: InternedId,
     kind_index: i32,
 ) -> Vec<i32> {
-    let frame = sim.session.binary_frame as i32;
+    let frame = sim.session.binary_frame() as i32;
     let weapons = sim.super_weapons.get(&owner);
     super_types_with_type(rules, kind_index)
         .map(|name| {
@@ -771,10 +1425,10 @@ pub(crate) fn supers_of_kind_remaining(
 }
 
 /// The place a Super joining the timer list takes: after every place taken.
-fn next_timer_place(sim: &Simulation) -> u32 {
-    sim.super_weapons
-        .values()
-        .flat_map(|weapons| weapons.values())
+fn next_timer_place(super_weapons: &SuperWeapons) -> u32 {
+    super_weapons
+        .iter()
+        .flat_map(|(_, weapons)| weapons.values())
         .filter_map(|instance| instance.timer_place)
         .max()
         .map_or(0, |place| place + 1)
@@ -844,7 +1498,7 @@ impl SuperTimerView {
 
 /// The timer list, in its order.
 pub fn super_timer_views(sim: &Simulation, rules: &RuleSet) -> Vec<SuperTimerView> {
-    let frame = sim.session.binary_frame as i32;
+    let frame = sim.session.binary_frame() as i32;
     let mut views: Vec<SuperTimerView> = sim
         .super_weapons
         .iter()
@@ -870,19 +1524,93 @@ pub fn super_timer_views(sim: &Simulation, rules: &RuleSet) -> Vec<SuperTimerVie
     views
 }
 
+/// The charge-to-drain ratio a type's AnimStage and ClickFire read: Ares
+/// GetChargeToDrainRatio10032690's `SW.ChargeToDrainRatio`, else (and when
+/// Ares doesn't play) `[General] ChargeToDrainRatio=` (Rules+0xEC0).
+pub(crate) fn charge_to_drain_ratio(rules: &RuleSet, sw: &SuperWeaponType) -> NativeF64Bits {
+    if rules.ares_form()
+        && let Some(metadata) = rules.super_weapon_metadata(&sw.id)
+    {
+        return metadata
+            .charge()
+            .charge_to_drain_ratio(rules.general.charge_to_drain_ratio);
+    }
+    rules.general.charge_to_drain_ratio
+}
+
+/// Derived native status text, without a presentation-local phase/timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuperWeaponStatus {
+    Hold,
+    Ready,
+    Charging,
+    Active,
+}
+
+/// Shared NameReadiness/AnimStage/ShouldDrawProgress projection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SuperWeaponDisplay {
+    pub stage: i32,
+    pub draw_progress: bool,
+    pub status: Option<SuperWeaponStatus>,
+}
+
+/// Why Ares's sidebar select hook (10034DA0) refuses a cameo press, in its
+/// test order. Ephemeral; gameplay state stays with the Super/House owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AresCameoRefusal {
+    /// CanFire6CC360 refuses: plays `EVA.Impatient` (gamemd's empty
+    /// `0x006CC070`), prints nothing.
+    NotReady,
+    /// Prints `Message.InsufficientFunds`.
+    InsufficientFunds,
+    /// A `SW.UseAITargeting` type's constraints refuse; prints
+    /// `Message.CannotFire`.
+    CannotFire,
+    /// `SW.AutoFire` without `SW.ManualFire`: refused without a message.
+    ManualFireDisabled,
+    /// A draining `SW.Unstoppable` charge-drain type: refused silently.
+    Unstoppable,
+}
+
 /// View struct for sidebar display — no sim internals exposed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SuperWeaponView {
     pub type_id: InternedId,
+    /// Immutable selection flag projected from the common Rules owner.
+    pub use_ai_targeting: bool,
     pub display_name: String,
     pub progress: f32,
+    pub display: SuperWeaponDisplay,
     pub is_ready: bool,
     pub is_online: bool,
+    /// Derived `SuperClass::ShouldFlashTab @ 0x006CE1A0` result for the
+    /// current simulation frame; the sidebar owns only the shared flash phase.
+    pub should_flash_tab: bool,
     /// Native CanFire6CC360, independently of the raw charge/display flags.
     pub can_fire: bool,
     /// Derived from the same wallet predicate used at launch, not readiness.
     pub can_afford: bool,
-    pub sidebar_image: Option<String>,
+    /// A `SW.UseAITargeting` type whose Ares constraints fail for a manual
+    /// launch (IsTargetConstraintsEligible10032110). Ares's sidebar hooks
+    /// darken (10034F3F) and refuse (10034E75) it, as Phobos's
+    /// SWButtonClass does. Always false without Ares.
+    pub constraints_blocked: bool,
+    /// The select hook's refusal of a press, if any. None without Ares.
+    pub ares_refusal: Option<AresCameoRefusal>,
+    /// The shots charged and waiting ([`SuperWeaponInstance::ready_shots`]):
+    /// more than one only with Superweapon Limit, when the cameo counts them.
+    pub ready_shots: usize,
+}
+
+impl SuperWeaponView {
+    /// The strip cameo's enabled state, the inverse of its darken flag (BL).
+    /// Stock StripDraw clears BL for every superweapon (0x006A99B5); Ares's
+    /// hook there (10034EF0) sets it while CanFire (0x006CC360) holds and the
+    /// type is unaffordable or its constraints refuse a manual launch.
+    pub fn sidebar_enabled(&self) -> bool {
+        !(self.can_fire && (!self.can_afford || self.constraints_blocked))
+    }
 }
 
 /// Query active superweapons for a specific owner (for sidebar rendering).
@@ -894,6 +1622,8 @@ pub fn superweapon_views_for_owner(
     let Some(weapons) = sim.super_weapons.get(owner) else {
         return Vec::new();
     };
+    let current_frame = sim.session.binary_frame() as i32;
+    let ares = rules.ares_form();
     let mut views = Vec::new();
     for inst in weapons.values() {
         if !inst.is_active {
@@ -903,15 +1633,68 @@ pub fn superweapon_views_for_owner(
         let Some(sw_type) = rules.super_weapon(type_id_str) else {
             continue;
         };
+        let paid_source = paid_pair_source(rules, sw_type);
+        let display = inst.sidebar_display(
+            sw_type,
+            current_frame,
+            charge_to_drain_ratio(rules, sw_type),
+            ares,
+        );
+        let native_can_fire = if paid_source.is_some() {
+            sim.paid_super_weapon_selection(*owner)
+                .is_some_and(|selection| selection.destination == inst.type_id)
+        } else {
+            inst.can_fire(sw_type)
+        };
+        // The wallet, the target constraints and the select hook's refusal
+        // are Ares': without it a cameo is never darkened or refused for
+        // them.
+        let can_afford =
+            !ares || money::can_afford(&sim.houses, *owner, financial_type(rules, sw_type));
+        let constraints_blocked = ares
+            && rules
+                .super_weapon_metadata(type_id_str)
+                .is_some_and(|metadata| {
+                    let targeting = metadata.targeting();
+                    targeting.use_ai_targeting()
+                        && !targeting.constraints().allows_manual_fire(
+                            sim.houses
+                                .get(owner)
+                                .map(|house| house.target_constraints_observations())
+                                .unwrap_or_default(),
+                        )
+                });
         views.push(SuperWeaponView {
             type_id: inst.type_id,
+            use_ai_targeting: rules.super_weapon_uses_ai_targeting(type_id_str),
             display_name: type_id_str.to_string(),
-            progress: inst.charge_progress(sim.session.binary_frame, inst.recharge_time(sw_type)),
+            progress: display.stage as f32 / 54.0,
+            display,
             is_ready: inst.is_ready,
             is_online: !inst.is_suspended,
-            can_fire: inst.can_fire(sw_type),
-            can_afford: money::can_afford(sim, *owner, sw_type),
-            sidebar_image: sw_type.sidebar_image.clone(),
+            should_flash_tab: inst.should_flash_tab(sw_type, current_frame),
+            can_fire: native_can_fire,
+            can_afford,
+            constraints_blocked,
+            ares_refusal: if ares {
+                ai_fire::manual_cameo_refusal(
+                    rules,
+                    sw_type,
+                    native_can_fire,
+                    can_afford,
+                    constraints_blocked,
+                    // 10034DA0's unstoppable test: a draining charge-drain
+                    // type with SW.Unstoppable cannot be clicked off.
+                    sw_type.use_charge_drain
+                        && inst.charge_drain_state == 2
+                        && rules
+                            .super_weapon_metadata(type_id_str)
+                            .is_some_and(|metadata| metadata.charge().unstoppable()),
+                )
+            } else {
+                None
+            },
+            ready_shots: inst.ready_shots(),
         });
     }
     views
@@ -925,27 +1708,91 @@ pub(crate) fn tick_house_superweapon_instances(
     rules: &RuleSet,
     owner: InternedId,
 ) {
-    let current_frame = sim.session.binary_frame;
+    let current_frame = sim.session.binary_frame();
+    let ares = rules.ares_form();
+    let human = ares
+        && sim
+            .houses
+            .get(&owner)
+            .is_some_and(|house| house.is_controlled_by_human(sim.session.game_mode_nonzero()));
     for type_id in house_super_order(sim, rules, owner) {
-        let (fade, ready) = {
+        let (fade, ready, drain_ended) = {
             let instance = sim
                 .super_weapons
-                .get_mut(&owner)
-                .and_then(|weapons| weapons.get_mut(&type_id))
+                .instance_mut(&owner, &type_id)
                 .expect("selected retained Super");
             // The fade head precedes the granted/held/readiness gates.
             let fade = instance.step_fade();
-            let ready = instance.is_active
-                && !instance.is_ready
+            instance.step_building_charges();
+            let sw = rules.super_weapon(sim.interner.resolve(type_id));
+            let charge_drain = sw.is_some_and(|sw| sw.use_charge_drain);
+            let running = instance.is_active
+                && (!instance.is_ready || charge_drain)
                 && !instance.is_suspended
-                && instance.charge_start_tick != -1
-                && instance.charge_timer().expired(current_frame as i32);
-            if ready {
-                instance.is_ready = true;
-                instance.ready_tick = current_frame as i32;
+                && instance.charge_start_tick != -1;
+            let expired = running && instance.charge_timer().expired(current_frame as i32);
+            // Ares SuperClass_Update_DrainMoney100358A0 (hook 6CBD6B), on a
+            // running draining timer: every Money.DrainDelay frames left it
+            // transacts Money.DrainAmount; an unaffordable one ends the drain
+            // as the timer's expiry would (6CBD73).
+            let expired = expired
+                || (ares
+                    && running
+                    && !expired
+                    && charge_drain
+                    && instance.charge_drain_state == 2
+                    && sw.is_some_and(|sw| {
+                        let remaining = instance.charge_remaining(current_frame as i32);
+                        !drain_money(
+                            &mut sim.houses,
+                            &mut sim.sound_events,
+                            rules,
+                            owner,
+                            type_id,
+                            sw,
+                            remaining,
+                            human,
+                        )
+                    }));
+            // AI6CBD7E..6CBDBD returns before ordinary ReadyFrame/EVA.
+            // Drain expiry does not clear rawReady; the next recharge must
+            // therefore remain visitable while that flag is already true.
+            let ready = expired && !charge_drain;
+            let mut drain_ended = false;
+            if expired && charge_drain {
+                if instance.charge_drain_state == 2 {
+                    instance.charge_drain_state = 0;
+                    instance.store_charge_timer(CdTimer::started(
+                        current_frame as i32,
+                        instance.recharge_time(sw.expect("drain type")),
+                    ));
+                    drain_ended = true;
+                } else {
+                    instance.charge_drain_state = 1;
+                    instance.is_ready = true;
+                }
             }
-            (fade, ready)
+            if ready {
+                instance.mark_ready(current_frame);
+            }
+            (fade, ready, drain_ended)
         };
+        // Ares SuperClass_Progress_Charged10035730 (hook 6CBD86): a drain
+        // that ran out deactivates its new type.
+        if ares
+            && drain_ended
+            && let Some(sw) = rules.super_weapon(sim.interner.resolve(type_id))
+        {
+            deactivate_ares_handler(
+                sim,
+                rules,
+                owner,
+                type_id,
+                sw,
+                true,
+                FrameEffects::default(),
+            );
+        }
         if let Some([x, y, z]) = fade
             && let Some(sound_id) = rules
                 .super_weapon(sim.interner.resolve(type_id))
@@ -953,7 +1800,7 @@ pub(crate) fn tick_house_superweapon_instances(
         {
             let (rx, ry, sub_x, sub_y, _) =
                 crate::sim::anim_class::AnimWorldCoord { x, y, z }.to_cell_sub_z();
-            sim.sound_events.push(SimSoundEvent::VocAt {
+            sim.sound_events.emit(SimSoundEvent::VocAt {
                 sound_id,
                 audible_to: None,
                 rx,
@@ -964,12 +1811,106 @@ pub(crate) fn tick_house_superweapon_instances(
             });
         }
         if ready {
-            sim.sound_events.push(SimSoundEvent::SuperWeaponReady {
+            sim.sound_events.emit(SimSoundEvent::SuperWeaponReady {
                 owner,
                 sw_type: type_id,
             });
         }
     }
+}
+
+/// SuperClass_Update_DrainMoney100358A0's body for one running draining
+/// Super with `remaining` frames left: false when the House could not pay,
+/// which ends the drain. A ControlledByHuman House announces the refusal on
+/// every client. No RNG, timer or detach call.
+fn drain_money(
+    houses: &mut Houses,
+    sound_events: &mut FrameChannel<SimSoundEvent>,
+    rules: &RuleSet,
+    owner: InternedId,
+    sw_type: InternedId,
+    sw: &SuperWeaponType,
+    remaining: i32,
+    human: bool,
+) -> bool {
+    let Some((amount, delay)) = rules
+        .super_weapon_metadata(&sw.id)
+        .map(|metadata| metadata.charge().money_drain())
+    else {
+        return true;
+    };
+    if remaining <= 0 || amount == 0 || delay <= 0 || remaining % delay != 0 {
+        return true;
+    }
+    if !money::can_transact(houses, owner, amount) {
+        if human {
+            sound_events.emit(SimSoundEvent::AresSuperWeaponDrainRefused { owner, sw_type });
+        }
+        return false;
+    }
+    money::settle(houses, owner, amount);
+    true
+}
+
+/// SWTypeExt::Deactivate100325D0: the new type's Deactivate (Battery's
+/// 1006EC40 and the Firestorm's 100715F0 have bodies among the ported
+/// types), then trigger event 76 (superweapon deactivated, source the Super)
+/// on the owner's House Tags. A stock type without a handler returns before
+/// both. The drain-expiry and hold passes reach this without the frame's
+/// effects and overlay table. `is_player` is ClickFire's (the drain expiry
+/// passes true, the loss and hold false).
+pub(super) fn deactivate_ares_handler(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    typ: InternedId,
+    sw: &SuperWeaponType,
+    is_player: bool,
+    effects: FrameEffects<'_>,
+) {
+    if !sw.kind.has_ares_handler() {
+        return;
+    }
+    match sw.kind {
+        crate::rules::superweapon_type::SuperWeaponKind::Battery => {
+            battery::deactivate(sim, rules, owner, sw);
+        }
+        crate::rules::superweapon_type::SuperWeaponKind::Firestorm => {
+            firewall::deactivate(sim, rules, owner, is_player, effects);
+        }
+        _ => {}
+    }
+    sim.raise_ares_super_event(
+        owner,
+        76,
+        crate::sim::trigger_runtime::AresEventSource::Super(typ),
+        rules,
+        effects.overlay_registry(),
+        effects,
+    );
+}
+
+/// SWTypeExt::Activate10032020 after its Launch10032ED0 accepted the Super:
+/// trigger event 77 (fired near a waypoint, source the Super and its target
+/// Cell), then 75 (activated, source the Super), each on every House Tag of
+/// the owner.
+pub(super) fn raise_ares_activation_events(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    typ: InternedId,
+    (rx, ry): (u16, u16),
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    effects: FrameEffects<'_>,
+) {
+    use crate::sim::trigger_runtime::AresEventSource;
+    let launch = AresEventSource::Launch {
+        sw_type: typ,
+        cell: (rx as i16, ry as i16),
+    };
+    sim.raise_ares_super_event(owner, 77, launch, rules, overlay_registry, effects);
+    let activated = AresEventSource::Super(typ);
+    sim.raise_ares_super_event(owner, 75, activated, rules, overlay_registry, effects);
 }
 
 /// `HouseClass::HouseClass` builds the House's whole Supers vector, one
@@ -984,7 +1925,7 @@ pub(crate) fn construct_house_supers(
     owner: InternedId,
     bind_native_ids: bool,
 ) {
-    let frame = sim.session.binary_frame as i32;
+    let frame = sim.session.binary_frame() as i32;
     let mut supers = std::collections::BTreeMap::new();
     for name in &rules.super_weapon_order {
         let type_id = sim.interner.intern(name);
@@ -1000,14 +1941,39 @@ pub(crate) fn construct_house_supers(
             "distinct Super type registry"
         );
     }
-    assert!(
-        sim.super_weapons.insert(owner, supers).is_none(),
-        "a House constructs its Supers once"
-    );
+    sim.super_weapons.install_house(owner, supers);
 }
 
 /// Supers are constructed by the scenario House owner before map objects.
 /// Storage-key order is not the original SuperWeaponTypes registry order.
+/// Ares BuildingClass_ReceiveDamage_FSW (`10014A90`): `owner`'s first
+/// `Type=Firestorm` Super (HouseClass::FindSuperWeapon, in
+/// `[SuperWeaponTypes]` order) has `amount` frames taken off its charge
+/// timer, which restarts now ([`SuperWeaponInstance::shorten_for_firestorm_hit`]).
+pub(crate) fn shorten_ares_firestorm_drain(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    amount: i32,
+) {
+    let Some(type_id) = house_super_order(sim, rules, owner)
+        .into_iter()
+        .find(|&id| {
+            rules
+                .super_weapon(sim.interner.resolve(id))
+                .is_some_and(|sw| {
+                    sw.kind == crate::rules::superweapon_type::SuperWeaponKind::Firestorm
+                })
+        })
+    else {
+        return;
+    };
+    let frame = sim.session.binary_frame() as i32;
+    if let Some(instance) = sim.super_weapons.instance_mut(&owner, &type_id) {
+        instance.shorten_for_firestorm_hit(frame, amount);
+    }
+}
+
 fn house_super_order(sim: &Simulation, rules: &RuleSet, owner: InternedId) -> Vec<InternedId> {
     let Some(weapons) = sim.super_weapons.get(&owner) else {
         return Vec::new();
@@ -1033,19 +1999,19 @@ pub(crate) fn tick_active_superweapon_effects(
     overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     frame_effects: FrameEffects<'_>,
 ) -> bool {
-    if sim
-        .session
-        .lighting
-        .step_nuke_flash(sim.session.binary_frame as i32)
-    {
+    let frame = sim.session.binary_frame() as i32;
+    if sim.session.lighting_mut().step_nuke_flash(frame) {
         // `0x0053A705`; the screen redraw (`0x0053A711`) is presentation.
         sim.update_lighting();
     }
     let dominator = psychic_dominator::process(sim, rules, overlay_registry, frame_effects);
-    let chrono = sim.process_chrono_screen_effect();
+    let chrono = sim.session.process_chrono_screen_effect();
     sim.publish_trigger_effects(chrono);
     let storm = lightning_storm::process(sim, rules, overlay_registry, frame_effects);
-    unit_delivery::tick(sim, rules, overlay_registry, frame_effects);
+    if rules.ares_form() {
+        unit_delivery::tick(sim, rules, overlay_registry, frame_effects);
+        chronosphere::ares_tick_chrono_warps(sim, rules, overlay_registry, frame_effects);
+    }
     dominator || storm
 }
 
@@ -1062,7 +2028,7 @@ fn owned_live_buildings(
     sim.houses
         .get(&owner)
         .into_iter()
-        .flat_map(|house| house.base_projection.buildings())
+        .flat_map(|house| house.base_projection().buildings())
         .filter_map(|&id| sim.substrate.entities.get(id))
         .filter(move |building| {
             building.category() == crate::map::entities::EntityCategory::Structure
@@ -1077,7 +2043,7 @@ fn owned_live_buildings(
 /// none, or the house has a building of that type on the map
 /// (`HouseClass+0x5550`). The provider test (`0x00457630`) and the
 /// detection EVA (`0x004468FA..0x00446935`) read it. Retail names none.
-pub fn aux_building_present(
+fn aux_building_present(
     sim: &Simulation,
     rules: &RuleSet,
     owner: InternedId,
@@ -1097,34 +2063,149 @@ fn owned_building_present(sim: &Simulation, rules: &RuleSet, owner: InternedId, 
         .zip(sim.houses.get(&owner))
         .is_some_and(|(building, house)| {
             house
-                .tracking
+                .tracking()
                 .active_count(EntityCategory::Structure, building)
                 > 0
         })
 }
 
-/// Shared grant/hold, detection and command availability decision. The Ares
-/// lists supplement (never replace) native AuxBuilding. Like Ares's
-/// SWTypeExt::ExtData::IsAvailable, presence is owned-and-on-map, not power.
-pub fn building_requirements_met(
+/// Shared grant/hold, detection, command and building-Anim availability owner.
+/// Phobos `SWTypeExt::IsAvailable` opens with the owner's TechLevel against
+/// `SW.TechLevel`; Ares100329E0 then tests retained shot count, mode-aware
+/// controller, native Aux, actual Country mask and extension Aux/Neg lists,
+/// and Phobos closes with `SW.AuxTechnos`/`SW.NegTechnos`. Presence is owned,
+/// present or limboed, not power. A game Ares doesn't play in keeps the stock
+/// Aux-only gate in its place.
+pub fn super_weapon_available(
     sim: &Simulation,
     rules: &RuleSet,
     owner: InternedId,
-    sw: &SuperWeaponType,
+    name: &str,
 ) -> bool {
-    aux_building_present(sim, rules, owner, sw)
-        && sw
-            .building_requirements
-            .as_ref()
-            .is_none_or(|requirements| {
+    #[cfg(feature = "phobos")]
+    if !phobos_tech_level_allows(sim, rules, owner, name) {
+        return false;
+    }
+
+    let allowed = if rules.ares_form() {
+        let Some(metadata) = rules.super_weapon_metadata(name) else {
+            return false;
+        };
+        let policy = metadata.availability();
+        let count = sim
+            .interner
+            .get(name)
+            .and_then(|id| sim.super_weapons.get(&owner)?.get(&id))
+            .map_or(0, |instance| instance.ares_launch_count);
+        if !policy.allows_shots(count) {
+            return false;
+        }
+        let Some(house) = sim.houses.get(&owner) else {
+            return false;
+        };
+        if !policy.allows_controller(house.is_controlled_by_human(sim.session.game_mode_nonzero()))
+        {
+            return false;
+        }
+        if metadata
+            .native_auxiliary()
+            .is_some_and(|aux| !owned_building_present(sim, rules, owner, aux))
+        {
+            return false;
+        }
+        let country = house
+            .country()
+            .map(|id| sim.interner.resolve(id))
+            .and_then(|id| rules.country_index(id))
+            .map_or(0, |index| i32::from(index.0));
+        policy.allows_country(country)
+            && metadata.building_requirements().is_none_or(|requirements| {
                 requirements.allows(|id| owned_building_present(sim, rules, owner, id))
             })
+    } else {
+        rules
+            .super_weapon(name)
+            .is_some_and(|sw| aux_building_present(sim, rules, owner, sw))
+    };
+
+    #[cfg(feature = "phobos")]
+    let allowed = allowed && phobos_technos_allow(sim, rules, owner, name);
+
+    allowed
+}
+
+/// `SW.TechLevel`: the owner's current TechLevel must reach the weapon's. The
+/// value is a plain minimum (`-1` is not special); `pHouse->TechLevel <
+/// SW_TechLevel` is the native test.
+#[cfg(feature = "phobos")]
+fn phobos_tech_level_allows(
+    sim: &Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    name: &str,
+) -> bool {
+    let Some(availability) = rules.phobos_super_weapon_metadata(name) else {
+        return true;
+    };
+    sim.houses
+        .get(&owner)
+        .is_some_and(|house| availability.allows_tech_level(house.tech_level()))
+}
+
+/// `SW.AuxTechnos`/`SW.NegTechnos`: owned technos that are present or in
+/// limbo (`HouseExt::CountOwnedPresentAndLimboed`), across every techno
+/// category.
+#[cfg(feature = "phobos")]
+fn phobos_technos_allow(sim: &Simulation, rules: &RuleSet, owner: InternedId, name: &str) -> bool {
+    let Some(availability) = rules.phobos_super_weapon_metadata(name) else {
+        return true;
+    };
+    availability.allows_technos(|id| owned_techno_present(sim, rules, owner, id))
+}
+
+/// Whether `owner` owns a `id` techno that is present on the map or in limbo.
+/// Read HouseTracking's active plus Phobos limbo counters. Add_Tracking's
+/// owned count also includes unfinished factory products and omits present
+/// Insignificant types, so it cannot supply this predicate.
+#[cfg(feature = "phobos")]
+fn owned_techno_present(sim: &Simulation, rules: &RuleSet, owner: InternedId, id: &str) -> bool {
+    use crate::map::entities::EntityCategory;
+    use crate::rules::object_type::ObjectCategory;
+
+    [
+        (ObjectCategory::Infantry, EntityCategory::Infantry),
+        (ObjectCategory::Vehicle, EntityCategory::Unit),
+        (ObjectCategory::Aircraft, EntityCategory::Aircraft),
+        (ObjectCategory::Building, EntityCategory::Structure),
+    ]
+    .into_iter()
+    .any(|(object_category, entity_category)| {
+        let Some(object) = rules.object_in_category(object_category, id) else {
+            return false;
+        };
+        // SWTypeExt::IsAvailable uses GetUpgradesAmount for upgrades; the
+        // temporary Building's counters cease to represent the installed type.
+        if object_category == ObjectCategory::Building
+            && let Some(count) = sim.count_owned_building_upgrades(owner, object, rules)
+        {
+            return count > 0;
+        }
+        sim.interner
+            .get(&object.id)
+            .zip(sim.houses.get(&owner))
+            .is_some_and(|(type_id, house)| {
+                house
+                    .tracking()
+                    .count_owned_present_and_limboed(entity_category, type_id)
+                    > 0
+            })
+    })
 }
 
 /// The Supers `building` provides: its type's `SuperWeapon=` and
 /// `SuperWeapon2=` (`BuildingClass @ 0x00457630`, `0x00457690`), each only
 /// while its owner meets the Super's native and optional Ares building gates
-/// ([`building_requirements_met`]). The grant pass, the hold pass and the
+/// ([`super_weapon_available`]). The grant pass, the hold pass and the
 /// building destructor (`0x0043BE47..0x0043BEEA`) share it.
 ///
 /// RESIDUAL: the passes also count the `SuperWeapon=`/`SuperWeapon2=` of a
@@ -1132,48 +2213,234 @@ pub fn building_requirements_met(
 /// `0x0050AFF2..0x0050B02A`), without the `AuxBuilding=` test. Retail has
 /// no upgrade building (`PowersUpBuilding=`), so it never decides.
 pub(crate) fn provided_supers<'r>(
-    sim: &Simulation,
+    sim: &'r Simulation,
     rules: &'r RuleSet,
     building: &crate::sim::game_entity::GameEntity,
 ) -> impl Iterator<Item = &'r str> + use<'r> {
     let object = sim.object_type(building.type_ref(), rules);
-    let provides = |sw_id: &str| {
-        rules
-            .super_weapon(sw_id)
-            .is_some_and(|sw| building_requirements_met(sim, rules, building.owner(), sw))
-    };
-    [
-        object.and_then(|object| object.super_weapon.as_deref()),
-        object.and_then(|object| object.super_weapon2.as_deref()),
+    let owner = building.owner();
+    let provides = move |sw_id: &str| super_weapon_available(sim, rules, owner, sw_id);
+    object
+        .into_iter()
+        .flat_map(type_super_weapons)
+        .filter(move |name| provides(name))
+}
+
+/// A BuildingType's Super definitions: `SuperWeapon=`, `SuperWeapon2=` and,
+/// with Ares, `SuperWeapons=` (`BuildingTypeExt::ExtData::GetSuperWeapons @
+/// 1000D700`), in that order, unfiltered. Only the Ares reader fills the
+/// `SuperWeapons=` list, and that key turns Ares on, so the list is empty in
+/// a game Ares doesn't play in.
+pub(crate) fn type_super_weapons(
+    object: &crate::rules::object_type::ObjectType,
+) -> impl Iterator<Item = &str> {
+    let primary = [
+        object.super_weapon.as_deref(),
+        object.super_weapon2.as_deref(),
     ]
-    .map(|sw_id| sw_id.filter(|sw_id| provides(sw_id)))
     .into_iter()
-    .flatten()
+    .flatten();
+    primary.chain(object.additional_super_weapons().iter().map(String::as_str))
+}
+
+/// BuildingTypeExt::GetSuperWeapon1000D610: primary, secondary and additional
+/// definitions, first available instance; no granted/charge admission and no
+/// second Super store. The House constructor owns every retained instance.
+pub(crate) fn first_available_building_super<'a>(
+    sim: &'a Simulation,
+    rules: &RuleSet,
+    building: &crate::sim::game_entity::GameEntity,
+) -> Option<&'a SuperWeaponInstance> {
+    let name = provided_supers(sim, rules, building).next()?;
+    let id = sim.interner.get(name)?;
+    sim.super_weapons.get(&building.owner())?.get(&id)
+}
+
+/// The Super whose type's SWTypeExt the common Launch (10032ED0) reads for
+/// `typ`: a PostClick handler's (10032F2B..10032F45) is the owner's Super at
+/// HouseExt SWLastIndex when that index is above 0 (3.0's test; index 0 never
+/// qualifies), any other type's its own.
+pub(super) fn ares_launch_data_type(
+    sim: &Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    typ: InternedId,
+) -> InternedId {
+    use crate::rules::superweapon_type::AresSuperWeaponFlags as F;
+    let post_click = rules
+        .super_weapon(sim.interner.resolve(typ))
+        .is_some_and(|sw| sw.kind.ares_flags().has(F::POST_CLICK));
+    if !post_click {
+        return typ;
+    }
+    let last = sim.houses.get(&owner).map(|house| house.ares_last_super());
+    last.filter(|&index| index > 0)
+        .and_then(|index| rules.super_weapon_order.get(index as usize))
+        .and_then(|name| sim.interner.get(name))
+        .filter(|data| {
+            sim.super_weapons
+                .get(&owner)
+                .is_some_and(|weapons| weapons.contains_key(data))
+        })
+        .unwrap_or(typ)
+}
+
+/// Fire_SW's PostClick source when Ares plays (hook 4FAE72, 10034C90): the
+/// owner's Super at HouseExt SWLastIndex, which only a negative index
+/// leaves unset; the type's PreDependent is not read. Paired only for a
+/// handler's PostClick type; the unported stock redirects keep PreDependent.
+pub(super) fn ares_post_click_source<'r>(
+    sim: &Simulation,
+    rules: &'r RuleSet,
+    owner: InternedId,
+) -> Option<(&'r str, &'r SuperWeaponType)> {
+    let index = sim.houses.get(&owner)?.ares_last_super();
+    let name = rules.super_weapon_order.get(usize::try_from(index).ok()?)?;
+    Some((name.as_str(), rules.super_weapon(name)?))
+}
+
+/// Accepted Ares handler -> HouseExt100226D0, then the common Launch's
+/// bookkeeping up to its EVA (10032ED0). Do not call this for merely
+/// selected, refused or unsupported stock-redirected Activate paths.
+fn finish_ares_launch(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    typ: InternedId,
+    cell: (u16, u16),
+) {
+    use crate::rules::superweapon_type::AresSuperWeaponFlags as F;
+    let frame = sim.session.binary_frame() as i32;
+    let flags = rules
+        .super_weapon(sim.interner.resolve(typ))
+        .map_or(F::NONE, |sw| sw.kind.ares_flags());
+    // 100226D0 counts the fired Super's shot before the PostClick switch.
+    if let Some(instance) = sim.super_weapons.instance_mut(&owner, &typ) {
+        instance.record_ares_launch(frame);
+    }
+    let data = ares_launch_data_type(sim, rules, owner, typ);
+    let data_name = sim.interner.resolve(data).to_owned();
+    let recheck = sim
+        .super_weapons
+        .get(&owner)
+        .and_then(|weapons| weapons.get(&data))
+        .is_some_and(|instance| {
+            instance.one_time
+                || rules
+                    .super_weapon_metadata(&data_name)
+                    .is_some_and(|metadata| {
+                        !metadata
+                            .availability()
+                            .allows_shots(instance.ares_launch_count)
+                    })
+        });
+    // Common Launch10032F54..10032F8F dirties House+1FC when one-time or
+    // the successful write reaches its limit; normal provider/hold ownership
+    // performs revocation at the reached House tail.
+    if recheck && let Some(house) = sim.houses.get_mut(&owner) {
+        house.request_tech_recheck();
+    }
+    // 10032F91..10032FBB: neither a PostClick type nor an SW.AutoFire one
+    // becomes the House's last Super (the type index of the data Super).
+    let auto_fire = rules
+        .super_weapon_target_policy(&data_name)
+        .is_some_and(|policy| policy.auto_fire());
+    if !flags.has(F::POST_CLICK)
+        && !auto_fire
+        && let Some(index) = rules.super_weapon_index(&data_name)
+        && let Some(house) = sim.houses.get_mut(&owner)
+    {
+        house.remember_ares_last_super(index as i32);
+    }
+    // Common Launch10032F15 records success before its activation EVA.
+    // Emit once here, after Activate has finished all immediate payloads.
+    let [x, y, z] = deck_coords(sim, cell);
+    sim.sound_events.emit(SimSoundEvent::SuperWeaponLaunched {
+        owner,
+        sw_type: typ,
+        world: crate::sim::components::DriveCoord { x, y, z }.into(),
+    });
+    // 10032FC3: the data type's EVA_Activated unless the Flags hold NoEVA.
+    if !flags.has(F::NO_EVA) {
+        sim.sound_events
+            .emit(SimSoundEvent::AresSuperWeaponActivatedEva { sw_type: data });
+    }
+}
+
+/// One House pass's provider facts (`provider_supers`).
+#[derive(Default)]
+struct SuperProviders {
+    /// A live provider building (stock found flag; Ares Available).
+    provided: std::collections::BTreeSet<InternedId>,
+    /// A provider that powers it, before the low-power pass: stock reads its
+    /// online byte `+0x660` (`0x0050B020`); Ares GetSuperWeaponStatuses
+    /// `10038F10` (PowerSourced) also wants it not under EMP (vt+0x37C) and
+    /// operated (`10062F50`).
+    online: std::collections::BTreeSet<InternedId>,
+    /// Ares Charging, which only the Ares hold pass reads: such a provider
+    /// that is not warped out (vt+0x1D4) and whose current and queued
+    /// missions are neither Construction nor Selling.
+    charging: std::collections::BTreeSet<InternedId>,
 }
 
 /// Shared provider facts for one reached House pass. Source authority is the
 /// retained House building list and the existing457630/457690 provider readers.
-fn provider_supers(
-    sim: &Simulation,
-    rules: &RuleSet,
-    owner: InternedId,
-) -> (
-    std::collections::BTreeSet<InternedId>,
-    std::collections::BTreeSet<InternedId>,
-) {
-    let mut provided = std::collections::BTreeSet::new();
-    let mut online = std::collections::BTreeSet::new();
+fn provider_supers(sim: &Simulation, rules: &RuleSet, owner: InternedId) -> SuperProviders {
+    let mut providers = SuperProviders::default();
+    // Ares GetSuperWeaponStatuses10038F10: the observer House has none; an
+    // available `SW.AlwaysGranted` type is Available, PowerSourced and
+    // Charging without a provider (the low-power pass still holds a powered
+    // one, as the shared hold decision does). Ares reads the client's own
+    // Observer pointer; VERA's observer list comes from every start slot, so
+    // all peers skip the same Houses.
+    let ares = rules.ares_form();
+    if ares {
+        if sim.session.is_observer_house(owner) {
+            return providers;
+        }
+        for name in &rules.super_weapon_order {
+            if rules
+                .super_weapon_metadata(name)
+                .is_some_and(|metadata| metadata.availability().always_granted())
+                && super_weapon_available(sim, rules, owner, name)
+                && let Some(id) = sim.interner.get(name)
+            {
+                providers.provided.insert(id);
+                providers.online.insert(id);
+                providers.charging.insert(id);
+            }
+        }
+    }
     for building in owned_live_buildings(sim, owner) {
+        // 10038F10 asks the building's power once: HasPower, not under EMP
+        // and NoOperatorRequired or operated (10062F50). The stock pass
+        // reads the online byte alone and has no Charging status.
+        let powered = building.building_online()
+            && (!ares
+                || (building.emp_remaining() <= 0
+                    && sim.ares_is_operated(building.stable_id(), rules)));
+        let charging = ares && powered && !building.is_warped_out() && {
+            use crate::sim::mission::MissionType::{Construction, Selling};
+            ![
+                building.mission.current().known(),
+                building.mission.queued().known(),
+            ]
+            .iter()
+            .any(|mission| matches!(mission, Some(Construction | Selling)))
+        };
         for name in provided_supers(sim, rules, building) {
             if let Some(id) = sim.interner.get(name) {
-                provided.insert(id);
-                if building.building_online() {
-                    online.insert(id);
+                providers.provided.insert(id);
+                if powered {
+                    providers.online.insert(id);
+                }
+                if charging {
+                    providers.charging.insert(id);
                 }
             }
         }
     }
-    (provided, online)
+    providers
 }
 
 /// House50AF10: hold/release or revoke existing Supers. Reached only at the
@@ -1181,83 +2448,240 @@ fn provider_supers(
 /// Native code reads the shared building providers and retained power totals;
 /// it does not grant or construct. Changed hold/loss re-dirties House+1FC.
 pub(crate) fn update_owned_supers(sim: &mut Simulation, rules: &RuleSet, owner: InternedId) {
+    let paid_before = sim.paid_super_weapon_selection(owner);
     let Some(house) = sim.houses.get(&owner) else {
         return;
     };
-    let defeated = house.is_defeated;
+    let defeated = house.is_defeated();
+    let ares = rules.ares_form();
     let low_power = sim
         .power_states
         .get(&owner)
         .is_some_and(|state| state.low_power());
-    let (provided, online) = provider_supers(sim, rules, owner);
+    let providers = provider_supers(sim, rules, owner);
     for type_id in house_super_order(sim, rules, owner) {
         let Some(sw) = rules.super_weapon(sim.interner.resolve(type_id)) else {
             continue;
         };
-        let allowed = sim.session.game_options.super_weapons || !sw.disableable_from_shell;
+        let allowed = sim.session.game_options().super_weapons || !sw.disableable_from_shell;
+        let frame = sim.session.binary_frame();
         let changed = {
             let instance = sim
                 .super_weapons
-                .get_mut(&owner)
-                .and_then(|weapons| weapons.get_mut(&type_id))
+                .instance_mut(&owner, &type_id)
                 .expect("selected retained Super");
-            if !instance.is_active {
-                false
-            } else if !defeated && (!instance.can_lose || instance.one_time) {
-                //50AF5B..50AF78 bypasses shell/provider/power checks, but a
-                //defeated House still reaches the ordinary Deactivate owner.
-                false
-            } else if defeated || !allowed || !provided.contains(&type_id) {
-                instance.deactivate();
-                true
-            } else if !low_power && online.contains(&type_id) {
-                instance.suspend(false, sw.manual_control, sim.session.binary_frame)
-            } else if sw.is_powered {
-                instance.suspend(true, sw.manual_control, sim.session.binary_frame)
-            } else {
-                false
+            let hold = super_hold(
+                instance,
+                sw,
+                defeated,
+                allowed,
+                providers.provided.contains(&type_id),
+                !low_power && providers.online.contains(&type_id),
+                providers.charging.contains(&type_id),
+                ares,
+            );
+            // Ares Lose10035610 and SetOnHold10035750 deactivate a draining
+            // charge-drain type's new type.
+            let draining = sw.use_charge_drain && instance.charge_drain_state == 2;
+            match hold {
+                SuperHold::Unchanged => (false, false),
+                SuperHold::Deactivate => {
+                    instance.deactivate();
+                    (true, draining)
+                }
+                SuperHold::Suspend(on) => {
+                    let changed = instance.suspend(on, sw.manual_control, frame);
+                    if ares && changed && sw.use_charge_drain {
+                        instance.ares_drain_hold(on, sw, rules, frame);
+                    }
+                    (changed, changed && on && draining)
+                }
             }
         };
+        let (changed, deactivated) = changed;
+        if ares && deactivated {
+            deactivate_ares_handler(
+                sim,
+                rules,
+                owner,
+                type_id,
+                sw,
+                false,
+                FrameEffects::default(),
+            );
+        }
         if changed {
-            sim.request_house_tech_tree_recheck(owner);
+            sim.houses.request_house_tech_tree_recheck(owner);
             sim.sound_events
-                .push(SimSoundEvent::SuperWeaponStatusChanged {
+                .emit(SimSoundEvent::SuperWeaponStatusChanged {
                     owner,
                     sw_type: type_id,
                 });
         }
     }
+    if let Some(selection) = paid_before
+        && sim.paid_super_weapon_selection(owner) != Some(selection)
+    {
+        Simulation::release_super_anim(
+            &mut sim.substrate,
+            &mut sim.super_weapons,
+            owner,
+            selection.source,
+        );
+        sim.sound_events
+            .emit(SimSoundEvent::SuperWeaponStatusChanged {
+                owner,
+                sw_type: selection.destination,
+            });
+    }
+    sync_building_charges(sim, rules, owner);
+}
+
+/// VERA's Superweapon Limit (`SuperWeaponPerBuilding=`,
+/// `docs/superweapon-limit.md`): each of `owner`'s live buildings of such a
+/// type charges its own shot of each Super it provides
+/// ([`SuperWeaponInstance::set_building_count`]). The hold and grant passes
+/// call it last, once they have decided which Supers stay granted; a held
+/// Super keeps its charges, a one-time, `ManualControl=`, `UseChargeDrain=`
+/// or `PostClick=` one has none. Without the key every count is zero and
+/// nothing changes.
+fn sync_building_charges(sim: &mut Simulation, rules: &RuleSet, owner: InternedId) {
+    let mut buildings: std::collections::BTreeMap<InternedId, usize> = Default::default();
+    for building in owned_live_buildings(sim, owner) {
+        if !sim
+            .object_type(building.type_ref(), rules)
+            .is_some_and(|object| object.super_weapon_per_building)
+        {
+            continue;
+        }
+        for name in provided_supers(sim, rules, building) {
+            if let Some(id) = sim.interner.get(name) {
+                *buildings.entry(id).or_default() += 1;
+            }
+        }
+    }
+    let interner = &sim.interner;
+    let frame = sim.session.binary_frame();
+    for (type_id, instance) in sim.super_weapons.house_instances_mut(&owner) {
+        let Some(sw) = rules.super_weapon(interner.resolve(*type_id)) else {
+            continue;
+        };
+        let stacks = instance.is_active
+            && !instance.one_time
+            && !sw.manual_control
+            && !sw.use_charge_drain
+            && !sw.post_click;
+        let count = if stacks {
+            buildings.get(type_id).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        let recharge = instance.recharge_time(sw);
+        instance.set_building_count(count, recharge, frame);
+    }
+}
+
+/// One instance's outcome in [`update_owned_supers`]'s hold pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SuperHold {
+    Unchanged,
+    Deactivate,
+    /// Suspend (`true`) or resume (`false`) the charge.
+    Suspend(bool),
+}
+
+/// The hold pass's decision for one retained instance: `allowed` is the shell
+/// option, `provided` a live provider building, `powered_online` an online
+/// provider while the House is not low on power, `charging` the Ares
+/// Charging status (`SuperProviders::charging`).
+pub(super) fn super_hold(
+    instance: &SuperWeaponInstance,
+    sw: &SuperWeaponType,
+    defeated: bool,
+    allowed: bool,
+    provided: bool,
+    powered_online: bool,
+    charging: bool,
+    ares: bool,
+) -> SuperHold {
+    if !instance.is_active {
+        SuperHold::Unchanged
+    } else if !defeated && (!instance.can_lose || instance.one_time) {
+        //50AF5B..50AF78 bypasses shell/provider/power checks, but a
+        //defeated House still reaches the ordinary Deactivate owner.
+        SuperHold::Unchanged
+    } else if defeated || !allowed || !provided {
+        SuperHold::Deactivate
+    } else if ares {
+        // Ares HouseClass_UpdateSuperWeaponsOwned10039450 (hook50AF10
+        // replaces the whole pass): an IsPowered (+0xE6) type is held
+        // without PowerSourced (low power clears it), any other type without
+        // Charging, so an EMPed or building-up provider holds it too.
+        SuperHold::Suspend(if sw.is_powered {
+            !powered_online
+        } else {
+            !charging
+        })
+    } else if powered_online {
+        SuperHold::Suspend(false)
+    } else if sw.is_powered {
+        SuperHold::Suspend(true)
+    } else {
+        SuperHold::Unchanged
+    }
 }
 
 /// House50B1D0: grant provided stock instances in the existing type registry
 /// order. Native dirty-tail callers run hold/revoke before this pass. Ordinary
-/// placement merely requests that tail; upgrade attachment is a separate,
-/// currently unported synchronous caller. Never construct a missing Super here.
+/// placement merely requests that tail; upgrade attachment calls it
+/// synchronously (`0x004409EF`, `sim::building_upgrades`). Never construct a
+/// missing Super here.
 pub(crate) fn grant_provided_supers(sim: &mut Simulation, rules: &RuleSet, owner: InternedId) {
     let Some(house) = sim.houses.get(&owner) else {
         return;
     };
-    if house.is_defeated {
+    if house.is_defeated() {
         return;
     }
+    let ares = rules.ares_form();
     //50B2C7..50B305 uses the power ratio even for an unpowered Super type.
     let low_power = sim
         .power_states
         .get(&owner)
         .is_some_and(|state| state.low_power());
-    let (provided, _) = provider_supers(sim, rules, owner);
+    let providers = provider_supers(sim, rules, owner);
     for type_id in house_super_order(sim, rules, owner) {
-        if !provided.contains(&type_id) {
+        if !providers.provided.contains(&type_id) {
             continue;
         }
         let Some(sw) = rules.super_weapon(sim.interner.resolve(type_id)) else {
             continue;
         };
-        if !sim.session.game_options.super_weapons && sw.disableable_from_shell {
+        if !sim.session.game_options().super_weapons && sw.disableable_from_shell {
             continue;
         }
-        grant_super(sim, rules, owner, type_id, false, low_power);
+        // Ares 10039580 grants with `!PowerSourced` (10038F10): a powered
+        // provider (or SW.AlwaysGranted), withdrawn on low power only for an
+        // IsPowered type. The stock pass holds on the power ratio alone.
+        let low_power = if ares {
+            !(providers.online.contains(&type_id) && !(low_power && sw.is_powered))
+        } else {
+            low_power
+        };
+        grant_super(
+            &sim.interner,
+            &sim.session,
+            &mut sim.substrate,
+            &sim.houses,
+            &mut sim.super_weapons,
+            rules,
+            owner,
+            type_id,
+            false,
+            low_power,
+        );
     }
+    sync_building_charges(sim, rules, owner);
 }
 
 /// Full Grant6CB560 owner: retained instance flags/timers, timer-list admission
@@ -1265,36 +2689,77 @@ pub(crate) fn grant_provided_supers(sim: &mut Simulation, rules: &RuleSet, owner
 /// Original AL reports timer restart; both native callers ignore it. The
 /// private state helper instead reports admission to coordinate these effects.
 fn grant_super(
-    sim: &mut Simulation,
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    substrate: &mut ObjectSubstrate,
+    houses: &Houses,
+    super_weapons: &mut SuperWeapons,
     rules: &RuleSet,
     owner: InternedId,
     type_id: InternedId,
     one_time: bool,
     on_hold: bool,
 ) -> bool {
-    let Some(house) = sim.houses.get(&owner) else {
+    let Some(house) = houses.get(&owner) else {
         return false;
     };
-    let passive = house.multiplay_passive;
-    let Some(sw) = rules.super_weapon(sim.interner.resolve(type_id)) else {
+    let passive = house.multiplay_passive();
+    let Some(sw) = rules.super_weapon(interner.resolve(type_id)) else {
         return false;
     };
-    let place = next_timer_place(sim);
-    let Some(instance) = sim
-        .super_weapons
-        .get_mut(&owner)
-        .and_then(|weapons| weapons.get_mut(&type_id))
-    else {
+    let place = next_timer_place(super_weapons);
+    let Some(instance) = super_weapons.instance_mut(&owner, &type_id) else {
         return false;
     };
-    if !instance.apply_grant_state(sw, sim.session.binary_frame, one_time, on_hold) {
+    if !instance.apply_grant_state(sw, rules, session.binary_frame(), one_time, on_hold) {
         return false;
     }
     instance.timer_place = (sw.show_timer && !passive).then_some(place);
     if !sw.manual_control {
-        sim.release_super_anim(owner, type_id);
+        Simulation::release_super_anim(substrate, super_weapons, owner, type_id);
     }
     true
+}
+
+/// Ares `SpyEffect.SuperWeapon` (`BuildingExt::ExtData::InfiltratedBy @
+/// 10012000`, hook `0x004571E0`): Grant6CB560 of `owner`'s Super of
+/// `type_id`, one-time unless `permanent`, on hold when the type is
+/// `IsPowered=` and the house has low power (`PowerDrain` nonzero above
+/// `PowerOutput`). A permanent grant that went through clears +60. Answers
+/// whether Grant went through.
+pub(crate) fn spy_grant_super(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    type_id: InternedId,
+    permanent: bool,
+) -> bool {
+    let Some(sw) = rules.super_weapon(sim.interner.resolve(type_id)) else {
+        return false;
+    };
+    let on_hold = sw.is_powered
+        && sim.power_states.get(&owner).is_some_and(|state| {
+            state.total_drain() != 0 && state.total_output() < state.total_drain()
+        });
+    let granted = grant_super(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &sim.houses,
+        &mut sim.super_weapons,
+        rules,
+        owner,
+        type_id,
+        !permanent,
+        on_hold,
+    );
+    if granted
+        && permanent
+        && let Some(instance) = sim.super_weapons.instance_mut(&owner, &type_id)
+    {
+        instance.can_lose = false;
+    }
+    granted
 }
 
 /// Execute33/34 at6DE925/6DE98E: use the incoming House's retained Super.
@@ -1303,25 +2768,37 @@ fn grant_super(
 /// Native local Sidebar Add/Recalc is projected by the existing active views,
 /// not by StatusChanged (whose distinct hold/revoke consumer clears selection).
 pub(crate) fn trigger_grant_super(
-    sim: &mut Simulation,
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    substrate: &mut ObjectSubstrate,
+    houses: &Houses,
+    super_weapons: &mut SuperWeapons,
     rules: &RuleSet,
     owner: InternedId,
     type_id: InternedId,
     one_time: bool,
 ) -> bool {
-    if !sim
-        .super_weapons
+    if !super_weapons
         .get(&owner)
         .is_some_and(|weapons| weapons.contains_key(&type_id))
     {
         return false;
     }
-    grant_super(sim, rules, owner, type_id, one_time, false);
+    grant_super(
+        interner,
+        session,
+        substrate,
+        houses,
+        super_weapons,
+        rules,
+        owner,
+        type_id,
+        one_time,
+        false,
+    );
     if !one_time {
-        sim.super_weapons
-            .get_mut(&owner)
-            .unwrap()
-            .get_mut(&type_id)
+        super_weapons
+            .instance_mut(&owner, &type_id)
             .unwrap()
             .can_lose = false;
     }

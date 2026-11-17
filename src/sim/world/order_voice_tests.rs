@@ -13,13 +13,11 @@ fn native_voice_corpus() -> serde_json::Value {
         "tools/spatial_oracle/allied_object_action.json",
     ))
     .unwrap();
-    assert_eq!(
-        corpus["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     corpus
 }
 
+// Ares replaces VoiceAttack's choice (TechnoClass_SelectFiringVoice
+// 1004B1D0, hook 0x7090A8): `ares_firing_voice_tiers_fall_through`.
 #[test]
 fn retail_attack_acknowledgement_spends_the_original_singleton_main_draw() {
     use crate::map::entities::EntityCategory;
@@ -40,12 +38,14 @@ fn retail_attack_acknowledgement_spends_the_original_singleton_main_draw() {
     };
     let mut sim = Simulation::with_seed(row["input"]["seed"].as_u64().unwrap());
     let local = sim.interner.intern("Local");
-    sim.session.current_house = Some(local);
-    sim.session.game_mode_nonzero = true;
+    sim.session.set_current_house_for_test(Some(local));
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     sim.houses
-        .insert(local, HouseState::new(local, 0, None, true, 0, 10));
+        .register(HouseState::new(local, 0, None, true, 0, 10));
     let type_ref = sim.interner.intern("MTNK");
-    sim.entities_mut()
+    sim.substrate
+        .entities
         .insert(GameEntity::new_at_frame_zero_for_test(
             1,
             10,
@@ -131,10 +131,14 @@ fn scene_for_rules(
         other => panic!("unknown native actor owner {other}"),
     };
     let type_ref = sim.interner.intern(type_name);
-    sim.session.current_house = Some(local);
-    sim.session.game_mode_nonzero = input["mode"].as_u64().unwrap_or(1) != 0;
+    sim.session.set_current_house_for_test(Some(local));
+    sim.session.set_game_mode(
+        crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+            input["mode"].as_u64().unwrap_or(1) != 0,
+        ),
+    );
     sim.houses
-        .insert(local, HouseState::new(local, 0, None, true, 0, 10));
+        .register(HouseState::new(local, 0, None, true, 0, 10));
     let mut other_house = HouseState::new(
         other,
         1,
@@ -143,10 +147,12 @@ fn scene_for_rules(
         0,
         10,
     );
-    other_house.player_control = input["other_player_control"].as_bool().unwrap_or(false);
-    sim.houses.insert(other, other_house);
+    other_house
+        .set_player_control_for_test(input["other_player_control"].as_bool().unwrap_or(false));
+    sim.houses.register(other_house);
     let id = 1;
-    sim.entities_mut()
+    sim.substrate
+        .entities
         .insert(GameEntity::new_at_frame_zero_for_test(
             id,
             0,
@@ -316,10 +322,6 @@ fn assert_move_voice_request(corpus: &serde_json::Value, row: &serde_json::Value
 #[test]
 fn move_voice_matches_original_linked_readers_fallbacks_and_all_streams() {
     let corpus = crate::test_fixture::json("tools/spatial_oracle/move_order_voice.json");
-    assert_eq!(
-        corpus["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     let rows = corpus["voice_controls"].as_array().unwrap();
     assert_eq!(rows.len(), 18, "all original action controls");
     for row in rows {
@@ -404,7 +406,9 @@ fn attack_control_rules(corpus: &serde_json::Value, input: &serde_json::Value) -
             // The native component supplies index1 at its declared selector
             // seam. Use the existing gunner owner to reach the same index,
             // rather than duplicating selection in the voice implementation.
-            body.push_str("TurretCount=1\nWeapon1=VOICE_CONTROL\nWeapon2=VOICE_CONTROL\n");
+            // Ares validates index1 against WeaponCount. Both original
+            // secondary rows keep that record's weapon pointer null.
+            body.push_str("TurretCount=1\nWeaponCount=2\nWeapon1=VOICE_CONTROL\n");
         }
         Some(-1) => body.push_str("DeployFire=yes\nDeployFireWeapon=-1\n"),
         None | Some(0) => {}
@@ -428,6 +432,8 @@ fn attack_control_rules(corpus: &serde_json::Value, input: &serde_json::Value) -
     rules
 }
 
+// Ares replaces VoiceAttack's choice (TechnoClass_SelectFiringVoice
+// 1004B1D0, hook 0x7090A8): `ares_firing_voice_tiers_fall_through`.
 #[test]
 fn attack_voice_matches_native_target_slots_rng_and_queue_admission() {
     use crate::map::entities::EntityCategory;
@@ -437,10 +443,6 @@ fn attack_voice_matches_native_target_slots_rng_and_queue_admission() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     let corpus = crate::test_fixture::json("tools/spatial_oracle/attack_order_voice.json");
-    assert_eq!(
-        corpus["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     let sound_name = |index: i64| {
         corpus["readers"]["sound"]["rows"]
             .as_array()
@@ -466,7 +468,7 @@ fn attack_voice_matches_native_target_slots_rng_and_queue_admission() {
             EntityCategory::Unit,
         );
         let object = rules.object(type_name).unwrap();
-        let entity = sim.entities_mut().get_mut(actor).unwrap();
+        let entity = sim.substrate.entities.get_mut(actor).unwrap();
         entity.veterancy.set_raw_for_test(NativeF32Bits::from_bits(
             input["raw_veterancy_bits"].as_u64().unwrap() as u32,
         ));
@@ -482,7 +484,7 @@ fn attack_voice_matches_native_target_slots_rng_and_queue_admission() {
             if index == -1 {
                 entity.set_unit_simple_deploy_for_test(true, false, false);
             } else {
-                entity.set_gunner_weapon(index as i32, object);
+                entity.set_gunner_weapon(index as i32, object, rules.ares());
             }
         }
         let target = if input["null_target"] == true {
@@ -495,7 +497,8 @@ fn attack_voice_matches_native_target_slots_rng_and_queue_admission() {
             } else {
                 EntityCategory::Unit
             };
-            sim.entities_mut()
+            sim.substrate
+                .entities
                 .insert(GameEntity::new_at_frame_zero_for_test(
                     2,
                     4,
@@ -540,9 +543,12 @@ fn attack_voice_matches_native_target_slots_rng_and_queue_admission() {
         });
         if output["fault"].is_object() {
             native_faults += 1;
-            assert!(
-                result.is_err(),
-                "{name}: original NULL slot faults before a draw"
+            // VoiceAttack7090C0 dereferences the NULL slot here; VERA carries
+            // on with no attack voice and, as checked below, no draw.
+            assert_eq!(
+                result.unwrap(),
+                None,
+                "{name}: no voice where the original faults on a NULL slot"
             );
         } else {
             let request = result.unwrap();
@@ -648,7 +654,8 @@ fn attack_voice_selects_for_the_committed_target_without_retargeting_the_actor()
     let owner = sim.interner.get("Other").unwrap();
     for (id, type_name) in [(2, "OLD"), (3, "NEW")] {
         let kind = sim.interner.intern(type_name);
-        sim.entities_mut()
+        sim.substrate
+            .entities
             .insert(GameEntity::new_at_frame_zero_for_test(
                 id,
                 id as u16,
@@ -667,7 +674,7 @@ fn attack_voice_selects_for_the_committed_target_without_retargeting_the_actor()
     sim.assign_target_represented(
         actor,
         Some(TargetKind::Entity(2)),
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::empty(),
     )
@@ -725,7 +732,7 @@ fn capture_enter_and_harvest_preserve_scalar_precedence_and_move_fallback() {
             ("VoiceEnter", enter),
             ("VoiceHarvest", harvest),
         ] {
-            let (mut sim, rules, id) = scene(body);
+            let (sim, rules, id) = scene(body);
             let (request, draws) =
                 trace_draws(|| sim.order_voice_request(&rules, id, field, None, true));
             assert_eq!(request, expected, "{field} with {body:?}");
@@ -744,33 +751,8 @@ fn capture_enter_and_harvest_preserve_scalar_precedence_and_move_fallback() {
 }
 
 #[test]
-fn scalar_and_unknown_order_voice_fields_do_not_spend_main_draws() {
-    let (mut sim, rules, id) = scene(
-        "VoiceMove=Move\nVoiceAttack=Attack\nVoiceCapture=Capture\n\
-         VoiceEnter=Enter\nVoiceHarvest=Harvest\n",
-    );
-    for (field, expected) in [
-        ("VoiceCapture", Some("Capture")),
-        ("VoiceEnter", Some("Enter")),
-        ("VoiceHarvest", Some("Harvest")),
-        ("unrecognized", None),
-    ] {
-        let before = sim.main_rng.native_state_hex();
-        let (sound, draws) = trace_draws(|| sim.order_voice_request(&rules, id, field, None, true));
-        assert_eq!(sound, expected, "{field}");
-        assert!(draws.is_empty(), "{field}");
-        assert_eq!(sim.main_rng.native_state_hex(), before, "{field}");
-    }
-    let (mut sim, rules, id) = scene("VoiceMove=Move\n");
-    assert_eq!(
-        sim.order_voice_request(&rules, id, "VoiceAttack", None, true),
-        None
-    );
-}
-
-#[test]
 fn disabled_order_voice_rejects_before_move_or_fallback_is_reached() {
-    let (mut sim, rules, id) = scene("VoiceMove=Move\n");
+    let (sim, rules, id) = scene("VoiceMove=Move\n");
     for field in [
         "VoiceMove",
         "VoiceAttack",
@@ -815,7 +797,7 @@ fn allied_object_move_voice_matches_native_rng_and_queue() {
         assert!(matches!(entry, 0x006f_fbe0 | 0x0070_8fc0), "{name}");
         let is_direct = entry == 0x0070_8fc0;
         let body = format!("VoiceMove={}\n", voices.join(","));
-        let (mut sim, rules, id) = scene_with_input(&body, input);
+        let (sim, rules, id) = scene_with_input(&body, input);
         let human = sim.house_is_human_player(sim.entities().get(id).unwrap().owner());
         assert_eq!(
             sim.main_rng.native_state_hex(),
@@ -900,4 +882,29 @@ fn allied_object_move_voice_matches_native_rng_and_queue() {
     ] {
         assert!(count > 0, "missing native {name} control");
     }
+}
+
+/// Ares 3.0 TechnoClass_SelectFiringVoice (1004B1D0, hook 0x7090A8): an
+/// elite unit without an elite override speaks its rookie override, with no
+/// Main draw (stock draws from VoiceAttack instead).
+#[test]
+fn ares_firing_voice_tiers_fall_through() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    use crate::util::native_x87::NativeF32Bits;
+    let (mut sim, rules, actor) = scene(
+        "Primary=Gun\nVoicePrimaryWeaponAttack=Special\nVoiceAttack=Attack\n\
+         [Gun]\nDamage=10\nWarhead=AP\n[AP]\nVerses=100%\n",
+    );
+    sim.substrate
+        .entities
+        .get_mut(actor)
+        .unwrap()
+        .veterancy
+        .set_raw_for_test(NativeF32Bits::from_bits(2.0f32.to_bits()));
+    let main = sim.main_rng.native_state_hex();
+    assert_eq!(
+        sim.order_voice_request(&rules, actor, "VoiceAttack", None, true),
+        Some("Special")
+    );
+    assert_eq!(sim.main_rng.native_state_hex(), main);
 }

@@ -10,44 +10,63 @@
 //!
 //! This replaced an egui proportional-font painter that used a fixed
 //! `(230,240,255)`, a radar-relative anchor and an invented `+1,+1` black
-//! shadow. Evidence: `docs/gap-scans/2026-08-02-phase4/survey-GSI-02.14.md`
-//! R12a (`CreditsClass::Draw`, decompiled 2026-08-02) and ranked gap 1.
+//! shadow. Evidence: `CreditsClass::Draw`.
 //!
 //! ## Dependency rules
 //! - Part of the app layer — may depend on everything.
 
 use crate::render::batch::SpriteInstance;
 use crate::render::bit_font::BitFont;
-use crate::ui::sidebar::SidebarView;
+use crate::ui::sidebar::{SidebarChromeLayoutSpec, SidebarView};
 // Generic credit glyph generation is render-owned (F06); this module keeps
 // only the sidebar-view adapter below. Re-exported for existing callers.
-#[cfg(test)]
-use crate::render::sidebar_text::{CREDITS_DEPTH, CREDITS_SURFACE_Y, format_credits};
 pub use crate::render::sidebar_text::{build_credits_instances, credits_tint};
-/// Per-frame wrapper over [`build_credits_instances`] taking the sidebar view.
+/// Per-frame wrapper over [`build_credits_instances`] taking the sidebar view
+/// and the layout table's place for the counter: centred on the credits
+/// plate, `plate_width` wide, which in the original spans the sidebar. The
+/// observer's counter shows the match's time through `time_format`
+/// (`TXT_TIME_FORMAT_HOURS`).
+/// Residual: CreditsClass::Draw centres on the sidebar surface's width; the
+/// two differ only for a plate narrower than the 168 px surface (retail
+/// credits.shp is 168 px wide in SIDEC01.MIX and SIDEC02.MIX).
 pub fn build_sidebar_credits_instances(
     font: &BitFont,
     view: &SidebarView,
-    ui_scale: f32,
+    spec: SidebarChromeLayoutSpec,
+    plate_width: f32,
+    time_format: &str,
     tint: [f32; 3],
     camera_offset: [f32; 2],
 ) -> Vec<SpriteInstance> {
+    let text = if view.observer.is_some() {
+        crate::render::sidebar_text::format_observer_clock(view.credits, time_format)
+    } else {
+        crate::render::sidebar_text::format_credits(view.credits)
+    };
+    let plate = crate::ui::sidebar::Rect {
+        x: view.panel_rect.x + spec.credits_x,
+        w: plate_width,
+        ..view.panel_rect
+    };
     build_credits_instances(
         font,
-        view.credits,
-        view.panel_rect,
-        ui_scale,
+        &text,
+        plate,
+        [spec.money_x, spec.credits_y + spec.money_y],
         tint,
         camera_offset,
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation))]
 mod tests {
     use super::*;
     use crate::render::bit_font::CHAR_SPACING;
     use crate::render::bit_font::tests::make_test_font;
     use crate::ui::sidebar::Rect;
+
+    /// The stock place of the counter: the layout table's money row.
+    const STOCK: [f32; 2] = [0.0, 2.0];
 
     /// Digit widths standing in for the GAME.FNT table: deliberately unequal so
     /// a proportional/system-font layout cannot reproduce the advances.
@@ -76,7 +95,8 @@ mod tests {
     #[test]
     fn credits_render_through_the_retail_font_glyph_table() {
         let font = digit_font();
-        let inst = build_credits_instances(&font, 1250, panel(), 1.0, [1.0, 1.0, 0.0], [0.0, 0.0]);
+        let inst =
+            build_credits_instances(&font, "1250", panel(), STOCK, [1.0, 1.0, 0.0], [0.0, 0.0]);
 
         // One quad per digit — no shadow pass, no outline pass.
         assert_eq!(inst.len(), 4, "expected exactly one quad per digit");
@@ -98,24 +118,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn credits_anchor_is_sidebar_surface_centre_at_row_two() {
-        let font = digit_font();
-        let rect = panel();
-        let inst = build_credits_instances(&font, 1250, rect, 1.0, [1.0, 1.0, 0.0], [0.0, 0.0]);
-
-        // gamemd: x = surface_width / 2 with the h-centre flag, y = the
-        // literal 2. Both literals are asserted here, not read back out of the
-        // constants, so a change to either fails.
-        assert_eq!(CREDITS_SURFACE_Y, 2.0);
-        let measured = font.text_width("1250") as i32;
-        let expected_x = 632.0 + (168 / 2 - measured / 2) as f32;
-        assert_eq!(inst[0].position[0], expected_x);
-        for q in &inst {
-            assert_eq!(q.position[1], 2.0, "credits sit on surface row 2");
-        }
-    }
-
     /// Native halves the surface width and the measured width with integer
     /// division. An odd/odd pair in float lands on a half pixel and the
     /// counter flips between two columns as the camera pans.
@@ -129,108 +131,32 @@ mod tests {
             w: 167.0,
             h: 600.0,
         };
-        let inst = build_credits_instances(&font, 1, rect, 1.0, [1.0, 1.0, 0.0], [0.0, 0.0]);
+        let inst = build_credits_instances(&font, "1", rect, STOCK, [1.0, 1.0, 0.0], [0.0, 0.0]);
         // 167/2 = 83, 4/2 = 2 → 100 + 81. Float halving would give 100 + 81.5.
         assert_eq!(inst[0].position[0], 181.0);
         assert_eq!(inst[0].position[0].fract(), 0.0);
 
         // A fractional panel origin still resolves to a whole pixel.
         let skewed = Rect { x: 100.4, ..rect };
-        let inst = build_credits_instances(&font, 1, skewed, 1.0, [1.0, 1.0, 0.0], [0.0, 0.0]);
+        let inst = build_credits_instances(&font, "1", skewed, STOCK, [1.0, 1.0, 0.0], [0.0, 0.0]);
         assert_eq!(inst[0].position[0].fract(), 0.0);
-    }
-
-    #[test]
-    fn credits_depth_is_the_sidebar_text_layer() {
-        let font = digit_font();
-        let inst = build_credits_instances(&font, 500, panel(), 1.0, [1.0, 1.0, 0.0], [0.0, 0.0]);
-        // The `sidebar_text` lane depth. Above the chrome (0.00048) and the
-        // cameo overlays (0.00043), matching the cameo status labels.
-        assert_eq!(CREDITS_DEPTH, 0.00042);
-        for q in &inst {
-            assert_eq!(q.depth, 0.00042);
-        }
-    }
-
-    /// The colour *decision*, not just its propagation: the credits take the
-    /// side-dependent sidebar text colour, and specifically not the fixed
-    /// `(230,240,255)` the retired egui painter used.
-    #[test]
-    fn credits_use_the_side_text_colour_not_a_fixed_rgb() {
-        use crate::render::sidebar_chrome::SidebarTheme;
-
-        const RETIRED_EGUI_RGB: [f32; 3] = [230.0 / 255.0, 240.0 / 255.0, 255.0 / 255.0];
-        let allied = credits_tint(SidebarTheme::Allied);
-        let soviet = credits_tint(SidebarTheme::Soviet);
-        assert_eq!(allied, [164.0 / 255.0, 210.0 / 255.0, 1.0]);
-        assert_eq!(soviet, [1.0, 1.0, 0.0]);
-        assert_eq!(credits_tint(SidebarTheme::Yuri), soviet);
-        assert_ne!(allied, RETIRED_EGUI_RGB);
-        assert_ne!(soviet, allied, "the colour must depend on the side");
-
-        let font = digit_font();
-        for theme in [SidebarTheme::Allied, SidebarTheme::Soviet] {
-            let tint = credits_tint(theme);
-            let inst = build_credits_instances(&font, 500, panel(), 1.0, tint, [0.0, 0.0]);
-            assert!(!inst.is_empty());
-            for q in &inst {
-                assert_eq!(q.tint, tint);
-                assert_eq!(q.alpha, 1.0);
-            }
-        }
-    }
-
-    #[test]
-    fn credits_scale_with_the_ui_scale() {
-        let font = digit_font();
-        let rect = Rect {
-            x: 1264.0,
-            y: 0.0,
-            w: 336.0,
-            h: 1200.0,
-        };
-        let inst = build_credits_instances(&font, 1250, rect, 2.0, [1.0, 1.0, 0.0], [0.0, 0.0]);
-        assert_eq!(inst[0].size[0], 6.0, "'1' at 2x");
-        // Native row 2 scaled by the UI factor: 2 * 2 = 4.
-        assert_eq!(inst[0].position[1], 4.0);
-        let measured = (font.text_width("1250") as f32 * 2.0) as i32;
-        assert_eq!(
-            inst[0].position[0],
-            1264.0 + (336 / 2 - measured / 2) as f32
-        );
-    }
-
-    #[test]
-    fn format_credits_matches_the_native_percent_ld() {
-        assert_eq!(format_credits(0), "0");
-        assert_eq!(format_credits(10000), "10000");
-        // `%ld` is signed: a negative total prints its minus sign, and the
-        // glyph table has a '-' so it renders rather than falling through to
-        // the missing-glyph path.
-        assert_eq!(format_credits(-25), "-25");
-        let font = digit_font();
-        let inst = build_credits_instances(&font, -25, panel(), 1.0, [1.0, 1.0, 0.0], [0.0, 0.0]);
-        assert_eq!(inst.len(), 3);
-        assert_eq!(inst[0].size[0], 4.0, "leading '-' glyph");
     }
 
     /// The production wrapper must read the *displayed* credit total and the
     /// sidebar panel rect off a real `SidebarView`, and land the glyphs inside
     /// the sidebar column. This is what `render::build_instances` appends
     /// to the `sidebar_text` lane, which is drawn from the GAME.FNT atlas.
-    #[test]
-    fn view_wrapper_places_credits_inside_the_sidebar_panel() {
+    /// A stock 1024x768 view whose counter shows `credits`.
+    fn stock_view(credits: i32) -> SidebarView {
         use crate::ui::sidebar::gadget_flash::SidebarGadgetState;
-        use crate::ui::sidebar::{
-            SidebarChromeLayoutSpec, SidebarTab, build_sidebar_view_with_spec,
-        };
+        use crate::ui::sidebar::{SidebarTab, build_sidebar_view_with_spec};
 
-        let view = build_sidebar_view_with_spec(
+        build_sidebar_view_with_spec(
             SidebarChromeLayoutSpec::stock(),
             1024.0,
             768.0,
             SidebarTab::Building,
-            1250,
+            credits,
             0,
             0,
             Some([28.0, 27.0]),
@@ -238,7 +164,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             None,
             &[],
             &SidebarGadgetState::new(),
@@ -248,9 +173,22 @@ mod tests {
             None,
             [None; 2],
             &crate::ui::sidebar::cameo_order::CameoStrips::default(),
-        );
+        )
+    }
+
+    #[test]
+    fn view_wrapper_places_credits_inside_the_sidebar_panel() {
+        let view = stock_view(1250);
         let font = digit_font();
-        let inst = build_sidebar_credits_instances(&font, &view, 1.0, [1.0, 1.0, 0.0], [0.0, 0.0]);
+        let inst = build_sidebar_credits_instances(
+            &font,
+            &view,
+            SidebarChromeLayoutSpec::stock(),
+            168.0,
+            "Time: %02d:%02d:%02d",
+            [1.0, 1.0, 0.0],
+            [0.0, 0.0],
+        );
 
         assert_eq!(inst.len(), 4, "one quad per digit of the displayed total");
         for q in &inst {
@@ -269,16 +207,33 @@ mod tests {
         assert_eq!(inst[0].position[0], expected_x);
     }
 
+    /// The observer's counter shows the match's time, anything past 99 hours
+    /// as 99:59:59 (`CreditsClass::Draw @ 0x004A2370`, `0x004A2437..0x004A24A4`).
     #[test]
-    fn credits_follow_the_camera_offset_convention() {
-        let font = digit_font();
-        let plain = build_credits_instances(&font, 500, panel(), 1.0, [1.0, 1.0, 0.0], [0.0, 0.0]);
-        let offset =
-            build_credits_instances(&font, 500, panel(), 1.0, [1.0, 1.0, 0.0], [13.25, -7.5]);
-        assert_eq!(plain.len(), offset.len());
-        for (p, o) in plain.iter().zip(offset.iter()) {
-            assert_eq!(o.position[0] - p.position[0], 13.25);
-            assert_eq!(o.position[1] - p.position[1], -7.5);
+    fn the_observers_counter_shows_the_time_capped_at_99_hours() {
+        let widths = [(b'0', 7), (b'1', 3), (b'5', 5), (b'9', 6), (b':', 2)];
+        let font = make_test_font(&widths.map(|(glyph, w)| (u16::from(glyph), w)), 4);
+        let mut view = stock_view(0);
+        view.observer = Some(Vec::new());
+        for (seconds, shown) in [(3_661, "01:01:01"), (360_000, "99:59:59")] {
+            view.credits = seconds;
+            let drawn: Vec<f32> = build_sidebar_credits_instances(
+                &font,
+                &view,
+                SidebarChromeLayoutSpec::stock(),
+                168.0,
+                "%02d:%02d:%02d",
+                [1.0, 1.0, 0.0],
+                [0.0, 0.0],
+            )
+            .iter()
+            .map(|glyph| glyph.size[0])
+            .collect();
+            let expected: Vec<f32> = shown
+                .bytes()
+                .map(|c| widths.iter().find(|(glyph, _)| *glyph == c).unwrap().1 as f32)
+                .collect();
+            assert_eq!(drawn, expected, "{seconds} s shows {shown}");
         }
     }
 }

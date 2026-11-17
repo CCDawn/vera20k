@@ -9,15 +9,114 @@ fn scene() -> Option<(Simulation, crate::rules::ruleset::RuleSet, InternedId)> {
     sim.intern_rule_type_ids(&rules);
     sim.resolve_type_handles(&rules);
     sim.input_delay_ticks = 0;
-    sim.session.game_options.short_game = false;
-    sim.session.game_options.multi_engineer = false;
+    sim.session.game_options_mut_for_test().short_game = false;
+    sim.session.game_options_mut_for_test().multi_engineer = false;
     let owner = sim.interner.get("Americans").unwrap();
-    sim.houses.insert(
-        owner,
-        crate::sim::house_state::HouseState::new(owner, 0, None, true, 50_000, 10),
-    );
-    sim.session.current_house = Some(owner);
+    sim.houses
+        .insert_for_test(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 50_000, 10,
+        ));
+    sim.session.set_current_house_for_test(Some(owner));
     Some((sim, rules, owner))
+}
+
+#[test]
+fn retail_parked_jumpjet_planning_blocks_scanning_until_player_load_drops_the_queue() {
+    use crate::sim::components::NavTargetRef;
+    use crate::sim::mission::MissionType;
+    let Some((mut sim, rules, owner)) = scene() else {
+        return;
+    };
+    let kind = rules.object("JUMPJET").unwrap();
+    assert!(kind.balloon_hover && kind.can_passive_acquire && !kind.opportunity_fire);
+    let actor = sim
+        .spawn_object("JUMPJET", "Americans", 12, 12, 0, &rules)
+        .unwrap();
+    assert!(sim.apply_command(
+        "Americans",
+        &Command::Move {
+            entity_id: actor,
+            target_rx: 15,
+            target_ry: 12
+        },
+        Some(&rules)
+    ));
+    let mut parked = false;
+    for _ in 0..600 {
+        step(&mut sim, &rules);
+        let entity = sim.entities().get(actor).unwrap();
+        if (entity.position.rx(), entity.position.ry()) == (15, 12)
+            && entity.navigation.nav_com() == Some(NavTargetRef::cell(15, 12))
+            && entity.mission.current().known() == Some(MissionType::Move)
+        {
+            parked = true;
+            break;
+        }
+    }
+    assert!(
+        parked,
+        "ordinary Move must reach the parked BalloonHover history"
+    );
+    planned(
+        &mut sim,
+        &rules,
+        owner,
+        Command::Move {
+            entity_id: actor,
+            target_rx: 18,
+            target_ry: 12,
+        },
+    );
+    assert_eq!(sim.planning.paths[&actor].nodes.len(), 1);
+    let entity = sim.entities().get(actor).unwrap();
+    assert_eq!(
+        entity.navigation.nav_com(),
+        Some(NavTargetRef::cell(15, 12))
+    );
+    assert_eq!(entity.mission.current().known(), Some(MissionType::Move));
+    let now = sim.session.binary_frame();
+    let entity = sim.substrate.entities.get_mut(actor).unwrap();
+    entity.passive_scan.arm_timer(now, 0);
+    entity
+        .passive_scan
+        .set_last_target_scan_frame_for_test(now.wrapping_sub(1));
+    let before = entity.passive_scan;
+    step(&mut sim, &rules);
+    assert_eq!(
+        sim.entities().get(actor).unwrap().passive_scan,
+        before,
+        "production mission dispatch must retain the suppression count"
+    );
+    // The full frame also has legitimate mission RNG. Isolate the passive
+    // gate's own no-draw contract only after the production visit above.
+    let rng = sim.scenario_rng.native_state_hex();
+    super::super::techno_ai::passive_target_acquire(&mut sim, actor, &rules, Default::default());
+    assert_eq!(sim.entities().get(actor).unwrap().passive_scan, before);
+    assert_eq!(sim.scenario_rng.native_state_hex(), rng);
+    let bytes = crate::sim::snapshot::GameSnapshot::save_validated(&sim, 0, 0, "planning", 0);
+    let mut restored =
+        crate::sim::snapshot::GameSnapshot::load_validated(&bytes, 0, 0, sim.session.map_name())
+            .unwrap()
+            .sim;
+    assert!(
+        restored
+            .planning
+            .paths
+            .get(&actor)
+            .is_none_or(|path| path.nodes.is_empty())
+    );
+    let now = restored.session.binary_frame();
+    let rng = restored.scenario_rng.native_state_hex();
+    super::super::techno_ai::passive_target_acquire(
+        &mut restored,
+        actor,
+        &rules,
+        Default::default(),
+    );
+    let scan = restored.entities().get(actor).unwrap().passive_scan;
+    assert_eq!(scan.last_scan_frame(), now);
+    assert_ne!(scan.timer(), before.timer());
+    assert_ne!(restored.scenario_rng.native_state_hex(), rng);
 }
 
 fn planned(
@@ -27,10 +126,10 @@ fn planned(
     command: Command,
 ) {
     let record = sim
-        .encode_planning_order_record(owner, &command)
+        .encode_planning_order_record(owner, &command, None)
         .expect("resolved click is representable");
     let command = sim
-        .decode_native_command_record(&record, sim.session.tick)
+        .decode_native_command_record(&record, sim.session.tick())
         .unwrap();
     assert!(
         sim.apply_command("Americans", &command.payload, Some(rules)),
@@ -41,7 +140,7 @@ fn planned(
 fn commit(sim: &mut Simulation, rules: &crate::rules::ruleset::RuleSet, owner: InternedId) {
     let record = sim.encode_plan_commit_record(owner).unwrap();
     let command = sim
-        .decode_native_command_record(&record, sim.session.tick)
+        .decode_native_command_record(&record, sim.session.tick())
         .unwrap();
     assert!(sim.apply_command("Americans", &command.payload, Some(rules)));
 }
@@ -58,13 +157,234 @@ fn step_with_overlays(
     let commands = sim.take_due_commands();
     sim.advance_app_frame(
         &commands,
-        Some(rules),
+        rules,
         overlays,
         33,
         super::super::TickLane::Ordinary,
         Default::default(),
     )
     .unwrap();
+}
+
+#[test]
+fn retail_plan_publication_uses_final_timing_and_yields_to_an_existing_player_move() {
+    use crate::sim::command::{CommandEnvelope, TimingRecord};
+    use crate::sim::components::NavTargetRef;
+    use crate::sim::scenario_session::ScenarioGameMode;
+    use std::num::NonZeroU8;
+
+    let Some((mut sim, rules, owner)) = scene() else {
+        return;
+    };
+    let rival = sim.interner.get("Russians").unwrap();
+    sim.houses
+        .insert_for_test(crate::sim::house_state::HouseState::new(
+            rival, 0, None, true, 0, 10,
+        ));
+    sim.session.set_game_mode(ScenarioGameMode::Wol);
+    sim.session.install_network_timing(40);
+    sim.session
+        .install_network_command_timing(1, NonZeroU8::new(10).unwrap(), [0, 1]);
+    sim.session.set_binary_frame_for_test(300);
+    let actor = sim
+        .spawn_object("E1", "Americans", 12, 12, 0, &rules)
+        .unwrap();
+    sim.spawn_object("E1", "Russians", 28, 28, 0, &rules)
+        .unwrap();
+    for target_rx in [13, 14] {
+        planned(
+            &mut sim,
+            &rules,
+            owner,
+            Command::Move {
+                entity_id: actor,
+                target_rx,
+                target_ry: 12,
+            },
+        );
+    }
+    let mut player_move = sim
+        .encode_megamission_record(
+            owner,
+            &Command::Move {
+                entity_id: actor,
+                target_rx: 18,
+                target_ry: 12,
+            },
+        )
+        .unwrap();
+    player_move.set_frame_stamp(305);
+    let player_frame = player_move.frame_stamp();
+    let commit = sim.encode_plan_commit_record(owner).unwrap();
+    // This supported timing shrink clears the retime window. Publication
+    // must observe the new rate, rather than hoping a later scan repairs it.
+    let timing = TimingRecord {
+        house_id: 1,
+        frame: 300,
+        max_ahead: 15,
+        frames_per_second: 30,
+        frame_send_rate: NonZeroU8::new(5).unwrap(),
+    }
+    .encode()
+    .unwrap();
+    sim.queue_commands(
+        [player_move, commit, timing].map(|record| CommandEnvelope::synchronized(record, 0)),
+    );
+    let advance = |sim: &mut Simulation| {
+        let output = sim
+            .advance_app_frame(
+                &[],
+                &rules,
+                None,
+                33,
+                super::super::TickLane::Ordinary,
+                Default::default(),
+            )
+            .unwrap();
+        assert!(output.network_failure.is_none() && output.tick.frame_committed);
+        output
+    };
+    advance(&mut sim);
+    let queued = sim.pending_command_snapshot();
+    assert_eq!(queued.len(), 2);
+    assert!(
+        matches!(&queued[0].payload, Command::PlanningRecord { record }
+        if record.payload()[22] == 2 && record.frame_stamp() == player_frame)
+    );
+    assert!(matches!(
+        queued[1].payload,
+        Command::Move { target_rx: 18, .. }
+    ));
+    for _ in 0..5 {
+        advance(&mut sim);
+    }
+    assert_eq!(
+        sim.entities().get(actor).unwrap().navigation.nav_com(),
+        Some(NavTargetRef::cell(18, 12)),
+        "the existing player order executes after the generated plan order"
+    );
+    assert!(sim.planning_paths(owner).is_empty());
+}
+
+#[test]
+fn retail_rate_one_plans_replay_with_the_same_publication_order_and_state() {
+    use crate::sim::command::CommandEnvelope;
+    use crate::sim::replay::{ReplayHeader, ReplayLog, ReplayRunner};
+    use crate::sim::runtime::{SimResources, SimRuntime};
+    use crate::sim::scenario_session::ScenarioGameMode;
+
+    let setup = || {
+        let (mut sim, rules, owner) = scene()?;
+        let rival = sim.interner.get("Russians").unwrap();
+        sim.houses
+            .insert_for_test(crate::sim::house_state::HouseState::new(
+                rival, 0, None, true, 0, 10,
+            ));
+        sim.session.set_game_mode(ScenarioGameMode::Wol);
+        sim.session.install_network_timing(10);
+        sim.session
+            .install_network_command_timing(1, std::num::NonZeroU8::new(5).unwrap(), [0, 1]);
+        sim.network_command_queues().configure_sequenced_clock(30);
+        sim.hash_state_every(std::num::NonZeroU64::MIN);
+        for y in [12, 13] {
+            let actor = sim
+                .spawn_object("E1", "Americans", 12, y, 0, &rules)
+                .unwrap();
+            planned(
+                &mut sim,
+                &rules,
+                owner,
+                Command::Move {
+                    entity_id: actor,
+                    target_rx: 14,
+                    target_ry: y,
+                },
+            );
+        }
+        sim.spawn_object("E1", "Russians", 28, 28, 0, &rules)
+            .unwrap();
+        let mut resources = SimResources::empty();
+        resources.rules = rules;
+        Some((
+            SimRuntime {
+                simulation: sim,
+                resources: std::sync::Arc::new(resources),
+            },
+            owner,
+        ))
+    };
+    let Some((mut live, owner)) = setup() else {
+        return;
+    };
+    let (mut replay, _) = setup().unwrap();
+    // Version3 logged internal flag2 copies without publication phases.
+    // A production playback must reject that protocol before regenerating.
+    let legacy = ReplayLog::new(ReplayHeader {
+        version: 3,
+        tick_hz: 30,
+        seed: replay.simulation.session.seed(),
+        map_name: replay.simulation.session.map_name().to_owned(),
+        rules_hash: 0,
+        pixel_conversion_bounds: replay.simulation.session.pixel_conversion_bounds(),
+    });
+    assert!(
+        ReplayRunner::run_runtime(&mut replay, &legacy, 33)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported replay version")
+    );
+    assert_eq!(live.simulation.state_hash(), replay.simulation.state_hash());
+    let commit = live.simulation.encode_plan_commit_record(owner).unwrap();
+    assert!(
+        live.simulation
+            .issue_local_command(CommandEnvelope::synchronized(commit, 0))
+    );
+    for frame in 0..13 {
+        let mut output = live
+            .advance_frame(
+                &[],
+                33,
+                super::super::TickLane::Ordinary,
+                Default::default(),
+            )
+            .unwrap();
+        assert!(output.tick.frame_committed && output.network_failure.is_none());
+        let recorded = output.take_admitted_commands();
+        assert!(!recorded.iter().any(|command| matches!(&command.payload,
+            Command::SynchronizedRecord { record } | Command::PlanningRecord { record }
+            if record.opcode() == 4 && record.payload()[22] == 2)));
+        let commands = replay.simulation.take_due_replay_commands(recorded);
+        let replayed = replay
+            .advance_frame(
+                &commands,
+                33,
+                super::super::TickLane::Ordinary,
+                Default::default(),
+            )
+            .unwrap();
+        assert!(replayed.tick.frame_committed && replayed.network_failure.is_none());
+        // The gameplay hash does not include DoList, so compare its full
+        // retained order, processed bits and retiming state explicitly too.
+        assert_eq!(
+            live.simulation.pending_commands, replay.simulation.pending_commands,
+            "publication queue at frame {frame}"
+        );
+        assert_eq!(
+            live.simulation.state_hash(),
+            replay.simulation.state_hash(),
+            "replay state at frame {frame}"
+        );
+        if frame == 0 {
+            let queued = live.simulation.pending_command_snapshot();
+            assert_eq!(queued.len(), 2);
+            assert!(
+                queued.iter().all(|command| matches!(&command.payload,
+                Command::PlanningRecord { record }
+                if record.frame_stamp() == live.simulation.session.binary_frame() as i32)),
+                "the admitted rate1 clock keeps next-frame plan execution"
+            );
+        }
+    }
 }
 
 #[test]
@@ -78,7 +398,7 @@ fn targetless_mobile_self_click_does_not_create_a_planning_node() {
     // Event633BC0 returns (-1,-1,-1) for three NULL tokens; PlanMgr638158
     // rejects that coordinate. A self-click is not the deploy key's Event9.
     let record = sim
-        .encode_planning_order_record(owner, &Command::DeployMcv { entity_id: actor })
+        .encode_planning_order_record(owner, &Command::DeployMcv { entity_id: actor }, None)
         .unwrap();
     let command = sim.decode_native_command_record(&record, 0).unwrap();
     assert!(!sim.apply_command("Americans", &command.payload, Some(&rules)));
@@ -133,14 +453,15 @@ fn retail_planned_tanya_plants_c4_and_continues_to_the_next_waypoint() {
         sim.entities()
             .get(target)
             .unwrap()
+            .building
             .pending_c4_detonation
             .pending()
             .is_none()
     );
-    // Save before committing: the new mission stays in the authoritative raw
-    // node records, retaining ordering and target through restoration.
+    // An internal checkpoint retains authoritative raw node records. Normal
+    // player load deliberately drops these future plans (tested separately).
     let bytes = crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "planned-c4", 0);
-    sim = crate::sim::snapshot::GameSnapshot::load(&bytes)
+    sim = crate::util::save_codec::deserialize::<crate::sim::snapshot::GameSnapshot>(&bytes)
         .unwrap()
         .sim;
     sim.restore_after_snapshot_load().unwrap();
@@ -156,7 +477,7 @@ fn retail_planned_tanya_plants_c4_and_continues_to_the_next_waypoint() {
         if let Some(charge) = sim
             .entities()
             .get(target)
-            .and_then(|entity| entity.pending_c4_detonation.pending())
+            .and_then(|entity| entity.building.pending_c4_detonation.pending())
         {
             assert_eq!(charge.source_entity_id(), Some(tanya));
             planted = true;
@@ -175,7 +496,7 @@ fn retail_planned_tanya_plants_c4_and_continues_to_the_next_waypoint() {
         "planned C4 must reach the real arrival/charge owner"
     );
     assert!(arrived, "the route must continue after sabotage");
-    assert!(!sim.planning.paths.contains_key(&tanya));
+    assert!(!sim.planning_has_remaining_nodes(tanya));
 }
 
 #[test]
@@ -244,17 +565,11 @@ fn retail_planned_enter_reaches_transport_and_bunker_adapters() {
                 &rules,
             )
             .unwrap();
-        let order = if bunker {
-            Command::EnterBunker {
-                unit_id: actor,
-                bunker_id: target,
-            }
-        } else {
-            Command::EnterTransport {
-                passenger_id: actor,
-                transport_id: target,
-            }
-        };
+        let order = Command::clicked_mission(
+            actor,
+            crate::sim::mission::MissionType::Enter,
+            crate::sim::combat::TargetKind::Entity(target),
+        );
         planned(&mut sim, &rules, owner, order);
         commit(&mut sim, &rules, owner);
         let mut entered = false;
@@ -274,7 +589,7 @@ fn retail_planned_enter_reaches_transport_and_bunker_adapters() {
             }
         }
         assert!(entered, "planned Enter, bunker={bunker}");
-        assert!(!sim.planning.paths.contains_key(&actor));
+        assert!(!sim.planning_has_remaining_nodes(actor));
     }
 }
 
@@ -300,14 +615,15 @@ fn retail_planned_depot_and_refinery_orders_reach_their_dock_owners() {
             .unwrap();
         if refinery {
             crate::sim::arena_fixture::install_status_miner_cargo(
-                sim.entities_mut().get_mut(actor).unwrap(),
+                sim.substrate.entities.get_mut(actor).unwrap(),
                 rules.object(kind).unwrap(),
                 &rules,
                 3,
                 0,
             );
         } else {
-            sim.entities_mut()
+            sim.substrate
+                .entities
                 .get_mut(actor)
                 .unwrap()
                 .health
@@ -321,17 +637,11 @@ fn retail_planned_depot_and_refinery_orders_reach_their_dock_owners() {
         for _ in 0..3 {
             step(&mut sim, &rules);
         }
-        let order = if refinery {
-            Command::MinerReturn {
-                entity_id: actor,
-                target_refinery_id: Some(target),
-            }
-        } else {
-            Command::RepairAtDepot {
-                entity_id: actor,
-                depot_id: target,
-            }
-        };
+        let order = Command::clicked_mission(
+            actor,
+            crate::sim::mission::MissionType::Enter,
+            crate::sim::combat::TargetKind::Entity(target),
+        );
         planned(&mut sim, &rules, owner, order);
         commit(&mut sim, &rules, owner);
         let mut docked = false;
@@ -437,6 +747,8 @@ fn retail_planned_and_ordinary_harvest_extracts_ore_after_walking() {
             assert!(sim.rebuild_dynamic_navigation(&rules));
             // Native Harvest73E67F..73E6C2 requires an owned instance of a
             // type in Dock=. An enemy refinery must not satisfy that gate.
+            // Ares 3.0 1004D6C0 (hook 0x73E66D) skips that loop, so HARV
+            // (Dock= set) harvests with or without a refinery there.
             if let Some(dock_owner) = dock_owner {
                 sim.spawn_object("NAREFN", dock_owner, 40, 40, 0, &rules)
                     .unwrap();
@@ -464,11 +776,11 @@ fn retail_planned_and_ordinary_harvest_extracts_ore_after_walking() {
                     .known(),
                 Some(crate::sim::mission::MissionType::Guard)
             );
-            let order = Command::HarvestCell {
-                entity_id: actor,
-                target_rx: 17,
-                target_ry: 12,
-            };
+            let order = Command::clicked_mission(
+                actor,
+                crate::sim::mission::MissionType::Harvest,
+                crate::sim::combat::TargetKind::Cell(17, 12),
+            );
             assert_eq!(
                 sim.resolved_terrain
                     .as_ref()
@@ -519,14 +831,14 @@ fn retail_planned_and_ordinary_harvest_extracts_ore_after_walking() {
                 harvest_dispatched,
                 "Harvest must reach the mission owner, planning={planning}"
             );
-            let owns_dock = dock_owner == Some("Americans");
+            let harvests = dock_owner == Some("Americans") || rules.ares();
             assert_eq!(
                 !actor.miner.as_ref().unwrap().cargo().is_empty(),
-                owns_dock,
+                harvests,
                 "planning={planning}, dock_owner={dock_owner:?}, mission={:?}",
                 actor.mission
             );
-            if owns_dock {
+            if harvests {
                 assert_eq!((actor.position.rx(), actor.position.ry()), (17, 12));
             } else {
                 // An armed miner may subsequently acquire the other house's

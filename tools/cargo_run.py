@@ -19,6 +19,29 @@ import tempfile
 import time
 
 
+def invoke(args: list[str], *, cwd: Path, env_extra: dict[str, str] | None = None,
+           isolated_ci: bool = False, on_line=None) -> int:
+    """Launch a tool's Cargo command through this owner unless CI is isolated.
+
+    Hosted CI jobs have no cooperating worktrees. Callers must opt into that
+    case; local tools retain the shared build lock and owned artifact records.
+    With ON_LINE, each line of the command's stdout (test output included) goes
+    to it instead of the terminal; stderr still reaches the terminal.
+    """
+    prefix = ['cargo'] if isolated_ci else [sys.executable, '-m', 'tools.cargo_run', '--']
+    command = [*prefix, *args]
+    print(f"+ {' '.join(command)}", flush=True)
+    env = {**os.environ, **(env_extra or {})}
+    if on_line is None:
+        return subprocess.call(command, cwd=cwd, env=env)
+    with subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                          text=True, encoding='utf-8', errors='replace') as child:
+        assert child.stdout is not None
+        for line in child.stdout:
+            on_line(line)
+        return child.wait()
+
+
 def git(root: Path, *args: str) -> str:
     return subprocess.check_output(['git', '-C', str(root), *args], text=True).strip()
 
@@ -139,9 +162,9 @@ def source_identity(root: Path, hashes: dict | None = None) -> dict:
             'source_sha256': digest.hexdigest()}
 
 
-def cargo_args(args: list[str], label: str | None) -> list[str]:
-    if not args or args[0] not in {'build', 'test', 'check', 'clippy'}:
-        raise ValueError('Expected Cargo build, test, check or clippy after --')
+def cargo_args(args: list[str], label: str | None, focus: tuple[str, list[str]] | None = None) -> list[str]:
+    if not args or args[0] not in {'build', 'test', 'check', 'clippy', 'rustc'}:
+        raise ValueError('Expected Cargo build, test, check, clippy or rustc after --')
     options = args[:args.index('--')] if '--' in args else args
     if any(a.split('=')[0] in {'--target-dir', '--manifest-path', '--message-format', '--config'}
            for a in options):
@@ -152,7 +175,7 @@ def cargo_args(args: list[str], label: str | None) -> list[str]:
         raise ValueError('--label requires build or test --lib --no-run')
     # Cargo options must precede --; leave libtest's arguments unchanged.
     return [args[0], '--message-format=json-render-diagnostics', *options[1:],
-            *core_test_features(args[0], options), *args[len(options):]]
+            *test_features(args[0], options, focus), *args[len(options):]]
 
 
 # `cargo test --workspace` builds core's tests with the features the client
@@ -162,19 +185,89 @@ def cargo_args(args: list[str], label: str | None) -> list[str]:
 WORKSPACE_CORE_FEATURES = ('dev-overlays', 'test-support')
 
 
-def core_test_features(command: str, options: list[str]) -> list[str]:
-    packages, feature_options = [], False
+def _selection(options: list[str]) -> tuple[list[str], list[str]]:
+    """The packages a Cargo command names and its feature options."""
+    packages, feature_options = [], []
     for i, option in enumerate(options):
         name, _, value = option.partition('=')
         if name in {'-p', '--package'}:
             packages.append(value or (options[i + 1] if i + 1 < len(options) else ''))
         elif option.startswith('-p') and len(option) > 2:
             packages.append(option[2:])
-        feature_options |= name in {'-F', '--features', '--all-features', '--no-default-features'} or (
-            option.startswith('-F') and len(option) > 2)
-    if command != 'test' or packages != ['vera20k-core'] or feature_options:
-        return []
-    return ['--features', ','.join(WORKSPACE_CORE_FEATURES)]
+        if name in {'-F', '--features'}:
+            feature_options.append(value or (options[i + 1] if i + 1 < len(options) else ''))
+        elif name in {'--all-features', '--no-default-features'} or (
+                option.startswith('-F') and len(option) > 2):
+            feature_options.append(option)
+    return packages, feature_options
+
+
+def test_features(command: str, options: list[str], focus: tuple[str, list[str]] | None) -> list[str]:
+    packages, feature_options = _selection(options)
+    names = []
+    if command == 'test' and packages == ['vera20k-core'] and not feature_options:
+        names += WORKSPACE_CORE_FEATURES
+    if focus:
+        from tools.group_tests import FOCUS_FEATURE, feature
+        names += [FOCUS_FEATURE, *map(feature, focus[1])]
+    return ['--features', ','.join(names)] if names else []
+
+
+# Options that take a separate value: the word after one is not a test filter.
+CARGO_VALUE_OPTIONS = frozenset({
+    '-p', '--package', '-F', '--features', '--profile', '--target', '-j', '--jobs', '--exclude',
+    '--bin', '--test', '--example', '--bench', '--color', '-Z', '--lockfile-path'})
+LIBTEST_VALUE_OPTIONS = frozenset({
+    '--skip', '--test-threads', '--format', '--color', '-Z', '--logfile', '--shuffle-seed'})
+
+
+def test_filters(args: list[str]) -> list[str]:
+    """The test name filters of a `cargo test` command: Cargo's own, then libtest's."""
+    def positionals(words, value_options):
+        found, value = [], False
+        for word in words:
+            if not value and not word.startswith('-'):
+                found.append(word)
+            value = not value and word in value_options
+        return found
+
+    split = args.index('--') if '--' in args else len(args)
+    return (positionals(args[1:split], CARGO_VALUE_OPTIONS)
+            + positionals(args[split + 1:], LIBTEST_VALUE_OPTIONS))
+
+
+# A filter that spans more test groups than this compiles every test: each
+# combination of groups is one more build in the cache.
+FOCUS_GROUPS = 2
+
+
+def focused_groups(root: Path, args: list[str]) -> tuple[str, list[str]] | None:
+    """The (package, test groups) a filtered test run compiles; None compiles every test.
+
+    A test run of one workspace crate whose filters all start inside one or two
+    test groups builds with `test-focus` and those groups' features, so only
+    their tests (and the shared test code) compile: tools/group_tests.py. Any
+    other run, and one that chooses `test-focus` or `--all-features` itself,
+    stays as the caller wrote it.
+    """
+    if not args or args[0] != 'test':
+        return None
+    options = args[:args.index('--')] if '--' in args else args
+    packages, feature_options = _selection(options)
+    filters = test_filters(args)
+    if (len(packages) != 1 or not filters or {'--workspace', '--all', '--all-features'} & set(options)
+            or any('test-focus' in names for names in feature_options)):
+        return None
+    from tools.group_tests import load
+    try:
+        crate = load(root).get(packages[0])
+    except (OSError, ValueError):
+        return None
+    if crate is None:
+        return None
+    found = [crate.groups_for_filter(text) for text in filters]
+    groups = sorted(set().union(*found))
+    return (packages[0], groups) if all(found) and len(groups) <= FOCUS_GROUPS else None
 
 
 def common_git_dir(root: Path) -> Path:
@@ -385,6 +478,10 @@ def test_runner_config(record: Path) -> str:
     return 'target."cfg(all())".runner=' + json.dumps(runner, ensure_ascii=False)
 
 
+# libtest's summary of one test executable (pretty and terse formats).
+TEST_SUMMARY = re.compile(rb'^test result: \S+ (\d+) passed; (\d+) failed; (\d+) ignored;')
+
+
 def run_recorded_tests(record: Path) -> int:
     """Start the recorded test executables together; report them in Cargo's order.
 
@@ -393,37 +490,110 @@ def run_recorded_tests(record: Path) -> int:
     while other cores idle, and the client suite fills them. The first streams
     its output; each later one's is held and printed once those before it end.
     Every executable runs to its end, so a failure no longer skips the others,
-    and any failure reports status 101 as Cargo does. No record means another
-    configured runner took precedence and Cargo already ran the tests.
+    and any failure reports status 101 as Cargo does. So does a run whose
+    executables all report that no test matched: a filter, or a test group, that
+    names nothing must not pass. No record means another configured runner took
+    precedence and Cargo already ran the tests.
     """
     calls = [json.loads(line) for line in record.read_text(encoding='utf-8').splitlines()] if record.exists() else []
     record.unlink(missing_ok=True)  # It holds the environment; keep it no longer than needed.
     failed = 0
+    counts = []  # One libtest summary per executable that printed one.
     with ExitStack() as outputs:
         children = []
         for i, call in enumerate(calls):
             print(f'Running {call["command"][0]} (build lock released)', file=sys.stderr, flush=True)
             output = outputs.enter_context(tempfile.TemporaryFile()) if i else None
             children.append((call['command'][0], output, subprocess.Popen(
-                call['command'], cwd=call['cwd'], env=call['env'], stdout=output,
+                call['command'], cwd=call['cwd'], env=call['env'], stdout=output or subprocess.PIPE,
                 stderr=subprocess.STDOUT if output else None)))
         for executable, output, child in children:
+            # The first executable's lines pass through as they arrive.
+            sys.stdout.flush()
+            if output is None:
+                for line in child.stdout:
+                    sys.stdout.buffer.write(line)
+                    sys.stdout.buffer.flush()
+                    counts.append(TEST_SUMMARY.match(line))
             status = child.wait()
             if output:
-                sys.stdout.flush()
                 output.seek(0)
-                shutil.copyfileobj(output, sys.stdout.buffer)
+                for line in output:
+                    sys.stdout.buffer.write(line)
+                    counts.append(TEST_SUMMARY.match(line))
                 sys.stdout.buffer.flush()
             if status:
                 print(f'error: test failed: {executable} exited with status {status}', file=sys.stderr, flush=True)
                 failed = 101
+    counts = [sum(map(int, summary.groups())) for summary in counts if summary]
+    if counts and not sum(counts):
+        print('error: no test matched: the filter names no test, or none in the test group '
+              'that was compiled (tools/README.md, "Test groups")', file=sys.stderr, flush=True)
+        failed = 101
     return failed
 
 
-def run(root: Path, args: list[str], label: str | None, timeout: float, *, policy=None) -> int:
+class RunTimes:
+    """Where one run's wall time went, printed as its last stderr line.
+
+    Callers mostly keep only the tail of the output, and Codex collapses the
+    repeated lock-wait lines: in the October 2026 transcripts one 1432 s focused
+    test showed 51 s of compile and three wait lines, so its queue was invisible.
+    """
+
+    PARTS = ('waiting for the build lock', 'cache retention', 'Cargo', 'tests')
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self.seconds = dict.fromkeys(self.PARTS, 0.0)
+
+    @contextmanager
+    def timing(self, part: str):
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.seconds[part] += time.monotonic() - started
+
+    def summary(self) -> str:
+        return (f'cargo_run: {time.monotonic() - self.started:.1f} s in all: '
+                + ', '.join(f'{seconds:.1f} s {part}' for part, seconds in self.seconds.items()))
+
+
+def run(root: Path, args: list[str], label: str | None, timeout: float, *, policy=None,
+        all_tests: bool = False) -> int:
+    times = RunTimes()
+    try:
+        status = _run(root, args, label, timeout, policy, times, all_tests)
+        if status is FOCUS_OUTGROWN:
+            print('Test groups: the group uses test code that only another group compiles (the errors '
+                  'above); compiling every test instead. To repair the group: python -m tools.group_tests '
+                  'lend <test module> <group> (tools/README.md, "Test groups")', file=sys.stderr, flush=True)
+            status = _run(root, args, label, timeout, policy, times, True)
+        return status
+    finally:
+        print(times.summary(), file=sys.stderr, flush=True)
+
+
+# What _run returns when a focused test build failed on an item rustc reports as
+# configured out: a test of the group now uses another group's test code.
+FOCUS_OUTGROWN = object()
+
+
+def _run(root: Path, args: list[str], label: str | None, timeout: float, policy, times: RunTimes,
+         all_tests: bool = False):
     from tools._cargo_cache import CachePolicy, register_locked, automatic_locked, retention_due
+    from tools._cargo_seed import profile_directory, seed
     policy = policy if policy is not None else CachePolicy.from_env()
-    args = cargo_args(args, label)
+    focus = None if all_tests else focused_groups(root, args)
+    args = cargo_args(args, label, focus)
+    if focus:
+        print(f'Test groups: {", ".join(focus[1])} of {focus[0]}; no other tests compile '
+              '(tools/README.md, "Test groups")', file=sys.stderr, flush=True)
+        from tools.group_tests import problems
+        if stale := problems(root):
+            print(f'Test groups: {len(stale)} out of step (python -m tools.group_tests check), first: {stale[0]}',
+                  file=sys.stderr, flush=True)
     if label:
         validate_label(label)
     store, namespace = build_store(root)
@@ -436,15 +606,19 @@ def run(root: Path, args: list[str], label: str | None, timeout: float, *, polic
     # test executable to a recorder, and they start once the shared lock is
     # released. This checkout's lock stays held, so its next run cannot relink them.
     with ExitStack() as checkout, ExitStack() as shared:
-        checkout.enter_context(file_lock(store / 'checkouts' / f'{namespace}.lock', deadline))
+        with times.timing('waiting for the build lock'):
+            checkout.enter_context(file_lock(store / 'checkouts' / f'{namespace}.lock', deadline))
         record = None
         if args[0] == 'test' and '--no-run' not in options:
             record = Path(checkout.enter_context(tempfile.TemporaryDirectory(prefix='cargo-tests-'))) / 'tests.jsonl'
             args = [args[0], '--config', test_runner_config(record), *args[1:]]
-        shared.enter_context(build_lock(store / 'cargo.lock', deadline - time.monotonic()))
+        with times.timing('waiting for the build lock'):
+            shared.enter_context(build_lock(store / 'cargo.lock', deadline - time.monotonic()))
         if output and output.exists():
             raise ValueError(f'Label already exists; choose a new label: {output}')
-        if others := register_locked(root, store, target):
+        # Retention ranks each profile of a cache by its runs; see _cargo_cache.
+        profile = profile_directory(options)
+        if others := register_locked(root, store, target, profile=profile):
             print('Note: this checkout also has caches at ' + ', '.join(map(str, others))
                   + '; one cache per checkout is intended (CARGO_TARGET_DIR differs between '
                   'sessions, or the other cache predates the primary-checkout default)',
@@ -461,7 +635,8 @@ def run(root: Path, args: list[str], label: str | None, timeout: float, *, polic
         # and grows with each worktree. Before Cargo it can matter only by
         # restoring the reserve, and the reserve is cheap to measure.
         if below_reserve():
-            automatic_locked(root, store, policy)
+            with times.timing('cache retention'):
+                automatic_locked(root, store, policy, volumes)
         # Admission uses a fresh measurement after cleanup, not projected file
         # allocation or a retention receipt. A protected cache must never cause
         # another compile to consume the remaining volume reserve.
@@ -472,15 +647,26 @@ def run(root: Path, args: list[str], label: str | None, timeout: float, *, polic
                 f'{policy.min_free_bytes / (1024 ** 3):.2f} GiB required. '
                 'Review owned superseded builds and the cache retention receipt '
                 'before retrying; protected files were preserved.')
+        # A profile's first build in this cache starts from another cache's
+        # dependency outputs; see tools/_cargo_seed.py.
+        if profile and not (target / profile).exists():
+            try:
+                if summary := seed(root, store, target, profile):
+                    print(summary, file=sys.stderr, flush=True)
+            except (OSError, ValueError) as error:
+                print(f'Cache seeding stopped ({error}); Cargo builds what it lacks',
+                      file=sys.stderr, flush=True)
         artifacts = set()
+        configured_out = False
         try:
             hashes = {}
             before = source_identity(root, hashes)
             env = dict(os.environ, CARGO_TARGET_DIR=str(target))
             command = ['cargo', *args]
             print(f'Checkout: {root}\nTarget: {target}\nCommand: {command}', file=sys.stderr, flush=True)
-            with subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE,
-                                  text=True, encoding='utf-8', errors='replace') as child:
+            with times.timing('Cargo'), subprocess.Popen(
+                    command, cwd=root, env=env, stdout=subprocess.PIPE,
+                    text=True, encoding='utf-8', errors='replace') as child:
                 assert child.stdout is not None
                 for line in child.stdout:
                     try:
@@ -493,12 +679,14 @@ def run(root: Path, args: list[str], label: str | None, timeout: float, *, polic
                     elif message.get('reason') == 'compiler-artifact' and message.get('executable'):
                         artifacts.add(Path(message['executable']))
                     elif message.get('reason') == 'compiler-message':
-                        print(message['message'].get('rendered', line), end='', file=sys.stderr, flush=True)
+                        rendered = message['message'].get('rendered', line)
+                        print(rendered, end='', file=sys.stderr, flush=True)
+                        configured_out |= 'configured out' in rendered
                     elif message.get('reason') not in {'compiler-artifact', 'build-script-executed', 'build-finished'}:
                         print(line, end='', flush=True)
                 result = child.wait()
             if result:
-                return result
+                return FOCUS_OUTGROWN if focus and configured_out else result
             # A label's manifest records this identity: compare contents exactly
             # there. Elsewhere the stat table is enough; see source_identity.
             after = source_identity(root, None if label else hashes)
@@ -535,12 +723,15 @@ def run(root: Path, args: list[str], label: str | None, timeout: float, *, polic
                     staging.rename(output)
                 print(f'Preserved build: {output}', flush=True)
         finally:
-            register_locked(root, store, target, artifacts)
-            if retention_due(store, policy, volumes):
-                automatic_locked(root, store, policy)
+            register_locked(root, store, target, artifacts, profile=profile)
+            if retention_due(root, store, policy, volumes):
+                with times.timing('cache retention'):
+                    automatic_locked(root, store, policy, volumes)
         shared.close()
         if record:
-            if failed := run_recorded_tests(record):
+            with times.timing('tests'):
+                failed = run_recorded_tests(record)
+            if failed:
                 return failed
             if source_identity(root, hashes) != before:
                 raise ValueError('Source changed during the tests; result is not a validation')
@@ -553,6 +744,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument('--label', help='Preserve executables and source manifest under a unique label')
     mode.add_argument('--resolve', metavar='BIN', help='Print a verified recorded host executable path; never builds')
     mode.add_argument('--trim-cache', action='store_true', help='Trim owned compiler caches without building')
+    parser.add_argument('--all-tests', action='store_true',
+                        help='Compile every test of the crate, even when the filter names one test group')
     mode.add_argument('--retire-label', action='append', metavar='LABEL',
                       help='Retire an exact saved build; repeat for multiple labels')
     mode.add_argument('--retire-export-plan', metavar='PLAN',
@@ -608,14 +801,15 @@ def main(argv: list[str] | None = None) -> int:
             print(path)
             return 0
         from tools._cargo_cache import CachePolicy, trim
+        focus = {'all_tests': True} if options.all_tests else {}
         if options.trim_cache or cache_options:
             policy = CachePolicy.from_env(options.cache_gib, options.incremental_gib, options.min_free_gib)
             if options.trim_cache:
                 receipt = trim(root, policy, wait_seconds, dry_run=options.dry_run)
                 print(json.dumps(receipt, indent=2))
                 return 2 if receipt['errors'] else 0
-            return run(root, args, options.label, wait_seconds, policy=policy)
-        return run(root, args, options.label, wait_seconds)
+            return run(root, args, options.label, wait_seconds, policy=policy, **focus)
+        return run(root, args, options.label, wait_seconds, **focus)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f'cargo_run: {error}', file=sys.stderr)
         return 2

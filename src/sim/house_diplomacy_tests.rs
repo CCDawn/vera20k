@@ -28,7 +28,8 @@ fn rules() -> RuleSet {
 /// Houses `(name, country, human)` in that array order, in a skirmish.
 fn sim_with(rules: &RuleSet, houses: &[(&str, &str, bool)]) -> (Simulation, Vec<InternedId>) {
     let mut sim = Simulation::with_seed(9);
-    sim.session.game_mode_nonzero = true;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     let ids = houses
         .iter()
         .map(|&(name, country, human)| {
@@ -36,10 +37,10 @@ fn sim_with(rules: &RuleSet, houses: &[(&str, &str, bool)]) -> (Simulation, Vec<
             let side = rules.country_side_index(country).expect("country side").0;
             let country_id = sim.interner.intern(country);
             let mut house = HouseState::new(id, side, Some(country_id), human, 0, 10);
-            house.multiplay_passive =
-                crate::sim::house_state::resolve_multiplay_passive(Some(rules), Some(country));
-            sim.houses.insert(id, house);
-            sim.session.house_order.push(id);
+            house.set_multiplay_passive_for_test(
+                crate::sim::house_state::resolve_multiplay_passive(rules, Some(country)),
+            );
+            sim.houses.register(house);
             id
         })
         .collect();
@@ -48,7 +49,8 @@ fn sim_with(rules: &RuleSet, houses: &[(&str, &str, bool)]) -> (Simulation, Vec<
 
 /// Each house's allies, by its graph key.
 fn allies(sim: &Simulation, name: &str) -> BTreeSet<String> {
-    sim.house_alliances
+    sim.house_alliances()
+        .as_map()
         .get(&name.to_ascii_uppercase())
         .cloned()
         .unwrap_or_default()
@@ -90,42 +92,40 @@ fn computer_paranoid_allies_the_computers_against_the_human() {
     let player = ids[0];
     for computer in &ids[1..3] {
         let house = &sim.houses[computer];
-        assert_eq!(house.grudge_scores.get(&player), Some(&1));
-        assert_eq!(house.enemy_house, Some(player));
+        assert_eq!(house.grudge_scores().get(&player), Some(&1));
+        assert_eq!(house.enemy_house(), Some(player));
     }
     for passive in &ids[3..] {
-        assert!(sim.houses[passive].grudge_scores.is_empty());
-        assert_eq!(sim.houses[passive].enemy_house, None);
+        assert!(sim.houses[passive].grudge_scores().is_empty());
+        assert_eq!(sim.houses[passive].enemy_house(), None);
     }
 
     // A second call allies no one anew and angers each computer again.
     paranoid(&mut sim, &rules);
     assert_eq!(allies(&sim, "Computer1"), set(&["Computer2"]));
-    assert_eq!(sim.houses[&ids[1]].grudge_scores.get(&player), Some(&2));
+    assert_eq!(sim.houses[&ids[1]].grudge_scores().get(&player), Some(&2));
 }
 
-/// A lone computer allies no one: Special would leave it without an enemy.
+/// VERA `[General] AINearestEnemy=`: the computers stay apart and none is
+/// turned on the human.
 #[test]
-fn a_lone_computer_allies_no_one() {
-    let rules = rules();
-    let (mut sim, _) = sim_with(
-        &rules,
-        &[
-            ("Player", "Americans", true),
-            ("Computer1", "Russians", false),
-            ("Neutral", "Neutral", false),
-            ("Special", "Special", false),
-        ],
-    );
+fn ai_nearest_enemy_keeps_the_computers_from_banding_against_the_human() {
+    let mut rules = rules();
+    rules.general.ai_nearest_enemy = true;
+    let houses = [
+        ("Player", "Americans", true),
+        ("Computer1", "Russians", false),
+        ("Computer2", "Russians", false),
+    ];
+    let (mut sim, ids) = sim_with(&rules, &houses);
     paranoid(&mut sim, &rules);
-    assert_eq!(allies(&sim, "Computer1"), set(&[]));
-    assert_eq!(allies(&sim, "Neutral"), set(&["Computer1"]));
-    assert_eq!(allies(&sim, "Special"), set(&["Computer1"]));
+    assert!(sim.house_alliances.as_map().is_empty());
+    assert!(sim.houses[&ids[1]].grudge_scores().is_empty());
 }
 
-/// The gate (`0x00501640..0x00501675`): Rules `AlliesAllowed=`, and no
-/// computer slot with a team, which `Create_Houses` records
-/// (`0x006881F5..0x00688209`).
+/// The gate (`0x00501640..0x00501675`): the mode's vt+4 (Cooperative only)
+/// or Rules `AlliesAllowed=`, and no computer slot with a team, which
+/// `Create_Houses` records (`0x006881F5..0x00688209`).
 #[test]
 fn computer_paranoid_needs_allies_allowed_and_no_computer_team() {
     let mut rules = rules();
@@ -137,31 +137,35 @@ fn computer_paranoid_needs_allies_allowed_and_no_computer_team() {
     ];
     let (mut sim, ids) = sim_with(&rules, &houses);
     paranoid(&mut sim, &rules);
-    assert!(sim.house_alliances.is_empty());
-    assert!(sim.houses[&ids[1]].grudge_scores.is_empty());
+    assert!(sim.house_alliances.as_map().is_empty());
+    assert!(sim.houses[&ids[1]].grudge_scores().is_empty());
 
     use crate::sim::scenario_bootstrap::{NormalizedSkirmishSlot, populate_launch_houses};
     use crate::skirmish_launch::{LaunchCountry, LaunchStartPosition, LaunchTeam};
     let rules = self::rules();
     let slot = |name: &str, human, team| NormalizedSkirmishSlot {
         owner_name: name.to_string(),
-        country: if human {
-            LaunchCountry::America
-        } else {
-            LaunchCountry::Russia
-        },
+        // Indices in this fixture's [Countries]: Americans 0, Russians 1.
+        country: LaunchCountry::from_country_index(if human { 0 } else { 1 }),
         color_index: 0,
         start_position: LaunchStartPosition::Auto,
         team,
         is_human: human,
+        observer: false,
+        controllers: Vec::new(),
+        handle: None,
         difficulty: crate::sim::house_state::HouseDifficulty::Normal,
+        super_tier: None,
+        commander: None,
     };
     for (human_team, computer_team, paranoid_runs) in [
         (LaunchTeam::Team(0), LaunchTeam::None, true),
         (LaunchTeam::None, LaunchTeam::Team(1), false),
     ] {
         let mut sim = Simulation::with_seed(9);
-        sim.session.game_mode_nonzero = true;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
         populate_launch_houses(
             &mut sim,
             &[
@@ -177,6 +181,42 @@ fn computer_paranoid_needs_allies_allowed_and_no_computer_team() {
             allies(&sim, "Computer1") == set(&["Computer2"]),
             paranoid_runs,
             "human team {human_team:?}, computer team {computer_team:?}"
+        );
+    }
+}
+
+/// Cooperative's vt+4 (`0x005C4EE0`) answers true, so its computers turn
+/// paranoid although retail MPCoopMD sets `AlliesAllowed=no` (`0x00501659`);
+/// FreeForAll's (`0x005C0E30`) answers false, like every other mode's.
+#[test]
+fn cooperative_computers_turn_paranoid_without_allies_allowed() {
+    use crate::skirmish_modes::MpModeClass;
+    let mut rules = rules();
+    rules.general.allies_allowed = false;
+    for (mode, paranoid_runs) in [
+        (MpModeClass::Cooperative, true),
+        (MpModeClass::FreeForAll, false),
+    ] {
+        let (mut sim, ids) = sim_with(
+            &rules,
+            &[
+                ("Player", "Americans", true),
+                ("Computer1", "Russians", false),
+                ("Computer2", "Russians", false),
+            ],
+        );
+        sim.session
+            .install_multiplayer_house_identity(mode, Vec::new());
+        paranoid(&mut sim, &rules);
+        assert_eq!(
+            allies(&sim, "Computer1") == set(&["Computer2"]),
+            paranoid_runs,
+            "{mode:?}"
+        );
+        assert_eq!(
+            !sim.houses[&ids[1]].grudge_scores().is_empty(),
+            paranoid_runs,
+            "{mode:?}"
         );
     }
 }
@@ -244,31 +284,123 @@ fn ally_writes_reach_the_remembered_reveal_viewers() {
     );
     for &id in &ids {
         sim.fog
-            .by_owner
+            .by_owner_mut_for_test()
             .get_or_insert_with(id, || crate::sim::vision::OwnerVisibility::new(8, 8));
     }
     let config = crate::sim::vision::VisionConfig::default();
     let viewers = |sim: &mut Simulation| {
+        // Every house stands for a client map here: the answers' memory, not
+        // the client set, is under test.
         let direct = sim.reveal_viewers.direct(
-            &sim.fog,
-            &sim.house_alliances,
+            sim.house_alliances.as_map(),
             ids[1],
             &config,
             &sim.interner,
+            &ids,
         );
         let allied =
             sim.reveal_viewers
-                .allied(&sim.fog, &sim.house_alliances, ids[1], &sim.interner);
+                .allied(sim.house_alliances.as_map(), ids[1], &sim.interner, &ids);
         (direct.to_vec(), allied.to_vec())
     };
     let (alone, with_ally) = (vec![ids[1]], vec![ids[1], ids[2]]);
-    sim.reveal_viewers.begin();
+    let clients = sim.fog_viewers();
+    sim.reveal_viewers.begin(clients);
     assert_eq!(viewers(&mut sim), (alone.clone(), alone.clone()));
-    sim.make_ally(ids[1], ids[2], &rules, None, FrameEffects::default());
+    sim.make_ally(ids[1], ids[2], &rules, None, FrameEffects::default(), false);
     assert_eq!(viewers(&mut sim), (with_ally.clone(), with_ally));
-    sim.make_enemy(ids[1], ids[2], &rules);
+    sim.make_enemy(ids[1], ids[2], &rules, None, FrameEffects::default(), false);
     assert_eq!(viewers(&mut sim), (alone.clone(), alone));
     sim.reveal_viewers.end();
+}
+
+/// The ally matrix answers as the graph does by name (`is_allied_with`),
+/// one way, through MakeAlly and MakeEnemy, which write it in place.
+/// Computer1's mask also holds Late, whose id is interned after the matrix
+/// is built, so the graph answers for it by name.
+#[test]
+fn ally_matrix_answers_as_the_graph_through_ally_writes() {
+    let rules = rules();
+    let (mut sim, mut ids) = sim_with(
+        &rules,
+        &[
+            ("Player", "Americans", true),
+            ("Computer1", "Russians", false),
+            ("Computer2", "Russians", false),
+        ],
+    );
+    let one_way = HouseAllianceMap::from([("COMPUTER1".to_string(), set(&["Computer2", "Late"]))]);
+    sim.install_house_alliances(
+        crate::sim::house_diplomacy::HouseAllianceAdmission::Admitted(one_way),
+        &rules,
+    );
+    let agree = |sim: &Simulation, ids: &[InternedId]| {
+        let alliances = &sim.house_alliances;
+        for &other in ids {
+            let allied_to = alliances.allied_to(&sim.interner, other);
+            for &asker in ids {
+                let by_name = crate::map::houses::is_allied_with(
+                    alliances.as_map(),
+                    sim.interner.resolve(asker),
+                    sim.interner.resolve(other),
+                );
+                assert_eq!(alliances.is_allied(&sim.interner, asker, other), by_name);
+                assert_eq!(allied_to(asker), by_name);
+            }
+        }
+    };
+    let allied =
+        |sim: &Simulation, asker, other| sim.house_alliances.is_allied(&sim.interner, asker, other);
+    let (first, second) = (ids[1], ids[2]);
+    assert!(
+        sim.house_alliances.matrix(&sim.interner).is_some(),
+        "the sim's own interner reads the matrix"
+    );
+    agree(&sim, &ids);
+    assert!(allied(&sim, first, second) && !allied(&sim, second, first));
+    let late = sim.interner.intern("Late");
+    ids.push(late);
+    agree(&sim, &ids);
+    assert!(allied(&sim, first, late));
+
+    sim.make_ally(second, first, &rules, None, FrameEffects::default(), false);
+    assert!(
+        sim.house_alliances
+            .matrix
+            .get()
+            .is_some_and(Option::is_some),
+        "a write between two rows keeps the matrix"
+    );
+    agree(&sim, &ids);
+    assert!(allied(&sim, second, first));
+    sim.make_enemy(first, second, &rules, None, FrameEffects::default(), false);
+    agree(&sim, &ids);
+    assert!(!allied(&sim, first, second) && !allied(&sim, second, first));
+    assert!(allied(&sim, first, late));
+}
+
+/// A house the headless scenario adds after the load gets a matrix row, as
+/// a launch's houses do, instead of every question about it going to the
+/// graph by name: the load has already built the matrix.
+#[test]
+fn a_house_added_after_the_load_gets_a_matrix_row() {
+    let Some((retail, _)) = crate::rules::retail_ini_fixture::retail_assets() else {
+        return;
+    };
+    let mut scene = crate::headless_scenario::load(&retail, "XMP03T4.MAP", 0x1269)
+        .expect("physical AnyTown Battle scenario");
+    let has_row = |sim: &Simulation, id| {
+        let matrix = sim.house_alliances.matrix(&sim.interner);
+        matrix.is_some_and(|matrix| matrix.row(id).is_some())
+    };
+    let local = scene.sim().session.current_house().expect("local house");
+    assert!(has_row(scene.sim(), local));
+    assert!(
+        scene.sim().interner.get("Late").is_none(),
+        "a name the load never interned"
+    );
+    let late = scene.add_human_house("Late", crate::skirmish_launch::LaunchCountry::Yuri);
+    assert!(has_row(scene.sim(), late));
 }
 
 /// MakeEnemy adds the anger first (`0x004F9FDD`), while the house is still
@@ -294,16 +426,16 @@ fn make_enemy_angers_before_it_breaks_both_sides() {
         &rules,
     );
     let (first, second) = (ids[1], ids[2]);
-    sim.make_enemy(first, second, &rules);
+    sim.make_enemy(first, second, &rules, None, FrameEffects::default(), false);
     assert_eq!(allies(&sim, "Computer1"), set(&[]));
     assert_eq!(allies(&sim, "Computer2"), set(&[]));
-    assert_eq!(sim.houses[&first].grudge_scores.get(&second), Some(&1));
-    assert_eq!(sim.houses[&first].enemy_house, None);
-    assert!(sim.houses[&second].grudge_scores.is_empty());
+    assert_eq!(sim.houses[&first].grudge_scores().get(&second), Some(&1));
+    assert_eq!(sim.houses[&first].enemy_house(), None);
+    assert!(sim.houses[&second].grudge_scores().is_empty());
 
-    sim.make_enemy(first, second, &rules);
-    assert_eq!(sim.houses[&first].grudge_scores.get(&second), Some(&2));
-    assert_eq!(sim.houses[&first].enemy_house, Some(second));
+    sim.make_enemy(first, second, &rules, None, FrameEffects::default(), false);
+    assert_eq!(sim.houses[&first].grudge_scores().get(&second), Some(&2));
+    assert_eq!(sim.houses[&first].enemy_house(), Some(second));
 }
 
 /// TAction30's 0x0050C210 can call ComputerParanoid before clearing placement
@@ -348,7 +480,164 @@ fn initial_scope_allies_keep_targets_and_can_ally_without_a_remaining_enemy() {
             .target(),
         Some(TargetKind::Entity(second))
     );
-    sim.with_object_placement_scope(|sim| sim.make_enemy(ids[0], ids[1], &rules));
+    sim.with_object_placement_scope(|sim| {
+        sim.make_enemy(ids[0], ids[1], &rules, None, FrameEffects::default(), false)
+    });
     assert!(allies(&sim, "Computer1").is_empty());
     assert!(allies(&sim, "Computer2").is_empty());
+}
+
+/// The ALLY event (`EventClass::Execute 0x004C6DEE`) toggles on the sender's
+/// mask with the announcement: MakeAlly sets one side, the reply makes it
+/// mutual, and a second toggle breaks both. Every step is a human line; the
+/// voice follows the local House (`0x004F9E01..0x004F9F35`,
+/// `0x004FA186..0x004FA1D5`).
+#[test]
+fn the_ally_event_toggles_and_announces_for_the_local_house() {
+    use crate::sim::world::{AllianceEva, SimSoundEvent};
+    let rules = rules();
+    let (mut sim, ids) = sim_with(
+        &rules,
+        &[
+            ("A", "Americans", true),
+            ("B", "Russians", true),
+            ("C", "Russians", true),
+        ],
+    );
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Lan);
+    let announced = |sim: &mut Simulation, local: usize, sender: &str, index: i32| {
+        sim.session.set_current_house_for_test(Some(ids[local]));
+        sim.sound_events.clear_for_test();
+        assert!(sim.apply_command(
+            sender,
+            &crate::sim::command::Command::Ally { house_index: index },
+            Some(&rules),
+        ));
+        sim.sound_events
+            .iter()
+            .filter_map(|event| match event {
+                SimSoundEvent::AllianceChanged {
+                    owner,
+                    other,
+                    formed,
+                    line,
+                    eva,
+                } => Some((*owner, *other, *formed, *line, *eva)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = (ids[0], ids[1]);
+    assert_eq!(
+        announced(&mut sim, 0, "A", 1),
+        [(a, b, true, true, Some(AllianceEva::Requesting))]
+    );
+    assert_eq!(allies(&sim, "A"), set(&["B"]));
+    assert_eq!(allies(&sim, "B"), set(&[]));
+    // C, a third party, hears the mutual alliance as an enemy one.
+    assert_eq!(
+        announced(&mut sim, 2, "B", 0),
+        [(b, a, true, true, Some(AllianceEva::EnemyFormed))]
+    );
+    assert_eq!(allies(&sim, "B"), set(&["A"]));
+    assert_eq!(
+        announced(&mut sim, 1, "A", 1),
+        [(a, b, false, true, Some(AllianceEva::Broken))],
+        "breaking clears both sides"
+    );
+    assert_eq!(allies(&sim, "A"), set(&[]));
+    assert_eq!(allies(&sim, "B"), set(&[]));
+    // Asked by B, A hears the request; a mutual reply is Formed for A.
+    assert_eq!(
+        announced(&mut sim, 0, "B", 0),
+        [(b, a, true, true, Some(AllianceEva::Requested))]
+    );
+    assert_eq!(
+        announced(&mut sim, 0, "A", 1),
+        [(a, b, true, true, Some(AllianceEva::Formed))]
+    );
+}
+
+/// Without the announcement (Paranoid, triggers) a human sender still gets
+/// the line and no voice; a computer sender gets neither.
+#[test]
+fn only_a_human_sender_prints_the_alliance_line() {
+    use crate::sim::world::SimSoundEvent;
+    let rules = rules();
+    let (mut sim, ids) = sim_with(
+        &rules,
+        &[
+            ("Player", "Americans", true),
+            ("Computer1", "Russians", false),
+            ("Computer2", "Russians", false),
+        ],
+    );
+    sim.session.set_current_house_for_test(Some(ids[0]));
+    sim.make_ally(ids[0], ids[1], &rules, None, FrameEffects::default(), false);
+    sim.make_ally(ids[1], ids[2], &rules, None, FrameEffects::default(), false);
+    let lines: Vec<_> = sim
+        .sound_events
+        .iter()
+        .filter_map(|event| match event {
+            SimSoundEvent::AllianceChanged {
+                owner, line, eva, ..
+            } => Some((*owner, *line, *eva)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lines, [(ids[0], true, None)]);
+}
+
+#[test]
+fn squad_alliances_ally_each_clan_list_and_fix_the_alliances() {
+    // Apply_Squad_Alliances 0x0069B170: GameMode 4, both lists nonempty;
+    // each entry gathers the human Houses whose +0x15FF4 matches it under
+    // _stricmp, every pair in a list allies, and FixedAlliance is set.
+    let rules = rules();
+    let (mut sim, ids) = sim_with(
+        &rules,
+        &[
+            ("A", "Americans", true),
+            ("B", "Russians", true),
+            ("C", "Americans", true),
+            ("D", "Russians", true),
+            ("E", "Americans", false),
+        ],
+    );
+    for (id, name) in ids.iter().zip(["Ann", "Bob", "Cid", "Dee", "Ann"]) {
+        sim.houses
+            .get_mut(id)
+            .unwrap()
+            .initialize_scenario_name(name);
+    }
+    sim.session.install_wol_start(
+        2,
+        [
+            vec!["ann".into(), "CID".into()],
+            vec!["Bob".into(), "Dee".into()],
+        ],
+    );
+    // Outside GameMode 4 nothing happens.
+    sim.apply_squad_alliances(&rules, None);
+    assert!(allies(&sim, "A").is_empty() && !sim.session.fixed_alliance());
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Wol);
+    sim.apply_squad_alliances(&rules, None);
+    assert_eq!(allies(&sim, "A"), set(&["C"]));
+    assert_eq!(allies(&sim, "C"), set(&["A"]));
+    assert_eq!(allies(&sim, "B"), set(&["D"]));
+    // The computer named like a list entry is not human.
+    assert!(allies(&sim, "E").is_empty());
+    assert!(sim.session.fixed_alliance() && sim.session.wol_tournament_game());
+
+    // One empty list: the flag is cleared and nobody allies.
+    let (mut sim, _) = sim_with(&rules, &[("A", "Americans", true)]);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Wol);
+    sim.session.set_fixed_alliance(true);
+    sim.session
+        .install_wol_start(2, [vec!["Ann".into()], Vec::new()]);
+    sim.apply_squad_alliances(&rules, None);
+    assert!(!sim.session.fixed_alliance());
 }

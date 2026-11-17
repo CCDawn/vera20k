@@ -150,9 +150,13 @@ fn crew_scene(input: &Value) -> (SlaveScene, Vec<u64>) {
     let rules = &s.scene.rules;
     let sim = &mut s.scene.sim;
     let owner = sim.substrate.entities.get(refinery).unwrap().owner();
-    sim.houses.get_mut(&owner).unwrap().side_index = input["side"].as_u64().unwrap() as u8;
+    sim.houses
+        .get_mut(&owner)
+        .unwrap()
+        .set_side_index_for_test(input["side"].as_i64().unwrap() as i32);
     let building = sim.substrate.entities.get_mut(refinery).unwrap();
     building
+        .building
         .has_been_captured
         .set_for_test(input["captured"] == true);
     building
@@ -195,7 +199,7 @@ fn crew_scene(input: &Value) -> (SlaveScene, Vec<u64>) {
     assert!(building.building_down(), "the sale commenced");
     building.mission.set_handler_state(1);
     sim.scenario_rng = SimRng::new(seed);
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     (s, passengers)
 }
 
@@ -239,6 +243,10 @@ fn compare_infantry(s: &SlaveScene, id: u64, expected: &Value, context: &str) {
 /// Sell's stage 1 (`0x0044A2EE..0x0044A8DE`) on each row's building.
 #[test]
 fn sale_stage_one_matches_the_original_survivors_and_sounds() {
+    // Stock oracle; Ares replaces Building and Techno GetCrew (44EB10, 707D20).
+    if crate::rules::ares_switch::ares_way() {
+        return;
+    }
     let corpus = corpus();
     let rows: Vec<&Value> = corpus["crew"]
         .as_array()
@@ -260,14 +268,14 @@ fn replay_crew_row(row: &Value) {
     let rules = &s.scene.rules;
     let sim = &mut s.scene.sim;
     assert_eq!(
-        i64::from(sim.building_survivor_count(rules, refinery, false)),
+        i64::from(sim.building_survivor_count(rules, refinery)),
         row["survivors"].as_i64().unwrap(),
         "{context}: How_Many_Survivors"
     );
     let before = sim.substrate.entities.keys_sorted();
     production::sell_stage_one(
         sim,
-        Some(rules),
+        rules,
         Some(super::harvest_field_oracle_tests::registry()),
         refinery,
         crate::sim::world::FrameEffects::default(),
@@ -387,8 +395,8 @@ fn sale_refund_matches_the_original() {
         .unwrap();
         let owner = crate::sim::intern::test_intern("Americans");
         let mut house = HouseState::new(owner, 0, None, true, 0, 10);
-        house.is_human = input["human"].as_bool().unwrap();
-        house.player_control = input["player_control"] == true;
+        house.set_is_human_for_test(input["human"].as_bool().unwrap());
+        house.set_player_control_for_test(input["player_control"] == true);
         let game_mode_nonzero = input["game_mode"].as_u64().unwrap() != 0;
         assert_eq!(
             i64::from(production::type_refund(
@@ -450,7 +458,7 @@ fn sales_through_the_frame_visit_on_the_original_frames() {
         };
         let sale_order = crate::sim::command::CommandEnvelope::new(
             s.sim.substrate.entities.get(building).unwrap().owner(),
-            s.sim.session.tick + 1,
+            s.sim.session.tick() + 1,
             crate::sim::command::Command::SellBuilding {
                 entity_id: building,
             },
@@ -515,10 +523,6 @@ fn sales_through_the_frame_visit_on_the_original_frames() {
     assert_eq!(compared, 8);
 }
 
-/// `ai_sale` rows VERA cannot express: an AttachedTag (`+0x34`; VERA has no
-/// per-object tags).
-const AI_SALE_SKIPPED: &[&str] = &["s_tagged"];
-
 /// The computer's low-credit sale (`production::update_repair_and_power`,
 /// whose sale arm runs before its repair step) against the `ai_sale` rows,
 /// for one building of a computer house: the Scenario RNG cursors before and
@@ -541,9 +545,6 @@ fn the_computers_low_credit_sale_matches_the_original_admission() {
     for row in corpus()["ai_sale"].as_array().unwrap() {
         let input = &row["input"];
         let name = input["name"].as_str().unwrap();
-        if AI_SALE_SKIPPED.contains(&name) {
-            continue;
-        }
         let int = |key: &str| input[key].as_i64().unwrap() as i32;
         let flag = |key: &str| if input[key] == true { "yes" } else { "no" };
         let mut text = format!(
@@ -573,12 +574,16 @@ fn the_computers_low_credit_sale_matches_the_original_admission() {
             RuleSet::from_ini_with_fixed_art_for_test(&IniFile::from_str(&text), &art).unwrap();
         rules.set_buildup_control_for_test("YAREFN", [0, 25, 2]);
         let mut sim = crate::sim::world::Simulation::new();
-        sim.session.game_mode_nonzero = int("game_mode") != 0;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+                int("game_mode") != 0,
+            ),
+        );
         let owner = sim.interner.intern("AI");
         let mut house = HouseState::new(owner, 0, None, false, int("balance"), int("tech_level"));
-        house.current_iq = int("current_iq");
-        house.authored_iq = int("authored_iq");
-        sim.houses.insert(owner, house);
+        house.set_current_iq_for_test(int("current_iq"));
+        house.set_authored_iq_for_test(int("authored_iq"));
+        sim.houses.register(house);
         let kind = sim.interner.intern("YAREFN");
         let mut building = GameEntity::new_at_frame_zero_for_test(
             1,
@@ -606,9 +611,9 @@ fn the_computers_low_credit_sale_matches_the_original_admission() {
             building.install_building_up(
                 crate::sim::components::BuildingUp::completing_in_ticks(
                     2,
-                    sim.session.binary_frame as i32,
+                    sim.session.binary_frame() as i32,
                 ),
-                sim.session.binary_frame as i32,
+                sim.session.binary_frame() as i32,
             );
         }
         building.mission.apply_test_fixture(MissionTestFixture {
@@ -624,6 +629,30 @@ fn the_computers_low_credit_sale_matches_the_original_admission() {
         let selling_before = building.mission.effective().known() == Some(MissionType::Selling);
         sim.substrate.entities.insert(building);
         sim.add_entity_occupancy(1);
+        if input["tag"] == true {
+            // The native row supplies nonnull Object+34. Construct its
+            // attachment through the existing map/Tag owner, including a
+            // disabled Trigger:4507D7 tests only the raw pointer presence.
+            let map = crate::map::map_file::MapFile::from_bytes(
+                b"[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
+                  [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n\
+                  [Basic]\nNewINIFormat=4\n\
+                  [Triggers]\nSALE_KEEP=AI,<none>,keep,1,1,1,1,0\n\
+                  [Tags]\nSALE_KEEP_TAG=2,keep,SALE_KEEP\n\
+                  [Events]\nSALE_KEEP=1,0,0,0\n\
+                  [Actions]\nSALE_KEEP=1,0,0,0,0,0,0,0,A\n",
+            )
+            .unwrap();
+            sim.initialize_trigger_definitions(
+                &map,
+                &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
+                None,
+                None,
+                None,
+            );
+            sim.attach_object_trigger_tag(1, Some("SALE_KEEP_TAG"));
+            assert!(sim.object_has_trigger_tag(1), "{name}: actual attachment");
+        }
         sim.scenario_rng = SimRng::new(input["seed"].as_u64().unwrap_or(1));
         let cursors = |sim: &crate::sim::world::Simulation| {
             let view = sim.scenario_rng.logical_view();
@@ -662,5 +691,5 @@ fn the_computers_low_credit_sale_matches_the_original_admission() {
         );
         compared += 1;
     }
-    assert_eq!(compared, 25);
+    assert_eq!(compared, 26);
 }

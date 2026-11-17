@@ -4,13 +4,17 @@
 //! network checksum is a narrow 32-bit diagnostic fold over class arrays,
 //! display-layer order, LogicClass order, and one Scenario RNG sample. Computing
 //! it also consumes one additional Scenario RNG sample for the native diagnostic
-//! snapshot path.
+//! snapshot path. The frame checksum clients exchange appends VERA-only money,
+//! health and trigger terms to it
+//! ([`Simulation::compute_multiplayer_frame_checksum`]).
+
+use std::collections::BTreeMap;
 
 use crate::map::entities::EntityCategory;
 use crate::sim::game_entity::GameEntity;
+use crate::sim::particles::Particle;
 use crate::sim::world::Simulation;
 use crate::util::direction_tables::round_facing16_to_8;
-use crate::util::native_x87::{NativeF32Bits, X87Chop53};
 
 const RTTI_UNIT: i32 = 1;
 const RTTI_AIRCRAFT: i32 = 2;
@@ -18,16 +22,18 @@ const RTTI_ANIM: i32 = 4;
 const RTTI_BUILDING: i32 = 6;
 const RTTI_BULLET: i32 = 8;
 const RTTI_INFANTRY: i32 = 0x0f;
+/// `ParticleClass` WhatAmI: vtable `0x007EF954` +0x2c is `0x0062D980`
+/// (`MOV EAX, 0x16; RET`).
+const RTTI_PARTICLE: i32 = 0x16;
 const RTTI_PARTICLE_SYSTEM: i32 = 0x18;
 const RTTI_TERRAIN: i32 = 0x24;
 /// `VoxelAnimClass` WhatAmI: vtable `0x007F6318` +0x2c is `0x0074AB20`
 /// (`MOV EAX, 0x29; RET`).
 const RTTI_VOXEL_ANIM: i32 = 0x29;
 const RTTI_WAVE: i32 = 0x240;
-const SYNC_EXEMPT_ANIM_ID: i32 = -2;
-const LEPTONS_PER_CELL: i32 = crate::util::lepton::LEPTONS_PER_CELL_I32;
-const CELL_CENTER_LEPTON: i32 = crate::util::lepton::CELL_CENTER_LEPTON_I32;
-const WAVE_EXTENDED_ENDPOINT_SCALE: NativeF32Bits = NativeF32Bits::from_bits(0x3f86_6666);
+/// The id a LAN or online MoveFlash takes (`FootClass::ClickedAction_Cell`,
+/// `0x004D7F42`), which `0x0064DAB0` skips with its Anim RTTI.
+pub(crate) const SYNC_EXEMPT_ANIM_ID: i32 = -2;
 
 /// One ObjectClass entry as seen by a display-layer checksum pass.
 ///
@@ -158,37 +164,12 @@ fn coordinate_term(world_x: i32, world_y: i32) -> u32 {
 }
 
 #[inline]
-fn terrain_world_xy(rx: u16, ry: u16) -> (i32, i32) {
-    // gamemd-derived: `TerrainClass__Constructor @ 0x0071BB90` converts the
-    // map cell passed to Unlimbo to `(cell * 0x100) + 0x80` on both axes.
-    (
-        i32::from(rx) * LEPTONS_PER_CELL + CELL_CENTER_LEPTON,
-        i32::from(ry) * LEPTONS_PER_CELL + CELL_CENTER_LEPTON,
-    )
-}
-
-#[inline]
-fn wave_object_axis(source: i32, target: i32, wave_type: u8) -> Option<i32> {
-    let scale = match wave_type {
-        0 | 3 => return Some(source),
-        1 | 2 => X87Chop53::load_f32(WAVE_EXTENDED_ENDPOINT_SCALE).ok()?,
-        _ => return None,
-    };
-    let complement = X87Chop53::sub(X87Chop53::load_f32(NativeF32Bits::ONE).ok()?, scale);
-    let source_term = X87Chop53::mul(X87Chop53::load_i32(source), scale);
-    let target_term = X87Chop53::mul(X87Chop53::load_i32(target), complement);
-    i32::try_from(X87Chop53::ftol_i64(X87Chop53::add(source_term, target_term)).ok()?).ok()
-}
-
-#[inline]
 fn wave_world_xy(wave: &crate::sim::wave::Wave) -> Option<(i32, i32)> {
     // gamemd-derived: `WaveClass__Constructor @ 0x0075E950` Reveals at the
-    // coordinate produced by `0x00761640/0x00762070`: source for types 0/3,
-    // and ftol(source*1.05f + target*(1-1.05f)) for types 1/2.
-    Some((
-        wave_object_axis(wave.source.x, wave.target.x, wave.wave_type)?,
-        wave_object_axis(wave.source.y, wave.target.y, wave.wave_type)?,
-    ))
+    // coordinate produced by `0x00761640/0x00762070`, SourceCoords (+0xB4),
+    // which `sim::wave` holds as `source` with the laser types' 1.05 endpoint
+    // push already applied.
+    (wave.wave_type() <= 3).then_some((wave.source().x, wave.source().y))
 }
 
 #[inline]
@@ -239,61 +220,114 @@ impl Simulation {
         })
     }
 
+    /// The checksum a multiplayer frame stores and its FRAMEINFO carries:
+    /// the retail fold ([`Self::compute_retail_multiplayer_checksum`]) and
+    /// its two Scenario samples, then VERA's own coverage terms, folded
+    /// the same way after the retail ones.
+    ///
+    /// VERA-only: `0x0064DAB0` folds no money, health or trigger state, so
+    /// retail sees such a divergence only once it moves an object or shifts
+    /// the Scenario RNG. Native folds them only in the per-class CRC bodies
+    /// (AbstractClass vt+0x34): `HouseClass::ComputeCRC @ 0x00502D60`
+    /// (Balance), `ObjectClass::ComputeCRC @ 0x005F6250` (Health `+0x6C`)
+    /// and `TriggerClass::ComputeCRC @ 0x00726790`, whose aggregate
+    /// `0x0067C6E0` has no static reference. Matches are VERA-to-VERA, so every
+    /// client folds these alike: each House's balance in registration
+    /// order, each Techno's health in stable-ID order (one pass, beside the
+    /// retail fold's three), then
+    /// [`TriggerRuntime::fold_match_checksum`](crate::sim::trigger_runtime::TriggerRuntime::fold_match_checksum).
+    /// A world without Houses, Technos, triggers or set variables folds
+    /// nothing more.
+    pub(crate) fn compute_multiplayer_frame_checksum(
+        &mut self,
+    ) -> Result<MultiplayerChecksumFrame, MultiplayerChecksumError> {
+        let frame = self.compute_retail_multiplayer_checksum()?;
+        let mut checksum = RetailChecksumAccumulator { value: frame.value };
+        for house in self.houses.in_order() {
+            checksum.fold_value(house.economy().credits() as u32);
+        }
+        for entity in self.substrate.entities.values_sorted() {
+            checksum.fold_value(entity.health.current() as u32);
+        }
+        self.trigger_runtime
+            .fold_match_checksum(self.session.binary_frame() as i32, &mut checksum);
+        Ok(MultiplayerChecksumFrame {
+            value: checksum.value(),
+            ..frame
+        })
+    }
+
     /// Every fold before the Scenario sample, in native order.
     fn fold_checksum_objects(&self) -> Result<RetailChecksumAccumulator, MultiplayerChecksumError> {
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         let mut checksum = RetailChecksumAccumulator::new();
 
         // Native class-array order is constructor/registration order. Stable
         // object IDs are monotonic construction IDs, so filtering the ordered
         // store preserves each class array's order without a second registry.
-        for entity in self.substrate.entities.values_sorted() {
-            if entity.category() == EntityCategory::Infantry {
-                let [x, y] = crate::sim::movement::ground_pose::position_world_xy(&entity.position);
-                checksum.fold_infantry(x, y, entity.body_facing_current(frame));
-            }
+        // Each walk picks its class from the store's category column and loads
+        // only that class's records, as native walks only that class's array.
+        for entity in self
+            .substrate
+            .entities
+            .values_of_category(EntityCategory::Infantry)
+        {
+            let [x, y] = crate::sim::movement::ground_pose::position_world_xy(&entity.position);
+            checksum.fold_infantry(x, y, entity.body_facing_current(frame));
         }
-        for entity in self.substrate.entities.values_sorted() {
-            if entity.category() == EntityCategory::Unit {
-                let [x, y] = crate::sim::movement::ground_pose::position_world_xy(&entity.position);
-                checksum.fold_unit(
-                    x,
-                    y,
-                    entity.body_facing_current(frame),
-                    secondary_facing(entity, frame),
-                );
-            }
+        for entity in self
+            .substrate
+            .entities
+            .values_of_category(EntityCategory::Unit)
+        {
+            let [x, y] = crate::sim::movement::ground_pose::position_world_xy(&entity.position);
+            checksum.fold_unit(
+                x,
+                y,
+                entity.body_facing_current(frame),
+                secondary_facing(entity, frame),
+            );
         }
-        for entity in self.substrate.entities.values_sorted() {
-            if entity.category() == EntityCategory::Structure {
-                let [x, y] = crate::sim::movement::ground_pose::position_world_xy(&entity.position);
-                checksum.fold_building(x, y, entity.body_facing_current(frame));
-            }
+        for entity in self
+            .substrate
+            .entities
+            .values_of_category(EntityCategory::Structure)
+        {
+            let [x, y] = crate::sim::movement::ground_pose::position_world_xy(&entity.position);
+            checksum.fold_building(x, y, entity.body_facing_current(frame));
         }
 
-        if self.session.house_order.len() != self.houses.len() {
+        if self.houses.order().len() != self.houses.len() {
             return Err(MultiplayerChecksumError::HouseOrderCoverage {
-                registered: self.session.house_order.len(),
+                registered: self.houses.order().len(),
                 stored: self.houses.len(),
             });
         }
-        for (index, owner) in self.session.house_order.iter().copied().enumerate() {
-            if self.session.house_order[..index].contains(&owner) {
+        for (index, owner) in self.houses.order().iter().copied().enumerate() {
+            if self.houses.order()[..index].contains(&owner) {
                 return Err(MultiplayerChecksumError::DuplicateHouse(owner));
             }
             let house = self
                 .houses
                 .get(&owner)
                 .ok_or(MultiplayerChecksumError::MissingHouse(owner))?;
-            checksum.fold_house(u8::from(house.map_is_clear));
+            checksum.fold_house(u8::from(house.map_is_clear()));
         }
 
+        // Finding a particle walks the systems, so index them once here
+        // rather than once per Air-layer entry.
+        let particles: BTreeMap<u64, &Particle> = self
+            .substrate
+            .particle_systems
+            .all_particles()
+            .map(|particle| (particle.stable_id(), particle))
+            .collect();
         // Layers 0..4 in index order, each in its stored member order.
         for &stable_id in self.display_layers().ordered_ids() {
-            checksum.fold_object(self.checksum_object(stable_id)?);
+            checksum.fold_object(self.checksum_object(stable_id, &particles)?);
         }
         for &stable_id in self.substrate.logic.as_slice() {
-            checksum.fold_object(self.checksum_object(stable_id)?);
+            checksum.fold_object(self.checksum_object(stable_id, &particles)?);
         }
         Ok(checksum)
     }
@@ -302,10 +336,22 @@ impl Simulation {
     ///
     /// gamemd-derived: `0x0064DAB0` reads ObjectClass +0x9c/+0xa0 directly
     /// and folds the full virtual WhatAmI value (vt+0x2c).
-    fn checksum_object(&self, stable_id: u64) -> Result<ChecksumObject, MultiplayerChecksumError> {
+    /// `particles` indexes every particle by ID ([`Self::fold_checksum_objects`]).
+    fn checksum_object(
+        &self,
+        stable_id: u64,
+        particles: &BTreeMap<u64, &Particle>,
+    ) -> Result<ChecksumObject, MultiplayerChecksumError> {
         use crate::sim::world::ObjectKind;
         let missing = MultiplayerChecksumError::MissingObject(stable_id);
-        let object = match self.classify_object(stable_id).ok_or(missing)? {
+        // IDs are unique across stores, so the index answers for a particle
+        // without `classify_object`'s walk.
+        let kind = if particles.contains_key(&stable_id) {
+            Some(ObjectKind::Particle)
+        } else {
+            self.classify_object(stable_id)
+        };
+        let object = match kind.ok_or(missing)? {
             ObjectKind::Entity => {
                 let entity = self.substrate.entities.get(stable_id).ok_or(missing)?;
                 let [world_x, world_y] =
@@ -315,10 +361,10 @@ impl Simulation {
             ObjectKind::Anim => {
                 let anim = self.substrate.anims.get(stable_id).ok_or(missing)?;
                 ChecksumObject::new(
-                    anim.world_coord.x,
-                    anim.world_coord.y,
+                    anim.world_coord().x,
+                    anim.world_coord().y,
                     RTTI_ANIM,
-                    anim.native_unique_id,
+                    anim.native_unique_id(),
                 )
             }
             ObjectKind::Spotlight => {
@@ -339,27 +385,45 @@ impl Simulation {
                     .particle_systems
                     .get(stable_id)
                     .ok_or(missing)?;
-                ChecksumObject::new(system.coords.x, system.coords.y, RTTI_PARTICLE_SYSTEM, 0)
+                ChecksumObject::new(
+                    system.coords().x,
+                    system.coords().y,
+                    RTTI_PARTICLE_SYSTEM,
+                    0,
+                )
+            }
+            // The Display Air layer holds each particle (`reveal_particle`).
+            // Its Location (`+0x9C`, read by Move at `0x0062D2B3`) is `coords`.
+            ObjectKind::Particle => {
+                let particle = particles.get(&stable_id).ok_or(missing)?;
+                ChecksumObject::new(particle.coords().x, particle.coords().y, RTTI_PARTICLE, 0)
             }
             ObjectKind::Terrain => {
                 let terrain = self
-                    .production
                     .terrain_objects
+                    .objects()
                     .get(&stable_id)
                     .ok_or(missing)?;
-                let (world_x, world_y) = terrain_world_xy(terrain.rx, terrain.ry);
-                ChecksumObject::new(world_x, world_y, RTTI_TERRAIN, 0)
+                // Compute_Game_Sync_Checksum64DD1B..64DD5D reads retained
+                // Object Location, not the packed cell or a recentered alias.
+                let coord = terrain.world_coord();
+                ChecksumObject::new(coord.x, coord.y, RTTI_TERRAIN, 0)
             }
             ObjectKind::Projectile => {
                 let projectile = self.projectiles.get(stable_id).ok_or(missing)?;
-                ChecksumObject::new(projectile.position.x, projectile.position.y, RTTI_BULLET, 0)
+                ChecksumObject::new(
+                    projectile.position().x,
+                    projectile.position().y,
+                    RTTI_BULLET,
+                    0,
+                )
             }
             ObjectKind::Wave => {
                 let wave = self.waves.get(stable_id).ok_or(missing)?;
                 let (world_x, world_y) =
                     wave_world_xy(wave).ok_or(MultiplayerChecksumError::InvalidWaveType {
                         id: stable_id,
-                        wave_type: wave.wave_type,
+                        wave_type: wave.wave_type(),
                     })?;
                 ChecksumObject::new(world_x, world_y, RTTI_WAVE, 0)
             }
@@ -371,7 +435,7 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod tests {
     use super::{
         ChecksumObject, MultiplayerChecksumError, RetailChecksumAccumulator, SYNC_EXEMPT_ANIM_ID,
@@ -413,6 +477,7 @@ mod tests {
                 constructor_reverse: false,
                 inactive: false,
                 paused: false,
+                temporal_paused: false,
             },
         )
     }
@@ -446,49 +511,51 @@ mod tests {
     ) -> (Simulation, [ChecksumObject; FAMILY_COUNT]) {
         let mut sim = Simulation::with_seed(0x16112026);
 
-        let entity_id = sim.allocate_stable_id();
+        let entity_id = sim.substrate.allocate_stable_id();
         let mut entity = GameEntity::test_default(entity_id, "ORCA", "Americans", 3, 4);
         entity.set_category_for_test(EntityCategory::Aircraft);
         sim.substrate.entities.insert(entity);
 
-        let anim_id = sim.allocate_stable_id();
+        let anim_id = sim.substrate.allocate_stable_id();
         sim.substrate.anims.insert(test_anim(anim_id, 77, 731, -29));
 
-        let particle_id = sim.allocate_stable_id();
+        let particle_id = sim.substrate.allocate_stable_id();
         sim.substrate.particle_systems.insert({
             let mut system = ParticleSystem::test_fixture(
                 particle_id,
                 ParticleSystemTypeId(0),
                 IVec3::new(-311, 912, 0),
             );
-            system.facing = 0;
+            system.set_facing_for_test(0);
             system
         });
 
-        let terrain_id = sim.allocate_stable_id();
-        sim.production.terrain_objects.insert(terrain_id, {
-            let mut terrain =
-                TerrainObjectState::for_test(terrain_id, InternedId::from_index(0), 7, 9);
-            terrain.health = 10;
-            terrain.max_health = 10;
-            terrain
-        });
+        let terrain_id = sim.substrate.allocate_stable_id();
+        sim.terrain_objects
+            .objects_mut_for_test()
+            .insert(terrain_id, {
+                let mut terrain =
+                    TerrainObjectState::for_test(terrain_id, InternedId::from_index(0), 7, 9);
+                terrain.set_health_for_test(10);
+                terrain.set_max_health_for_test(10);
+                terrain
+            });
 
-        let bullet_id = sim.allocate_stable_id();
+        let bullet_id = sim.substrate.allocate_stable_id();
         sim.projectiles.spawn(
             bullet_id,
             test_projectile(ProjectileCoord::new(1234, -567, 0)),
         );
 
-        let wave_id = sim.allocate_stable_id();
-        sim.waves.spawn(
-            wave_id,
-            Wave::new(
-                1,
-                ProjectileCoord::new(1000, 2000, 0),
-                ProjectileCoord::new(0, 0, 0),
-            ),
+        let wave_id = sim.substrate.allocate_stable_id();
+        let mut wave = Wave::new(
+            1,
+            ProjectileCoord::new(1000, 2000, 0),
+            ProjectileCoord::new(0, 0, 0),
         );
+        // The constructor's Draw_NonMagnetic moves the laser's SourceCoords.
+        wave.initialize(crate::sim::wave::WaveUpdateContext::default(), None);
+        sim.waves.spawn(wave_id, wave);
 
         let ids = [
             entity_id,
@@ -561,30 +628,6 @@ mod tests {
     }
 
     #[test]
-    fn only_the_multiplayer_feedback_anim_sentinel_is_skipped() {
-        let mut checksum = RetailChecksumAccumulator::new();
-        checksum.fold_object(ChecksumObject::new(100, 200, 4, SYNC_EXEMPT_ANIM_ID));
-        assert_eq!(checksum.value(), 0);
-
-        checksum.fold_object(ChecksumObject::new(100, 200, 4, -1));
-        assert_ne!(checksum.value(), 0);
-    }
-
-    #[test]
-    fn multiplayer_frame_consumes_exactly_two_scenario_rng_samples() {
-        let mut sim = Simulation::with_seed(0x1234);
-        let mut reference = sim.scenario_rng.clone();
-        let checksum_sample = reference.next_u32();
-        let diagnostic_sample = reference.next_u32();
-
-        let frame = sim.compute_retail_multiplayer_checksum().unwrap();
-
-        assert_eq!(frame.value, checksum_sample);
-        assert_eq!(frame.diagnostic_rng_sample, diagnostic_sample);
-        assert_eq!(sim.scenario_rng.next_u32(), reference.next_u32());
-    }
-
-    #[test]
     fn gsi_16_11_six_family_logic_fold_uses_stored_order_direct_coords_and_full_rtti() {
         let first_order = [5, 1, 4, 0, 3, 2];
         let second_order = [2, 3, 0, 4, 1, 5];
@@ -614,7 +657,7 @@ mod tests {
     #[test]
     fn gsi_16_11_only_anim_minus_two_is_exempt_in_the_live_logic_resolver() {
         let mut sim = Simulation::with_seed(0x16_11);
-        let anim_id = sim.allocate_stable_id();
+        let anim_id = sim.substrate.allocate_stable_id();
         sim.substrate
             .anims
             .insert(test_anim(anim_id, SYNC_EXEMPT_ANIM_ID, 500, 700));
@@ -634,11 +677,11 @@ mod tests {
     fn display_layers_fold_in_layer_order_before_the_logic_vector() {
         use crate::sim::world::display_layers::DisplayLayer;
         let mut sim = Simulation::with_seed(0x64da);
-        let top = sim.allocate_stable_id();
+        let top = sim.substrate.allocate_stable_id();
         sim.substrate.anims.insert(test_anim(top, 5, 40, 50));
-        let surface = sim.allocate_stable_id();
+        let surface = sim.substrate.allocate_stable_id();
         sim.substrate.anims.insert(test_anim(surface, 6, 70, 80));
-        let logic = sim.allocate_stable_id();
+        let logic = sim.substrate.allocate_stable_id();
         sim.substrate.anims.insert(test_anim(logic, 7, 100, 110));
         // Submission order is deliberately the reverse of layer order.
         assert!(
@@ -682,17 +725,20 @@ mod tests {
 
     #[test]
     fn only_the_multiplayer_queue_route_checksums_a_frame() {
-        use crate::sim::world::{CommandQueueRoute, FrameEffects, TickLane};
+        use crate::sim::world::{FrameEffects, TickLane};
         let mut single = Simulation::with_seed(0x6476);
         let mut multi = Simulation::with_seed(0x6476);
-        multi.set_command_queue_route(CommandQueueRoute::Multiplayer);
-        let frame = multi.session.binary_frame;
+        multi
+            .session
+            .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Lan);
+        multi.session.install_network_timing(10);
+        let frame = multi.session.binary_frame();
         let mut expected_rng = single.scenario_rng.clone();
 
         let advance = |sim: &mut Simulation| {
             sim.advance_app_frame(
                 &[],
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
                 None,
                 67,
                 TickLane::Ordinary,
@@ -726,12 +772,90 @@ mod tests {
         assert_eq!(multi.rng_state().scenario, expected_rng.logical_state());
     }
 
+    /// The retail fold misses a client whose wallet, unit health or trigger
+    /// variables diverge; the checksum a LAN frame stores catches each.
+    #[test]
+    fn lan_frame_checksum_covers_money_health_and_trigger_state() {
+        use crate::sim::house_state::HouseState;
+        use crate::sim::world::{FrameEffects, TickLane};
+        fn world(diverge: fn(&mut Simulation)) -> Simulation {
+            let mut sim = Simulation::with_seed(0x30c);
+            let owner = sim.intern("Americans");
+            sim.houses
+                .register(HouseState::new(owner, 0, None, true, 1000, 10));
+            sim.session
+                .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Lan);
+            sim.session.install_network_timing(10);
+            let id = sim.substrate.allocate_stable_id();
+            let tank = GameEntity::new_at_frame_zero_for_test(
+                id,
+                3,
+                4,
+                0,
+                0,
+                owner,
+                crate::sim::combat::Health::new(300),
+                sim.intern("MTNK"),
+                EntityCategory::Unit,
+                0,
+                5,
+                true,
+            );
+            sim.substrate.entities.insert(tank);
+            diverge(&mut sim);
+            sim
+        }
+        let stored = |sim: &mut Simulation| {
+            let output = sim
+                .advance_app_frame(
+                    &[],
+                    crate::rules::ruleset::RuleSet::empty_for_test(),
+                    None,
+                    67,
+                    TickLane::Ordinary,
+                    FrameEffects::default(),
+                )
+                .expect("the frame completes");
+            output.multiplayer_checksum.unwrap().checksum.unwrap().value
+        };
+        let retail = |sim: &mut Simulation| sim.compute_retail_multiplayer_checksum().unwrap();
+        let divergences: [fn(&mut Simulation); 3] = [
+            |sim| {
+                let owner = sim.intern("Americans");
+                let house = sim.houses.get_mut(&owner).unwrap();
+                house.economy_mut_for_test().add_credits(1);
+            },
+            |sim| {
+                let tank = sim.substrate.entities.values_sorted().next().unwrap();
+                let id = tank.stable_id();
+                let tank = sim.substrate.entities.get_mut(id).unwrap();
+                tank.health.set_for_test(299);
+            },
+            |sim| {
+                Simulation::set_trigger_variable(
+                    &sim.session,
+                    &mut sim.scenario_rng,
+                    &mut sim.trigger_runtime,
+                    true,
+                    3,
+                    true,
+                );
+                assert!(sim.global_variables()[3]);
+            },
+        ];
+        let baseline = stored(&mut world(|_| {}));
+        for diverge in divergences {
+            assert_eq!(retail(&mut world(diverge)), retail(&mut world(|_| {})));
+            assert_ne!(stored(&mut world(diverge)), baseline);
+        }
+    }
+
     #[test]
     fn voxel_anim_debris_folds_in_the_air_layer_and_logic_with_whatami_0x29() {
         use crate::rules::ini_parser::IniFile;
         use crate::rules::voxel_anim_type::{VoxelAnimType, VoxelAnimTypeId};
         let mut sim = Simulation::with_seed(0x74ab);
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         let tire = VoxelAnimType::from_ini_section(
             "TIRE",
             IniFile::from_str("[TIRE]\nDuration=150\n")
@@ -763,6 +887,102 @@ mod tests {
         assert_eq!(frame.value, expected.value());
     }
 
+    /// Each particle's Air entry folds its Location with ParticleClass's
+    /// WhatAmI (0x16), whether it is still in its system or detached, and a
+    /// restored copy resolves the same entries.
+    #[test]
+    fn particles_fold_in_the_air_layer_with_whatami_0x16() {
+        use crate::rules::particle_type::ParticleTypeId;
+        use crate::sim::particles::Particle;
+        use crate::sim::snapshot::GameSnapshot;
+        let mut sim = Simulation::with_seed(0x62d9);
+        let mut particle = |coords: IVec3| {
+            let mut particle = Particle::test_fixture(ParticleTypeId(0), coords);
+            particle.set_stable_id_for_test(sim.substrate.allocate_stable_id());
+            particle
+        };
+        let child = particle(IVec3::new(300, 500, 7));
+        let detached = particle(IVec3::new(-40, 900, 0));
+        let (child_id, detached_id) = (child.stable_id(), detached.stable_id());
+        let system_id = sim.substrate.allocate_stable_id();
+        let mut system =
+            ParticleSystem::test_fixture(system_id, ParticleSystemTypeId(0), IVec3::new(64, 32, 0));
+        system.set_particles_for_test(vec![child]);
+        sim.substrate.particle_systems.insert(system);
+        assert!(
+            sim.reveal_particle_system(system_id, crate::rules::ruleset::RuleSet::empty_for_test())
+        );
+        sim.substrate
+            .particle_systems
+            .retain_detached_particle(detached);
+        for id in [child_id, detached_id] {
+            Simulation::reveal_particle(&mut sim.substrate, id);
+        }
+        let bytes = GameSnapshot::save(&sim, 0, 0, "particles", 0);
+        let rng = sim.scenario_rng.clone();
+        let mut reference = rng.clone();
+
+        let frame = sim.compute_retail_multiplayer_checksum().unwrap();
+
+        // Ground, then Air, then Logic.
+        let system = ChecksumObject::new(64, 32, 0x18, 0);
+        let mut expected = RetailChecksumAccumulator::new();
+        expected.fold_object(system);
+        expected.fold_object(ChecksumObject::new(300, 500, 0x16, 0));
+        expected.fold_object(ChecksumObject::new(-40, 900, 0x16, 0));
+        expected.fold_object(system);
+        expected.fold_value(reference.next_u32());
+        assert_eq!(frame.value, expected.value());
+
+        let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
+        restored.restore_after_snapshot_load().unwrap();
+        // The loader reseeds Scenario; continue the saved stream.
+        restored.scenario_rng = rng;
+        assert_eq!(restored.compute_retail_multiplayer_checksum(), Ok(frame));
+    }
+
+    /// The app's Network menu starts a LAN match (`install_startup_session_mode`),
+    /// and every LAN frame computes this checksum (`Queue_AI_Multiplayer`). A
+    /// particle on the map no longer fails the frame.
+    #[test]
+    fn a_lan_frame_with_a_particle_on_the_map_checksums() {
+        use crate::rules::particle_type::ParticleTypeId;
+        use crate::sim::particles::Particle;
+        use crate::sim::world::{FrameEffects, TickLane};
+        let mut sim = Simulation::with_seed(0x6476);
+        sim.session
+            .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Lan);
+        sim.session.install_network_timing(10);
+        let mut particle = Particle::test_fixture(ParticleTypeId(0), IVec3::new(300, 500, 7));
+        particle.set_stable_id_for_test(sim.substrate.allocate_stable_id());
+        let id = particle.stable_id();
+        sim.substrate
+            .particle_systems
+            .retain_detached_particle(particle);
+        Simulation::reveal_particle(&mut sim.substrate, id);
+
+        let output = sim
+            .advance_app_frame(
+                &[],
+                crate::rules::ruleset::RuleSet::empty_for_test(),
+                None,
+                67,
+                TickLane::Ordinary,
+                FrameEffects::default(),
+            )
+            .expect("the frame completes");
+
+        let sync = output
+            .multiplayer_checksum
+            .expect("a LAN frame stores its checksum");
+        assert!(sync.checksum.is_ok(), "{:?}", sync.checksum);
+        assert!(
+            sim.display_layers()
+                .ordered_ids()
+                .any(|&member| member == id)
+        );
+    }
+
     #[test]
     fn an_unresolved_entry_still_draws_both_scenario_samples() {
         let mut sim = Simulation::with_seed(0x64da);
@@ -773,16 +993,5 @@ mod tests {
 
         assert!(sim.compute_retail_multiplayer_checksum().is_err());
         assert_eq!(sim.scenario_rng.next_u32(), reference.next_u32());
-    }
-
-    #[test]
-    fn gsi_16_11_dangling_logic_id_remains_a_hard_error() {
-        let mut sim = Simulation::new();
-        sim.substrate.logic.set_order_for_test(vec![91]);
-
-        assert_eq!(
-            sim.compute_retail_multiplayer_checksum(),
-            Err(MultiplayerChecksumError::MissingObject(91))
-        );
     }
 }

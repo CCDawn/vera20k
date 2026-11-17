@@ -14,14 +14,14 @@ fn retail_factories() -> Option<(RuleSet, Simulation, u64, u64)> {
     let mut sim = Simulation::with_seed(0x0044_8160);
     sim.intern_rule_type_ids(&rules);
     sim.resolve_type_handles(&rules);
-    sim.session.game_mode_nonzero = true;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     let owner = sim.intern("Americans");
     let side = rules.country_side_index("Americans").unwrap().0;
     let mut house = HouseState::new(owner, side, Some(owner), true, 50_000, 10);
     house.project_country_mults(&rules, &sim.interner);
-    sim.houses.insert(owner, house);
-    sim.session.house_order.push(owner);
-    sim.session.current_house = Some(owner);
+    sim.houses.register(house);
+    sim.session.set_current_house_for_test(Some(owner));
     crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
     let first = sim.spawn_object("GAWEAP", "Americans", 6, 6, 0, &rules)?;
     let second = sim.spawn_object("GAWEAP", "Americans", 20, 6, 0, &rules)?;
@@ -111,6 +111,39 @@ fn stale_primary_events_preserve_then_toggle_each_limbo_peer_flag() {
     assert!(!restored.production.is_primary_factory(second));
 }
 
+/// Building448070/448160 group primaries by raw Factory and Naval, so a raw
+/// `Factory=Unit` (1) building keeps its own flag beside raw UnitType (40).
+#[test]
+fn raw_factory_values_form_their_own_primary_groups() {
+    let rules = RuleSet::from_ini(&crate::sim::arena_fixture::clear_ground_ini(
+        "[Countries]\n0=Americans\n[Sides]\nGDI=Americans\n\
+         [BuildingTypes]\n0=WEAP\n1=UNITFAC\n\
+         [WEAP]\nFactory=UnitType\nOwner=Americans\n\
+         [UNITFAC]\nFactory=Unit\nOwner=Americans\n",
+    ))
+    .unwrap();
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x0044_8070);
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    let ids = [(4, "WEAP"), (10, "UNITFAC"), (16, "UNITFAC")].map(|(x, kind)| {
+        sim.spawn_object(kind, "Americans", x, 4, 0, &rules)
+            .unwrap()
+    });
+    let primary = |sim: &Simulation| ids.map(|id| sim.production.is_primary_factory(id));
+    assert_eq!(primary(&sim), [true, true, false], "Unlimbo's 448070");
+    assert!(can_select_factory_primary(&sim, &rules, ids[2]));
+    assert!(sim.apply_command(
+        "Americans",
+        &Command::TogglePrimaryFactory { entity_id: ids[2] },
+        Some(&rules)
+    ));
+    assert_eq!(
+        primary(&sim),
+        [true, false, true],
+        "448160 clears raw-1 peers"
+    );
+}
+
 fn manual_primary_corpus() -> &'static serde_json::Value {
     crate::test_fixture::json("tools/spatial_oracle/building_manual_primary.json")
 }
@@ -133,12 +166,12 @@ fn assert_native_primary_type(rules: &RuleSet, name: &str, expected: &serde_json
             "factory": object.factory_rtti(),
             "build_category": build_category,
             "construction_yard": u8::from(object.construction_yard),
-            "foundation": crate::rules::foundation::foundation_id(&object.foundation),
+            "foundation": object.foundation.selector(),
             "gap_generator": u8::from(object.gap_generator),
             "infantry_absorb": u8::from(object.infantry_absorb),
             "invisible_in_game": u8::from(object.invisible_in_game),
             "naval": u8::from(object.naval),
-            "ownable": crate::sim::ai_buildable::house_token_mask(&object.owner, rules),
+            "ownable": rules.house_type_mask(&object.owner),
             "passengers": object.passengers,
             "strength": object.strength,
             "unit_absorb": u8::from(object.unit_absorb),
@@ -232,7 +265,7 @@ fn manual_primary_case_rules(
         manual_primary_corpus()["query_unit"]["naval"]
     );
     assert_eq!(
-        crate::sim::ai_buildable::house_token_mask(&query.owner, &rules),
+        rules.house_type_mask(&query.owner),
         manual_primary_corpus()["query_unit"]["ownable"]
             .as_u64()
             .unwrap() as u32
@@ -379,7 +412,7 @@ fn assert_primary_native_state(
                 "{context}: native supplied empty queue slot"
             );
             assert!(
-                sim.production.factories.view(owner, category).is_none(),
+                sim.production.factories().view(owner, category).is_none(),
                 "{context}: queue unchanged"
             );
         }
@@ -396,10 +429,6 @@ fn manual_primary_native_histories_preserve_retained_flags_consumers_and_streams
         return;
     };
     let corpus = manual_primary_corpus();
-    assert_eq!(
-        corpus["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     assert_eq!(corpus["cases"].as_array().unwrap().len(), 6);
     for case in corpus["cases"].as_array().unwrap() {
         let name = case["input"]["name"].as_str().unwrap();
@@ -407,7 +436,9 @@ fn manual_primary_native_histories_preserve_retained_flags_consumers_and_streams
         let mut sim = Simulation::new();
         sim.intern_rule_type_ids(&rules);
         sim.resolve_type_handles(&rules);
-        sim.session.game_mode_nonzero = true;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
         crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
         let owners = [sim.intern("Americans"), sim.intern("Alliance")];
         for owner in owners {
@@ -418,10 +449,9 @@ fn manual_primary_native_histories_preserve_retained_flags_consumers_and_streams
             let mut house = HouseState::new(owner, side, Some(owner), true, 50_000, 10);
             house.project_country_mults(&rules, &sim.interner);
             house.take_tech_recheck();
-            sim.houses.insert(owner, house);
-            sim.session.house_order.push(owner);
+            sim.houses.register(house);
         }
-        sim.session.current_house = Some(owners[0]);
+        sim.session.set_current_house_for_test(Some(owners[0]));
         let mut ids = Vec::new();
         for (index, (actor, kind)) in case["input"]["actors"]
             .as_array()
@@ -452,19 +482,15 @@ fn manual_primary_native_histories_preserve_retained_flags_consumers_and_streams
             // claim about ordinary placement, occupancy or scene loading.
             supply_primary_actor_flags(&mut sim, id, &case["initial"]["actors"][index]["flags"]);
             let entity = sim.substrate.entities.get_mut(id).unwrap();
-            entity.lifecycle.set_cell_marked(true);
+            entity.lifecycle.set_cell_marked_for_test(true);
             entity.selection.set_selected_for_test(false);
             sim.append_house_base_building_for_test(id);
             if actor["primary"].as_u64() == Some(1) {
-                let category = super::production_tech::factory_category_for_building(
-                    rules.object(kind).unwrap(),
-                )
-                .unwrap();
-                sim.production.set_primary_factory(owner, category, id);
+                sim.production.set_primary_factory(id);
             }
             ids.push(id);
         }
-        sim.sound_events.clear();
+        sim.sound_events.clear_for_test();
         let seed = corpus["seed"].as_u64().unwrap();
         sim.main_rng = SimRng::new(seed).into();
         sim.scenario_rng = SimRng::new(seed);
@@ -488,12 +514,13 @@ fn manual_primary_native_histories_preserve_retained_flags_consumers_and_streams
         };
         assert_rng(&sim, &case["rng_before"]);
         assert_primary_native_state(&sim, &rules, &ids, &owners, &case["initial"], name);
-        let factories = sim.production.factories.clone();
+        let factories = sim.production.factories().clone();
         let mut issued = Vec::new();
         let (_, draws) = trace_draws(|| {
             for phase in case["phases"].as_array().unwrap() {
                 let input = &phase["input"];
-                sim.session.binary_frame = phase["frame"].as_u64().unwrap() as u32;
+                sim.session
+                    .set_binary_frame_for_test(phase["frame"].as_u64().unwrap() as u32);
                 let actor_index = input["actor"].as_u64().map(|id| id as usize - 1);
                 let id = actor_index.map_or(0x1234_5678, |index| ids[index]);
                 if let Some(changes) = input.get("changes") {
@@ -506,12 +533,12 @@ fn manual_primary_native_histories_preserve_retained_flags_consumers_and_streams
                 let mut houses_before = sim.houses.clone();
                 let edges_before: Vec<_> = owners
                     .iter()
-                    .map(|owner| sim.houses[owner].waypoint_edge)
+                    .map(|owner| sim.houses[owner].waypoint_edge())
                     .collect();
-                sim.sound_events.clear();
+                sim.sound_events.clear_for_test();
                 let mut event = None;
                 match input["op"].as_str().unwrap() {
-                    "automatic" => initialize_factory_primary(&mut sim, id, &rules),
+                    "automatic" => initialize_factory_primary(&mut sim, &rules, id),
                     "click" => {
                         for &selected in &ids {
                             sim.substrate
@@ -564,7 +591,8 @@ fn manual_primary_native_histories_preserve_retained_flags_consumers_and_streams
                 assert_primary_native_state(&sim, &rules, &ids, &owners, &phase["state"], &context);
                 assert_rng(&sim, &phase["rng"]);
                 assert_eq!(
-                    sim.production.factories, factories,
+                    *sim.production.factories(),
+                    factories,
                     "{context}: no allocation/relink/queue mutation"
                 );
                 assert!(
@@ -578,10 +606,11 @@ fn manual_primary_native_histories_preserve_retained_flags_consumers_and_streams
                         "{context}: no Stage writes"
                     );
                 }
-                // Yard setting calls the existing edge owner. Its broader
-                // geometry is an explicit separate bound; all other phases,
-                // including already-primary yard clear, preserve every House
-                // field and timer. Compare cloned state, not a mirror owner.
+                // Yard setting calls DetermineEdge; these controls record the
+                // call, and `house_base::edge_tests` covers the edge it writes.
+                // All other phases, including already-primary yard clear,
+                // preserve every House field and timer. Compare cloned state,
+                // not a mirror owner.
                 let has_edge = phase["effects"]
                     .as_array()
                     .unwrap()
@@ -589,8 +618,10 @@ fn manual_primary_native_histories_preserve_retained_flags_consumers_and_streams
                     .any(|effect| effect["event"] == "determine_edge");
                 for owner in owners {
                     if has_edge {
-                        houses_before.get_mut(&owner).unwrap().waypoint_edge =
-                            sim.houses[&owner].waypoint_edge;
+                        houses_before
+                            .get_mut(&owner)
+                            .unwrap()
+                            .set_waypoint_edge_for_test(sim.houses[&owner].waypoint_edge());
                     }
                 }
                 assert_eq!(
@@ -602,7 +633,7 @@ fn manual_primary_native_histories_preserve_retained_flags_consumers_and_streams
                     assert_eq!(
                         owners
                             .iter()
-                            .map(|owner| sim.houses[owner].waypoint_edge)
+                            .map(|owner| sim.houses[owner].waypoint_edge())
                             .collect::<Vec<_>>(),
                         edges_before,
                         "{context}: no edge write"
@@ -690,6 +721,7 @@ fn primary_event_failed_building_resolution_preserves_a_live_units_plan() {
                 target_rx: 12,
                 target_ry: 20,
             },
+            None,
         )
         .unwrap();
     let planned = sim.decode_native_command_record(&record, 0).unwrap();

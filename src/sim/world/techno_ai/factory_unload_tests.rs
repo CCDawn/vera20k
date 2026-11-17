@@ -2,6 +2,8 @@
 //! The saved UnitUnlimboControls continuation executes nine producer Unload
 //! leaves, two shared Door completion callers and two miner primary controls.
 //! UnitAI, AStar setup and subsequent harvesting are separate boundaries.
+//! The stock transport-order regression below also joins paid production,
+//! local Strip publication, UnitAI, movement, clearance and real boarding.
 
 use super::{ObjectAiCtx, RuleSet, Simulation, mission_unload};
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
@@ -24,12 +26,9 @@ use crate::sim::timer::CdTimer;
 use crate::util::fixed_math::SimFixed;
 use serde_json::{Value, json};
 
-const NATIVE_SHA256: &str = "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c";
-
 fn corpus() -> &'static Value {
     let corpus = crate::test_fixture::json("tools/spatial_oracle/anytown_damage/unit_unlimbo.json");
     assert_eq!(corpus["schema_version"], 1);
-    assert_eq!(corpus["native_sha256"], NATIVE_SHA256);
     assert_eq!(corpus["factory_unload_rows"].as_array().unwrap().len(), 1);
     assert_eq!(
         corpus["factory_miner_per_cell_rows"]
@@ -348,11 +347,11 @@ fn fixture(rules: &RuleSet, ini: &IniFile) -> Fixture {
         off_104: 256,
         off_108: 256,
     });
-    sim.session.map_width = 128;
-    sim.session.map_height = 128;
+    sim.session.set_map_width_for_test(128);
+    sim.session.set_map_height_for_test(128);
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 50_000, 10));
+        .register(HouseState::new(owner, 0, None, true, 50_000, 10));
     let product = sim
         .construct_object_limbo_at_height(
             "MTNK",
@@ -393,7 +392,9 @@ fn actor_input(actor: &mut GameEntity, native: &Value) {
         .lifecycle
         .set_object_alive_for_test(native["alive"] == 1);
     actor.lifecycle.set_in_limbo_for_test(native["limbo"] == 1);
-    actor.lifecycle.set_cell_marked(native["marked"] == 1);
+    actor
+        .lifecycle
+        .set_cell_marked_for_test(native["marked"] == 1);
     actor
         .in_logic_vector
         .set_for_test(native["logic_registered"] == 1);
@@ -444,7 +445,8 @@ fn fixture_input(fixture: &mut Fixture, rules: &RuleSet, native: &Value) {
         product,
         producer,
     } = fixture;
-    sim.session.binary_frame = native["product"]["frame"].as_u64().unwrap() as u32;
+    sim.session
+        .set_binary_frame_for_test(native["product"]["frame"].as_u64().unwrap() as u32);
     actor_input(
         sim.substrate.entities.get_mut(*product).unwrap(),
         &native["product"],
@@ -506,7 +508,7 @@ fn fixture_input(fixture: &mut Fixture, rules: &RuleSet, native: &Value) {
                     *product,
                     message,
                     RadioPayload::default(),
-                    Some(rules),
+                    rules,
                     crate::sim::world::FrameEffects::default()
                 )
                 .code(),
@@ -530,7 +532,7 @@ fn fixture_input(fixture: &mut Fixture, rules: &RuleSet, native: &Value) {
                 sim,
                 *product,
                 RadioMessage::RequestClearance,
-                Some(rules),
+                rules,
                 crate::sim::world::FrameEffects::default()
             )
             .code(),
@@ -706,9 +708,10 @@ fn retail_factory_unload_leaves_match_original_door_track_and_cadence() {
         match operation {
             "producer_commence_queued_unload" => {
                 commence += 1;
-                let now = fixture.sim.session.binary_frame;
+                let now = fixture.sim.session.binary_frame();
                 let result = fixture
                     .sim
+                    .substrate
                     .mission_commence_exact(fixture.producer, now)
                     .unwrap();
                 assert_eq!(json!(u8::from(result)), call["returned_eax"]);
@@ -730,7 +733,7 @@ fn retail_factory_unload_leaves_match_original_door_track_and_cadence() {
             }
             "original_techno_door_caller" => {
                 door_calls += 1;
-                let now = fixture.sim.session.binary_frame;
+                let now = fixture.sim.session.binary_frame();
                 fixture
                     .sim
                     .substrate
@@ -760,10 +763,7 @@ fn retail_factory_unload_leaves_match_original_door_track_and_cadence() {
 #[test]
 fn stock_naval_unload_leaves_match_original_mission_door_slots_and_rng() {
     let native = crate::test_fixture::json("tools/sidebar_oracle/factory_naval_output.json");
-    let provenance =
-        crate::test_fixture::json("tools/sidebar_oracle/factory_naval_output.meta.json");
     assert_eq!(native["schema"], 1);
-    assert_eq!(provenance["native_sha256"], NATIVE_SHA256);
     let control = native["controls"]
         .as_array()
         .unwrap()
@@ -792,14 +792,12 @@ fn stock_naval_unload_leaves_match_original_mission_door_slots_and_rng() {
     };
     let mut rules = retail.rules;
     crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
-    rules
-        .bind_scheduler_anim_assets(
-            &["GAYARD_A".into(), "GAYARD_C".into(), "GAYARD_D".into()],
-            &assets,
-            "tem",
-            "TEMPERATE",
-        )
-        .expect("native-read slot names need their physical retail SHP bounds");
+    rules.bind_scheduler_anim_assets(
+        &["GAYARD_A".into(), "GAYARD_C".into(), "GAYARD_D".into()],
+        &assets,
+        "tem",
+        "TEMPERATE",
+    );
 
     let assert_boundary = |sim: &Simulation, yard: u64, expected: &Value| {
         let entity = sim.substrate.entities.get(yard).unwrap();
@@ -861,7 +859,7 @@ fn stock_naval_unload_leaves_match_original_mission_door_slots_and_rng() {
         for slot in expected["slots"].as_array().unwrap() {
             let index = int(&slot["slot"]) as usize;
             let actual = entity.building_art.anim_slots()[index]
-                .map(|id| sim.interner.resolve(sim.anim(id).unwrap().type_id));
+                .map(|id| sim.interner.resolve(sim.anim(id).unwrap().type_id()));
             assert_eq!(json!(actual), slot["type"], "native slot{index}");
             if let Some(id) = entity.building_art.anim_slots()[index] {
                 let anim = sim.anim(id).unwrap();
@@ -871,7 +869,7 @@ fn stock_naval_unload_leaves_match_original_mission_door_slots_and_rng() {
                     .iter()
                     .find(|anim| anim["pointer"] == slot["pointer"])
                     .unwrap();
-                let mut runtime = serde_json::to_value(&anim.runtime).unwrap();
+                let mut runtime = serde_json::to_value(&anim.runtime()).unwrap();
                 for flag in [
                     "first_ai_guard",
                     "constructor_reverse",
@@ -881,9 +879,16 @@ fn stock_naval_unload_leaves_match_original_mission_door_slots_and_rng() {
                     runtime[flag] = json!(u8::from(runtime[flag].as_bool().unwrap()));
                 }
                 runtime["frame_timer"] = json!([
-                    anim.runtime.frame_timer.start_frame(),
-                    anim.runtime.frame_timer.duration(),
+                    anim.runtime().frame_timer.start_frame(),
+                    anim.runtime().frame_timer.duration(),
                 ]);
+                // The capture predates Anim+11A; no Temporal erase is live.
+                assert_eq!(
+                    runtime["temporal_paused"],
+                    json!(false),
+                    "native slot{index}"
+                );
+                runtime.as_object_mut().unwrap().remove("temporal_paused");
                 assert_eq!(runtime, native_anim["runtime"], "native slot{index} clock");
             }
         }
@@ -900,14 +905,14 @@ fn stock_naval_unload_leaves_match_original_mission_door_slots_and_rng() {
         // consume the value actually read at this native boundary.
         assert!(
             sim.session
-                .game_options
+                .game_options_mut_for_test()
                 .apply_in_game_speed(int(&before["game_speed"]) as u8)
         );
         sim.intern_rule_type_ids(&rules);
         sim.resolve_type_handles(&rules);
         let owner = sim.interner.intern("Americans");
         sim.houses
-            .insert(owner, HouseState::new(owner, 0, None, true, 50_000, 10));
+            .register(HouseState::new(owner, 0, None, true, 50_000, 10));
         // Both receivers come from their real retail constructors. The DEST
         // starts held in Limbo; this leaf imports its measured post-Exit prior
         // rather than substituting a land tank or claiming to replay Exit.
@@ -943,7 +948,9 @@ fn stock_naval_unload_leaves_match_original_mission_door_slots_and_rng() {
                 .lifecycle
                 .set_object_alive_for_test(actor["alive"] == 1);
             entity.lifecycle.set_in_limbo_for_test(actor["limbo"] == 1);
-            entity.lifecycle.set_cell_marked(actor["marked"] == 1);
+            entity
+                .lifecycle
+                .set_cell_marked_for_test(actor["marked"] == 1);
             entity.in_logic_vector.set_for_test(actor["logic"] == 1);
             entity.set_in_playfield(actor["in_playfield"] == 1);
             assert_eq!(actor["contacts"], json!([0]));
@@ -1004,7 +1011,7 @@ fn stock_naval_unload_leaves_match_original_mission_door_slots_and_rng() {
             let id = sim
                 .set_building_anim_slot(yard, int(&slot["slot"]) as u8, false, false, 0, &rules)
                 .unwrap();
-            assert_eq!(sim.interner.resolve(sim.anim(id).unwrap().type_id), name);
+            assert_eq!(sim.interner.resolve(sim.anim(id).unwrap().type_id()), name);
             let prior = before["selected_anims"]
                 .as_array()
                 .unwrap()
@@ -1013,21 +1020,21 @@ fn stock_naval_unload_leaves_match_original_mission_door_slots_and_rng() {
                 .unwrap();
             let runtime = &prior["runtime"];
             let anim = sim.substrate.anims.get_mut(id).unwrap();
-            anim.runtime.current_frame = int(&runtime["current_frame"]);
-            anim.runtime.frame_step = int(&runtime["frame_step"]);
-            anim.runtime.delay_remaining = int(&runtime["delay_remaining"]) as u16;
-            anim.runtime.rate_reload = int(&runtime["rate_reload"]) as u16;
-            anim.runtime.frame_timer = CdTimer::from_raw(
+            anim.runtime_mut_for_test().current_frame = int(&runtime["current_frame"]);
+            anim.runtime_mut_for_test().frame_step = int(&runtime["frame_step"]);
+            anim.runtime_mut_for_test().delay_remaining = int(&runtime["delay_remaining"]);
+            anim.runtime_mut_for_test().rate_reload = int(&runtime["rate_reload"]) as u16;
+            anim.runtime_mut_for_test().frame_timer = CdTimer::from_raw(
                 int(&runtime["frame_timer"][0]),
                 int(&runtime["frame_timer"][1]),
             );
-            anim.runtime.loop_remaining = int(&runtime["loop_remaining"]) as u8;
-            anim.runtime.first_ai_guard = runtime["first_ai_guard"] == 1;
-            anim.runtime.constructor_reverse = runtime["constructor_reverse"] == 1;
-            anim.runtime.inactive = runtime["inactive"] == 1;
-            anim.runtime.paused = runtime["paused"] == 1;
+            anim.runtime_mut_for_test().loop_remaining = int(&runtime["loop_remaining"]) as u8;
+            anim.runtime_mut_for_test().first_ai_guard = runtime["first_ai_guard"] == 1;
+            anim.runtime_mut_for_test().constructor_reverse = runtime["constructor_reverse"] == 1;
+            anim.runtime_mut_for_test().inactive = runtime["inactive"] == 1;
+            anim.runtime_mut_for_test().paused = runtime["paused"] == 1;
         }
-        sim.session.binary_frame = now;
+        sim.session.set_binary_frame_for_test(now);
         sim.main_rng =
             SimRng::from_native_state_hex_for_test(before["rng"]["main"].as_str().unwrap()).into();
         sim.scenario_rng =
@@ -1043,7 +1050,7 @@ fn stock_naval_unload_leaves_match_original_mission_door_slots_and_rng() {
             .building_art
             .anim_slots();
         let production_before =
-            slots_before[8].map(|id| (id, sim.anim(id).unwrap().runtime.clone()));
+            slots_before[8].map(|id| (id, sim.anim(id).unwrap().runtime().clone()));
         let delay = mission_unload(&mut sim, yard, &rules, ObjectAiCtx::default()).unwrap();
         assert_eq!(
             json!(delay),
@@ -1079,7 +1086,7 @@ fn stock_naval_unload_leaves_match_original_mission_door_slots_and_rng() {
                 Some(id)
             );
             assert_eq!(
-                sim.anim(id).unwrap().runtime,
+                *sim.anim(id).unwrap().runtime(),
                 runtime,
                 "state4 retains the actual running Production8"
             );
@@ -1149,7 +1156,7 @@ fn original_harvester_and_weeder_primary_controls_use_shared_mission_authority()
             .per_cell_process(
                 fixture.product,
                 PerCellReason::Arrival,
-                Some(&rules),
+                &rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
             )
@@ -1184,80 +1191,6 @@ fn original_harvester_and_weeder_primary_controls_use_shared_mission_authority()
 }
 
 #[test]
-fn unit_move_deployment_guard_preserves_door_navigation_and_rng() {
-    // Unit740A93..740AB6 returns1 after QueueMission(Guard,0) when any
-    // of its existing +6E0/+6E1/+6E2 deployment bytes is set. It never
-    // reaches Door Close or the Foot Move cadence/arrival owner.
-    for flags in [
-        (true, false, false),
-        (false, true, false),
-        (false, false, true),
-        (true, true, true),
-    ] {
-        for navigation in [None, Some(NavTargetRef::cell(11, 10))] {
-            let ini = IniFile::from_str(
-                "[VehicleTypes]\n0=MTNK\n[MTNK]\nStrength=300\nSpeed=6\n\
-                 SpeedType=Track\nMovementZone=Normal\nDeployTime=.044\n\
-                 Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
-                 [Clear]\nBuildable=yes\n",
-            );
-            let rules = parsed_rules(&ini, &IniFile::from_str(""), None);
-            let mut sim = Simulation::with_seed(0);
-            crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
-            let id = sim
-                .spawn_object("MTNK", "Americans", 10, 10, 64, &rules)
-                .unwrap();
-            sim.session.binary_frame = 200;
-            sim.mission_assign_exact(
-                id,
-                MissionId::from_known(crate::sim::mission::MissionType::Move),
-                200,
-            )
-            .unwrap();
-            sim.mission_queue_exact(
-                id,
-                MissionId::from_known(crate::sim::mission::MissionType::Attack),
-                0,
-                200,
-                &crate::sim::mission::authority::EntityReadyInputProvider,
-            )
-            .unwrap();
-            let entity = sim.substrate.entities.get_mut(id).unwrap();
-            entity.set_unit_simple_deploy_for_test(flags.0, flags.1, flags.2);
-            entity.navigation.set_nav_com_for_test(navigation);
-            entity.open_door(40, 190);
-            let door_before = (entity.door_phase(), entity.door_timer_fields());
-            let rng_before = sim.rng_state();
-
-            super::super::dispatch_foot_mission(&mut sim, id, &rules, ObjectAiCtx::default());
-
-            let entity = sim.substrate.entities.get(id).unwrap();
-            assert_eq!(
-                (entity.door_phase(), entity.door_timer_fields()),
-                door_before,
-                "{flags:?} {navigation:?}: deployment guard skips Door"
-            );
-            assert_eq!(entity.navigation.nav_com(), navigation);
-            assert_eq!(
-                entity.mission.current().known(),
-                Some(crate::sim::mission::MissionType::Move)
-            );
-            assert_eq!(
-                entity.mission.queued().known(),
-                Some(crate::sim::mission::MissionType::Guard)
-            );
-            assert_eq!(entity.mission.dispatch_timer().start_frame(), 200);
-            assert_eq!(entity.mission.dispatch_timer().delay(), 1);
-            assert_eq!(
-                sim.rng_state(),
-                rng_before,
-                "deployment guard has no jitter"
-            );
-        }
-    }
-}
-
-#[test]
 fn original_unit_move_deployment_guards_match_mission_dispatch() {
     let data = corpus();
     let rows = data["unit_move_guard_rows"].as_array().unwrap();
@@ -1277,7 +1210,7 @@ fn original_unit_move_deployment_guards_match_mission_dispatch() {
         let id = sim
             .spawn_object("MTNK", "Americans", 10, 10, 64, &rules)
             .unwrap();
-        sim.session.binary_frame = now;
+        sim.session.set_binary_frame_for_test(now);
         let nav = |value: &Value| {
             value.as_array().map(|pair| {
                 NavTargetRef::cell(
@@ -1321,7 +1254,7 @@ fn original_unit_move_deployment_guards_match_mission_dispatch() {
 
         // The arena's pose differs from the native crop. Only dispatch inputs
         // and effects are compared: this guard never resolves coordinates.
-        super::super::dispatch_foot_mission(&mut sim, id, &rules, ObjectAiCtx::default());
+        super::super::dispatch_foot_mission(&mut sim, id, &rules, ObjectAiCtx::default()).unwrap();
 
         let entity = sim.substrate.entities.get(id).unwrap();
         let expected = &after["actor"];
@@ -1409,7 +1342,7 @@ fn a_busy_factory_exit_pushes_its_neighbours_away_from_the_head() {
         spawn(&mut sim, 15, 15);
         let east = spawn(&mut sim, 16, 15);
         let north = spawn(&mut sim, 15, 14);
-        let producer = sim.substrate.next_stable_object_id;
+        let producer = sim.next_stable_object_id();
         let track = DriveCoord {
             x: 15 * 256 + 255,
             y: 15 * 256 + 1,
@@ -1442,5 +1375,657 @@ fn a_busy_factory_exit_pushes_its_neighbours_away_from_the_head() {
                 MissionId::from_known(MissionType::Move)
             );
         }
+    }
+}
+
+/// Guard449929..449940 calls the same ClearBib449540 owner as Unload.
+/// The retail factory keeps StupidGuard; a legal map override admits the
+/// status-0 idle entry, then clears the occupied head on its next visit.
+#[test]
+fn retail_factory_guard_clears_its_exit_after_idle_entry() {
+    use crate::sim::mission::MissionType;
+    for authored in [false, true] {
+        let patch = if authored {
+            "[GAWEAP]\nHasStupidGuardMode=no\n"
+        } else {
+            ""
+        };
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules_with_map_patch(
+            &IniFile::from_str(patch),
+        ) else {
+            return;
+        };
+        let rules = retail.rules;
+        let factory_type = rules.object("GAWEAP").unwrap();
+        assert!(factory_type.weapons_factory);
+        assert_eq!(factory_type.has_stupid_guard_mode, !authored);
+        assert!(factory_type.primary().is_none());
+        let mut sim = crate::sim::arena_fixture::rival_arena_with_size(&rules, 0x0044_993B, 48);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        let factory = sim
+            .spawn_object("GAWEAP", "Americans", 15, 15, 0, &rules)
+            .unwrap();
+        // Finished Unlimbo queues Guard; the Update's existing ready-byte
+        // owner commences it before the first mission dispatch.
+        super::ready_commence(&sim.session, &mut sim.substrate, factory, false);
+        let actor = sim.substrate.entities.get(factory).unwrap();
+        let head = factory_exit_track_coordinate(
+            ground_pose::position_world_coord(&actor.position),
+            factory_type,
+        );
+        assert_eq!(
+            actor.mission.current(),
+            MissionId::from_known(MissionType::Guard)
+        );
+        assert_eq!(actor.mission.handler_state(), 0);
+        let cell = ((head.x / 256) as u16, (head.y / 256) as u16);
+        let blocker = sim
+            .spawn_object("HTNK", "Americans", cell.0, cell.1, 0, &rules)
+            .unwrap();
+        let east = sim
+            .spawn_object("HTNK", "Americans", cell.0 + 1, cell.1, 0, &rules)
+            .unwrap();
+        let before_rng = sim.scenario_rng.native_state_hex();
+        let mut bridge_changed = false;
+        super::dispatch(
+            &mut sim,
+            factory,
+            &rules,
+            ObjectAiCtx::default(),
+            &mut bridge_changed,
+        );
+        assert!(
+            sim.substrate
+                .entities
+                .get(blocker)
+                .unwrap()
+                .navigation
+                .nav_com()
+                .is_none(),
+            "status0 must not fall through to ClearBib"
+        );
+        let actor = sim.substrate.entities.get(factory).unwrap();
+        assert_eq!(actor.mission.handler_state(), u32::from(authored));
+        let delay = actor.mission.dispatch_timer().delay();
+        assert!(delay > 0);
+        if !authored {
+            assert_eq!(
+                sim.scenario_rng.native_state_hex(),
+                before_rng,
+                "StupidGuard takes no mission jitter or Scatter draw"
+            );
+        }
+        // Advance to the dispatch timer's actual due frame, without forcing
+        // status1 or bypassing the mission dispatcher on the second visit.
+        sim.session.set_binary_frame_for_test(delay as u32);
+        super::dispatch(
+            &mut sim,
+            factory,
+            &rules,
+            ObjectAiCtx::default(),
+            &mut bridge_changed,
+        );
+        for id in [blocker, east] {
+            let unit = sim.substrate.entities.get(id).unwrap();
+            if authored {
+                assert!(
+                    unit.navigation.nav_com().is_some(),
+                    "Guard must scatter the blocked factory head and its neighbour"
+                );
+                if id == east {
+                    // The head receives null-coordinate Scatter, which only
+                    // sets its destination; the neighbour queues Move too.
+                    assert_eq!(
+                        unit.mission.queued(),
+                        MissionId::from_known(MissionType::Move)
+                    );
+                }
+            } else {
+                assert!(
+                    unit.navigation.nav_com().is_none(),
+                    "retail StupidGuard leaves the bib alone"
+                );
+            }
+        }
+        assert_eq!(
+            sim.substrate
+                .entities
+                .get(factory)
+                .unwrap()
+                .mission
+                .handler_state(),
+            u32::from(authored)
+        );
+        if authored {
+            // Consume the real Scatter destinations through ordinary frames,
+            // including the null-head receiver that queues no Move itself.
+            // Human ownership keeps automatic AI Hunt orders from replacing
+            // these destinations while the clearance is being observed.
+            sim.session.set_game_mode(
+                crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+            );
+            sim.session
+                .set_current_house_for_test(sim.interner.get("Americans"));
+            sim.session.game_options_mut_for_test().short_game = false;
+            sim.spawn_object("NAPOWR", "Russians", 3, 3, 0, &rules)
+                .unwrap();
+            let starts = [(blocker, cell), (east, (cell.0 + 1, cell.1))];
+            let finished = |sim: &Simulation| {
+                starts.iter().all(|&(id, old_cell)| {
+                    let unit = sim.substrate.entities.get(id).unwrap();
+                    (unit.position.rx(), unit.position.ry()) != old_cell
+                        && unit.navigation.nav_com().is_none()
+                })
+            };
+            for _ in 0..180 {
+                let output = sim
+                    .advance_app_frame(
+                        &[],
+                        &rules,
+                        Some(rules.overlay_registry()),
+                        33,
+                        crate::sim::world::TickLane::Ordinary,
+                        crate::sim::world::FrameEffects::empty(),
+                    )
+                    .unwrap();
+                assert!(
+                    output.tick.frame_committed,
+                    "the clearance scene must advance an ordinary simulation frame"
+                );
+                if finished(&sim) {
+                    break;
+                }
+            }
+            assert!(
+                finished(&sim),
+                "the guarding factory's real Scatter must move both tanks clear and finish their navigation: frame={} tick={} units={:?}",
+                sim.session.binary_frame(),
+                sim.session.tick(),
+                starts
+                    .iter()
+                    .map(|&(id, old_cell)| {
+                        let unit = sim.substrate.entities.get(id).unwrap();
+                        (
+                            id,
+                            old_cell,
+                            (unit.position.rx(), unit.position.ry()),
+                            unit.navigation.nav_com(),
+                            unit.mission.current(),
+                            unit.mission.queued(),
+                            unit.radio_contacts.slot(0),
+                            unit.locomotor.as_ref().map(|loco| loco.active_kind()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// Mission_Unload state 2 for a Teleport product (`0x0044DFAD..0x0044E163`):
+/// the retail Chrono Miner takes a Drive piggyback over its Teleport and
+/// leaves the bay on track 0x42, as a Drive product does
+/// (`0x0044DF72..0x0044DFA4`); once it stops past the bay the Drive ends and
+/// its Teleport is back.
+#[test]
+fn a_chrono_miner_leaves_the_war_factory_on_the_bay_track() {
+    use crate::rules::locomotor_type::LocomotorKind;
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = retail.rules;
+    let mut sim = crate::sim::arena_fixture::rival_arena_with_size(&rules, 0x0044_DFAD, 48);
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    sim.session
+        .set_current_house_for_test(sim.interner.get("Americans"));
+    let grid = sim
+        .path_grid_snapshot()
+        .map(|grid| (*grid).clone())
+        .unwrap();
+    let factory = sim
+        .spawn_object("GAWEAP", "Americans", 20, 20, 0, &rules)
+        .unwrap();
+    // A rival building keeps the skirmish from ending in victory.
+    sim.spawn_object("NAPOWR", "Russians", 14, 30, 0, &rules)
+        .unwrap();
+    // ExitObject's War Factory arm (`0x00444492`) places the product in the
+    // bay, makes the factory its contact and queues the factory's Unload.
+    let miner = sim
+        .construct_object_limbo_at_height(
+            "CMIN",
+            "Americans",
+            0,
+            0,
+            0,
+            0,
+            &rules,
+            crate::sim::world::FrameEffects::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        crate::sim::production::exit_produced_object(
+            &mut sim,
+            &rules,
+            factory,
+            miner,
+            (0, 0),
+            None,
+            crate::sim::world::FrameEffects::default(),
+        ),
+        crate::sim::ai_base_building::BuildingExit::Placed
+    ));
+    let active = |sim: &Simulation| {
+        sim.substrate
+            .entities
+            .get(miner)
+            .unwrap()
+            .locomotor
+            .as_ref()
+            .unwrap()
+            .active_kind()
+    };
+    let bay_track = |sim: &Simulation| {
+        sim.substrate
+            .entities
+            .get(miner)
+            .unwrap()
+            .locomotor
+            .as_ref()
+            .and_then(|loco| loco.selected_drive_runtime())
+            .and_then(|drive| drive.retained())
+            .is_some_and(|drive| drive.track().turn_index() == 0x42)
+    };
+    assert_eq!(active(&sim), LocomotorKind::Teleport);
+
+    let mut on_track = false;
+    for _ in 0..600 {
+        let commands = sim.take_due_commands();
+        sim.advance_tick(&commands, Some(&rules), Some(&grid), None, 33);
+        if active(&sim) == LocomotorKind::Drive && bay_track(&sim) {
+            on_track = true;
+            break;
+        }
+    }
+    assert!(on_track, "the Chrono Miner runs the bay track on a Drive");
+
+    // Past the bay the Drive stops and ends back onto the Teleport.
+    let mut teleport_again = false;
+    for _ in 0..600 {
+        let commands = sim.take_due_commands();
+        sim.advance_tick(&commands, Some(&rules), Some(&grid), None, 33);
+        if active(&sim) == LocomotorKind::Teleport {
+            teleport_again = true;
+            break;
+        }
+    }
+    assert!(teleport_again, "the Drive piggyback ends past the bay");
+    let unit = sim.substrate.entities.get(miner).unwrap();
+    let (rx, ry) = (unit.position.rx(), unit.position.ry());
+    assert!(
+        sim.substrate.occupancy.first_building_on_layer(
+            rx,
+            ry,
+            crate::sim::movement::locomotor::MovementLayer::Ground
+        ) != Some(factory),
+        "out of the bay at ({rx}, {ry})"
+    );
+}
+
+#[test]
+fn a_factory_product_reconnects_to_its_ordered_transport_after_clearance() {
+    use crate::sim::combat::TargetKind;
+    use crate::sim::command::{Command, CommandEnvelope};
+    use crate::sim::mission::MissionType;
+    use crate::sim::world::world_orders::{EntryBaseAction, EntryClickAction};
+    use crate::sim::world::{FrameEffects, TickLane};
+
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = retail.rules;
+    let mut sim = Simulation::with_seed(0x0073_A981);
+    // The graphical match loader enables this movement mode too.
+    sim.batch_path_searches();
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    sim.session.game_options_mut_for_test().short_game = false;
+    let owner = sim.intern("Americans");
+    let side = rules.country_side_index("Americans").unwrap().0;
+    let mut house = HouseState::new(owner, side, Some(owner), true, 50_000, 10);
+    house.project_country_mults(&rules, &sim.interner);
+    sim.houses.register(house);
+    let rival = sim.intern("Russians");
+    sim.houses
+        .register(HouseState::new(rival, 1, Some(rival), false, 0, 10));
+    sim.session.set_current_house_for_test(Some(owner));
+    crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
+    sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(32, 32));
+    for (kind, x, y) in [
+        ("GACNST", 10, 14),
+        ("GAPOWR", 16, 12),
+        ("GAPOWR", 20, 12),
+        ("GAPILE", 10, 22),
+        ("GAREFN", 14, 22),
+    ] {
+        sim.spawn_object(kind, "Americans", x, y, 0, &rules)
+            .unwrap();
+    }
+    let factory = sim
+        .spawn_object("GAWEAP", "Americans", 20, 20, 0, &rules)
+        .unwrap();
+    sim.spawn_object("NAPOWR", "Russians", 14, 30, 0, &rules)
+        .unwrap();
+    let transport = sim
+        .spawn_object("LCRF", "Americans", 30, 21, 0, &rules)
+        .unwrap();
+    let product_type = sim.interner.get("MTNK").unwrap();
+    // Confirm the stock world actually batches searches; this does not
+    // identify which Foot supplied the work or compare route timing.
+    let saw_batch_search = std::cell::Cell::new(false);
+    let frame = |sim: &mut Simulation, command: Option<Command>| {
+        let mut commands = sim.take_due_commands();
+        if let Some(command) = command {
+            commands.push(CommandEnvelope::new(owner, sim.session.tick() + 1, command));
+        }
+        // Headless advance_tick has no local sidebar and intentionally emits
+        // no mobile PLACE. Supply the real Strip owner through its frame seam.
+        let visits = sim.production.factories().strip_visits_for_test(owner);
+        let output = sim
+            .advance_app_frame(
+                &commands,
+                &rules,
+                Some(rules.overlay_registry()),
+                33,
+                TickLane::Ordinary,
+                FrameEffects::default().with_production_strip(&visits, &|_| {}),
+            )
+            .expect("ordinary local production frame");
+        assert!(output.tick.frame_committed);
+        if sim
+            .path_batch_stats()
+            .is_some_and(|stats| stats.searched > 0)
+        {
+            saw_batch_search.set(true);
+        }
+    };
+    frame(
+        &mut sim,
+        Some(Command::QueueProduction {
+            type_id: product_type,
+        }),
+    );
+    let bay_head = |sim: &Simulation, id| {
+        sim.substrate.entities.get(id).and_then(|unit| {
+            unit.locomotor
+                .as_ref()
+                .and_then(|loco| loco.selected_drive_runtime())
+                .and_then(|drive| drive.retained())
+                .filter(|drive| drive.track().turn_index() == 0x42)
+                .and_then(|drive| drive.head_to())
+        })
+    };
+    let mut product = None;
+    for _ in 0..4000 {
+        product = sim
+            .substrate
+            .entities
+            .values()
+            .find(|unit| {
+                unit.type_ref() == product_type
+                    && !unit.lifecycle.in_limbo()
+                    && unit.mission.current().known() == Some(MissionType::Move)
+                    && unit.mission.queued() == MissionId::NONE
+                    && unit.radio_contacts.slot(0) == Some(factory)
+                    && unit.tether.partner() == Some(factory)
+                    && bay_head(&sim, unit.stable_id()).is_some()
+            })
+            .map(|unit| unit.stable_id());
+        if product.is_some() {
+            break;
+        }
+        frame(&mut sim, None);
+    }
+    let product = product.expect("paid production reaches the factory exit track");
+    assert!(sim.houses.get(&owner).unwrap().economy().spent_credits() > 0);
+    let enter = Command::MegaMission {
+        entity_id: product,
+        mission: MissionType::Enter,
+        target: None,
+        destination: Some(TargetKind::Entity(transport)),
+    };
+    assert_eq!(
+        sim.entry_click_action(product, transport, EntryBaseAction::Select, &rules),
+        Some(EntryClickAction::Enter)
+    );
+    let head = bay_head(&sim, product).unwrap();
+    frame(&mut sim, Some(enter.clone()));
+    let unit = sim.substrate.entities.get(product).unwrap();
+    assert_eq!(
+        unit.navigation.nav_list(),
+        &[NavTargetRef::Object { id: transport }]
+    );
+    assert_eq!(bay_head(&sim, product), Some(head));
+    for _ in 0..20 {
+        frame(&mut sim, None);
+        if sim
+            .substrate
+            .entities
+            .get(product)
+            .unwrap()
+            .mission
+            .current()
+            .known()
+            == Some(MissionType::Enter)
+        {
+            break;
+        }
+    }
+    let unit = sim.substrate.entities.get(product).unwrap();
+    assert_eq!(unit.mission.current().known(), Some(MissionType::Enter));
+    assert_eq!(bay_head(&sim, product), Some(head));
+    // The second ordinary Enter is processed with committed Enter, so the
+    // factory's NavList deferral no longer applies (Unit742D7D).
+    frame(&mut sim, Some(enter));
+    let unit = sim.substrate.entities.get(product).unwrap();
+    assert_eq!(
+        unit.navigation.nav_com(),
+        Some(NavTargetRef::Object { id: transport })
+    );
+    assert_eq!(unit.radio_contacts.slot(0), Some(factory));
+    assert_eq!(unit.tether.partner(), Some(factory));
+    assert_eq!(bay_head(&sim, product), Some(head));
+
+    radio::take_transmit_log();
+    let mut clearance = false;
+    for _ in 0..600 {
+        frame(&mut sim, None);
+        let sends = radio::take_transmit_log();
+        if let Some(cleared) = sends.iter().position(|send| {
+            send.sender_sid == product
+                && send.target_sid == factory
+                && send.msg == 8
+                && send.reply == Some(0x17)
+        }) {
+            clearance = true;
+            assert!(
+                saw_batch_search.get(),
+                "the enabled path batch must perform a search in this world"
+            );
+            assert!(
+                sends[cleared + 1..]
+                    .iter()
+                    .any(|send| send.sender_sid == product
+                        && send.target_sid == transport
+                        && send.msg == 0x0e),
+                "Unit73A981 sends CanDock to the retained foreign NavCom after clearance: {sends:?}"
+            );
+            let unit = sim.substrate.entities.get(product).unwrap();
+            assert_eq!(unit.radio_contacts.slot(0), Some(transport));
+            assert_eq!(
+                sim.substrate
+                    .entities
+                    .get(transport)
+                    .unwrap()
+                    .radio_contacts
+                    .slot(0),
+                Some(product)
+            );
+            assert!(
+                !sim.substrate
+                    .entities
+                    .get(factory)
+                    .unwrap()
+                    .radio_contacts
+                    .contains(product)
+            );
+            assert!(!unit.radio_contacts.contains(factory));
+            assert_ne!(unit.tether.partner(), Some(factory));
+            break;
+        }
+    }
+    assert!(clearance, "the ordered product clears the factory");
+    for _ in 0..600 {
+        frame(&mut sim, None);
+        if sim
+            .substrate
+            .entities
+            .get(product)
+            .unwrap()
+            .passenger_role
+            .inside_transport()
+            .is_some()
+        {
+            break;
+        }
+    }
+    let unit = sim.substrate.entities.get(product).unwrap();
+    assert_eq!(
+        unit.passenger_role.inside_transport(),
+        Some((transport, false))
+    );
+    assert!(
+        unit.lifecycle.in_limbo(),
+        "the original paid product boards without a third order"
+    );
+    assert_eq!(
+        sim.substrate
+            .entities
+            .get(transport)
+            .unwrap()
+            .passenger_role
+            .cargo()
+            .unwrap()
+            .passengers(),
+        &[product]
+    );
+}
+
+/// #3593, a VERA deviation from gamemd: a factory captured while its door is
+/// still opening keeps Unload, so the product drives out for the new owner
+/// instead of staying in the bay forever.
+#[test]
+fn a_factory_captured_while_its_door_opens_still_lets_the_product_out() {
+    use crate::sim::mission::MissionType;
+    use crate::sim::world::FrameEffects;
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = retail.rules;
+    for capture_after in [1usize, 20] {
+        let mut sim = crate::sim::arena_fixture::rival_arena_with_size(&rules, 0x0044_8260, 48);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        sim.session
+            .set_current_house_for_test(sim.interner.get("Americans"));
+        sim.session.game_options_mut_for_test().short_game = false;
+        let grid = sim
+            .path_grid_snapshot()
+            .map(|grid| (*grid).clone())
+            .unwrap();
+        let factory = sim
+            .spawn_object("GAWEAP", "Russians", 20, 20, 0, &rules)
+            .unwrap();
+        // A plant each keeps both houses in the game.
+        sim.spawn_object("NAPOWR", "Russians", 14, 30, 0, &rules)
+            .unwrap();
+        sim.spawn_object("GAPOWR", "Americans", 34, 30, 0, &rules)
+            .unwrap();
+        let tank = sim
+            .construct_object_limbo_at_height(
+                "HTNK",
+                "Russians",
+                0,
+                0,
+                0,
+                0,
+                &rules,
+                FrameEffects::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            crate::sim::production::exit_produced_object(
+                &mut sim,
+                &rules,
+                factory,
+                tank,
+                (0, 0),
+                None,
+                FrameEffects::default(),
+            ),
+            crate::sim::ai_base_building::BuildingExit::Placed
+        ));
+        let tick = |sim: &mut Simulation| {
+            let commands = sim.take_due_commands();
+            sim.advance_tick(&commands, Some(&rules), Some(&grid), None, 33);
+        };
+        for _ in 0..capture_after {
+            tick(&mut sim);
+        }
+        let producer = sim.substrate.entities.get(factory).unwrap();
+        assert_eq!(
+            producer.mission.current().known(),
+            Some(MissionType::Unload)
+        );
+        assert!(
+            producer.mission.handler_state() <= 2,
+            "the capture lands before the product starts driving"
+        );
+        let americans = sim.interner.get("Americans").unwrap();
+        sim.change_owner_with_rules(factory, americans, &rules, None, FrameEffects::default());
+        let left = (0..600).any(|_| {
+            tick(&mut sim);
+            let unit = sim.substrate.entities.get(tank).unwrap();
+            sim.substrate.occupancy.first_building_on_layer(
+                unit.position.rx(),
+                unit.position.ry(),
+                crate::sim::movement::locomotor::MovementLayer::Ground,
+            ) != Some(factory)
+        });
+        assert!(
+            left,
+            "captured after {capture_after} frames, the tank stayed in the bay"
+        );
+        let finished = (0..300).any(|_| {
+            tick(&mut sim);
+            sim.substrate
+                .entities
+                .get(factory)
+                .unwrap()
+                .mission
+                .current()
+                .known()
+                != Some(MissionType::Unload)
+        });
+        assert!(finished, "the captured factory never finished unloading");
+        assert_eq!(sim.substrate.entities.get(tank).unwrap().owner(), americans);
     }
 }

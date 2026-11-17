@@ -13,6 +13,15 @@ use crate::sim::game_entity::GameEntity;
 use crate::sim::mission::MissionType;
 use crate::sim::world::{FrameEffects, Simulation};
 
+/// The outer Process distinguishes an immediate return from its common tail.
+/// Same-cell/Guard-arrival and callback retirement returns skip the rest write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrackProcessEntry {
+    Movement,
+    Tail,
+    Return,
+}
+
 pub(super) fn sample(latched: &mut bool, rotating: bool) -> bool {
     let completed = *latched && !rotating;
     *latched = rotating;
@@ -23,7 +32,12 @@ pub(super) fn sample(latched: &mut bool, rotating: bool) -> bool {
 /// clearing +4C, unless the descriptor (or Foot queue8) and turn gates admit.
 /// The world TrackProcess entry calls this once before the scalar prefix.
 pub(super) fn admit_track_entry(entity: &mut GameEntity, has_turret: bool) -> bool {
-    let queue_eight = entity.navigation.path_replay.remaining_directions().first() == Some(&8);
+    let queue_eight = entity
+        .navigation
+        .path_replay()
+        .remaining_directions()
+        .first()
+        == Some(&8);
     let Some(loco) = entity.locomotor.as_mut() else {
         return false;
     };
@@ -50,40 +64,55 @@ impl Simulation {
     pub(crate) fn process_track_turn(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
-    ) -> bool {
-        let frame = self.session.binary_frame;
-        let Some(entity) = self.substrate.entities.get_mut(id) else {
-            return false;
+    ) -> TrackProcessEntry {
+        let frame = self.session.binary_frame();
+        let Some(entity) = self.substrate.entities.get(id) else {
+            return TrackProcessEntry::Return;
         };
         if entity.death.is_dying() || !entity.lifecycle.object_alive() {
-            return false;
+            return TrackProcessEntry::Return;
         }
         if super::track_head::active_track_family(entity).is_some() {
-            return true;
+            return TrackProcessEntry::Movement;
         }
         if !entity
             .locomotor
             .as_ref()
             .is_some_and(|l| matches!(l.active_kind(), LocomotorKind::Drive | LocomotorKind::Ship))
         {
-            return true;
+            return TrackProcessEntry::Movement;
         }
         // Drive4B066C..4B06D2 / Ship69FD13..69FD79: a Cell NavCom naming the
         // current cell stops (or takes the next waypoint) and Process returns
         // before the turn observation, Process_Movement and Process_Track.
-        if matches!(entity.navigation.nav_com(), Some(NavTargetRef::Cell { rx, ry })
-            if (rx, ry) == (entity.position.rx(), entity.position.ry()))
+        // A quiet unit has no NavCom (`world::quiet_units`).
+        if !self.quiet(id)
+            && matches!(entity.navigation.nav_com(), Some(NavTargetRef::Cell { rx, ry })
+                if (rx, ry) == (entity.position.rx(), entity.position.ry()))
         {
             self.track_navcom_stop(id, rules, effects);
-            return false;
+            return TrackProcessEntry::Return;
         }
-        let current = super::ground_pose::position_world_coord(&entity.position);
-        let loco = entity.locomotor.as_mut().unwrap();
+        let loco = entity.locomotor.as_ref().unwrap();
         let family = TrackFamily::from_kind(loco.active_kind()).unwrap();
-        loco.ensure_installed_track_state();
+        // The sample reads; it takes the object only to install the class's
+        // missing track state or to store a changed latch.
+        if loco.track_turn_latched(family).is_none() {
+            self.substrate
+                .entities
+                .get_mut(id)
+                .unwrap()
+                .locomotor
+                .as_mut()
+                .unwrap()
+                .ensure_installed_track_state();
+        }
+        let entity = self.substrate.entities.get(id).unwrap();
+        let current = super::ground_pose::position_world_coord(&entity.position);
+        let loco = entity.locomotor.as_ref().unwrap();
         let mut latched = loco.track_turn_latched(family).unwrap();
         let valid = loco.track_valid(family).unwrap();
         let destination = loco.track_destination(family);
@@ -95,20 +124,25 @@ impl Simulation {
             && destination.is_some_and(|dest| dest == current)
         {
             self.track_navcom_stop(id, rules, effects);
-            return false;
+            return TrackProcessEntry::Return;
         }
         let rotating = entity.body_facing.is_rotating(frame);
+        let was_latched = latched;
         let completed = sample(&mut latched, rotating);
-        entity
-            .locomotor
-            .as_mut()
-            .unwrap()
-            .store_track_turn_latched(family, latched);
+        if latched != was_latched {
+            self.substrate
+                .entities
+                .get_mut(id)
+                .unwrap()
+                .locomotor
+                .as_mut()
+                .unwrap()
+                .store_track_turn_latched(family, latched);
+        }
         // Drive4B0788 ->4B078C..893 / Ship69FE35: live rotation
         // returns through the Process tail, never fresh ProcessMovement.
-        // The common resting-speed tail remains to be migrated.
         if rotating {
-            return false;
+            return TrackProcessEntry::Tail;
         }
         if completed {
             self.unit_per_cell_process(
@@ -122,10 +156,63 @@ impl Simulation {
             if !self.substrate.entities.get(id).is_some_and(|e| {
                 e.lifecycle.object_alive() && !e.lifecycle.in_limbo() && !e.is_falling_down()
             }) {
-                return false;
+                return TrackProcessEntry::Return;
             }
         }
-        self.track_movement_gates(id, rules, effects)
+        if self.track_movement_gates(id, rules, effects) {
+            TrackProcessEntry::Movement
+        } else {
+            TrackProcessEntry::Tail
+        }
+    }
+
+    /// Drive4B0828..4B0880 / Ship69FEF0..69FF47, reached only through the
+    /// common Process tail. Stop4AFE00 / Stop69F510 leave Foot+578 alone.
+    /// Neither NavCom nor the selector decides this write: both class
+    /// coordinates and Foot's queue must be empty, and only a positive
+    /// applied speed calls SetSpeedFraction(0).
+    /// Original whole-Process controls: track_order_path --rest.
+    pub(crate) fn track_process_rest_tail(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        effects: FrameEffects<'_>,
+    ) {
+        if !self.substrate.entities.get(id).is_some_and(|entity| {
+            entity.lifecycle.object_alive()
+                && entity
+                    .locomotor
+                    .as_ref()
+                    .is_some_and(|loco| TrackFamily::from_kind(loco.active_kind()).is_some())
+        }) {
+            return;
+        }
+        // A PerCell/idle callback's restored destination ran synchronously in
+        // native code. Publish the existing owed setter before reading the
+        // class coordinates, as the active-track continuation already does.
+        self.complete_pending_order(id, rules, registry, effects);
+        if let Some(entity) = self.substrate.entities.get_mut_if(id, |entity| {
+            entity.locomotor.as_ref().is_some_and(|loco| {
+                // The speed first: a unit at rest is let go without its
+                // path being read (VERA-only order; every test only reads).
+                TrackFamily::from_kind(loco.active_kind()).is_some_and(|family| {
+                    entity.foot_speed.speed_fraction_is_positive()
+                        && entity.lifecycle.object_alive()
+                        && loco.track_destination(family).is_none()
+                        && loco.track_head(family).is_none()
+                        && entity
+                            .navigation
+                            .path_replay()
+                            .remaining_directions()
+                            .is_empty()
+                })
+            })
+        }) {
+            entity
+                .foot_speed
+                .set_speed_fraction(crate::util::fixed_math::SIM_ZERO);
+        }
     }
 
     /// Drive4B08D1..4B0A69 / Ship69FF98..6A0131: the outer Process gates
@@ -135,7 +222,7 @@ impl Simulation {
     fn track_movement_gates(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) -> bool {
         let Some(entity) = self.substrate.entities.get(id) else {
@@ -151,38 +238,48 @@ impl Simulation {
         if !moving
             && entity
                 .navigation
-                .path_replay
+                .path_replay()
                 .remaining_directions()
                 .is_empty()
         {
-            // 4B0921..4B096C: the +3CD (sinking/crashing) arm has no Rust
-            // producer. 4B0971..4B09A6: a NavCom re-enters the locomotor's
-            // own Move_To (+0x44) with its live coordinate; either way the
-            // tail follows and Process_Movement waits for the next visit.
+            // 4B0921..4B096C: the +3CD (sinking) arm is unreachable, as
+            // FootClass::AI runs no locomotor Process while sinking (4DA81A
+            // skips 4DA877). 4B0971..4B09A6: a NavCom re-enters the
+            // locomotor's own Move_To (+0x44) with its live coordinate; either
+            // way the tail follows and Process_Movement waits for the next visit.
             if let Some(target) = entity.navigation.nav_com()
                 && let Ok(coord) = super::navcom::nav_target_coordinate(
                     target,
                     Some(id),
                     self,
                     self.resolved_terrain.as_ref(),
-                    rules.map(|rules| (rules, &self.interner)),
+                    Some((rules, &self.interner)),
                 )
             {
                 let terrain = self.resolved_terrain.as_ref();
                 if let Some(entity) = self.substrate.entities.get_mut(id) {
-                    super::navcom::track_move_to(entity, coord, terrain, self.session.binary_frame);
+                    super::navcom::track_move_to(
+                        entity,
+                        coord,
+                        terrain,
+                        self.session.binary_frame(),
+                    );
                 }
             }
             return false;
         }
         // 4B09AB..4B0A68: an in-playfield (+3D5), non-Enter mover whose
         // destination fails the zone precheck clears its head, then stops or
-        // takes the next waypoint; either way the tail follows.
+        // takes the next waypoint. The NULL setter and a false idle entry go
+        // on to the tail; a true one returns false without it (4B0A57).
+        // RESIDUAL: VERA runs the tail after a true idle entry too. Its rest
+        // write needs empty class coordinates, which the taken waypoint
+        // fills, and FootClass::AI ignores Process's result (4DA877). The
+        // tail's Wake (4B078C..4B0823; Ship's 69FE97..69FEEB) is
+        // `spawn_wakes_for_frame` here, which does not depend on this return:
+        // at most one invisible wake differs.
         if entity.in_playfield() && mission != Some(MissionType::Enter) && moving {
             let destination = super::track_path::track_destination_or_null(entity);
-            let Some(rules) = rules else {
-                return true;
-            };
             // Unrepresented precheck inputs (no zone topology or bounds in a
             // component fixture) admit Process_Movement unchanged.
             if let Ok(false) = self.foot_path_zone_precheck(id, destination, rules) {
@@ -194,6 +291,10 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "track_turn_tests.rs"]
 mod tests;
+
+#[cfg(all(test, tests_sim_movement))]
+#[path = "track_rest_tests.rs"]
+mod rest_tests;

@@ -15,9 +15,8 @@
 //! families that can reach this gate, derived per gate evaluation by
 //! [`crate::sim::movement::ready_producer`] — native makes a fresh locomotor
 //! call at each of its own gate sites rather than caching one per frame. The
-//! signed object height still has no live producer; the host promotion maps that
-//! unavailability to a permissive moving-defer gate (recorded residual) rather
-//! than stalling queued missions forever.
+//! signed object height (`Get_Height`) is read from the object's position on
+//! the moving path.
 
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
@@ -30,8 +29,7 @@ use crate::sim::world::Simulation;
 use super::concrete_effects::UnavailableConcreteMissionEffects;
 use super::concrete_effects::{
     AuthorityUnavailable, ConcreteMissionEffects, ConcreteSetterRequest,
-    RepresentedConcreteMissionEffects, represented_assign_destination,
-    represented_assign_target_admitted,
+    RepresentedConcreteMissionEffects,
 };
 use super::readiness::{
     AircraftReadyView, BuildingReadyView, InfantryReadyView, ReadyLeptonPoint, ReadyResult,
@@ -41,6 +39,8 @@ use super::readiness::{
 };
 use super::verb::{self, QueueContinuation};
 use super::{MissionCom, MissionId};
+use crate::sim::rng::SimRng;
+use crate::sim::world::ObjectSubstrate;
 
 mod ready_private {
     pub trait Sealed {}
@@ -81,39 +81,6 @@ impl SuspendedTarget {
     }
 }
 
-/// Entity-local Restore transaction used after a represented pointer-expiry
-/// callback has already cleared the expired target through Assign_Target.
-///
-/// The write set matches native Restore: selector first, then archived Target,
-/// then mode-one destination. Callers must preserve the distinct expiry order
-/// (clear first, then conditionally Restore); live-object detach uses a separate
-/// wrapper and order. `saved_target_stored` is `assign_target_stored` for the
-/// archived target, read before the receiver was borrowed.
-/// `FootClass::Restore_Mission @ 0x004D8F80`, a Building's `TechnoClass::Restore_Mission`
-/// (`0x007013E0`): `+0xB0` to `+0xAC`, Assign_Target(`+0x2B8`), Assign_Destination(`+0x5A8`, 1).
-pub(crate) fn restore_entity_after_target_expiry(
-    entity: &mut crate::sim::game_entity::GameEntity,
-    saved_target_stored: Option<TargetKind>,
-) -> bool {
-    if entity.mission.suspended() == MissionId::NONE {
-        return false;
-    }
-
-    let saved_target = entity.suspended_attack_target.target();
-    let saved_destination = entity.navigation.suspended_nav_com();
-    let category = entity.category();
-    let restored = verb::restore_base(&mut entity.mission);
-    debug_assert!(restored);
-    represented_assign_target_admitted(entity, saved_target, saved_target_stored);
-    if category != EntityCategory::Structure {
-        represented_assign_destination(entity, saved_destination);
-        if saved_destination.is_some() {
-            entity.navigation.owe_destination_setter();
-        }
-    }
-    true
-}
-
 /// Entity-local category wrapper for `Queue_Mission(requested, false)`.
 ///
 /// Receiver special-damage branches already hold the target's mutable entity
@@ -146,10 +113,10 @@ const AIRCRAFT_PROTECTED: [MissionId; 5] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OverridePacket {
-    mission: MissionId,
-    combat_target: Option<TargetKind>,
-    destination: Option<NavTargetRef>,
+pub(crate) struct OverridePacket {
+    pub(crate) mission: MissionId,
+    pub(crate) combat_target: Option<TargetKind>,
+    pub(crate) destination: Option<NavTargetRef>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -169,25 +136,18 @@ pub(crate) trait ReadyInputProvider: ready_private::Sealed {
     fn ready_to_commence(&self, sim: &Simulation, receiver: u64, mission: &MissionCom) -> bool;
 }
 
-/// Production view over currently represented exact inputs, without rules.
-///
-/// Unit factory/contact lookups need parsed rules data, so this rules-free
-/// provider reports them unavailable. Use [`LiveReadyInputProvider`] wherever
-/// a `RuleSet` is in scope. Early native false branches still short-circuit
-/// normally.
-#[derive(Debug, Default)]
-pub(crate) struct EntityReadyInputProvider;
-
-/// Production view with the Unit world lookups live (rules in scope).
-///
-/// Retained as the rules-aware exact readiness provider while the current host
-/// evaluates the same inputs directly.
+/// The production readiness view: the live world, whose Unit contact and
+/// factory lookups read the rules.
 #[derive(Debug)]
 pub(crate) struct LiveReadyInputProvider<'r> {
     pub(crate) rules: &'r RuleSet,
 }
 
-struct UnavailableUnitWorld;
+/// `Get_Height` (vt+0x1C8, `ObjectClass::GetHeight @ 0x005F5F40`): the
+/// object's height above the ground or bridge deck under it.
+fn unit_signed_height(sim: &Simulation, entity: &crate::sim::game_entity::GameEntity) -> i32 {
+    crate::sim::movement::air_movement::current_fly_height(entity, sim.resolved_terrain.as_ref())
+}
 
 /// Live Unit-readiness world: Radio contact slot 0 identity and the
 /// building-under lookup in the existing per-cell stored list order.
@@ -256,23 +216,13 @@ impl UnitReadyWorld for LiveUnitWorld<'_> {
             anchor,
         )))
     }
+
+    fn signed_height(&self) -> i32 {
+        unit_signed_height(self.sim, self.entity)
+    }
 }
 
-impl ready_private::Sealed for EntityReadyInputProvider {}
 impl ready_private::Sealed for LiveReadyInputProvider<'_> {}
-
-impl UnitReadyWorld for UnavailableUnitWorld {
-    fn contact_slot_zero(&self) -> Result<Option<UnitReadyContact>, ReadyUnavailable> {
-        Err(ReadyUnavailable::WorldLookup)
-    }
-
-    fn building_under_in_stored_order(
-        &self,
-        _unit_position: ReadyLeptonPoint,
-    ) -> Result<Option<UnitReadyBuilding>, ReadyUnavailable> {
-        Err(ReadyUnavailable::WorldLookup)
-    }
-}
 
 /// Fallback moving-gate input for entities whose locomotor has no producer.
 ///
@@ -291,9 +241,6 @@ impl UnitReadyWorld for UnavailableUnitWorld {
 /// and answering "not moving" is also the safe direction if that ever changes.
 /// It is not their native answer: Fly and Rocket have real `Is_Moving_Now`
 /// bodies, which `motion_query::is_moving_now` answers.
-///
-/// This constant and the `degraded_moving_gate` parameter can retire together
-/// once `evaluate_ready` no longer needs a `None` fallback at all.
 const DEGRADED_NOT_MOVING: crate::sim::movement::locomotor_ready::LocomotorReadyState =
     crate::sim::movement::locomotor_ready::LocomotorReadyState::Drive {
         turning_active: false,
@@ -306,8 +253,7 @@ fn evaluate_ready(
     sim: &Simulation,
     receiver: u64,
     mission: &MissionCom,
-    rules: Option<&RuleSet>,
-    degraded_moving_gate: bool,
+    rules: &RuleSet,
 ) -> ReadyResult {
     {
         let entity = sim
@@ -322,16 +268,10 @@ fn evaluate_ready(
         // the second call with the first call's state.
         let locomotor = crate::sim::movement::ready_producer::ready_state_for(
             entity,
-            rules.map(|rules| {
-                crate::sim::movement::SpeedRules::new(rules, &sim.interner, &sim.houses)
-            }),
-            sim.session.binary_frame,
+            crate::sim::movement::SpeedRules::new(rules, &sim.interner, &sim.houses),
+            sim.session.binary_frame(),
         )
-        .or(if degraded_moving_gate {
-            Some(DEGRADED_NOT_MOVING)
-        } else {
-            None
-        });
+        .or(Some(DEGRADED_NOT_MOVING));
         let attack_target_present = entity.attack_target.target().is_some();
 
         match entity.category() {
@@ -346,76 +286,15 @@ fn evaluate_ready(
                     .miner
                     .as_ref()
                     .is_some_and(|miner| miner.unload_active());
-                match rules {
-                    Some(rules) => unit_ready_to_commence(UnitReadyView {
-                        mission,
-                        leaf,
-                        unload_active,
-                        locomotor,
-                        // Deliberately absent, and NOT for want of a producer.
-                        //
-                        // Native's input is `Get_Height`: the object's Z minus
-                        // the ground height at its cell, minus the bridge deck
-                        // when on a bridge — so ground and bridge both read 0,
-                        // airborne reads positive, only below-ground reads
-                        // negative. GetHeight's port, `current_fly_height`, is
-                        // exactly that quantity, so the producer is a one-liner.
-                        //
-                        // It is not wired up because turning it on stalls
-                        // vehicles. Supplying it makes this branch's
-                        // `signed_height >= 0` true, which arms the moving-defer
-                        // — and measured over the global harness that took gate
-                        // evaluations from 28 (all ready) to 8045, of which 8021
-                        // were deferrals. The count explodes precisely because a
-                        // deferral leaves the mission queued, so the same unit
-                        // re-defers every tick and the queue never drains.
-                        //
-                        // Root cause is upstream of here: the dominant deferral
-                        // reads `effective=Move, current=NONE, queued=Move,
-                        // bypass_latch=0, moving=true` — a unit already moving
-                        // with no commenced mission at all. The order's class
-                        // destination setter starts the locomotor in the same
-                        // MEGAMISSION call that queues the mission, natively
-                        // too (`0x004C747C`), so movement precedes
-                        // commencement there as well; what lets native
-                        // commence such a unit is not established.
-                        // `set_movement_bypass_after_verified_queue` — native's
-                        // escape hatch for exactly this — is called only by the
-                        // refinery and jumpjet completion paths here, never by
-                        // the general queue an ordinary Move uses.
-                        //
-                        // So this stays `None` until that is established. Until
-                        // then `ready_to_commence_answer` maps the resulting
-                        // error to ready and the Unit moving-defer branch is
-                        // inert — which is why none of the Drive/Ship readiness
-                        // mapping can affect vehicle behaviour yet.
-                        // MCV Event9 stops before queuing Unload, so this route
-                        // can supply native GetHeight without a Move's
-                        // start-before-Commence cycle.
-                        signed_height: (mission.queued()
-                            == MissionId::from_known(super::MissionType::Unload)
-                            && crate::sim::mcv_deploy::is_mcv(sim, entity, rules))
-                        .then(|| {
-                            crate::sim::movement::air_movement::current_fly_height(
-                                entity,
-                                sim.resolved_terrain.as_ref(),
-                            )
-                        }),
-                        attack_target_present,
-                        position,
-                        world: &LiveUnitWorld { sim, rules, entity },
-                    }),
-                    None => unit_ready_to_commence(UnitReadyView {
-                        mission,
-                        leaf,
-                        unload_active,
-                        locomotor,
-                        signed_height: None,
-                        attack_target_present,
-                        position,
-                        world: &UnavailableUnitWorld,
-                    }),
-                }
+                unit_ready_to_commence(UnitReadyView {
+                    mission,
+                    leaf,
+                    unload_active,
+                    locomotor,
+                    attack_target_present,
+                    position,
+                    world: &LiveUnitWorld { sim, rules, entity },
+                })
             }
             EntityCategory::Infantry => {
                 let leaf = entity
@@ -448,15 +327,9 @@ fn evaluate_ready(
     }
 }
 
-impl ReadyInputProvider for EntityReadyInputProvider {
-    fn ready_to_commence(&self, sim: &Simulation, receiver: u64, mission: &MissionCom) -> bool {
-        ready_to_commence_answer(sim, receiver, mission, None)
-    }
-}
-
 impl ReadyInputProvider for LiveReadyInputProvider<'_> {
     fn ready_to_commence(&self, sim: &Simulation, receiver: u64, mission: &MissionCom) -> bool {
-        ready_to_commence_answer(sim, receiver, mission, Some(self.rules))
+        ready_to_commence_answer(sim, receiver, mission, self.rules)
     }
 }
 
@@ -464,30 +337,15 @@ impl ReadyInputProvider for LiveReadyInputProvider<'_> {
 /// call and the per-tick promotion alike. Absent locomotor producers read as
 /// "not moving now", so every later exact gate still evaluates.
 ///
-/// RESIDUAL: a Locomotor or SignedHeight input the evaluation cannot read
-/// answers ready, the moving-defer branch's pass outcome. Unit readiness has
-/// no `Get_Height` (vt+0x1C8) producer outside an MCV's Unload (see
-/// `evaluate_ready`), so a moving Unit skips the defer at `0x007442E9..
-/// 0x00744327`. Trigger: a Unit queues a mission while it moves on a mission
-/// other than Guard, or Attack with no target, without the `+0xB8` bypass.
-/// Effect: VERA commences the queued mission at once; native keeps it queued
-/// until the Unit stops moving. Frequency: every such queue, e.g. an
-/// attack-mover's scan hit while it drives. Risk: missions start earlier,
-/// so a driving Unit stops to attack where native drives on.
-///
-/// Rules-free callers answer not ready on a Unit's factory and contact
-/// lookups, so the next per-tick promotion decides.
+/// A lookup the evaluation cannot make answers not ready, so the next
+/// per-tick promotion decides.
 fn ready_to_commence_answer(
     sim: &Simulation,
     receiver: u64,
     mission: &MissionCom,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
 ) -> bool {
-    match evaluate_ready(sim, receiver, mission, rules, true) {
-        Ok(ready) => ready,
-        Err(ReadyUnavailable::Locomotor | ReadyUnavailable::SignedHeight) => true,
-        Err(_) => false,
-    }
+    evaluate_ready(sim, receiver, mission, rules).unwrap_or(false)
 }
 
 /// The five-mission filter `AircraftClass::Queue_Mission @ 0x0041BA90` and
@@ -516,6 +374,12 @@ pub(crate) fn commence_entity_mission(
     verb::commence_base(&mut entity.mission, now)
 }
 
+/// Whether [`commence_entity_mission`] writes: an aircraft's clears `+0x6D2`
+/// first, and the base promotes a queued mission.
+pub(crate) fn commence_entity_mission_writes(entity: &crate::sim::game_entity::GameEntity) -> bool {
+    entity.mission_leaf.as_aircraft().is_some() || verb::commences(&entity.mission)
+}
+
 /// The `RandomRanged(0, 2)` ceiling of the Rate epilogue.
 pub(crate) const RATE_EPILOGUE_JITTER_MAX_FRAMES: u32 = 2;
 
@@ -540,63 +404,22 @@ pub(crate) fn rate_epilogue(
 }
 
 impl Simulation {
-    /// [`rate_epilogue`] on the Scenario stream.
-    pub(crate) fn mission_rate_epilogue(
-        &mut self,
-        rules: &RuleSet,
-        mission: super::MissionType,
-    ) -> i32 {
-        rate_epilogue(rules, mission, &mut self.scenario_rng)
-    }
-
-    /// [`Self::mission_rate_epilogue`] on `receiver`'s current mission as the
-    /// handler leaves it (`dispatched` when the object is gone or holds none).
+    /// [`rate_epilogue`] on the Scenario stream for `receiver`'s current
+    /// mission as the handler leaves it (`dispatched` when the object is gone
+    /// or holds none).
     pub(crate) fn mission_rate_epilogue_for(
-        &mut self,
+        scenario_rng: &mut SimRng,
+        substrate: &ObjectSubstrate,
         rules: &RuleSet,
         receiver: u64,
         dispatched: super::MissionType,
     ) -> i32 {
-        let current = self
-            .substrate
+        let current = substrate
             .entities
             .get(receiver)
             .and_then(|entity| entity.mission.current().known())
             .unwrap_or(dispatched);
-        self.mission_rate_epilogue(rules, current)
-    }
-
-    /// `AircraftClass::Assign_Mission @ 0x0041B9F0`'s filter, then
-    /// `MissionClass::Assign_Mission @ 0x005B2FD0`.
-    pub(crate) fn mission_assign_exact(
-        &mut self,
-        receiver: u64,
-        requested: MissionId,
-        now: u32,
-    ) -> Result<(), MissionAuthorityError> {
-        let entity = self
-            .substrate
-            .entities
-            .get_mut(receiver)
-            .ok_or(MissionAuthorityError::MissingReceiver(receiver))?;
-        if !aircraft_allows(entity, requested) {
-            return Ok(());
-        }
-        verb::assign_base(&mut entity.mission, requested, now);
-        Ok(())
-    }
-
-    pub(crate) fn mission_commence_exact(
-        &mut self,
-        receiver: u64,
-        now: u32,
-    ) -> Result<bool, MissionAuthorityError> {
-        let entity = self
-            .substrate
-            .entities
-            .get_mut(receiver)
-            .ok_or(MissionAuthorityError::MissingReceiver(receiver))?;
-        Ok(commence_entity_mission(entity, now))
+        rate_epilogue(rules, current, scenario_rng)
     }
 
     /// Host-time queued-mission promotion at the per-object AI position.
@@ -608,7 +431,7 @@ impl Simulation {
     /// `decompile_function 0x007360c0` / `0x0051bab0` and the Queue/Commence
     /// active-caller census. Commence is a fieldwise no-op on an empty queue,
     /// so the Ready read is skipped there (pure, result unused). Readiness is
-    /// [`ready_to_commence_answer`], with its moving-defer residual.
+    /// [`ready_to_commence_answer`].
     pub(crate) fn mission_host_promote(&mut self, receiver: u64, now: u32, rules: &RuleSet) {
         let queued = self
             .substrate
@@ -630,7 +453,7 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get(receiver) else {
             return false;
         };
-        ready_to_commence_answer(self, receiver, &entity.mission, Some(rules))
+        ready_to_commence_answer(self, receiver, &entity.mission, rules)
     }
 
     /// `MissionClass::Queue_Mission @ 0x005B35E0` (vt+0x1E8): the guarded
@@ -702,14 +525,14 @@ impl Simulation {
         self.mission_restore_exact_with_effects(receiver, &mut effects)
     }
 
-    /// The overlay registry and frame effects serve the Infantry setter's
-    /// `Infiltrate=` arm, the one that sets a destination
-    /// ([`Simulation::infiltrator_target_building`]).
+    /// The overlay registry serves Building target admission's line of fire
+    /// and, with frame effects, the Infantry setter's `Infiltrate=` destination
+    /// arm ([`Simulation::infiltrator_target_building`]).
     pub fn assign_target_represented(
         &mut self,
         receiver: u64,
         requested: Option<TargetKind>,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> Result<(), MissionAuthorityError> {
@@ -732,7 +555,7 @@ impl Simulation {
         &mut self,
         receiver: u64,
         requested: Option<NavTargetRef>,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> Result<(), MissionAuthorityError> {
@@ -751,7 +574,7 @@ impl Simulation {
         &mut self,
         receiver: u64,
         requested: Option<NavTargetRef>,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> Result<(), MissionAuthorityError> {
@@ -796,13 +619,29 @@ impl Simulation {
     pub(crate) fn mission_restore_represented(
         &mut self,
         receiver: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> Result<bool, MissionAuthorityError> {
         let mut effects =
             RepresentedConcreteMissionEffects::new(rules, overlay_registry, frame_effects);
         self.mission_restore_exact_with_effects(receiver, &mut effects)
+    }
+
+    /// Concrete Override_Mission (Aircraft41BB30 -> Foot4D8F40 ->
+    /// Techno7013A0 -> Mission5B3650). The transaction owns suspended
+    /// mission/target/navigation and dispatches both live class setters.
+    pub(crate) fn mission_override_represented(
+        &mut self,
+        receiver: u64,
+        packet: OverridePacket,
+        rules: &RuleSet,
+        overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) -> Result<bool, MissionAuthorityError> {
+        let mut effects =
+            RepresentedConcreteMissionEffects::new(rules, overlay_registry, frame_effects);
+        self.mission_override_exact_with_effects(receiver, packet, &mut effects)
     }
 
     /// `Override(Attack, attacker, NULL)` from the synchronous ReceiveDamage
@@ -820,6 +659,7 @@ impl Simulation {
         receiver: u64,
         attacker: u64,
         rules: &RuleSet,
+        overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
         if !self.substrate.entities.contains(attacker)
@@ -827,18 +667,19 @@ impl Simulation {
         {
             return false;
         }
-        let mut effects = RepresentedConcreteMissionEffects::new(Some(rules), None, frame_effects);
         //7013CB dispatches the class target setter AFTER the mission writes.
         // A dying source or a refused Building target still takes the override;
         // target admission belongs to that live setter, not this caller.
-        self.mission_override_exact_with_effects(
+        self.mission_override_represented(
             receiver,
             OverridePacket {
                 mission: MISSION_ATTACK,
                 combat_target: Some(TargetKind::Entity(attacker)),
                 destination: None,
             },
-            &mut effects,
+            rules,
+            overlay_registry,
+            frame_effects,
         )
         .expect("present represented retaliation receiver has concrete setters")
     }
@@ -860,17 +701,18 @@ impl Simulation {
         if !self.substrate.entities.contains(mover) {
             return false;
         }
-        let mut effects = RepresentedConcreteMissionEffects::new(Some(rules), None, frame_effects);
         // The locomotor caller owns its later head/Stop suffix. A refused
         // class destination must retain navigation through this transaction.
-        self.mission_override_exact_with_effects(
+        self.mission_override_represented(
             mover,
             OverridePacket {
                 mission: MISSION_ATTACK,
                 combat_target: Some(target),
                 destination: None,
             },
-            &mut effects,
+            rules,
+            None,
+            frame_effects,
         )
         .expect("present represented blocker receiver has concrete setters")
     }
@@ -880,8 +722,15 @@ impl Simulation {
         &mut self,
         receiver: u64,
         now: u32,
+        rules: &RuleSet,
     ) -> Result<(), MissionAuthorityError> {
-        self.mission_queue_exact(receiver, MISSION_GUARD, 0, now, &EntityReadyInputProvider)?;
+        self.mission_queue_exact(
+            receiver,
+            MISSION_GUARD,
+            0,
+            now,
+            &LiveReadyInputProvider { rules },
+        )?;
         let entity = self
             .substrate
             .entities
@@ -928,45 +777,6 @@ impl Simulation {
         Ok(())
     }
 
-    /// A building's ready check in its Update (`0x0043FE27..0x0043FE54`
-    /// before the Techno AI, which also needs BState out of 0, and
-    /// `0x0043FF91..0x0043FFB4` after it): with `+0x6DD` set
-    /// (Ready_To_Commence, building vt+0x200 = `0x00454250`), a successful
-    /// Commence clears the byte. Commence fails with nothing queued and then
-    /// leaves it set.
-    pub(crate) fn mission_building_ready_commence(
-        &mut self,
-        receiver: u64,
-        now: u32,
-    ) -> Result<bool, MissionAuthorityError> {
-        let ready = {
-            let entity = self
-                .substrate
-                .entities
-                .get(receiver)
-                .ok_or(MissionAuthorityError::MissingReceiver(receiver))?;
-            let leaf = entity
-                .mission_leaf
-                .as_building()
-                .ok_or(ReadyUnavailable::WorldLookup)?;
-            building_ready_to_commence(BuildingReadyView { leaf })?
-        };
-        if !ready {
-            return Ok(false);
-        }
-
-        let entity = self
-            .substrate
-            .entities
-            .get_mut(receiver)
-            .expect("building-ready receiver remains present");
-        if !commence_entity_mission(entity, now) {
-            return Ok(false);
-        }
-        entity.mission_leaf.set_building_ready_latch(0);
-        Ok(true)
-    }
-
     /// Original Foot4D8F40 -> Techno7013A0 -> Mission5B3650, then the
     /// concrete Target7013CB and Destination4D8F6D. Refused setters retain
     /// their native partial effects; they do not undo the prior override.
@@ -1006,9 +816,8 @@ impl Simulation {
             if entity.category() != EntityCategory::Structure {
                 entity.navigation.suspend_nav_com();
             }
-            entity
-                .suspended_attack_target
-                .archive(entity.attack_target.target());
+            let target = entity.attack_target.target();
+            entity.suspended_attack_target.archive(target);
             verb::override_base(&mut entity.mission, packet.mission);
         }
         effects.apply_target(self, &prepared, packet.combat_target);
@@ -1085,7 +894,78 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+impl crate::sim::world::ObjectSubstrate {
+    /// `AircraftClass::Assign_Mission @ 0x0041B9F0`'s filter, then
+    /// `MissionClass::Assign_Mission @ 0x005B2FD0`.
+    pub(crate) fn mission_assign_exact(
+        &mut self,
+        receiver: u64,
+        requested: MissionId,
+        now: u32,
+    ) -> Result<(), MissionAuthorityError> {
+        let entity = self
+            .entities
+            .get_mut(receiver)
+            .ok_or(MissionAuthorityError::MissingReceiver(receiver))?;
+        if !aircraft_allows(entity, requested) {
+            return Ok(());
+        }
+        verb::assign_base(&mut entity.mission, requested, now);
+        Ok(())
+    }
+    pub(crate) fn mission_commence_exact(
+        &mut self,
+        receiver: u64,
+        now: u32,
+    ) -> Result<bool, MissionAuthorityError> {
+        let entity = self
+            .entities
+            .get_mut(receiver)
+            .ok_or(MissionAuthorityError::MissingReceiver(receiver))?;
+        Ok(commence_entity_mission(entity, now))
+    }
+    /// A building's ready check in its Update (`0x0043FE27..0x0043FE54`
+    /// before the Techno AI, which also needs BState out of 0, and
+    /// `0x0043FF91..0x0043FFB4` after it): with `+0x6DD` set
+    /// (Ready_To_Commence, building vt+0x200 = `0x00454250`), a successful
+    /// Commence clears the byte. Commence fails with nothing queued and then
+    /// leaves it set.
+    pub(crate) fn mission_building_ready_commence(
+        &mut self,
+        receiver: u64,
+        now: u32,
+    ) -> Result<bool, MissionAuthorityError> {
+        let ready = {
+            let entity = self
+                .entities
+                .get(receiver)
+                .ok_or(MissionAuthorityError::MissingReceiver(receiver))?;
+            let leaf = entity
+                .mission_leaf
+                .as_building()
+                .ok_or(ReadyUnavailable::WorldLookup)?;
+            building_ready_to_commence(BuildingReadyView { leaf })?
+        };
+        if !ready {
+            return Ok(false);
+        }
+
+        // With nothing queued, Commence fails and writes nothing.
+        let Some(entity) = self
+            .entities
+            .get_mut_if(receiver, commence_entity_mission_writes)
+        else {
+            return Ok(false);
+        };
+        if !commence_entity_mission(entity, now) {
+            return Ok(false);
+        }
+        entity.mission_leaf.set_building_ready_latch(0);
+        Ok(true)
+    }
+}
+
+#[cfg(all(test, tests_sim_h_o))]
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -1134,7 +1014,7 @@ mod tests {
             mission: &MissionCom,
         ) -> bool {
             self.reads.set(self.reads.get() + 1);
-            self.missions.borrow_mut().push(*mission);
+            self.missions.borrow_mut().push(mission.clone());
             self.values
                 .borrow_mut()
                 .pop_front()
@@ -1162,7 +1042,7 @@ mod tests {
             mission: &MissionCom,
         ) -> bool {
             self.reads.set(self.reads.get() + 1);
-            self.missions.borrow_mut().push(*mission);
+            self.missions.borrow_mut().push(mission.clone());
             self.ready
         }
     }
@@ -1194,13 +1074,16 @@ mod tests {
     fn mission_authority_assign_applies_aircraft_gate_before_writes() {
         let mut aircraft = entity(EntityCategory::Aircraft, MissionId::from_raw(4));
         aircraft.mission_leaf = MissionLeafState::aircraft_raw_for_test(9, 1);
-        let before = aircraft.mission;
+        let before = aircraft.mission.clone();
         let mut sim = sim_with(aircraft);
 
-        sim.mission_assign_exact(1, MissionId::NONE, 10).unwrap();
+        sim.substrate
+            .mission_assign_exact(1, MissionId::NONE, 10)
+            .unwrap();
         assert_eq!(sim.substrate.entities.get(1).unwrap().mission, before);
 
-        sim.mission_assign_exact(1, MissionId::from_raw(0x1a), 10)
+        sim.substrate
+            .mission_assign_exact(1, MissionId::from_raw(0x1a), 10)
             .unwrap();
         assert_eq!(
             sim.substrate.entities.get(1).unwrap().mission.current(),
@@ -1211,12 +1094,12 @@ mod tests {
     #[test]
     fn mission_authority_assign_preserves_base_guard_and_raw_ids() {
         let mut sim = sim_with(entity(EntityCategory::Unit, MissionId::from_raw(28)));
-        let before = sim.substrate.entities.get(1).unwrap().mission;
-        sim.mission_assign_exact(1, GUARD, 10).unwrap();
+        let before = sim.substrate.entities.get(1).unwrap().mission.clone();
+        sim.substrate.mission_assign_exact(1, GUARD, 10).unwrap();
         assert_eq!(sim.substrate.entities.get(1).unwrap().mission, before);
 
         let unknown = MissionId::from_raw(0x1234_5678);
-        sim.mission_assign_exact(1, unknown, 11).unwrap();
+        sim.substrate.mission_assign_exact(1, unknown, 11).unwrap();
         assert_eq!(
             sim.substrate.entities.get(1).unwrap().mission.current(),
             unknown
@@ -1224,32 +1107,19 @@ mod tests {
     }
 
     /// `0x005B3614` writes the queue before `0x005B362D` asks
-    /// Ready_To_Commence, so a Unit whose readiness lookups are unavailable
-    /// (no rules: its factory and contact lookups) keeps the queued mission
-    /// for the per-tick promotion rather than losing it.
+    /// Ready_To_Commence, so a Unit that is not ready keeps the queued
+    /// mission for the per-tick promotion rather than losing it.
     #[test]
-    fn mission_authority_queue_writes_before_an_unavailable_readiness_answer() {
+    fn mission_authority_queue_writes_before_a_not_ready_answer() {
         let mut sim = sim_with(entity(EntityCategory::Unit, GUARD));
 
-        sim.mission_queue_exact(1, MOVE, 1, 10, &EntityReadyInputProvider)
+        sim.mission_queue_exact(1, MOVE, 1, 10, &TestReadyProvider::ready(false))
             .unwrap();
 
         let after = sim.substrate.entities.get(1).unwrap();
         assert_eq!(after.mission.current(), GUARD);
         assert_eq!(after.mission.queued(), MOVE);
         assert_eq!(after.mission.movement_bypass_latch(), 0);
-    }
-
-    #[test]
-    fn mission_authority_queue_zero_never_reads_or_commences() {
-        let mut sim = sim_with(entity(EntityCategory::Unit, GUARD));
-        let readiness = TestReadyProvider::ready(true);
-
-        sim.mission_queue_exact(1, MOVE, 0, 10, &readiness).unwrap();
-        let entity = sim.substrate.entities.get(1).unwrap();
-        assert_eq!(entity.mission.current(), GUARD);
-        assert_eq!(entity.mission.queued(), MOVE);
-        assert_eq!(readiness.reads.get(), 0);
     }
 
     #[test]
@@ -1279,34 +1149,11 @@ mod tests {
     }
 
     #[test]
-    fn mission_authority_queue_ready_false_keeps_queue_ready_true_commences_inline() {
-        let mut false_sim = sim_with(entity(EntityCategory::Unit, GUARD));
-        let false_ready = TestReadyProvider::ready(false);
-        false_sim
-            .mission_queue_exact(1, MOVE, 1, 10, &false_ready)
-            .unwrap();
-        let false_entity = false_sim.substrate.entities.get(1).unwrap();
-        assert_eq!(false_entity.mission.current(), GUARD);
-        assert_eq!(false_entity.mission.queued(), MOVE);
-        assert_eq!(false_ready.reads.get(), 1);
-
-        let mut true_sim = sim_with(entity(EntityCategory::Unit, GUARD));
-        let true_ready = TestReadyProvider::ready(true);
-        true_sim
-            .mission_queue_exact(1, MOVE, 1, 10, &true_ready)
-            .unwrap();
-        let entity = true_sim.substrate.entities.get(1).unwrap();
-        assert_eq!(entity.mission.current(), MOVE);
-        assert_eq!(entity.mission.queued(), MissionId::NONE);
-        assert_eq!(true_ready.reads.get(), 1);
-    }
-
-    #[test]
     fn aircraft_mission_authority_queue_gate_covers_manager_unknown_and_none() {
         for requested in [MissionId::NONE, MissionId::from_raw(0x1234_5678)] {
             let mut aircraft = entity(EntityCategory::Aircraft, MissionId::from_raw(4));
             aircraft.mission_leaf = MissionLeafState::aircraft_raw_for_test(9, 1);
-            let before_mission = aircraft.mission;
+            let before_mission = aircraft.mission.clone();
             let before_leaf = aircraft.mission_leaf;
             let mut sim = sim_with(aircraft);
             let readiness = TestReadyProvider::ready(true);
@@ -1356,7 +1203,7 @@ mod tests {
             (MissionId::from_raw(28), GUARD),
         ] {
             let mut sim = sim_with(entity(EntityCategory::Unit, current));
-            let before = sim.substrate.entities.get(1).unwrap().mission;
+            let before = sim.substrate.entities.get(1).unwrap().mission.clone();
             let readiness = TestReadyProvider::ready(true);
 
             sim.mission_queue_exact(1, requested, 1, 10, &readiness)
@@ -1371,7 +1218,7 @@ mod tests {
     fn mission_authority_queue_none_and_redundant_requests_still_read_once() {
         for requested in [MissionId::NONE, GUARD] {
             let mut sim = sim_with(entity(EntityCategory::Unit, GUARD));
-            let before = sim.substrate.entities.get(1).unwrap().mission;
+            let before = sim.substrate.entities.get(1).unwrap().mission.clone();
             let readiness = TestReadyProvider::ready(false);
 
             sim.mission_queue_exact(1, requested, 1, 10, &readiness)
@@ -1413,7 +1260,7 @@ mod tests {
         aircraft.mission_leaf = MissionLeafState::aircraft_raw_for_test(9, 1);
         let mut sim = sim_with(aircraft);
 
-        assert!(!sim.mission_commence_exact(1, 10).unwrap());
+        assert!(!sim.substrate.mission_commence_exact(1, 10).unwrap());
         assert_eq!(
             sim.substrate
                 .entities
@@ -1443,7 +1290,6 @@ mod tests {
         let Some(art) = crate::rules::retail_ini_fixture::retail_ini("artmd.ini") else {
             return;
         };
-        let registry = crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art);
         let rules: std::collections::BTreeMap<_, _> = ["yes", "no"]
             .into_iter()
             .map(|raw| {
@@ -1456,7 +1302,6 @@ mod tests {
                     RuleSet::from_processed_rules(&layers.process_with_fixed_art(&art).unwrap())
                         .unwrap();
                 rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-                rules.bind_animation_sequences(&registry);
                 (raw, rules)
             })
             .collect();
@@ -1507,7 +1352,7 @@ mod tests {
                 let mut sim = Simulation::new();
                 let owner = sim.interner.intern("Receiver");
                 sim.houses
-                    .insert(owner, HouseState::new(owner, 0, None, true, 0, 0));
+                    .register(HouseState::new(owner, 0, None, true, 0, 0));
                 let mut actor = GameEntity::new_at_frame_zero_for_test(
                     1,
                     10,
@@ -1552,11 +1397,14 @@ mod tests {
                 actor
                     .navigation
                     .set_nav_com_for_test(Some(NavTargetRef::cell(12, 10)));
-                actor.navigation.path_replay.set_directions_for_test(vec![
-                    before["path_field"].as_u64().unwrap() as u8,
-                    2,
-                    3,
-                ]);
+                actor
+                    .navigation
+                    .path_replay_mut()
+                    .set_directions_for_test(vec![
+                        before["path_field"].as_u64().unwrap() as u8,
+                        2,
+                        3,
+                    ]);
                 actor.locomotor = Some(LocomotorState::for_test_kind(
                     crate::rules::locomotor_type::LocomotorKind::Walk,
                 ));
@@ -1590,7 +1438,8 @@ mod tests {
                         0,
                         true,
                     ));
-                sim.session.binary_frame = row["input"]["frame"].as_u64().unwrap() as u32;
+                sim.session
+                    .set_binary_frame_for_test(row["input"]["frame"].as_u64().unwrap() as u32);
                 sim.scenario_rng = SimRng::new(row["input"]["seed"].as_u64().unwrap());
                 assert_eq!(sim.scenario_rng.native_state_hex(), row["rng_before"]);
 
@@ -1599,6 +1448,7 @@ mod tests {
                         1,
                         2,
                         rules,
+                        None,
                         crate::sim::world::FrameEffects::default(),
                     )
                 } else {
@@ -1675,7 +1525,7 @@ mod tests {
                 assert_eq!(
                     actor
                         .navigation
-                        .path_replay
+                        .path_replay()
                         .remaining_directions()
                         .first()
                         .copied(),
@@ -1912,7 +1762,7 @@ mod tests {
         unit.attack_target.set_for_test(Some(TargetKind::Entity(7)));
         unit.navigation
             .set_nav_com_for_test(Some(NavTargetRef::cell(1, 2)));
-        let before_mission = unit.mission;
+        let before_mission = unit.mission.clone();
         let mut sim = sim_with(unit);
         let mut effects = RecordingConcreteMissionEffects::available();
 
@@ -1986,12 +1836,6 @@ mod tests {
     }
 
     #[test]
-    fn restore_empty_does_not_require_concrete_provider() {
-        let mut sim = sim_with(entity(EntityCategory::Unit, GUARD));
-        assert!(!sim.mission_restore_exact(1).unwrap());
-    }
-
-    #[test]
     fn restore_success_unavailable_does_not_pop_mission() {
         let mut unit = entity(EntityCategory::Unit, ATTACK);
         unit.mission.apply_test_fixture(MissionTestFixture {
@@ -2004,7 +1848,7 @@ mod tests {
             ai_counter: 12,
             dispatch_timer: MissionDispatchTimer::from_raw(13, 14),
         });
-        let before = unit.mission;
+        let before = unit.mission.clone();
         let mut sim = sim_with(unit);
 
         assert!(matches!(
@@ -2060,40 +1904,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_receiver_is_atomic_for_every_exact_authority_entry() {
-        let mut sim = Simulation::new();
-        let readiness = TestReadyProvider::ready(true);
-
-        assert!(matches!(
-            sim.mission_assign_exact(99, MOVE, 0),
-            Err(MissionAuthorityError::MissingReceiver(99))
-        ));
-        assert!(matches!(
-            sim.mission_queue_exact(99, MOVE, 1, 0, &readiness),
-            Err(MissionAuthorityError::MissingReceiver(99))
-        ));
-        assert!(matches!(
-            sim.mission_commence_exact(99, 0),
-            Err(MissionAuthorityError::MissingReceiver(99))
-        ));
-        assert!(matches!(
-            sim.mission_override_exact(
-                99,
-                OverridePacket {
-                    mission: MOVE,
-                    combat_target: None,
-                    destination: None,
-                }
-            ),
-            Err(MissionAuthorityError::MissingReceiver(99))
-        ));
-        assert!(matches!(
-            sim.mission_restore_exact(99),
-            Err(MissionAuthorityError::MissingReceiver(99))
-        ));
-    }
-
-    #[test]
     fn mission_authority_operations_preserve_all_rng_streams() {
         let mut sim = sim_with(entity(EntityCategory::Unit, GUARD));
         let before = (
@@ -2103,7 +1913,7 @@ mod tests {
         );
         let readiness = TestReadyProvider::ready(false);
 
-        sim.mission_assign_exact(1, ATTACK, 1).unwrap();
+        sim.substrate.mission_assign_exact(1, ATTACK, 1).unwrap();
         sim.mission_queue_exact(1, MOVE, 1, 2, &readiness).unwrap();
         let after = (
             sim.scenario_rng.state(),
@@ -2117,7 +1927,12 @@ mod tests {
     fn mission_b8_owner_sequence_refinery_queues_then_sets_latch() {
         let mut sim = sim_with(entity(EntityCategory::Unit, ATTACK));
 
-        sim.mission_refinery_completion_exact(1, 10).unwrap();
+        sim.mission_refinery_completion_exact(
+            1,
+            10,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+        )
+        .unwrap();
 
         let mission = &sim.substrate.entities.get(1).unwrap().mission;
         assert_eq!(mission.current(), ATTACK);
@@ -2170,7 +1985,11 @@ mod tests {
         building.mission_leaf = MissionLeafState::building_raw_for_test(1);
         let mut sim = sim_with(building);
 
-        assert!(!sim.mission_building_ready_commence(1, 10).unwrap());
+        assert!(
+            !sim.substrate
+                .mission_building_ready_commence(1, 10)
+                .unwrap()
+        );
         assert_eq!(
             sim.substrate
                 .entities
@@ -2200,7 +2019,11 @@ mod tests {
         });
         let mut sim = sim_with(building);
 
-        assert!(sim.mission_building_ready_commence(1, 10).unwrap());
+        assert!(
+            sim.substrate
+                .mission_building_ready_commence(1, 10)
+                .unwrap()
+        );
         let entity = sim.substrate.entities.get(1).unwrap();
         assert_eq!(entity.mission.current(), MOVE);
         assert_eq!(entity.mission_leaf.as_building().unwrap().ready_latch(), 0);

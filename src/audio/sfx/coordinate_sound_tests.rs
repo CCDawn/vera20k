@@ -295,6 +295,31 @@ fn inaudible_requests_use_the_independent_native200_pool_and_reap_in_order() {
     });
 }
 
+/// `GamePause::Enter @ 0x00406F00` skips the sound half while ChronoScreen
+/// runs (`0x0053BAD0`); `Exit @ 0x00406F40` resumes it unconditionally.
+#[test]
+fn a_pause_exit_resumes_sounds_even_while_chrono_screen_runs() {
+    with_player(|player, registry, _assets, _index| {
+        let sound = cue("sound_index");
+        let gain = gain("coordinate_before_nested_pause", sound, registry).unwrap();
+        assert!(player.play_sound_at_coord(
+            sound,
+            coordinate(),
+            request_flags(),
+            source(),
+            Some(gain),
+            registry
+        ));
+        player.set_paused(true, 1000);
+        assert_eq!(player.coordinate_requests[0].suspend_depth, 1);
+        player.set_chrono_screen_active(true);
+        player.set_paused(false, 2000);
+        assert_eq!(player.coordinate_requests[0].suspend_depth, 0);
+        player.set_paused(true, 3000);
+        assert_eq!(player.coordinate_requests[0].suspend_depth, 0);
+    });
+}
+
 #[test]
 fn retained_request_depths_and_newborn_depth_match_executed_nested_pause() {
     with_player(|player, registry, _assets, _index| {
@@ -432,5 +457,41 @@ fn coordinate_stop_matches_full_xyz_and_intersecting_flags_without_hard_stop() {
             player.coordinate_requests.is_empty(),
             "750EC0 owns retirement"
         );
+    });
+}
+
+/// `VocClass::SaveStaticSounds @ 0x00751620` writes every node;
+/// `LoadStaticSounds @ 0x00751710` brings back only the loopable ones, with
+/// flags 0, so a map's ambient loop survives a save and TAction 116's mask 1
+/// (`0x006E1A31`) no longer stops it.
+#[test]
+fn a_saved_ambient_loop_returns_after_load_and_a_one_shot_does_not() {
+    with_player(|player, registry, _assets, _index| {
+        let (looped, once) = ("OilDerrickLoop", "GIMove");
+        let at = coordinate();
+        let elsewhere = [at[0] + 256, at[1], at[2]];
+        assert!(player.play_sound_at_coord(looped, at, 1, source(), None, registry));
+        assert!(player.play_sound_at_coord(
+            once,
+            elsewhere,
+            1,
+            SoundSource::from_coordinate(elsewhere),
+            None,
+            registry,
+        ));
+        let saved = player.saved_static_sounds();
+        let nodes: Vec<_> = saved
+            .iter()
+            .map(|node| (node.sound_id.as_str(), node.coordinate))
+            .collect();
+        assert_eq!(nodes, [("OILDERRICKLOOP", at), ("GIMOVE", elsewhere)]);
+
+        player.stop_all();
+        player.restore_static_sounds(&saved, registry);
+        assert_eq!(player.saved_static_sounds(), saved[..1]);
+        assert_eq!(player.coordinate_requests[0].flags, 0);
+        player.stop_sound_at_coord(at, 1);
+        player.service_coordinate_sounds(registry);
+        assert_eq!(player.coordinate_requests.len(), 1, "flags 0 match no mask");
     });
 }

@@ -4,8 +4,8 @@
 //! Native owner: `HouseClass`. `+0x5650` (Unit), `+0x5654` (Infantry) and
 //! `+0x5658` (Aircraft) hold a type's index in its class array, -1 for none
 //! (constructor `0x004F5BC6..0x004F5BD2`). The choosers (`AI_Choose_Unit @
-//! 0x004FEA60`; `0x004FEEE0` for infantry and `0x004FF210` for aircraft,
-//! whose Ghidra labels are swapped) fill a choice that is -1; the house's
+//! 0x004FEA60`; `0x004FEEE0` for infantry and `0x004FF210` for aircraft)
+//! fill a choice that is -1; the house's
 //! chooser dispatch calls them (`sim::ai_base_building`). A factory building
 //! makes the choice (`Suggest_New_Object @ 0x004FBD80`,
 //! `production::factory_ai`), whose exit clears it again
@@ -30,13 +30,13 @@
 //! Available_Money, IsRecruitable and the draws hooked (the
 //! `ai_unit_choice_tests` goldens).
 //!
-//! RESIDUALS:
-//! - Native tallies need in stack arrays of 100 entries: a class with more
-//!   than 100 types, or more than 100 candidate types, writes past them.
-//!   VERA sizes them by the class. Retail classes hold fewer than 100 types.
-//! - A team's `+0x79` (full) and `+0x77` (forced) are written only by
-//!   recruitment, which is not ported (`sim::team_script_vm`), so a
-//!   `Reinforce=` team counts as needing members forever.
+//! A team's `+0x79` (full) comes from `TeamClass::Recalc @ 0x006EA3E0` and
+//! team creation, its `+0x77` (forced) from reinforcement creation
+//! (`0x0065DD64`), all in `sim::team_script_vm`.
+//!
+//! RESIDUAL: native tallies need in stack arrays of 100 entries: a class with
+//! more than 100 types, or more than 100 candidate types, writes past them.
+//! VERA sizes them by the class. Retail classes hold fewer than 100 types.
 
 use serde::{Deserialize, Serialize};
 
@@ -47,17 +47,17 @@ use crate::sim::game_entity::GameEntity;
 use crate::sim::intern::InternedId;
 use crate::sim::production::{CanBuild, can_build};
 use crate::sim::world::Simulation;
-use crate::util::native_x87::{NativeF64Bits, X87Chop53, X87Ordering};
+use crate::util::native_random::unit_draw_threshold;
+use crate::util::native_x87::{NativeF64Bits, X87Chop53};
 
-/// `1 / 0x7FFFFFFE` as the choosers scale their draw (`[0x007E3570]`).
-const DRAW_SCALE: NativeF64Bits = NativeF64Bits::from_bits(0x3E00_0000_0040_0000);
 /// `0.01` (`[0x007E3808]`).
 const PERCENT_SCALE: NativeF64Bits = NativeF64Bits::from_bits(0x3F84_7AE1_47AE_147B);
 
-/// One of the three choices.
+/// One of the house's mobile production choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnitChoiceKind {
     Unit,
+    NavalUnit,
     Infantry,
     Aircraft,
 }
@@ -66,15 +66,18 @@ impl UnitChoiceKind {
     /// The class array the choice indexes.
     pub(crate) const fn category(self) -> ObjectCategory {
         match self {
-            Self::Unit => ObjectCategory::Vehicle,
+            Self::Unit | Self::NavalUnit => ObjectCategory::Vehicle,
             Self::Infantry => ObjectCategory::Infantry,
             Self::Aircraft => ObjectCategory::Aircraft,
         }
     }
 
     /// The choice a produced object of `category` fills; none for a building.
-    pub(crate) const fn of(category: ObjectCategory) -> Option<Self> {
+    pub(crate) const fn of(category: ObjectCategory, naval: bool) -> Option<Self> {
         match category {
+            ObjectCategory::Vehicle if crate::rules::NPATCH_ENABLED && naval => {
+                Some(Self::NavalUnit)
+            }
             ObjectCategory::Vehicle => Some(Self::Unit),
             ObjectCategory::Infantry => Some(Self::Infantry),
             ObjectCategory::Aircraft => Some(Self::Aircraft),
@@ -85,11 +88,27 @@ impl UnitChoiceKind {
 
 /// `HouseClass+0x5650`, `+0x5654` and `+0x5658`: a type index in its class
 /// array, -1 for none.
+///
+/// NPSE adds a second vehicle slot at `House+0x16130` (initialised to -1 at
+/// `0xC31275`) for naval yards, so a shipyard and a war factory stop sharing
+/// one choice: `Suggest_New_Object`'s hook (`0x4FBDAF -> 0xC2F130`) reads the
+/// producer's `Naval=` (`Type+0xCCE`) and takes `+0x16130` for a naval
+/// producer, `+0x5650` otherwise. An ordinary build keeps the vanilla single
+/// slot and never reads the naval choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HouseAiUnitChoices {
     unit: i32,
     infantry: i32,
     aircraft: i32,
+    /// `House+0x16130` (NPSE): the naval yard's vehicle choice, -1 for none.
+    #[serde(default = "no_choice")]
+    naval_unit: i32,
+}
+
+/// The constructor's `-1` for a choice slot, also the value a saved state
+/// without the NPSE field loads as.
+fn no_choice() -> i32 {
+    -1
 }
 
 impl Default for HouseAiUnitChoices {
@@ -98,6 +117,7 @@ impl Default for HouseAiUnitChoices {
             unit: -1,
             infantry: -1,
             aircraft: -1,
+            naval_unit: -1,
         }
     }
 }
@@ -106,6 +126,7 @@ impl HouseAiUnitChoices {
     pub(crate) const fn get(&self, kind: UnitChoiceKind) -> i32 {
         match kind {
             UnitChoiceKind::Unit => self.unit,
+            UnitChoiceKind::NavalUnit => self.naval_unit,
             UnitChoiceKind::Infantry => self.infantry,
             UnitChoiceKind::Aircraft => self.aircraft,
         }
@@ -114,9 +135,19 @@ impl HouseAiUnitChoices {
     fn slot_mut(&mut self, kind: UnitChoiceKind) -> &mut i32 {
         match kind {
             UnitChoiceKind::Unit => &mut self.unit,
+            UnitChoiceKind::NavalUnit => &mut self.naval_unit,
             UnitChoiceKind::Infantry => &mut self.infantry,
             UnitChoiceKind::Aircraft => &mut self.aircraft,
         }
+    }
+
+    /// `AI_Manage_Build_Queue` 4FE09A..4FE0B5 clears the original three
+    /// choices. NPSE 2.0 preserves an unconsumed naval choice here; held
+    /// objects clear their own channel through AbandonProduction first.
+    pub(crate) fn clear_all(&mut self) {
+        self.unit = -1;
+        self.infantry = -1;
+        self.aircraft = -1;
     }
 
     /// An exit or abandon of `kind`'s object.
@@ -152,27 +183,36 @@ pub(crate) fn choose(
     let Some(house) = sim.houses.get(&owner) else {
         return;
     };
-    if house.ai_unit_choices.get(kind) != -1 {
+    if house.ai_unit_choices().get(kind) != -1 {
         return;
     }
     let fill_earliest_percent =
         house.difficulty_value(&rules.general.fill_earliest_team_probability);
-    let choice = match (kind == UnitChoiceKind::Unit)
+    let choice = match matches!(kind, UnitChoiceKind::Unit | UnitChoiceKind::NavalUnit)
         .then(|| harvester_choice(sim, rules, owner))
         .flatten()
     {
-        Some(index) => Some(index),
+        // NPSE 2.0 C339D0..C33A34 returns from the harvester branch even
+        // for the other channel's type: no team fallback or chooser RNG.
+        Some(index) => (!crate::rules::NPATCH_ENABLED
+            || rules
+                .type_array_at(ObjectCategory::Vehicle, index)
+                .is_some_and(|ty| ty.naval == (kind == UnitChoiceKind::NavalUnit)))
+        .then_some(index),
         None => {
             let candidates = candidates(sim, rules, owner, kind);
-            pick(&candidates, fill_earliest_percent, |low, high| {
-                sim.scenario_rng.next_range_i32_inclusive(low, high)
-            })
+            pick(
+                &candidates,
+                fill_earliest_percent,
+                rules.ares_form(),
+                |low, high| sim.scenario_rng.next_range_i32_inclusive(low, high),
+            )
         }
     };
     if let Some(index) = choice
         && let Some(house) = sim.houses.get_mut(&owner)
     {
-        *house.ai_unit_choices.slot_mut(kind) = index;
+        *house.ai_unit_choices_mut().slot_mut(kind) = index;
     }
 }
 
@@ -181,31 +221,35 @@ pub(crate) fn choose(
 fn harvester_choice(sim: &Simulation, rules: &RuleSet, owner: InternedId) -> Option<i32> {
     let house = sim.houses.get(&owner)?;
     let country_name = sim.interner.resolve(house.house_type_id());
-    let country_bit = crate::sim::ai_buildable::house_country_bit(rules, country_name);
+    let country_bit = rules.country_owner_mask(country_name);
     let unit_index = |id: &str| rules.type_array_index(ObjectCategory::Vehicle, id);
     let refinery = crate::sim::ai_buildable::first_buildable_from_array(
         rules,
         &rules.build_refinery_types,
         country_name,
-        house.side_index,
-        sim.session.game_options.super_weapons,
+        house.side_index(),
+        sim.session.game_options().super_weapons,
     );
     let harvester = crate::sim::ai_buildable::first_owner_compatible_harvester(rules, country_bit);
-    harvester_decision(&HarvesterFacts {
-        harvester: harvester.and_then(|harvester| {
-            Some((unit_index(&harvester.id)?, sim.object_tech_level(harvester)))
-        }),
-        refinery: refinery.map(|refinery| refinery.undeploys_into.as_deref().and_then(unit_index)),
-        gatherers: house.tracking.resource_gatherers(),
-        destinations: house.tracking.resource_destinations(),
-        harvesters_per_refinery: house.difficulty_value(&rules.general.harvesters_per_refinery),
-        slave_miners: house.difficulty_value(&rules.ai_slave_miner_number),
-        current_iq: house.current_iq,
-        iq_harvester: rules.general.iq_harvester,
-        no_ore: house.harvester_no_ore,
-        human: house.is_controlled_by_human(sim.session.game_mode_nonzero),
-        tech_level: house.tech_level,
-    })
+    harvester_decision(
+        &HarvesterFacts {
+            harvester: harvester.and_then(|harvester| {
+                Some((unit_index(&harvester.id)?, sim.object_tech_level(harvester)))
+            }),
+            refinery: refinery
+                .map(|refinery| refinery.undeploys_into.as_deref().and_then(unit_index)),
+            gatherers: house.tracking().resource_gatherers(),
+            destinations: house.tracking().resource_destinations(),
+            harvesters_per_refinery: house.difficulty_value(&rules.general.harvesters_per_refinery),
+            slave_miners: house.difficulty_value(&rules.ai_slave_miner_number),
+            current_iq: house.current_iq(),
+            iq_harvester: rules.general.iq_harvester,
+            no_ore: house.harvester_no_ore(),
+            human: house.is_controlled_by_human(sim.session.game_mode_nonzero()),
+            tech_level: house.tech_level(),
+        },
+        rules.ares_form(),
+    )
 }
 
 /// What the Unit chooser's harvester branch reads.
@@ -245,8 +289,9 @@ struct HarvesterFacts {
 /// Harvester=`, no harvester found no ore, no human controls the house, its
 /// gatherers are below the limit and the harvester's TechLevel is within the
 /// house's (unsigned). Without one: the refinery's `UndeploysInto=` while
-/// the gatherers are below `AISlaveMinerNumber`.
-fn harvester_decision(facts: &HarvesterFacts) -> Option<i32> {
+/// the gatherers are below `AISlaveMinerNumber`. `ares`: the game's Rules
+/// were read the Ares way (`RuleSet::ares_form`).
+fn harvester_decision(facts: &HarvesterFacts, ares: bool) -> Option<i32> {
     let Some((harvester, harvester_tech)) = facts.harvester else {
         return (facts.gatherers < facts.slave_miners)
             .then_some(facts.refinery)
@@ -264,8 +309,19 @@ fn harvester_decision(facts: &HarvesterFacts) -> Option<i32> {
         && !facts.no_ore
         && !facts.human
         && facts.gatherers < limit
-        && (harvester_tech as u32) <= (facts.tech_level as u32);
+        && tech_admits(harvester_tech, facts.tech_level, ares);
     admitted.then_some(harvester)
+}
+
+/// The harvester's TechLevel against the house's: unsigned in gamemd's
+/// harvester branch (`0x004FEA7D..0x004FEBD7`), signed in Ares 3.0
+/// HouseClass_AI_UnitProduction 10023410 (hook `0x004FEA60`).
+fn tech_admits(harvester_tech: i32, house_tech: i32, ares: bool) -> bool {
+    if ares {
+        harvester_tech <= house_tech
+    } else {
+        (harvester_tech as u32) <= (house_tech as u32)
+    }
 }
 
 /// A type the house's teams need and the house may buy now.
@@ -290,13 +346,22 @@ fn candidates(
     let category = kind.category();
     let type_count = rules.type_array_ids(category).len();
     let type_index = |id: InternedId| {
-        rules
-            .type_array_index(category, sim.interner.resolve(id))
+        sim.interner
+            .type_array_index(id, category, rules)
+            // NPSE 2.0 C33B30 filters needed vehicle types before their
+            // recruitment, CanBuild, cost and random-choice consumers.
+            .filter(|&index| {
+                !crate::rules::NPATCH_ENABLED
+                    || category != ObjectCategory::Vehicle
+                    || rules
+                        .type_array_at(category, index)
+                        .is_some_and(|ty| ty.naval == (kind == UnitChoiceKind::NavalUnit))
+            })
             .and_then(|index| usize::try_from(index).ok())
             .filter(|&index| index < type_count)
     };
     let vm = &sim.team_script_vm;
-    let teams = vm
+    let teams: Vec<(i32, Vec<usize>)> = vm
         .teams_in_order()
         .filter(|team| {
             team.owner() == owner
@@ -317,17 +382,24 @@ fn candidates(
                 .filter_map(|member_type| type_index(member_type.id))
                 .collect();
             (team.created_frame(), needed)
-        });
+        })
+        .collect();
+    // With no need tallied, the tally asks IsRecruitable of no object and
+    // CanBuild and Cost_Of of no type, and keeps no candidate whatever the
+    // objects are, so VERA skips their walk. The pick still draws.
+    if teams.iter().all(|(_, needed)| needed.is_empty()) {
+        return Vec::new();
+    }
     let class = EntityCategory::from(category);
     // IsRecruitable refuses other houses' objects, so only `owner`'s are
-    // tallied.
-    let objects = sim
-        .substrate
-        .entities
-        .values()
-        .filter(|entity| entity.category() == class && entity.owner() == owner)
+    // tallied, in the same order.
+    let entities = &sim.substrate.entities;
+    let objects = entities
+        .owned_ids(owner, class)
+        .iter()
+        .filter_map(|&id| entities.get(id))
         .filter_map(|entity| Some((type_index(entity.type_ref())?, entity)));
-    let money = crate::sim::credit_income::available_money(sim, owner);
+    let money = crate::sim::credit_income::available_money(&sim.houses, owner);
     let class_type = |index: usize| rules.type_array_at(category, index as i32);
     tally(
         type_count,
@@ -389,11 +461,12 @@ fn tally<T>(
 }
 
 /// `FootClass::IsRecruitable @ 0x004DA230` for house `owner`: owned by it
-/// (`+0x21C`), out of limbo (`+0x81`; VERA's dead await their removal, so
-/// they count as in limbo, see `GameEntity::is_ai_alive`), in no team
+/// (`+0x21C`), out of limbo (`+0x81`), in no team
 /// (`+0x5D4`), on a mission (`Get_Mission`) MissionControl lets recruit
 /// (`0x005B36E0`: none, -1, is recruitable), and its first scenario
 /// recruit byte (`+0x421`) set.
+/// Native has no Health gate: retained Infantry corpses still cover needs.
+/// `is_active` only excludes VERA's records awaiting native-equivalent removal.
 fn is_recruitable(
     sim: &Simulation,
     rules: &RuleSet,
@@ -401,7 +474,7 @@ fn is_recruitable(
     owner: InternedId,
 ) -> bool {
     entity.owner() == owner
-        && entity.is_ai_alive()
+        && entity.is_active()
         && !entity.lifecycle.in_limbo()
         && sim
             .team_script_vm
@@ -417,13 +490,16 @@ fn is_recruitable(
 /// A candidate whose need exceeds every earlier one's restarts the list; a
 /// later one of lower need still joins it. The earliest team's type is the
 /// first candidate of the lowest creation frame. The first draw,
-/// `RandomRanged(0, 0x7FFFFFFE)`, always happens; in PC53/chop, `fill% *
-/// 0.01 > r * (1 / 0x7FFFFFFE)` (`FCOMPP`, `TEST AH,0x41`) takes the earliest
-/// team's type (none without candidates) with no second draw; otherwise a
-/// non-empty list takes `list[RandomRanged(0, len - 1)]`.
+/// `RandomRanged(0, 0x7FFFFFFE)`, always happens; when it passes the unit gate
+/// against the chopped `fill% * 0.01` (`0x004FEE63..0x004FEE89`: FCOMPP,
+/// `TEST AH,0x41`), the earliest team's type is taken (none without
+/// candidates) with no second draw; otherwise a non-empty list takes
+/// `list[RandomRanged(0, len - 1)]`. `ares`: the game's Rules were read the
+/// Ares way (`RuleSet::ares_form`), which replaces the first draw (below).
 fn pick(
     candidates: &[Candidate],
     fill_earliest_percent: i32,
+    ares: bool,
     mut draw: impl FnMut(i32, i32) -> i32,
 ) -> Option<i32> {
     type X = X87Chop53;
@@ -440,10 +516,22 @@ fn pick(
             earliest = Some(candidate);
         }
     }
-    let load = |bits| X::load_f64(bits).expect("the chooser scales are finite");
-    let roll = X::mul(X::load_i32(draw(0, 0x7FFF_FFFE)), load(DRAW_SCALE));
-    let fill = X::mul(X::load_i32(fill_earliest_percent), load(PERCENT_SCALE));
-    if X::compare(fill, roll) == X87Ordering::Greater {
+    // Ares 3.0 HouseExt::GetTypeToProduce 100216A0 (the "100 unit bug"
+    // replacement behind hooks 0x004FEA60 10023410, 0x004FEEE0 100233B0 and
+    // 0x004FF210 10023350) draws `RandomRanged(0, 99)` and takes the
+    // earliest team's type below `FillEarliestTeamProbability`.
+    let earliest_wins = if ares {
+        draw(0, 99) < fill_earliest_percent
+    } else {
+        let roll = draw(0, 0x7FFF_FFFE) as u32;
+        let fill = X::store_f64(X::mul(
+            X::load_i32(fill_earliest_percent),
+            X::load_f64(PERCENT_SCALE).expect("0.01 is finite"),
+        ))
+        .expect("a percent of 0.01 is a finite double");
+        roll < unit_draw_threshold(f64::from_bits(fill.bits()))
+    };
+    if earliest_wins {
         return earliest.map(|candidate| candidate.index);
     }
     if most_needed.is_empty() {
@@ -453,6 +541,6 @@ fn pick(
     most_needed.get(usize::try_from(slot).ok()?).copied()
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "ai_unit_choice_tests.rs"]
 mod tests;

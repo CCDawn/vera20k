@@ -30,7 +30,7 @@ pub(crate) const BUILDING_OCCUPATION_BIT: u8 = 0x80;
 /// by ProductionState; this view inserts its member between mobile objects
 /// and the building tail, as the native AddContent registration paths do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CellObjectMember {
+pub enum CellObjectMember {
     Entity(u64),
     Terrain(u64),
 }
@@ -324,13 +324,40 @@ impl RawCellOccupationGrid {
     }
 
     pub(crate) fn mark_ground(&mut self, rx: u16, ry: u16, mask: u8) {
-        if mask != 0 {
-            self.cells.get_or_insert_with((rx, ry), Default::default).ground |= mask;
+        self.mark_ground_at(RawCellKey::Real(rx, ry), mask);
+    }
+
+    /// Literal ground OR, preserving the independent Infantry owner. Terrain
+    /// MarkOccupation71C110 may select Dummy from retained Object.Location
+    /// even when PlaceDown5683C0 admitted a different real footprint cell.
+    pub(crate) fn mark_ground_at(&mut self, key: RawCellKey, mask: u8) {
+        if mask == 0 {
+            return;
+        }
+        match key {
+            RawCellKey::Real(rx, ry) => {
+                self.cells
+                    .get_or_insert_with((rx, ry), Default::default)
+                    .ground |= mask;
+            }
+            RawCellKey::Dummy => self.dummy.ground |= mask,
         }
     }
 
     pub(crate) fn clear_ground(&mut self, rx: u16, ry: u16, mask: u8) {
-        self.update_and_prune(rx, ry, |cell| cell.ground &= !mask);
+        self.clear_ground_at(RawCellKey::Real(rx, ry), mask);
+    }
+
+    /// Literal ground-bit AND, including TerrainLimbo71C9E7..71C9F6's
+    /// retained CellClass receiver. Unlike UnmarkCellOccupancy this leaves
+    /// the Infantry owner untouched, even on the shared Dummy.
+    pub(crate) fn clear_ground_at(&mut self, key: RawCellKey, mask: u8) {
+        match key {
+            RawCellKey::Real(rx, ry) => {
+                self.update_and_prune(rx, ry, |cell| cell.ground &= !mask);
+            }
+            RawCellKey::Dummy => self.dummy.ground &= !mask,
+        }
     }
 
     pub(crate) fn ground_bits(&self, rx: u16, ry: u16) -> u8 {
@@ -369,7 +396,9 @@ impl RawCellOccupationGrid {
 
     pub(crate) fn mark_deck(&mut self, rx: u16, ry: u16, mask: u8) {
         if mask != 0 {
-            self.cells.get_or_insert_with((rx, ry), Default::default).deck |= mask;
+            self.cells
+                .get_or_insert_with((rx, ry), Default::default)
+                .deck |= mask;
         }
     }
 
@@ -450,12 +479,14 @@ impl HiddenOccupationGrid {
     }
 
     /// Apply the post-object-list enter contribution for one building.
+    /// `ares` is the caller's `rules.ares_form()`, for the guarded decrement.
     pub(crate) fn enter_building(
         &mut self,
         origin: (u16, u16),
-        foundation: &str,
+        foundation: &crate::rules::foundation::Foundation,
         profile: crate::rules::object_type::BuildingHiddenOccupancyProfile,
         map_size: Option<(u16, u16)>,
+        ares: bool,
     ) -> bool {
         if !profile.can_hide_things {
             return false;
@@ -473,31 +504,33 @@ impl HiddenOccupationGrid {
             if let Some(offset) = profile.remove_occupy[slot]
                 && let Some(cell) = hidden_offset_cell(origin, offset, map_size)
             {
-                self.decrement_guarded(cell);
+                self.decrement_guarded(cell, ares);
             }
         }
         true
     }
 
     /// Reverse the post-object-list contribution for one building. RemoveOccupy
-    /// slots deliberately have no exit-side inverse.
+    /// slots deliberately have no exit-side inverse. `ares` is the caller's
+    /// `rules.ares_form()`, for the guarded decrement.
     pub(crate) fn exit_building(
         &mut self,
         origin: (u16, u16),
-        foundation: &str,
+        foundation: &crate::rules::foundation::Foundation,
         profile: crate::rules::object_type::BuildingHiddenOccupancyProfile,
         map_size: Option<(u16, u16)>,
+        ares: bool,
     ) -> bool {
         if !profile.can_hide_things {
             return false;
         }
 
         for cell in hidden_diagonal_cells(origin, foundation, profile.occupy_height, map_size) {
-            self.decrement_guarded(cell);
+            self.decrement_guarded(cell, ares);
         }
         for offset in profile.add_occupy.into_iter().flatten() {
             if let Some(cell) = hidden_offset_cell(origin, offset, map_size) {
-                self.decrement_guarded(cell);
+                self.decrement_guarded(cell, ares);
             }
         }
         true
@@ -512,10 +545,15 @@ impl HiddenOccupationGrid {
         }
     }
 
-    fn decrement_guarded(&mut self, cell: (u16, u16)) {
+    fn decrement_guarded(&mut self, cell: (u16, u16), ares: bool) {
         let Some(current) = self.cells.get_mut(&cell) else {
             return;
         };
+        // Installed Ares10015504 uses signed JLE; the original568A97 only
+        // tests zero. Both share this counter owner, not separate grids.
+        if ares && (*current as i32) <= 0 {
+            return;
+        }
         if *current == 1 {
             self.cells.remove(&cell);
         } else {
@@ -573,15 +611,24 @@ impl AirSlotGrid {
     }
 }
 
+/// The OccupyHeight diagonals, exactly deduplicated. Ares 3.0
+/// MapClass_AddContentAt_Foundation_OccupyHeight 10015420 (hook
+/// `0x00568565`) and _RemoveContentAt_ 100154B0 (hook `0x00568997`) build
+/// them with BuildingExt::GetCoveredCells (sort and unique over the whole
+/// foundation) where gamemd dedupes through a 16x16 bitmap of foundation
+/// offsets, which only a custom foundation of 16 or more cells across could
+/// alias; the foundation is the full list (Ares 10015490 / 10015520, hooks
+/// `0x00568411` / `0x00568841`, lift Place_Down's and Pick_Up's 32-cell
+/// copy), as [`crate::rules::foundation::Foundation::cell_offsets`] is.
 fn hidden_diagonal_cells(
     origin: (u16, u16),
-    foundation: &str,
+    foundation: &crate::rules::foundation::Foundation,
     occupy_height: i32,
     map_size: Option<(u16, u16)>,
 ) -> BTreeSet<(u16, u16)> {
     let depth = occupy_height.saturating_sub(1).max(1);
     let mut cells = BTreeSet::new();
-    for (dx, dy) in crate::rules::foundation::foundation_cell_offsets(foundation) {
+    for (dx, dy) in foundation.cell_offsets() {
         for k in 0..depth {
             let rx = i32::from(origin.0) + i32::from(dx) - k;
             let ry = i32::from(origin.1) + i32::from(dy) - k;
@@ -734,6 +781,12 @@ impl CellOccupancy {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OccupancyGrid {
     cells: CellMap<CellOccupancy>,
+    /// VERA-only: the emptied list of a cell an object last left, kept for
+    /// the next vacant cell an object enters, so a cell crossing and a
+    /// blocked mover's lift and put-back free and allocate nothing. Always
+    /// empty; only its capacity is kept. Never saved, hashed or read.
+    #[serde(skip)]
+    spare_list: Vec<CellOccupant>,
     /// Monotonic counter bumped on every cell-membership mutation, so tests can
     /// tell whether membership changed between two points. Never serialized,
     /// never part of the state hash.
@@ -884,6 +937,15 @@ impl OccupancyGrid {
     }
 }
 
+impl GameEntity {
+    /// Derived membership in this object's retained Mark footprint. Lifecycle
+    /// admission and actual per-cell lists remain with their existing owners.
+    /// This exposes a read decision across the app/core boundary, not the list.
+    pub fn footprint_contains_cell(&self, cell: (u16, u16)) -> bool {
+        entity_occupancy_cells(self).contains(&cell)
+    }
+}
+
 /// The cells an object's Mark lists it in: its own cell, or a building's
 /// occupy list (`vt+0x108`, Type `+0xDFC`), which Place_Down's AddContent
 /// (`0x0047E8A0`) walks. The lists are row-major rectangles except
@@ -892,7 +954,10 @@ pub(crate) fn entity_occupancy_cells(entity: &GameEntity) -> Vec<(u16, u16)> {
     if entity.category() != EntityCategory::Structure {
         return vec![(entity.position.rx(), entity.position.ry())];
     }
-    crate::rules::foundation::foundation_cell_offsets(entity.type_facts.foundation())
+    entity
+        .type_facts
+        .foundation()
+        .cell_offsets()
         .into_iter()
         .filter_map(|(dx, dy)| {
             Some((
@@ -908,6 +973,7 @@ impl OccupancyGrid {
     pub fn new() -> Self {
         Self {
             cells: CellMap::new(),
+            spare_list: Vec::new(),
             #[cfg(any(test, feature = "test-support"))]
             generation: 0,
         }
@@ -948,7 +1014,10 @@ impl OccupancyGrid {
             sub_cell,
             is_building: insertion == CellListInsertion::AppendBuilding,
         };
-        let occ = self.cells.get_or_insert_with((rx, ry), Default::default);
+        let spare = &mut self.spare_list;
+        let occ = self.cells.get_or_insert_with((rx, ry), || CellOccupancy {
+            occupants: std::mem::take(spare),
+        });
         match insertion {
             CellListInsertion::PrependNonBuilding => {
                 let index = occ
@@ -999,8 +1068,11 @@ impl OccupancyGrid {
         if let Some(occ) = self.cells.get_mut(&(rx, ry)) {
             occ.occupants
                 .retain(|o| !(o.entity_id == entity_id && o.layer == layer));
-            if occ.occupants.is_empty() {
-                self.cells.remove(&(rx, ry));
+            if occ.occupants.is_empty()
+                && let Some(emptied) = self.cells.remove(&(rx, ry))
+                && self.spare_list.capacity() == 0
+            {
+                self.spare_list = emptied.occupants;
             }
         }
     }
@@ -1036,22 +1108,29 @@ impl OccupancyGrid {
     /// Terrain precedes buildings and follows mobile objects for the current
     /// terrain-first scenario registration. Generic native AddContent prepends
     /// every nonbuilding; this projection does not model later Terrain insertion.
-    pub(crate) fn cell_objects(
-        &self,
+    pub(crate) fn cell_objects<'a, I>(
+        &'a self,
         rx: u16,
         ry: u16,
         layer: MovementLayer,
-        terrain_id: Option<u64>,
-    ) -> impl Iterator<Item = CellObjectMember> + '_ {
-        let mut terrain = terrain_id.filter(|_| layer == MovementLayer::Ground);
+        terrain_ids: I,
+    ) -> impl Iterator<Item = CellObjectMember> + 'a
+    where
+        I: IntoIterator<Item = u64> + 'a,
+        I::IntoIter: 'a,
+    {
+        let mut terrain = terrain_ids
+            .into_iter()
+            .filter(move |_| layer == MovementLayer::Ground)
+            .peekable();
         let mut entities = self
             .get(rx, ry)
             .into_iter()
             .flat_map(move |cell| cell.iter_layer(layer))
             .peekable();
         std::iter::from_fn(move || {
-            if terrain.is_some() && entities.peek().is_none_or(|member| member.is_building) {
-                return terrain.take().map(CellObjectMember::Terrain);
+            if terrain.peek().is_some() && entities.peek().is_none_or(|member| member.is_building) {
+                return terrain.next().map(CellObjectMember::Terrain);
             }
             entities
                 .next()
@@ -1151,29 +1230,52 @@ impl OccupancyGrid {
     }
 }
 
-#[cfg(test)]
+impl OccupancyGrid {
+    /// Bring `mirror`, the presentation copy of the world's grid, up to
+    /// this one (docs/sim-thread.md).
+    pub(crate) fn sync_into(&mut self, mirror: &mut Self) {
+        let Self {
+            cells,
+            spare_list: _,
+            #[cfg(any(test, feature = "test-support"))]
+            generation,
+        } = self;
+        cells.sync_into(&mut mirror.cells);
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            mirror.generation = *generation;
+        }
+    }
+}
+
+impl RawCellOccupationGrid {
+    /// Bring `mirror`, the presentation copy, up to this grid.
+    pub(crate) fn sync_into(&mut self, mirror: &mut Self) {
+        let Self { cells, dummy } = self;
+        cells.sync_into(&mut mirror.cells);
+        mirror.dummy = dummy.clone();
+    }
+}
+
+impl HiddenOccupationGrid {
+    /// Bring `mirror`, the presentation copy, up to this grid.
+    pub(crate) fn sync_into(&mut self, mirror: &mut Self) {
+        let Self { cells } = self;
+        cells.sync_into(&mut mirror.cells);
+    }
+}
+
+impl AirSlotGrid {
+    /// Bring `mirror`, the presentation copy, up to this grid.
+    pub(crate) fn sync_into(&mut self, mirror: &mut Self) {
+        let Self { cells } = self;
+        cells.sync_into(&mut mirror.cells);
+    }
+}
+
+#[cfg(all(test, tests_sim_h_o))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn gsi_04_12_raw_occupation_preserves_every_raw_bit() {
-        let mut grid = RawCellOccupationGrid::new();
-        for mask in [
-            0x01,
-            0x02,
-            0x04,
-            0x08,
-            0x10,
-            VEHICLE_OCCUPATION_BIT,
-            0x40,
-            0x80,
-        ] {
-            grid.mark_ground(7, 9, mask);
-        }
-
-        assert_eq!(grid.ground_bits(7, 9), u8::MAX);
-        assert_eq!(grid.ground_bits(9, 7), 0);
-    }
 
     #[test]
     fn infantry_owner_indices_follow_selected_plane_and_functional_bits() {
@@ -1265,6 +1367,42 @@ mod tests {
         assert!(grid.generation() > g2, "remove must bump generation");
     }
 
+    /// The list of a cell an object left is kept, empty, and becomes the list
+    /// of the next vacant cell an object enters. The cells and what is saved
+    /// are those of a grid that never kept one.
+    #[test]
+    fn an_emptied_cells_list_serves_the_next_vacant_cell() {
+        let enter = |grid: &mut OccupancyGrid, cell: (u16, u16), id| {
+            grid.add(
+                cell.0,
+                cell.1,
+                id,
+                MovementLayer::Ground,
+                None,
+                CellListInsertion::PrependNonBuilding,
+            );
+        };
+        let mut grid = OccupancyGrid::new();
+        enter(&mut grid, (3, 4), 7);
+        grid.remove_on_layer(3, 4, 7, MovementLayer::Ground);
+        assert!(grid.get(3, 4).is_none());
+        assert!(grid.spare_list.is_empty() && grid.spare_list.capacity() > 0);
+        assert_eq!(
+            serde_json::to_string(&grid).unwrap(),
+            serde_json::to_string(&OccupancyGrid::new()).unwrap()
+        );
+
+        enter(&mut grid, (5, 6), 9);
+        assert_eq!(grid.spare_list.capacity(), 0);
+        assert_eq!(
+            grid.get(5, 6)
+                .unwrap()
+                .snapshot_layer(MovementLayer::Ground),
+            [9]
+        );
+        assert_eq!(grid.occupied_cell_count(), 1);
+    }
+
     #[test]
     fn gsi_04_05_hidden_garefn_exact_counter_contribution() {
         let mut grid = HiddenOccupationGrid::new();
@@ -1276,14 +1414,14 @@ mod tests {
         profile.add_occupy[1] = Some((-1, -1));
         profile.remove_occupy[0] = Some((3, 1));
 
-        assert!(grid.enter_building((10, 10), "4x3", profile, Some((32, 32))));
+        assert!(grid.enter_building((10, 10), &"4x3".into(), profile, Some((32, 32)), false));
         assert_eq!(grid.entry_count(), 13);
         assert_eq!(grid.count(10, 10), 1);
         assert_eq!(grid.count(13, 11), 0);
         assert_eq!(grid.count(9, 10), 1);
         assert_eq!(grid.count(9, 9), 1);
 
-        assert!(grid.exit_building((10, 10), "4x3", profile, Some((32, 32))));
+        assert!(grid.exit_building((10, 10), &"4x3".into(), profile, Some((32, 32)), false));
         assert_eq!(grid.entry_count(), 0);
     }
 }

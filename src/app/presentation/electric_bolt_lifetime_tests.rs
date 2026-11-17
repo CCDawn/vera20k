@@ -22,6 +22,125 @@ fn coord(value: &Value) -> ProjectileCoord {
     ProjectileCoord::new(x, y, z)
 }
 
+/// The native `lifetime_same_frame` bolt, an in-view camera and a palette.
+fn lifetime_bolt() -> (ElectricBoltBirth, SurfaceLineViewport, ElectricBoltPalette) {
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/procedural_drawing_oracle/electric_bolt.json",
+    ))
+    .unwrap();
+    let row = corpus["draw_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["input"]["name"] == "lifetime_same_frame")
+        .unwrap();
+    let source = &row["births"][0]["bolt"];
+    let birth = ElectricBoltBirth {
+        frame: 0,
+        from: coord(&source["source"]),
+        to: coord(&source["target"]),
+        z_adjust: int(&source["z_adjust"]),
+        phase: int(&source["phase"]),
+        alternate_color: source["alternate"].as_bool().unwrap(),
+        colors: [None; 3],
+        owner: None,
+    };
+    let mut camera = point(&row["input"]["camera"]);
+    camera[1] += 15;
+    let viewport = SurfaceLineViewport {
+        camera,
+        clip: [0, 0, 160, 120],
+        z_origin_y: 0,
+        zoom: 1.0,
+    };
+    let palette = ElectricBoltPalette {
+        ordinary: 0xffff,
+        alternate: 0x001f,
+        center: 0xffff,
+    };
+    (birth, viewport, palette)
+}
+
+/// Manager4C2830 runs once per tactical composite, and Main_Tick composites
+/// once per tick: drawn three times a tick, a bolt still lives seventeen
+/// ticks. A draw between composites takes no Main draw and shows the last
+/// composite's lines under the moved camera.
+#[test]
+fn a_bolt_lives_seventeen_composite_ticks_however_often_it_is_drawn() {
+    use crate::app::presentation::tactical_composite::{CompositeCadence, TacticalComposite};
+    let (birth, mut viewport, palette) = lifetime_bolt();
+    let mut bolts = ElectricBolts::default();
+    bolts.create(birth);
+    let main = MainRng::new(1);
+    let mut composite = TacticalComposite::default();
+    let mut ticks = 0;
+    while !bolts.live.is_empty() {
+        composite.note_main_tick();
+        ticks += 1;
+        let mut first: Option<Vec<crate::render::surface_line::SurfaceLine>> = None;
+        for draw in 0..3 {
+            viewport.camera[0] += 1;
+            let before = main.native_state_hex();
+            for _ in 0..composite.begin_draw(CompositeCadence::PerMainTick, 0, false) {
+                bolts.composite(viewport, Some(palette), &mut main.draws(), |_| true);
+            }
+            let lines = bolts.shown(viewport.camera).to_vec();
+            if draw > 0 {
+                assert_eq!(main.native_state_hex(), before, "tick {ticks} draw {draw}");
+                let shifted: Vec<_> = first
+                    .iter()
+                    .flatten()
+                    .map(|line| {
+                        let mut line = *line;
+                        line.follow_camera(
+                            [viewport.camera[0] - draw, viewport.camera[1]],
+                            viewport.camera,
+                        );
+                        line
+                    })
+                    .collect();
+                assert_eq!(lines, shifted, "tick {ticks} draw {draw}");
+            } else {
+                first = Some(lines);
+            }
+        }
+    }
+    assert_eq!(ticks, 17);
+}
+
+#[test]
+fn concealment_keeps_bolt_phase_lifetime_and_main_draws() {
+    let (birth, viewport, palette) = lifetime_bolt();
+    let mut shown = ElectricBolts::default();
+    let mut hidden = ElectricBolts::default();
+    shown.create(birth);
+    hidden.create(birth);
+    let shown_main = MainRng::new(1);
+    let hidden_main = MainRng::new(1);
+    let before = shown_main.native_state_hex();
+    assert!(
+        !shown
+            .composite(viewport, Some(palette), &mut shown_main.draws(), |_| true)
+            .is_empty()
+    );
+    assert!(
+        hidden
+            .composite(viewport, Some(palette), &mut hidden_main.draws(), |_| false)
+            .is_empty()
+    );
+    assert_ne!(
+        shown_main.native_state_hex(),
+        before,
+        "the accepted geometry consumes Main"
+    );
+    assert_eq!(hidden.live[0].phase, shown.live[0].phase);
+    assert_eq!(hidden.live[0].decay, shown.live[0].decay);
+    assert_eq!(
+        hidden_main.native_state_hex(),
+        shown_main.native_state_hex()
+    );
+}
+
 #[test]
 fn native_tactical_visits_own_lifetime_reverse_order_and_clear() {
     let corpus: Value = serde_json::from_str(crate::test_fixture::text(
@@ -60,6 +179,7 @@ fn native_tactical_visits_own_lifetime_reverse_order_and_clear() {
                 z_adjust: int(&birth["z_adjust"]),
                 phase: int(&birth["phase"]),
                 alternate_color: birth["alternate"].as_bool().unwrap(),
+                colors: [None; 3],
                 owner: None,
             });
             // These explicit native manager fixtures include retained zero
@@ -81,7 +201,7 @@ fn native_tactical_visits_own_lifetime_reverse_order_and_clear() {
                 bolts.clear_on_load();
                 assert!(bolts.lines.is_empty(), "{at} retained geometry cleared");
             } else {
-                let lines = bolts.composite(viewport, Some(palette), &mut main.draws());
+                let lines = bolts.composite(viewport, Some(palette), &mut main.draws(), |_| true);
                 let expected = visit["segments"]
                     .as_array()
                     .unwrap()
@@ -166,11 +286,14 @@ fn accepted_bolt_composites_preserve_the_next_actual_bullet_identity() {
         crate::sim::arena_fixture::flat_arena(&mut sim, rules);
         for (index, name) in ["Americans", "Russians"].into_iter().enumerate() {
             let owner = sim.intern(name);
-            sim.houses.insert(
+            sim.houses_mut_for_test().register(HouseState::new(
                 owner,
-                HouseState::new(owner, index as u8, None, true, 0, 10),
-            );
-            sim.session.house_order.push(owner);
+                index as u8,
+                None,
+                true,
+                0,
+                10,
+            ));
         }
         let source = sim
             .spawn_object("MTNK", "Americans", 10, 10, 0, rules)
@@ -182,7 +305,7 @@ fn accepted_bolt_composites_preserve_the_next_actual_bullet_identity() {
         // FireAt's explicit argument does not install TarCom. The cannon's
         // launch aim70BCB0 reads that retained target independently.
         assert!(crate::sim::combat::install_entity_attack_target_for_test(
-            sim.entities_mut(),
+            sim.entities_mut_for_test(),
             source,
             target,
         ));
@@ -190,12 +313,13 @@ fn accepted_bolt_composites_preserve_the_next_actual_bullet_identity() {
         let before = sim.rng_state();
         let mut bolts = ElectricBolts::default();
         bolts.create(ElectricBoltBirth {
-            frame: sim.session.binary_frame as i32,
+            frame: sim.session().binary_frame() as i32,
             from: coord(&birth["source"]),
             to: coord(&birth["target"]),
             z_adjust: int(&birth["z_adjust"]),
             phase: int(&birth["phase"]),
             alternate_color: birth["alternate"].as_bool().unwrap(),
+            colors: [None; 3],
             owner: None,
         });
         for visit in row["visits"]
@@ -205,8 +329,12 @@ fn accepted_bolt_composites_preserve_the_next_actual_bullet_identity() {
             .take(composite_count)
         {
             assert!(!visit["segments"].as_array().unwrap().is_empty());
-            let lines =
-                bolts.composite(viewport, Some(palette), &mut sim.presentation_main_draws());
+            let lines = bolts.composite(
+                viewport,
+                Some(palette),
+                &mut sim.presentation_main_draws(),
+                |_| true,
+            );
             assert!(!lines.is_empty(), "accepted composite must consume Main");
             let native_delta = (int(&visit["native_id_after"]) as u32)
                 .wrapping_sub(int(&visit["native_id_before"]) as u32);
@@ -230,7 +358,7 @@ fn accepted_bolt_composites_preserve_the_next_actual_bullet_identity() {
 
         // Actual FireAt6FE55D -> CreateBullet46B050 -> Abstract410230 owns
         // this preincrement. This is a real retail shell, not an ID probe.
-        assert!(sim.projectiles.is_empty());
+        assert!(sim.projectiles().is_empty());
         sim.commit_fire_visit(
             FireVisit::Direct {
                 id: source,
@@ -241,11 +369,11 @@ fn accepted_bolt_composites_preserve_the_next_actual_bullet_identity() {
             None,
             crate::sim::world::FrameEffects::default(),
         );
-        assert_eq!(sim.projectiles.len(), 1, "retail MTNK emitted its shell");
-        let (_, bullet) = sim.projectiles.iter().next().unwrap();
-        assert_eq!(bullet.source_id, source);
-        assert_eq!(bullet.native_unique_id, cursor.wrapping_add(1) as i32);
-        outcomes.push((after.main, bullet.native_unique_id, bullet.id));
+        assert_eq!(sim.projectiles().len(), 1, "retail MTNK emitted its shell");
+        let (_, bullet) = sim.projectiles().iter().next().unwrap();
+        assert_eq!(bullet.source_id(), source);
+        assert_eq!(bullet.native_unique_id(), cursor.wrapping_add(1) as i32);
+        outcomes.push((after.main, bullet.native_unique_id(), bullet.id()));
     }
     for outcome in &outcomes[1..] {
         assert_ne!(outcome.0, outcomes[0].0, "composites advanced shared Main");
@@ -273,6 +401,7 @@ fn a_unit_owns_one_bolt_whose_source_follows_it() {
         z_adjust: 0,
         phase: 0,
         alternate_color: false,
+        colors: [None; 3],
         owner: Some(owner),
     };
     let mut bolts = ElectricBolts::default();

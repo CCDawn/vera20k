@@ -26,16 +26,15 @@ fn fixture(relative_z: i32) -> (Simulation, RuleSet, u64) {
     super::super::lifecycle_tests::install_common_raw_terrain(&mut sim, 128, 82, 2, None);
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, false, 0, 10));
-    sim.session.house_order.push(owner);
-    let id = sim.allocate_stable_id();
+        .register(HouseState::new(owner, 0, None, false, 0, 10));
+    let id = sim.substrate.allocate_stable_id();
     let mut entity = GameEntity::test_default(id, "TEST", "Americans", 113, 59);
     entity.set_type_ref_for_test(sim.interner.intern("TEST"));
     entity.set_owner_for_test(owner);
     entity.set_category_for_test(EntityCategory::Unit);
     entity.health.set_for_test(0);
     entity.lifecycle.set_in_limbo_for_test(false);
-    entity.lifecycle.set_cell_marked(false);
+    entity.lifecycle.set_cell_marked_for_test(false);
     entity.position.set_sub_x_for_test(SimFixed::from_num(128));
     entity.position.set_sub_y_for_test(SimFixed::from_num(128));
     entity.position.set_z_for_test(2);
@@ -43,8 +42,16 @@ fn fixture(relative_z: i32) -> (Simulation, RuleSet, u64) {
         .position
         .set_exact_z_leptons_for_test(Some(208 + relative_z));
     sim.substrate.entities.insert(entity);
-    sim.begin_receiver_kill_record(id);
-    sim.record_destruction_once(id);
+    // The corpus starts from the actual C4 receiver's kill: its RecordKill
+    // books the first loss, then Destroy closes the record.
+    sim.substrate.begin_receiver_kill_record(id);
+    sim.record_the_kill(
+        id,
+        crate::sim::combat::KillSource::Techno(None),
+        crate::sim::combat::KillCallback::Terminal,
+        crate::sim::world::UninitContext::with_rules(&rules),
+    );
+    Simulation::close_kill_record(&mut sim.substrate, id);
     sim.begin_ship_sinking(id, &rules, crate::sim::world::FrameEffects::default());
     (sim, rules, id)
 }
@@ -60,7 +67,8 @@ fn native_sink_suffix_preserves_cadence_coordinates_and_complete_rng_states() {
         let expected = &row["output"];
         let name = input["name"].as_str().unwrap();
         let (mut sim, rules, id) = fixture(input["relative_z"].as_i64().unwrap_or(0) as i32);
-        sim.session.binary_frame = input["frame"].as_u64().unwrap() as u32;
+        sim.session
+            .set_binary_frame_for_test(input["frame"].as_u64().unwrap() as u32);
         let seed = input["seed"].as_u64().unwrap_or(1);
         sim.main_rng = SimRng::new(seed).into();
         sim.scenario_rng = SimRng::new(seed);
@@ -83,7 +91,7 @@ fn native_sink_suffix_preserves_cadence_coordinates_and_complete_rng_states() {
         );
         assert_eq!(terminal, expected["endpoint"] == "0x4de5d0", "{name}");
         assert_eq!(
-            sim.houses[&entity.owner()].stats.units_lost(),
+            sim.houses[&entity.owner()].stats().units_lost(),
             expected["owner_units_lost"].as_u64().unwrap() as u32,
             "{name}"
         );
@@ -111,12 +119,16 @@ fn native_sink_suffix_preserves_cadence_coordinates_and_complete_rng_states() {
         if let Some(wake) = wake {
             let (_, anim) = sim.substrate.anims.iter().next().unwrap();
             assert_eq!(
-                serde_json::json!([anim.world_coord.x, anim.world_coord.y, anim.world_coord.z]),
+                serde_json::json!([
+                    anim.world_coord().x,
+                    anim.world_coord().y,
+                    anim.world_coord().z
+                ]),
                 wake["coord"],
                 "{name}"
             );
             assert_eq!(
-                anim.draw_flags,
+                anim.draw_flags(),
                 wake["draw_flags"].as_u64().unwrap() as u32,
                 "{name}"
             );
@@ -129,7 +141,7 @@ fn sinking_state_is_hashed_and_survives_snapshot() {
     use crate::sim::snapshot::GameSnapshot;
 
     let (mut sim, rules, id) = fixture(-125);
-    sim.session.map_name = "SINK.MAP".to_owned();
+    sim.session.set_map_name_for_test("SINK.MAP".to_owned());
     // Both futures begin with the production rule handles initialized. Their
     // warhead names must already be interned when the first wake is allocated.
     sim.intern_rule_type_ids(&rules);
@@ -138,7 +150,13 @@ fn sinking_state_is_hashed_and_survives_snapshot() {
     // at that same cursor; this test does not assert saved Scenario retention.
     sim.scenario_rng = SimRng::new(0);
     let active_hash = sim.state_hash();
-    sim.sinking_edge_sounds(id, &rules);
+    Simulation::sinking_edge_sounds(
+        &sim.interner,
+        &mut sim.substrate,
+        &mut sim.sound_events,
+        id,
+        &rules,
+    );
     assert_ne!(
         sim.state_hash(),
         active_hash,
@@ -166,8 +184,8 @@ fn sinking_state_is_hashed_and_survives_snapshot() {
             .sound_edge_seen()
     );
     for frame in 1..=60 {
-        sim.session.binary_frame = frame;
-        loaded.session.binary_frame = frame;
+        sim.session.set_binary_frame_for_test(frame);
+        loaded.session.set_binary_frame_for_test(frame);
         let terminal =
             sim.tick_ship_sinking(id, &rules, None, crate::sim::world::FrameEffects::default());
         assert_eq!(
@@ -181,7 +199,7 @@ fn sinking_state_is_hashed_and_survives_snapshot() {
             assert!(!hull.lifecycle.object_alive());
             assert!(hull.lifecycle.in_limbo());
             assert!(loaded.substrate.pending_delete.contains_object(&id));
-            assert_eq!(loaded.houses[&hull.owner()].stats.units_lost(), 2);
+            assert_eq!(loaded.houses[&hull.owner()].stats().units_lost(), 2);
             return;
         }
     }
@@ -285,8 +303,14 @@ fn native_sinking_sound_readers_and_reachable_edges_match() {
         sim.main_rng = SimRng::new(1).into();
         sim.scenario_rng = SimRng::new(1);
         sim.mapgen_rng = SimRng::new(1);
-        sim.sound_events.clear();
-        sim.sinking_edge_sounds(id, &rules);
+        sim.sound_events.clear_for_test();
+        Simulation::sinking_edge_sounds(
+            &sim.interner,
+            &mut sim.substrate,
+            &mut sim.sound_events,
+            id,
+            &rules,
+        );
         let events: Vec<_> = sim
             .sound_events
             .iter()
@@ -367,7 +391,7 @@ fn load_preserves_sinking_edge_and_resets_shared_foot_sound_bytes() {
             &IniFile::from_str("[TEST]\nSinkingSound=GenLargeWaterDie\n"),
             &sounds,
         );
-        sim.session.map_name = "SINK.MAP".to_owned();
+        sim.session.set_map_name_for_test("SINK.MAP".to_owned());
         let hull = sim.substrate.entities.get_mut(id).unwrap();
         hull.sinking.sound_edge_seen = seen;
         hull.move_sound = crate::sim::world::MoveSoundState::from_raw_for_test(
@@ -394,7 +418,13 @@ fn load_preserves_sinking_edge_and_resets_shared_foot_sound_bytes() {
         );
         let rng = loaded.rng_state();
         assert!(loaded.sound_events.is_empty());
-        loaded.sinking_edge_sounds(id, &rules);
+        Simulation::sinking_edge_sounds(
+            &loaded.interner,
+            &mut loaded.substrate,
+            &mut loaded.sound_events,
+            id,
+            &rules,
+        );
         assert_eq!(
             loaded.sound_events.len(),
             row["events"].as_array().unwrap().len()
@@ -427,7 +457,7 @@ fn retained_health_one_ship_is_illegal_as_firer_and_target() {
          [AP]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
     ))
     .unwrap();
-    let firer_id = sim.allocate_stable_id();
+    let firer_id = sim.substrate.allocate_stable_id();
     let mut firer = GameEntity::test_default(firer_id, "TEST", "Russians", 112, 59);
     firer.set_type_ref_for_test(sim.interner.intern("TEST"));
     firer.set_owner_for_test(sim.interner.intern("Russians"));
@@ -453,7 +483,7 @@ fn retained_health_one_ship_is_illegal_as_firer_and_target() {
     assert_eq!(query(&sim), FireError::Illegal, "native target+3CD6FCBCD");
     assert!(!assign_target_commits(
         &sim.substrate.entities,
-        &sim.production.terrain_objects,
+        sim.terrain_objects.objects(),
         Some(TargetKind::Entity(target_id))
     ));
     sim.substrate
@@ -469,7 +499,7 @@ fn retained_health_one_ship_is_illegal_as_firer_and_target() {
     );
     assert!(assign_target_commits(
         &sim.substrate.entities,
-        &sim.production.terrain_objects,
+        sim.terrain_objects.objects(),
         Some(TargetKind::Entity(target_id))
     ));
     sim.substrate
@@ -490,7 +520,7 @@ fn retained_ship_skips_process_but_keeps_its_head_and_runs_sinking_ai() {
     use crate::sim::world::techno_ai::ObjectAiCtx;
 
     let (mut sim, rules, id) = fixture(0);
-    sim.session.binary_frame = 1;
+    sim.session.set_binary_frame_for_test(1);
     let head = DriveCoord::cell(114, 59, 208);
     let hull = sim.substrate.entities.get_mut(id).unwrap();
     hull.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Ship));
@@ -510,8 +540,8 @@ fn retained_ship_skips_process_but_keeps_its_head_and_runs_sinking_ai() {
     let slope_before = *slope_transition::state_for_entity(hull).unwrap();
     // A second Stun (Unit setter, Path[0] = -1, Stop_Driver) clears the
     // destination, retaining the committed head.
-    sim.techno_death_stun(id, UninitContext::with_rules(&rules));
-    sim.advance_live_object_turn(id, Some(&rules), ObjectAiCtx::default())
+    sim.stun(id, UninitContext::with_rules(&rules));
+    sim.advance_live_object_turn(id, &rules, ObjectAiCtx::default())
         .unwrap();
     let hull = sim.substrate.entities.get(id).unwrap();
     assert_eq!(

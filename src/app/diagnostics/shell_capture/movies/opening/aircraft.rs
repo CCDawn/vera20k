@@ -13,7 +13,7 @@ pub(super) fn observe(state: &AppState, output_prefix: &Path) -> Result<Value> {
     let sim = &state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .context("aircraft runtime absent")?
         .simulation;
     let mut objects = Vec::new();
@@ -26,7 +26,7 @@ pub(super) fn observe(state: &AppState, output_prefix: &Path) -> Result<Value> {
     let model_coverage = sim.entities().values()
         .filter(|entity| entity.category() == crate::map::entities::EntityCategory::Aircraft)
         .map(|entity| {
-            let name = sim.interner.resolve(entity.type_ref());
+            let name = sim.interner().resolve(entity.type_ref());
             let frames = state.match_state.match_presentation.unit_atlas.as_ref()
                 .map(|atlas| atlas.frame_counts.iter().filter(|((model,_,_),_)| model == name)
                     .map(|((_,layer,turret),count)| json!({"layer": format!("{layer:?}"), "turret": turret, "frames": count}))
@@ -90,8 +90,9 @@ pub(super) fn observe(state: &AppState, output_prefix: &Path) -> Result<Value> {
         }
         let shroud = state.match_state.match_presentation.shroud_buffer.as_ref();
         let input = &state.match_state.input;
+        let gpu = &state.renderer.gpu;
         observations.push(json!({
-            "id": entity.stable_id(), "type": sim.interner.resolve(entity.type_ref()),
+            "id": entity.stable_id(), "type": sim.interner().resolve(entity.type_ref()),
             "display_layer": object.parent.layer.0,
             "pieces": object.pieces.iter().map(|piece| {
                 let sprite = &piece.instance;
@@ -99,7 +100,7 @@ pub(super) fn observe(state: &AppState, output_prefix: &Path) -> Result<Value> {
                 json!({"texture": format!("{:?}",piece.target), "position": sprite.position,
                     "size": sprite.size, "z_adjust": sprite.z_adjust, "z_gradient": sprite.z_gradient,
                     "z_rect": sprite.zshape_origin, "a_at_rect_center": shroud.and_then(|a|
-                        a.sample_world(x,y,input.camera_x,input.camera_y))})
+                        a.read_world(&gpu.device, &gpu.queue, x, y, input.camera_x, input.camera_y))})
             }).collect::<Vec<_>>(),
             "outputs": outputs,
         }));
@@ -169,6 +170,7 @@ fn raster(
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         let (x, y, w, h) = crate::app::input::camera::tactical_viewport_px(state);
         pass.set_scissor_rect(x, y, w, h);
@@ -197,7 +199,7 @@ fn raster(
             );
         }
     }
-    let read = crate::render::frame_readback::PendingBgra8Readback::encode(
+    let read = crate::render::frame_readback::PendingTextureReadback::encode(
         &gpu.device,
         &mut encoder,
         &texture,

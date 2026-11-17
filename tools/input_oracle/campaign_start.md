@@ -6,8 +6,6 @@ INI parser, VM, decoder, allocator or simulation. Native scalar readers,
 constructors, RNG and numeric instructions execute unchanged. Each case compares
 every executable PE section with the original file after execution.
 
-The accepted `gamemd.exe` SHA256 is
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
 No executable, complete retail INI/map or rendered capture is included.
 
 ## Reproduction and source seals
@@ -45,7 +43,8 @@ in scratch, not this directory.
 | `rng_cases` | Full52FC20 and original seed/RandomStraw bodies; ten entropy, override, saved/replay/network/mode and MapGen-disabled controls with full raw RNG states |
 | `difficulty_cases` | Full_Init686B6A..686C48 for Options0..4; only0..2 are ordinary campaign-selector inputs |
 | `basic_start` | Selected Basic.Action/Home/Alt readers, SpecialFlags6B8CA0, selected Waypoint ReadInt/divide/remainder and opening-view cell-center kernel before world ground-height/Radar calls |
-| `special_controls`, `reset_control` | Native SpecialFlags read and SetDefaults683610; current-bit defaults, exact case and repeated selection's Home/Alt reset |
+| `special_controls`, `reset_control` | Native SpecialFlags read and SetDefaults683610; current-bit defaults, exact case, four distinct bit3/bit15 DestroyableBridges controls, and repeated selection's Home/Alt reset |
+| `local_variable_controls` | Whole ReadLocal689B20 across seven reads in three retained histories; absent slots/tokens, exact section case, numeric values and source-ordered atoi aliases. All three complete RNG buffers and original code remain unchanged. Names are fresh each read; values retain their prior unless explicitly assigned. |
 | `campaign_start_houses.json` / `stock_rows` | ALL/SOV×Options0..2: selected native Rules prerequisites, Country/Side/SuperWeaponType registration, full5009B0/500B40 House creation/read/SetDifficulty, then current-house68ACAA..68AD2F |
 | `controls`, `edge_controls`, `allies_reader_controls` | Eleven credits/TechLevel/no-Houses/Allies histories,20 original ReadEdge475980 controls and27 original ReadHousesList475260 controls |
 | `color_controls` | 22 full ReadColor474A90 calls and24 full Country511850 reads; current0/3, whole-section admission, missing/stored-empty/physical-empty, case, unknown/numeric and31/32-byte boundaries |
@@ -180,14 +179,22 @@ These conclusions are caller/body evidence, not full engine replay:
   OS boundary outside these native fixtures and the stock-digital launch
   comparison. Missing map bytes follow the shared loader's failure route.
 * Campaign Full_Init686B20 skips the nonzero-mode early Country/House/Gather/
-  Resize generation. Its second ClearScene resets native IDs before the optional
-  basename `.INI` Process; common Rules reset and RULESMD/LANGRULE/map Process
-  follow. Campaign then creates one House/Super generation at6877BD, one Resize,
-  Fill, and the map reader's saved-ID+10000 reservation. Complete type counts
-  still require their original registry producer evidence.
-* Optional basename `.INI` uses file existence admission. After an existing
-  file is opened, CCINI.Read4741F0's return is ignored and Process668BF0 consumes
-  its resulting cache, including a partial/failed parse.
+  Resize generation. It caches whether entry GameMode is0 at686B3D, then checks
+  current GameMode at686C8B; the branch at686C9D skips the scenario-basename
+  Rules Process at686D35 unless entry mode was nonzero and current mode is
+  Campaign (0). The normal campaign path carries Campaign0 from its existing
+  session-mode owner, and the direct Start_Scenario/ReadScenario path here shows
+  no intervening mode write, so it follows0->0 and skips the basename pass. The
+  corpus uses0 as a fixture prior and excludes the full ClearScene/Rules chain;
+  it does not establish an active-YR entry-nonzero-to-current-zero transition.
+  Campaign then creates one
+  House/Super generation at6877BD, one Resize, Fill, and the map reader's
+  saved-ID+10000 reservation. Complete type counts still require their original
+  registry producer evidence.
+* If the basename gate is admitted, optional `.INI` uses file-existence
+  admission. Full_Init calls ReadCCFile4741F0 with both digest options zero,
+  so `[Digest]` remains in the INIClass; its return is ignored and
+  Process668BF0 consumes the resulting cache, including a partial/failed parse.
 * Scenario+1254 is the persistent mission counter: ctor1, no SetDefaults write,
   Victory increment685AA9..685AB0, shared battle termination reset6865B0.
   It is not parsed from filename or Basic. Theme uses this owner.
@@ -255,3 +262,7 @@ Production Rust comparisons, retail release loading and rendered output need
 their own validation. Full Rules Process, scenario/world initialization,
 trigger execution, whole-campaign behavior and engine parity remain outside
 this native fixture's coverage.
+
+The independent [explicit filename/index prefix](campaign_start_prefix.md) is
+replayed with `--start-prefix`; it uses synthetic inputs and needs no campaign
+asset extraction. It stops before selected CD handling and full map loading.

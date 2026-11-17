@@ -1,11 +1,10 @@
 //! Hospital arm of Building::MissionRepairAndProduce44B780,44B870..44BA79.
-//! Original Steam gamemd.exe SHA256
-//! 3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600.
+//! Original Steam gamemd.exe.
 //! Instruction-level reading. It uses the
 //! building's existing StageClass, Techno RepairTick and ExitObject owners.
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::passenger::{DepartureRoute, depart_cargo_head};
 use crate::sim::radio::{self, RadioMessage, RadioResponse};
@@ -21,7 +20,7 @@ pub(super) fn mission_repair(
     registry: Option<&OverlayTypeRegistry>,
     effects: FrameEffects<'_>,
 ) -> i32 {
-    let now = sim.session.binary_frame;
+    let now = sim.session.binary_frame();
     //44BA44 reads the live BuildingType+684 Ammo, not an instance cache.
     let type_ammo = sim
         .substrate
@@ -63,13 +62,8 @@ pub(super) fn mission_repair(
         }
         building.mission_leaf.set_building_ready_latch(0);
         building.mission_leaf.reset_building_repair_progress();
-        let response = radio::transmit_to_contact(
-            sim,
-            hospital,
-            RadioMessage::RepairTick,
-            Some(rules),
-            effects,
-        );
+        let response =
+            radio::transmit_to_contact(sim, hospital, RadioMessage::RepairTick, rules, effects);
         if matches!(
             response,
             RadioResponse::Negatory
@@ -82,8 +76,9 @@ pub(super) fn mission_repair(
             {
                 //44B939/50B6F0: player-house gate covers radar/EVA AND HealCrateSound;
                 //EVA itself is further gated by the app's radar admission.
-                sim.sound_events.push(SimSoundEvent::UnitRepaired {
+                sim.sound_events.emit(SimSoundEvent::UnitRepaired {
                     owner: building.owner(),
+                    owner_admitted: true,
                     radar: crate::sim::radar::RadarEventRequest::new(
                         crate::sim::radar::RadarEventType::UnitRepaired,
                         building.position.rx(),
@@ -93,7 +88,7 @@ pub(super) fn mission_repair(
                 if let Some(sound_id) = rules.crate_rules.heal_crate_sound.clone() {
                     let coordinate =
                         crate::sim::movement::ground_pose::position_world_coord(&building.position);
-                    sim.sound_events.push(SimSoundEvent::voc_at_world_coord(
+                    sim.sound_events.emit(SimSoundEvent::voc_at_world_coord(
                         sound_id,
                         crate::sim::anim_class::AnimWorldCoord {
                             x: coordinate.x,
@@ -102,6 +97,9 @@ pub(super) fn mission_repair(
                         },
                     ));
                 }
+                // MissionRepair44B9A3 plays after radar/EVA and before the
+                // patient is removed from cargo at44B9B7.
+                effects.flush_sound(sim, rules);
             }
             //44B9A8/44B9E0: pop first, call the existing443C60 exit,
             //ignore its return. A blocked exit is not an absorber retry.
@@ -113,7 +111,13 @@ pub(super) fn mission_repair(
                 DepartureRoute::Hospital,
                 |sim, patient| {
                     let _ = crate::sim::production::exit_produced_object(
-                        sim, rules, hospital, patient, registry, effects,
+                        sim,
+                        rules,
+                        hospital,
+                        patient,
+                        (0, 0),
+                        registry,
+                        effects,
                     );
                     Ok(())
                 },
@@ -125,7 +129,7 @@ pub(super) fn mission_repair(
                     MissionId::from_known(MissionType::Guard),
                     0,
                     now,
-                    &EntityReadyInputProvider,
+                    &LiveReadyInputProvider { rules },
                 );
             }
         }

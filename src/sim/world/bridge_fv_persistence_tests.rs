@@ -5,14 +5,21 @@ use crate::rules::mission_data::MissionType;
 use crate::sim::mission::MissionId;
 use crate::sim::world::bridge_test_evidence::{
     assert_navigation_fields_equal, navigation_authority, rebuilt_graphs, restored_retail,
-    save_scene,
+    retail_anytown_map_bytes, save_scene,
 };
 use crate::sim::world::{Simulation, TickLane};
 use crate::util::save_codec;
 use serde_json::{Value, json};
 
 fn authority(sim: &Simulation, source: u64, expected_load: bool) -> Value {
-    let actor = sim.substrate.entities.get(source).unwrap();
+    let mut actor = sim.substrate.entities.get(source).unwrap().clone();
+    if expected_load {
+        // Unit/Foot Load executes FootClass::Load's audio-reset tail
+        // @ 0x004DB60D..0x004DB624, rebuilding Foot+0x544 and clearing the
+        // logical MoveSound latch/countdown at +0x53C/+0x540. Compare the
+        // saved authority with the original post-Load fields.
+        actor.move_sound = crate::sim::world::MoveSoundState::default();
+    }
     let bullets: Vec<_> = sim
         .projectiles
         .iter()
@@ -21,23 +28,25 @@ fn authority(sim: &Simulation, source: u64, expected_load: bool) -> Value {
             if expected_load {
                 // Original Bullet Load46AE9C..46AEB0 restarts the timer;
                 // the remaining saved guidance, launch and fuse state survives.
-                bullet.arm_timer.start(sim.session.binary_frame as i32, 0);
+                bullet
+                    .arm_timer_mut_for_test()
+                    .start(sim.session.binary_frame() as i32, 0);
             }
-            json!({"state":bullet,"in_logic":bullet.in_logic_vector})
+            json!({"state":bullet,"in_logic":bullet.in_logic_vector()})
         })
         .collect();
     json!({
         "actor":actor,"actor_in_logic":actor.in_logic_vector.is_member(),
         "bullets":bullets,
         "anims":sim.substrate.anims.iter().map(|(_, anim)|
-            json!({"state":anim,"in_logic":anim.in_logic_vector,
-                "building_slot":anim.building_slot,"damage_fire_slot":anim.damage_fire_slot})
+            json!({"state":anim,"in_logic":anim.in_logic_vector(),
+                "building_slot":anim.building_slot(),"damage_fire_slot":anim.damage_fire_slot()})
         ).collect::<Vec<_>>(),
         "logic":sim.substrate.logic.snapshot(),"display":sim.substrate.display,
         "pending_delete":sim.substrate.pending_delete.object_ids(),
         "native_id_cursor":sim.native_unique_ids.as_ref().unwrap().current_raw(),
-        "next_stable_id":sim.substrate.next_stable_object_id,
-        "clock":[sim.session.tick, u64::from(sim.session.binary_frame)],
+        "next_stable_id":sim.next_stable_object_id(),
+        "clock":[sim.session.tick(), u64::from(sim.session.binary_frame())],
         "bridge_authority":crate::util::sha256::sha256_hex(
             &save_codec::serialize(&sim.bridge_state).unwrap()),
         "cell_memberships":crate::util::sha256::sha256_hex(
@@ -93,7 +102,7 @@ fn checkpoint(
     let sim = scene.sim();
     eprintln!(
         "FV restore checkpoint {name} before frame{}",
-        sim.session.binary_frame
+        sim.session.binary_frame()
     );
     Checkpoint {
         name,
@@ -104,32 +113,44 @@ fn checkpoint(
             (48..=59).flat_map(|y| (84..=90).map(move |x| (x, y))),
         ),
         transients: transient_ids(sim, ambient),
-        collapsed: sim
-            .resolved_terrain
-            .as_ref()
-            .unwrap()
-            .cell(87, 54)
-            .unwrap()
-            .bridge_facts
-            .overlay_id
-            == Some(232),
+        collapsed: sim.overlay_grid.as_ref().unwrap().cell(87, 54).overlay_id == Some(232),
     }
 }
 
+/// Stock `[CombatDamage] BridgeStrength=1500` admits this 25-damage hit only
+/// when the area-damage roll `RandomRanged(1, BridgeStrength)` @ 0x0065C7E0
+/// (caller 0x0048A29F, `CMP EAX, damage; JGE` skip at 0x0048A2A4) is below 25,
+/// so whether the stock bridge falls within the run depends on which Scenario
+/// words reach the impacts. The v26 native packet collapsed at Logic 32 (roll
+/// 10) only under its captured outside-call schedule; the current scene's
+/// outside producers draw a different schedule and the original admission
+/// rejects both stock hits (#2260). A stock-strength restore test therefore
+/// tested the outside schedule, not save/load, and is retired.
+///
+/// RulesClass::ReadCombatDamage @ 0x0066CD66..0x0066CD86 reads this live map
+/// layer over the stock value. With strength 1, RandomRanged(1, 1) returns 1
+/// without drawing (`JZ` at 0x0065C7EF), so the first impact admits; the rest
+/// of the original map is unchanged.
 #[test]
 #[ignore = "requires physical Anytown and retail TEMPERATE assets"]
-fn retail_fv_pursuit_missiles_collapse_and_guard_survive_restore() {
+fn retail_fv_pursuit_missiles_collapse_and_guard_survive_restore_with_map_strength_one() {
+    let directory =
+        crate::map::source::test_support::TestDirectory::new("fv-pursuit-bridge-strength-one");
+    let mut bytes = retail_anytown_map_bytes();
+    bytes.extend_from_slice(b"\r\n[CombatDamage]\r\nBridgeStrength=1\r\n");
+    directory.write("XMP03T4.MAP", &bytes);
+    let map_path = directory.path().join("XMP03T4.MAP");
     let pristine = {
-        let (healthy, _) = prepared_paid_scene("healthy");
+        let (healthy, _) = prepared_paid_scene("healthy", Some(&map_path));
         healthy.sim().resolved_terrain.as_ref().unwrap().clone()
     };
-    let (mut scene, ambient) = prepared_paid_scene("damaged");
-    // The v26 original-native damaged case with declared Scenario seed 31
-    // fires at 1/4, collapses 220->232 at 32 and drains into Guard by next_frame 53.
-    // Main's migrated Infantry idle scheduling changes the supplied outside
-    // RNG calls, so the historical seed 3 case no longer guarantees collapse.
-    // Use the independently executed current witness; keep every save boundary.
-    // Evidence: tools/spatial_oracle/fv_cell_attack/paid_conditional_v26_vectors.json.
+    let (mut scene, ambient) = prepared_paid_scene("damaged", Some(&map_path));
+    assert_eq!(
+        scene.runtime.resources.rules.bridge_rules.strength, 1,
+        "production map layer BridgeStrength"
+    );
+    // The v26 damaged case's declared seed 31 and FV coordinate; the
+    // collapse no longer depends on the Scenario words the impacts draw.
     let source = command_paid_fv(&mut scene, [22400, 12414, 416], 31, 3);
     let mut checkpoints = Vec::new();
     for _ in 0..96 {
@@ -163,7 +184,7 @@ fn retail_fv_pursuit_missiles_collapse_and_guard_survive_restore() {
             1 if sim
                 .projectiles
                 .iter()
-                .filter(|(_, bullet)| bullet.source_id == source && bullet.guidance.is_some())
+                .filter(|(_, bullet)| bullet.source_id() == source && bullet.guidance().is_some())
                 .count()
                 == 2 =>
             {
@@ -171,15 +192,7 @@ fn retail_fv_pursuit_missiles_collapse_and_guard_survive_restore() {
             }
             2 if output.tick.bridge_state_changed
                 && actor.attack_target.target().is_none()
-                && sim
-                    .resolved_terrain
-                    .as_ref()
-                    .unwrap()
-                    .cell(87, 54)
-                    .unwrap()
-                    .bridge_facts
-                    .overlay_id
-                    == Some(232) =>
+                && sim.overlay_grid.as_ref().unwrap().cell(87, 54).overlay_id == Some(232) =>
             {
                 Some("collapsed")
             }

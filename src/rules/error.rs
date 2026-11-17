@@ -9,8 +9,17 @@ use thiserror::Error;
 /// Errors that can occur when parsing INI files or game data definitions.
 #[derive(Debug, Error)]
 pub enum RulesError {
+    #[error("map Terrain factory requires the current scenario Rules owner")]
+    MissingScenarioRegistry,
+
     #[error("Invalid saved Rules state: {0}")]
     InvalidSavedState(&'static str),
+
+    /// Load_Game_Rules52CD70 returns false at52D302 when LANGRULE's
+    /// ReadCCFile (52D26F) reports status 2, and Init_Game52C963 then fails
+    /// with "Failed to initialize Rules!".
+    #[error("LANGRULE.INI failed its Digest check")]
+    LangRuleDigestRejected,
 
     /// The INI data is not valid UTF-8.
     #[error("INI data is not valid UTF-8: {0}")]

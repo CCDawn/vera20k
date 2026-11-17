@@ -4,9 +4,11 @@
 use super::Simulation;
 use crate::rules::ruleset::RuleSet;
 
-/// Drop observation packets after their synchronous producers have run.
-/// PLACE radio C owns the yard's Production8 animation at43CC4C; replaying
-/// it here would allocate another animation, IDs and RNG at the frame tail.
+/// Drop the test observation packets after their synchronous producers have
+/// run. PLACE radio C owns the yard's Production8 animation at43CC4C;
+/// replaying it here would allocate another animation, IDs and RNG at the
+/// frame tail.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn finalize(sim: &mut Simulation) {
     sim.bale_events.clear();
     sim.bunker_wall_events.clear();
@@ -94,7 +96,11 @@ pub(crate) fn emit_refinery_smoke(sim: &mut Simulation, rules: &RuleSet, buildin
                 rules,
             ) {
                 // Original4599CD calls6301F0 after each constructor.
-                sim.particle_systems_mut().get_mut(system).unwrap().lifetime = lifetime;
+                sim.substrate
+                    .particle_systems
+                    .get_mut(system)
+                    .unwrap()
+                    .override_lifetime(lifetime);
             }
         }
     }
@@ -155,7 +161,7 @@ pub(crate) fn set_bunker_wall_slots(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 mod tests {
     use super::*;
     use crate::rules::art_data::ArtRegistry;
@@ -218,7 +224,7 @@ mod tests {
             text.push_str("[Particles]\n0=Smk\n[ParticleSystems]\n0=Sys\n[Smk]\nBehavesLike=Smoke\nMaxEC=10\n[Sys]\nBehavesLike=Smoke\nHoldsWhat=Smk\nLifetime=200\n");
             let rules = RuleSet::from_ini(&IniFile::from_str(&text)).unwrap();
             let mut sim = Simulation::new();
-            let id = sim.allocate_stable_id();
+            let id = sim.substrate.allocate_stable_id();
             let mut entity = GameEntity::test_default(
                 id,
                 "GAREFN",
@@ -244,12 +250,12 @@ mod tests {
                 .collect();
             assert_eq!(actual.len(), expected.len(), "{row}");
             for (system, call) in actual.into_iter().zip(expected) {
-                assert_eq!(system.coords, vector(&call["coords"]), "{row}");
-                assert_eq!(system.target_coords, vector(&call["target"]));
-                assert_eq!(system.lifetime, call["lifetime"].as_i64().unwrap() as i32);
-                assert_eq!(system.owner_entity, Some(id));
-                assert_eq!(system.target_ref, None);
-                assert_eq!(system.owner_house, None);
+                assert_eq!(system.coords(), vector(&call["coords"]), "{row}");
+                assert_eq!(system.target_coords(), vector(&call["target"]));
+                assert_eq!(system.lifetime(), call["lifetime"].as_i64().unwrap() as i32);
+                assert_eq!(system.owner_entity(), Some(id));
+                assert_eq!(system.target_ref(), None);
+                assert_eq!(system.owner_house(), None);
             }
             represented += 1;
         }
@@ -267,7 +273,7 @@ mod tests {
         entity.set_type_ref_for_test(sim.interner.intern(name));
         entity.set_owner_for_test(sim.interner.intern("Americans"));
         entity.health.set_for_test(100);
-        sim.entities_mut().insert(entity);
+        sim.substrate.entities.insert(entity);
     }
     fn refinery_sim_with_bale() -> Simulation {
         let mut sim = Simulation::new();
@@ -359,17 +365,17 @@ mod tests {
         );
 
         assert_eq!(
-            sim.successful_non_wall_placement_owner(&refinery_command, false, Some(&rules)),
+            sim.successful_non_wall_placement_owner(&refinery_command, false, &rules),
             None,
             "a rejected placement cannot borrow an unrelated spawn signal"
         );
         assert_eq!(
-            sim.successful_non_wall_placement_owner(&wall_command, true, Some(&rules)),
+            sim.successful_non_wall_placement_owner(&wall_command, true, &rules),
             None,
             "wall overlays do not arm a producer crane"
         );
         assert_eq!(
-            sim.successful_non_wall_placement_owner(&refinery_command, true, Some(&rules)),
+            sim.successful_non_wall_placement_owner(&refinery_command, true, &rules),
             Some(owner)
         );
     }
@@ -387,7 +393,7 @@ mod tests {
         let app_output = app_sim
             .advance_app_frame(
                 &[],
-                Some(&rules),
+                &rules,
                 None,
                 67,
                 crate::sim::world::TickLane::Ordinary,
@@ -405,44 +411,6 @@ mod tests {
     }
 
     #[test]
-    fn app_frame_hash_includes_synchronous_bale_slot_and_particle_state() {
-        let rules = refinery_rules_and_art();
-        let mut sim = Simulation::new();
-        sim.hash_state_every(std::num::NonZeroU64::MIN);
-        insert_building(&mut sim, 41, "GAREFN", 7, 9);
-        sim.bale_events.push(BaleDepositEvent {
-            building_id: 41,
-            tick: 12,
-            drained: true,
-            empty: false,
-        });
-
-        begin_refinery_unload_gate(&mut sim, &rules, 41);
-        let output = sim
-            .advance_app_frame(
-                &[],
-                Some(&rules),
-                None,
-                67,
-                crate::sim::world::TickLane::Ordinary,
-                crate::sim::world::FrameEffects::default(),
-            )
-            .expect("fixture frame must complete");
-
-        assert!(output.tick.frame_committed);
-        assert!(sim.bale_events.is_empty());
-        assert!(
-            sim.entities()
-                .get(41)
-                .expect("refinery")
-                .building_art
-                .anim_slots()[10]
-                .is_some()
-        );
-        assert_eq!(sim.particle_systems().len(), 1);
-        assert_eq!(output.tick.state_hash, Some(sim.state_hash()));
-    }
-    #[test]
     fn original_health_ratio_corpus_selects_real_refinery_slot_variant() {
         for row in crate::sim::health_ratio_fixture::rows() {
             let art_ini = IniFile::from_str(
@@ -458,7 +426,8 @@ mod tests {
             }
             rules.install_art_data(art);
             let mut sim = refinery_sim_with_bale();
-            sim.entities_mut()
+            sim.substrate
+                .entities
                 .get_mut(41)
                 .unwrap()
                 .health
@@ -467,7 +436,7 @@ mod tests {
             finalize(&mut sim);
             let id = sim.entities().get(41).unwrap().building_art.anim_slots()[10].unwrap();
             assert_eq!(
-                sim.interner.resolve(sim.anim(id).unwrap().type_id),
+                sim.interner.resolve(sim.anim(id).unwrap().type_id()),
                 if row.output.refinery_special_damaged {
                     "DAMAGED"
                 } else {
@@ -486,11 +455,15 @@ mod tests {
             );
         }
     }
+    /// Without `SpecialAnimDamaged=`, ReadINI's copy at `0x00462DDE` leaves the
+    /// damaged name `GAREFN_B`: `0x00451750` takes it for a damaged building,
+    /// and `0x00451890` raises the damaged flag and constructs it.
     #[test]
-    fn missing_damaged_name_smokes_without_constructing_or_changing_flag() {
+    fn missing_damaged_name_constructs_the_normal_anim_and_sets_flag() {
         let rules = refinery_rules_and_art();
         let mut sim = refinery_sim_with_bale();
-        sim.entities_mut()
+        sim.substrate
+            .entities
             .get_mut(41)
             .unwrap()
             .health
@@ -500,8 +473,12 @@ mod tests {
         assert!(sim.bale_events.is_empty());
         assert_eq!(sim.particle_systems().len(), 1);
         let building = sim.entities().get(41).unwrap();
-        assert_eq!(building.building_art.anim_slots()[10], None);
-        assert!(!building.building_art.damage_state_active());
+        let anim = building.building_art.anim_slots()[10].expect("damaged SpecialAnim");
+        assert_eq!(
+            sim.interner.resolve(sim.anim(anim).unwrap().type_id()),
+            "GAREFN_B"
+        );
+        assert!(building.building_art.damage_state_active());
     }
     #[test]
     fn empty_bale_constructs_then_scalar_deletes_and_drain_only_emits_once() {

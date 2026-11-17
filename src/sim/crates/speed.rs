@@ -6,30 +6,35 @@
 
 use crate::map::entities::EntityCategory;
 use crate::sim::components::DriveCoord;
+use crate::sim::houses::Houses;
 use crate::sim::movement::ground_pose::position_world_coord;
-use crate::sim::world::Simulation;
+use crate::sim::world::ObjectSubstrate;
 use crate::util::native_x87::{NativeF64Bits, distance_3d_leptons};
 
 /// Returns the native local EVA latch: at least one changed recipient's house
 /// has PlayerControl(+1ED). No owner-equality filter or RNG draw occurs here.
-pub(super) fn apply_speed_crate(
-    sim: &mut Simulation,
+pub(crate) fn apply_speed_crate(
+    substrate: &mut ObjectSubstrate,
+    houses: &Houses,
+    rules: &crate::rules::ruleset::RuleSet,
+    interner: &crate::sim::intern::StringInterner,
     center: DriveCoord,
     radius: i32,
     multiplier: NativeF64Bits,
 ) -> bool {
+    let ares = rules.ares_form();
     let mut announce = false;
     // This arm has no callback that changes the display vector. Coordinate
-    // getters are retained XYZ, and the only entity write is Foot+580.
-    for &id in sim
-        .substrate
+    // getters are retained XYZ; Ares writes the permanent Ext+90 and its
+    // derived Foot+580 through the same attachment projection.
+    for &id in substrate
         .display
         .members(crate::sim::world::display_layers::DisplayLayer::GROUND)
     {
-        let Some(entity) = sim.substrate.entities.get_mut(id) else {
+        let Some(entity) = substrate.entities.get_mut(id) else {
             continue;
         };
-        if entity.category() == EntityCategory::Structure {
+        if !entity.category().is_foot() {
             continue;
         }
         let position = position_world_coord(&entity.position);
@@ -40,23 +45,32 @@ pub(super) fn apply_speed_crate(
         {
             continue;
         }
-        if entity.category() == EntityCategory::Aircraft {
+        // Ares Speed2@1005FA36 excludes WhatAmI3, not stock Aircraft2.
+        // Original vtable+2C: Unit7F5C70->746E20 returns1,
+        // Aircraft7E22A4->41C180 returns2, Infantry7EB058->523340 returns15.
+        // RTTI3 is AircraftType7E2868->41CFB0, never a GameEntity/Foot.
+        if !rules.ares() && entity.category() == EntityCategory::Aircraft {
             continue;
         }
         if entity.foot_speed.accept_speed_crate(multiplier) {
-            announce |= sim
-                .houses
+            // Installed Speed2 hook1005FA00 stores Ext+90, then calls
+            //100460A0 before returning to the ordinary recipient loop.
+            if ares {
+                entity.recompute_ares_attached_stats(rules, interner);
+            }
+            announce |= houses
                 .get(&entity.owner())
-                .is_some_and(|house| house.player_control);
+                .is_some_and(|house| house.player_control());
         }
     }
     announce
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
     use crate::rules::{ini_parser::IniFile, ruleset::RuleSet};
+    use crate::sim::world::Simulation;
     use crate::sim::{combat::Health, game_entity::GameEntity, house_state::HouseState};
     use crate::util::fixed_math::SimFixed;
 
@@ -64,10 +78,14 @@ mod tests {
     fn lifecycle_ground_membership_controls_recipients_independently_of_logic() {
         use crate::sim::world::{PlacementEvidence, RevealPosition, RevealRequest};
         let mut sim = Simulation::new();
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[InfantryTypes]\n0=E1\n[E1]\nStrength=100\nSpeed=4\n",
+        ))
+        .unwrap();
         let owner = sim.interner.intern("Americans");
         let type_id = sim.interner.intern("E1");
         for id in 1..=3 {
-            assert_eq!(sim.allocate_stable_id(), id);
+            assert_eq!(sim.substrate.allocate_stable_id(), id);
             let mut entity = GameEntity::new_at_frame_zero_for_test(
                 id,
                 10,
@@ -107,7 +125,10 @@ mod tests {
         assert!(sim.substrate.logic.as_slice().is_empty());
         let multiplier = NativeF64Bits::from_bits(1.2f64.to_bits());
         apply_speed_crate(
-            &mut sim,
+            &mut sim.substrate,
+            &sim.houses,
+            &rules,
+            &sim.interner,
             DriveCoord {
                 x: 2688,
                 y: 2688,
@@ -139,6 +160,87 @@ mod tests {
     }
 
     #[test]
+    fn speed_crate_picker_and_recipient_use_profile_and_permanent_baseline() {
+        use crate::rules::powerups::POWERUP_SPEED;
+        use crate::rules::terrain_rules::LandType;
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[VehicleTypes]\n0=MOVER\n[InfantryTypes]\n0=SOLDIER\n[AircraftTypes]\n0=PLANE\n\
+             [MOVER]\nStrength=100\nSpeed=4\n[SOLDIER]\nStrength=100\nSpeed=4\n[PLANE]\nStrength=100\nSpeed=4\n",
+        )).unwrap();
+        let factor = NativeF64Bits::from_bits(0x3ff3_3333_3333_3333);
+        for (category, name) in [
+            (EntityCategory::Unit, "MOVER"),
+            (EntityCategory::Infantry, "SOLDIER"),
+            (EntityCategory::Aircraft, "PLANE"),
+        ] {
+            for already_upgraded in [false, true] {
+                let mut sim = Simulation::with_seed(17);
+                let owner = sim.interner.intern("Americans");
+                sim.houses
+                    .register(HouseState::new(owner, 0, None, true, 0, 10));
+                let id = sim.substrate.allocate_stable_id();
+                let mut entity =
+                    GameEntity::test_default_of_category(id, name, "Americans", 10, 10, category);
+                entity.set_owner_for_test(owner);
+                entity.set_type_ref_for_test(sim.interner.intern(name));
+                entity.position.set_sub_x_for_test(SimFixed::from_num(128));
+                entity.position.set_sub_y_for_test(SimFixed::from_num(128));
+                if already_upgraded {
+                    assert!(entity.foot_speed.accept_speed_crate(factor));
+                }
+                sim.substrate.entities.insert(entity);
+                // Explicit ground-display recipient input, including Aircraft.
+                // This checks class admission, not aircraft crate reachability
+                // or a Fly/Jumpjet movement-speed equivalence claim.
+                sim.substrate.display.submit(
+                    id,
+                    Some(crate::sim::world::display_layers::DisplayLayer::GROUND),
+                    &|_| 0,
+                );
+                let expected =
+                    !already_upgraded && (rules.ares() || category != EntityCategory::Aircraft);
+                let slot = super::super::pickup::multiplayer_eligible_slot(
+                    &sim,
+                    &rules,
+                    id,
+                    LandType::Clear.as_index(),
+                    POWERUP_SPEED,
+                );
+                assert_eq!(
+                    slot == POWERUP_SPEED,
+                    expected,
+                    "{category:?} prior={already_upgraded}"
+                );
+                let position = position_world_coord(&sim.entities().get(id).unwrap().position);
+                let announced = apply_speed_crate(
+                    &mut sim.substrate,
+                    &sim.houses,
+                    &rules,
+                    &sim.interner,
+                    DriveCoord {
+                        x: position.x,
+                        y: position.y,
+                        z: position.z,
+                    },
+                    1,
+                    factor,
+                );
+                assert_eq!(announced, expected, "{category:?} prior={already_upgraded}");
+                let state = &sim.entities().get(id).unwrap().foot_speed;
+                assert_eq!(
+                    state.crate_multiplier(),
+                    if expected || already_upgraded {
+                        factor
+                    } else {
+                        NativeF64Bits::ONE
+                    }
+                );
+                assert!(!state.attached());
+            }
+        }
+    }
+
+    #[test]
     fn original_speed_effect_updates_live_foot_speed_for_every_recipient() {
         let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
             "tools/spatial_oracle/crate_speed_effect.json",
@@ -166,11 +268,12 @@ mod tests {
                 let owner = sim
                     .interner
                     .intern(&format!("H{}", actor["house"].as_u64().unwrap_or(0)));
-                let house = sim
-                    .houses
-                    .entry(owner)
-                    .or_insert_with(|| HouseState::new(owner, 0, None, false, 0, 10));
-                house.player_control = actor["player_controlled"].as_u64().unwrap_or(0) != 0;
+                let house = sim.houses.get_or_register_for_test(owner, || {
+                    HouseState::new(owner, 0, None, false, 0, 10)
+                });
+                house.set_player_control_for_test(
+                    actor["player_controlled"].as_u64().unwrap_or(0) != 0,
+                );
                 let category = if actor["flags"].as_u64().unwrap_or(4) & 4 == 0 {
                     EntityCategory::Structure
                 } else {
@@ -239,7 +342,10 @@ mod tests {
             };
             let rng_before = sim.scenario_rng.logical_state();
             let announce = apply_speed_crate(
-                &mut sim,
+                &mut sim.substrate,
+                &sim.houses,
+                &rules,
+                &sim.interner,
                 center,
                 input["radius"].as_i64().unwrap_or(768) as i32,
                 NativeF64Bits::from_bits(

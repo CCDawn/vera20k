@@ -5,6 +5,8 @@
 //! useful metadata now and leave the broader scenario semantics for later work.
 
 use crate::rules::ini_parser::IniFile;
+use crate::util::native_string::decode_widened_utf8;
+use crate::util::native_x87::NativeF64Bits;
 
 /// Owner of the active `SpecialFlags::DestroyableBridges` bit during load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +30,12 @@ pub struct BasicSection {
     pub briefing: Option<String>,
     /// Post-read movie catalog name (Scenario+1444, Basic.Action).
     pub action: Option<String>,
+    /// Scenario+0x143C: ReadMovie4757D0 at68A048, reset to -1 at6837F4.
+    /// GameExit::Victory685928 plays it before testing SkipScore.
+    pub win: Option<String>,
+    /// Scenario+0x1440 movie (`ReadMovie` at `0x0068A066`), which campaign
+    /// defeat plays before its retry prompt (`0x0068606B`).
+    pub lose: Option<String>,
     /// Opening campaign waypoint; SetDefaults683622 resets it to699.
     pub home_cell: Option<i32>,
     /// Alternate opening waypoint; SetDefaults683628 resets it to699.
@@ -42,6 +50,12 @@ pub struct BasicSection {
     pub ice_growth_enabled: Option<bool>,
     /// Scenario34A7: current-default ReadBool68A58F..68A5BA, fresh true.
     pub vein_growth_enabled: Option<bool>,
+    /// Scenario+0x34B3 `TiberiumDeathToVisceroid`: current-default ReadBool
+    /// in `ScenarioClass::Read_INI_Basic @ 0x00689E90` between
+    /// IceGrowthEnabled and FreeRadar; `Set_Defaults @ 0x00683610` resets it
+    /// to true. Only Ares reads the byte (`TechnoExt::SpawnVisceroid @
+    /// 100468B0`), so only a game Ares plays in stores it in the Scenario.
+    pub tiberium_death_to_visceroid: Option<bool>,
     /// Scenario+34A5, current-default ReadBool68A235..68A24D; fresh false.
     pub train_crate: Option<bool>,
     /// Scenario+34B1, current-default ReadBool68A217..68A22F; fresh false.
@@ -56,6 +70,17 @@ pub struct BasicSection {
     /// 0x0068A271..0x0068A289`, `Set_Defaults` false at `0x00683899`): the
     /// AI triggers of `AIMD.INI` never qualify (`sim::ai_team_creation`).
     pub ignore_global_ai_triggers: Option<bool>,
+    /// gamemd ScenarioClass::Read_INI_Basic @0x00689E90, Scenario+34AD:
+    /// ReadBool68A0E9..68A101 uses the current value;
+    /// fresh SetDefaults683875 clears it. The receiving map owns inheritance.
+    pub timer_inherit: Option<bool>,
+    /// gamemd ScenarioClass::Read_INI_Basic: Scenario+1C78 ReadDouble68A175,
+    /// capped at1.0 at68A17A..68A199.
+    /// SetDefaults68381E..683824 supplies0. The receiving map owns this policy.
+    pub carry_over_money: Option<NativeF64Bits>,
+    /// Scenario+1C80: current-default ReadInt68A1B2; fresh68382A supplies0.
+    /// EvadeClass::Do4C623D treats only-1 as an unlimited cap.
+    pub carry_over_cap: Option<i32>,
     /// Scenario+0x34AE `SkipScore`, read from map `[Basic]` at
     /// `0x0068A1BD..0x0068A1D5`; a fresh Scenario defaults this byte to false
     /// (`Set_Defaults` `0x0068387B`). Campaign Victory uses it to bypass only
@@ -68,10 +93,31 @@ pub struct BasicSection {
     /// Scenario+0x34B0 (`0x0068A20C`): MapSelect takes NextScenario instead
     /// of the MAPSELMD stage following the current map.
     pub skip_map_select: Option<bool>,
+    /// Read_INI_Basic689FD6/689FF4: current-default ReadString into the
+    /// Scenario+4/+108 buffers (260 bytes). Fresh constructor683407/40A clears them.
+    pub next_scenario: Option<String>,
+    pub alt_next_scenario: Option<String>,
     /// Scenario+0x1448 movie (`ReadMovie` at `0x0068A0A2`), after the score.
     pub post_score: Option<String>,
     /// Scenario+0x144C movie (`ReadMovie` at `0x0068A0C0`), before MapSelect.
     pub pre_map_select: Option<String>,
+}
+
+impl BasicSection {
+    /// gamemd.exe ScenarioClass::Read_INI_Basic @0x00689E90,
+    /// 689FC0..689FF4 reads Next/Alt with their current buffers as defaults. ClearScene685237 -> SetDefaults
+    /// preserves them; only the constructor683407/68340A clears them.
+    /// Resolve parsed writes against the installed Scenario, not reset fields.
+    /// Physical empty values are omitted by the native INI parser; an actual
+    /// cached Some("") remains an explicit write that clears its buffer.
+    pub fn resolve_retained_destinations(&mut self, prior: &Self) {
+        if self.next_scenario.is_none() {
+            self.next_scenario.clone_from(&prior.next_scenario);
+        }
+        if self.alt_next_scenario.is_none() {
+            self.alt_next_scenario.clone_from(&prior.alt_next_scenario);
+        }
+    }
 }
 
 /// Parsed flags from a map's `[SpecialFlags]` section.
@@ -91,6 +137,17 @@ pub struct SpecialFlagsSection {
     /// Campaign/editor `ScenarioFlags` bit 0x20. While set, direct and area
     /// damage return before mutating world state (`Inert=`).
     pub inert: Option<bool>,
+    /// Campaign/editor ScenarioFlags bit 0x1000, read by
+    /// `ScenarioClass::Read_SpecialFlags @ 0x006B8E69..0x006B8E89`.
+    pub fog_of_war: Option<bool>,
+    /// Campaign/editor `ScenarioFlags` bit 0x800 (`HarvesterImmune=`,
+    /// `ScenarioClass::Read_SpecialFlags @ 0x006B8EBF..0x006B8ED7`, the
+    /// reader's last key). While set, `Evaluate_Candidate`
+    /// (`0x006F8009..0x006F8047`) refuses every candidate whose type is in
+    /// Rules' `HarvesterUnit=` list. A nonzero game mode never reads it: the
+    /// session's Harvester Truce replaces the map's flags
+    /// (`0x00687C16..0x00687C29`).
+    pub harvester_immune: Option<bool>,
 }
 
 impl SpecialFlagsSection {
@@ -99,6 +156,9 @@ impl SpecialFlagsSection {
     /// initializes0x8088: Inert/grows false, spreads/destroyable bridges true.
     /// The passed snapshot is a projection of the existing live authorities.
     pub fn resolve_campaign_defaults(&mut self, prior: Option<&Self>) {
+        // Full_Init686BA2 clears this bit before Read_SpecialFlags, even
+        // when the outgoing campaign retained FogOfWar=yes.
+        self.fog_of_war.get_or_insert(false);
         self.inert
             .get_or_insert(prior.and_then(|flags| flags.inert).unwrap_or(false));
         self.tiberium_grows.get_or_insert(
@@ -115,6 +175,13 @@ impl SpecialFlagsSection {
             prior
                 .and_then(|flags| flags.destroyable_bridges)
                 .unwrap_or(true),
+        );
+        // The cold ctor word `0x8088` leaves bit 0x800 clear; a retained
+        // scenario keeps it until a key rewrites the bit.
+        self.harvester_immune.get_or_insert(
+            prior
+                .and_then(|flags| flags.harvester_immune)
+                .unwrap_or(false),
         );
     }
 
@@ -135,11 +202,12 @@ pub fn parse_basic_section(ini: &IniFile) -> BasicSection {
         return BasicSection::default();
     };
 
+    let map_text = |value: &str| decode_widened_utf8(value).into_owned();
     BasicSection {
         // The scenario list's ReadString 0x40 (`0x00699858`).
-        name: section.read_name("Name", 0x40).map(str::to_string),
+        name: section.read_name("Name", 0x40).map(map_text),
         // No gamemd reader; VERA's scenario menu shows it.
-        author: section.read_name("Author", 0x80).map(str::to_string),
+        author: section.read_name("Author", 0x80).map(map_text),
         // ReadMovie4757D0 uses ReadString128 then the fixed movie registry;
         // bare `none` is an ordinary movie name, not a ReadType sentinel.
         intro: section
@@ -151,6 +219,12 @@ pub fn parse_basic_section(ini: &IniFile) -> BasicSection {
         action: section
             .is_present("Action")
             .then(|| section.read_string("Action", "", 128)),
+        win: section
+            .is_present("Win")
+            .then(|| section.read_string("Win", "", 128)),
+        lose: section
+            .is_present("Lose")
+            .then(|| section.read_string("Lose", "", 128)),
         // Current-default reads at68A601..68A656, after fresh SetDefaults.
         home_cell: section
             .is_present("HomeCell")
@@ -166,18 +240,37 @@ pub fn parse_basic_section(ini: &IniFile) -> BasicSection {
         tiberium_growth_enabled: section.read_bool_value("TiberiumGrowthEnabled"),
         ice_growth_enabled: section.read_bool_value("IceGrowthEnabled"),
         vein_growth_enabled: section.read_bool_value("VeinGrowthEnabled"),
+        tiberium_death_to_visceroid: section.read_bool_value("TiberiumDeathToVisceroid"),
         train_crate: section.read_bool_value("TrainCrate"),
         truck_crate: section.read_bool_value("TruckCrate"),
         free_radar: section.read_bool_value("FreeRadar"),
         fill_silos: section.read_bool_value("FillSilos"),
         // ReadBool with the current Scenario+0x34B4 as default (`0x0068A284`).
         ignore_global_ai_triggers: section.read_bool_value("IgnoreGlobalAITriggers"),
+        timer_inherit: section.read_bool_value("TimerInherit"),
+        carry_over_money: section.is_present("CarryOverMoney").then(|| {
+            let value = section.read_double("CarryOverMoney", 0.0);
+            NativeF64Bits::from_bits(if value >= 1.0 {
+                NativeF64Bits::ONE.bits()
+            } else {
+                value.to_bits()
+            })
+        }),
+        carry_over_cap: section
+            .is_present("CarryOverCap")
+            .then(|| section.read_int("CarryOverCap", 0)),
         // ReadBool with the current Scenario+0x34AE as default. A fresh map
         // load resets that byte to false in Set_Defaults.
         skip_score: section.read_bool_value("SkipScore"),
         end_of_game: section.read_bool_value("EndOfGame"),
         one_time_only: section.read_bool_value("OneTimeOnly"),
         skip_map_select: section.read_bool_value("SkipMapSelect"),
+        next_scenario: section
+            .is_present("NextScenario")
+            .then(|| section.read_string("NextScenario", "", 0x104)),
+        alt_next_scenario: section
+            .is_present("AltNextScenario")
+            .then(|| section.read_string("AltNextScenario", "", 0x104)),
         post_score: section
             .is_present("PostScore")
             .then(|| section.read_string("PostScore", "", 128)),
@@ -201,13 +294,131 @@ pub fn parse_special_flags_section(ini: &IniFile) -> SpecialFlagsSection {
         tiberium_spreads: section.read_bool_value("TiberiumSpreads"),
         destroyable_bridges: section.read_bool_value("DestroyableBridges"),
         inert: section.read_bool_value("Inert"),
+        fog_of_war: section.read_bool_value("FogOfWar"),
+        // `0x006B8EBF..0x006B8ED7`, the reader's last key; every read takes
+        // the current bit as its default, which the campaign retention pass
+        // (`resolve_campaign_defaults`) models.
+        harvester_immune: section.read_bool_value("HarvesterImmune"),
     }
 }
 
-#[cfg(test)]
+/// The most of a map's briefing [`briefing_text`] keeps, in characters.
+const MAX_BRIEFING_CHARS: usize = 2000;
+
+/// VERA: a map's `[Basic] Briefing`, the text lobby programs show over the
+/// map preview, each `@` starting a new line. gamemd never reads the key; its
+/// briefings come from `MISSIONMD.INI`. It is read from the file's own lines,
+/// as the INI reader keeps only 511 bytes of a line (`Straw::ReadLine`) and
+/// briefings run longer: section and key names match without case, the first
+/// copy with a value counts, and the value ends at `;`. Control characters
+/// other than spacing go, runs of space become one, blank lines collapse to
+/// one and the text is cut at [`MAX_BRIEFING_CHARS`], as vera20k.org's map
+/// list shows it. `None` without one, or when it is only a string-table name
+/// such as `Brief:TRN01`, which map editors leave in maps.
+pub fn briefing_text(map_bytes: &[u8]) -> Option<String> {
+    let value = basic_briefing_value(map_bytes)?;
+    let value = crate::util::native_string::widen_bytes(value);
+    let value = decode_widened_utf8(&value);
+    if is_string_table_name(&value) {
+        return None;
+    }
+    let mut text = String::new();
+    let mut blank = false;
+    for line in value.split('@') {
+        let line: String = line
+            .chars()
+            .filter(|c| !c.is_control() || c.is_whitespace())
+            .collect();
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.is_empty() {
+            blank = !text.is_empty();
+            continue;
+        }
+        if !text.is_empty() {
+            text.push_str(if blank { "\n\n" } else { "\n" });
+        }
+        blank = false;
+        text.push_str(&words.join(" "));
+    }
+    let text: String = text.chars().take(MAX_BRIEFING_CHARS).collect();
+    let text = text.trim_end();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// The raw value of the first `Briefing=` with one in a `[Basic]` section.
+fn basic_briefing_value(map_bytes: &[u8]) -> Option<&[u8]> {
+    let mut in_basic = false;
+    for line in map_bytes.split(|&byte| byte == b'\n') {
+        let line = line.trim_ascii();
+        if let Some(rest) = line.strip_prefix(b"[") {
+            in_basic = rest
+                .iter()
+                .position(|&byte| byte == b']')
+                .is_some_and(|end| rest[..end].trim_ascii().eq_ignore_ascii_case(b"Basic"));
+            continue;
+        }
+        if !in_basic {
+            continue;
+        }
+        let line = line.split(|&byte| byte == b';').next().unwrap_or_default();
+        let Some(equals) = line.iter().position(|&byte| byte == b'=') else {
+            continue;
+        };
+        let value = line[equals + 1..].trim_ascii();
+        if line[..equals]
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"Briefing")
+            && !value.is_empty()
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// A string-table name: two names of letters, digits and `_` around one `:`.
+fn is_string_table_name(value: &str) -> bool {
+    let name = |part: &str| {
+        !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
+    value
+        .split_once(':')
+        .is_some_and(|(category, label)| name(category) && name(label))
+}
+
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
+
+    #[test]
+    fn fresh_destination_reads_retain_missing_and_physical_empty_keys() {
+        let prior = parse_basic_section(&IniFile::from_str(
+            "[Basic]\nNextScenario=ALL02UMD.MAP\nAltNextScenario=ALL03UMD.MAP\nSkipScore=yes\n",
+        ));
+        let mut incoming = parse_basic_section(&IniFile::from_str(
+            "[Basic]\nNextScenario=\nAltNextScenario=   \nSkipMapSelect=yes\n",
+        ));
+        incoming.resolve_retained_destinations(&prior);
+        assert_eq!(incoming.next_scenario.as_deref(), Some("ALL02UMD.MAP"));
+        assert_eq!(incoming.alt_next_scenario.as_deref(), Some("ALL03UMD.MAP"));
+        assert_eq!(incoming.skip_score, None);
+    }
+
+    #[test]
+    fn a_stored_empty_destination_clears_only_its_native_buffer() {
+        let prior = parse_basic_section(&IniFile::from_str(
+            "[Basic]\nNextScenario=ALL02UMD.MAP\nAltNextScenario=ALL03UMD.MAP\n",
+        ));
+        let mut section = crate::rules::ini_parser::IniSection::new("Basic".into());
+        // Unlike physical empty lines, an actual cached INI entry is a write.
+        section.set("NextScenario", "");
+        let ini = IniFile::from_sections_for_test([section]);
+        let mut incoming = parse_basic_section(&ini);
+        incoming.resolve_retained_destinations(&prior);
+        assert_eq!(incoming.next_scenario.as_deref(), Some(""));
+        assert_eq!(incoming.alt_next_scenario.as_deref(), Some("ALL03UMD.MAP"));
+    }
 
     #[test]
     fn campaign_current_special_bits_match_original_execution() {
@@ -219,7 +430,10 @@ mod tests {
             inert: Some(word & 0x20 != 0),
             tiberium_grows: Some(word & 0x40 != 0),
             tiberium_spreads: Some(word & 0x80 != 0),
-            destroyable_bridges: Some(word & 0x08 != 0),
+            // ReadSpecialFlags6B8E19..6B8E39 reads/writes bit15. The
+            // ApplyAreaDamage489EB2 consumer independently tests CH,0x80.
+            destroyable_bridges: Some(word & 0x8000 != 0),
+            harvester_immune: Some(word & 0x800 != 0),
             ..SpecialFlagsSection::default()
         };
         let assert_bits = |actual: &SpecialFlagsSection, expected: u64| {
@@ -228,6 +442,7 @@ mod tests {
             assert_eq!(actual.tiberium_grows, expected.tiberium_grows);
             assert_eq!(actual.tiberium_spreads, expected.tiberium_spreads);
             assert_eq!(actual.destroyable_bridges, expected.destroyable_bridges);
+            assert_eq!(actual.harvester_immune, expected.harvester_immune);
         };
         for row in native["special_controls"].as_array().unwrap() {
             let ini =
@@ -291,13 +506,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_basic_section_returns_defaults() {
-        let ini = IniFile::from_str("[Map]\nTheater=TEMPERATE\n");
-        let basic = parse_basic_section(&ini);
-        assert_eq!(basic, BasicSection::default());
-    }
-
-    #[test]
     fn free_radar_preserves_original_bool_tokens_and_supplied_default() {
         let original: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
             "tools/free_radar_oracle/fixtures/native-free-radar.json",
@@ -344,30 +552,29 @@ mod tests {
         assert_eq!(flags.inert, Some(true));
     }
 
+    /// `HarvesterImmune=` (`0x006B8EBF..0x006B8ED7`): present key parses;
+    /// absent key stays `None` and the campaign default resolves it from the
+    /// retained scenario bit, cold false.
     #[test]
-    fn gsi_04_10_special_flags_inert_is_optional_scenario_authority() {
+    fn parse_special_flags_harvester_immune_key_and_campaign_default() {
+        let ini = IniFile::from_str("[SpecialFlags]\nHarvesterImmune=yes\n");
         assert_eq!(
-            parse_special_flags_section(&IniFile::from_str("[SpecialFlags]\nInert=yes\n")).inert,
+            parse_special_flags_section(&ini).harvester_immune,
             Some(true)
         );
-        assert_eq!(
-            parse_special_flags_section(&IniFile::from_str("[SpecialFlags]\nInert=no\n")).inert,
-            Some(false)
-        );
-        assert_eq!(
-            parse_special_flags_section(&IniFile::from_str("[Basic]\nName=Ordinary\n")).inert,
-            None
-        );
-    }
 
-    #[test]
-    fn parse_special_flags_mcvdeploy_no() {
-        let ini = IniFile::from_str("[SpecialFlags]\nMCVDeploy=no\n");
-        let flags = parse_special_flags_section(&ini);
-        assert_eq!(flags.mcv_deploy, Some(false));
-        assert_eq!(flags.tiberium_grows, None);
-        assert_eq!(flags.tiberium_spreads, None);
-        assert_eq!(flags.destroyable_bridges, None);
+        let ini = IniFile::from_str("[SpecialFlags]\nTiberiumGrows=yes\n");
+        let mut flags = parse_special_flags_section(&ini);
+        assert_eq!(flags.harvester_immune, None);
+        flags.resolve_campaign_defaults(Some(&SpecialFlagsSection {
+            harvester_immune: Some(true),
+            ..SpecialFlagsSection::default()
+        }));
+        assert_eq!(flags.harvester_immune, Some(true));
+
+        let mut cold = parse_special_flags_section(&ini);
+        cold.resolve_campaign_defaults(None);
+        assert_eq!(cold.harvester_immune, Some(false));
     }
 
     #[test]
@@ -414,6 +621,32 @@ mod tests {
                     bridge_destruction: true,
                 }
             )
+        );
+    }
+
+    #[test]
+    fn a_briefing_past_the_ini_readers_511_bytes_reads_whole_with_each_at_a_new_line() {
+        let orders = "-Hold the bridge ".repeat(40);
+        let map = format!(
+            "[Map]\r\nBriefing=Not this\r\n[Basic]\r\nName=Bridge\r\n\
+             Briefing=Welcome  to Bridge@@@ Orders:@{orders}@@Good luck ; aside\r\n"
+        );
+        assert!(map.lines().any(|line| line.len() > 511));
+        assert_eq!(
+            briefing_text(map.as_bytes()),
+            Some(format!(
+                "Welcome to Bridge\n\nOrders:\n{}\n\nGood luck",
+                orders.trim_end()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_string_table_name_in_place_of_a_briefing_is_no_briefing() {
+        assert_eq!(briefing_text(b"[Basic]\nBriefing=Brief:TRN01\n"), None);
+        assert_eq!(
+            briefing_text(b"[BASIC]\nbriefing=MISSION BRIEFING:@Retake the coast.\n").as_deref(),
+            Some("MISSION BRIEFING:\nRetake the coast.")
         );
     }
 }

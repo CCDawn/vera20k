@@ -5,12 +5,12 @@
 
 use crate::sim::trigger_runtime::ThemeRequest;
 use crate::ui::shell::list::ListMetrics;
+use crate::util::time::Instant;
 use std::sync::Arc;
-use std::time::Instant;
 
 use super::{App, AppState};
 use crate::app::frontend::credits_roll::{
-    CreditsInput, CreditsReturn, CreditsRoll, CreditsRollSession,
+    CreditsInput, CreditsReturn, CreditsRoll, CreditsRollSession, CreditsViewport,
 };
 use crate::app::frontend::fullscreen_movie::{FullscreenMovie, MovieReturn, movie_stem};
 use crate::app::shell_route::ShellRoute;
@@ -252,6 +252,18 @@ impl App {
             .options_profile
             .movie_progress
             .note_played(stem);
+        // 0x005BED61..0x005BED6A: outside a campaign (GameMode != 0) Play_Movie
+        // returns right after that note, with no video, audio hold or suspend,
+        // so a skirmish or multiplayer map's movie action only moves on.
+        if running_scenario
+            && state
+                .match_state
+                .sim_runtime
+                .runtime()
+                .is_some_and(|runtime| runtime.simulation.session().game_mode_nonzero())
+        {
+            return;
+        }
         let file_name = format!("{stem}.BIK");
         let resolved = state.process_assets.manager().and_then(|assets| {
             assets
@@ -271,6 +283,9 @@ impl App {
             bytes,
             source,
             false,
+            // Fitted windows scale the frame (fullscreen_movie::movie_rect);
+            // at the native 1:1 size linear sampling returns exact texels.
+            wgpu::FilterMode::Linear,
         ) {
             Ok(surface) => surface,
             Err(err) => {
@@ -279,11 +294,13 @@ impl App {
                 return;
             }
         };
-        //5BEDFB..5BEE38 enters the same ABF35C movie hold as radar5BF580:
-        //Vox/streams pause, both VolumeInterp targets become0x2000.
-        //The separate menu pause owner must not acquire another movie credit.
+        // 5BEDFB..5BEE38 enters the same ABF35C movie hold as radar 5BF580
+        // (Vox/streams pause, both masters glide to 0x2000), then 5BEE3E
+        // suspends the sound events, which the radar movie does not. The
+        // separate menu pause owner must not acquire another movie credit.
         let wall_ms = crate::app::match_runtime::frame_pacer::wall_clock_ms();
         state.audio.set_movie_audio_held(true, wall_ms);
+        state.audio.set_movie_sounds_suspended(true, wall_ms);
         // The Bink soundtrack plays at VoiceVolume: BinkSetVolume(ftol(
         // VoiceVolume * 32768.0)) at `0x00432897` (32768 = unity gain).
         let voice_volume = state
@@ -291,10 +308,22 @@ impl App {
             .options_profile
             .voice_volume
             .clamp(0.0, 1.0);
+        // 0x006C99D0: the movie's cues, when it has any.
+        let header = &surface.file().header;
+        let subtitles =
+            crate::app::movie_subtitles::cues_for_movie(state.process_assets.manager(), stem)
+                .and_then(|cues| {
+                    crate::app::movie_subtitles::SubtitleTrack::new(
+                        cues,
+                        header.fps_num,
+                        header.fps_den,
+                    )
+                });
         let movie = FullscreenMovie::new(
             surface,
             state.audio.music_player.as_ref().map(|music| music.mixer()),
             voice_volume,
+            subtitles,
             return_to,
         );
         state.frontend.fullscreen_movie = Some(movie);
@@ -358,6 +387,11 @@ impl App {
 
     fn return_from_fullscreen_movie(state: &mut AppState, return_to: MovieReturn) {
         match return_to {
+            // The frame loop presents the splash, then starts the pending
+            // intro, then paints the shell (`App::render_frame`).
+            MovieReturn::StartupLogo | MovieReturn::StartupIntro => {
+                state.platform.window.request_redraw();
+            }
             MovieReturn::MoviesAndCredits => Self::open_movies_credits_page(state),
             MovieReturn::MovieList => Self::open_movie_list(state),
             MovieReturn::CampaignStart(request) => {
@@ -370,8 +404,14 @@ impl App {
                 state.frontend.screen = crate::ui::game_screen::GameScreen::InGame;
                 state.platform.window.request_redraw();
             }
+            MovieReturn::CampaignResult(destination) => {
+                Self::complete_scenario_exit(state, *destination);
+            }
             MovieReturn::CampaignVictory(victory) => {
                 Self::advance_campaign_victory(state, *victory);
+            }
+            MovieReturn::CampaignDefeat(defeat) => {
+                Self::open_campaign_replay_prompt(state, *defeat);
             }
         }
     }
@@ -409,9 +449,13 @@ impl App {
             return;
         };
         let lookup = |key: &str| Self::csf_label(state, key, &format!("MISSING:'{key}'"));
+        let viewport = CreditsViewport::new(
+            state.renderer.gpu.config.width,
+            state.renderer.gpu.config.height,
+        );
         let lines = crate::ui::movies_credits_shell::parse_credits(
             &bytes,
-            state.renderer.gpu.config.height as i32,
+            viewport.surface_height,
             &lookup,
         );
         let now_ms = crate::app::match_runtime::frame_pacer::wall_clock_ms();
@@ -479,6 +523,7 @@ impl App {
             CreditsReturn::MainMenu => {
                 Self::destroy_current_shell_dialog(state);
                 state.frontend.shell_route = ShellRoute::MainMenu;
+                Self::resume_shell_after_match(state);
             }
         }
     }

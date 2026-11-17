@@ -7,7 +7,7 @@ use crate::app::frontend::shell_transition::{ColumnDraw, PanelArt};
 use crate::render::batch::SpriteInstance;
 use crate::render::skirmish_shell_chrome::{SkirmishShellChromeAtlas, SkirmishShellChromeEntry};
 use crate::ui::shell::geom::ShellScale;
-use crate::ui::shell::slide::{column_draw_origin, panel_art_origin};
+use crate::ui::shell::slide::panel_art_origin;
 use crate::ui::skirmish_shell::{RectPx, SkirmishShellLayout, SkirmishShellState};
 
 use super::draw_order::{LowerStripRole, ShellDialogChromeProfile, lower_strip_role};
@@ -305,6 +305,25 @@ pub(super) fn push_entry_sized_alpha(
 
 /// Flag and icon art authored at its native size, grown by the layout's stretch,
 /// clipped to and centred in `rect`. Identity on the retail layout.
+/// `entry` whole, shrunk to fit `rect` where it is larger, centred in it.
+pub(super) fn push_entry_fitted(
+    out: &mut Vec<SpriteInstance>,
+    entry: SkirmishShellChromeEntry,
+    rect: RectPx,
+    scale: ShellScale,
+    depth: f32,
+) {
+    let [art_w, art_h] = scale.art_size(entry.pixel_size[0], entry.pixel_size[1]);
+    if art_w <= 0.0 || art_h <= 0.0 || rect.w <= 0 || rect.h <= 0 {
+        return;
+    }
+    let fit = (rect.w as f32 / art_w).min(rect.h as f32 / art_h).min(1.0);
+    let (w, h) = ((art_w * fit).round(), (art_h * fit).round());
+    let x = rect.x as f32 + ((rect.w as f32 - w) / 2.0).floor();
+    let y = rect.y as f32 + ((rect.h as f32 - h) / 2.0).floor();
+    push_entry_sized(out, entry, x, y, [w, h], depth);
+}
+
 pub(super) fn push_flag_entry_clipped_centered(
     out: &mut Vec<SpriteInstance>,
     mut entry: SkirmishShellChromeEntry,
@@ -405,14 +424,17 @@ pub(super) fn push_right_panel_button_shp(
     out: &mut Vec<SpriteInstance>,
     atlas: &SkirmishShellChromeAtlas,
     rect: RectPx,
-    pressed: bool,
+    visual: impl Into<crate::ui::shell::button::ButtonVisual>,
     disabled: bool,
     depth: f32,
 ) {
+    let visual = visual.into();
+    let pressed = visual.pressed;
     // Skirmish shell setup classifies Start/Choose/Back as owner-draw type 1.
     // Type 0 PCX pieces are only a missing-asset fallback for this path.
-    let entry = match right_panel_button_sdbtnanm_frame_index(pressed, disabled) {
+    let entry = match right_panel_button_sdbtnanm_frame_index(visual, disabled) {
         4 => atlas.right_panel_button_sdbtnanm_frame4,
+        3 => atlas.right_panel_button_sdbtnanm_frame3,
         _ => atlas.right_panel_button_sdbtnanm_frame2,
     };
     if let Some(entry) = entry {
@@ -432,11 +454,18 @@ pub(super) fn push_right_panel_button_shp(
     }
 }
 
-pub(super) const fn right_panel_button_sdbtnanm_frame_index(
-    pressed: bool,
+pub(super) fn right_panel_button_sdbtnanm_frame_index(
+    visual: impl Into<crate::ui::shell::button::ButtonVisual>,
     disabled: bool,
 ) -> usize {
-    if pressed && !disabled { 4 } else { 2 }
+    let visual = visual.into();
+    if visual.pressed && !disabled {
+        4
+    } else if visual.highlighted {
+        3
+    } else {
+        2
+    }
 }
 
 /// Look up a baked SDBTNANM frame by index for the slide-in wave path.
@@ -645,12 +674,8 @@ pub(super) fn right_panel_overlay_rect(
     row: i32,
     entry: SkirmishShellChromeEntry,
 ) -> RectPx {
-    let (scale_x, scale_y) = layout.right_panel.stretch();
-    let w = (entry.pixel_size[0] * scale_x).round() as i32;
-    let h = (entry.pixel_size[1] * scale_y).round().max(1.0) as i32;
-    let panel = layout.right_panel;
-    let x = panel.tile.x + panel.tile.w - w;
-    RectPx::new(x, panel.tile.y + row * h, w, h)
+    let [w, h] = entry.pixel_size.map(|side| side.round() as i32);
+    layout.right_panel.row_cell(row, w, h)
 }
 
 pub(super) fn sdmpbtn_rect(
@@ -678,12 +703,7 @@ pub(super) fn push_right_panel_base_instances(
             push_entry(
                 out,
                 tile,
-                RectPx::new(
-                    layout.right_panel.tile.x,
-                    layout.right_panel.tile.y + row * layout.right_panel.tile.h,
-                    layout.right_panel.tile.w,
-                    layout.right_panel.tile.h,
-                ),
+                layout.right_panel.tile_row(row),
                 RIGHT_PANEL_TILE_DEPTH,
             );
         }
@@ -796,19 +816,15 @@ pub(super) fn push_slide_column(
     draws: &[ColumnDraw],
     depth: f32,
 ) {
-    let panel = layout.right_panel;
-    let (scale_x, scale_y) = panel.stretch();
     for (index, draw) in draws.iter().enumerate() {
         let Some(entry) = right_panel_button_sdbtnanm_frame(atlas, draw.frame) else {
             continue;
         };
-        let w = (entry.pixel_size[0] * scale_x).round() as i32;
-        let h = (entry.pixel_size[1] * scale_y).round().max(1.0) as i32;
-        let (x, y) = column_draw_origin(panel, draw.row, w);
+        let [w, h] = entry.pixel_size.map(|side| side.round() as i32);
         push_entry(
             out,
             entry,
-            RectPx::new(x, y, w, h),
+            layout.right_panel.row_cell(draw.row as i32, w, h),
             depth - index as f32 * 1e-7,
         );
     }

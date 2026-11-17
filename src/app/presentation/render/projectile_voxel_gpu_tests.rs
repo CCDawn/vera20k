@@ -87,11 +87,11 @@ fn stock_flat_torpedo_pose_upload_and_surface_replay_match_original_pixels() {
             let z_words = logical(&physical_z);
             let a_words = logical(&physical_a);
             let point = &input["point"];
-            let bullet = sim.projectiles.get(id).unwrap();
+            let bullet = sim.projectiles().get(id).unwrap();
             let (x, y) = crate::util::lepton::absolute_leptons_to_screen(
-                bullet.position.x,
-                bullet.position.y,
-                bullet.position.z,
+                bullet.position().x,
+                bullet.position().y,
+                bullet.position().z,
             );
             let cam = [
                 x - point[0].as_f64().unwrap() as f32,
@@ -124,7 +124,7 @@ fn stock_flat_torpedo_pose_upload_and_surface_replay_match_original_pixels() {
                             .unwrap(),
                     )
                 }));
-                sim.projectiles.redirect(id, velocity);
+                sim.projectiles_mut_for_test().redirect(id, velocity);
                 let matrix = projectile_voxel_matrix(velocity).unwrap();
                 let matrix_bits: Vec<_> = (0..3)
                     .flat_map(|row| (0..4).map(move |col| matrix.col(col)[row].to_bits()))
@@ -135,7 +135,16 @@ fn stock_flat_torpedo_pose_upload_and_surface_replay_match_original_pixels() {
                     "{name}"
                 );
                 let body = cache
-                    .render_matrix(&assets, "SUBT", matrix, 0, true, VxlLighting::Diffuse)
+                    .render_matrix(
+                        &assets,
+                        "SUBT",
+                        matrix,
+                        0,
+                        true,
+                        VxlLighting::Diffuse,
+                        false,
+                        None,
+                    )
                     .unwrap();
                 let rect = &draw["body"]["rect"];
                 assert_eq!(
@@ -151,18 +160,27 @@ fn stock_flat_torpedo_pose_upload_and_surface_replay_match_original_pixels() {
                 let before = sim.state_hash();
                 let order = NativeDisplayOrder::from_display(sim.display_layers());
                 let object = projectile_draw_instance(
-                    sim.projectiles.get(id).unwrap(),
+                    sim.projectiles().get(id).unwrap(),
                     &kind,
                     "Torpedo",
                     HouseColorIndex(8),
                     None,
-                    sim.resolved_terrain.as_ref().unwrap(),
+                    sim.resolved_terrain().unwrap(),
                     cam,
                     size.map(|n| n as f32),
                     DepthAxis::NONE,
                     &order,
                     |image, matrix| {
-                        cache.render_matrix(&assets, image, matrix, 0, true, VxlLighting::Diffuse)
+                        cache.render_matrix(
+                            &assets,
+                            image,
+                            matrix,
+                            0,
+                            true,
+                            VxlLighting::Diffuse,
+                            false,
+                            None,
+                        )
                     },
                 );
                 assert_eq!(sim.state_hash(), before, "read-only draw: {name}");
@@ -195,8 +213,8 @@ fn stock_flat_torpedo_pose_upload_and_surface_replay_match_original_pixels() {
                 );
                 prepared.push((layers, body));
             }
-            // Build all poses before the single upload, as the production frame.
-            cache.upload(&gpu.device, &gpu.queue, &batch);
+            // Build all poses before the single encode, as the production frame.
+            cache.submit(&gpu.device, &gpu.queue, &batch);
             let color = gpu.target(size, format);
             let cv = color.create_view(&Default::default());
             let depth = gpu.target(size, wgpu::TextureFormat::Depth32Float);
@@ -263,6 +281,7 @@ fn stock_flat_torpedo_pose_upload_and_surface_replay_match_original_pixels() {
                 let tactical = std::array::from_fn(|i| clip[i].as_u64().unwrap() as u32);
                 let stats = draw_native_object_pass(
                     &mut encoder,
+                    crate::app::render::merge_passes::ObjectDrawPhase::Display,
                     &cv,
                     &dv,
                     &mut terrain,
@@ -390,7 +409,7 @@ fn kirov_voxel_pose_upload_and_retained_replay_survive_a_changed_second_frame() 
             &[HouseColorIndex(0)],
         );
         let (mut sim, id) = admitted_kirov_bomb(rules, "BlimpBomb");
-        let position = sim.projectiles.get(id).unwrap().position;
+        let position = sim.projectiles().get(id).unwrap().position();
         let (x, y) =
             crate::util::lepton::absolute_leptons_to_screen(position.x, position.y, position.z);
         let cam = [x - 48.0, y - 48.0];
@@ -411,11 +430,22 @@ fn kirov_voxel_pose_upload_and_retained_replay_survive_a_changed_second_frame() 
             ProjectileVelocity::new(0, 0, -1),
             ProjectileVelocity::new(1, 0, 0),
         ] {
-            sim.projectiles.get_mut(id).unwrap().velocity = velocity;
+            sim.projectiles_mut_for_test()
+                .get_mut(id)
+                .unwrap()
+                .set_velocity_for_test(velocity);
             cache.begin_frame();
-            let matrix = projectile_voxel_matrix(velocity).unwrap();
+            let matrix = crate::render::vxl_raster::projectile_voxel_matrix(velocity).unwrap();
             let (expected, _) = model
-                .render_matrix(matrix, 0, true, VxlLighting::Diffuse, Some(&vpl))
+                .render_matrix(
+                    matrix,
+                    0,
+                    true,
+                    VxlLighting::Diffuse,
+                    Some(&vpl),
+                    false,
+                    None,
+                )
                 .unwrap();
             if let Some(previous) = previous_pixels.replace(expected.palette_indices.clone()) {
                 assert_ne!(
@@ -424,32 +454,56 @@ fn kirov_voxel_pose_upload_and_retained_replay_survive_a_changed_second_frame() 
                 );
             }
             let order = NativeDisplayOrder::from_display(sim.display_layers());
-            let object = projectile_draw_instance(
-                sim.projectiles.get(id).unwrap(),
+            let object = crate::app::presentation::instances::projectile_draw_instance_for_frame(
+                sim.projectiles().get(id).unwrap(),
+                sim.session().binary_frame(),
+                // A voxel bullet takes no SHP frame.
+                false,
                 kind,
                 "BlimpBombP",
                 HouseColorIndex(8),
+                [1000; 3],
                 None,
-                sim.resolved_terrain.as_ref().unwrap(),
-                cam,
-                size.map(|n| n as f32),
+                sim.resolved_terrain().unwrap(),
+                crate::app::presentation::instances::TacticalAdmission {
+                    corner: cam,
+                    size: size.map(|n| n as f32),
+                },
                 DepthAxis::NONE,
                 &order,
                 |image, matrix| {
-                    cache.render_matrix(&assets, image, matrix, 0, true, VxlLighting::Diffuse)
+                    cache.render_matrix(
+                        &assets,
+                        image,
+                        matrix,
+                        0,
+                        true,
+                        VxlLighting::Diffuse,
+                        false,
+                        None,
+                    )
                 },
             )
             .unwrap();
             let instance = object.pieces[0].instance;
             let reused = cache
-                .render_matrix(&assets, "ZBOMB", matrix, 0, true, VxlLighting::Diffuse)
+                .render_matrix(
+                    &assets,
+                    "ZBOMB",
+                    matrix,
+                    0,
+                    true,
+                    VxlLighting::Diffuse,
+                    false,
+                    None,
+                )
                 .unwrap();
             assert_eq!(
                 instance.uv_origin, reused.uv_origin,
                 "equal simultaneous bombs reuse the same page slot"
             );
-            // One upload after all requests, as the production frame builder.
-            cache.upload(&gpu.device, &gpu.queue, &batch);
+            // One encode after all requests, as the production frame.
+            cache.submit(&gpu.device, &gpu.queue, &batch);
             let texels = gpu.read_uint_texels(
                 &cache.page_texture(reused.page).unwrap().view,
                 instance.uv_origin.map(|v| (v * 1024.0) as u32),
@@ -480,6 +534,7 @@ fn kirov_voxel_pose_upload_and_retained_replay_survive_a_changed_second_frame() 
                 );
                 let stats = draw_native_object_pass(
                     &mut encoder,
+                    crate::app::render::merge_passes::ObjectDrawPhase::Display,
                     &cv,
                     &dv,
                     &mut terrain,
@@ -684,6 +739,7 @@ fn global_voxel_palette_bypasses_theater_and_house_remap_on_both_replay_routes()
                 );
                 let stats = draw_native_object_pass(
                     &mut encoder,
+                    crate::app::render::merge_passes::ObjectDrawPhase::Display,
                     &cv,
                     &dv,
                     &mut terrain,

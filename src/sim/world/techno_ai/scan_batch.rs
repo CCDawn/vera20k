@@ -36,24 +36,33 @@
 //! weapon range by design, so their check skips the range test and reaches
 //! the class tests after it.
 //!
-//! Proposed sim-scale deviation from native order (update order and
-//! same-frame effects), pending side-by-side play: an answered scan sees the
-//! world as it stood when the pass began rather than at the scanner's turn.
-//! A target that comes into reach, or a better one that appears, during the
-//! turns before the scanner's is seen at its next scan (the targeting slot's
-//! `[General] NormalTargetingDelay=` frames later, plus the 0..2 draw; Area
-//! Guard's at its next handler run with the timer run out; Hunt's at its next
-//! handler run), and
-//! an estimate another scan debited during those turns does not lower this
-//! scan's scores (`VHPScan=`, retail `[NASAM]` only). The scan's own effects
+//! Sim-scale deviation from native order (update order and same-frame
+//! effects), kept so target scans stay off the main thread at 20,000 units:
+//! an answered scan sees the world as it stood when the pass began, not as
+//! the scanner's turn finds it. A target that an earlier turn in the same
+//! pass admits (for a campaign player's scanner, discovers: the target's own
+//! vt+0x4A0 prelude or a reveal, read by the `0x006F81BE` gate), brings into
+//! reach or makes better is seen one scan later:
+//! the targeting slot's `[General] NormalTargetingDelay=` frames later, plus
+//! the 0..2 draw; Area Guard's at its next handler run with the timer run
+//! out; Hunt's at its next handler run. An estimate another scan debited
+//! during those turns does not lower this scan's scores (`VHPScan=`, retail
+//! `[NASAM]` only). The scan's own effects
 //! stay at the object's turn in native order: the scan frame stamp, the
 //! RandomRanged(0, 2) draw, the timer, the drop step, the assignment, the
-//! estimate debit and Foot+688's write. Greatest_Threat draws no random
-//! numbers, so the RNG stream changes only through changed picks. Each answer
+//! estimate debit and Foot+688's write. Greatest_Threat draws only for a
+//! computer's disguise detection (`0x006F851C`) of a blinking candidate: an
+//! answer that drew is dropped, and so is one that refused a disguised
+//! candidate for want of a blink once a shot starts a blink during the pass
+//! ([`Simulation::note_disguise_blink_started`]); their objects scan live.
+//! Residual: a candidate that disguises or comes into reach during the pass
+//! is not seen by an answer, and neither is its roll. Each answer
 //! reads only the frame-start world, and its copy of the Dummy (below) starts
 //! from the shared word on whichever thread it runs, so no result depends on
-//! the thread count. Simulations start without batching; real matches and
-//! sim-bench turn it on ([`Simulation::batch_target_scans`]).
+//! the thread count. Simulations start without batching; real matches,
+//! replay reconstruction and sim-bench turn it on
+//! ([`Simulation::batch_target_scans`]). A save carries the setting, so a
+//! save made without batching resumes scanning in native order.
 //!
 //! Lookups off the map stamp the shared Dummy, so each answer works on its
 //! own copy of the Dummy's coordinate (`SharedCellDummy::detached_stamps`),
@@ -66,9 +75,10 @@
 //! serial scan's did not. A `DistributedFire=` scanner (retail `[AEGIS]`)
 //! keeps the candidates its walk collects, so it always scans live. Aircraft
 //! guard areas and hunt through their own missions (`aircraft_guard`,
-//! `aircraft::hunt_mission`), deployed infantry guard areas through the
-//! deploy shim (`0x00521320`), and a computer house's deployed infantryman
-//! undeploys in Hunt, so none of those is foreseen.
+//! `aircraft::hunt_mission`), patrolling Foot scan through `foot_patrol`'s
+//! own call, deployed infantry guard areas through the deploy shim
+//! (`0x00521320`), and a computer house's deployed infantryman undeploys in
+//! Hunt, so none of those is foreseen.
 
 use std::collections::BTreeSet;
 
@@ -78,7 +88,7 @@ use crate::rules::object_type::ObjectType;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat::combat_weapon::{
-    AttackerFacts, attacker_facts, controlled_transport_house, is_ally_by_object,
+    AttackerFacts, attacker_facts, controlled_transport_house, is_ally_by_object, weapon_range,
 };
 use crate::sim::combat::fire_error::FireError;
 use crate::sim::combat::fire_error_world::{FireSubject, FirerPart};
@@ -92,8 +102,10 @@ use crate::sim::movement::FacingClass;
 use crate::sim::world::Simulation;
 use crate::util::fixed_math::SimFixed;
 
-/// This live object pass's answered scans.
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+/// This live object pass's answered scans. Every field is serde-skipped:
+/// saves encode `Option<ScanBatch>` as the setting alone, the same bytes the
+/// retired empty struct wrote.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ScanBatch {
     /// The pass's answers in ascending object id, each until a scan takes
     /// it. Empty between passes, so a save carries only the setting.
@@ -102,13 +114,17 @@ pub(crate) struct ScanBatch {
     /// The picks a release reached during the pass.
     #[serde(skip)]
     released: BTreeSet<u64>,
+    /// A shot started a disguise blink during the pass
+    /// ([`Simulation::note_disguise_blink_started`]).
+    #[serde(skip)]
+    blink_started: bool,
     /// Answers scans took.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     #[serde(skip)]
     used: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct BatchedScan {
     /// The scan the answer is for.
     mask: ScanMission,
@@ -138,12 +154,24 @@ struct ScannerKey {
     /// The selection ladder's facts (`attacker_facts`): veterancy, weapon,
     /// gattling stage, deployment, transport and garrison, drain, Unload.
     facts: AttackerFacts,
+    /// Its two weapons' ranges (`weapon_range`), which other objects can
+    /// change during the pass: an open-topped transport's passengers cap
+    /// them, and a garrison's firing occupant, an upgrade or an AttachEffect
+    /// modifier sets them. Residual: a weapon replaced at the same range is
+    /// not keyed, so that scan scores with the old one.
+    ranges: [i32; 2],
     /// The house controlling the open-topped transport it rides.
     transport_controller: Option<InternedId>,
     /// Its team, and whether that team defends a base.
     team: Option<(u64, bool)>,
     /// Its house's last lost building (`House+0x54E0`).
     lost_building: Option<u64>,
+    /// Its house's current enemy (`House+0x5600`), whose objects
+    /// `Calculate_Threat_Score @ 0x0070CD10` favours with
+    /// `EnemyHouseThreatBonus=`, and its All-To-Hunt latch (`House+0x249`).
+    /// A hit during the pass can move the enemy (ReceiveDamage `0x00701E68`
+    /// -> `HouseClass::UpdateAngerNodes @ 0x00504790`).
+    enemy: (Option<InternedId>, bool),
     /// GetFireError's firer half (`FireSubject::firer_part`), which the
     /// scan's candidate probes read: NavCom, speed, sequence, links and the
     /// rest.
@@ -153,6 +181,7 @@ struct ScannerKey {
 impl ScannerKey {
     fn of(world: &Simulation, entity: &GameEntity, obj: &ObjectType, rules: &RuleSet) -> Self {
         let position = &entity.position;
+        let house = world.houses.get(&entity.owner());
         Self {
             owner: entity.owner(),
             type_ref: entity.type_ref(),
@@ -165,6 +194,16 @@ impl ScannerKey {
             retarget_after_stop: entity.foot_retarget_after_stop,
             berserk: entity.berserk.is_active(),
             facts: attacker_facts(entity, obj),
+            ranges: [0, 1].map(|index| {
+                weapon_range(
+                    entity,
+                    obj,
+                    index,
+                    &world.substrate.entities,
+                    rules,
+                    &world.interner,
+                )
+            }),
             transport_controller: controlled_transport_house(
                 &world.substrate.entities,
                 rules,
@@ -172,10 +211,13 @@ impl ScannerKey {
                 entity,
             ),
             team: world.team_script_vm.team_for_member(entity.stable_id()),
-            lost_building: world
-                .houses
-                .get(&entity.owner())
-                .and_then(|house| house.lost_building()),
+            lost_building: house.and_then(|house| house.lost_building()),
+            enemy: house.map_or((None, false), |house| {
+                (
+                    house.enemy_house(),
+                    house.strategy_emergency().all_to_hunt_bias(),
+                )
+            }),
             fire: FireSubject {
                 world,
                 rules,
@@ -198,35 +240,43 @@ impl Simulation {
         self.scan_batch.get_or_insert_with(ScanBatch::default);
     }
 
+    /// Whether target scans are batched ([`Self::batch_target_scans`]).
+    pub(crate) fn target_scans_batched(&self) -> bool {
+        self.scan_batch.is_some()
+    }
+
     /// The pass's answers, before its first turn.
     pub(in crate::sim::world) fn answer_batched_scans(
         &mut self,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         overlay_registry: Option<&OverlayTypeRegistry>,
     ) {
-        let (Some(rules), Some(terrain), Some(_)) = (
-            rules,
-            self.resolved_terrain.as_ref(),
-            self.scan_batch.as_ref(),
-        ) else {
+        let _area = crate::sim::frame_profile::area(crate::sim::frame_profile::phase::TARGETING);
+        let (Some(terrain), Some(_)) = (self.resolved_terrain.as_ref(), self.scan_batch.as_ref())
+        else {
             return;
         };
         let dummy = terrain.shared_cell_dummy();
         let world: &Simulation = self;
         // Only the Logic list's objects take a turn.
         let logic = world.substrate.logic.as_slice();
+        let now = world.session.binary_frame();
         let mut answers = crate::sim::parallel::filter_map_indices(logic.len(), |index| {
             let id = logic[index];
-            let entity = world.substrate.entities.get(id)?;
+            let (entity, quiet) = world.substrate.entities.get_and_quiet(id)?;
+            if !scan_may_be_due(entity, now) {
+                return None;
+            }
             let (answer, stamped) = dummy.detached_stamps(|| {
-                let obj = world.object_type(entity.type_ref(), rules)?;
+                let obj = world.entity_object_type(entity, rules)?;
                 if obj.distributed_fire {
                     return None;
                 }
-                let (mask, scan_coord) = world.scan_ahead(id, entity, rules, overlay_registry)?;
+                let (mask, scan_coord) =
+                    world.scan_ahead(id, entity, quiet, rules, overlay_registry)?;
                 let outcome = world.threat_scan(rules, overlay_registry, id, mask, scan_coord);
                 let pick_house = outcome
-                    .target()
+                    .object()
                     .and_then(|pick| world.substrate.entities.get(pick))
                     .map(|pick| (pick.owner(), world.scanner_allies(entity, pick.owner())));
                 Some(BatchedScan {
@@ -237,7 +287,15 @@ impl Simulation {
                     pick_house,
                 })
             });
-            answer.filter(|_| !stamped).map(|answer| (id, Some(answer)))
+            // A wall Cell pick (the ring walk's fallback, `0x006F8C10`) is
+            // never kept: an earlier turn may destroy or rebuild the wall.
+            answer
+                .filter(|answer| {
+                    !stamped
+                        && !answer.outcome.drew_scenario_rng()
+                        && !matches!(answer.outcome.target(), Some(TargetKind::Cell(..)))
+                })
+                .map(|answer| (id, Some(answer)))
         });
         answers.sort_unstable_by_key(|&(id, _)| id);
         if let Some(batch) = self.scan_batch.as_mut() {
@@ -250,6 +308,18 @@ impl Simulation {
         if let Some(batch) = self.scan_batch.as_mut() {
             batch.answers.clear();
             batch.released.clear();
+            batch.blink_started = false;
+        }
+    }
+
+    /// A shot started a disguise blink (`UnitClass::Fire_At @ 0x0074143E`):
+    /// no answer that refused a disguised candidate only for want of a blink
+    /// is taken this pass, so its scan runs live and rolls as native does.
+    pub(crate) fn note_disguise_blink_started(&mut self) {
+        if let Some(batch) = self.scan_batch.as_mut()
+            && !batch.answers.is_empty()
+        {
+            batch.blink_started = true;
         }
     }
 
@@ -274,19 +344,22 @@ impl Simulation {
     /// Arrival_Target_Handler scans ([`Simulation::foot_arrival_step`]) with
     /// no target left, or Passive_Target_Acquire's gate passes with none
     /// held. A held target the drop step would drop is not foreseen: its
-    /// object scans live.
+    /// object scans live. A `quiet` unit is neither frozen nor in a tube
+    /// (`world::quiet_units`).
     fn scan_ahead(
         &self,
         id: u64,
         entity: &GameEntity,
+        quiet: bool,
         rules: &RuleSet,
         overlay_registry: Option<&OverlayTypeRegistry>,
     ) -> Option<(ScanMission, Option<[i32; 3]>)> {
-        if entity.ai_frozen()
-            || (matches!(
-                entity.category(),
-                EntityCategory::Unit | EntityCategory::Infantry
-            ) && entity.low_bridge_tube_state.is_some())
+        if !quiet
+            && (entity.ai_frozen()
+                || (matches!(
+                    entity.category(),
+                    EntityCategory::Unit | EntityCategory::Infantry
+                ) && entity.low_bridge_tube_state.is_some()))
         {
             return None;
         }
@@ -297,14 +370,14 @@ impl Simulation {
             return Some((ScanMission::Hunt, None));
         }
         let unheld = entity.attack_target.target().is_none();
-        let scans = match super::target_scan::targeting_slot(entity, self.session.binary_frame) {
+        let scans = match super::target_scan::targeting_slot(entity, self.session.binary_frame()) {
             TargetingSlot::Skip => false,
             TargetingSlot::ArrivalHandler => matches!(
                 self.foot_arrival_step(id, rules, overlay_registry),
                 Some(ArrivalStep::Scan { drop_tarcom, .. }) if drop_tarcom || unheld
             ),
-            TargetingSlot::PassiveAcquire(mission) => {
-                unheld && passive_acquire_gate(self, id, rules, mission)
+            TargetingSlot::PassiveAcquire => {
+                unheld && passive_acquire_gate(self, id, rules, entity.passive_acquire_mission())
             }
         };
         scans.then_some((ScanMission::Guard, None))
@@ -354,14 +427,15 @@ impl Simulation {
         let answer = slot.take()?;
         let released = answer
             .outcome
-            .target()
-            .is_some_and(|pick| batch.released.contains(&pick));
+            .object()
+            .is_some_and(|pick| batch.released.contains(&pick))
+            || (batch.blink_started && answer.outcome.met_idle_disguise());
         let scanner = self.substrate.entities.get(id)?;
-        let obj = self.object_type(scanner.type_ref(), rules)?;
+        let obj = self.entity_object_type(scanner, rules)?;
         if released || ScannerKey::of(self, scanner, obj, rules) != answer.key {
             return None;
         }
-        if let Some(pick) = answer.outcome.target() {
+        if let Some(pick) = answer.outcome.object() {
             let pick_house = self
                 .substrate
                 .entities
@@ -386,7 +460,7 @@ impl Simulation {
                 return None;
             }
         }
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         {
             self.scan_batch.as_mut().unwrap().used += 1;
         }
@@ -394,12 +468,41 @@ impl Simulation {
     }
 
     /// Answers scans took.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn batched_scans_used(&self) -> usize {
         self.scan_batch.as_ref().map_or(0, |batch| batch.used)
     }
 }
 
-#[cfg(test)]
+/// Whether `entity`'s turn can reach Greatest_Threat at `now` at all, from its
+/// own record: its Area Guard or Hunt handler runs with no target held
+/// ([`GameEntity::mission_handler_due`]), or its targeting slot runs
+/// ([`targeting_slot`](super::target_scan::targeting_slot)) and, for
+/// Passive_Target_Acquire, it holds no target. Every scan
+/// [`Simulation::scan_ahead`] foresees needs one of these, so the pass skips
+/// an object that fails them before its type lookup and the handlers' own
+/// lookups (VERA-only; the same answers).
+fn scan_may_be_due(entity: &GameEntity, now: u32) -> bool {
+    use crate::sim::mission::MissionType;
+    let unheld = entity.attack_target.target().is_none();
+    let handler_scans = unheld
+        && matches!(
+            entity.mission.current().known(),
+            Some(MissionType::AreaGuard | MissionType::Hunt)
+        )
+        && matches!(
+            entity.category(),
+            EntityCategory::Unit | EntityCategory::Infantry
+        )
+        && entity.mission_handler_due(now);
+    handler_scans
+        || match super::target_scan::targeting_slot(entity, now) {
+            TargetingSlot::Skip => false,
+            TargetingSlot::ArrivalHandler => true,
+            TargetingSlot::PassiveAcquire => unheld,
+        }
+}
+
+#[cfg(all(test, tests_sim_world_techno))]
 #[path = "scan_batch_tests.rs"]
 mod tests;

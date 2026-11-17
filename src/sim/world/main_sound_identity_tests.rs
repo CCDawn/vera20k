@@ -53,21 +53,18 @@ fn rules() -> RuleSet {
 
 fn scene(rules: &RuleSet) -> (Simulation, [u64; 2], u64, u64) {
     let mut sim = Simulation::with_seed(1);
-    sim.session.map_width = 64;
-    sim.session.map_height = 64;
+    sim.session.set_map_width_for_test(64);
+    sim.session.set_map_height_for_test(64);
     sim.intern_rule_type_ids(rules);
     sim.resolve_type_handles(rules);
     for (index, name) in ["Local", "Enemy"].into_iter().enumerate() {
         let owner = sim.interner.intern(name);
-        sim.houses.insert(
-            owner,
-            HouseState::new(owner, index as u8, None, index == 0, 0, 10),
-        );
-        sim.session.house_order.push(owner);
+        sim.houses
+            .register(HouseState::new(owner, index as u8, None, index == 0, 0, 10));
     }
     let owner = sim.interner.get("Local").unwrap();
     let squids = std::array::from_fn(|index| {
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         let mut actor = GameEntity::test_default(id, "SQD", "Local", 10, 10 + index as u16);
         actor.set_owner_for_test(owner);
         actor.set_type_ref_for_test(sim.interner.get("SQD").unwrap());
@@ -92,7 +89,7 @@ fn scene(rules: &RuleSet) -> (Simulation, [u64; 2], u64, u64) {
     sim.assign_target_represented(
         gun,
         Some(TargetKind::Entity(target)),
-        Some(rules),
+        rules,
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -120,15 +117,55 @@ fn presentation_main_service_cannot_change_later_projectile_identity() {
     assert_eq!(quiet.state_hash(), serviced.state_hash());
 
     let (_, quiet_draws) = crate::sim::rng::trace_draws(|| {
-        quiet.tick_move_sound_after_process(quiet_squids[0], 0, Some(&rules));
-        quiet.tick_move_sound_after_process(quiet_squids[1], 0, Some(&rules));
+        Simulation::tick_move_sound_after_process(
+            &quiet.interner,
+            &quiet.session,
+            &quiet.main_rng,
+            &mut quiet.substrate,
+            &mut quiet.sound_events,
+            &quiet.houses,
+            quiet_squids[0],
+            0,
+            &rules,
+        );
+        Simulation::tick_move_sound_after_process(
+            &quiet.interner,
+            &quiet.session,
+            &quiet.main_rng,
+            &mut quiet.substrate,
+            &mut quiet.sound_events,
+            &quiet.houses,
+            quiet_squids[1],
+            0,
+            &rules,
+        );
     });
     let (_, serviced_draws) = crate::sim::rng::trace_draws(|| {
-        serviced.tick_move_sound_after_process(serviced_squids[0], 0, Some(&rules));
+        Simulation::tick_move_sound_after_process(
+            &serviced.interner,
+            &serviced.session,
+            &serviced.main_rng,
+            &mut serviced.substrate,
+            &mut serviced.sound_events,
+            &serviced.houses,
+            serviced_squids[0],
+            0,
+            &rules,
+        );
         // One ordinary inclusive presentation draw between otherwise identical
         // paid Foot visits. No Scenario or MapGen capability is lent.
         let _ = serviced.presentation_main_draws().ranged(0, 1);
-        serviced.tick_move_sound_after_process(serviced_squids[1], 0, Some(&rules));
+        Simulation::tick_move_sound_after_process(
+            &serviced.interner,
+            &serviced.session,
+            &serviced.main_rng,
+            &mut serviced.substrate,
+            &mut serviced.sound_events,
+            &serviced.houses,
+            serviced_squids[1],
+            0,
+            &rules,
+        );
     });
     let rng: Value = serde_json::from_str(crate::test_fixture::text(
         "tools/rmg_oracle/vectors/rng.json",
@@ -186,7 +223,7 @@ fn presentation_main_service_cannot_change_later_projectile_identity() {
         (&mut quiet, quiet_gun, quiet_target),
         (&mut serviced, serviced_gun, serviced_target),
     ] {
-        sim.sound_events.clear();
+        sim.sound_events.clear_for_test();
         sim.commit_fire_visit(
             FireVisit::Direct {
                 id: gun,
@@ -205,10 +242,13 @@ fn presentation_main_service_cannot_change_later_projectile_identity() {
         let (_, bullet) = sim.projectiles.iter().next().unwrap();
         assert_eq!(
             sim.interner
-                .resolve(bullet.payload.installed_weapon().unwrap()),
+                .resolve(bullet.payload().installed_weapon().unwrap()),
             "LateGun"
         );
-        assert_eq!(sim.interner.resolve(bullet.payload.warhead), "LateWarhead");
+        assert_eq!(
+            sim.interner.resolve(bullet.payload().warhead),
+            "LateWarhead"
+        );
     }
     assert_eq!(
         quiet.scenario_rng.logical_state(),
@@ -221,8 +261,8 @@ fn presentation_main_service_cannot_change_later_projectile_identity() {
     let payload_ids = |sim: &Simulation| {
         let (_, bullet) = sim.projectiles.iter().next().unwrap();
         (
-            bullet.payload.installed_weapon().unwrap().index(),
-            bullet.payload.warhead.index(),
+            bullet.payload().installed_weapon().unwrap().index(),
+            bullet.payload().warhead.index(),
         )
     };
     assert_eq!(

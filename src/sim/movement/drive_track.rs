@@ -3451,7 +3451,7 @@ pub(crate) fn occupant_slot_a4_answers_true(
     };
     let path_head = occupant
         .navigation
-        .path_replay
+        .path_replay()
         .remaining_directions()
         .first()
         .copied();
@@ -3587,6 +3587,6 @@ pub struct DriveTrackSelection {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "drive_track_tests.rs"]
 mod drive_track_tests;

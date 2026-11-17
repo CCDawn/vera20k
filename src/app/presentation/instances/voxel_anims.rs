@@ -11,11 +11,6 @@
 //! The draw takes no RNG draws, writes no timers and detaches nothing.
 //!
 //! RESIDUAL: DrawIt arms VERA does not draw.
-//! - A `VoxelIndex=` other than zero, a model with more than one section, and
-//!   the `Share*Data=` types (`[SONICTURRET]`, `[4TNKTURRET]`, `[CRYSTAL01]`),
-//!   whose ReadINI copies another type's model instead of loading `%s.VXL`:
-//!   VERA draws them nothing. Stock death debris is `[TIRE]` alone, one
-//!   section and no `VoxelIndex=`.
 //! - ObjectClass::DrawIfVisible's redraw bookkeeping (`+0x80` and the
 //!   NeedsRedraw gates), which no VERA object builder models.
 //! - Until its first AI visit, gamemd draws a piece at its Unlimbo coordinate
@@ -27,7 +22,7 @@
 
 use glam::IVec3;
 
-use super::helpers::projection_admitted;
+use super::helpers::{TacticalAdmission, projection_admitted};
 use crate::app::AppState;
 use crate::app::presentation::render::draw_plan_lowering::{
     NativeDisplayOrder, ObjectPieceInstance, ObjectTexture, PlannedObjectInstance,
@@ -107,7 +102,7 @@ fn piece_palette(
     let location = piece.world_coord();
     let [x, y] = [location.x, location.y]
         .map(|lepton| lepton.div_euclid(256).clamp(0, i32::from(u16::MAX)) as u16);
-    let Some(owner) = piece.owner_house else {
+    let Some(owner) = piece.owner_house() else {
         let brightness = if kind.is_tiberium {
             light
                 .cell_light_at((x, y))
@@ -118,7 +113,7 @@ fn piece_palette(
         return (0, 1, PaletteLight::plain(53, brightness));
     };
     let scheme = house_colors
-        .get(sim.interner.resolve(owner))
+        .get(sim.interner().resolve(owner))
         .copied()
         .unwrap_or(NO_REMAP);
     (
@@ -131,50 +126,60 @@ fn piece_palette(
 /// What every piece of one frame shares.
 struct DebrisView<'a> {
     terrain: &'a ResolvedTerrainGrid,
-    camera: [f32; 2],
-    viewport: [f32; 2],
+    admission: TacticalAdmission,
     axis: DepthAxis,
 }
 
-pub(crate) fn build_voxel_anim_instances(
-    state: &AppState,
-    objects: &mut Vec<PlannedObjectInstance>,
-    order: &NativeDisplayOrder,
-) {
+impl DebrisView<'_> {
+    /// Whether `piece`'s body point passes Object6D2140's padded projection
+    /// admission, which VoxelAnimDrawIfVisible749B20 tests before DrawIt.
+    /// The point is the piece's own position, whatever floor lies under it.
+    fn admits(&self, piece: &VoxelAnimObject) -> bool {
+        let location = piece.world_coord();
+        let (x, y) = absolute_leptons_to_screen(location.x, location.y, location.z);
+        projection_admitted([x, y], self.admission)
+    }
+}
+
+/// One Display member's piece, if `id` names one that draws. The caller
+/// visits the members in Display order.
+pub(crate) fn voxel_anim_visitor<'a>(
+    state: &'a AppState,
+    order: &'a NativeDisplayOrder,
+) -> Option<impl FnMut(&mut Vec<PlannedObjectInstance>, u64) + 'a> {
     let (Some(rt), Some(assets)) = (
-        state.match_state.sim_runtime.as_ref(),
+        state.match_state.sim_runtime.presentation(),
         state.process_assets.manager(),
     ) else {
-        return;
+        return None;
     };
     let sim = &rt.simulation;
-    let Some(terrain) = sim.resolved_terrain.as_ref() else {
-        return;
-    };
+    let terrain = sim.resolved_terrain()?;
     if sim.voxel_anims().is_empty() {
-        return;
+        return None;
     }
     let rules = &rt.resources.rules;
-    let input = &state.match_state.input;
-    let (_, _, width, height) = crate::app::input::camera::tactical_viewport_px(state);
     let view = DebrisView {
         terrain,
-        camera: [input.camera_x, input.camera_y],
-        viewport: [
-            width as f32 / input.zoom_level,
-            height as f32 / input.zoom_level,
-        ],
+        admission: TacticalAdmission::of_state(state),
         axis: super::helpers::depth_axis(state),
     };
     let presentation = &state.match_state.match_presentation;
-    let mut cache = state.renderer.vxl_pose_frame_cache.borrow_mut();
-    for (&id, piece) in sim.voxel_anims().iter() {
-        let kind = rules.voxel_anim_type(piece.type_id);
+    Some(move |objects: &mut Vec<PlannedObjectInstance>, id: u64| {
+        // A piece off the view is passed by before its type, palette and
+        // floor are looked up.
+        let Some(piece) = sim.voxel_anims().get(id).filter(|piece| view.admits(piece)) else {
+            return;
+        };
+        let kind = rules.voxel_anim_type(piece.type_id());
+        let Some(model) = rules.voxel_anim_model(piece.type_id()) else {
+            return;
+        };
         let palette = piece_palette(
             piece,
             kind,
             sim,
-            &presentation.house_color_map,
+            presentation.effective_house_color_map(),
             presentation.lighting.grid(),
         );
         if let Some(object) = voxel_anim_draw_instance(
@@ -184,16 +189,40 @@ pub(crate) fn build_voxel_anim_instances(
             palette,
             &view,
             order,
-            |image, section, matrix| cache.render_tumble(assets, image, section, matrix),
+            // VoxelAnimClass draws uncached in the style 0xB43180 holds: its
+            // shadow renders, then its body (`0x00749CBE`, `0x00749DA8`).
+            |section, matrix| {
+                let mut images = presentation.voxel_images.borrow_mut();
+                let mut cache = state.renderer.vxl_pose_frame_cache.borrow_mut();
+                let depth_tested = images.part_style(false);
+                let (body, shadow) =
+                    cache.render_tumble(assets, model, section, matrix, depth_tested, None)?;
+                if let Some(shadow) = shadow {
+                    images.render_shadow(None, false, 0, shadow.native_size());
+                }
+                if !images.render_part(false, body.native_size()).stale {
+                    return Some((body, shadow));
+                }
+                let (body, _) = cache.render_tumble(
+                    assets,
+                    model,
+                    section,
+                    matrix,
+                    true,
+                    Some(images.depth_map()),
+                )?;
+                Some((body, shadow))
+            },
         ) {
             objects.push(object);
         }
-    }
+    })
 }
 
-/// One piece's draw. Display membership is admission: storage alone never
-/// draws a piece. `render` rasterizes the model `image` names at the drawing
-/// matrix and places its body and shadow on the pose page.
+/// One admitted piece's draw ([`DebrisView::admits`]). Display membership is
+/// admission: storage alone never draws a piece. `render` rasterizes the
+/// bound physical model at the drawing matrix and places its body and shadow
+/// on the pose page.
 fn voxel_anim_draw_instance(
     id: u64,
     piece: &VoxelAnimObject,
@@ -201,30 +230,16 @@ fn voxel_anim_draw_instance(
     (remap_row, source_palette, palette_light): (u32, u32, PaletteLight),
     view: &DebrisView<'_>,
     order: &NativeDisplayOrder,
-    render: impl FnOnce(&str, i32, glam::Mat4) -> Option<(UnitSpriteEntry, Option<UnitSpriteEntry>)>,
+    render: impl FnOnce(i32, glam::Mat4) -> Option<(UnitSpriteEntry, Option<UnitSpriteEntry>)>,
 ) -> Option<PlannedObjectInstance> {
     let parent = order.object_draw(id, SpriteEncoding::Voxel)?;
-    if kind.shares_data() {
-        // Module residual: the model is another type's, not `image`'s.
-        return None;
-    }
     let location = piece.world_coord();
-    let (ground_z, bridge) = super::foot_depth::floor_probe(view.terrain, location.x, location.y);
+    let (ground_z, bridge) = super::foot_depth::floor_probe(view.terrain, location.x, location.y)?;
     let geometry = geometry(location, ground_z, bridge);
-    // Object6D2140's padded projection admission precedes DrawIt.
-    if !projection_admitted(geometry.body.point, view.camera, view.viewport) {
-        return None;
-    }
-    let matrix = piece
-        .bounce
-        .drawing_matrix()
-        .ok()?
-        .map(|bits| f32::from_bits(bits.bits()));
-    let (body, shadow) = render(
-        &kind.image,
-        kind.voxel_index,
-        crate::render::vxl_raster::hva_to_mat4(&matrix, 1.0),
-    )?;
+    let matrix = piece.bounce().drawing_matrix().ok().map(|matrix| {
+        crate::render::vxl_raster::hva_to_mat4(&matrix.map(|v| f32::from_bits(v.bits())), 1.)
+    })?;
+    let (body, shadow) = render(kind.voxel_index, matrix)?;
     let depth = crate::render::native_z::depth_for_row(
         geometry.body.point[1] + adjust_for_z_standard(location.z) as f32,
         view.axis.origin_y,
@@ -295,6 +310,6 @@ fn pose_piece(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation_instances))]
 #[path = "voxel_anims_tests.rs"]
 mod tests;

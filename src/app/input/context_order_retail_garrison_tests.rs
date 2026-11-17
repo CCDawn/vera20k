@@ -58,8 +58,11 @@ fn advance_garrison_frame(runtime: &mut crate::sim::runtime::SimRuntime) {
 
 fn queue_ordinary_order(runtime: &mut crate::sim::runtime::SimRuntime, order: Command) {
     let sim = &runtime.simulation;
-    let envelope =
-        CommandEnvelope::new(sim.session.current_house.unwrap(), sim.session.tick, order);
+    let envelope = CommandEnvelope::new(
+        sim.session().current_house().unwrap(),
+        sim.session().tick(),
+        order,
+    );
     let envelope =
         crate::app::input::commands::roundtrip_ordinary_local_megamission(sim, envelope).unwrap();
     runtime.simulation.queue_commands(vec![envelope]);
@@ -78,7 +81,7 @@ fn retail_gi_group_boards_a_4x4_garrison_from_its_far_side() {
         return;
     };
     let runtime = &mut scene.runtime;
-    let owner = runtime.simulation.session.current_house.unwrap();
+    let owner = runtime.simulation.session().current_house().unwrap();
     let owner_name = runtime.simulation.resolve(owner).to_owned();
     let rules = &runtime.resources.rules;
     let position = &runtime.simulation.entities().get(castle).unwrap().position;
@@ -123,10 +126,18 @@ fn retail_gi_group_boards_a_4x4_garrison_from_its_far_side() {
             None,
             crate::app::input::context_order::OrderModifier::Normal,
             false,
+            false,
         ),
         CursorFeedbackKind::Enter
     );
-    let orders = transport_entry_orders(&runtime.simulation, rules, &gis, castle);
+    let orders = garrison_entry_orders(
+        &runtime.simulation,
+        rules,
+        &gis,
+        castle,
+        OrderModifier::Normal,
+        false,
+    );
     assert_eq!(orders.len(), gis.len());
     for (order, &gi) in orders.iter().zip(&gis) {
         assert_eq!(
@@ -142,7 +153,7 @@ fn retail_gi_group_boards_a_4x4_garrison_from_its_far_side() {
     let envelopes: Vec<_> = orders
         .into_iter()
         .map(|order| {
-            let envelope = CommandEnvelope::new(owner, runtime.simulation.session.tick, order);
+            let envelope = CommandEnvelope::new(owner, runtime.simulation.session().tick(), order);
             crate::app::input::commands::roundtrip_ordinary_local_megamission(
                 &runtime.simulation,
                 envelope,
@@ -172,12 +183,11 @@ fn retail_gi_group_boards_a_4x4_garrison_from_its_far_side() {
                 "frame {frame}: GI {gi} must not target the castle while entering"
             );
         }
-        let cargo = sim
+        let occupants = sim
             .entities()
             .get(castle)
-            .and_then(|b| b.passenger_role.cargo())
-            .map(|c| c.count());
-        if cargo == Some(gis.len() as u32) {
+            .map(|b| b.passenger_role.occupants().count());
+        if occupants == Some(gis.len() as i32) {
             boarded_frame = Some(frame);
             break;
         }
@@ -222,14 +232,20 @@ fn retail_capture_walk_rechecks_admission_and_respects_a_replacement_order() {
             return;
         };
         let runtime = &mut scene.runtime;
-        let owner = runtime.simulation.session.current_house.unwrap();
+        let owner = runtime.simulation.session().current_house().unwrap();
         let owner_name = runtime.simulation.resolve(owner).to_owned();
         let gi = runtime
             .simulation
             .spawn_object("E1", &owner_name, 88, 118, 0, &runtime.resources.rules)
             .unwrap();
-        let orders =
-            transport_entry_orders(&runtime.simulation, &runtime.resources.rules, &[gi], castle);
+        let orders = garrison_entry_orders(
+            &runtime.simulation,
+            &runtime.resources.rules,
+            &[gi],
+            castle,
+            OrderModifier::Normal,
+            false,
+        );
         assert_eq!(orders.len(), 1, "{control}: initially admitted");
         queue_ordinary_order(runtime, orders.into_iter().next().unwrap());
         for _ in 0..4 {
@@ -246,11 +262,11 @@ fn retail_capture_walk_rechecks_admission_and_respects_a_replacement_order() {
             Some(crate::sim::components::NavTargetRef::Object { id: castle })
         );
 
-        let expected_cargo = match control {
+        let expected_occupants = match control {
             "red_health" => {
                 runtime
                     .simulation
-                    .entities_mut()
+                    .entities_mut_for_test()
                     .get_mut(castle)
                     .unwrap()
                     .health
@@ -278,14 +294,17 @@ fn retail_capture_walk_rechecks_admission_and_respects_a_replacement_order() {
                         .simulation
                         .spawn_object("E1", occupant_owner, 89, 118, 0, &runtime.resources.rules)
                         .unwrap();
-                    assert!(crate::sim::passenger::add_garrison_occupant(
-                        &mut runtime.simulation,
-                        &runtime.resources.rules,
-                        occupant,
-                        castle,
-                        None,
-                        crate::sim::world::FrameEffects::default(),
-                    ));
+                    assert!(
+                        crate::sim::passenger::add_garrison_occupant(
+                            &mut runtime.simulation,
+                            &runtime.resources.rules,
+                            occupant,
+                            castle,
+                            None,
+                            crate::sim::world::FrameEffects::default(),
+                        )
+                        .unwrap()
+                    );
                 }
                 count
             }
@@ -333,8 +352,8 @@ fn retail_capture_walk_rechecks_admission_and_respects_a_replacement_order() {
         );
         let building = runtime.simulation.entities().get(castle).unwrap();
         assert_eq!(
-            building.passenger_role.passenger_count(),
-            expected_cargo,
+            building.passenger_role.occupants().count(),
+            expected_occupants as i32,
             "{control}"
         );
         if control == "other_owner" {
@@ -343,15 +362,73 @@ fn retail_capture_walk_rechecks_admission_and_respects_a_replacement_order() {
     }
 }
 
-/// The same retail click producer keeps a carrier on Enter7; migrating
-/// garrison action9 must not change the IFV's admission/Radio route.
+/// Infantry's garrison arm (`0x0051E668..0x0051E6B1`) is refused only by
+/// Ctrl without Shift (`0x0051E3B0..0x0051E42A`): Alt and Ctrl+Shift+Alt
+/// garrison, cursor and click alike, while Ctrl and Ctrl+Alt do not.
+#[test]
+fn retail_alt_garrisons_as_its_cursor_shows() {
+    let Some((mut scene, castle)) = retail_garrison_scene() else {
+        return;
+    };
+    let runtime = &mut scene.runtime;
+    let owner = runtime.simulation.session().current_house().unwrap();
+    let owner_name = runtime.simulation.resolve(owner).to_owned();
+    let rules = &runtime.resources.rules;
+    let gi = runtime
+        .simulation
+        .spawn_object("E1", &owner_name, 88, 118, 0, rules)
+        .unwrap();
+    let sim = &runtime.simulation;
+    let hover = HoverTargetKindWithId {
+        kind: HoverTargetKind::EnemyStructure,
+        stable_id: castle,
+    };
+    for (modifier, alt, garrisons) in [
+        (OrderModifier::ForceMove, true, true),
+        (OrderModifier::AttackMove, true, true),
+        (OrderModifier::ForceFire, false, false),
+        (OrderModifier::GuardArea, true, false),
+    ] {
+        let cursor = capability_cursor_for_hover(
+            sim,
+            &[gi],
+            Some(gi),
+            &hover,
+            Some(rules),
+            None,
+            modifier,
+            alt,
+            false,
+        );
+        assert_eq!(
+            cursor == CursorFeedbackKind::Enter,
+            garrisons,
+            "{modifier:?}"
+        );
+        assert_eq!(
+            garrison_entry_orders(sim, rules, &[gi], castle, modifier, alt),
+            if garrisons {
+                vec![Command::CaptureBuilding {
+                    engineer_id: gi,
+                    target_building_id: castle,
+                }]
+            } else {
+                Vec::new()
+            },
+            "{modifier:?}"
+        );
+    }
+}
+
+/// A carrier takes the passenger row's Enter (3), the MEGAMISSION Enter
+/// event, not garrison action 9.
 #[test]
 fn retail_gi_ifv_click_keeps_enter() {
     let Some((mut scene, _)) = retail_garrison_scene() else {
         return;
     };
     let runtime = &mut scene.runtime;
-    let owner = runtime.simulation.session.current_house.unwrap();
+    let owner = runtime.simulation.session().current_house().unwrap();
     let owner_name = runtime.simulation.resolve(owner).to_owned();
     let rules = &runtime.resources.rules;
     let gi = runtime
@@ -368,11 +445,36 @@ fn retail_gi_ifv_click_keeps_enter() {
                 .spawn_object("FV", &owner_name, rx, ry, 0, rules)
         })
         .expect("a vehicle-admitted cell near the castle");
+    assert!(
+        garrison_entry_orders(
+            &runtime.simulation,
+            rules,
+            &[gi],
+            ifv,
+            OrderModifier::Normal,
+            false
+        )
+        .is_empty()
+    );
     assert_eq!(
-        transport_entry_orders(&runtime.simulation, rules, &[gi], ifv),
-        vec![Command::EnterTransport {
-            passenger_id: gi,
-            transport_id: ifv
-        }]
+        entry_orders(
+            &runtime.simulation,
+            rules,
+            &[gi],
+            &mut vec![gi],
+            &HoverTargetKindWithId {
+                kind: HoverTargetKind::FriendlyUnit,
+                stable_id: ifv,
+            },
+            OrderModifier::Normal,
+            false,
+            None,
+        ),
+        Some(vec![Command::MegaMission {
+            entity_id: gi,
+            mission: crate::sim::mission::MissionType::Enter,
+            target: None,
+            destination: Some(TargetKind::Entity(ifv)),
+        }])
     );
 }

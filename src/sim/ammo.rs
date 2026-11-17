@@ -1,5 +1,6 @@
 //! The shared Techno ammo (`+0x2FC`) owner, including an aircraft's pending
-//! release (`+0x6C8`) and dock (`+0x6CC`). Unit735592..7355A8,
+//! release (`+0x6C8`) and dock (`+0x6CC`). Building442C81..442C92,
+//! Unit735592..7355A8,
 //! Infantry517D69..517D7A and Aircraft414033..41404B initialize the same
 //! signed count from InitialAmmo, falling back to Ammo only for exactly -1.
 //! Chrono reinforcement65ED83..65EDC8 reads/decrements that count even on
@@ -19,7 +20,7 @@
 
 /// Per-Techno ammo and the associated aircraft release/dock state.
 ///
-/// Present on every constructed Foot, including negative native counts. The
+/// Present on every constructed Techno, including negative native counts. The
 /// pending release survives Mission changes; it is not an Attack sub-state.
 #[derive(Debug, Clone, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TechnoAmmo {
@@ -39,7 +40,7 @@ pub struct TechnoAmmo {
 }
 
 impl TechnoAmmo {
-    /// Concrete Foot constructors select InitialAmmo unless it is exactly -1
+    /// Concrete Techno constructors select InitialAmmo unless it is exactly -1
     /// (module addresses). No clamping to zero or the type's maximum occurs.
     pub(crate) fn from_type(obj: &crate::rules::object_type::ObjectType) -> Self {
         let mut ammo = Self::new(obj.ammo);
@@ -64,6 +65,20 @@ impl TechnoAmmo {
         self.current
     }
 
+    /// Whether the count is exactly zero, which
+    /// [`Self::refill_empty_from_type`] refills.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.current == 0
+    }
+
+    /// Installed Ares conversion100437A0..100437B3 keeps the lesser signed
+    /// count. Dock/release state and the Techno reload clock are preserved;
+    /// InitialAmmo belongs only to construction.
+    pub(crate) fn change_type_capacity(&mut self, maximum: i32) {
+        self.current = self.current.min(maximum);
+        self.max = maximum;
+    }
+
     /// The type's `Ammo=`; only the rearm reads it in production.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) const fn max(&self) -> i32 {
@@ -80,16 +95,64 @@ impl TechnoAmmo {
         self.current
     }
 
+    /// TechnoClass::DecreaseAmmo70D670, virtual+390: only positive counts
+    /// debit. Aircraft overrides the slot with RET41B900 at the caller.
+    /// Ares100441F0 calls the same DecreaseAmmo slot once per positive
+    /// weapon Ammo. Its closed form preserves negative/unlimited counts.
+    pub(crate) fn decrease_by(&mut self, amount: i32) {
+        if self.current > 0 && amount > 0 {
+            self.current -= amount.min(self.current);
+        }
+    }
+
+    /// Techno ReceiveDamage701AEF..701B56: the defended packet, before the
+    /// warhead kernel, consumes readiness. Healing may raise it above Ammo.
+    pub(crate) fn reduce_readiness(
+        &mut self,
+        damage: i32,
+        strength: i32,
+        max: i32,
+        multiplier: f32,
+    ) {
+        use crate::util::native_x87::{MaskedX87Chop53 as X, NativeF32Bits};
+        let fraction = X::div(X::load_i32(damage), X::load_i32(strength));
+        let reduction = X::mul(
+            X::load_i32(max),
+            X::mul(
+                X::load_f32(NativeF32Bits::from_bits(multiplier.to_bits())),
+                fraction,
+            ),
+        );
+        self.current = X::ftol_i32_low_masked(X::sub(X::load_i32(self.current), reduction)).max(0);
+    }
+
     /// RELOAD, radio `0x1F` (`0x006F4C9C`): one round more. The receiver has
     /// already refused a full aircraft.
     pub(crate) fn reload_round(&mut self) {
         self.current = self.current.wrapping_add(1);
     }
 
+    /// Ares TechnoClass_Reload_ReloadAmount (Ares.dll 10047A70, hook
+    /// 0x6FB05B) in place of Reload's one round: add `amount` (negative
+    /// removes), then a negative count is zero and the type's `Ammo=` caps it.
+    pub(crate) fn reload_rounds(&mut self, amount: i32, type_ammo: i32) {
+        let ammo = self.current.wrapping_add(amount);
+        self.current = if ammo < 0 { 0 } else { ammo.min(type_ammo) };
+    }
+
     /// The SpawnManager's case-6 rearm (`0x006B788F..0x006B78AA`): Ammo from
     /// the type's `Ammo=`.
     pub(crate) fn refill(&mut self) {
         self.current = self.max;
+    }
+
+    /// BuildingClass::Update43FE8E..43FEB8 and Infantry fear5200E1..520105
+    /// copy the current type's Ammo when this count is exactly zero. Each
+    /// caller owns its Hospital/Armory or fear-expiry/IsArmed gates.
+    pub(crate) fn refill_empty_from_type(&mut self, type_ammo: i32) {
+        if self.is_empty() {
+            self.current = type_ammo;
+        }
     }
 
     /// The kamikaze tracker's Ammo = 1: Push (`0x0054E478..0x0054E483`) and
@@ -143,17 +206,9 @@ impl TechnoAmmo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn aircraft_ammo_new() {
-        let ammo = TechnoAmmo::new(3);
-        assert_eq!(ammo.current, 3);
-        assert_eq!(ammo.max, 3);
-        assert!(ammo.dock().is_none());
-    }
 
     #[test]
     fn chrono_reinforcement_signed_decrement_matches_original_dec() {

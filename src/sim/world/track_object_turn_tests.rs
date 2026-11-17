@@ -15,14 +15,14 @@ fn passive_rules() -> RuleSet {
 fn fixture() -> (Simulation, RuleSet) {
     let rules = RuleSet::from_ini(&IniFile::from_str("[VehicleTypes]\n0=MTNK\n[MTNK]\nStrength=500\nSpeed=6\nSensorsSight=1\nWalkRate=1\nIdleRate=0\n")).unwrap();
     let mut sim = Simulation::new();
-    sim.fog.width = 32;
-    sim.fog.height = 32;
-    sim.session.binary_frame = 10;
+    sim.fog.set_width_for_test(32);
+    sim.fog.set_height_for_test(32);
+    sim.session.set_binary_frame_for_test(10);
     let mut entity = GameEntity::test_default(1, "MTNK", "Americans", 10, 10);
     entity.set_category_for_test(EntityCategory::Unit);
     entity.lifecycle.set_object_alive_for_test(true);
     entity.lifecycle.set_in_limbo_for_test(false);
-    entity.lifecycle.set_cell_marked(true);
+    entity.lifecycle.set_cell_marked_for_test(true);
     entity.set_is_voxel_for_test(false);
     entity.mover_facts.set_drive_accelerates_for_test(false);
     entity.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
@@ -46,12 +46,14 @@ fn fixture() -> (Simulation, RuleSet) {
     // duration. Active TrackProcess4B0F20 does not mutate that timer.
     entity
         .navigation
-        .path_runtime
+        .path_runtime_mut()
         .set_blocked_timer_for_test(crate::sim::timer::CdTimer::started(10, 9));
     sim.substrate.entities.insert(entity);
     sim.substrate.occupancy =
         crate::sim::occupancy::OccupancyGrid::rebuild(&sim.substrate.entities);
     crate::sim::arena_fixture::supply_native_map(&mut sim);
+    sim.spatial_threat_after_unlimbo(1, &rules, None);
+    sim.foot_neighbors_after_unlimbo(1, &rules);
     (sim, rules)
 }
 
@@ -85,8 +87,12 @@ fn object_turn_resets_foot_idle_latch_only_on_native_live_continuation() {
         actor.lifecycle.set_object_alive_for_test(alive);
         actor.mission_leaf.set_foot_idle_entry_latch(1);
         let rng = sim.rng_state();
-        sim.advance_live_object_turn(1, None, techno_ai::ObjectAiCtx::default())
-            .expect("bounded object-turn continuation");
+        sim.advance_live_object_turn(
+            1,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            techno_ai::ObjectAiCtx::default(),
+        )
+        .expect("bounded object-turn continuation");
         let actor = sim
             .substrate
             .entities
@@ -112,7 +118,14 @@ fn terminal_sensor_receiver_finishes_before_shp_and_is_not_deferred_to_cell_chan
         .unwrap()
         .position
         .set_rx_for_test(5);
-    sim.add_unit_sensor_after_unlimbo(1, &rules, None);
+    sim.per_cell_process(
+        1,
+        movement::PerCellReason::Arrival,
+        &rules,
+        None,
+        crate::sim::world::FrameEffects::default(),
+    )
+    .unwrap();
     let owner = sim.substrate.entities.get(1).unwrap().owner();
     let entity = sim.substrate.entities.get_mut(1).unwrap();
     entity.position.set_rx_for_test(10);
@@ -139,10 +152,9 @@ fn terminal_sensor_receiver_finishes_before_shp_and_is_not_deferred_to_cell_chan
         ));
     };
     entity.body_frame_counter.set_for_test(5);
-    sim.advance_live_object_turn(1, Some(&rules), techno_ai::ObjectAiCtx::default())
+    sim.advance_live_object_turn(1, &rules, techno_ai::ObjectAiCtx::default())
         .expect("fixture object turn must complete");
     let entity = sim.substrate.entities.get(1).unwrap();
-    assert_eq!(entity.sensor_deposit.unwrap().center(), (10, 10));
     assert!(!sim.fog.has_sensor_for_house(owner, 5, 10));
     assert!(sim.fog.has_sensor_for_house(owner, 10, 10));
     assert!(entity.navigation.nav_com().is_none());
@@ -174,7 +186,7 @@ fn accepted_chain_runs_sensor_callback_and_consumes_more_paid_points_in_same_obj
                 (0..32).map(move |x| {
                     let mut cell =
                         crate::map::resolved_terrain::ResolvedTerrainCell::clear_for_test(x, y);
-                    cell.speed_costs.track = Some(100);
+                    cell.speed_costs.track = Some(crate::util::native_x87::NativeF32Bits::ONE);
                     cell
                 })
             })
@@ -184,12 +196,15 @@ fn accepted_chain_runs_sensor_callback_and_consumes_more_paid_points_in_same_obj
         crate::sim::pathfinding::PathGrid::from_resolved_terrain(&terrain),
     ));
     sim.resolved_terrain = Some(terrain);
-    sim.add_unit_sensor_after_unlimbo(1, &rules, None);
+    // The fixture inserts its unit already placed, so no Unlimbo stamped it.
+    sim.add_unit_sensors_at_current(1, &rules, None);
     let selection = drive_track::select_drive_track(32, 64, false).unwrap();
     assert!(selection.entry_index > 0);
     let entity = sim.substrate.entities.get_mut(1).unwrap();
     entity.body_facing.snap(0x2000, 0);
-    entity.navigation.path_replay = FootPathQueue::for_test(vec![2, 3], 0, Some((10, 10)));
+    entity
+        .navigation
+        .set_path_replay_for_test(FootPathQueue::for_test(vec![2, 3], 0, Some((10, 10))));
     assert!(entity.locomotor.as_mut().unwrap().store_track_progress(
         crate::sim::movement::track_process::TrackFamily::Drive,
         TrackProgress::for_test(
@@ -200,7 +215,7 @@ fn accepted_chain_runs_sensor_callback_and_consumes_more_paid_points_in_same_obj
         )
     ));
     let outcome = sim
-        .advance_live_object_turn(1, Some(&rules), techno_ai::ObjectAiCtx::default())
+        .advance_live_object_turn(1, &rules, techno_ai::ObjectAiCtx::default())
         .expect("fixture object turn must complete");
     let entity = sim.substrate.entities.get(1).unwrap();
     let track = entity
@@ -221,11 +236,15 @@ fn accepted_chain_runs_sensor_callback_and_consumes_more_paid_points_in_same_obj
             .track_valid()
     );
     assert!(track.cursor() > i32::from(selection.entry_index));
-    assert_eq!(entity.navigation.path_replay.cursor(), 1);
+    assert_eq!(entity.navigation.path_replay().cursor(), 1);
     // Retail RawTrack[3]7E7A58 -> point37 at7E66B4=(-136,136,32).
     // TurnTrack[1]7E7B34 flags8 leaves XY unchanged in Transform4B4780.
     // With head(2688,2432), PerCell4B1CFD runs in signed cell(9,10).
-    assert_eq!(entity.sensor_deposit.unwrap().center(), (9, 10));
+    // SensorsSight=1 stamps only the centre cell: the PerCell removed the
+    // Unlimbo add at (10,10) and added at (9,10).
+    let owner = entity.owner();
+    assert!(sim.fog.has_sensor_for_house(owner, 9, 10));
+    assert!(!sim.fog.has_sensor_for_house(owner, 10, 10));
     // Live MTNK Speed=6 gives budget15: the next paid point must move away
     // from the callback's exact coordinates, even if it stays in that cell.
     let current = crate::sim::movement::ground_pose::position_world_coord(&entity.position);
@@ -234,13 +253,13 @@ fn accepted_chain_runs_sensor_callback_and_consumes_more_paid_points_in_same_obj
     assert_eq!(
         entity
             .navigation
-            .path_runtime
+            .path_runtime()
             .blocked_timer()
-            .remaining(sim.session.binary_frame as i32),
+            .remaining(sim.session.binary_frame() as i32),
         9
     );
     assert_eq!(
-        entity.navigation.path_runtime.blocked_timer(),
+        entity.navigation.path_runtime().blocked_timer(),
         crate::sim::timer::CdTimer::started(10, 9),
         "chain callbacks and additional paid points do not rewrite the timer"
     );
@@ -304,7 +323,7 @@ fn first_process_after_command_applies_raw_head_once_without_a_paid_point_and_af
                 0
             );
             sim.install_fixture_path_grid(Some(&grid));
-            sim.advance_live_object_turn(1, Some(&rules), techno_ai::ObjectAiCtx::default())
+            sim.advance_live_object_turn(1, &rules, techno_ai::ObjectAiCtx::default())
                 .expect("fixture object turn must complete");
             let entity = sim.substrate.entities.get(1).unwrap();
             if kind == LocomotorKind::Drive {
@@ -332,7 +351,7 @@ fn first_process_after_command_applies_raw_head_once_without_a_paid_point_and_af
             );
             sim.substrate.raw_cell_occupation.clear_ground(10, 9, 0x20);
             sim.install_fixture_path_grid(Some(&grid));
-            sim.advance_live_object_turn(1, Some(&rules), techno_ai::ObjectAiCtx::default())
+            sim.advance_live_object_turn(1, &rules, techno_ai::ObjectAiCtx::default())
                 .expect("fixture object turn must complete");
             assert_eq!(
                 sim.substrate.raw_cell_occupation.ground_bits(10, 9) & 0x20,
@@ -366,7 +385,7 @@ fn terminal_arrival_resets_owner_speed_before_next_accelerating_move() {
         ));
     };
     entity.foot_speed.set_speed_fraction(SimFixed::from_num(1));
-    sim.advance_live_object_turn(1, Some(&rules), techno_ai::ObjectAiCtx::default())
+    sim.advance_live_object_turn(1, &rules, techno_ai::ObjectAiCtx::default())
         .expect("fixture object turn must complete");
     assert_eq!(
         sim.substrate
@@ -390,7 +409,7 @@ fn terminal_arrival_resets_owner_speed_before_next_accelerating_move() {
     entity.mover_facts.set_drive_accelerates_for_test(true);
     // The first Process after the order requests the route from the grid.
     sim.install_fixture_path_grid(Some(&grid));
-    sim.advance_live_object_turn(1, Some(&rules), techno_ai::ObjectAiCtx::default())
+    sim.advance_live_object_turn(1, &rules, techno_ai::ObjectAiCtx::default())
         .expect("fixture object turn must complete");
     assert_eq!(
         sim.substrate
@@ -425,7 +444,7 @@ fn ship_fresh_claim_survives_next_object_visit_and_snapshot() {
     ));
     sim.install_fixture_path_grid(Some(&grid));
     let ctx = techno_ai::ObjectAiCtx::default;
-    sim.advance_live_object_turn(1, Some(&rules), ctx())
+    sim.advance_live_object_turn(1, &rules, ctx())
         .expect("fixture object turn must complete");
     let head = sim
         .substrate
@@ -447,7 +466,7 @@ fn ship_fresh_claim_survives_next_object_visit_and_snapshot() {
             .unwrap()
             .foot_occupation_enabled()
     );
-    sim.advance_live_object_turn(1, Some(&rules), ctx())
+    sim.advance_live_object_turn(1, &rules, ctx())
         .expect("fixture object turn must complete");
     let bytes = GameSnapshot::save(&sim, 0, 0, "ship_head", 0);
     let loaded = GameSnapshot::load(&bytes).unwrap().sim;
@@ -473,8 +492,10 @@ fn ordinary_default_passive_false_does_not_accept_a_chain() {
         crate::sim::movement::track_process::TrackFamily::Drive,
         TrackProgress::for_test(1, 37, false, 0)
     ));
-    entity.navigation.path_replay = FootPathQueue::for_test(vec![2, 3], 0, Some((10, 10)));
-    sim.advance_live_object_turn(1, Some(&rules), techno_ai::ObjectAiCtx::default())
+    entity
+        .navigation
+        .set_path_replay_for_test(FootPathQueue::for_test(vec![2, 3], 0, Some((10, 10))));
+    sim.advance_live_object_turn(1, &rules, techno_ai::ObjectAiCtx::default())
         .expect("fixture object turn must complete");
     let entity = sim.substrate.entities.get(1).unwrap();
     assert_eq!(
@@ -488,5 +509,5 @@ fn ordinary_default_passive_false_does_not_accept_a_chain() {
             .turn_index(),
         1
     );
-    assert_eq!(entity.navigation.path_replay.cursor(), 0);
+    assert_eq!(entity.navigation.path_replay().cursor(), 0);
 }

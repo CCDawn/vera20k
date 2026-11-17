@@ -15,20 +15,17 @@ pub(super) fn load_backgrounds(
     assets: &super::AssetManager,
     mix: &super::MixArchive,
     mix_name: &str,
-    theme: super::SidebarTheme,
     names: (&str, &str, &str),
+    palette_name: &str,
+    ares: bool,
 ) -> Option<(
     [Option<RenderedChromeEntry>; 3],
     super::SidebarChromeAssetIdentity,
 )> {
-    let palette_name = match theme {
-        super::SidebarTheme::Yuri => "UIBKGDY.PAL",
-        _ => "UIBKGD.PAL",
-    };
     let (palette, source_archive) =
-        super::resolve_theme_palette_with_source(assets, mix, mix_name, palette_name)?;
-    let entries =
-        [names.0, names.1, names.2].map(|name| super::render_entry(assets, mix, name, &palette, 0));
+        super::resolve_theme_palette_with_source(assets, mix, mix_name, palette_name, ares)?;
+    let entries = [names.0, names.1, names.2]
+        .map(|name| super::render_entry(assets, mix, name, &palette, 0, ares));
     Some((
         entries,
         super::SidebarChromeAssetIdentity {

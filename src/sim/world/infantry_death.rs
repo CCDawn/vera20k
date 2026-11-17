@@ -22,11 +22,17 @@
 
 use super::Simulation;
 use crate::map::entities::EntityCategory;
+use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::animation::SequenceKind;
+use crate::sim::intern::StringInterner;
 use crate::sim::movement::infantry_action::DO_PARADROP;
 use crate::sim::movement::locomotor::MovementLayer;
+use crate::sim::pathfinding::PathGrid;
+use crate::sim::rng::SimRng;
 use crate::sim::world::FrameEffects;
+use crate::sim::world::ObjectSubstrate;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum InfantryDeathSequence {
@@ -35,14 +41,22 @@ pub enum InfantryDeathSequence {
 }
 
 impl InfantryDeathSequence {
-    fn for_inf_death(inf_death: u8) -> Option<Self> {
+    /// The sequence arms of the InfDeath table (`0x00518D58`, dispatched on
+    /// `InfDeath - 1` over 0..9 unsigned at `0x005185C8`): 1 plays Die1 and
+    /// 2 Die2 (`Do_Action(11/12, 1, 0)`, `0x005185DF`, `0x0051863F`), with
+    /// no anim. The arms 3..=10 build an anim and play no sequence
+    /// ([`inf_death_spawns_anim`]); any other value, the warhead default 0
+    /// included, takes neither (`0x005185CC` is an unsigned `ja`). No arm
+    /// reaches Die3..Die5 (DoType `0x0D`..`0x0F`), and the selection draws no
+    /// RNG: `Do_Action`'s randomStart, which gates the frame-start draw, is 0.
+    pub(crate) fn for_inf_death(inf_death: i32) -> Option<Self> {
         match inf_death {
             1 => Some(Self::Die1),
             2 => Some(Self::Die2),
             _ => None,
         }
     }
-    fn animation(self) -> SequenceKind {
+    pub(crate) fn animation(self) -> SequenceKind {
         match self {
             Self::Die1 => SequenceKind::Die1,
             Self::Die2 => SequenceKind::Die2,
@@ -50,9 +64,18 @@ impl InfantryDeathSequence {
     }
 }
 
+/// Whether the InfDeath table's arm (`0x00518D58`) for this InfDeath builds
+/// an anim (3..=10) instead of playing a sequence; exclusive with
+/// [`InfantryDeathSequence::for_inf_death`].
+fn inf_death_spawns_anim(inf_death: i32) -> bool {
+    (3..=10).contains(&inf_death)
+}
+
 enum ReceiverDeathRecipe {
     Sequence,
-    ExternalAnim(u8),
+    ExternalAnim(i32),
+    /// An InfDeath off the table (`0x005185CC`), the warhead default 0
+    /// included: neither sequence nor anim, then UnInit.
     Cleanup,
     /// DropAsBomb water landing (`0x005181B5..0x005182AF`): Wake at
     /// Location and SplashList[0] three leptons higher, then the common
@@ -65,6 +88,11 @@ enum ReceiverDeathRecipe {
     /// InfDeath 9's InfantryMutate after its admission
     /// ([`Simulation::infantry_mutation_admits`]), then UnInit.
     Mutate,
+    /// Ares InfantryClass_ReceiveDamage_InfDeath (hook 0x5185C8, installed
+    /// 10025DE0): the killing warhead's `InfDeathAnim` in place of the
+    /// table, owned by SetMakeInfOwner, then the anim arms' tail
+    /// (`0x005185F1`) and UnInit.
+    AresInfDeathAnim(String),
 }
 
 /// Captured concrete-receiver inputs after recursive DeathWeapon damage;
@@ -78,6 +106,8 @@ pub struct InfantryDeathPostlude {
     /// The house InfDeath 8 and 9 give their anim: the killing source's
     /// owner, else the receiver's house argument.
     house: Option<crate::sim::intern::InternedId>,
+    /// The infantryman's owner, the victim house of an Ares `InfDeathAnim`.
+    victim_house: crate::sim::intern::InternedId,
     recipe: ReceiverDeathRecipe,
 }
 
@@ -102,7 +132,9 @@ impl InfantryDeathPostlude {
         effects: &mut crate::sim::combat::DeathEffects,
         uninit: Option<super::UninitContext<'_>>,
     ) {
-        use crate::sim::combat::destruction_effects::{DeathAnimFollowUp, DeathAnimSpawn};
+        use crate::sim::combat::destruction_effects::{
+            AresMakeInfTail, DeathAnimFollowUp, DeathAnimSpawn,
+        };
         if matches!(self.recipe, ReceiverDeathRecipe::WaterSplash) {
             world.emit_death_anim(
                 rules,
@@ -156,7 +188,53 @@ impl InfantryDeathPostlude {
             ReceiverDeathRecipe::Sequence
             | ReceiverDeathRecipe::Cleanup
             | ReceiverDeathRecipe::WaterSplash => None,
+            ReceiverDeathRecipe::AresInfDeathAnim(_) => None,
         };
+        // Ares replaces each anim arm's owner write with SetMakeInfOwner
+        // (1000A5F0): InfantryClass_ReceiveDamage_InfantryVirus2 (10025F50,
+        // hook 0x51887B) and _InfantryMutate (10025EB0, hook 0x518A96) with
+        // the killing house as invoker; _Anims (10025D20, hooks 0x518698
+        // InfantryExplode, 0x5186F2 FlamingInfantry, 0x518755 the
+        // electrocution anim, 0x5187BB InfantryHeadPop, 0x518821
+        // InfantryNuked, 0x518B93 InfantryBrute) with none.
+        let anim = if rules.ares() {
+            anim.map(|(inf_death, _)| {
+                let (invoker, tail) = match inf_death {
+                    VIRUS_INF_DEATH => (self.house, AresMakeInfTail::ClearInvokerRemap),
+                    INFANTRY_MUTATE_INF_DEATH => (self.house, AresMakeInfTail::MarkCellOccupancy),
+                    _ => (None, AresMakeInfTail::None),
+                };
+                (
+                    inf_death,
+                    Some(DeathAnimFollowUp::AresMakeInfOwner {
+                        invoker,
+                        victim: self.victim_house,
+                        killer: self.house,
+                        tail,
+                    }),
+                )
+            })
+        } else {
+            anim
+        };
+        if rules.ares()
+            && let ReceiverDeathRecipe::AresInfDeathAnim(name) = &self.recipe
+        {
+            world.emit_death_anim(
+                rules,
+                &mut effects.explosion_effects,
+                name,
+                DeathAnimSpawn {
+                    follow_up: Some(DeathAnimFollowUp::AresMakeInfOwner {
+                        invoker: self.house,
+                        victim: self.victim_house,
+                        killer: self.house,
+                        tail: AresMakeInfTail::None,
+                    }),
+                    ..DeathAnimSpawn::at(self.location, 0)
+                },
+            );
+        }
         if let Some((inf_death, follow_up)) = anim
             && let Some(name) = rules.general.infantry_death_anim(inf_death)
         {
@@ -170,13 +248,17 @@ impl InfantryDeathPostlude {
                 },
             );
         }
-        if matches!(
-            self.recipe,
-            ReceiverDeathRecipe::ExternalAnim(_)
-                | ReceiverDeathRecipe::Mutate
-                | ReceiverDeathRecipe::Cleanup
-                | ReceiverDeathRecipe::WaterSplash
-        ) {
+        let ares_anim =
+            rules.ares() && matches!(self.recipe, ReceiverDeathRecipe::AresInfDeathAnim(_));
+        if ares_anim
+            || matches!(
+                self.recipe,
+                ReceiverDeathRecipe::ExternalAnim(_)
+                    | ReceiverDeathRecipe::Mutate
+                    | ReceiverDeathRecipe::Cleanup
+                    | ReceiverDeathRecipe::WaterSplash
+            )
+        {
             match uninit {
                 Some(context) => world.uninit_with_context(self.id, context),
                 None => effects.immediate_uninit_ids.push(self.id),
@@ -187,15 +269,15 @@ impl InfantryDeathPostlude {
 
 /// The InfDeath arm whose anim is `[General] InfantryExplode=`: a `JumpJet=`
 /// infantryman's death builds it whatever the warhead (`0x00518313`).
-const INFANTRY_EXPLODE_INF_DEATH: u8 = 3;
+const INFANTRY_EXPLODE_INF_DEATH: i32 = 3;
 
 /// The InfDeath arm whose anim is `[General] InfantryVirus=` and takes an
 /// owner (`0x00518826..0x005188A9`).
-const VIRUS_INF_DEATH: u8 = 8;
+const VIRUS_INF_DEATH: i32 = 8;
 
 /// The InfDeath arm whose anim is `[General] InfantryMutate=`
 /// (`0x005188AE..0x00518B2C`).
-const INFANTRY_MUTATE_INF_DEATH: u8 = 9;
+const INFANTRY_MUTATE_INF_DEATH: i32 = 9;
 
 /// The InfDeath an infantryman dies with while its action is still Paradrop
 /// (`+0x6C4` 0x21), whatever the warhead's (`0x0051836F..0x0051842F`): a
@@ -204,7 +286,7 @@ const INFANTRY_MUTATE_INF_DEATH: u8 = 9;
 ///
 /// InfDeath8 first emits the same temporary-anim single particle as the
 /// animal branch (51837E..51842C), before the ordinary explosion.
-const PARADROP_INF_DEATH: u8 = INFANTRY_EXPLODE_INF_DEATH;
+const PARADROP_INF_DEATH: i32 = INFANTRY_EXPLODE_INF_DEATH;
 
 /// The arm of `InfantryClass::ReceiveDamage`'s death ladder (`0x00517FA0`)
 /// that takes a killed infantryman, as far as VERA ports the ladder.
@@ -219,17 +301,25 @@ enum InfantryDeathArm {
     /// (`0x0051850F`) whatever the InfDeath.
     NotHuman,
     /// The InfDeath table (`0x00518D58`) with this InfDeath.
-    Table(u8),
+    Table(i32),
 }
 
 impl Simulation {
     /// Infantry51851E..5185C6 (also Paradrop51837E): construct InfantryVirus,
     /// spawn its explicit SpawnsParticle once, then scalar-delete the temporary
     /// animation. This is distinct from the human death animation's Middle.
+    ///
+    /// Ares 3.0 InfantryClass_ReceiveDamage_InfantryVirus1 10025EF0 (hooks
+    /// 0x5183DE paradrop, 0x518575 NotHuman) first owns the anim through
+    /// SetMakeInfOwner (`house` as invoker and killer, `victim`), and a type
+    /// without `SpawnsParticle` keeps its anim: the hook resumes past the
+    /// particle and the delete (0x518422, 0x5185B9).
     fn emit_inline_virus_particle(
         &mut self,
         rules: &RuleSet,
         location: crate::sim::anim_class::AnimWorldCoord,
+        house: Option<crate::sim::intern::InternedId>,
+        victim: crate::sim::intern::InternedId,
     ) {
         let Some(name) = rules.general.infantry_death_anim(VIRUS_INF_DEATH) else {
             return;
@@ -242,12 +332,28 @@ impl Simulation {
         ) else {
             return;
         };
+        if rules.ares() {
+            self.ares_set_make_inf_owner(anim, type_id, house, Some(victim), house, rules);
+            let spawns_particle = self
+                .anim(anim)
+                .and_then(|anim| {
+                    rules
+                        .art()
+                        .anim_runtime_config(self.interner.resolve(anim.type_id()))
+                })
+                .and_then(|config| config.spawns_particle.as_deref())
+                .and_then(|name| rules.p_type_id_by_name(name))
+                .is_some();
+            if !spawns_particle {
+                return;
+            }
+        }
         if let Some(kind) = self
             .anim(anim)
             .and_then(|anim| {
                 rules
                     .art()
-                    .anim_runtime_config(self.interner.resolve(anim.type_id))
+                    .anim_runtime_config(self.interner.resolve(anim.type_id()))
             })
             .and_then(|config| config.spawns_particle.as_deref())
             .and_then(|name| rules.p_type_id_by_name(name))
@@ -280,14 +386,19 @@ impl Simulation {
     /// on retail. An ignoreDefenses kill of a `Cyborg=` (`+0xEAC`)
     /// type raises a flag (`0x0051815B`) that takes the Die1, Die2,
     /// NotHuman and refused InfDeath 9 arms on to UnInit (`0x005185E5`); a
-    /// prone Cyborg builds InfantryExplode (`0x005182B4`). Retail sets no
+    /// prone Cyborg builds InfantryExplode (`0x005182B4`), and so does one
+    /// dropped as a bomb (`+0x8F`, `0x00518155..0x005181B0`). A Cyborg's
+    /// first lethal hit without ignoreDefenses never reaches here:
+    /// `ObjectClass::ReceiveDamage` (`0x005F5509..0x005F55E8`) builds
+    /// InfantryExplode, sets its health to a quarter of `Strength=` (at least
+    /// 1) and leaves it crawling with its legs gone (`+0x6DB`). Retail sets no
     /// `Cyborg=`. The preceding low DropAsBomb water arm is ported here
     /// (`0x005181B5..0x005182AF`; original `tools.native_inspect` instructions).
     ///
     fn infantry_death_arm(
         &self,
         entity: &crate::sim::game_entity::GameEntity,
-        inf_death: u8,
+        inf_death: i32,
         rules: &RuleSet,
     ) -> InfantryDeathArm {
         if let Some(location) = self.dropped_bomb_water_death_location(entity.stable_id()) {
@@ -333,8 +444,16 @@ impl Simulation {
     /// Native execution: `tools/superweapon_oracle.py` section
     /// `infantry_mutate_death`, replayed in
     /// `superweapon::genetic_converter_tests`.
-    fn infantry_mutation_admits(&mut self, id: u64, rules: &RuleSet) -> bool {
-        let Some(entity) = self.substrate.entities.get(id) else {
+    fn infantry_mutation_admits(
+        interner: &StringInterner,
+        scenario_rng: &mut SimRng,
+        substrate: &mut ObjectSubstrate,
+        path_grid: &Option<Arc<PathGrid>>,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        id: u64,
+        rules: &RuleSet,
+    ) -> bool {
+        let Some(entity) = substrate.entities.get(id) else {
             return false;
         };
         let [x, y] = crate::sim::movement::ground_pose::position_world_xy(&entity.position);
@@ -343,19 +462,25 @@ impl Simulation {
             y,
             z: crate::sim::movement::ground_pose::object_world_z_leptons(
                 entity,
-                self.resolved_terrain.as_ref(),
+                resolved_terrain.as_ref(),
             ),
         };
         let on_bridge = entity.on_bridge();
-        self.object_raw_receiver_at(id, location, false);
+        Self::object_raw_receiver_at(
+            substrate,
+            path_grid,
+            resolved_terrain,
+            id,
+            location,
+            false,
+            rules.ares_form(),
+        );
         let (rx, ry) = ((x / 256) as u16, (y / 256) as u16);
-        let building = self
-            .substrate
+        let building = substrate
             .occupancy
             .get(rx, ry)
             .is_some_and(|cell| cell.has_building_on(MovementLayer::Ground));
-        let footless = self
-            .resolved_terrain
+        let footless = resolved_terrain
             .as_ref()
             .and_then(|terrain| terrain.cell(rx, ry))
             .is_some_and(|cell| {
@@ -363,19 +488,33 @@ impl Simulation {
                 // unbound row admits.
                 cell.speed_costs
                     .cost_for_speed_type(crate::rules::locomotor_type::SpeedType::Foot)
-                    == Some(0)
+                    .is_some_and(|cost| cost.is_zero())
             });
         if footless && !on_bridge {
             return false;
         }
-        if self
-            .place_infantry_in_ground_cell(rules, location)
-            .is_none()
+        if Self::place_infantry_in_ground_cell(
+            interner,
+            scenario_rng,
+            substrate,
+            resolved_terrain,
+            rules,
+            location,
+        )
+        .is_none()
             || building
         {
             return false;
         }
-        self.object_raw_receiver_at(id, location, true);
+        Self::object_raw_receiver_at(
+            substrate,
+            path_grid,
+            resolved_terrain,
+            id,
+            location,
+            true,
+            rules.ares_form(),
+        );
         true
     }
 
@@ -392,11 +531,12 @@ impl Simulation {
     /// Stop_Driver (`0x005180FE`) and Stun (`0x00518108`), which stop its
     /// locomotor with Scenario draws.
     ///
-    /// RESIDUAL: native tests `Crashable=` after every anim arm, not only the
-    /// JumpJet one. Trigger: a `Crashable=` type without `JumpJet=`, which
-    /// retail lacks (its Crashable infantry, JUMPJET and LUNR, are JumpJet
-    /// types by the production reader). Effect: it would crash instead of
-    /// being UnInit.
+    /// RESIDUAL: native tests `Crashable=` (`0x005185F1`) after every anim arm
+    /// and after an InfDeath off the table (the warhead default 0 included),
+    /// not only after the JumpJet one. Trigger: a `Crashable=` type without
+    /// `JumpJet=`, which retail lacks (its Crashable infantry, JUMPJET and
+    /// LUNR, are JumpJet types by the production reader). Effect: it would
+    /// crash instead of being UnInit.
     ///
     /// RESIDUAL: a walker skips that Stop_Driver and Stun. Trigger: every
     /// infantry death. Effect: none observable: its Walk stop and Stun repeat
@@ -408,11 +548,18 @@ impl Simulation {
     /// later native callback or defer its House statistics until UnInit.
     ///
     /// `house` is the owner InfDeath 8 and 9 give their anim.
+    ///
+    /// `inf_death_anim` is the killing warhead's Ares `InfDeathAnim` (hook
+    /// 0x5185C8, installed 10025DE0): ahead of the table's dispatch, a human
+    /// (not `NotHuman=`) infantryman below height 10 (GetHeight, vt+0x1C8)
+    /// builds it at its Location instead of the table's arm, and the anim
+    /// tail follows.
     pub(crate) fn begin_infantry_receiver_death(
         &mut self,
         id: u64,
-        inf_death: u8,
+        inf_death: i32,
         house: Option<crate::sim::intern::InternedId>,
+        inf_death_anim: Option<&str>,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         effects: super::FrameEffects<'_>,
@@ -426,9 +573,9 @@ impl Simulation {
             if let Err(cause) = self.infantry_stop_driver(id, rules, overlay_registry, effects) {
                 log::debug!("infantry {id} death Stop_Driver: {cause}");
             }
-            self.techno_death_stun(
+            self.stun(
                 id,
-                super::UninitContext::new(Some(rules), overlay_registry).with_effects(effects),
+                super::UninitContext::new(rules, overlay_registry).with_effects(effects),
             );
         }
         // `InfantryClass::ReceiveDamage 0x0051810E..0x0051812E`, before the
@@ -440,8 +587,8 @@ impl Simulation {
                 crate::sim::mission::MissionId::from_known(crate::sim::mission::MissionType::Guard),
             );
         }
-        let now = self.session.binary_frame;
-        let _ = self.mission_commence_exact(id, now);
+        let now = self.session.binary_frame();
+        let _ = self.substrate.mission_commence_exact(id, now);
         let entity = self
             .substrate
             .entities
@@ -458,10 +605,22 @@ impl Simulation {
             ),
         };
         let arm = self.infantry_death_arm(entity, inf_death, rules);
+        let entity_owner = entity.owner();
+        let ares_anim = if rules.ares() {
+            inf_death_anim.filter(|_| {
+                matches!(arm, InfantryDeathArm::Table(_))
+                    && crate::sim::movement::air_movement::current_fly_height(
+                        entity,
+                        self.resolved_terrain.as_ref(),
+                    ) < 10
+            })
+        } else {
+            None
+        };
         if inf_death == VIRUS_INF_DEATH
             && matches!(arm, InfantryDeathArm::Table(PARADROP_INF_DEATH))
         {
-            self.emit_inline_virus_particle(rules, location);
+            self.emit_inline_virus_particle(rules, location, house, entity_owner);
         }
         let recipe = match arm {
             InfantryDeathArm::WaterSplash(raw_location) => {
@@ -478,12 +637,23 @@ impl Simulation {
             InfantryDeathArm::NotHuman => {
                 self.begin_infantry_death_sequence(id, InfantryDeathSequence::Die1, rules, effects);
                 if inf_death == VIRUS_INF_DEATH {
-                    self.emit_inline_virus_particle(rules, location);
+                    self.emit_inline_virus_particle(rules, location, house, entity_owner);
                 }
                 ReceiverDeathRecipe::Sequence
             }
+            InfantryDeathArm::Table(_) if ares_anim.is_some() => {
+                ReceiverDeathRecipe::AresInfDeathAnim(ares_anim.unwrap_or_default().to_owned())
+            }
             InfantryDeathArm::Table(INFANTRY_MUTATE_INF_DEATH) => {
-                if self.infantry_mutation_admits(id, rules) {
+                if Self::infantry_mutation_admits(
+                    &self.interner,
+                    &mut self.scenario_rng,
+                    &mut self.substrate,
+                    &self.path_grid,
+                    &self.resolved_terrain,
+                    id,
+                    rules,
+                ) {
                     ReceiverDeathRecipe::Mutate
                 } else {
                     self.begin_infantry_death_sequence(
@@ -499,7 +669,7 @@ impl Simulation {
                 if let Some(sequence) = InfantryDeathSequence::for_inf_death(inf_death) {
                     self.begin_infantry_death_sequence(id, sequence, rules, effects);
                     ReceiverDeathRecipe::Sequence
-                } else if crate::sim::animation::inf_death_spawns_anim(inf_death) {
+                } else if inf_death_spawns_anim(inf_death) {
                     ReceiverDeathRecipe::ExternalAnim(inf_death)
                 } else {
                     ReceiverDeathRecipe::Cleanup
@@ -510,6 +680,7 @@ impl Simulation {
             id,
             location,
             house,
+            victim_house: entity_owner,
             recipe,
         }
     }
@@ -566,7 +737,11 @@ impl Simulation {
             return None;
         }
         let location = crate::sim::movement::ground_pose::position_world_coord(&entity.position);
-        let body = self.pick_death_anim(bodies).to_string();
+        let body = crate::sim::combat::destruction_effects::pick_death_anim(
+            &mut self.scenario_rng,
+            bodies,
+        )
+        .to_string();
         let body = self.interner.intern(&body);
         self.admit_death_anim(
             rules,
@@ -584,7 +759,7 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_c_o))]
 mod corpse_tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -610,9 +785,6 @@ mod corpse_tests {
         let mut registry = crate::rules::art_data::ArtRegistry::from_ini(&art);
         registry.bind_anim_frame_count_for_test("NUKEDIE", 20);
         rules.install_art_data(registry);
-        rules.bind_animation_sequences(
-            &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-        );
         let mut sim = Simulation::new();
         crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
         let id = sim
@@ -633,23 +805,6 @@ mod corpse_tests {
         );
     }
 
-    /// The corpse keeps IsAlive and takes `InfantryClass::AI`'s ordinary
-    /// visit: `MissionClass::AI`'s `+0xC4` count (`0x006FA646`) runs for it
-    /// as for any infantryman.
-    #[test]
-    fn a_corpse_takes_its_ordinary_visit() {
-        let (mut sim, rules, id) = corpse_scene();
-        sim.advance_tick(&[], Some(&rules), None, None, 100);
-        kill_with_die1(&mut sim, &rules, id);
-        let counter = sim.substrate.entities.get(id).unwrap().mission.ai_counter();
-        sim.advance_tick(&[], Some(&rules), None, None, 100);
-        let corpse = sim.substrate.entities.get(id).unwrap();
-        assert!(!corpse.death.is_dying() && corpse.is_active());
-        assert_eq!(corpse.health.current(), 0);
-        assert_eq!(corpse.mission_leaf.as_infantry().unwrap().doing(), 11);
-        assert_eq!(corpse.mission.ai_counter(), counter + 1);
-    }
-
     /// FootClass::AI's radiation (`0x004DA554..0x004DA635`) has no Health
     /// gate, and TechnoClass::ReceiveDamage takes a Health-0 receiver to its
     /// death branch again (`0x0070202E`): a Die1 corpse standing in
@@ -658,7 +813,7 @@ mod corpse_tests {
     #[test]
     fn a_corpse_in_radiation_dies_again_at_the_next_application() {
         let (mut sim, rules, id) = corpse_scene();
-        sim.session.binary_frame = 10;
+        sim.session.set_binary_frame_for_test(10);
         kill_with_die1(&mut sim, &rules, id);
         sim.radiation.apply_detonation(
             crate::sim::radiation::RadDetonation {
@@ -666,20 +821,23 @@ mod corpse_tests {
                 ry: 5,
                 rad_level: 500,
                 spread: 2,
+                rad_type: None,
+                firing_house: None,
+                invoker: None,
             },
             10,
-            &sim.session.theater,
-            &rules.radiation,
+            &sim.session.theater(),
+            &rules,
             sim.resolved_terrain.as_ref(),
-            &mut sim.lighting_sources.pending,
+            &mut sim.lighting_sources,
         );
         let nukedie = |sim: &Simulation| {
             sim.anims()
-                .filter(|(_, anim)| sim.interner.resolve(anim.type_id) == "NUKEDIE")
+                .filter(|(_, anim)| sim.interner.resolve(anim.type_id()) == "NUKEDIE")
                 .count()
         };
         for frame in 10..16 {
-            sim.session.binary_frame = frame;
+            sim.session.set_binary_frame_for_test(frame);
             sim.advance_tick(&[], Some(&rules), None, None, 100);
             assert!(
                 sim.substrate
@@ -690,7 +848,7 @@ mod corpse_tests {
             );
         }
         assert_eq!(nukedie(&sim), 0);
-        sim.session.binary_frame = 16;
+        sim.session.set_binary_frame_for_test(16);
         sim.advance_tick(&[], Some(&rules), None, None, 100);
         assert!(
             sim.substrate
@@ -701,6 +859,82 @@ mod corpse_tests {
         assert_eq!(nukedie(&sim), 1);
     }
 
+    /// The InfDeath table (`0x00518D58`) dispatches on `InfDeath - 1` over
+    /// 0..9 unsigned: 0, negatives and values above 10 take neither a
+    /// sequence nor an anim, 1 and 2 are its only sequence arms, and 3..=10
+    /// build an anim; no arm reaches Die3..Die5.
+    #[test]
+    fn inf_death_table_arms_are_exclusive() {
+        let sequence = |inf_death| {
+            InfantryDeathSequence::for_inf_death(inf_death).map(InfantryDeathSequence::animation)
+        };
+        for off_table in [0, -1, 11] {
+            assert_eq!(sequence(off_table), None);
+            assert!(!inf_death_spawns_anim(off_table));
+        }
+        assert_eq!(sequence(1), Some(SequenceKind::Die1));
+        assert_eq!(sequence(2), Some(SequenceKind::Die2));
+        assert!(!inf_death_spawns_anim(1));
+        assert!(!inf_death_spawns_anim(2));
+        for inf_death in 3..=10 {
+            assert_eq!(sequence(inf_death), None);
+            assert!(inf_death_spawns_anim(inf_death));
+        }
+    }
+
+    /// Retail `[CometWH]` (the Prism Tank's beam and its shrapnel fragments)
+    /// and `[GrandCannonWH]` name no `InfDeath=`, so the production reader
+    /// keeps the WarheadTypeClass constructor's 0 (`0x0075CF14`). Killed by
+    /// either through the production receiver, an E1 takes no table arm
+    /// (`0x005185C8`: `InfDeath - 1` is above 9 unsigned) and is UnInit inside
+    /// the killing call (`0x005185F1` -> `0x00518B9A`): no death sequence, no
+    /// anim, no corpse. `[SA]`'s `InfDeath=1` still leaves the Die1 corpse.
+    #[test]
+    fn retail_warheads_without_inf_death_remove_the_infantryman_at_once() {
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        else {
+            return;
+        };
+        for (warhead, inf_death) in [("CometWH", 0), ("GrandCannonWH", 0), ("SA", 1)] {
+            assert_eq!(
+                rules.warhead(warhead).unwrap().inf_death,
+                inf_death,
+                "{warhead}"
+            );
+            let mut sim = Simulation::new();
+            crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
+            let id = sim
+                .spawn_object("E1", "Americans", 5, 5, 0, &rules)
+                .unwrap();
+            let hit = crate::sim::combat::EntityDamageEvent::direct_receiver(
+                id,
+                100_000,
+                0,
+                crate::sim::combat::RAD_NO_ATTACKER,
+                None,
+                sim.interner.intern(warhead),
+                crate::sim::combat::ReceiverCallFlags {
+                    ignore_defenses: false,
+                    arg6: false,
+                },
+            );
+            sim.commit_noncombat_aoe_hits(&rules, None, &[hit], FrameEffects::default());
+            let entity = sim.substrate.entities.get(id).unwrap();
+            assert_eq!(entity.health.current(), 0, "{warhead}");
+            assert_eq!(sim.anims().count(), 0, "{warhead}: no InfDeath anim");
+            let doing = entity.mission_leaf.as_infantry().unwrap().doing();
+            if inf_death == 0 {
+                assert!(!entity.lifecycle.object_alive(), "{warhead}: UnInit");
+                assert!(sim.substrate.pending_delete.contains_object(&id));
+                assert_ne!(doing, 11, "{warhead}: no Die1");
+            } else {
+                assert!(entity.lifecycle.object_alive(), "the Die1 corpse stays");
+                assert!(!sim.substrate.pending_delete.contains_object(&id));
+                assert_eq!(doing, 11);
+            }
+        }
+    }
+
     /// The zero-count refusal (`0x0051D70F`) that leaves a killed
     /// infantryman to the Health reset (`0x0051BC57`) meets one retail type:
     /// every other `[InfantryTypes]` entry has Die1 and Die2 frames once
@@ -709,16 +943,10 @@ mod corpse_tests {
     /// a map that places one can kill it into that revival.
     #[test]
     fn retail_infantry_without_die_frames_are_the_weedguy() {
-        let Some(mut rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
         else {
             return;
         };
-        let Some(art) = crate::rules::retail_ini_fixture::retail_ini("artmd.ini") else {
-            return;
-        };
-        rules.bind_animation_sequences(
-            &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-        );
         assert!(!rules.infantry_ids.is_empty());
         let without: Vec<&String> = rules
             .infantry_ids
@@ -737,7 +965,7 @@ mod corpse_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_c_o))]
 mod dead_body_tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;

@@ -11,16 +11,16 @@ use crate::sim::combat::combat_weapon;
 use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::movement::{ground_pose, target_cell_coord};
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "aircraft_fire_location_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "aircraft_approach_tests.rs"]
 mod approach_tests;
 
 /// Live occupants and Cell NavCom reservations read once per search.
-/// Is_Cell_Free_For_Landing419B00 is an any-match over live objects, so one
+/// Is_Cell_Free_For_Landing419B00 is an any-match over marked objects, so one
 /// pass answers every candidate of one search; nothing mutates between them.
 /// One search passes one `include_self`, which the pass already applied.
 /// VERA-only: the sets are bitmaps, built from every live object and asked
@@ -106,25 +106,24 @@ impl CellSet {
 impl Simulation {
     /// Target+48 is its physical center, independently of the destination
     /// receiver+4C. In particular, do not read a Building's helipad offset here.
+    ///
+    /// The callers ask whatever object they hold, with no class test
+    /// (Find_Attack_Cell `0x00418EC1`, IsLandZoneClear `0x004DDC60`), so an
+    /// object target answers through the shared vt+0x48 owner: a tree an
+    /// aircraft was sent to is a Terrain NavCom, not a Techno.
     pub(super) fn fire_location_center(&self, target: NavTargetRef) -> Option<DriveCoord> {
-        let id = match target {
-            NavTargetRef::Cell { rx, ry } => {
-                return Some(target_cell_coord(
-                    rx,
-                    ry,
-                    self.resolved_terrain
-                        .as_ref()
-                        .map(crate::map::resolved_terrain::NativeCellQuery::canonical)
-                        .as_ref(),
-                ));
-            }
-            NavTargetRef::Object { id } => id,
-        };
-        let entity = self.substrate.entities.get(id)?;
-        Some(ground_pose::object_get_coords(
-            entity,
-            self.resolved_terrain.as_ref(),
-        ))
+        let cells = self
+            .resolved_terrain
+            .as_ref()
+            .map(crate::map::resolved_terrain::NativeCellQuery::canonical);
+        match target {
+            NavTargetRef::Cell { rx, ry } => Some(target_cell_coord(rx, ry, cells.as_ref())),
+            NavTargetRef::Object { id } => ground_pose::target_get_coords(
+                crate::sim::combat::TargetKind::Entity(id),
+                self,
+                cells.as_ref(),
+            ),
+        }
     }
 
     pub(crate) fn aircraft_find_fire_location(
@@ -168,7 +167,7 @@ impl Simulation {
             .unwrap_or_else(|| {
                 ground_pose::object_get_coords(entity, self.resolved_terrain.as_ref())
             });
-        let check_shroud = !self.session.game_mode_nonzero && !entity.is_mission_only();
+        let check_shroud = !self.session.game_mode_nonzero() && !entity.is_mission_only();
         let mut claims = None;
         let mut radius = range.wrapping_sub(256);
         while radius > 256 {
@@ -193,7 +192,7 @@ impl Simulation {
                         .resolved_terrain
                         .as_ref()
                         .map_or(cell, |t| t.native_cell_coord(t.native_cell_identity(cell)));
-                    if !self.session.current_house.is_some_and(|viewer| {
+                    if !self.session.current_house().is_some_and(|viewer| {
                         self.fog
                             .is_ground_open(viewer, resolved.0 as u16, resolved.1 as u16)
                     }) {
@@ -323,7 +322,9 @@ impl Simulation {
         for other in self.substrate.entities.values() {
             if carried == Some(other.stable_id())
                 || own == Some(other.stable_id())
-                || !other.lifecycle.object_alive()
+                //419C13..419C22 reads InLimbo+81 and Marked+74, not Alive+90.
+                // A fatal ship receiver unmarks its retained, living hull.
+                || !other.lifecycle.cell_marked()
                 || other.lifecycle.in_limbo()
                 || !matches!(
                     other.category(),

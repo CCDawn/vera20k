@@ -19,9 +19,11 @@ use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::sim::components::DriveCoord;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::game_entity::GameEntity;
+use crate::sim::intern::StringInterner;
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::occupancy::OccupancyGrid;
 use crate::sim::rng::SimRng;
+use crate::sim::world::ObjectSubstrate;
 
 /// Functional infantry sub-cell positions. The original engine uses sub-cells
 /// 2 (NE), 3 (SW), 4 (SE) — three corners of the isometric diamond. Sub-cells
@@ -35,11 +37,18 @@ pub(crate) fn build_blocker_neighbor_counts_with_overlays(
     width: u16,
     height: u16,
     resolved_terrain: Option<&ResolvedTerrainGrid>,
+    terrain_objects: &crate::sim::terrain_object::TerrainObjectStore,
     overlay_grid: Option<&crate::sim::overlay_grid::OverlayGrid>,
     interner: &crate::sim::intern::StringInterner,
-    rules: Option<&crate::rules::ruleset::RuleSet>,
+    rules: &crate::rules::ruleset::RuleSet,
 ) -> BlockerNeighborCounts {
-    let mut counts = blocker_plane_base(width, height, resolved_terrain, overlay_grid);
+    let mut counts = blocker_plane_base(
+        width,
+        height,
+        resolved_terrain,
+        terrain_objects,
+        overlay_grid,
+    );
     let retained_foot = overlay_grid.is_some();
     for entity in entities.values() {
         if let Some(source) =
@@ -58,6 +67,7 @@ pub(crate) fn blocker_plane_base(
     width: u16,
     height: u16,
     resolved_terrain: Option<&ResolvedTerrainGrid>,
+    terrain_objects: &crate::sim::terrain_object::TerrainObjectStore,
     overlay_grid: Option<&crate::sim::overlay_grid::OverlayGrid>,
 ) -> BlockerNeighborCounts {
     let retained_wall_counts = overlay_grid.map(|grid| {
@@ -72,16 +82,33 @@ pub(crate) fn blocker_plane_base(
         .map(|plane| BlockerNeighborCounts::from_retained_wall_plane(width, height, plane))
         .unwrap_or_else(|| BlockerNeighborCounts::new(width, height));
 
-    if let Some(terrain) = resolved_terrain {
-        for y in 0..height {
-            for x in 0..width {
-                let Some(cell) = terrain.cell(x, y) else {
-                    continue;
-                };
-                if cell.terrain_object_occupation.is_some() {
-                    counts.add_single_cell_neighbor_source(x, y);
+    // TerrainUnlimbo71D000 / Limbo71C930 increment/decrement the eight
+    // neighbouring Cell+122 bytes once per instance, including overlaps.
+    // This derived plane reads the live owner; raw occupation is independent.
+    for object in terrain_objects
+        .objects()
+        .values()
+        .filter(|object| object.is_live())
+    {
+        if let Some(terrain) = resolved_terrain {
+            // Rebuild only real allocated identities, including fixed512
+            // aliases. Actual Unlimbo/Limbo already wrote Dummy's retained
+            // byte; a derived cache must neither replay nor stamp it.
+            for (x, y) in object.neighbor_cells() {
+                if let Some(index) = terrain.native_fixed_cell_index(x, y) {
+                    let (x, y) = terrain
+                        .native_cell_coord(crate::map::cell_index::NativeCellIdentity::Real(index));
+                    if x >= 0 && y >= 0 && (x as u16) < width && (y as u16) < height {
+                        counts.apply_retained_delta(
+                            usize::from(y as u16) * usize::from(width) + usize::from(x as u16),
+                            1,
+                        );
+                    }
                 }
             }
+        } else {
+            let (x, y) = object.cell();
+            counts.add_single_cell_neighbor_source(x, y);
         }
     }
 
@@ -127,7 +154,7 @@ pub(crate) fn blocker_plane_source(
     entity: &GameEntity,
     terrain: Option<&ResolvedTerrainGrid>,
     interner: &crate::sim::intern::StringInterner,
-    rules: Option<&crate::rules::ruleset::RuleSet>,
+    rules: &crate::rules::ruleset::RuleSet,
     retained_foot: bool,
 ) -> Option<BlockerPlaneSource> {
     if retained_foot && entity.category() != EntityCategory::Structure {
@@ -146,9 +173,9 @@ pub(crate) fn blocker_plane_source(
     }
     let pos = (entity.position.rx(), entity.position.ry());
     if entity.category() == EntityCategory::Structure {
-        let size = rules
-            .and_then(|r| interner.object_type(entity.type_ref(), r))
-            .map(|obj| crate::rules::foundation::foundation_dimensions(&obj.foundation))
+        let size = interner
+            .object_type(entity.type_ref(), rules)
+            .map(|obj| obj.foundation.dimensions())
             .unwrap_or((1, 1));
         Some(BlockerPlaneSource::Building { origin: pos, size })
     } else {
@@ -163,7 +190,7 @@ pub(crate) fn blocker_plane_source(
 fn ground_gate_is_open(
     occupancy: &OccupancyGrid,
     entities: &EntityStore,
-    rules: Option<&crate::rules::ruleset::RuleSet>,
+    rules: &crate::rules::ruleset::RuleSet,
     interner: &crate::sim::intern::StringInterner,
     cell: (u16, u16),
 ) -> bool {
@@ -171,8 +198,8 @@ fn ground_gate_is_open(
         .first_building_on_layer(cell.0, cell.1, MovementLayer::Ground)
         .and_then(|id| entities.get(id))
         .is_some_and(|building| {
-            rules
-                .and_then(|rules| interner.object_type(building.type_ref(), rules))
+            interner
+                .object_type(building.type_ref(), rules)
                 .is_some_and(|object| object.gate)
                 && building.is_open_gate()
         })
@@ -186,7 +213,7 @@ pub(crate) enum GroundGate<'a> {
     Live {
         occupancy: &'a OccupancyGrid,
         entities: &'a EntityStore,
-        rules: Option<&'a crate::rules::ruleset::RuleSet>,
+        rules: &'a crate::rules::ruleset::RuleSet,
         interner: &'a crate::sim::intern::StringInterner,
     },
     /// The answer an original-executable replay recorded.
@@ -290,7 +317,7 @@ pub(crate) fn pick_infantry_sublocation(
     raw: &crate::sim::occupancy::RawCellOccupationGrid,
     occupancy: &OccupancyGrid,
     entities: &EntityStore,
-    rules: Option<&crate::rules::ruleset::RuleSet>,
+    rules: &crate::rules::ruleset::RuleSet,
     interner: &crate::sim::intern::StringInterner,
     rng: &mut SimRng,
     coords: DriveCoord,
@@ -339,12 +366,15 @@ impl crate::sim::world::Simulation {
     /// ParasiteClass::GetReleaseCoords (`0x0062ADE9`), SpawnSurvivors
     /// (`0x00443182`) and Mission_Selling's crew (`0x0044A6ED`) ask it so.
     pub(crate) fn place_infantry_in_ground_cell(
-        &mut self,
+        interner: &StringInterner,
+        scenario_rng: &mut SimRng,
+        substrate: &ObjectSubstrate,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
         rules: &crate::rules::ruleset::RuleSet,
         point: DriveCoord,
     ) -> Option<u8> {
         use crate::sim::occupancy::RawCellKey;
-        let key = match self.resolved_terrain.as_ref() {
+        let key = match resolved_terrain.as_ref() {
             Some(terrain) => RawCellKey::from_native(
                 terrain,
                 crate::map::resolved_terrain::NativeCellQuery::canonical(terrain)
@@ -352,7 +382,7 @@ impl crate::sim::world::Simulation {
             ),
             None => RawCellKey::Real((point.x / 256) as u16, (point.y / 256) as u16),
         };
-        self.place_infantry_in_ground_key(rules, key, point)
+        Self::place_infantry_in_ground_key(interner, scenario_rng, substrate, rules, key, point)
     }
 
     /// PlaceInfantryInCell with useCellCoords (`0x00481212`) on `cell`, the
@@ -362,21 +392,30 @@ impl crate::sim::world::Simulation {
     /// spot's offset, and its Z the ground at `request` (`0x00578080` at
     /// `0x0048146E`). `None` is the empty coordinate.
     pub(crate) fn place_infantry_spot_in_cell(
-        &mut self,
+        interner: &StringInterner,
+        scenario_rng: &mut SimRng,
+        substrate: &ObjectSubstrate,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
         rules: &crate::rules::ruleset::RuleSet,
         cell: crate::map::cell_index::NativeCellIdentity,
         request: DriveCoord,
     ) -> Result<Option<DriveCoord>, String> {
-        let terrain = self
-            .resolved_terrain
+        let terrain = resolved_terrain
             .as_ref()
             .ok_or("PlaceInfantryInCell requires map cells")?;
         let key = crate::sim::occupancy::RawCellKey::from_native(terrain, cell);
-        let Some(slot) = self.place_infantry_in_ground_key(rules, key, request) else {
+        let Some(slot) = Self::place_infantry_in_ground_key(
+            interner,
+            scenario_rng,
+            substrate,
+            rules,
+            key,
+            request,
+        ) else {
             return Ok(None);
         };
         let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(
-            self.resolved_terrain.as_ref().unwrap(),
+            resolved_terrain.as_ref().unwrap(),
         );
         let [x, y] = cell_kernel::native_cell_own_xy(cell, &cells);
         let z = super::ground_pose::query_ground_height(&cells, request)?;
@@ -391,24 +430,26 @@ impl crate::sim::world::Simulation {
     /// [`place_infantry_in_native_cell`] on `key`'s ground plane without
     /// priority, with the live ground Gate.
     pub(crate) fn place_infantry_in_ground_key(
-        &mut self,
+        world_interner: &StringInterner,
+        scenario_rng: &mut SimRng,
+        substrate: &ObjectSubstrate,
         rules: &crate::rules::ruleset::RuleSet,
         key: crate::sim::occupancy::RawCellKey,
         request: DriveCoord,
     ) -> Option<u8> {
         place_infantry_in_native_cell(
-            &self.substrate.raw_cell_occupation,
+            &substrate.raw_cell_occupation,
             key,
             MovementLayer::Ground,
             request,
             false,
             GroundGate::Live {
-                occupancy: &self.substrate.occupancy,
-                entities: &self.substrate.entities,
-                rules: Some(rules),
-                interner: &self.interner,
+                occupancy: &substrate.occupancy,
+                entities: &substrate.entities,
+                rules,
+                interner: world_interner,
             },
-            &mut self.scenario_rng,
+            scenario_rng,
         )
     }
 }
@@ -516,10 +557,10 @@ impl CrushTarget {
 /// `UnitClass::Death_Explosion` with its Scenario picks and anims, then the
 /// same release), `Record_The_Kill` (score, trigger events, EVA and the
 /// crusher's veterancy, which this engine now pays), then unmark, limbo and
-/// `UnInit`; no smudge. A crushed vehicle's `Death_Explosion` is not run
-/// here (residual in `combat/destruction_effects.rs`).
+/// `UnInit`; no smudge. `Simulation::per_cell_process` runs them in that
+/// order, the captive release included.
 ///
-/// RESIDUAL (GSI-08.17) — two real gaps sit underneath it.
+/// GSI-08.17 named two more gaps underneath it.
 /// - **Overlay crushing — CLOSED.** `Per_Cell_Process @ 0x0073AFD4` flattens any
 ///   overlay whose `ObjectTypeClass::Crushable=` (`+0x22D`) is set, and a
 ///   `MovementZone=CrusherAll` type (stock: the Battle Fortress alone) also
@@ -529,8 +570,9 @@ impl CrushTarget {
 ///   This block previously described the rule correctly while listing it as
 ///   open, and the gate it describes was for a while implemented as a Drive
 ///   locomotor test instead.
-/// - **Mind-control release.** A crushed controller does not free its captives
-///   here, so their ownership stays with a dead object.
+/// - **Mind-control release — CLOSED.** A crushed controller frees its
+///   captives inside vt+0x170, before Record_The_Kill
+///   (`Simulation::free_all_captures` in `per_cell_process`).
 pub fn can_crush(
     capability: CrushCapability,
     target: CrushTarget,
@@ -580,49 +622,30 @@ fn deploy_crush_immune(entity: &GameEntity) -> bool {
     entity.native_crush_immunity() != 0
 }
 
-/// Emit the normal crush-path `EntityCrushed` (CrushSound) event for a single
-/// victim. Native crush teardown does not also enter the ordinary DieSound
-/// path. The event is skipped when CrushSound is absent. Caller must invoke BEFORE
-/// removing the victim from the EntityStore so victim.position and
-/// victim.type_ref are still valid.
-#[cfg(any(test, feature = "test-support"))]
-pub fn emit_crush_kill_sounds(
+/// Emit the crush-path `EntityCrushed` (CrushSound) event for a victim at the
+/// crusher's Location (`0x007418AA..0x007418DC`, `0x0054CCDE..0x0054CD14`);
+/// native crush teardown does not also enter the ordinary DieSound path.
+/// Skipped when CrushSound is absent. Call before removing the victim from
+/// the EntityStore, while its type is still readable.
+pub(crate) fn emit_crush_kill_sounds_at(
     victim: &crate::sim::game_entity::GameEntity,
+    crusher_location: DriveCoord,
     rules: &crate::rules::ruleset::RuleSet,
     interner: &mut crate::sim::intern::StringInterner,
-    sound_events: &mut Vec<crate::sim::world::SimSoundEvent>,
+    sound_events: &mut crate::sim::world::FrameChannel<crate::sim::world::SimSoundEvent>,
 ) {
-    emit_crush_kill_sounds_at(
-        victim,
-        (
-            i32::from(victim.position.rx()),
-            i32::from(victim.position.ry()),
-        ),
-        rules,
-        interner,
-        sound_events,
-    );
-}
-
-pub fn emit_crush_kill_sounds_at(
-    victim: &crate::sim::game_entity::GameEntity,
-    crush_coord: (i32, i32),
-    rules: &crate::rules::ruleset::RuleSet,
-    interner: &mut crate::sim::intern::StringInterner,
-    sound_events: &mut Vec<crate::sim::world::SimSoundEvent>,
-) {
-    let rx = crush_coord.0.clamp(0, i32::from(u16::MAX)) as u16;
-    let ry = crush_coord.1.clamp(0, i32::from(u16::MAX)) as u16;
-    let type_str = interner.resolve(victim.type_ref()).to_string();
-    let Some(obj) = rules.object(&type_str) else {
+    // Unit7418CE/7418D4 and Jumpjet54CD06/54CD0C read the victim's
+    // concrete Type+1F0, even when another class registers the same ID.
+    let Some(obj) =
+        interner.object_type_in_category(victim.type_ref(), victim.category().into(), rules)
+    else {
         return;
     };
     if let Some(ref crush_sound) = obj.crush_sound {
         let id = interner.intern(crush_sound);
-        sound_events.push(crate::sim::world::SimSoundEvent::EntityCrushed {
+        sound_events.emit(crate::sim::world::SimSoundEvent::EntityCrushed {
             crush_sound_id: id,
-            rx,
-            ry,
+            world: crusher_location.into(),
         });
     }
 }
@@ -637,7 +660,7 @@ pub fn select_crush_victims(
     occ: &[u64],
     entities: &EntityStore,
     crusher_id: u64,
-    alliances: &crate::map::houses::HouseAllianceMap,
+    alliances: &crate::sim::house_diplomacy::HouseAlliances,
     interner: &crate::sim::intern::StringInterner,
     crusher_coord: (i32, i32),
     capability: CrushCapability,
@@ -672,6 +695,9 @@ pub fn select_crush_victims(
                             )
                         },
                     )
+                    // UnitCrush741811..741819 skips Object+8D only here;
+                    // the falling occupant remains crushable for cell entry.
+                    && !victim.is_falling_down()
             })
         })
         .collect()

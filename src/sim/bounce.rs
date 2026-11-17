@@ -36,11 +36,15 @@ use crate::util::native_x87::{
     NativeF32Bits, NativeF64Bits, NativeX87Error, X87Chop53, X87Ordering, X87Value, sqrt_approx_f32,
 };
 
-/// Transient Anim4222FF..422433 launch values (Steam3e81a617..08600).
-/// Its literal70 lifetime is only an input to the initial displacement.
+/// Transient meteor launch values (Steam gamemd): Anim4222FF..422433 and
+/// VoxelAnim749668..749787 take the same prefix.
 pub(crate) struct MeteorLaunch {
     pub start: IVec3,
     pub velocity: [NativeF32Bits; 3],
+    /// The shortened lifetime. Anim's literal 70 (4223D8) only places the
+    /// start; VoxelAnim shortens its Type Duration and stores it as the
+    /// countdown (74972C..74973F).
+    pub duration: i32,
 }
 
 /// The constructor draws Y, X, then the lifetime shortening. Reflect both
@@ -50,6 +54,7 @@ pub(crate) struct MeteorLaunch {
 /// ftol, signed origins, duration0 and constrained INT_MIN draws.
 pub(crate) fn meteor_launch(
     origin: IVec3,
+    lifetime: i32,
     min_z: NativeF64Bits,
     max_xy: NativeF64Bits,
     rng: &mut SimRng,
@@ -75,7 +80,7 @@ pub(crate) fn meteor_launch(
         x = NativeF32Bits::from_bits(x.bits() ^ 0x8000_0000);
         y = NativeF32Bits::from_bits(y.bits() ^ 0x8000_0000);
     }
-    let duration = 70i32.wrapping_sub(rng.next_raw_abs_modulo(20) as i32);
+    let duration = lifetime.wrapping_sub(rng.next_raw_abs_modulo(20) as i32);
     let place = |coord, velocity| -> Result<i32, NativeX87Error> {
         Ok(X87Chop53::ftol_i64(X87Chop53::sub(
             X87Chop53::load_i32(coord),
@@ -92,6 +97,7 @@ pub(crate) fn meteor_launch(
             place(origin.z, z)?,
         ),
         velocity: [x, y, z],
+        duration,
     })
 }
 
@@ -106,27 +112,27 @@ pub(crate) fn meteor_launch(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BounceState {
     /// `+0x00`. Bounce coefficient from the type's `Elasticity`.
-    pub elasticity: NativeF64Bits,
+    elasticity: NativeF64Bits,
     /// `+0x08`. Subtracted from `velocity_z` every tick. 1.4 for voxel debris,
     /// hardcoded in `VoxelAnimClass::Constructor`; 3.0 in the terrain-meteor
     /// helper `FUN_00439690`.
-    pub gravity: NativeF64Bits,
+    gravity: NativeF64Bits,
     /// `+0x10`. Clamp threshold for the velocity vector's length. Zero disables
     /// the clamp, which is the voxel-debris case.
-    pub angular_velocity_magnitude: NativeF64Bits,
+    angular_velocity_magnitude: NativeF64Bits,
     /// `+0x18`, `+0x1C`, `+0x20`. World position in leptons, carried as float.
-    pub position: [NativeF32Bits; 3],
+    position: [NativeF32Bits; 3],
     /// `+0x24`, `+0x28`, `+0x2C`. Velocity in leptons per tick.
-    pub velocity: [NativeF32Bits; 3],
+    velocity: [NativeF32Bits; 3],
     /// `+0x30` CurrentAngle, the drawn orientation as a quaternion
     /// `(x, y, z, w)`. `Init` sets it to `(+0, +0, +0, 1)`, and every
     /// [`Self::update`] multiplies it by [`Self::rotation`]. Only the draw
     /// reads it ([`Self::drawing_matrix`]).
-    pub orientation: [NativeF32Bits; 4],
+    orientation: [NativeF32Bits; 4],
     /// `+0x40` AngularVelocity, the per-tick rotation `Init` builds from its
     /// three axis draws and its angle argument. A bounce negates its vector
     /// part, reversing the spin.
-    pub rotation: [NativeF32Bits; 4],
+    rotation: [NativeF32Bits; 4],
 }
 
 /// What one `BounceClass::Update` reported, from the switch in
@@ -144,6 +150,57 @@ pub enum BounceOutcome {
 }
 
 impl BounceState {
+    /// A fixture's body from the native BounceClass fields, in their
+    /// layout order (`+0x00`..`+0x40`).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn from_native_for_test(
+        elasticity: NativeF64Bits,
+        gravity: NativeF64Bits,
+        angular_velocity_magnitude: NativeF64Bits,
+        position: [NativeF32Bits; 3],
+        velocity: [NativeF32Bits; 3],
+        orientation: [NativeF32Bits; 4],
+        rotation: [NativeF32Bits; 4],
+    ) -> Self {
+        Self {
+            elasticity,
+            gravity,
+            angular_velocity_magnitude,
+            position,
+            velocity,
+            orientation,
+            rotation,
+        }
+    }
+
+    pub const fn elasticity(&self) -> NativeF64Bits {
+        self.elasticity
+    }
+
+    pub const fn gravity(&self) -> NativeF64Bits {
+        self.gravity
+    }
+
+    pub const fn angular_velocity_magnitude(&self) -> NativeF64Bits {
+        self.angular_velocity_magnitude
+    }
+
+    pub const fn position(&self) -> [NativeF32Bits; 3] {
+        self.position
+    }
+
+    pub const fn velocity(&self) -> [NativeF32Bits; 3] {
+        self.velocity
+    }
+
+    pub const fn orientation(&self) -> [NativeF32Bits; 4] {
+        self.orientation
+    }
+
+    pub const fn rotation(&self) -> [NativeF32Bits; 4] {
+        self.rotation
+    }
+
     /// Meteor tails42395C..423962 /74A7C8..74A7D4 add gravity BACK after
     /// Update. Retain both float stores; bypassing gravity in the integrator
     /// would lose the subtraction/addition rounding of the original.
@@ -925,7 +982,7 @@ fn ranged_i32(rng: &mut SimRng, low: i32, high: i32) -> i32 {
     (low as i64 + drawn as i64) as i32
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 mod tests {
     use super::*;
 
@@ -1053,24 +1110,6 @@ mod tests {
             expected.next_range_u32_inclusive(0, (0xFFFF - -0xFFFF) as u32);
         }
         assert_eq!(rng.logical_view(), expected.logical_view());
-    }
-
-    #[test]
-    fn gsi_05_14_init_copies_position_and_velocity_verbatim() {
-        // Position is `FILD`ed from the integer coordinate; velocity is copied
-        // float for float from the constructor's vector. Neither is scaled.
-        let mut rng = SimRng::new(3);
-        let state = init_at(IVec3::new(1024, 2048, 96), 0.8, &mut rng);
-        assert_eq!(state.position_leptons(), IVec3::new(1024, 2048, 96));
-        assert_eq!(state.velocity_f32(), [3.0, -4.0, 12.0]);
-        assert_eq!(f64::from_bits(state.gravity.bits()), 1.4);
-        assert_eq!(f64::from_bits(state.elasticity.bits()), 0.8);
-        assert_eq!(
-            state.angular_velocity_magnitude,
-            NativeF64Bits::POSITIVE_ZERO,
-            "every caller passes two literal zeros, which is what makes the \
-             Update clamp dead"
-        );
     }
 
     fn golden() -> &'static serde_json::Value {

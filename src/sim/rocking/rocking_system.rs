@@ -15,13 +15,12 @@ const PI10: NativeF32Bits = NativeF32Bits::from_bits(0x3ea0_d97c);
 const BASE: NativeF32Bits = NativeF32Bits::from_bits(0x3b03_126f); //7F4E70
 
 /// Pure caller inputs, not competing per-entity state. Production has no
-/// DirectRocker-link or building-crush writer yet; native controls supply
-/// those branches explicitly through this same numerical owner.
+/// DirectRocker-link writer yet; native controls supply that branch.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RockingUpdateInputs {
     pub direct_rocker_linked: bool,
     pub is_foot: bool,
-    pub crushing_building: bool,
+    pub crush_slowdown: bool,
     pub sinking: bool,
     pub crashing: bool,
     pub balloon_hover: bool,
@@ -128,7 +127,7 @@ pub(crate) fn advance_state(state: &mut RockingState, inputs: RockingUpdateInput
         inputs.direct_rocker_linked,
         inputs.fallback,
     );
-    let cap = if inputs.is_foot && inputs.crushing_building {
+    let cap = if inputs.is_foot && inputs.crush_slowdown {
         PI10
     } else {
         PI4
@@ -163,6 +162,18 @@ pub(crate) fn advance_crash_spin(state: &mut RockingState, balloon_hover: bool) 
     }
 }
 
+/// Whether [`update`] can change `entity`: it sinks, or it holds a rocking
+/// state that crashes or is not at rest. A state at rest
+/// ([`RockingState::at_rest`]) comes out of an ordinary visit as it went in,
+/// with no damage request.
+pub(crate) fn updates(entity: &GameEntity) -> bool {
+    entity.sinking.is_active()
+        || entity
+            .rocking
+            .as_ref()
+            .is_some_and(|state| entity.crash.is_crashing() || !state.at_rest())
+}
+
 /// The host runs this once at Techno6FA236, before the Foot parasite tail.
 /// A true result requests the existing actual C4 receiver after this borrow.
 pub(crate) fn update(
@@ -175,7 +186,7 @@ pub(crate) fn update(
     //70B5AE's sinking branch writes forwards from that zero state; sparse
     // Rust storage must materialize it on this first native producer.
     if entity.sinking.is_active() {
-        entity.rocking.get_or_insert_with(RockingState::default);
+        entity.rocking_mut();
     }
     let inputs = RockingUpdateInputs {
         direct_rocker_linked: false,
@@ -183,7 +194,7 @@ pub(crate) fn update(
             entity.category(),
             EntityCategory::Unit | EntityCategory::Infantry | EntityCategory::Aircraft
         ),
-        crushing_building: false,
+        crush_slowdown: entity.foot_speed.crush_slowdown(),
         sinking: entity.sinking.is_active(),
         crashing: entity.crash.is_crashing(),
         balloon_hover: object_type.balloon_hover,

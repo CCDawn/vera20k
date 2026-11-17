@@ -53,7 +53,11 @@ impl Simulation {
             let replay = entity.building_art.anim_effect_replay[usize::from(slot)];
             if flags.powered {
                 if let Some(anim) = anim.and_then(|anim| self.substrate.anims.get_mut(anim)) {
-                    anim.runtime.paused = !restoring;
+                    if restoring {
+                        anim.resume();
+                    } else {
+                        anim.pause();
+                    }
                 }
             } else if flags.powered_light {
                 if restoring {
@@ -97,6 +101,26 @@ impl Simulation {
         }
     }
 
+    /// The building anim power policy's `Powered=` test (`0x004467D0`,
+    /// `0x00451A54`, `0x00454BF7`). Ares 3.0 BuildingClass_Place_NeedsEngineer
+    /// 100143C0 (hook `0x004467D6`), _PlayAnim_NeedsEngineer 10014400
+    /// (`0x00451A54`) and _UpdatePowered_NeedsEngineer 100145F0
+    /// (`0x00454BF7`) also count a `NeedsEngineer=` building no engineer has
+    /// entered (`+0x6CC`).
+    pub(crate) fn anim_power_policy(
+        object: &crate::rules::object_type::ObjectType,
+        entity: &crate::sim::game_entity::GameEntity,
+        rules: &RuleSet,
+    ) -> bool {
+        if rules.ares_form()
+            && object.needs_engineer
+            && !entity.building.building_has_engineer.is_set()
+        {
+            return true;
+        }
+        object.powered
+    }
+
     ///4549B0 slot tail, after the gap publication. Ordinary low power and the
     ///PoweredSpecial House outage are distinct conditions in the original.
     pub(crate) fn update_building_anim_power(
@@ -111,7 +135,8 @@ impl Simulation {
         let Some(object) = self.interner.object_type(entity.type_ref(), rules) else {
             return;
         };
-        if object.powered && crate::sim::power_system::native_building_power_drain(object.power) > 0
+        if Self::anim_power_policy(object, entity, rules)
+            && crate::sim::power_system::native_building_power_drain(object.power) > 0
         {
             self.apply_building_anim_power(id, operational, rules);
         }
@@ -142,7 +167,7 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 mod tests {
     use super::*;
     use crate::rules::{art_data::ArtRegistry, ini_parser::IniFile};
@@ -185,7 +210,7 @@ mod tests {
         let ini = IniFile::from_str(&text);
         let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
             &IniFile::from_str(&format!(
-                "[BuildingTypes]\n0=B\n[B]\nStrength={strength}\n{extra}\n[Animations]\n0=N\n1=D\n"
+                "[BuildingTypes]\n0=B\n[B]\nStrength={strength}\nUpgrades=3\nTurretAnim=N\nTurretAnimDamaged=D\n{extra}\n[Animations]\n0=N\n1=D\n"
             )),
             &ini,
         )
@@ -200,7 +225,7 @@ mod tests {
 
     fn building(current: i32) -> (Simulation, u64) {
         let mut sim = Simulation::new();
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         let mut entity = GameEntity::test_default_of_category(
             id,
             "B",
@@ -299,7 +324,12 @@ mod tests {
                     .unwrap()
             });
             if let Some(old) = old {
-                sim.substrate.anims.get_mut(old).unwrap().runtime.paused = i.restoring;
+                sim.substrate
+                    .anims
+                    .get_mut(old)
+                    .unwrap()
+                    .runtime_mut_for_test()
+                    .paused = i.restoring;
             }
             let entity = sim.substrate.entities.get_mut(id).unwrap();
             entity.building_art.actually_placed = i.placed;
@@ -336,7 +366,7 @@ mod tests {
                 );
                 if let Some(anim) = sim.anim(old) {
                     assert_eq!(
-                        u8::from(anim.runtime.paused),
+                        u8::from(anim.runtime().paused),
                         row.output.paused,
                         "pause row {index}"
                     );
@@ -349,8 +379,8 @@ mod tests {
                 .filter(|(anim, _)| Some(**anim) != old)
                 .map(|(_, anim)| {
                     (
-                        anim.building_slot.unwrap().1,
-                        sim.interner.resolve(anim.type_id).to_string(),
+                        anim.building_slot().unwrap().1,
+                        sim.interner.resolve(anim.type_id()).to_string(),
                     )
                 })
                 .collect();
@@ -368,6 +398,25 @@ mod tests {
         }
     }
 
+    /// Ares 100143C0 (hook 0x4467D6): an unpowered-type `NeedsEngineer=`
+    /// building opens with its powered anims paused until an engineer
+    /// enters; stock leaves them running.
+    #[test]
+    fn needs_engineer_opening_pauses_until_engineered() {
+        let rules = rules(100, "NeedsEngineer=yes");
+        let (mut sim, id) = building(100);
+        sim.grand_opening(
+            id,
+            false,
+            true,
+            &rules,
+            None,
+            crate::sim::world::FrameEffects::default(),
+        );
+        let anim = sim.entities().get(id).unwrap().building_art.anim_slots[3].unwrap();
+        assert_eq!(sim.anim(anim).unwrap().runtime().paused, rules.ares_form());
+    }
+
     #[test]
     fn operational_edge_pauses_real_animation_without_stopping_its_timer() {
         let rules = rules(100, "Powered=yes\nPower=-10");
@@ -383,7 +432,7 @@ mod tests {
         );
         let anim = sim.entities().get(id).unwrap().building_art.anim_slots[3].unwrap();
         assert!(
-            sim.anim(anim).unwrap().runtime.paused,
+            sim.anim(anim).unwrap().runtime().paused,
             "4467D0 initial pause"
         );
         sim.visit_building_operational(
@@ -392,21 +441,25 @@ mod tests {
             None,
             crate::sim::world::FrameEffects::default(),
         );
-        assert!(!sim.anim(anim).unwrap().runtime.paused);
+        assert!(!sim.anim(anim).unwrap().runtime().paused);
         sim.substrate
             .anims
             .get_mut(anim)
             .unwrap()
-            .runtime
+            .runtime_mut_for_test()
             .first_ai_guard = false;
         sim.substrate
             .anims
             .get_mut(anim)
             .unwrap()
-            .runtime
+            .runtime_mut_for_test()
             .frame_timer = CdTimer::started(0, 3);
-        sim.power_states.entry(owner).or_default().total_drain = 100;
-        sim.session.binary_frame = 20;
+        sim.power_states
+            .map_mut_for_test()
+            .entry(owner)
+            .or_default()
+            .set_total_drain_for_test(100);
+        sim.session.set_binary_frame_for_test(20);
         sim.visit_building_operational(
             id,
             &rules,
@@ -418,27 +471,194 @@ mod tests {
             &rules,
             None,
             crate::sim::world::FrameEffects::default(),
-        );
-        assert_eq!(sim.anim(anim).unwrap().runtime.current_frame, 0);
-        assert_eq!(sim.anim(anim).unwrap().runtime.frame_timer.start_frame(), 0);
-        sim.power_states.get_mut(&owner).unwrap().total_output = 100;
-        sim.visit_building_operational(
-            id,
-            &rules,
-            None,
-            crate::sim::world::FrameEffects::default(),
-        );
-        sim.visit_anim(
-            anim,
-            &rules,
-            None,
-            crate::sim::world::FrameEffects::default(),
-        );
-        assert_eq!(sim.anim(anim).unwrap().runtime.current_frame, 1);
+        )
+        .unwrap();
+        assert_eq!(sim.anim(anim).unwrap().runtime().current_frame, 0);
         assert_eq!(
-            sim.anim(anim).unwrap().runtime.frame_timer.start_frame(),
+            sim.anim(anim).unwrap().runtime().frame_timer.start_frame(),
+            0
+        );
+        sim.power_states
+            .get_mut(&owner)
+            .unwrap()
+            .set_total_output_for_test(100);
+        sim.visit_building_operational(
+            id,
+            &rules,
+            None,
+            crate::sim::world::FrameEffects::default(),
+        );
+        sim.visit_anim(
+            anim,
+            &rules,
+            None,
+            crate::sim::world::FrameEffects::default(),
+        )
+        .unwrap();
+        assert_eq!(sim.anim(anim).unwrap().runtime().current_frame, 1);
+        assert_eq!(
+            sim.anim(anim).unwrap().runtime().frame_timer.start_frame(),
             20
         );
+    }
+
+    /// Retail inputs and the normal House assessment / Building / Anim Logic
+    /// visits. Native 4555D0 + 4549B0 require Type.Powered and positive drain;
+    /// 4547C0 pauses each Powered slot, 4545D0 resumes it. GAAIRC/AMRADR omit
+    /// Powered (constructor 45E04B defaults false), unlike NARADR/NAPSIS.
+    #[test]
+    fn retail_building_animations_follow_house_power_loss_and_restore() {
+        fn settle(sim: &mut Simulation, rules: &RuleSet) {
+            for _ in 0..300 {
+                sim.advance_tick(&[], Some(rules), None, None, 67);
+            }
+        }
+        fn assert_motion(
+            sim: &mut Simulation,
+            rules: &RuleSet,
+            id: u64,
+            slots: &[usize],
+            paused: bool,
+            phase: &str,
+        ) {
+            let name = sim
+                .interner
+                .resolve(sim.entities().get(id).unwrap().type_ref())
+                .to_owned();
+            let anims: Vec<_> = slots
+                .iter()
+                .map(|&slot| {
+                    let anim = sim.entities().get(id).unwrap().building_art.anim_slots[slot]
+                        .unwrap_or_else(|| panic!("{name} slot {slot} missing: {phase}"));
+                    let runtime = sim.anim(anim).unwrap().runtime();
+                    assert_eq!(runtime.paused, paused, "{name} slot {slot}: {phase}");
+                    (slot, anim, runtime.current_frame, false)
+                })
+                .collect();
+            let mut anims = anims;
+            for _ in 0..96 {
+                sim.advance_tick(&[], Some(rules), None, None, 67);
+                for (_, anim, held, advanced) in &mut anims {
+                    *advanced |= sim.anim(*anim).unwrap().runtime().current_frame != *held;
+                }
+            }
+            for (slot, _, _, advanced) in anims {
+                assert_eq!(advanced, !paused, "{name} slot {slot} frames: {phase}");
+            }
+        }
+        let Some(mut battle) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let theater = crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
+        let mut roots =
+            crate::rules::effect_asset_catalog::tolerant_anim_class_roots(&battle.rules);
+        roots.extend(
+            battle
+                .rules
+                .general
+                .damage_fire_types
+                .iter()
+                .map(|anim| anim.name.clone()),
+        );
+        battle
+            .rules
+            .bind_anim_class_assets(&roots, &assets, theater.extension, "TEMPERATE");
+        battle
+            .rules
+            .bind_effect_assets(&assets, theater.extension, "TEMPERATE");
+        let rules = battle.rules;
+        for (name, powered, slots) in [
+            ("NARADR", true, &[3][..]),
+            ("NAPSIS", true, &[3][..]),
+            ("GASPYSAT", true, &[3][..]),
+            ("NAINDP", true, &[18][..]),
+            ("GAROBO", true, &[3][..]),
+            ("GAAIRC", false, &[3, 4, 5][..]),
+            ("AMRADR", false, &[3, 4, 5][..]),
+        ] {
+            assert_eq!(rules.object(name).unwrap().powered, powered, "{name}");
+            let mut sim = Simulation::new();
+            sim.session
+                .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+            sim.install_resolved_terrain_for_new_map(
+                crate::map::resolved_terrain::test_flat_ground_grid(32),
+            );
+            crate::sim::arena_fixture::supply_native_map(&mut sim);
+            let owner = sim.interner.intern("Americans");
+            sim.houses
+                .register(crate::sim::house_state::HouseState::new(
+                    owner, 0, None, true, 10_000, 10,
+                ));
+            sim.intern_rule_type_ids(&rules);
+            sim.resolve_type_handles(&rules);
+            sim.resolve_rule_animation_lists(&rules);
+            let plant = sim
+                .spawn_object("NANRCT", "Americans", 4, 4, 0, &rules)
+                .unwrap();
+            let id = sim
+                .spawn_object(name, "Americans", 16, 16, 0, &rules)
+                .unwrap();
+            settle(&mut sim, &rules);
+            assert!(
+                sim.power_states[&owner].has_full_power(),
+                "{name} initial power"
+            );
+            assert_motion(&mut sim, &rules, id, slots, false, "initial power");
+
+            sim.uninit_with_rules(plant, &rules);
+            settle(&mut sim, &rules);
+            assert!(
+                !sim.power_states[&owner].has_full_power(),
+                "{name} lost power"
+            );
+            assert_motion(&mut sim, &rules, id, slots, powered, "lost power");
+
+            // Replacing a normal slot with its damaged variant must retain the
+            // constructor's operational gate (451A36..451A6B), even though the
+            // building's last operational sample does not change.
+            sim.substrate
+                .entities
+                .get_mut(id)
+                .unwrap()
+                .health
+                .set_for_test(rules.object(name).unwrap().strength / 4);
+            sim.refresh_building_damage_state(id, &rules);
+            assert_motion(
+                &mut sim,
+                &rules,
+                id,
+                slots,
+                powered,
+                "damaged during outage",
+            );
+
+            sim.spawn_object("NANRCT", "Americans", 4, 4, 0, &rules)
+                .unwrap();
+            settle(&mut sim, &rules);
+            assert!(
+                sim.power_states[&owner].has_full_power(),
+                "{name} restored power"
+            );
+            assert_motion(&mut sim, &rules, id, slots, false, "restored power");
+            sim.substrate
+                .entities
+                .get_mut(id)
+                .unwrap()
+                .health
+                .set_for_test(rules.object(name).unwrap().strength);
+            sim.refresh_building_damage_state(id, &rules);
+            assert_motion(
+                &mut sim,
+                &rules,
+                id,
+                slots,
+                false,
+                "repaired after restoration",
+            );
+        }
     }
 
     #[test]
@@ -486,19 +706,29 @@ mod tests {
             let old10 = sim
                 .set_building_anim_slot(id, 10, damaged, false, 0, &rules)
                 .unwrap();
-            sim.substrate.anims.get_mut(old3).unwrap().runtime.paused = false;
+            sim.substrate
+                .anims
+                .get_mut(old3)
+                .unwrap()
+                .runtime_mut_for_test()
+                .paused = false;
             let entity = sim.substrate.entities.get_mut(id).unwrap();
             entity.building_art.actually_placed = true;
             entity
+                .building
                 .building_last_operational
                 .set_for_test(i["old"].as_bool().unwrap());
             let owner = entity.owner();
-            let state = sim.power_states.entry(owner).or_default();
-            state.total_output = i["output"].as_i64().unwrap() as i32;
-            state.total_drain = 100;
-            state.is_low_power = state.total_output < 100;
+            let state = sim
+                .power_states
+                .map_mut_for_test()
+                .entry(owner)
+                .or_default();
+            state.set_total_output_for_test(i["output"].as_i64().unwrap() as i32);
+            state.set_total_drain_for_test(100);
+            state.set_is_low_power_for_test(state.total_output() < 100);
             state.start_blackout(
-                sim.session.binary_frame,
+                sim.session.binary_frame(),
                 i["outage"].as_u64().unwrap() as i32,
             );
             sim.visit_building_operational(
@@ -509,12 +739,12 @@ mod tests {
             );
             let entity = sim.entities().get(id).unwrap();
             assert_eq!(
-                entity.building_last_operational.is_operational(),
+                entity.building.building_last_operational.is_operational(),
                 o["operational"].as_bool().unwrap(),
                 "sample row {index}"
             );
             assert_eq!(
-                sim.anim(old3).unwrap().runtime.paused,
+                sim.anim(old3).unwrap().runtime().paused,
                 o["paused"].as_bool().unwrap(),
                 "pause row {index}"
             );
@@ -536,8 +766,8 @@ mod tests {
                 .filter(|(anim, _)| **anim != old3 && **anim != old10)
                 .map(|(_, anim)| {
                     (
-                        anim.building_slot.unwrap().1,
-                        sim.interner.resolve(anim.type_id).to_string(),
+                        anim.building_slot().unwrap().1,
+                        sim.interner.resolve(anim.type_id()).to_string(),
                     )
                 })
                 .collect();

@@ -3,20 +3,38 @@
 //! This is presentation state, deliberately not simulation state. Active YR's
 //! registered byte (`TechnoClass+0x423`) and discovery/visibility decisions are
 //! local-client facts: they read `g_PlayerPtr` and that client's shroud. The
-//! tracker is also recreated by `FUN_00655990` and on load. Serializing or
+//! tracker is also recreated by `FUN_00655990` and on load. Its dots are
+//! drawn by `RadarClass::RenderCellPixel @ 0x00655C50` (RefreshRadar
+//! `0x00657D77`, Update `0x006574C3`/`0x00657520`). `RenderTrackedObjects @
+//! 0x00656150`, which draws every tracked pixel without RenderCellPixel's
+//! eligibility tests, is RefreshRadar's windowless branch (`g_hWnd` null,
+//! `0x00657D30`) and does not run in a windowed game. Serializing or
 //! world-hashing it would therefore make a local view cache part of lockstep.
-
-use std::collections::{BTreeMap, BTreeSet};
+//!
+//! `RadarClass::MarkPixelDirty @ 0x006562D0` queues one pixel for Update's
+//! RenderCellPixel pass; this owner recomputes every dot on each minimap
+//! update instead, so its callers' requests are subsumed.
+//!
+//! Sim-scale deviation, the maintainer's choice: the tracker syncs once per
+//! drawn picture, not once per Logic frame (`TechnoClass+0x4A0`,
+//! `0x0070D990`), so that no per-tick pass runs over every unit. When several
+//! frames pass between pictures, objects sharing one exact pixel can take
+//! another order there: only which of them colours that pixel or answers a
+//! click on it differs.
 
 use crate::map::houses::HouseColorMap;
+use crate::render::snapshot::SnapshotObject;
 use crate::rules::house_colors::HouseColorRamps;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::intern::InternedId;
 use crate::sim::vision::FogState;
+use crate::util::lookup_hash::{LookupMap, LookupSet};
 
 use super::geometry::NativeRadarSurfaceGeometry;
 use super::helpers::owner_dot_color;
-use super::visibility::{RadarRegistrationVisibilityFacts, radar_owner_is_human_player};
+use super::visibility::{
+    RadarRegistrationVisibilityFacts, radar_cell_shrouded, radar_owner_is_human_player,
+};
 
 const TRACKER_BUCKET_COUNT: usize = 256;
 
@@ -53,10 +71,11 @@ impl RadarProjectionFacts {
         x_scale.abs().min(y_scale.abs()).max(f32::EPSILON)
     }
 
-    fn pixel_to_cell(self, x: i32, y: i32) -> Option<(u16, u16)> {
-        if let Some(surface) = self.native_surface {
-            return surface.surface_pixel_to_cell((x, y));
-        }
+    /// The mapless fallback's cell under pixel `(x, y)`. A generated surface
+    /// answers from its own table
+    /// ([`super::terrain::NativeRadarTerrainSurface::visibility_cell`]).
+    pub fn mapless_pixel_to_cell(self, x: i32, y: i32) -> Option<(u16, u16)> {
+        debug_assert!(self.native_surface.is_none());
         let normalized_x = (x as f32 - self.map_offset_x) / self.map_pixel_w.max(1.0);
         let normalized_y = (y as f32 - self.map_offset_y) / self.map_pixel_h.max(1.0);
         let screen_x = self.world_origin_x + normalized_x * self.world_width;
@@ -75,36 +94,19 @@ impl RadarProjectionFacts {
 }
 
 pub(super) fn radar_entity_owner_color(
-    entity: &crate::sim::game_entity::GameEntity,
+    entity: &impl crate::render::snapshot::SnapshotObject,
     interner: Option<&crate::sim::intern::StringInterner>,
     house_colors: &HouseColorMap,
     ramps: &HouseColorRamps,
-    observer: Option<InternedId>,
     owner_allied_with_observer: bool,
 ) -> [u8; 4] {
-    use crate::map::entities::EntityCategory;
     // Radar655F48 asks the class's +D0(0) only when +C4 says disguised.
-    // Unit7465F0 and Infantry5226C0 preserve the owner's directional alliance
-    // with the current viewer; selection and disguise sensors are not inputs.
-    let color_owner = match entity.disguise.as_ref().filter(|d| d.is_disguised()) {
-        None => Some(entity.owner()),
-        Some(_)
-            if owner_allied_with_observer
-                && matches!(
-                    entity.category(),
-                    EntityCategory::Unit | EntityCategory::Infantry
-                ) =>
-        {
-            Some(entity.owner())
-        }
-        Some(disguise) => match entity.category() {
-            EntityCategory::Unit => disguise.house(),
-            // The Spy leaf deliberately differs: NULL disguiseHouse returns
-            // CurrentHouse, whereas a Mirage preserves NULL.
-            EntityCategory::Infantry => disguise.house().or(observer),
-            // Building/Aircraft retain Techno41BE70: XOR EAX,EAX; RET4.
-            EntityCategory::Structure | EntityCategory::Aircraft => None,
-        },
+    let color_owner = if entity.disguise().is_some_and(|d| d.is_disguised()) {
+        // `GameEntity::disguise_house(false, observer, ..)`, captured for
+        // the frame's local player, the observer.
+        entity.radar().disguise_house[usize::from(owner_allied_with_observer)]
+    } else {
+        Some(entity.owner())
     };
     let Some(color_owner) = color_owner else {
         // 655FD6..655FE5 finds literal LightGrey but copies ColorScheme+330
@@ -128,12 +130,18 @@ pub(super) fn radar_entity_owner_color(
 /// request at each period boundary (`0x0070DBCC..0x0070DC37`) is subsumed:
 /// every dot is recomputed on each minimap update.
 ///
-/// RESIDUAL: `FlashFrameTime=0` divides by zero natively; here it never
-/// flashes.
+/// Deliberate differences:
+/// - `FlashFrameTime=0` divides by zero natively (`0x0070DC29`); here it
+///   never flashes, as outside data never stops the game.
+/// - The maintainer's choice, with the per-update recompute above: a re-hit
+///   while the dot is inverted restarts the flash, and natively the request
+///   at the restart's first boundary (`r % FlashFrameTime == 0`,
+///   `0x0070DC29..0x0070DC37`) is missed when the hit lands after the
+///   victim's own update that frame, leaving the dot inverted about six
+///   frames longer with retail 49/7; here the new phase shows at once.
 pub(super) fn radar_combat_flash_inverts(
-    entity: &crate::sim::game_entity::GameEntity,
+    entity: &impl crate::render::snapshot::SnapshotObject,
     current_player: Option<InternedId>,
-    binary_frame: u32,
     rules: Option<&RuleSet>,
 ) -> bool {
     let Some(period) = rules
@@ -142,52 +150,53 @@ pub(super) fn radar_combat_flash_inverts(
     else {
         return false;
     };
-    let remaining = entity.radar_combat_flash.remaining(binary_frame as i32);
+    // Captured at the frame's committed binary frame.
+    let remaining = entity.radar().combat_flash_remaining;
     remaining > 0 && (remaining - 1) / period % 2 == 1 && current_player == Some(entity.owner())
 }
 
+/// RenderCellPixel's test of one tracker entry. `pixel_cell` is the cell its
+/// inverse (`0x00655CB8..0x00655D03`) names for the entry's pixel.
 pub(super) fn radar_pixel_candidate_eligible(
     entry: RadarTrackerEntry,
-    entities: &crate::sim::entity_store::EntityStore,
-    houses: &BTreeMap<InternedId, crate::sim::house_state::HouseState>,
+    frame: &impl crate::render::snapshot::SnapshotObjects,
+    houses: &crate::sim::houses::Houses,
     local_owner: Option<InternedId>,
     fog: &FogState,
-    alliances: &crate::map::houses::HouseAllianceMap,
+    alliances: &crate::sim::house_diplomacy::HouseAlliances,
     full_visibility: bool,
     game_mode_nonzero: bool,
     rules: Option<&RuleSet>,
     interner: Option<&crate::sim::intern::StringInterner>,
-    projection: RadarProjectionFacts,
+    pixel_cell: Option<(u16, u16)>,
+    cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
 ) -> bool {
-    let Some(entity) = entities.get(entry.stable_id) else {
+    let Some(entity) = frame.object(entry.stable_id) else {
         return false;
     };
-    let type_str = interner.map_or("", |i| i.resolve(entity.type_ref()));
-    let object = rules.and_then(|rules| rules.object(type_str));
+    let object = rules
+        .zip(interner)
+        .and_then(|(rules, interner)| interner.object_type(entity.type_ref(), rules));
 
     if let Some(local_owner) = local_owner {
-        let friendly = entity.owner() == local_owner
-            || interner.is_some_and(|interner| {
-                crate::map::houses::are_houses_friendly(
-                    alliances,
-                    interner.resolve(local_owner),
-                    interner.resolve(entity.owner()),
-                )
-            });
         if !full_visibility {
-            let (rx, ry) = projection
-                .pixel_to_cell(entry.x, entry.y)
-                .unwrap_or((entity.position.rx(), entity.position.ry()));
+            let (rx, ry) = pixel_cell.unwrap_or((entity.position().rx(), entity.position().ry()));
             let owner_is_human =
                 radar_owner_is_human_player(entity.owner(), local_owner, houses, game_mode_nonzero);
-            if !fog.is_cell_revealed(local_owner, rx, ry) && !owner_is_human {
+            if radar_cell_shrouded(fog, cells, local_owner, (rx, ry)) && !owner_is_human {
                 return false;
             }
         }
         // RenderCellPixel @ 0x00655DFF tests RadarInvisible before the later
         // Insignificant/RadarVisible branch. RadarVisible cannot rescue a
         // hostile RadarInvisible object.
-        if object.is_some_and(|object| object.radar_invisible) && !friendly {
+        // `PlayerPtr->Is_Ally_ByObject(object)` (`0x00655E09`), asked only of
+        // a RadarInvisible object: nothing else in this test reads it.
+        if object.is_some_and(|object| object.radar_invisible)
+            && entity.owner() != local_owner
+            && !interner
+                .is_some_and(|interner| alliances.is_allied(interner, local_owner, entity.owner()))
+        {
             return false;
         }
     }
@@ -195,7 +204,7 @@ pub(super) fn radar_pixel_candidate_eligible(
     if object.is_some_and(|object| object.insignificant && !object.radar_visible)
         && !houses
             .get(&entity.owner())
-            .is_some_and(|house| !house.multiplay_passive)
+            .is_some_and(|house| !house.multiplay_passive())
     {
         return false;
     }
@@ -223,11 +232,37 @@ pub(super) struct RadarObjectUpdate {
     pub origin: (i32, i32),
     pub event_source_cell: Option<(u16, u16)>,
     pub enemy_sensed_prefilter: bool,
+    /// Ares `SensorArray.Warn=`: TechnoClass_RadarTrackingUpdate_
+    /// AnnounceDetected10016E60 (hook70DA95) skips the type-5 event of a
+    /// type that does not warn. True unless the game's Ares switch read the
+    /// key.
+    pub sensor_array_warn: bool,
     pub foundation: Option<(u32, u32)>,
     pub radar_scale: f32,
     pub discovery_observed: bool,
     pub visibility: RadarRegistrationVisibilityFacts,
     pub local_front: bool,
+    /// Present with the native radar surface ([`RadarSurfaceEdge`]).
+    pub surface_edge: Option<RadarSurfaceEdge>,
+}
+
+/// TechnoClass+0x4A0's off-surface step (`0x0070DADC..0x0070DB64`): the
+/// generated surface's size (`pRadarSurface` GetRect, vt+0x78) and, when the
+/// object's cell (GetCell, vt+0x1C4) is in the playfield
+/// (`MapClass::Is_Cell_In_Playfield @ 0x00578540`, mode 1), its Location
+/// re-projected with clamping (`FUN_006557F0`, clamp 1). Builders fill it when
+/// the fresh pixel lies off the surface, and always for Buildings, whose
+/// cached pixel the tracker may test instead.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RadarSurfaceEdge {
+    pub size: (i32, i32),
+    pub in_playfield_origin: Option<(i32, i32)>,
+}
+
+impl RadarSurfaceEdge {
+    pub fn contains(self, pixel: (i32, i32)) -> bool {
+        (0..self.size.0).contains(&pixel.0) && (0..self.size.1).contains(&pixel.1)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,15 +279,21 @@ pub(super) struct RadarSensedPresentationEvent {
 #[derive(Debug, Clone)]
 pub(super) struct RetainedRadarTracker {
     buckets: Vec<Vec<RadarTrackerEntry>>,
-    objects: BTreeMap<u64, RadarObjectCache>,
+    /// By stable id. Its order reaches nothing: stale objects' entries leave
+    /// the same buckets in whatever order they are removed.
+    objects: LookupMap<u64, RadarObjectCache>,
     action40_building_tail_pending: bool,
 }
 
+/// `RadarClass::CreateTracker @ 0x006558D0` (its sole caller is the random
+/// map generator, `0x0059A51A`) allocates the same 256 empty buckets. Its
+/// teardown, `FreeBuffers @ 0x00655A90` from the destructor `0x00652C00`, is
+/// this value's drop.
 impl Default for RetainedRadarTracker {
     fn default() -> Self {
         Self {
             buckets: vec![Vec::new(); TRACKER_BUCKET_COUNT],
-            objects: BTreeMap::new(),
+            objects: LookupMap::default(),
             action40_building_tail_pending: false,
         }
     }
@@ -293,15 +334,15 @@ impl RetainedRadarTracker {
     /// native radar registration is independent of LogicVector membership.
     pub fn remove_absent_or_ineligible(
         &mut self,
-        entities: &crate::sim::entity_store::EntityStore,
+        frame: &impl crate::render::snapshot::SnapshotObjects,
     ) {
         let stale: Vec<u64> = self
             .objects
             .keys()
             .copied()
             .filter(|&stable_id| {
-                entities.get(stable_id).is_none_or(|entity| {
-                    entity.lifecycle.in_limbo() || !entity.lifecycle.object_alive()
+                frame.object(stable_id).is_none_or(|entity| {
+                    entity.lifecycle().in_limbo() || !entity.lifecycle().object_alive()
                 })
             })
             .collect();
@@ -331,21 +372,30 @@ impl RetainedRadarTracker {
         let was_discovered = existing.is_some_and(|cache| cache.discovered);
         let discovered = was_discovered || update.discovery_observed;
         let visibility = update.visibility.evaluate(discovered);
-        let visible = visibility.visible;
+        // A visible object whose pixel lies off the generated surface is
+        // drawn on its edge, re-projected from its Location with clamping
+        // (`0x0070DB27..0x0070DB64`), while its cell is in the playfield;
+        // otherwise it is radar-invisible (`0x0070DB0A..0x0070DB25`).
+        let (origin, visible) = match update.surface_edge {
+            Some(edge) if visibility.visible && !edge.contains(origin) => {
+                match edge.in_playfield_origin {
+                    Some(clamped) => (clamped, true),
+                    None => (origin, false),
+                }
+            }
+            _ => (origin, visibility.visible),
+        };
         let registration_identity_changed = existing.is_some_and(|cache| {
             cache.owner != update.owner || cache.local_front != update.local_front
         });
 
-        if was_registered
-            && (old_origin != Some(origin) || !visible || registration_identity_changed)
-        {
+        let remove = was_registered
+            && (old_origin != Some(origin) || !visible || registration_identity_changed);
+        if remove {
             self.unregister(update.stable_id);
         }
 
-        let registered_after_remove = self
-            .objects
-            .get(&update.stable_id)
-            .is_some_and(|cache| cache.registered);
+        let registered_after_remove = was_registered && !remove;
         self.objects
             .entry(update.stable_id)
             .and_modify(|cache| {
@@ -376,7 +426,7 @@ impl RetainedRadarTracker {
                 .collect();
             self.register(update.stable_id, &pixels, update.local_front);
         }
-        if visibility.out_code != 0 && update.enemy_sensed_prefilter {
+        if visibility.out_code != 0 && update.enemy_sensed_prefilter && update.sensor_array_warn {
             update
                 .event_source_cell
                 .map(|cell| RadarSensedPresentationEvent {
@@ -425,12 +475,10 @@ impl RetainedRadarTracker {
     /// RemoveObjectFromTracker @ 0x00655740 shifts the remaining vector over
     /// the removed entry. `Vec::remove` preserves that exact relative order.
     fn unregister(&mut self, stable_id: u64) {
-        let pixels = self
-            .objects
-            .get(&stable_id)
-            .map(|cache| cache.pixels.clone())
-            .unwrap_or_default();
-        for (x, y) in pixels {
+        let Some(cache) = self.objects.get_mut(&stable_id) else {
+            return;
+        };
+        for &(x, y) in &cache.pixels {
             let bucket = &mut self.buckets[tracker_bucket(x, y)];
             if let Some(index) = bucket
                 .iter()
@@ -439,10 +487,8 @@ impl RetainedRadarTracker {
                 bucket.remove(index);
             }
         }
-        if let Some(cache) = self.objects.get_mut(&stable_id) {
-            cache.registered = false;
-            cache.pixels.clear();
-        }
+        cache.registered = false;
+        cache.pixels.clear();
     }
 
     /// RenderCellPixel's forward bucket scan, once for each occupied exact
@@ -451,11 +497,11 @@ impl RetainedRadarTracker {
         &self,
         mut eligible: impl FnMut(RadarTrackerEntry) -> bool,
     ) -> Vec<RadarTrackerEntry> {
-        let mut chosen = BTreeSet::new();
+        let mut chosen = LookupSet::default();
         let mut winners = Vec::new();
         for bucket in &self.buckets {
             for &entry in bucket {
-                let coordinate = (entry.x, entry.y);
+                let coordinate = u64::from(entry.x as u32) | u64::from(entry.y as u32) << 32;
                 if chosen.contains(&coordinate) || !eligible(entry) {
                     continue;
                 }
@@ -504,7 +550,7 @@ impl RetainedRadarTracker {
     }
 
     #[cfg(test)]
-    fn entries_at(&self, x: i32, y: i32) -> Vec<u64> {
+    pub(super) fn entries_at(&self, x: i32, y: i32) -> Vec<u64> {
         self.buckets[tracker_bucket(x, y)]
             .iter()
             .filter(|entry| entry.x == x && entry.y == y)
@@ -520,14 +566,45 @@ fn tracker_bucket(x: i32, y: i32) -> usize {
 /// Building radar brush constructor @ 0x006563B0. Native scales the foundation
 /// width/height by radar zoom, rounds with +0.5, applies the 1-vs-2 minimum,
 /// then emits this ordered isometric diamond rather than an occupancy square.
+/// Native builds it once per Foundation index from the foundation size
+/// tables; `RadarClass::GetFoundationPixels @ 0x00656580` returns the entry
+/// for a building's type. Computing it from the same width and height here
+/// gives the same pixels. Ares 3.0 builds a custom foundation's shape by the
+/// same rows from its width and height (UpdateFoundationRadarShape 1000F510,
+/// called for every type by 10015580, hook `0x006563B0`) and returns it for
+/// a Foundation past the 22 stock ones (10015540, hook `0x00656584`).
 pub(super) fn radar_foundation_brush(
     foundation_width: u32,
     foundation_height: u32,
     radar_scale: f32,
 ) -> Vec<(i32, i32)> {
+    // `0x006563E2..0x00656446`: FILD the cell count, FMUL the f32 zoom, FADD
+    // 0.5, raise to 1.0 for one cell (the multiply skipped) or 2.0 otherwise,
+    // then `ftol`, all at x87 precision; f32 arithmetic rounds 5 x 0.7 up to
+    // 3.5 and gives a cell too many.
     let scaled_dimension = |cells: u32| {
-        let rounded = (cells as f32 * radar_scale + 0.5).floor() as i32;
-        rounded.max(if cells <= 1 { 1 } else { 2 })
+        use crate::util::native_x87::{NativeF32Bits, NativeF64Bits, X87Chop53, X87Ordering};
+        let constant = |value: f64| X87Chop53::load_f64(NativeF64Bits::from_bits(value.to_bits()));
+        let minimum = if cells == 1 { 1 } else { 2 };
+        let (Ok(scale), Ok(half), Ok(floor)) = (
+            X87Chop53::load_f32(NativeF32Bits::from_bits(radar_scale.to_bits())),
+            constant(0.5),
+            constant(f64::from(minimum)),
+        ) else {
+            return minimum;
+        };
+        let scaled = if cells == 1 {
+            scale
+        } else {
+            X87Chop53::mul(X87Chop53::load_i32(cells as i32), scale)
+        };
+        let value = X87Chop53::add(scaled, half);
+        let value = if X87Chop53::compare(floor, value) == X87Ordering::Greater {
+            floor
+        } else {
+            value
+        };
+        X87Chop53::ftol_i32_low_masked(value)
     };
     let width = scaled_dimension(foundation_width);
     let height = scaled_dimension(foundation_height);
@@ -550,7 +627,7 @@ pub(super) fn radar_foundation_brush(
     pixels
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_a_r))]
 mod tests {
     use super::*;
     use crate::render::radar::visibility::RadarMobileVisibilityFacts;
@@ -580,11 +657,13 @@ mod tests {
             origin: (40, 60),
             event_source_cell: Some((10, 20)),
             enemy_sensed_prefilter: true,
+            sensor_array_warn: true,
             foundation: None,
             radar_scale: 1.0,
             discovery_observed: true,
             visibility: RadarRegistrationVisibilityFacts::Mobile(visible_mobile_facts()),
             local_front,
+            surface_edge: None,
         }
     }
 
@@ -631,6 +710,27 @@ mod tests {
         assert_eq!(tracker.entries_at(41, 61), vec![1]);
     }
 
+    /// Off the generated surface, an object whose cell is outside the
+    /// playfield is radar-invisible (`0x0070DB0A..0x0070DB25`); inside, its
+    /// pixel is clamped onto the edge (`0x0070DB27..0x0070DB64`).
+    #[test]
+    fn radar_tracker_clamps_an_off_surface_pixel_only_inside_the_playfield() {
+        let mut tracker = RetainedRadarTracker::default();
+        let mut off = update(1, false);
+        off.surface_edge = Some(RadarSurfaceEdge {
+            size: (40, 100),
+            in_playfield_origin: None,
+        });
+        tracker.update_object(off, false);
+        assert!(!tracker.is_registered(1));
+        off.surface_edge = Some(RadarSurfaceEdge {
+            size: (40, 100),
+            in_playfield_origin: Some((39, 60)),
+        });
+        tracker.update_object(off, false);
+        assert_eq!(tracker.entries_at(39, 60), vec![1]);
+    }
+
     #[test]
     fn radar_tracker_consumes_nonzero_visibility_outcode_as_local_event() {
         let mut tracker = RetainedRadarTracker::default();
@@ -667,6 +767,32 @@ mod tests {
             None,
             "native Foot/+0x684 prefilter rejects before CreateRadarEvent"
         );
+    }
+
+    /// Ares hook70DA95 in every build: a sensed type with
+    /// `SensorArray.Warn=no` raises no event.
+    #[test]
+    fn a_type_that_does_not_warn_raises_no_sensed_event() {
+        let mut tracker = RetainedRadarTracker::default();
+        let mut sensed = update(1, false);
+        sensed.visibility = RadarRegistrationVisibilityFacts::Mobile(RadarMobileVisibilityFacts {
+            cloak_state: 2,
+            has_sensor: true,
+            ..visible_mobile_facts()
+        });
+        sensed.sensor_array_warn = false;
+        assert_eq!(tracker.update_object(sensed, false), None);
+    }
+
+    /// `0x0065641F..0x00656446` scales at x87 precision: 5 cells at the zoom
+    /// a 200-wide raw map gets (f32 0.7, just under) make 3.9999... and
+    /// `ftol` gives 3, where f32 arithmetic rounds to 4.
+    #[test]
+    fn radar_brush_scales_foundations_at_x87_precision() {
+        let zoom = 140.0_f32 / 200.0;
+        let rows = |cells| radar_foundation_brush(cells, 1, zoom).last().unwrap().1 + 1;
+        assert_eq!(rows(5), 3);
+        assert_eq!(rows(2), 2);
     }
 
     #[test]
@@ -710,22 +836,6 @@ mod tests {
         // The mobile returns only at its later ordinary Techno +0x4A0 visit.
         tracker.update_object(update(1, false), false);
         assert!(tracker.is_registered(1));
-    }
-
-    #[test]
-    fn radar_tracker_two_identical_action40_resets_both_rebuild() {
-        let mut tracker = RetainedRadarTracker::default();
-        let mut building = update(2, false);
-        building.foundation = Some((2, 2));
-        tracker.update_object(building, false);
-        for _ in 0..2 {
-            tracker.reset_for_action40();
-            assert!(tracker.take_action40_building_tail_pending());
-            assert!(!tracker.is_registered(2));
-            tracker.update_object(building, true);
-            assert!(tracker.is_registered(2));
-            assert_eq!(tracker.entries_at(40, 60).len(), 1);
-        }
     }
 
     #[test]

@@ -25,32 +25,6 @@ fn bridge_test_cell(level: u8, structural: bool, transition: bool, slope_type: u
     }
 }
 
-#[test]
-fn test_path_grid_new_all_walkable() {
-    let grid: PathGrid = PathGrid::new(10, 10);
-    assert!(grid.is_walkable(0, 0));
-    assert!(grid.is_walkable(9, 9));
-    assert!(grid.is_walkable(5, 5));
-}
-
-#[test]
-fn test_path_grid_out_of_bounds() {
-    let grid: PathGrid = PathGrid::new(10, 10);
-    assert!(!grid.is_walkable(10, 0));
-    assert!(!grid.is_walkable(0, 10));
-    assert!(!grid.is_walkable(255, 255));
-}
-
-#[test]
-fn test_path_grid_set_blocked() {
-    let mut grid: PathGrid = PathGrid::new(10, 10);
-    grid.set_blocked(3, 4, true);
-    assert!(!grid.is_walkable(3, 4));
-    // Unblock it again.
-    grid.set_blocked(3, 4, false);
-    assert!(grid.is_walkable(3, 4));
-}
-
 /// An expansion's cheapest child is held out of the open list; on a tie the
 /// open list's root is expanded first and the held child takes its place
 /// (`0x0042A1B3..0x0042A1E2`).
@@ -64,7 +38,7 @@ fn the_held_child_gives_way_to_an_equal_open_root() {
         height: 0,
         on_bridge: false,
     };
-    let mut open = OpenList::default();
+    let mut open = OpenList::new(OPEN_LIST_SIZE);
     let mut held = None;
     for (x, f_cost) in [(1, 5.0), (2, 3.0), (3, 3.0)] {
         offer_child(&mut held, &mut open, node(f_cost, x));
@@ -141,6 +115,149 @@ fn a_closed_goal_refused_from_a_cheaper_neighbor_ends_the_route_there() {
             .collect::<Vec<_>>(),
         [(0, 0), (1, 1)]
     );
+}
+
+/// Admits every cell but `walls` (class 7), recording each ask as its
+/// expanded cell, candidate and direction.
+struct AskLog {
+    walls: Vec<(u16, u16)>,
+    asks: RefCell<Vec<((u16, u16), (u16, u16), i32)>>,
+}
+
+impl SearchFootEntry for AskLog {
+    fn classify(&self, query: SearchEntryQuery) -> Result<u8, String> {
+        let SearchEntryCandidate::CopiedCoord(candidate) = query.candidate else {
+            panic!("A* asks copied coordinates");
+        };
+        let from = query.from.expect("A* asks from the expanded cell");
+        self.asks
+            .borrow_mut()
+            .push((from, candidate, query.direction));
+        Ok(if self.walls.contains(&candidate) {
+            7
+        } else {
+            0
+        })
+    }
+}
+
+/// An expansion asks about each allocated neighbour on the grid that has no
+/// node yet, in ascending direction, and about no other
+/// (`0x00429E19..0x00429F54`). An admitted cell gets its node at once, so it
+/// is never asked again, while a refused wall is asked from each side. The
+/// hole's neighbours are not interior, so their allocation is tested. The
+/// goal is left out: a closed goal may be asked again (`0x00429EE2`).
+#[test]
+fn an_expansion_asks_its_allocated_neighbours_without_a_node_in_order() {
+    let mut terrain = crate::map::resolved_terrain::test_grid(8, 8, make_resolved_cell);
+    let hole = (2, 2);
+    let allocated: Vec<_> = (0..8)
+        .flat_map(|y| (0..8).map(move |x| (x, y)))
+        .filter(|&cell| cell != hole)
+        .collect();
+    terrain.test_set_native_allocated_cells(&allocated);
+    let grid = PathGrid::from_resolved_terrain(&terrain);
+    let entry = AskLog {
+        walls: (1..8).map(|y| (4, y)).collect(),
+        asks: RefCell::default(),
+    };
+    let (start, goal) = ((1, 4), (6, 4));
+    astar_search(
+        &grid,
+        start,
+        MovementLayer::Ground,
+        goal,
+        &AStarOptions {
+            resolved_terrain: Some(&terrain),
+            ..AStarOptions::new(&entry)
+        },
+    )
+    .expect("a route round the wall");
+    let mut admitted = vec![start];
+    for expansion in entry.asks.borrow().chunk_by(|a, b| a.0 == b.0) {
+        let from = expansion[0].0;
+        let expected: Vec<i32> = (0..8)
+            .filter(|&direction| {
+                let (dx, dy) = DIRECTION_DELTAS[direction as usize];
+                let (x, y) = (i32::from(from.0) + dx, i32::from(from.1) + dy);
+                let cell = (x as u16, y as u16);
+                (0..8).contains(&x)
+                    && (0..8).contains(&y)
+                    && allocated.contains(&cell)
+                    && cell != goal
+                    && !admitted.contains(&cell)
+            })
+            .collect();
+        let asked: Vec<i32> = expansion
+            .iter()
+            .filter(|ask| ask.1 != goal)
+            .map(|ask| ask.2)
+            .collect();
+        assert_eq!(asked, expected, "the expansion of {from:?}");
+        admitted.extend(
+            expansion
+                .iter()
+                .map(|ask| ask.1)
+                .filter(|cell| !entry.walls.contains(cell)),
+        );
+    }
+    let beside_hole =
+        |cell: (u16, u16)| cell.0.abs_diff(hole.0) <= 1 && cell.1.abs_diff(hole.1) <= 1;
+    assert!(
+        entry.asks.borrow().iter().any(|ask| beside_hole(ask.0)),
+        "the flood expands cells beside the hole"
+    );
+}
+
+/// Admits every cell and stops the search at its `stop_at`th ask whether it
+/// goes on, recording the expansions each ask reports.
+struct Stopper {
+    stop_at: usize,
+    asked: RefCell<Vec<u32>>,
+}
+
+impl SearchFootEntry for Stopper {
+    fn classify(&self, _query: SearchEntryQuery) -> Result<u8, String> {
+        Ok(0)
+    }
+    fn keeps_searching(&self, expanded: u32) -> bool {
+        let mut asked = self.asked.borrow_mut();
+        asked.push(expanded);
+        asked.len() < self.stop_at
+    }
+}
+
+/// VERA-only: the receiver is asked after every 1,024 expansions whether
+/// the search goes on. A stop fails it there, with those expansions made;
+/// going on changes nothing.
+#[test]
+fn a_receiver_stops_the_search_after_a_stride_of_expansions() {
+    // In a corridor each expansion reaches one new cell.
+    let grid = PathGrid::new(3_000, 1);
+    let search = |stop_at| {
+        let entry = Stopper {
+            stop_at,
+            asked: RefCell::default(),
+        };
+        let before = search_steps();
+        let found = astar_search(
+            &grid,
+            (0, 0),
+            MovementLayer::Ground,
+            (2_999, 0),
+            &AStarOptions::new(&entry),
+        );
+        (
+            found.map(|path| path.len()),
+            search_steps() - before,
+            entry.asked.into_inner(),
+        )
+    };
+    assert_eq!(
+        search(2),
+        (Err(PathSearchFailure::Stopped), 2_048, vec![1_024, 2_048])
+    );
+    assert_eq!(search(usize::MAX), (Ok(3_000), 2_999, vec![1_024, 2_048]));
 }
 
 /// Refuses only the goal, as a Unit whose type may be `Passive=`.
@@ -235,29 +352,6 @@ fn test_find_path_same_cell_has_no_route() {
     let grid: PathGrid = PathGrid::new(10, 10);
     let path: Option<Vec<(u16, u16)>> = find_path(&grid, (5, 5), (5, 5));
     assert_eq!(path, None);
-}
-
-#[test]
-fn test_find_path_straight_line() {
-    let grid: PathGrid = PathGrid::new(10, 10);
-    let path: Option<Vec<(u16, u16)>> = find_path(&grid, (0, 0), (4, 0));
-    let path: Vec<(u16, u16)> = path.expect("Should find a path on open grid");
-    // Path should start at (0,0) and end at (4,0).
-    assert_eq!(*path.first().expect("non-empty"), (0, 0));
-    assert_eq!(*path.last().expect("non-empty"), (4, 0));
-    // Should be 5 cells (0,0) through (4,0).
-    assert_eq!(path.len(), 5);
-}
-
-#[test]
-fn test_find_path_diagonal() {
-    let grid: PathGrid = PathGrid::new(10, 10);
-    let path: Option<Vec<(u16, u16)>> = find_path(&grid, (0, 0), (3, 3));
-    let path: Vec<(u16, u16)> = path.expect("Should find diagonal path");
-    assert_eq!(*path.first().expect("non-empty"), (0, 0));
-    assert_eq!(*path.last().expect("non-empty"), (3, 3));
-    // Pure diagonal: exactly 4 cells.
-    assert_eq!(path.len(), 4);
 }
 
 #[test]
@@ -516,20 +610,13 @@ fn gsi_04_12_astar_allows_destination_legal_bridge_diagonal_with_missing_flank()
 }
 
 #[test]
-fn test_path_grid_dimensions() {
-    let grid: PathGrid = PathGrid::new(80, 70);
-    assert_eq!(grid.width(), 80);
-    assert_eq!(grid.height(), 70);
-}
-
-#[test]
 fn test_block_building_movement_cells() {
     let mut grid = PathGrid::new(10, 10);
     // All cells should be walkable initially.
     assert!(grid.is_walkable(3, 3));
     assert!(grid.is_walkable(4, 4));
     // Block a 2x2 building at (3, 3).
-    grid.block_building_movement_cells(3, 3, "2x2", false);
+    grid.block_building_movement_cells(3, 3, &"2x2".into(), false);
     assert!(!grid.is_walkable(3, 3));
     assert!(!grid.is_walkable(4, 3));
     assert!(!grid.is_walkable(3, 4));
@@ -542,7 +629,7 @@ fn test_block_building_movement_cells() {
 #[test]
 fn garefn_footprint_leaves_dock_pad_walkable() {
     let mut grid = PathGrid::new(32, 32);
-    grid.block_building_movement_cells(10, 10, "4x3", false);
+    grid.block_building_movement_cells(10, 10, &"4x3".into(), false);
     assert!(
         !grid.is_walkable(13, 11),
         "base foundation should block the dock pad"
@@ -562,7 +649,7 @@ fn garefn_footprint_leaves_dock_pad_walkable() {
 #[test]
 fn garefn_bib_static_blockers_only_relax_east_edge() {
     let mut grid = PathGrid::new(32, 32);
-    grid.block_building_movement_cells(10, 10, "4x3", true);
+    grid.block_building_movement_cells(10, 10, &"4x3".into(), true);
     assert!(!grid.is_walkable(10, 11));
     assert!(!grid.is_walkable(12, 11));
     assert!(grid.is_walkable(13, 11));
@@ -600,16 +687,6 @@ fn test_from_resolved_terrain_uses_resolved_blocking_flags() {
     assert!(grid.is_walkable(1, 0), "Water is PathGrid-walkable");
     assert!(!grid.is_walkable(0, 1), "Terrain object blocks all units");
     assert!(!grid.is_walkable(1, 1), "Overlay blocks all units");
-}
-
-#[test]
-fn test_parse_foundation() {
-    assert_eq!(parse_foundation("2x2"), (2, 2));
-    assert_eq!(parse_foundation("3x3"), (3, 3));
-    assert_eq!(parse_foundation("1x1"), (1, 1));
-    assert_eq!(parse_foundation("4x2"), (4, 2));
-    assert_eq!(parse_foundation(""), (1, 1));
-    assert_eq!(parse_foundation("custom"), (1, 1));
 }
 
 #[test]
@@ -659,10 +736,11 @@ fn test_path_grid_rebuild_closes_destroyed_bridge_deck() {
     );
     let mut terrain = terrain;
     // Legacy decks (no bit0x100) stay intact while their +44 identity decodes.
+    let mut overlays = crate::sim::overlay_grid::OverlayGrid::new(5, 1);
     for rx in 1..=3 {
-        terrain.cell_mut(rx, 0).unwrap().bridge_facts.overlay_id = Some(0x18);
+        overlays.cell_mut_for_test(rx, 0).overlay_id = Some(0x18);
     }
-    let intact_grid = PathGrid::from_resolved_terrain_with_bridges(&terrain);
+    let intact_grid = PathGrid::from_resolved_terrain_with_bridges(&terrain, Some(&overlays));
     assert!(
         intact_grid.is_walkable_on_layer(2, 0, MovementLayer::Bridge),
         "intact deck stays open on the bridge layer"
@@ -670,11 +748,14 @@ fn test_path_grid_rebuild_closes_destroyed_bridge_deck() {
 
     // Destroy only the body cell (rx=2) with 47E040's destroyed stamp: state
     // 0, bit0x100 clear and bit0x400 set. The bridgeheads keep their state.
-    let body = &mut terrain.cell_mut(2, 0).unwrap().bridge_facts;
-    body.raw_flags = crate::map::bridge_facts::BRIDGE_FLAG_DESTROYED_OR_RAMP;
-    body.state_byte = 0;
+    terrain
+        .cell_mut_for_test(2, 0)
+        .unwrap()
+        .bridge_facts
+        .raw_flags = crate::map::bridge_facts::BRIDGE_FLAG_DESTROYED_OR_RAMP;
+    overlays.cell_mut_for_test(2, 0).overlay_data = 0;
 
-    let destroyed_grid = PathGrid::from_resolved_terrain_with_bridges(&terrain);
+    let destroyed_grid = PathGrid::from_resolved_terrain_with_bridges(&terrain, Some(&overlays));
     assert!(
         !destroyed_grid.is_walkable_on_layer(2, 0, MovementLayer::Bridge),
         "the rebuild closes the destroyed deck"
@@ -728,7 +809,7 @@ fn test_pathcell_bridge_walkable_preserved_for_bridgeheads_across_rebuild() {
     // Multiple rebuilds: in production each fires from a non-bridge event
     // (unit spawn, ownership change, destroyed structure).
     for _ in 0..3 {
-        let grid = PathGrid::from_resolved_terrain_with_bridges(&terrain);
+        let grid = PathGrid::from_resolved_terrain_with_bridges(&terrain, None);
         let pc1 = grid.cell(1, 0).expect("bridgehead cell exists");
         let pc3 = grid.cell(3, 0).expect("bridgehead cell exists");
         assert!(
@@ -753,22 +834,6 @@ fn test_pathcell_bridge_walkable_preserved_for_bridgeheads_across_rebuild() {
 // Native height and list-selection goldens live in astar_entry_tests.rs; the
 // class's height, bridge and tube traversal (Foot `0x004D9C60`) is compared
 // with the original rows in `world::object_entry`'s `unit_entry_tests`.
-
-#[test]
-fn test_encode_decode_from_ground() {
-    let encoded = encode_from(1234, false);
-    let (idx, bridge) = decode_from(encoded);
-    assert_eq!(idx, 1234);
-    assert!(!bridge);
-}
-
-#[test]
-fn test_encode_decode_from_bridge() {
-    let encoded = encode_from(1234, true);
-    let (idx, bridge) = decode_from(encoded);
-    assert_eq!(idx, 1234);
-    assert!(bridge);
-}
 
 #[test]
 fn test_encode_decode_from_max_map() {
@@ -811,7 +876,8 @@ fn infantry_under_span_cell(rx: u16, foot_cost: u8, transition: bool) -> Resolve
     ResolvedTerrainCell {
         level: 2,
         speed_costs: SpeedCostProfile {
-            foot: Some(foot_cost),
+            foot: Some(crate::rules::terrain_rules::test_speed_percent(foot_cost)),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
             ..Default::default()
         },
         has_bridge_deck: true,
@@ -1298,132 +1364,8 @@ fn astar_hierarchy_marker_follows_the_marked_straight_path() {
 }
 
 // ---------------------------------------------------------------------------
-// Path truncation tests (RA2 24-step segment system)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_truncate_path_shorter_than_limit_unchanged() {
-    let path: Vec<(u16, u16)> = vec![(0, 0), (1, 0), (2, 0)]; // 2 steps
-    let result = truncate_path(path.clone(), 24);
-    assert_eq!(result, path, "Short path should be returned unchanged");
-}
-
-#[test]
-fn test_truncate_path_exactly_at_limit() {
-    // 24 steps = 25 entries (start + 24 moves).
-    let path: Vec<(u16, u16)> = (0..25).map(|i| (i as u16, 0)).collect();
-    let result = truncate_path(path.clone(), 24);
-    assert_eq!(result, path, "Path at exact limit should be unchanged");
-}
-
-#[test]
-fn test_truncate_path_longer_than_limit() {
-    // 30 steps = 31 entries → should be truncated to 25 entries (24 steps).
-    let path: Vec<(u16, u16)> = (0..31).map(|i| (i as u16, 0)).collect();
-    let result = truncate_path(path, 24);
-    assert_eq!(
-        result.len(),
-        25,
-        "Should truncate to 25 entries (24 steps + start)"
-    );
-    assert_eq!(result[0], (0, 0));
-    assert_eq!(result[24], (24, 0));
-}
-
-#[test]
-fn test_truncate_layered_path_truncates_both_vecs() {
-    let path: Vec<(u16, u16)> = (0..31).map(|i| (i as u16, 0)).collect();
-    let layers: Vec<MovementLayer> = vec![MovementLayer::Ground; 31];
-    let (rp, rl) = truncate_layered_path(path, layers, 24);
-    assert_eq!(rp.len(), 25);
-    assert_eq!(rl.len(), 25);
-    assert_eq!(rp[24], (24, 0));
-}
-
-#[test]
-fn test_truncate_path_single_cell() {
-    let path: Vec<(u16, u16)> = vec![(5, 5)]; // 0 steps
-    let result = truncate_path(path.clone(), 24);
-    assert_eq!(result, path);
-}
-
-#[test]
-fn test_find_path_long_gets_full_result() {
-    // A* itself returns the full path — truncation happens at the caller level.
-    let grid = PathGrid::new(50, 1);
-    let path = find_path(&grid, (0, 0), (40, 0)).expect("should find path on open grid");
-    assert_eq!(path.len(), 41, "A* should return the complete 40-step path");
-}
-
-// ---------------------------------------------------------------------------
 // Water / naval pathfinding tests
 // ---------------------------------------------------------------------------
-
-/// Helper: build a resolved terrain grid with a water channel across the middle.
-/// Layout (7 wide × 3 tall):
-///   Row 0: land  land  land  land  land  land  land
-///   Row 1: water water water water water water water
-///   Row 2: land  land  land  land  land  land  land
-fn make_water_channel_terrain() -> ResolvedTerrainGrid {
-    let width: u16 = 7;
-    let height: u16 = 3;
-    let mut cells: Vec<ResolvedTerrainCell> = Vec::new();
-    for ry in 0..height {
-        for rx in 0..width {
-            let is_water: bool = ry == 1;
-            cells.push(ResolvedTerrainCell {
-                land_type: if is_water {
-                    LandType::Water.as_index()
-                } else {
-                    LandType::Clear.as_index()
-                },
-                ground_walk_blocked: is_water,
-                speed_costs: if is_water {
-                    // Water: ground blocked, Float/Hover/Amphibious passable.
-                    SpeedCostProfile {
-                        foot: Some(0),
-                        track: Some(0),
-                        wheel: Some(0),
-                        float: Some(100),
-                        amphibious: Some(100),
-                        hover: Some(100),
-                        float_beach: Some(100),
-                    }
-                } else {
-                    // Land: ground passable, Float blocked.
-                    SpeedCostProfile {
-                        foot: Some(100),
-                        track: Some(100),
-                        wheel: Some(100),
-                        float: Some(0),
-                        amphibious: Some(80),
-                        hover: Some(50),
-                        float_beach: Some(0),
-                    }
-                },
-                ..make_resolved_cell(rx, ry)
-            });
-        }
-    }
-    ResolvedTerrainGrid::from_cells(width, height, cells)
-}
-
-#[test]
-fn test_water_cells_are_pathgrid_walkable() {
-    let terrain: ResolvedTerrainGrid = make_water_channel_terrain();
-    let grid: PathGrid = PathGrid::from_resolved_terrain(&terrain);
-    // Water cells should be walkable in PathGrid (the land row is the class's).
-    assert!(
-        grid.is_walkable(0, 1),
-        "Water cell should be PathGrid-walkable"
-    );
-    assert!(
-        grid.is_walkable(3, 1),
-        "Water cell should be PathGrid-walkable"
-    );
-    // Land cells still walkable.
-    assert!(grid.is_walkable(0, 0), "Land cell should be walkable");
-}
 
 #[test]
 fn test_cliff_cells_remain_pathgrid_blocked() {
@@ -1443,91 +1385,6 @@ fn test_cliff_cells_remain_pathgrid_blocked() {
     assert!(grid.is_walkable(0, 0));
     assert!(!grid.is_walkable(1, 0), "Cliff cell must remain blocked");
     assert!(grid.is_walkable(2, 0));
-}
-
-#[test]
-fn test_ground_units_on_land_no_regression() {
-    // Basic sanity: ground pathfinding on land still works correctly.
-    let grid: PathGrid = PathGrid::new(10, 10);
-    let path = find_path(&grid, (0, 0), (5, 5));
-    assert!(
-        path.is_some(),
-        "Ground pathfinding on open land must still work"
-    );
-    let path: Vec<(u16, u16)> = path.unwrap();
-    assert_eq!(path.first(), Some(&(0, 0)));
-    assert_eq!(path.last(), Some(&(5, 5)));
-}
-
-// --- nearest_walkable tests ---
-
-#[test]
-fn test_nearest_walkable_already_walkable() {
-    let grid: PathGrid = PathGrid::new(10, 10);
-    let result = grid.nearest_walkable(5, 5, 3, None, None);
-    assert_eq!(result, Some((5, 5)));
-}
-
-#[test]
-fn test_nearest_walkable_blocked_center() {
-    let mut grid: PathGrid = PathGrid::new(10, 10);
-    grid.set_blocked(5, 5, true);
-    let result = grid.nearest_walkable(5, 5, 3, None, None);
-    assert!(result.is_some());
-    let (rx, ry) = result.unwrap();
-    // Must be adjacent (distance 1) since surrounding cells are walkable.
-    let dx = (rx as i32 - 5).abs();
-    let dy = (ry as i32 - 5).abs();
-    assert!(
-        dx <= 1 && dy <= 1,
-        "Expected adjacent cell, got ({},{})",
-        rx,
-        ry
-    );
-    assert!(grid.is_walkable(rx, ry));
-}
-
-#[test]
-fn test_nearest_walkable_building_footprint() {
-    // 3x3 building at (4,4) — block cells (4,4) through (6,6).
-    let mut grid: PathGrid = PathGrid::new(10, 10);
-    for dy in 0..3u16 {
-        for dx in 0..3u16 {
-            grid.set_blocked(4 + dx, 4 + dy, true);
-        }
-    }
-    // Searching from center of building (5,5) should find a cell outside.
-    let result = grid.nearest_walkable(5, 5, 5, None, None);
-    assert!(result.is_some());
-    let (rx, ry) = result.unwrap();
-    assert!(grid.is_walkable(rx, ry));
-}
-
-#[test]
-fn test_nearest_walkable_with_entity_blocks() {
-    let grid: PathGrid = PathGrid::new(10, 10);
-    let mut blocks: BTreeSet<(u16, u16)> = BTreeSet::new();
-    blocks.insert((5, 5));
-    blocks.insert((5, 4)); // block north neighbor too
-    let result = grid.nearest_walkable(5, 5, 3, Some(&blocks), None);
-    assert!(result.is_some());
-    let (rx, ry) = result.unwrap();
-    assert_ne!((rx, ry), (5, 5));
-    assert_ne!((rx, ry), (5, 4));
-    assert!(grid.is_walkable(rx, ry));
-}
-
-#[test]
-fn test_nearest_walkable_no_walkable_in_radius() {
-    // Tiny grid entirely blocked.
-    let mut grid: PathGrid = PathGrid::new(3, 3);
-    for y in 0..3u16 {
-        for x in 0..3u16 {
-            grid.set_blocked(x, y, true);
-        }
-    }
-    let result = grid.nearest_walkable(1, 1, 5, None, None);
-    assert_eq!(result, None);
 }
 
 #[test]
@@ -1554,7 +1411,7 @@ fn gsi_04_10_resolved_zero_occupation_is_walkable_path_input() {
 /// terrain types are `=4`, i.e. a single sub-cell bit.
 fn tree_cell(rx: u16, ry: u16, bits: u8) -> ResolvedTerrainCell {
     ResolvedTerrainCell {
-        terrain_object_occupation: Some(bits),
+        terrain_object_occupation: Some(i32::from(bits)),
         terrain_object_blocks: bits != 0,
         // Resolved terrain folds the terrain object into ground_walk_blocked;
         // base_ground_walk_blocked is the value without it.

@@ -98,7 +98,7 @@ pub(super) fn finish_fresh_head(
             .set_speed_fraction(crate::util::fixed_math::SIM_ONE);
         //75BC36's dead-owner exit bypasses75BCB2 and retains the exact byte.
         // Native controls: foot_scold_latch.json dead_fresh_head rows.
-        entity.navigation.path_runtime.clear_scold_latch();
+        entity.navigation.path_runtime_mut().clear_scold_latch();
     }
     true
 }
@@ -149,7 +149,7 @@ impl crate::sim::world::Simulation {
         &mut self,
         id: u64,
         request: Option<DriveCoord>,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: crate::sim::world::FrameEffects<'_>,
     ) -> Result<bool, String> {
@@ -217,7 +217,7 @@ impl crate::sim::world::Simulation {
         &mut self,
         id: u64,
         coord: Option<DriveCoord>,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: crate::sim::world::FrameEffects<'_>,
     ) -> Result<(), String> {
@@ -250,7 +250,7 @@ impl crate::sim::world::Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::*;
 
@@ -283,12 +283,12 @@ mod tests {
                 .set_speed_fraction(SimFixed::from_num(0.75));
             actor
                 .navigation
-                .path_runtime
+                .path_runtime_mut()
                 .set_scold_latch_for_test(row["supplied_byte"].as_u64().unwrap() as u8);
             let body_before = actor.body_facing;
             assert!(finish_fresh_head(&mut actor, 100));
             assert_eq!(
-                u64::from(actor.navigation.path_runtime.scold_latch_raw()),
+                u64::from(actor.navigation.path_runtime().scold_latch_raw()),
                 row["final_byte"].as_u64().unwrap()
             );
             assert_eq!(
@@ -336,7 +336,7 @@ mod tests {
         master.set_type_ref_for_test(interner.intern("MASTER"));
         let slav = interner.intern("SLAV");
         // An existing manager that does not hold the slave refuses it.
-        master.slave_manager = Some(SlaveManager::new(slav, [None; 0], 0, 0, 0));
+        master.slave_manager = Some(Box::new(SlaveManager::new(slav, [None; 0], 0, 0, 0)));
         entities.insert(master);
         let mut slave = GameEntity::test_default(2, "SLAV", "Owner", 3, 4);
         slave.set_owner_for_test(owner);
@@ -345,8 +345,13 @@ mod tests {
         slave.position.set_sub_x_for_test(SimFixed::from_num(192));
         slave.position.set_sub_y_for_test(SimFixed::from_num(64));
         slave.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Walk));
-        slave.navigation.path_replay =
-            crate::sim::components::FootPathQueue::for_test(vec![2], 0, Some((3, 4)));
+        slave
+            .navigation
+            .set_path_replay_for_test(crate::sim::components::FootPathQueue::for_test(
+                vec![2],
+                0,
+                Some((3, 4)),
+            ));
         slave.slave = crate::sim::slave_manager::SlaveLink::for_test(Some(1), Vec::new());
         let current = super::super::ground_pose::position_world_coord(&slave.position);
         entities.insert(slave);
@@ -392,7 +397,7 @@ mod tests {
             "failed selection restores the cleared current slot"
         );
         entities.get_mut(1).unwrap().slave_manager =
-            Some(SlaveManager::new(slav, [Some(2)], 0, 0, 0));
+            Some(Box::new(SlaveManager::new(slav, [Some(2)], 0, 0, 0)));
         assert!(prepare_step_head(
             &mut entities,
             2,
@@ -456,7 +461,7 @@ mod tests {
                 })
                 .collect(),
         );
-        let c = terrain.cell_mut(10, 10).unwrap();
+        let c = terrain.cell_mut_for_test(10, 10).unwrap();
         c.level = 2;
         c.slope_type = 1;
         for row in selections {
@@ -511,12 +516,15 @@ mod tests {
         for row in rows {
             let i = &row["input"];
             let out = &row["output"];
-            terrain.cell_mut(10, 10).unwrap().bridge_facts.raw_flags =
-                if i["structural"].as_bool().unwrap() {
-                    0x100
-                } else {
-                    0
-                };
+            terrain
+                .cell_mut_for_test(10, 10)
+                .unwrap()
+                .bridge_facts
+                .raw_flags = if i["structural"].as_bool().unwrap() {
+                0x100
+            } else {
+                0
+            };
             let mut raw = RawCellOccupationGrid::default();
             raw.mark_ground_infantry(
                 10,
@@ -655,8 +663,13 @@ mod tests {
                 ai_counter: 0,
                 dispatch_timer: crate::sim::mission::MissionDispatchTimer::at_frame(0),
             });
-            entity.navigation.path_replay =
-                FootPathQueue::for_test(vec![2, 3, 4, 5], 0, Some((9, 8)));
+            entity
+                .navigation
+                .set_path_replay_for_test(FootPathQueue::for_test(
+                    vec![2, 3, 4, 5],
+                    0,
+                    Some((9, 8)),
+                ));
             if input["nav"].as_bool().unwrap_or(true) {
                 entity
                     .navigation
@@ -713,8 +726,14 @@ mod tests {
                 entity.foot_speed.applied_fraction(),
                 SimFixed::from_num(row["speed_fraction"].as_f64().unwrap())
             );
-            assert_eq!(entity.navigation.path_replay.directions(), vec![2, 3, 4, 5]);
-            assert_eq!(entity.navigation.path_replay.reference_cell(), Some((9, 8)));
+            assert_eq!(
+                entity.navigation.path_replay().directions(),
+                vec![2, 3, 4, 5]
+            );
+            assert_eq!(
+                entity.navigation.path_replay().reference_cell(),
+                Some((9, 8))
+            );
             assert_eq!(
                 raw.ground_bits(9, 10),
                 row["current_raw"].as_u64().unwrap() as u8
@@ -823,7 +842,7 @@ mod tests {
         sim.foot_force_immediate_destination(
             id,
             Some(DriveCoord::cell(7, 5, 0)),
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -859,7 +878,12 @@ pub(super) fn prepare_step_head(
     if loco.active_kind() != LocomotorKind::Walk || loco.step_head().is_some() {
         return true;
     }
-    let Some(&direction) = entity.navigation.path_replay.remaining_directions().first() else {
+    let Some(&direction) = entity
+        .navigation
+        .path_replay()
+        .remaining_directions()
+        .first()
+    else {
         return true;
     };
     let (dx, dy) = crate::util::direction::DIRECTION_DELTAS[usize::from(direction & 7)];
@@ -900,7 +924,7 @@ pub(super) fn select_step_head_at(
     raw: &mut RawCellOccupationGrid,
     terrain: Option<&ResolvedTerrainGrid>,
     grid: Option<&PathGrid>,
-    rules: Option<&crate::rules::ruleset::RuleSet>,
+    rules: &crate::rules::ruleset::RuleSet,
     interner: &crate::sim::intern::StringInterner,
     rng: &mut crate::sim::rng::SimRng,
     input: Option<DriveCoord>,
@@ -937,6 +961,10 @@ pub(super) fn select_step_head_at(
     };
     let next = ((input.x / 256) as u16, (input.y / 256) as u16);
     let mut priority = false;
+    // RESIDUAL: 0x0075C2F3..0x0075C333 ask Get_Mission (0x005B3040: current,
+    // else queued); this reads current. They differ only while current is
+    // NONE with one of these missions queued, before the first Commence
+    // (rare): native already grants the target cell's priority, VERA waits.
     if [7, 8, 9, 11, 25].contains(&entity.mission.current().raw()) {
         let target = match entity.navigation.nav_com() {
             Some(crate::sim::components::NavTargetRef::Object { id }) => entities.get(id),
@@ -965,7 +993,7 @@ pub(super) fn select_step_head_at(
     }
     //75C434 still executes when the ordinary target already granted
     //priority. Its map lookups cannot be elided by boolean short-circuit.
-    if let (Some(terrain), Some(rules)) = (terrain, rules) {
+    if let Some(terrain) = terrain {
         let query = crate::sim::slave_deposit::SlaveDepositQuery {
             entities,
             occupancy,
@@ -1082,7 +1110,7 @@ pub(super) fn prepare_step_head_at(
         raw,
         terrain,
         grid,
-        rules,
+        rules.unwrap_or(crate::rules::ruleset::RuleSet::empty_for_test()),
         interner,
         rng,
         Some(input),

@@ -36,6 +36,7 @@ pub(crate) struct LaserDraw {
     pub color: LaserDrawColor,
     pub age: i32,
     pub duration: i32,
+    pub fade_start: NativeF32Bits,
     pub fade_end: NativeF32Bits,
 }
 
@@ -43,10 +44,12 @@ impl LaserDraw {
     /// The native f32 store precedes both downstream consumers. Reuse the
     /// existing finite numeric owner rather than an independent approximation.
     pub(crate) fn intensity(self) -> NativeF32Bits {
+        // Draw5505EF: (start - end) * (duration - age) / duration + end.
+        let start = X::load_f32(self.fade_start).expect("finite laser fade start");
         let end = X::load_f32(self.fade_end).expect("finite laser fade endpoint");
         X::div(
             X::mul(
-                X::sub(X::load_i32(1), end),
+                X::sub(start, end),
                 X::load_i32(self.duration.wrapping_sub(self.age)),
             ),
             X::load_i32(self.duration),
@@ -139,9 +142,11 @@ impl LaserDraw {
             if high_detail && outer.is_none() {
                 // RESIDUAL: General outerRGB[0,0,0] selects DSurface4BC750
                 // with per-channel masks and interpolated Z. Those shared
-                // AA branches remain unported; stock frequency is unknown.
-                // Missing AA pixels affect generic laser/ray coverage, not
-                // this stock DiskLaser's nonzero80/0/88 outer-color arm.
+                // AA branches remain unported. Dormant in retail: only
+                // LaserFire and LaserFire2 set LaserOuterColor=0,0,0, and no
+                // retail object fires them; house-colour lasers take the
+                // Special arm (0x005509F0), and this stock DiskLaser's
+                // outer color is the nonzero 80/0/88.
                 return;
             }
             // General detail0 draws center/A/B without fade; detail!=0

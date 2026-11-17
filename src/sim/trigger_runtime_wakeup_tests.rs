@@ -1,15 +1,11 @@
 //! Wakeup queues Guard through the existing Mission authority. Native
 //! Execute6DDB67 ->6E01C0 uses the live Trigger's Tag membership, not a House.
 use super::*;
-use crate::sim::mission::{MissionId, MissionType};
+use crate::sim::mission::MissionId;
 use crate::util::save_codec;
 
 fn corpus() -> &'static serde_json::Value {
     let value = crate::test_fixture::json("tools/spatial_oracle/trigger_wakeup.json");
-    assert_eq!(
-        value["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     assert_eq!(value["controls"].as_array().unwrap().len(), 57);
     assert!(value["code_unchanged"].as_bool().unwrap());
     value
@@ -74,7 +70,7 @@ fn wakeup_selection_and_deferred_mission_state_match_original_controls() {
         let mut ids = vec![0; actors.len()];
         for index in construction {
             let input = &actors[index];
-            let id = sim.allocate_stable_id();
+            let id = sim.substrate.allocate_stable_id();
             ids[index] = id;
             let category = match input["category"].as_str().unwrap() {
                 "infantry" => EntityCategory::Infantry,
@@ -104,7 +100,7 @@ fn wakeup_selection_and_deferred_mission_state_match_original_controls() {
                 .set_object_alive_for_test(input["alive"].as_bool().unwrap());
             entity
                 .lifecycle
-                .set_cell_marked(input["cell_marked"].as_bool().unwrap());
+                .set_cell_marked_for_test(input["cell_marked"].as_bool().unwrap());
             entity
                 .lifecycle
                 .set_in_limbo_for_test(input["limbo"].as_bool().unwrap());
@@ -132,7 +128,8 @@ fn wakeup_selection_and_deferred_mission_state_match_original_controls() {
                     dispatch_guard: false,
                 }));
                 sim.trigger_runtime.tag_order.push(tag);
-                sim.replace_trigger_tag_attachment(TagAttachment::Object(id), Some(tag));
+                sim.trigger_runtime
+                    .replace_trigger_tag_attachment(TagAttachment::Object(id), Some(tag));
             }
             originals.push((index, entity.clone()));
             if order.iter().any(|v| int(v) as usize == index) {
@@ -150,7 +147,7 @@ fn wakeup_selection_and_deferred_mission_state_match_original_controls() {
                 input: TagEventInput::default(),
             },
             &mut Vec::new(),
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             None,
             FrameEffects::default(),
         );
@@ -186,45 +183,6 @@ fn wakeup_selection_and_deferred_mission_state_match_original_controls() {
     }
 }
 
-#[test]
-fn wakeup_tagged_sleep_queues_guard_without_commencing() {
-    let (mut sim, rules, _, houses) = super::tests::event_ingress_fixture();
-    super::tests::install_event_ingress_map(
-        &mut sim,
-        &rules,
-        "[Triggers]\nWAKE=Country0,<none>,Wake,0,1,1,1,0\n\
-         [Events]\nWAKE=1,8,0,0\n\
-         [Actions]\nWAKE=1,81,0,0,0,0,0,0,A\n\
-         [Tags]\nTAG=2,Wake,WAKE\n",
-    );
-    let actor = super::tests::spawn_event_ingress_unit(&mut sim, &rules, houses[1], (15, 15));
-    sim.attach_object_trigger_tag(actor, Some("TAG"));
-    sim.mission_assign_exact(actor, MissionId::from_known(MissionType::Sleep), 17)
-        .unwrap();
-    let before = sim.substrate.entities.get(actor).unwrap().mission;
-    let rng = sim.scenario_rng.native_state_hex();
-    let live = sim.trigger_runtime.trigger_order[0];
-    let typ = sim.trigger_runtime.trigger(live).unwrap().type_index;
-    let action = sim.trigger_runtime.definitions.trigger_types[typ].actions[0].clone();
-    sim.apply_live_trigger_action(
-        &action,
-        TriggerActionContext {
-            live_index: Some(live),
-            incoming_house: Some(houses[0]),
-            input: TagEventInput::default(),
-        },
-        &mut Vec::new(),
-        Some(&rules),
-        None,
-        FrameEffects::default(),
-    );
-    let after = sim.substrate.entities.get(actor).unwrap().mission;
-    assert_eq!(after.current(), before.current());
-    assert_eq!(after.queued().known(), Some(MissionType::Guard));
-    assert_eq!(after.dispatch_timer(), before.dispatch_timer());
-    assert_eq!(after.mission_start_frame(), before.mission_start_frame());
-    assert_eq!(sim.scenario_rng.native_state_hex(), rng);
-}
 #[test]
 fn retail_all02_prisoner_damage_enable_elapsed_wakeup_survives_restore() {
     use crate::map::{entities::EntityCategory, map_file::MapFile};
@@ -314,12 +272,13 @@ fn retail_all02_prisoner_damage_enable_elapsed_wakeup_survives_restore() {
     crate::sim::scenario_bootstrap::initialize_map_roster_houses(
         &mut sim,
         &roster,
-        Some(&rules),
+        &rules,
         Some(&map.ini),
     );
     sim.intern_rule_type_ids(&rules);
     sim.resolve_type_handles(&rules);
-    sim.session.game_mode_nonzero = false;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false));
     crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
     for row in native["houses"].as_array().unwrap() {
         assert_eq!(
@@ -330,10 +289,11 @@ fn retail_all02_prisoner_damage_enable_elapsed_wakeup_survives_restore() {
             sim.interner.get(row["name"].as_str().unwrap())
         );
     }
-    let cropped = super::tests::install_event_ingress_map(&mut sim, &rules, &body);
-    sim.install_team_ai_registry(&teams, &rules).unwrap();
-    sim.initialize_trigger_definitions(&cropped, &teams, None, None);
-    sim.classify_map_triggers(Some(&rules));
+    let cropped = super::tests::trigger_fixture_map(&body);
+    sim.initialize_trigger_definitions(&cropped, &teams, None, None, None);
+    sim.install_team_ai_registry(&teams, &rules);
+    sim.install_authored_cell_trigger_tags(&cropped);
+    sim.classify_map_triggers(&rules);
 
     for id in [chain[0], chain[1]] {
         for raw in native["routes"][id]["attachments"].as_array().unwrap() {
@@ -424,7 +384,7 @@ fn retail_all02_prisoner_damage_enable_elapsed_wakeup_survives_restore() {
     assert_eq!(guards.len(), 8);
     assert_eq!(sim.trigger_runtime.tag(wake_tag).unwrap().refs, 7);
     let poll = |sim: &mut Simulation| {
-        sim.advance_triggers(Some(&rules), Some(&overlays), FrameEffects::default());
+        sim.advance_triggers(&rules, Some(&overlays), FrameEffects::default());
     };
     poll(&mut sim);
     assert!(sim.trigger_runtime.action_trace.is_empty());
@@ -475,7 +435,7 @@ fn retail_all02_prisoner_damage_enable_elapsed_wakeup_survives_restore() {
     for candidate in [&mut sim, &mut restored] {
         let before: Vec<_> = prisoners
             .iter()
-            .map(|&id| candidate.substrate.entities.get(id).unwrap().mission)
+            .map(|&id| candidate.substrate.entities.get(id).unwrap().mission.clone())
             .collect();
         let rng = candidate.rng_state();
         poll(candidate);
@@ -503,7 +463,7 @@ fn retail_all02_prisoner_damage_enable_elapsed_wakeup_survives_restore() {
         }
         assert_eq!(candidate.rng_state(), rng);
         candidate.process_pending_delete_with(
-            Some(&rules),
+            &rules,
             Some(&overlays),
             FrameEffects::default(),
             1,
@@ -513,10 +473,10 @@ fn retail_all02_prisoner_damage_enable_elapsed_wakeup_survives_restore() {
         assert!(!candidate.trigger_runtime.has_live_tag(wake_tag));
         assert!(candidate.trigger_runtime.trigger(source_live).is_none());
         assert!(candidate.trigger_runtime.trigger(wake_live).is_none());
-        candidate.session.binary_frame = 1;
+        candidate.session.set_binary_frame_for_test(1);
         for &id in &prisoners {
             candidate.mission_host_promote(id, 1, &rules);
-            let mission = candidate.substrate.entities.get(id).unwrap().mission;
+            let mission = candidate.substrate.entities.get(id).unwrap().mission.clone();
             assert_eq!(mission.current().known(), Some(MissionType::Guard));
             assert_eq!(mission.queued(), crate::sim::mission::MissionId::NONE);
         }

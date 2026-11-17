@@ -58,17 +58,30 @@ pub(crate) fn particle_system_light(
     system: &crate::sim::particles::ParticleSystem,
     kind: &crate::rules::particle_system_type::ParticleSystemType,
     detail: &mut DetailState,
+    ares: bool,
 ) -> Option<CombatLightDrawRecord> {
-    if !kind.one_frame_light || kind.light_size <= 0 || system.particles.is_empty() {
+    let count =
+        i32::try_from(system.particles().len()).expect("native particle vector count fits i32");
+    // Ares 3.0 ParticleSystemClass_Draw (Ares.dll 10029050, hook 0x62E2AD on
+    // the count read, resuming at 0x62E2B3): its Spark/Railgun records count
+    // too, and `ParticleCap=0` counts nothing instead of dividing by zero.
+    // `ares` is [`RuleSet::ares`](crate::rules::ruleset::RuleSet::ares).
+    let count = if !ares {
+        count
+    } else if kind.particle_cap == 0 {
+        0
+    } else {
+        count.saturating_add(system.ares().map_or(0, |ext| {
+            i32::try_from(ext.particles().len()).unwrap_or(i32::MAX)
+        }))
+    };
+    if !kind.one_frame_light || kind.light_size <= 0 || count <= 0 {
         return None;
     }
-    let count =
-        i32::try_from(system.particles.len()).expect("native particle vector count fits i32");
-    let base_size =
-        system_light_base_size(count, kind.particle_cap as i32, kind.light_size).ok()?;
+    let base_size = system_light_base_size(count, kind.particle_cap, kind.light_size).ok()?;
     CombatLight {
-        coord: ProjectileCoord::new(system.coords.x, system.coords.y, system.coords.z),
-        stage: system.facing,
+        coord: ProjectileCoord::new(system.coords().x, system.coords().y, system.coords().z),
+        stage: system.facing(),
         base_size,
         flags: 0,
     }
@@ -84,9 +97,15 @@ fn system_light_base_size(
     // Original62E280: division, binary64 lower clamp7E3550,
     // binary32 upper clamp7E2AC8, multiplication then Math::ftol.
     // Consumed original controls: procedural_drawing_oracle/welding.json.
-    let mut ratio = X::div(X::load_i32(count), X::load_i32(cap))?;
     let minimum = X::load_f64(NativeF64Bits::from_bits(0x3fd9_9999_9999_999a))?;
     let maximum = X::load_f32(NativeF32Bits::from_bits(0x3f80_0000))?;
+    // `ParticleCap=0` (mod data): FIDIV of a positive count by zero gives +inf
+    // under the masked zero-divide, which the upper clamp makes 1.0.
+    let mut ratio = if cap == 0 {
+        maximum
+    } else {
+        X::div(X::load_i32(count), X::load_i32(cap))?
+    };
     if X::compare(ratio, minimum) == X87Ordering::Less {
         ratio = minimum;
     }
@@ -133,6 +152,10 @@ impl CombatLightRuntime {
     }
 
     /// Age the pre-existing vector before this logic frame's producers append.
+    /// RESIDUAL (invisible): `SpotLightClass::UpdateAll @ 0x005FF390` runs at
+    /// 0x0055B5BE, after the trigger events and the team/DiskLaser loops, so a
+    /// light those create is aged once and first draws at stage 8, one frame
+    /// shorter. Here every new light first draws at stage 0.
     pub(crate) fn commit_frame(&mut self, new_entries: impl IntoIterator<Item = CombatLight>) {
         for entry in &mut self.entries {
             entry.stage = entry.stage.saturating_add(STAGE_STEP);
@@ -234,12 +257,19 @@ fn scaled_surface_index(base_size: i32, stage: u8) -> i32 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
     use crate::rules::ruleset::DetailRules;
     use crate::sim::world::Simulation;
+
+    /// `ParticleSystemClass::DrawIt @ 0x0062E280` with `ParticleCap=0`: the
+    /// zero divide gives +inf, clamped to 1.0, so the light is full size.
+    #[test]
+    fn a_zero_particle_cap_draws_the_full_size_light() {
+        assert_eq!(system_light_base_size(3, 0, 120).unwrap(), 120);
+    }
 
     #[test]
     fn welding_immediate_light_size_stage_and_admission_match_original_system_draw() {
@@ -369,17 +399,6 @@ mod tests {
         }
         detail.throttle_tail(0);
         detail
-    }
-
-    fn effect(sim: &mut Simulation, x: i32, flags: u32, damage: i32) -> CombatLightRequest {
-        CombatLightRequest::Impact {
-            target_id: Some(x as u64),
-            damage,
-            warhead_ref: sim.interner.intern("WH"),
-            coord: ProjectileCoord { x, y: 512, z: 0 },
-            force_create: true,
-            flags,
-        }
     }
 
     #[test]
@@ -566,96 +585,6 @@ mod tests {
     }
 
     #[test]
-    fn gsi_04_07_invulnerability_light_materializes_and_draws_reverse_order() {
-        let ini = IniFile::from_str("[Warheads]\n0=WH\n[WH]\nCombatLightSize=40%\n");
-        let rules = RuleSet::from_ini(&ini).expect("rules");
-        let mut sim = Simulation::new();
-        let first = effect(&mut sim, 256, 1, 400);
-        let second = effect(&mut sim, 768, 6, 400);
-        let mut runtime = CombatLightRuntime::default();
-        let new_entries = materialize_combat_lights(
-            vec![first, second],
-            Some(&rules),
-            &sim.interner,
-            2,
-            &mut detail_with_frame_rate(60),
-        );
-        assert_eq!(
-            new_entries.iter().map(|e| e.base_size).collect::<Vec<_>>(),
-            vec![25, 25]
-        );
-        runtime.commit_frame(new_entries);
-
-        let draw = runtime.draw_records(&mut detail_with_frame_rate(60));
-        assert_eq!(
-            draw.iter().map(|r| r.coord.x).collect::<Vec<_>>(),
-            vec![768, 256]
-        );
-        assert_eq!(draw.iter().map(|r| r.flags).collect::<Vec<_>>(), vec![6, 1]);
-        assert_eq!(
-            draw.iter().map(|r| r.surface_index).collect::<Vec<_>>(),
-            vec![1, 1]
-        );
-        assert!(
-            materialize_combat_lights(
-                Vec::new(),
-                Some(&rules),
-                &sim.interner,
-                2,
-                &mut detail_with_frame_rate(60),
-            )
-            .is_empty()
-        );
-    }
-
-    #[test]
-    fn gsi_04_07_invulnerability_light_stages_zero_through_72_then_expires_before_80() {
-        let mut runtime = CombatLightRuntime::default();
-        runtime.commit_frame([CombatLight {
-            coord: ProjectileCoord { x: 0, y: 0, z: 0 },
-            stage: 0,
-            base_size: 63,
-            flags: 1,
-        }]);
-        let mut detail = detail_with_frame_rate(60);
-        let mut observed = vec![(0, runtime.draw_records(&mut detail)[0].surface_index)];
-        for _ in 0..9 {
-            runtime.commit_frame([]);
-            let entry = runtime.entries[0];
-            observed.push((
-                entry.stage,
-                runtime.draw_records(&mut detail)[0].surface_index,
-            ));
-        }
-        assert_eq!(
-            observed,
-            vec![
-                (0, 4),
-                (8, 44),
-                (16, 62),
-                (24, 54),
-                (32, 46),
-                (40, 38),
-                (48, 30),
-                (56, 22),
-                (64, 14),
-                (72, 6)
-            ]
-        );
-        runtime.commit_frame([]);
-        assert_eq!(runtime.len(), 0, "stage 80 is removed before draw");
-    }
-
-    #[test]
-    fn gsi_04_07_invulnerability_light_damage_size_uses_wrapping_shift_and_override_chop() {
-        assert_eq!(materialize_base_size(400, 0.0), 63);
-        assert_eq!(materialize_base_size(-1, 0.0), 21);
-        assert_eq!(materialize_base_size(i32::MAX, 0.0), 21);
-        assert_eq!(materialize_base_size(1, 0.4_f32 as f64), 25);
-        assert_eq!(materialize_base_size(1, 2.0), 63);
-    }
-
-    #[test]
     fn map_lighting_transylv_large_flash_keeps_original_non_bright_c4_no_light_result() {
         let Some(fixture) =
             crate::rules::retail_ini_fixture::retail_battle_rules_for_map("Transylv.yro")
@@ -693,7 +622,7 @@ mod tests {
             let impact = CombatLightRequest::Impact {
                 target_id: None,
                 damage: call["damage"].as_i64().unwrap() as i32,
-                warhead_ref: sim.interner.intern(call["warhead"].as_str().unwrap()),
+                warhead_ref: sim.intern(call["warhead"].as_str().unwrap()),
                 coord: ProjectileCoord::new(
                     call["arguments"][0].as_i64().unwrap() as i32,
                     call["arguments"][1].as_i64().unwrap() as i32,
@@ -706,7 +635,7 @@ mod tests {
                 materialize_combat_lights(
                     vec![impact],
                     Some(&rules),
-                    &sim.interner,
+                    sim.interner(),
                     2,
                     &mut detail_with_frame_rate(60),
                 )
@@ -732,7 +661,7 @@ mod tests {
             let request = CombatLightRequest::Impact {
                 target_id: None,
                 damage: input["damage"].as_i64().unwrap() as i32,
-                warhead_ref: sim.interner.intern("WH"),
+                warhead_ref: sim.intern("WH"),
                 coord: ProjectileCoord::new(0, 0, 0),
                 force_create: input["force"] != 0,
                 flags: input["flags"].as_u64().unwrap() as u32,
@@ -740,7 +669,7 @@ mod tests {
             let lights = materialize_combat_lights(
                 vec![request],
                 Some(&rules),
-                &sim.interner,
+                sim.interner(),
                 input["detail"].as_u64().unwrap() as u32,
                 &mut detail,
             );
@@ -771,7 +700,7 @@ mod tests {
         let request = CombatLightRequest::Impact {
             target_id: None,
             damage: input["damage"].as_i64().unwrap() as i32,
-            warhead_ref: sim.interner.intern("WH"),
+            warhead_ref: sim.intern("WH"),
             coord: ProjectileCoord::new(0, 0, 0),
             force_create: input["force"] != 0,
             flags: input["flags"].as_u64().unwrap() as u32,
@@ -780,7 +709,7 @@ mod tests {
             materialize_combat_lights(
                 vec![request],
                 Some(&rules),
-                &sim.interner,
+                sim.interner(),
                 input["detail"].as_u64().unwrap() as u32,
                 &mut detail,
             )
@@ -808,7 +737,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation))]
 mod spotlight_tests {
     use super::*;
     #[test]

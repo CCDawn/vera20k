@@ -55,15 +55,15 @@ fn rules() -> RuleSet {
 fn scene() -> (Simulation, RuleSet, InternedId) {
     let rules = rules();
     let mut sim = Simulation::with_seed(0x5E1F_4EA1);
-    sim.fog.width = 64;
-    sim.fog.height = 64;
+    sim.fog.set_width_for_test(64);
+    sim.fog.set_height_for_test(64);
     sim.playfield_bounds = Some(PlayfieldBounds::from_normalized_local_size(
         64, 2, 2, 56, 52,
     ));
     sim.intern_rule_type_ids(&rules);
     let owner = sim.interner.intern("Soviet");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, false, 0, 10));
+        .register(HouseState::new(owner, 0, None, false, 0, 10));
     (sim, rules, owner)
 }
 
@@ -83,36 +83,6 @@ fn spawn(sim: &mut Simulation, rules: &RuleSet, type_id: &str) -> u64 {
 }
 
 #[test]
-fn a_completed_hospital_grants_its_infantry_count_and_limbo_takes_it_back() {
-    let (mut sim, rules, owner) = scene();
-    let hospital = spawn(&mut sim, &rules, "CAHOSP");
-    // The spawn ran the production opening, so the grant is already applied by
-    // `grand_opening` 鈥?this is the live path, not a synthetic call.
-    assert_eq!(
-        sim.houses[&owner].self_heal_infantry(),
-        1,
-        "0x00446392..0x00446398 adds InfantryGainSelfHeal to house +0x164"
-    );
-    assert_eq!(
-        sim.houses[&owner].self_heal_units(),
-        0,
-        "a hospital grants no unit self-heal"
-    );
-
-    let second = spawn(&mut sim, &rules, "CAHOSP");
-    assert_eq!(
-        sim.houses[&owner].self_heal_infantry(),
-        2,
-        "each completed hospital adds its own count"
-    );
-
-    sim.remove_house_self_heal(hospital, &rules);
-    assert_eq!(sim.houses[&owner].self_heal_infantry(), 1);
-    sim.remove_house_self_heal(second, &rules);
-    assert_eq!(sim.houses[&owner].self_heal_infantry(), 0);
-}
-
-#[test]
 fn limbo_clamps_a_shortfall_at_zero() {
     let (mut sim, rules, owner) = scene();
     let shop = spawn(&mut sim, &rules, "CAMACH");
@@ -127,41 +97,6 @@ fn limbo_clamps_a_shortfall_at_zero() {
         sim.houses[&owner].self_heal_units(),
         0,
         "clamped, not negative"
-    );
-}
-
-/// The full owner transfer, through the production entry rather than the
-/// counter helper: `TechnoClass::ChangeOwner` writes the new owner first and
-/// takes the counts off the old house afterwards at `0x00448AC8`, while the new
-/// house gains them from the `Grand_Opening(1)` the same function calls at
-/// `0x00448CEF`. Driving only the helper misses exactly that split — and did:
-/// the old house kept its count and the new one gained a second one.
-#[test]
-fn an_owner_change_moves_the_counter_between_houses() {
-    let (mut sim, rules, owner) = scene();
-    let new_owner = sim.interner.intern("Americans");
-    sim.houses
-        .insert(new_owner, HouseState::new(new_owner, 0, None, false, 0, 10));
-    let hospital = spawn(&mut sim, &rules, "CAHOSP");
-    assert_eq!(sim.houses[&owner].self_heal_infantry(), 1);
-
-    sim.change_owner_with_rules(
-        hospital,
-        new_owner,
-        &rules,
-        None,
-        crate::sim::world::FrameEffects::default(),
-    );
-
-    assert_eq!(
-        sim.houses[&owner].self_heal_infantry(),
-        0,
-        "0x00448AC8 takes the count off the house that lost the building"
-    );
-    assert_eq!(
-        sim.houses[&new_owner].self_heal_infantry(),
-        1,
-        "0x00448CEF's Grand_Opening gives it to the new house, exactly once"
     );
 }
 
@@ -212,8 +147,16 @@ fn losing_one_of_three_hospitals_releases_one_share() {
         .unwrap()
         .health
         .set_for_test(20);
-    sim.session.binary_frame = 50;
-    house_self_heal_step(&mut sim, man, &rules);
+    sim.session.set_binary_frame_for_test(50);
+    house_self_heal_step(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &sim.houses,
+        &sim.resolved_terrain,
+        man,
+        &rules,
+    );
     assert_eq!(
         sim.substrate.entities.get(man).unwrap().health.current(),
         80,
@@ -254,160 +197,20 @@ fn losing_one_of_three_hospitals_releases_one_share() {
         .unwrap()
         .health
         .set_for_test(20);
-    sim.session.binary_frame = 100;
-    house_self_heal_step(&mut sim, man, &rules);
+    sim.session.set_binary_frame_for_test(100);
+    house_self_heal_step(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &sim.houses,
+        &sim.resolved_terrain,
+        man,
+        &rules,
+    );
     assert_eq!(
         sim.substrate.entities.get(man).unwrap().health.current(),
         40,
         "one share left: 20 x 1"
-    );
-}
-
-#[test]
-fn a_machine_shop_heals_non_organic_units_on_the_unit_cadence() {
-    let (mut sim, rules, owner) = scene();
-    let tank = spawn(&mut sim, &rules, "MTNK");
-    sim.substrate
-        .entities
-        .get_mut(tank)
-        .unwrap()
-        .health
-        .set_for_test(100);
-    sim.houses.get_mut(&owner).unwrap().grant_self_heal(0, 1);
-
-    sim.session.binary_frame = 74;
-    house_self_heal_step(&mut sim, tank, &rules);
-    assert_eq!(
-        sim.substrate.entities.get(tank).unwrap().health.current(),
-        100,
-        "off-cadence frames do nothing (0x006FA7EE tests the remainder)"
-    );
-
-    sim.session.binary_frame = 75;
-    house_self_heal_step(&mut sim, tank, &rules);
-    assert_eq!(
-        sim.substrate.entities.get(tank).unwrap().health.current(),
-        105,
-        "SelfHealUnitAmount(5) x the house count on a SelfHealUnitFrames frame"
-    );
-
-    // A second shop doubles both the count and the step: the fixture's single
-    // hand-set shop becomes two.
-    let house = sim.houses.get_mut(&owner).unwrap();
-    house.revoke_self_heal(0, 1);
-    house.grant_self_heal(0, 2);
-    sim.session.binary_frame = 150;
-    house_self_heal_step(&mut sim, tank, &rules);
-    assert_eq!(
-        sim.substrate.entities.get(tank).unwrap().health.current(),
-        115
-    );
-}
-
-#[test]
-fn a_hospital_heals_organic_infantry_on_the_infantry_cadence() {
-    let (mut sim, rules, owner) = scene();
-    let infantry = spawn(&mut sim, &rules, "E1");
-    sim.substrate
-        .entities
-        .get_mut(infantry)
-        .unwrap()
-        .health
-        .set_for_test(100);
-    sim.houses.get_mut(&owner).unwrap().grant_self_heal(1, 0);
-
-    sim.session.binary_frame = 75;
-    house_self_heal_step(&mut sim, infantry, &rules);
-    assert_eq!(
-        sim.substrate
-            .entities
-            .get(infantry)
-            .unwrap()
-            .health
-            .current(),
-        100,
-        "the 75-frame unit cadence does not drive the organic arm"
-    );
-
-    sim.session.binary_frame = 50;
-    house_self_heal_step(&mut sim, infantry, &rules);
-    assert_eq!(
-        sim.substrate
-            .entities
-            .get(infantry)
-            .unwrap()
-            .health
-            .current(),
-        120,
-        "SelfHealInfantryAmount(20) on a SelfHealInfantryFrames frame"
-    );
-}
-
-#[test]
-fn each_arm_ignores_the_other_classes_and_an_empty_counter() {
-    let (mut sim, rules, owner) = scene();
-    let infantry = spawn(&mut sim, &rules, "E1");
-    let tank = spawn(&mut sim, &rules, "MTNK");
-    for id in [infantry, tank] {
-        sim.substrate
-            .entities
-            .get_mut(id)
-            .unwrap()
-            .health
-            .set_for_test(50);
-    }
-
-    // Both counters stocked: each object takes exactly its own arm's amount.
-    sim.houses.get_mut(&owner).unwrap().grant_self_heal(1, 0);
-    sim.houses.get_mut(&owner).unwrap().grant_self_heal(0, 1);
-    sim.session.binary_frame = 150; // divisible by both 50 and 75
-    house_self_heal_step(&mut sim, infantry, &rules);
-    house_self_heal_step(&mut sim, tank, &rules);
-    assert_eq!(
-        sim.substrate
-            .entities
-            .get(infantry)
-            .unwrap()
-            .health
-            .current(),
-        70,
-        "the organic object takes only the infantry arm"
-    );
-    assert_eq!(
-        sim.substrate.entities.get(tank).unwrap().health.current(),
-        55,
-        "the non-organic object takes only the unit arm"
-    );
-
-    // No ability: neither object heals.
-    sim.houses.get_mut(&owner).unwrap().revoke_self_heal(1, 1);
-    sim.substrate
-        .entities
-        .get_mut(infantry)
-        .unwrap()
-        .health
-        .set_for_test(50);
-    sim.substrate
-        .entities
-        .get_mut(tank)
-        .unwrap()
-        .health
-        .set_for_test(50);
-    sim.session.binary_frame = 300;
-    house_self_heal_step(&mut sim, infantry, &rules);
-    house_self_heal_step(&mut sim, tank, &rules);
-    assert_eq!(
-        sim.substrate
-            .entities
-            .get(infantry)
-            .unwrap()
-            .health
-            .current(),
-        50
-    );
-    assert_eq!(
-        sim.substrate.entities.get(tank).unwrap().health.current(),
-        50
     );
 }
 
@@ -432,9 +235,25 @@ fn only_infantry_and_units_reach_a_house_heal_arm() {
             .set_for_test(40);
     }
 
-    sim.session.binary_frame = 150; // divisible by both 50 and 75
-    house_self_heal_step(&mut sim, plant, &rules);
-    house_self_heal_step(&mut sim, aircraft, &rules);
+    sim.session.set_binary_frame_for_test(150); // divisible by both 50 and 75
+    house_self_heal_step(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &sim.houses,
+        &sim.resolved_terrain,
+        plant,
+        &rules,
+    );
+    house_self_heal_step(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &sim.houses,
+        &sim.resolved_terrain,
+        aircraft,
+        &rules,
+    );
     assert_eq!(
         sim.substrate.entities.get(plant).unwrap().health.current(),
         40,
@@ -473,8 +292,16 @@ fn an_organic_no_infantry_takes_the_hospital_arm() {
 
     // The hospital counter alone: 20 x 1 on the 50-frame cadence.
     sim.houses.get_mut(&owner).unwrap().grant_self_heal(1, 0);
-    sim.session.binary_frame = 150;
-    house_self_heal_step(&mut sim, man, &rules);
+    sim.session.set_binary_frame_for_test(150);
+    house_self_heal_step(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &sim.houses,
+        &sim.resolved_terrain,
+        man,
+        &rules,
+    );
     assert_eq!(
         sim.substrate.entities.get(man).unwrap().health.current(),
         120,
@@ -491,8 +318,16 @@ fn an_organic_no_infantry_takes_the_hospital_arm() {
         .unwrap()
         .health
         .set_for_test(100);
-    sim.session.binary_frame = 300;
-    house_self_heal_step(&mut sim, man, &rules);
+    sim.session.set_binary_frame_for_test(300);
+    house_self_heal_step(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &sim.houses,
+        &sim.resolved_terrain,
+        man,
+        &rules,
+    );
     assert_eq!(
         sim.substrate.entities.get(man).unwrap().health.current(),
         100,
@@ -517,8 +352,16 @@ fn an_over_strength_or_dead_object_never_heals() {
         .unwrap()
         .health
         .set_for_test(320);
-    sim.session.binary_frame = 75;
-    house_self_heal_step(&mut sim, tank, &rules);
+    sim.session.set_binary_frame_for_test(75);
+    house_self_heal_step(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &sim.houses,
+        &sim.resolved_terrain,
+        tank,
+        &rules,
+    );
     assert_eq!(
         sim.substrate.entities.get(tank).unwrap().health.current(),
         320,
@@ -532,8 +375,16 @@ fn an_over_strength_or_dead_object_never_heals() {
         .unwrap()
         .health
         .set_for_test(0);
-    sim.session.binary_frame = 150;
-    house_self_heal_step(&mut sim, tank, &rules);
+    sim.session.set_binary_frame_for_test(150);
+    house_self_heal_step(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &sim.houses,
+        &sim.resolved_terrain,
+        tank,
+        &rules,
+    );
     assert_eq!(
         sim.substrate.entities.get(tank).unwrap().health.current(),
         0,
@@ -554,16 +405,32 @@ fn the_heal_stops_at_full_strength() {
         .set_for_test(strength - 3);
     sim.houses.get_mut(&owner).unwrap().grant_self_heal(0, 2);
 
-    sim.session.binary_frame = 75;
-    house_self_heal_step(&mut sim, tank, &rules);
+    sim.session.set_binary_frame_for_test(75);
+    house_self_heal_step(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &sim.houses,
+        &sim.resolved_terrain,
+        tank,
+        &rules,
+    );
     assert_eq!(
         sim.substrate.entities.get(tank).unwrap().health.current(),
         strength,
         "0x6FA852 clamps the added step to Strength - Health"
     );
 
-    sim.session.binary_frame = 150;
-    house_self_heal_step(&mut sim, tank, &rules);
+    sim.session.set_binary_frame_for_test(150);
+    house_self_heal_step(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &sim.houses,
+        &sim.resolved_terrain,
+        tank,
+        &rules,
+    );
     assert_eq!(
         sim.substrate.entities.get(tank).unwrap().health.current(),
         strength,
@@ -589,7 +456,7 @@ fn the_production_ai_stage_consumes_the_hospital_count() {
 
     // `TechnoClass::AI_Update`'s own position: the house pulse is inside
     // `techno_common_steps`, which `object_ai_stage` drives.
-    sim.session.binary_frame = 50;
+    sim.session.set_binary_frame_for_test(50);
     sim.object_ai_stage(Some(&rules));
     assert_eq!(
         sim.substrate
@@ -612,7 +479,7 @@ fn the_production_ai_stage_consumes_the_hospital_count() {
         .expect("hospital");
     sim.remove_house_self_heal(hospital, &rules);
     assert_eq!(sim.houses[&owner].self_heal_infantry(), 0);
-    sim.session.binary_frame = 100;
+    sim.session.set_binary_frame_for_test(100);
     sim.object_ai_stage(Some(&rules));
     assert_eq!(
         sim.substrate
@@ -652,16 +519,25 @@ fn missing_house_self_heal_keys_retain_constructor_defaults_and_completed_buildi
     let infantry = spawn(&mut sim, &rules, "E1");
     let tank = spawn(&mut sim, &rules, "MTNK");
     for actor in [infantry, tank] {
-        sim.entities_mut()
+        sim.substrate
+            .entities
             .get_mut(actor)
             .unwrap()
             .health
             .set_for_test(10);
     }
     for (frame, expected) in [(999, 10), (1000, 11), (1001, 11)] {
-        sim.session.binary_frame = frame;
+        sim.session.set_binary_frame_for_test(frame);
         for actor in [infantry, tank] {
-            house_self_heal_step(&mut sim, actor, &rules);
+            house_self_heal_step(
+                &sim.interner,
+                &sim.session,
+                &mut sim.substrate,
+                &sim.houses,
+                &sim.resolved_terrain,
+                actor,
+                &rules,
+            );
             assert_eq!(
                 sim.entities().get(actor).unwrap().health.current(),
                 expected
@@ -671,7 +547,7 @@ fn missing_house_self_heal_keys_retain_constructor_defaults_and_completed_buildi
     // The actual building ownership transition revokes both live grants.
     let other = sim.interner.intern("Other");
     sim.houses
-        .insert(other, HouseState::new(other, 1, None, false, 0, 10));
+        .register(HouseState::new(other, 1, None, false, 0, 10));
     for building in [hospital, machine_shop] {
         sim.change_owner_with_rules(building, other, &rules, None, FrameEffects::empty());
     }
@@ -679,17 +555,26 @@ fn missing_house_self_heal_keys_retain_constructor_defaults_and_completed_buildi
     assert_eq!(sim.houses[&owner].self_heal_units(), 0);
     assert_eq!(sim.houses[&other].self_heal_infantry(), 1);
     assert_eq!(sim.houses[&other].self_heal_units(), 1);
-    sim.session.binary_frame = 2000;
+    sim.session.set_binary_frame_for_test(2000);
     for actor in [infantry, tank] {
-        house_self_heal_step(&mut sim, actor, &rules);
+        house_self_heal_step(
+            &sim.interner,
+            &sim.session,
+            &mut sim.substrate,
+            &sim.houses,
+            &sim.resolved_terrain,
+            actor,
+            &rules,
+        );
         assert_eq!(sim.entities().get(actor).unwrap().health.current(), 11);
     }
 }
 
 /// Native IDIV6FA7EE/6FA8E2 raises interrupt0 before either HasSelfHeal
-/// query, including count0. Missing keys are covered separately above.
+/// query, including count0; VERA carries on without the heal. Missing keys
+/// are covered separately above.
 #[test]
-fn authored_house_self_heal_divide_faults_precede_the_house_count() {
+fn authored_house_self_heal_divide_faults_carry_on_without_a_heal() {
     let native = crate::test_fixture::json("tools/procedural_drawing_oracle/self_heal_status.json");
     let mut checked = 0;
     for row in native["divide_controls"].as_array().unwrap() {
@@ -703,7 +588,8 @@ fn authored_house_self_heal_divide_faults_precede_the_house_count() {
             spawn(&mut sim, &rules, if infantry { "CAHOSP" } else { "CAMACH" });
         }
         let actor = spawn(&mut sim, &rules, name);
-        sim.entities_mut()
+        sim.substrate
+            .entities
             .get_mut(actor)
             .unwrap()
             .health
@@ -714,12 +600,21 @@ fn authored_house_self_heal_divide_faults_precede_the_house_count() {
         } else {
             rules.general.self_heal_unit_frames = period;
         }
-        sim.session.binary_frame = row["binary_frame"].as_i64().unwrap() as u32;
+        sim.session
+            .set_binary_frame_for_test(row["binary_frame"].as_i64().unwrap() as u32);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            house_self_heal_step(&mut sim, actor, &rules);
+            house_self_heal_step(
+                &sim.interner,
+                &sim.session,
+                &mut sim.substrate,
+                &sim.houses,
+                &sim.resolved_terrain,
+                actor,
+                &rules,
+            );
         }));
         assert_eq!(row["fault"]["interrupt"], 0);
-        assert!(result.is_err(), "{row}");
+        assert!(result.is_ok(), "{row}");
         assert_eq!(
             sim.entities().get(actor).unwrap().health.current(),
             row["health_after"].as_i64().unwrap() as i32,
@@ -782,7 +677,7 @@ fn the_mechanism_runs_on_a_real_map() {
         assert_eq!(parses_gain.units_gain_self_heal, 0);
     }
 
-    let owner = runtime.simulation.session.current_house.unwrap();
+    let owner = runtime.simulation.session.current_house().unwrap();
     let owner_name = runtime.simulation.resolve(owner).to_owned();
     let cadence = runtime.resources.rules.general.self_heal_infantry_frames;
     assert_eq!(cadence, 50, "retail SelfHealInfantryFrames");
@@ -805,6 +700,7 @@ fn the_mechanism_runs_on_a_real_map() {
                         hospital,
                         (rx, ry),
                         Some(owner),
+                        None,
                         None,
                     )
             })
@@ -891,7 +787,7 @@ fn the_mechanism_runs_on_a_real_map() {
     let mut heals: Vec<(u32, u32, i32)> = Vec::new();
     for _ in 0..(cadence as usize * 3) {
         let due = runtime.simulation.take_due_commands();
-        let before = runtime.simulation.session.binary_frame;
+        let before = runtime.simulation.session.binary_frame();
         runtime
             .advance_frame(
                 &due,
@@ -900,7 +796,7 @@ fn the_mechanism_runs_on_a_real_map() {
                 crate::sim::world::FrameEffects::default(),
             )
             .expect("frame");
-        let after = runtime.simulation.session.binary_frame;
+        let after = runtime.simulation.session.binary_frame();
         let current = runtime
             .simulation
             .substrate

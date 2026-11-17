@@ -20,12 +20,12 @@
 //! `tools/spatial_oracle/track_blocked_timers`.
 //!
 //! Residuals:
-//! - `vt+0x37C` (Unit `0x746C90`: the EMP lock Techno+504 or the Unit
-//!   death-frame counter +6D8): neither has a Rust producer (VERA has no EMP
-//!   mechanism; see `techno_ai_cloak`), so the prologue gate reads false.
+//! - `vt+0x37C` (`GameEntity::is_under_emp`: EMP, or a Unit's running
+//!   `DeathFrames=` counter) is not asked, so the prologue gate reads false.
 //!   Trigger: an EMP'd or dying Unit. Effect: it could start a track native
-//!   refuses. Frequency: no stock EMP source is proven reachable. Risk: this
-//!   gate is a consumer of the EMP system when it lands.
+//!   refuses. Frequency: Ares EMP; a death counter only on a modded
+//!   `Crashable=` `DeathFrames=` Unit, whose Health of 0 stops the missions
+//!   that would move it. Risk: modded EMP.
 //! - Crates (`CellClass::PickupCrate 0x481A00` at `0x4B405D` and
 //!   `0x4B46E6`) run through [`Simulation::pickup_crate_at`]; a host called
 //!   without the OverlayType table answers as a cell without a crate (the
@@ -33,11 +33,8 @@
 //! - Terrain blockers retain the actual Object target through the shared
 //!   code-4/5 Override arm (4B3B8D..4B3BE9). The ordinary route must first
 //!   admit that cell; a blocked zone can reject a destination before this arm.
-//! - Drive's retained +64 now feeds the wall pre-entry tilt in `track_host`.
-//!   The separate CrusherAll/current-Unit arm4B1A04..4B1A58 still lacks its
-//!   Foot+6B5 producer/speed-clamp integration. Selected stock MTNK's zone0
-//!   does not enter it. Ship's distinct +64 constructor/fresh writers and
-//!   reader6A103A are outside that Drive wall-tilt path and remain unported.
+//! - Ship's distinct +64 constructor/fresh writers and reader6A103A remain
+//!   unported. Drive's +64 wall/CrusherAll pre-entry paths live in `track_host`.
 //! - A candidate at a negative cell coordinate publishes no target speed
 //!   (`publish_fresh_speed`); native reads the shared dummy Cell's land row.
 //!   Trigger: a Foot on map row or column 0 heading off the map. Frequency:
@@ -55,6 +52,7 @@ use super::foot_path::{FindPathResult, FootPathOutcome, coord_cell};
 use super::ground_pose;
 use super::infantry_entry::InfantryEntryArgs;
 use super::movement_tick::FootPathRequest;
+use super::path_batch::WaitingRequest;
 use super::track_fresh_dispatch::{
     FreshDispatch, FreshStage, coerce_entry_code, dispatch_entry, normalize_second_direction,
 };
@@ -63,16 +61,16 @@ use super::track_process::TrackFamily;
 use crate::map::entities::EntityCategory;
 use crate::rules::locomotor_type::MovementZone;
 use crate::rules::mission_data::MissionType;
-use crate::rules::object_type::Ability;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::cell_kernel::native_xyz_distance;
 use crate::sim::combat::TargetKind;
-use crate::sim::combat::veterancy::has_weapon_ability;
 use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::game_entity::GameEntity;
 use crate::sim::movement::locomotor::MovementLayer;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::world::FrameEffects;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
 use crate::util::direction::TUBE_STEP_DIRECTION;
 use crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS;
@@ -97,6 +95,36 @@ impl ProcessMovementArgs {
         allow_retry: false,
         force_single: false,
     };
+
+    /// The request a batched no-queue arm with these arguments waits as: the
+    /// outer call's (1, 0), a retry recursion's (0, 0), or the second stage's
+    /// code-4/5 re-entry (argument 2, 1); see `path_batch`.
+    fn waiting_request(self) -> WaitingRequest {
+        match self {
+            Self {
+                allow_retry,
+                force_single: true,
+            } => WaitingRequest::StraightReentry { allow_retry },
+            Self {
+                allow_retry: false, ..
+            } => WaitingRequest::RetryRecursion,
+            Self {
+                allow_retry: true, ..
+            } => WaitingRequest::NoQueue,
+        }
+    }
+
+    /// The arguments of the recursion `request` waited for.
+    fn of_recursion(request: WaitingRequest) -> Option<Self> {
+        match request {
+            WaitingRequest::RetryRecursion => Some(Self::RETRY),
+            WaitingRequest::StraightReentry { allow_retry } => Some(Self {
+                allow_retry,
+                force_single: true,
+            }),
+            WaitingRequest::NoQueue | WaitingRequest::Code2Ladder { .. } => None,
+        }
+    }
 }
 
 /// Mark0/Mark1 and the per-call services the arm reaches.
@@ -113,7 +141,7 @@ struct FreshCall<'a> {
 fn path_word(entity: &GameEntity, index: usize) -> Option<u8> {
     entity
         .navigation
-        .path_replay
+        .path_replay()
         .remaining_directions()
         .get(index)
         .copied()
@@ -164,12 +192,7 @@ impl Simulation {
                 .expect("same Process_Movement owner");
             clear_track_head(actor);
             if mission == Some(MissionType::Move) {
-                return Ok(self.unit_enter_idle_mode(
-                    id,
-                    Some(call.rules),
-                    false,
-                    call.frame_effects,
-                ));
+                return Ok(self.unit_enter_idle_mode(id, call.rules, false, call.frame_effects));
             }
             return Ok(false);
         }
@@ -189,17 +212,17 @@ impl Simulation {
             return Ok(false);
         }
         //4B2741..4B2761: vt+37C (Unit 0x746C90: the EMP lock +504 or the
-        //death-frame counter +6D8, neither represented; see the residual) and
+        //death-frame counter +6D8, not asked; see the residual) and
         //vt+380, FootClass::IsParalyzed 0x4DE770 (the Foot+6A0 timer a
         //parasite arms), return with the out byte clear. Ship's vt+380 gate
         //is6A1DA9. The consumed track_fresh_response controls cover both
         //families with active and expired timers through this shared owner.
-        if actor.parasite.is_paralyzed(self.session.binary_frame) {
+        if actor.parasite.is_paralyzed(self.session.binary_frame()) {
             return Ok(false);
         }
         let head = if head.is_some() {
             if let Some(destination) = track_destination(actor) {
-                self.trim_path_for_object_navcom(id, destination);
+                self.substrate.trim_path_for_object_navcom(id, destination);
             }
             self.substrate
                 .entities
@@ -215,52 +238,11 @@ impl Simulation {
         }
     }
 
-    /// 0x4B2770..0x4B2813 (Hover 0x005163EC..0x00516485): while NavCom is a
-    /// Unit or an Infantry, the path is cut at the cell count of
-    /// |Foot - destination| (Distance3D >> 8) when that is below 24, so a
-    /// chase re-plans as it closes in. Returns whether it cut.
-    pub(super) fn trim_path_for_object_navcom(&mut self, id: u64, destination: DriveCoord) -> bool {
-        let Some(actor) = self.substrate.entities.get(id) else {
-            return false;
-        };
-        let object = match actor.navigation.nav_com() {
-            Some(NavTargetRef::Object { id: object }) => object,
-            _ => return false,
-        };
-        if !self.substrate.entities.get(object).is_some_and(|nav| {
-            matches!(
-                nav.category(),
-                EntityCategory::Unit | EntityCategory::Infantry
-            )
-        }) {
-            return false;
-        }
-        let location = ground_pose::position_world_coord(&actor.position);
-        let distance = crate::util::native_x87::distance_3d_leptons(
-            [location.x, location.y, location.z],
-            [destination.x, destination.y, destination.z],
-        );
-        let cells = crate::util::lepton::lepton_to_cell(distance);
-        if cells >= 24 {
-            return false;
-        }
-        let queue = &mut self
-            .substrate
-            .entities
-            .get_mut(id)
-            .expect("same NavCom trim owner")
-            .navigation
-            .path_replay;
-        let slot = usize::from(queue.cursor()) + cells as usize;
-        queue.set_direction(slot, u8::MAX);
-        true
-    }
-
     /// 0x4B281C..0x4B2845 then track_path's request and continuations. A found
     /// route resumes head selection in the same call (0x4B3282..0x4B3298).
     fn track_no_queue_arm(&mut self, call: &FreshCall<'_>) -> Result<bool, String> {
         let id = call.id;
-        let frame = self.session.binary_frame as i32;
+        let frame = self.session.binary_frame() as i32;
         let actor = self
             .substrate
             .entities
@@ -269,7 +251,7 @@ impl Simulation {
         //4B281C..4B2845: the Foot+640 exact-zero wait.
         if !actor
             .navigation
-            .path_runtime
+            .path_runtime()
             .movement_timer()
             .expired(frame)
         {
@@ -277,17 +259,36 @@ impl Simulation {
         }
         let destination = track_destination(actor).ok_or("no-queue arm without destination")?;
         // A batched request waits for the next frame's batch as if the timer
-        // still ran (`path_batch`, a proposed deviation). So does a
-        // recursion's (the retries at 0x4B397F, 0x4B4480 and the 0x4B4541
-        // tail, the second stage's re-entries at 0x4B41B3 and 0x4B420B),
-        // unless it is the Foot's first request in a frame the batch answered.
-        if self.defer_path_search(id, super::path_batch::WaitingRequest::NoQueue) {
+        // still ran (`path_batch`, a sim-scale deviation). So does a
+        // recursion's, unless it is the Foot's first request in a frame the
+        // batch answered: a retry's (Drive 0x4B397F, 0x4B4480 and the 0x4B4541
+        // tail at 0x4B4552; Ship 0x6A2FCE, 0x6A3AAC, 0x6A3B7E) and the second
+        // stage's code-4/5 re-entry, which clears the path (Drive 0x4B41F7,
+        // Ship 0x6A3823). A recursion's request registers as that recursion,
+        // and the request that takes its answer resumes with the recursion's
+        // arguments, as the recursion runs. A request for the Foot's own cell
+        // never waits.
+        let resumed = self
+            .answered_recursion(id)
+            .and_then(ProcessMovementArgs::of_recursion);
+        if Self::defer_path_search(
+            &mut self.path_batch,
+            &self.resolved_terrain,
+            &self.overlay_grid,
+            &self.substrate.entities,
+            id,
+            call.args.waiting_request(),
+        ) {
             return Ok(false);
         }
+        let call = &match resumed {
+            Some(args) => call.with_args(args),
+            None => *call,
+        };
         let request = self.track_path_request(call, destination, 0)?;
         match self.run_track_path_request(
             &request,
-            Some(call.rules),
+            call.rules,
             call.registry,
             call.frame_effects,
         )? {
@@ -318,7 +319,7 @@ impl Simulation {
             call.id,
             destination,
             urgency,
-            self.playfield_bounds,
+            self.playfield_bounds(),
         )
         .ok_or_else(|| "retired Drive/Ship Find_Path requester".into())
     }
@@ -331,7 +332,7 @@ impl Simulation {
         if direction == TUBE_STEP_DIRECTION {
             return Ok(false);
         }
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         let terrain = self
             .resolved_terrain
             .as_ref()
@@ -353,7 +354,7 @@ impl Simulation {
         let bridge_mismatch = (cells.flags(cells.lookup(cell)) & 0x100 != 0) != actor.on_bridge();
         let door_closed = actor.door_phase() == crate::sim::door::DoorPhase::ClosedStable;
         if bridge_mismatch {
-            self.latch_foot_68b(id);
+            self.substrate.latch_foot_68b(id);
         }
         //4B3398..4B33A5: Unit744180 admits only the shared Techno door's
         //closed-stable predicate. Unit Move closes that same door.
@@ -377,13 +378,18 @@ impl Simulation {
             .get(id)
             .ok_or("retired Drive/Ship fresh owner")?;
         if !fresh_heading_ready(actor.body_facing_current(frame), direction) {
-            self.track_do_turn(id, u16::from(direction) << 13);
+            Self::track_do_turn(
+                &self.session,
+                &mut self.substrate,
+                id,
+                u16::from(direction) << 13,
+            );
             return Ok(false);
         }
         //4B345B..4B34D1: Mark0, Unit+1AC(cell, dir, height, 0, 1), Mark1.
-        self.foot_mark_remove(id, Some(rules), call.registry, call.frame_effects);
+        self.foot_mark_remove(id, rules, call.registry, call.frame_effects);
         let code = self.track_can_enter(call, cell, direction, height)?;
-        self.foot_mark_put(id, Some(rules), call.registry, call.frame_effects);
+        self.foot_mark_put(id, rules, call.registry, call.frame_effects);
         let object = self.track_object(id, rules)?;
         let overlay = self.track_overlay(cell);
         //4B34D7..4B351D: the train and crusher coercions.
@@ -413,7 +419,7 @@ impl Simulation {
                 //4B394D..4B3984: ground contact callbacks, then recursion.
                 self.uncloak_contacts_at_cell(cell, rules)?;
                 if retry.is_some() {
-                    self.clear_path_head(id);
+                    self.substrate.clear_path_head(id);
                     return self
                         .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
                 }
@@ -431,16 +437,16 @@ impl Simulation {
                     id,
                     rules,
                 );
-                self.track_first_rejected_tail(id);
+                self.substrate.track_first_rejected_tail(id);
                 Ok(false)
             }
             FreshDispatch::WallOrObject { retry } => {
-                self.clear_track_head_of(id);
+                self.substrate.clear_track_head_of(id);
                 if retry.is_some() {
                     //4B3AD3..4B3AFE then 4B4541: drop the head, expire the
                     //movement timer and recurse.
-                    self.clear_path_head(id);
-                    self.expire_movement_timer(id);
+                    self.substrate.clear_path_head(id);
+                    Self::expire_movement_timer(&self.session, &mut self.substrate, id);
                     return self
                         .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
                 }
@@ -455,16 +461,16 @@ impl Simulation {
                 );
                 //4B3C67..4B3C81: code != 7 retires the selector.
                 if let Some(actor) = self.substrate.entities.get_mut(id) {
-                    actor.navigation.path_runtime.clear_scold_latch();
+                    actor.navigation.path_runtime_mut().clear_scold_latch();
                 }
-                self.track_retire_selector(id);
+                self.substrate.track_retire_selector(id);
                 Ok(false)
             }
             FreshDispatch::ScatterOrStop { retry, .. } => {
                 if retry.is_some() {
                     //4B3721..4B373D then 4B4541.
-                    self.clear_path_head(id);
-                    self.expire_movement_timer(id);
+                    self.substrate.clear_path_head(id);
+                    Self::expire_movement_timer(&self.session, &mut self.substrate, id);
                     return self
                         .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
                 }
@@ -485,18 +491,18 @@ impl Simulation {
                         call.frame_effects,
                     )?;
                 }
-                self.track_first_rejected_tail(id);
+                self.substrate.track_first_rejected_tail(id);
                 Ok(false)
             }
             FreshDispatch::FirstOtherBlocked { retry } => {
                 //4B3607 then4B3AA1..4B3ACE / 6A30F3..6A311D. The sound
                 //guard is NOT cleared before the possible code7 recursion.
-                self.clear_track_head_of(id);
-                self.play_foot_path_scold(id, rules);
+                self.substrate.clear_track_head_of(id);
+                Self::play_foot_path_scold(&self.substrate, &mut self.sound_events, id, rules);
                 if retry.is_some() {
                     //4B3BF6..4B3C21 then 4B4541.
-                    self.clear_path_head(id);
-                    self.expire_movement_timer(id);
+                    self.substrate.clear_path_head(id);
+                    Self::expire_movement_timer(&self.session, &mut self.substrate, id);
                     return self
                         .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
                 }
@@ -513,37 +519,23 @@ impl Simulation {
         }
     }
 
-    /// 0x4B3607 then 0x4B3AA1..0x4B3C81 for a code other than 2/4/5/7: clear
-    /// the head; Foot+68A = 0 and the selector retires. This is a silent
-    /// exit, distinct from the code7 sound/retry corridor.
-    fn track_first_rejected_tail(&mut self, id: u64) {
-        self.clear_track_head_of(id);
-        if let Some(actor) = self.substrate.entities.get_mut(id) {
-            actor.navigation.path_runtime.clear_scold_latch();
-        }
-        self.track_retire_selector(id);
-    }
-
     /// 0x4B3607..0x4B3A94: the first candidate's code-2 ladder.
     fn track_blocked_delay(&mut self, call: &FreshCall<'_>) -> Result<bool, String> {
         let id = call.id;
         let rules = call.rules;
-        let frame = self.session.binary_frame;
-        self.clear_track_head_of(id);
+        let frame = self.session.binary_frame();
+        self.substrate.clear_track_head_of(id);
         let actor = self
             .substrate
             .entities
             .get_mut(id)
             .ok_or("retired Drive/Ship code-2 owner")?;
-        let runtime = &mut actor.navigation.path_runtime;
+        let runtime = actor.navigation.path_runtime_mut();
         //4B3656..4B368D: the latch arms the blockage timer once.
-        if !runtime.path_blocked() {
-            runtime.set_path_blocked(true);
-            runtime.start_blocked(frame, rules.general.blockage_path_delay_ticks);
-        }
+        runtime.latch_blockage(frame, rules.general.blockage_path_delay_ticks);
         //4B3690..4B36B6: while the movement timer runs, the rejected tail.
         if !runtime.movement_timer().expired(frame as i32) {
-            self.track_first_rejected_tail(id);
+            self.substrate.track_first_rejected_tail(id);
             return Ok(false);
         }
         //4B36BC..4B36EF / 4B39D1..4B3A0E: urgency 2 once the latched
@@ -552,12 +544,17 @@ impl Simulation {
         let destination = super::path_batch::code2_ladder_destination(actor)
             .ok_or("Drive/Ship code-2 ladder without a track locomotor")?;
         // A batched re-path waits for the next frame's batch as if the timer
-        // still ran (`path_batch`, a proposed deviation).
-        if self.defer_path_search(
+        // still ran (`path_batch`, a sim-scale deviation), unless it heads for
+        // the Foot's own cell.
+        if Self::defer_path_search(
+            &mut self.path_batch,
+            &self.resolved_terrain,
+            &self.overlay_grid,
+            &self.substrate.entities,
             id,
             super::path_batch::WaitingRequest::Code2Ladder { urgency },
         ) {
-            self.track_first_rejected_tail(id);
+            self.substrate.track_first_rejected_tail(id);
             return Ok(false);
         }
         // An answered re-path searches at the urgency it registered at.
@@ -577,13 +574,13 @@ impl Simulation {
             if let Some(actor) = self.substrate.entities.get_mut(id) {
                 actor
                     .navigation
-                    .path_runtime
+                    .path_runtime_mut()
                     .start_movement(frame, rules.general.path_delay_ticks());
             }
             return Ok(false);
         }
         //4B3A3E..4B3A56: SetDestination(NULL, 1).
-        self.set_unit_null_destination(id, Some(rules), None, call.frame_effects);
+        self.set_unit_null_destination(id, rules, None, call.frame_effects);
         Ok(false)
     }
 
@@ -640,7 +637,7 @@ impl Simulation {
                     }
                     //4B3F58..4B3F6E: an unreachable live destination clears.
                     if !self.foot_path_zone_precheck(id, self.live_track_destination(id), rules)? {
-                        self.set_unit_null_destination(id, Some(rules), None, call.frame_effects);
+                        self.set_unit_null_destination(id, rules, None, call.frame_effects);
                     }
                 }
                 second = self
@@ -724,7 +721,7 @@ impl Simulation {
         let picked = self.pickup_crate_at(
             id,
             coord_cell(candidate),
-            Some(call.rules),
+            call.rules,
             call.registry,
             call.frame_effects,
         );
@@ -777,7 +774,7 @@ impl Simulation {
             FreshDispatch::Accept => {
                 //4B45CB..4B45F4: shift two words, Foot+68B = 1, then the
                 //finalize tail.
-                self.latch_foot_68b(id);
+                self.substrate.latch_foot_68b(id);
                 self.track_fresh_finalize(call, Some(second_candidate), 2, turn_index)
             }
             FreshDispatch::Gate { .. } => {
@@ -799,8 +796,8 @@ impl Simulation {
             }
             FreshDispatch::ClearSecondThenRetry(retry) => {
                 //4B41B3..4B41F7: clear, then recurse with arg3 = 1.
-                self.clear_path_head(id);
-                self.track_retire_selector(id);
+                self.substrate.clear_path_head(id);
+                self.substrate.track_retire_selector(id);
                 self.track_process_movement(&call.with_args(ProcessMovementArgs {
                     allow_retry: retry.allow_retry,
                     force_single: retry.force_single_direction,
@@ -809,8 +806,8 @@ impl Simulation {
             FreshDispatch::ScatterOrStop { retry, .. } => {
                 if retry.is_some() {
                     //4B424E..4B426E then 4B4541.
-                    self.clear_path_head(id);
-                    self.expire_movement_timer(id);
+                    self.substrate.clear_path_head(id);
+                    Self::expire_movement_timer(&self.session, &mut self.substrate, id);
                     return self
                         .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
                 }
@@ -835,7 +832,7 @@ impl Simulation {
                 //4B444A..4B4485: ground contact callbacks, then recursion.
                 self.uncloak_contacts_at_cell(second_cell, rules)?;
                 if retry.is_some() {
-                    self.clear_path_head(id);
+                    self.substrate.clear_path_head(id);
                     return self
                         .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
                 }
@@ -846,8 +843,8 @@ impl Simulation {
             FreshDispatch::SecondRetryOrStop { retry } => {
                 if retry.is_some() {
                     //4B4521..4B453D then 4B4541.
-                    self.clear_path_head(id);
-                    self.expire_movement_timer(id);
+                    self.substrate.clear_path_head(id);
+                    Self::expire_movement_timer(&self.session, &mut self.substrate, id);
                     return self
                         .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
                 }
@@ -866,8 +863,8 @@ impl Simulation {
     /// 0x4B41B3..0x4B41E7 for a refused second candidate that does not
     /// recurse, then the finalize tail with a null candidate.
     fn track_second_refused(&mut self, call: &FreshCall<'_>) -> Result<bool, String> {
-        self.clear_path_head(call.id);
-        self.track_retire_selector(call.id);
+        self.substrate.clear_path_head(call.id);
+        self.substrate.track_retire_selector(call.id);
         self.track_fresh_finalize(call, None, 0, 0)
     }
 
@@ -889,33 +886,24 @@ impl Simulation {
         //4B460C..4B4659: +63C = -1 (the shift's terminator), +558 = the
         //candidate's cell, Foot+68A = 0, class +5C = 0, then the head clears.
         let reference = candidate.map_or((0, 0), coord_cell);
-        actor.navigation.path_runtime.clear_scold_latch();
+        actor.navigation.path_runtime_mut().clear_scold_latch();
         clear_track_head(actor);
         let Some(candidate) = candidate else {
-            actor
-                .navigation
-                .path_replay
-                .set_reference_cell(Some(reference));
-            return self.track_finalize_stop(id);
+            actor.navigation.path_replay_mut().rebase(reference);
+            return self.substrate.track_finalize_stop(id);
         };
-        super::path_markers::accept_path_replay(
-            &mut actor.navigation.path_replay,
-            reference,
-            consumed,
-        );
+        actor
+            .navigation
+            .path_replay_mut()
+            .accept(reference, consumed);
         //4B46C3..4B46D7: install the selector and head (+63 = 1).
         if let Some(loco) = actor.locomotor.as_mut() {
             super::track_head::accept_fresh_progress(loco, turn_index);
             loco.store_track_head(call.family, Some(candidate));
         }
         //4B46DF..4B46FA: the crate question on the head, then limbo.
-        let picked = self.pickup_crate_at(
-            id,
-            reference,
-            Some(call.rules),
-            call.registry,
-            call.frame_effects,
-        );
+        let picked =
+            self.pickup_crate_at(id, reference, call.rules, call.registry, call.frame_effects);
         let actor = self
             .substrate
             .entities
@@ -923,7 +911,15 @@ impl Simulation {
             .ok_or("retired Drive/Ship finalize owner")?;
         if picked && !actor.lifecycle.in_limbo() {
             //4B46FC..4B4705: Apply_Track_Occupation_Mode(head, 1).
-            self.track_apply_occupation(id, call.family, true);
+            Self::track_apply_occupation(
+                &mut self.substrate,
+                &self.path_grid,
+                &self.resolved_terrain,
+                id,
+                call.family,
+                true,
+                call.rules.ares_form(),
+            );
             return Ok(false);
         }
         //4B4716..4B473C: a false answer or a limbo owner: a live owner drops
@@ -931,24 +927,12 @@ impl Simulation {
         if actor.lifecycle.object_alive() {
             clear_track_head(actor);
         }
-        self.track_finalize_stop(id)
-    }
-
-    /// 0x4B4740..0x4B4764: selector -1, path word -1, SetSpeedFraction(0).
-    fn track_finalize_stop(&mut self, id: u64) -> Result<bool, String> {
-        self.track_retire_selector(id);
-        self.clear_path_head(id);
-        if let Some(actor) = self.substrate.entities.get_mut(id) {
-            actor
-                .foot_speed
-                .set_speed_fraction(crate::util::fixed_math::SIM_ZERO);
-        }
-        Ok(false)
+        self.substrate.track_finalize_stop(id)
     }
 
     /// The live Unit+1AC answer for one candidate, arguments (cell, dir, h, 0, 1).
     fn track_can_enter(
-        &mut self,
+        &self,
         call: &FreshCall<'_>,
         cell: (i16, i16),
         direction: u8,
@@ -1032,6 +1016,7 @@ impl Simulation {
         else {
             return;
         };
+        let terrain_speed = self.terrain_speed_config().clone();
         let Some(actor) = self.substrate.entities.get_mut(id) else {
             return;
         };
@@ -1040,26 +1025,10 @@ impl Simulation {
             strength,
             rules,
             terrain,
-            &self.terrain_speed_config,
+            &terrain_speed,
             (cell.0 as u16, cell.1 as u16),
             road,
         );
-    }
-
-    fn clear_track_head_of(&mut self, id: u64) {
-        if let Some(actor) = self.substrate.entities.get_mut(id) {
-            clear_track_head(actor);
-        }
-    }
-
-    /// Foot+68B = 1 (0x4B3391, 0x4B45ED): write-once in the program (the
-    /// Foot constructor zeroes it; nothing clears it), read only by
-    /// `FootClass::ComputeChecksum` (0x4DBD0C). Its persisted analogue is
-    /// the hashed `RuntimeBridgeTransitionState::pending_mismatch`.
-    pub(super) fn latch_foot_68b(&mut self, id: u64) {
-        if let Some(actor) = self.substrate.entities.get_mut(id) {
-            actor.runtime_bridge_transition.latch();
-        }
     }
 
     /// The live Destination (+34) that 0x4B3E89 reads and 0x4B39D6 / 0x4B3E8F
@@ -1073,40 +1042,23 @@ impl Simulation {
         )
     }
 
-    /// Foot+5E0 = -1 on the live path word.
-    fn clear_path_head(&mut self, id: u64) {
-        if let Some(actor) = self.substrate.entities.get_mut(id) {
-            actor.clear_live_path_head();
-        }
-    }
-
     /// Foot+640 = (Frame, 0) before a retry recursion (0x4B4541..0x4B4548).
-    fn expire_movement_timer(&mut self, id: u64) {
-        let frame = self.session.binary_frame;
-        if let Some(actor) = self.substrate.entities.get_mut(id) {
-            actor.navigation.path_runtime.start_movement(frame, 0);
-        }
-    }
-
-    /// Class selector +58 = -1. Only the first-rejection/fresh-finalize
-    /// callers also clear Foot+68A; second-candidate retries retain it.
-    fn track_retire_selector(&mut self, id: u64) {
-        let Some(actor) = self.substrate.entities.get_mut(id) else {
-            return;
-        };
-        if let Some(loco) = actor.locomotor.as_mut()
-            && let Some(family) = TrackFamily::from_kind(loco.active_kind())
-            && let Some(mut progress) = loco.track_progress(family)
-        {
-            progress.retire_selector();
-            loco.store_track_progress(family, progress);
+    fn expire_movement_timer(session: &ScenarioSession, substrate: &mut ObjectSubstrate, id: u64) {
+        let frame = session.binary_frame();
+        if let Some(actor) = substrate.entities.get_mut(id) {
+            actor.navigation.path_runtime_mut().start_movement(frame, 0);
         }
     }
 
     /// Do_Turn 0x4B0EF0: FacingClass::Set 0x4C9220 on the body facing.
-    fn track_do_turn(&mut self, id: u64, desired: u16) {
-        let frame = self.session.binary_frame;
-        let Some(actor) = self.substrate.entities.get_mut(id) else {
+    fn track_do_turn(
+        session: &ScenarioSession,
+        substrate: &mut ObjectSubstrate,
+        id: u64,
+        desired: u16,
+    ) {
+        let frame = session.binary_frame();
+        let Some(actor) = substrate.entities.get_mut(id) else {
             return;
         };
         super::drive_do_turn(actor, desired, frame);
@@ -1164,6 +1116,21 @@ impl Simulation {
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> Result<(), String> {
+        self.scatter_blocked_track_list(id, cell, cell, rules, registry, frame_effects)
+    }
+
+    /// The same call with the deck flag read from `deck_cell` and the
+    /// objects taken from `list_cell`, which only the chain arm separates
+    /// (`0x004B1EC0..0x004B1F43`).
+    pub(super) fn scatter_blocked_track_list(
+        &mut self,
+        id: u64,
+        deck_cell: (i16, i16),
+        list_cell: (i16, i16),
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) -> Result<(), String> {
         let Some(terrain) = self.resolved_terrain.as_ref() else {
             return Ok(());
         };
@@ -1171,12 +1138,12 @@ impl Simulation {
             return Ok(());
         };
         let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
-        let native = cells.lookup(cell);
+        let native = cells.lookup(deck_cell);
         let level = i32::from(cells.ground_fields(native).0 as i8);
         let location = ground_pose::position_world_coord(&actor.position);
         let deck = cells.flags(native) & 0x100 != 0
             && (location.z / GROUND_LEVEL_HEIGHT_LEPTONS - level).abs() > 2;
-        self.scatter_cell_contacts(cell, deck, true, rules, registry, frame_effects)
+        self.scatter_cell_contacts(list_cell, deck, true, rules, registry, frame_effects)
     }
 
     /// `CellClass::Scatter_Objects(null, 1, no_kidding, deck)` on `cell`
@@ -1242,8 +1209,8 @@ impl Simulation {
             return Ok(());
         };
         //Type+D28, or HasWeaponAbility(0x11) by rank (0x70D0D0).
-        let crusher = object.crusher
-            || has_weapon_ability(actor.veterancy.rank_kind(), object, Ability::Crusher);
+        let crusher =
+            crate::sim::combat::veterancy::is_crusher(actor.veterancy.rank_kind(), object);
         let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
         let native = cells.lookup(cell);
         let deck = cells.flags(native) & 0x100 != 0 && {
@@ -1304,11 +1271,10 @@ impl Simulation {
                     return;
                 };
                 //4B3B52..4B3B62: the mover's House asks about the object.
-                if crate::map::houses::is_allied_with(
-                    &self.house_alliances,
-                    self.interner.resolve(actor.owner()),
-                    self.interner.resolve(target.owner()),
-                ) {
+                if self
+                    .house_alliances
+                    .is_allied(&self.interner, actor.owner(), target.owner())
+                {
                     return;
                 }
                 self.track_override(id, TargetKind::Entity(blocker), rules, frame_effects);
@@ -1377,11 +1343,108 @@ impl Simulation {
         if let Some(object) = nearest {
             return Some(BlockingObject::Entity(object));
         }
-        self.production
-            .terrain_object_cells
+        self.terrain_objects
+            .cell_index()
             .get(&cell)
             .copied()
             .map(BlockingObject::Terrain)
+    }
+}
+
+impl crate::sim::world::ObjectSubstrate {
+    /// 0x4B2770..0x4B2813 (Hover 0x005163EC..0x00516485): while NavCom is a
+    /// Unit or an Infantry, the path is cut at the cell count of
+    /// |Foot - destination| (Distance3D >> 8) when that is below 24, so a
+    /// chase re-plans as it closes in. Returns whether it cut.
+    pub(super) fn trim_path_for_object_navcom(&mut self, id: u64, destination: DriveCoord) -> bool {
+        let Some(actor) = self.entities.get(id) else {
+            return false;
+        };
+        let object = match actor.navigation.nav_com() {
+            Some(NavTargetRef::Object { id: object }) => object,
+            _ => return false,
+        };
+        if !self.entities.get(object).is_some_and(|nav| {
+            matches!(
+                nav.category(),
+                EntityCategory::Unit | EntityCategory::Infantry
+            )
+        }) {
+            return false;
+        }
+        let location = ground_pose::position_world_coord(&actor.position);
+        let distance = crate::util::native_x87::distance_3d_leptons(
+            [location.x, location.y, location.z],
+            [destination.x, destination.y, destination.z],
+        );
+        let cells = crate::util::lepton::lepton_to_cell(distance);
+        if cells >= 24 {
+            return false;
+        }
+        let queue = &mut self
+            .entities
+            .get_mut(id)
+            .expect("same NavCom trim owner")
+            .navigation
+            .path_replay_mut();
+        let slot = usize::from(queue.cursor()) + cells as usize;
+        queue.terminate_at(slot);
+        true
+    }
+    /// 0x4B3607 then 0x4B3AA1..0x4B3C81 for a code other than 2/4/5/7: clear
+    /// the head; Foot+68A = 0 and the selector retires. This is a silent
+    /// exit, distinct from the code7 sound/retry corridor.
+    fn track_first_rejected_tail(&mut self, id: u64) {
+        self.clear_track_head_of(id);
+        if let Some(actor) = self.entities.get_mut(id) {
+            actor.navigation.path_runtime_mut().clear_scold_latch();
+        }
+        self.track_retire_selector(id);
+    }
+    /// 0x4B4740..0x4B4764: selector -1, path word -1, SetSpeedFraction(0).
+    fn track_finalize_stop(&mut self, id: u64) -> Result<bool, String> {
+        self.track_retire_selector(id);
+        self.clear_path_head(id);
+        if let Some(actor) = self.entities.get_mut(id) {
+            actor
+                .foot_speed
+                .set_speed_fraction(crate::util::fixed_math::SIM_ZERO);
+        }
+        Ok(false)
+    }
+    fn clear_track_head_of(&mut self, id: u64) {
+        if let Some(actor) = self.entities.get_mut(id) {
+            clear_track_head(actor);
+        }
+    }
+    /// Foot+68B = 1 (0x4B3391, 0x4B45ED): write-once in the program (the
+    /// Foot constructor zeroes it; nothing clears it), read only by
+    /// `FootClass::ComputeChecksum` (0x4DBD0C). Its persisted analogue is
+    /// the hashed `RuntimeBridgeTransitionState::pending_mismatch`.
+    pub(super) fn latch_foot_68b(&mut self, id: u64) {
+        if let Some(actor) = self.entities.get_mut(id) {
+            actor.runtime_bridge_transition.latch();
+        }
+    }
+    /// Foot+5E0 = -1 on the live path word.
+    fn clear_path_head(&mut self, id: u64) {
+        if let Some(actor) = self.entities.get_mut(id) {
+            actor.clear_live_path_head();
+        }
+    }
+    /// Class selector +58 = -1. Only the first-rejection/fresh-finalize
+    /// callers also clear Foot+68A; second-candidate retries retain it.
+    fn track_retire_selector(&mut self, id: u64) {
+        let Some(actor) = self.entities.get_mut(id) else {
+            return;
+        };
+        if let Some(loco) = actor.locomotor.as_mut()
+            && let Some(family) = TrackFamily::from_kind(loco.active_kind())
+            && let Some(mut progress) = loco.track_progress(family)
+        {
+            progress.retire_selector();
+            loco.store_track_progress(family, progress);
+        }
     }
 }
 
@@ -1408,7 +1471,7 @@ pub(super) fn fresh_heading_ready(body_facing: u16, direction: u8) -> bool {
     body_facing == u16::from(direction) << 13
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::*;
     use crate::sim::mission::MissionId;
@@ -1443,8 +1506,11 @@ mod tests {
             ),
             1
         );
-        let tree = sim.production.terrain_object_cells[&(11, 10)];
+        let tree = sim.terrain_objects.cell_index()[&(11, 10)];
         assert!(!sim.substrate.entities.contains(tree));
+        // ObjectClass::Unlimbo5F4FEF..5F5045 admits only spawners to
+        // Logic; an ordinary TREE01 remains indexed and displayed without it.
+        assert!(!sim.terrain_objects.objects()[&tree].in_logic_vector());
         let cell = sim
             .resolved_terrain
             .as_ref()
@@ -1470,7 +1536,8 @@ mod tests {
         assert!(
             sim.set_unit_destination(tank, destination, &rules, true, FrameEffects::default(),)
         );
-        sim.mission_assign_exact(tank, MissionId::from_known(MissionType::Move), 0)
+        sim.substrate
+            .mission_assign_exact(tank, MissionId::from_known(MissionType::Move), 0)
             .unwrap();
         assert_eq!(
             sim.substrate
@@ -1498,7 +1565,7 @@ mod tests {
         // native save timing. Native load resets Scenario RNG, so these two
         // continuations assert the loop outcome, not matching clocks/hashes.
         let terrain = sim.resolved_terrain.as_ref().unwrap().clone();
-        let speed_config = sim.terrain_speed_config.clone();
+        let speed_config = sim.terrain_speed_config().clone();
         let bytes =
             crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "Terrain blocker interrupt", 0);
         let mut restored = crate::sim::snapshot::GameSnapshot::load(&bytes)
@@ -1526,13 +1593,13 @@ mod tests {
                 fired_at_tree |= sim.fire_events.iter().any(|event| {
                     event.attacker_id == tank && event.target == TargetKind::Entity(tree)
                 });
-                if !sim.production.terrain_object_cells.contains_key(&(11, 10)) {
+                if !sim.terrain_objects.cell_index().contains_key(&(11, 10)) {
                     break;
                 }
             }
             assert!(fired_at_tree, "the retained Object target reaches FireAt");
             assert!(
-                !sim.production.terrain_object_cells.contains_key(&(11, 10)),
+                !sim.terrain_objects.cell_index().contains_key(&(11, 10)),
                 "the existing Terrain receiver takes the cannon's Wood damage"
             );
             let actor = sim.substrate.entities.get(tank).unwrap();
@@ -1548,7 +1615,7 @@ mod tests {
                     .iter()
                     .filter(|event| matches!(
                         event, crate::sim::world::LifecycleTestEvent::TerrainExpiryBoundary {
-                            stable_id, indexed: true, in_logic: true, live: true, ..
+                            stable_id, indexed: true, in_logic: false, live: true, ..
                         } if *stable_id == tree
                     ))
                     .count(),

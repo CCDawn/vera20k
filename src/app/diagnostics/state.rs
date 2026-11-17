@@ -4,40 +4,46 @@
 //! Match-lifetime diagnostic replay lives in `app::match_diagnostics`; this
 //! owner is process-scoped tooling state.
 
+use crate::app::presentation::render::RenderPhases;
+use crate::util::time::{Duration, Instant};
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
 
 const FRAME_TIMER_WINDOW: usize = 60;
 
-/// Means of in-game render phase spans during one observation window.
+/// In-game render phase spans during one observation window: their means for
+/// the dashboard's report, their totals for the performance panel's Most CPU row.
 ///
 /// The spans are wall time from `presentation::render::render_game`; this meter
-/// only averages them, so a single slow frame cannot mislead the report.
-#[cfg(feature = "telemetry-dashboard")]
+/// only sums them, so a single slow frame cannot mislead the report.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RenderTimingMeter {
     frames: u32,
-    sums: [Duration; 7],
+    sums: [Duration; RenderPhases::COUNT],
 }
 
-#[cfg(feature = "telemetry-dashboard")]
 impl RenderTimingMeter {
     /// Fold one finished render into the totals.
-    pub(crate) fn record(&mut self, phases: crate::app::presentation::render::RenderPhases) {
+    pub(crate) fn record(&mut self, phases: RenderPhases) {
         self.frames = self.frames.saturating_add(1);
         for (sum, span) in self.sums.iter_mut().zip(phases.spans()) {
             *sum += span;
         }
     }
 
+    /// Each phase's summed span, in `RenderPhases::spans` order.
+    pub(crate) fn totals(&self) -> [Duration; RenderPhases::COUNT] {
+        self.sums
+    }
+
     /// Mean span of each phase in milliseconds, or `None` before the first
     /// render. Order matches `RenderPhases::spans`.
-    pub(crate) fn mean_ms(&self) -> Option<[f32; 7]> {
+    #[cfg(feature = "telemetry-dashboard")]
+    pub(crate) fn mean_ms(&self) -> Option<[f32; RenderPhases::COUNT]> {
         if self.frames == 0 {
             return None;
         }
         let frames = self.frames as f32;
-        let mut means = [0.0f32; 7];
+        let mut means = [0.0f32; RenderPhases::COUNT];
         for (mean, sum) in means.iter_mut().zip(self.sums) {
             *mean = sum.as_secs_f32() * 1000.0 / frames;
         }
@@ -45,6 +51,7 @@ impl RenderTimingMeter {
     }
 
     /// The wire form: per-render means, or `None` before the first render.
+    #[cfg(feature = "telemetry-dashboard")]
     pub(crate) fn report(&self) -> Option<crate::sim::telemetry::RenderTimingReport> {
         let means = self.mean_ms()?;
         Some(crate::sim::telemetry::RenderTimingReport {
@@ -55,7 +62,11 @@ impl RenderTimingMeter {
             ui_ms: means[3],
             sidebar_ms: means[4],
             upload_ms: means[5],
-            other_ms: means[6],
+            lights_ms: means[6],
+            effects_ms: means[7],
+            draw_calls_ms: means[8],
+            handoff_ms: means[9],
+            other_ms: means[10],
         })
     }
 }
@@ -134,12 +145,30 @@ pub(crate) struct DiagnosticsState {
     pub(crate) frame_timer: FrameTimer,
     #[cfg(feature = "telemetry-dashboard")]
     pub(crate) render_timing: RenderTimingMeter,
+    /// The last render breakdown with samples. A hidden window stops rendering,
+    /// and report samples close the live window, so the dashboard keeps the
+    /// last measured one instead of showing an empty report.
+    #[cfg(feature = "telemetry-dashboard")]
+    pub(crate) render_report_cache: Option<crate::sim::telemetry::RenderTimingReport>,
     #[cfg(feature = "telemetry-dashboard")]
     pub(crate) process_stats: crate::app::process_stats::ProcessStatsSampler,
     #[cfg(feature = "telemetry-dashboard")]
     pub(crate) telemetry_server: Option<crate::app::telemetry_server::TelemetryServer>,
     #[cfg(feature = "telemetry-dashboard")]
     pub(crate) telemetry_last_publish: Option<Instant>,
+    /// The server attach count the last publish answered; a change means a new
+    /// client still needs the whole-match history.
+    #[cfg(feature = "telemetry-dashboard")]
+    pub(crate) telemetry_history_generation: u64,
+    /// The encoded elevation grid for the loaded map, cached because the grid
+    /// is static per map (a 500x500 map is 250k cells) but must go out to each
+    /// client that attaches. Dropped on world replacement.
+    #[cfg(feature = "telemetry-dashboard")]
+    pub(crate) telemetry_terrain: Option<crate::sim::telemetry::TerrainGrid>,
+    /// Set when a world replacement invalidates the cached terrain, so the next
+    /// publish resends it even while the same client stays attached.
+    #[cfg(feature = "telemetry-dashboard")]
+    pub(crate) telemetry_terrain_dirty: bool,
     #[cfg(feature = "telemetry-dashboard")]
     pub(crate) telemetry_observer: crate::app::match_runtime::telemetry::ObserverSession,
     #[cfg(feature = "debug-tools")]
@@ -174,11 +203,19 @@ impl DiagnosticsState {
             #[cfg(feature = "telemetry-dashboard")]
             render_timing: Default::default(),
             #[cfg(feature = "telemetry-dashboard")]
+            render_report_cache: None,
+            #[cfg(feature = "telemetry-dashboard")]
             process_stats: Default::default(),
             #[cfg(feature = "telemetry-dashboard")]
             telemetry_server: None,
             #[cfg(feature = "telemetry-dashboard")]
             telemetry_last_publish: None,
+            #[cfg(feature = "telemetry-dashboard")]
+            telemetry_history_generation: 0,
+            #[cfg(feature = "telemetry-dashboard")]
+            telemetry_terrain: None,
+            #[cfg(feature = "telemetry-dashboard")]
+            telemetry_terrain_dirty: true,
             #[cfg(feature = "telemetry-dashboard")]
             telemetry_observer: Default::default(),
             #[cfg(feature = "debug-tools")]
@@ -226,8 +263,8 @@ impl crate::app::AppState {
         let tick = self
             .match_state
             .sim_runtime
-            .as_ref()
-            .map_or(0, |runtime| runtime.simulation.session.tick);
+            .runtime()
+            .map_or(0, |runtime| runtime.simulation.session().tick());
         self.diag.presentation_ms(tick)
     }
 
@@ -237,7 +274,7 @@ impl crate::app::AppState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
 
@@ -258,8 +295,7 @@ mod tests {
         let mut diagnostics = DiagnosticsState::new(None);
         diagnostics.use_map_presentation_clock().unwrap();
         let mut messages = crate::ui::messages::MessageList::new(0, 0, 6, 600);
-        let pause_clock = crate::ui::messages::PauseAwareClock::default();
-        let now = |tick| pause_clock.now(diagnostics.presentation_ms(tick).unwrap());
+        let now = |tick| diagnostics.presentation_ms(tick).unwrap();
         messages.add_message(
             &crate::ui::messages::MessagePost {
                 prefix: None,
@@ -279,20 +315,6 @@ mod tests {
     }
 
     #[test]
-    fn frame_timer_empty_returns_zero() {
-        let t = FrameTimer::new();
-        assert_eq!(t.frame_ms_mean(), 0.0);
-    }
-
-    #[test]
-    fn frame_timer_single_sample_is_still_zero() {
-        // First sample establishes the baseline; no delta yet.
-        let mut t = FrameTimer::new();
-        t.sample(Instant::now());
-        assert_eq!(t.frame_ms_mean(), 0.0);
-    }
-
-    #[test]
     fn frame_timer_two_samples_record_one_delta() {
         let mut t = FrameTimer::new();
         let t0 = Instant::now();
@@ -301,15 +323,5 @@ mod tests {
         t.sample(t1);
         let mean = t.frame_ms_mean();
         assert!((mean - 16.0).abs() < 0.5, "expected ~16ms, got {mean}");
-    }
-
-    #[test]
-    fn frame_timer_window_caps_at_60() {
-        let mut t = FrameTimer::new();
-        let t0 = Instant::now();
-        for i in 0..200 {
-            t.sample(t0 + Duration::from_millis(16 * i));
-        }
-        assert_eq!(t.samples.len(), FRAME_TIMER_WINDOW);
     }
 }

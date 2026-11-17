@@ -11,14 +11,15 @@
 //! screen to a shell dialog, (re)starts/advances the wave on entry edges, plays
 //! the slide-in start cue, and dispatches the per-frame shell repaint while the
 //! wave is live. The slide-in start cue is `GUIMoveInSound` (stock `MenuSlideIn`);
-//! the stock-empty end cue (`ShellButtonSlideSound`) stays silent.
+//! the end cue `ShellButtonSlideSound` is empty in stock rules.
 
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 
 use crate::app::AppState;
 use crate::ui::shell::descriptor::DialogId;
+use crate::ui::shell::menu_page::MenuPageSpec;
 
 // Re-export the render-agnostic schedule types from the shared substrate so the
 // shell renderers (and the `AppState` field) keep their existing import paths.
@@ -54,6 +55,8 @@ pub(crate) enum ShellSlideKind {
     MoviesAndCredits,
     /// Dialog 0x129 — movie list (Play Movie and Back).
     MovieList,
+    /// VERA's Mods page, from the Mods button of Options.
+    Mods,
     /// Dialog 0x102 — offline skirmish setup.
     Skirmish,
     /// Dialog 0x94 — campaign selection.
@@ -64,19 +67,54 @@ pub(crate) enum ShellSlideKind {
     Options,
     /// Dialog 0x10E — Westwood Online welcome.
     WolWelcome,
+    /// Dialog 0x10F — Westwood Online login.
+    WolLogin,
+    /// Dialog 0x113 — Westwood Online custom-match lobby.
+    WolLobby,
+    /// Dialog 0x2BC — Westwood Online Options, over the hidden lobby.
+    WolOptions,
+    /// Dialog 0xD6 — the shell's Sound Options, run from WOL Options.
+    WolSoundOptions,
+    /// Dialog 0x112 — the WOL auto-login query after a dialog login.
+    WolAutoLoginQuery,
+    /// Dialog 0xFE — the WOL locale page during the connect.
+    WolLocale,
+    /// Dialog 0x114 — WOL My Information.
+    WolMyInformation,
+    /// Dialog 0x116 — the WOL Buddy List.
+    WolBuddyList,
+    /// Dialog 0x117 — WOL Quick Match's status page.
+    WolQuickMatch,
+    /// Dialog 0x122 — WOL Quick Match's postmatch add-buddy query.
+    WolAddBuddyQuery,
     /// Dialog 0xA3 — Options' Keyboard page (front-end parent only).
     Keyboard,
+    LanLobby,
+    /// BC/BD (LAN) or C2/C9 (WOL) network setup.
+    NetworkSetup(crate::ui::multiplayer_setup::SetupDialog),
     /// Dialog 0x6B — Skirmish's Choose Map, a family page of its own.
     ChooseMap,
     /// Dialog 0x108 — the score screen after a skirmish game.
     Score,
     /// Dialog 0x103 — campaign victory StandaloneScore.
     CampaignScore,
+    /// Dialog 0xBC7 — the LAN Cooperative campaign end.
+    CampaignEnd,
     /// Dialog 0x105 — Choose Map's random-map dialog.
     RandomMap,
 }
 
 impl ShellSlideKind {
+    /// The shell of a campaign score page's dialog.
+    pub(crate) fn campaign_score(
+        dialog: crate::ui::campaign_score_shell::CampaignScoreDialog,
+    ) -> Self {
+        match dialog {
+            crate::ui::campaign_score_shell::CampaignScoreDialog::Victory => Self::CampaignScore,
+            crate::ui::campaign_score_shell::CampaignScoreDialog::CampaignEnd => Self::CampaignEnd,
+        }
+    }
+
     /// The Win32 dialog resource id this shell maps to. The slide's eligibility
     /// and column are looked up from this id in the data-driven `slide` table
     /// (no hardcoded per-kind counts here).
@@ -86,45 +124,100 @@ impl ShellSlideKind {
             ShellSlideKind::SinglePlayer => 0x0100,
             ShellSlideKind::MoviesAndCredits => 0x0101,
             ShellSlideKind::MovieList => 0x0129,
+            ShellSlideKind::Mods => crate::ui::mods_shell::DIALOG.0,
             ShellSlideKind::Skirmish => 0x0102,
             ShellSlideKind::Campaign => 0x0094,
             ShellSlideKind::LoadSavedGame => 0x00B7,
             ShellSlideKind::Options => 0x00D5,
             ShellSlideKind::WolWelcome => 0x010E,
+            ShellSlideKind::WolLogin => 0x010F,
+            ShellSlideKind::WolLobby => 0x0113,
+            ShellSlideKind::WolOptions => 0x02BC,
+            ShellSlideKind::WolSoundOptions => 0x00D6,
+            ShellSlideKind::WolAutoLoginQuery => 0x0112,
+            ShellSlideKind::WolLocale => 0x00FE,
+            ShellSlideKind::WolMyInformation => 0x0114,
+            ShellSlideKind::WolBuddyList => 0x0116,
+            ShellSlideKind::WolQuickMatch => 0x0117,
+            ShellSlideKind::WolAddBuddyQuery => 0x0122,
             ShellSlideKind::Keyboard => 0x00A3,
+            ShellSlideKind::LanLobby => 0xBB,
+            ShellSlideKind::NetworkSetup(dialog) => dialog.page().dialog.0,
             ShellSlideKind::ChooseMap => 0x006B,
             ShellSlideKind::Score => 0x0108,
             ShellSlideKind::CampaignScore => 0x0103,
+            ShellSlideKind::CampaignEnd => 0x0BC7,
             ShellSlideKind::RandomMap => 0x0105,
         })
     }
 
     /// The dialog's slide column with the panel's `rows` tile rows. Every
     /// rendered shell has a `slide` table entry, so a miss is a programming
-    /// error.
-    pub(crate) fn column(self, rows: u32) -> SlideColumn {
-        crate::ui::shell::slide::slide_spec_for(self.dialog_id())
-            .expect("rendered shell dialog must have a slide column")
-            .column(rows)
+    /// error. Options slides VERA's page buttons and its Mods button under
+    /// retail's Keyboard.
+    /// Skirmish slides VERA's Game Options between Start Game and Choose Map.
+    pub(crate) fn column(self, rows: u32, page: Option<&MenuPageSpec>) -> SlideColumn {
+        let spec = crate::ui::shell::slide::slide_spec_for(self.dialog_id())
+            .expect("rendered shell dialog must have a slide column");
+        let page = page.filter(|page| page.dialog == self.dialog_id());
+        // WOL's simplified pages must slide only their visible buttons too.
+        let top_buttons = page.map_or_else(
+            || match self {
+                ShellSlideKind::Options => {
+                    crate::ui::main_menu_dialogs::options::shell::OPTIONS_PAGE
+                        .stacked
+                        .len() as u32
+                }
+                ShellSlideKind::Skirmish => spec.top_buttons + 1,
+                _ => spec.top_buttons,
+            },
+            |page| page.stacked.len() as u32,
+        );
+        crate::ui::shell::slide::SlideDialogSpec {
+            top_buttons,
+            // The online lobby keeps the warning monitor for its top panel.
+            top_panel: spec.top_panel && page.is_none_or(crate::ui::wol_lobby::keeps_top_panel),
+            ..spec
+        }
+        .column(rows)
     }
 }
 
-/// Right-panel tile rows at the current surface size (`[0x00B0FA20]`).
-fn panel_rows(state: &AppState) -> u32 {
+fn column_page_spec(
+    visit: Option<&crate::app::shell_wol::WolVisit>,
+    kind: Option<ShellSlideKind>,
+) -> Option<&'static MenuPageSpec> {
+    let visit = visit?;
+    match kind? {
+        ShellSlideKind::WolWelcome => Some(&crate::ui::wol_shell::WOL_WELCOME_PAGE),
+        ShellSlideKind::WolLogin => Some(visit.login()?.policy.page_spec()),
+        ShellSlideKind::WolLobby => Some(visit.lobby()?.ui.page_spec()),
+        _ => None,
+    }
+}
+
+/// Right-panel tile rows a new wave of `kind` slides on, at the current
+/// surface size (`[0x00B0FA20]`).
+fn panel_rows(state: &AppState, kind: Option<ShellSlideKind>) -> u32 {
     // A fitted shell paints the scaled 800x600 column, so its slide must use
     // the authored 9 tile rows even when the live window is too short for
     // `right_panel_rects(window)` to reach the same count. Retail 640/800
-    // keep the live window's own rows.
-    if crate::app::frontend::shell_layout::fills_window(state) {
-        return crate::ui::shell::geom::right_panel_rects(
+    // keep the live window's own rows, but for Options where they are too
+    // few for its column: that page is fitted there too.
+    let config = &state.renderer.gpu.config;
+    let (width, height) = (config.width as i32, config.height as i32);
+    let fitted = crate::app::frontend::shell_layout::fills_window(state)
+        || (kind == Some(ShellSlideKind::Options)
+            && !crate::ui::main_menu_dialogs::options::shell::retail_column_fits(width, height));
+    let (width, height) = if fitted {
+        (
             crate::ui::shell::geom::SHELL_BASE_W,
             crate::ui::shell::geom::SHELL_BASE_H,
         )
-        .tile_count
-        .max(1) as u32;
-    }
-    let config = &state.renderer.gpu.config;
-    crate::ui::shell::geom::right_panel_rects(config.width as i32, config.height as i32)
+    } else {
+        (width, height)
+    };
+    crate::ui::shell::geom::right_panel_rects(width, height)
         .tile_count
         .max(1) as u32
 }
@@ -134,12 +227,23 @@ fn panel_rows(state: &AppState) -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShellExitThen {
     MainMenu(crate::ui::main_menu_shell::MainMenuShellAction),
+    /// The updater's offer: `0xE2` slides out as for Exit Game, then the
+    /// message box asks over the empty shell backdrop.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    UpdateOffer,
+    /// Options' Check for Updates: `0xD5` slides out, then the updater's
+    /// boxes show over the empty shell backdrop.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    UpdateCheck,
     SinglePlayer(crate::ui::single_player_shell::SinglePlayerShellAction),
     MoviesCredits(crate::ui::movies_credits_shell::MoviesCreditsAction),
     /// Movie list Play Movie with a selected row.
     PlayMovie,
     /// Movie list Back (state `0xE` result -1).
     MovieListBack,
+    /// VERA's Mods page Back: Options is built again, on the page it was
+    /// left from.
+    ModsBack,
     /// Skirmish Start Game (result `0x617`) with the session packed and
     /// resolved when it was pressed.
     SkirmishStart(Box<crate::skirmish_launch::SkirmishLaunchSession>),
@@ -155,9 +259,23 @@ pub(crate) enum ShellExitThen {
     /// commits and writes (Main Menu `0x5CB`; state 0x12 recreates `0xE2`) or
     /// commits and runs the Keyboard page (`0x5CE`).
     Options(crate::ui::main_menu_dialogs::options::LauncherParentResult),
+    /// VERA's Esc menu chose Options: the page it asked over slides out and
+    /// `0xD5` runs, as for the Main Menu's own Options.
+    ShellMenuOptions(ShellSlideKind),
     /// Keyboard `0xA3` Back or Cancel: `0x005FBEF0` tears it down with its
     /// slide, then the bindings save or reload and a new `0xD5` is built.
     KeyboardClose(crate::app::input::keyboard::KeyboardExit),
+    LanBack,
+    LanCreate {
+        observe: bool,
+    },
+    LanJoinAccepted(crate::app::shell_lan::LanJoinAcceptance),
+    NetworkSetupBack(crate::ui::multiplayer_setup::SetupDialog),
+    NetworkSetupChooseMap(crate::ui::multiplayer_setup::SetupDialog),
+    NetworkStart {
+        dialog: crate::ui::multiplayer_setup::SetupDialog,
+        agreed_seed: u32,
+    },
     /// Skirmish Choose Map (`0x5AA`): `0x102` slides out and hides without
     /// packing (`0x006AD931`, `0x006AD93C`), then `0x6B` runs.
     SkirmishChooseMap,
@@ -184,9 +302,52 @@ pub(crate) enum ShellExitThen {
     /// Campaign victory Continue (`0x423`, result 1): `0x103` slides out
     /// before GameExit::Victory continues the campaign.
     CampaignScoreContinue,
-    /// A Westwood Online action: `0x10E` closes before the WOLAPI object
-    /// fails to load and `TXT_APIMISSING` shows.
-    WolApiMissing,
+    /// Campaign-end Continue (`0x6D1`, result 1): `0xBC7` slides out and
+    /// Main_Game returns to the mode's shell.
+    CampaignEndContinue,
+    /// A Westwood Online mode button: `0x10E` closes with the mode written
+    /// and `WOL_Main` runs that mode's flow.
+    WolAction(crate::ui::wol_shell::WolMode),
+    /// `0x10F` closed with Login (`0x539`) or Back (2).
+    WolLoginClose(u16),
+    /// `0x113` Back (`0x686`): the runner leaves its channel and returns 0.
+    WolLobbyBack,
+    /// `0x113` Buddy List (`0x689`), or the online page's Quick Match: the
+    /// runner ends as for Back, with mode 5 or 1 and return mode 4.
+    WolLobbyRunner(crate::ui::wol_shell::WolMode),
+    /// A game join was requested (`0x0078C281`): `0x113` slides out and hides.
+    WolLobbyHide,
+    /// The create succeeded: `0x113` slides out and hides, then C2 opens.
+    WolCreateAccepted {
+        observe: bool,
+    },
+    /// `0x113` Options (`0x61F`): the lobby slides out and `0x2BC` opens.
+    WolOptionsOpen,
+    /// `0x2BC` closed with OK (the staged values and the chat translation
+    /// settings) or Cancel (`None`).
+    WolOptionsClose(
+        Option<(
+            crate::ui::wol_options::WolPreferences,
+            crate::ui::chat_translation::ChatTranslation,
+        )>,
+    ),
+    /// `0x2BC` Sound Options (`0x63A`): it slides out and `0xD6` runs.
+    WolSoundOptionsOpen,
+    /// `0xD6` Back (`0x686`): `0x2BC` shows again.
+    WolSoundOptionsBack,
+    /// `0x112` closed with Yes or No.
+    WolAutoLoginClose(crate::ui::wol_persona::AutoLoginAnswer),
+    /// `0xFE` closed with the chosen locale (0 for Cancel or none).
+    WolLocaleClose(i32),
+    /// `0x114` closed with this button.
+    WolMyInformationClose(u16),
+    /// `0x116` ended with Create, Join or Back.
+    WolBuddyClose(u16),
+    /// `0x122` closed with Yes or No; both write Don't Ask.
+    WolAddBuddyClose {
+        yes: bool,
+        ask_again: bool,
+    },
 }
 
 impl ShellExitThen {
@@ -194,22 +355,48 @@ impl ShellExitThen {
     pub(crate) fn dialog(&self) -> ShellSlideKind {
         match self {
             Self::MainMenu(_) => ShellSlideKind::MainMenu,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            Self::UpdateOffer => ShellSlideKind::MainMenu,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            Self::UpdateCheck => ShellSlideKind::Options,
             Self::SinglePlayer(_) => ShellSlideKind::SinglePlayer,
             Self::MoviesCredits(_) => ShellSlideKind::MoviesAndCredits,
             Self::PlayMovie | Self::MovieListBack => ShellSlideKind::MovieList,
+            Self::ModsBack => ShellSlideKind::Mods,
             Self::SkirmishStart(_) | Self::SkirmishBack => ShellSlideKind::Skirmish,
             Self::CampaignBack | Self::CampaignStart(_) => ShellSlideKind::Campaign,
             Self::LoadSavedGameBack => ShellSlideKind::LoadSavedGame,
             Self::Options(_) => ShellSlideKind::Options,
+            Self::ShellMenuOptions(page) => *page,
             Self::KeyboardClose(_) => ShellSlideKind::Keyboard,
+            Self::LanBack | Self::LanCreate { .. } | Self::LanJoinAccepted(_) => {
+                ShellSlideKind::LanLobby
+            }
+            Self::NetworkSetupBack(dialog)
+            | Self::NetworkSetupChooseMap(dialog)
+            | Self::NetworkStart { dialog, .. } => ShellSlideKind::NetworkSetup(*dialog),
             Self::SkirmishChooseMap => ShellSlideKind::Skirmish,
             Self::ChooseMapUse(_) | Self::ChooseMapCancel | Self::ChooseMapRandomMap => {
                 ShellSlideKind::ChooseMap
             }
             Self::RandomMapUse | Self::RandomMapCancel => ShellSlideKind::RandomMap,
-            Self::WolBack | Self::WolApiMissing => ShellSlideKind::WolWelcome,
+            Self::WolBack | Self::WolAction(_) => ShellSlideKind::WolWelcome,
+            Self::WolLoginClose(_) => ShellSlideKind::WolLogin,
+            Self::WolLobbyBack
+            | Self::WolLobbyRunner(_)
+            | Self::WolLobbyHide
+            | Self::WolCreateAccepted { .. }
+            | Self::WolOptionsOpen => ShellSlideKind::WolLobby,
+            Self::WolOptionsClose(_) | Self::WolSoundOptionsOpen => ShellSlideKind::WolOptions,
+            Self::WolSoundOptionsBack => ShellSlideKind::WolSoundOptions,
+            Self::WolAutoLoginClose(_) => ShellSlideKind::WolAutoLoginQuery,
+            Self::WolLocaleClose(_) => ShellSlideKind::WolLocale,
+            Self::WolMyInformationClose(_) => ShellSlideKind::WolMyInformation,
+            Self::WolBuddyClose(_) => ShellSlideKind::WolBuddyList,
+            Self::WolAddBuddyClose { .. } => ShellSlideKind::WolAddBuddyQuery,
             Self::ScoreContinue => ShellSlideKind::Score,
             Self::CampaignScoreContinue => ShellSlideKind::CampaignScore,
+            Self::CampaignEndContinue => ShellSlideKind::CampaignEnd,
         }
     }
 }
@@ -278,7 +465,10 @@ pub(crate) fn begin_shell_exit(state: &mut AppState, then: ShellExitThen) -> She
         kind,
     ) {
         ExitStartRule::Slide => {
-            let column = kind.column(panel_rows(state));
+            let column = kind.column(
+                panel_rows(state, Some(kind)),
+                column_page_spec(state.frontend.wol.as_ref(), Some(kind)),
+            );
             state.frontend.shell_exit = Some(ShellExit {
                 wave: ShellFrameWave::new_slide_out(column, Instant::now()),
                 then,
@@ -365,6 +555,7 @@ enum ShellEntryEffect {
 
 #[derive(Debug)]
 enum ShellWaveCompletion {
+    MultiplayerSetup,
     /// Single Player `0x100`, Movies & Credits `0x101` or movie list `0x129`.
     MenuPage,
     Skirmish,
@@ -387,6 +578,7 @@ enum ShellWaveCompletion {
 struct ShellLifecycleReducer<'a> {
     /// Right-panel tile rows for a new wave's column.
     panel_rows: u32,
+    page_spec: Option<&'static MenuPageSpec>,
     active_shell: &'a mut Option<ShellSlideKind>,
     first_paint_slide: &'a mut Option<ShellFrameWave>,
     slide_generation: &'a mut u64,
@@ -398,8 +590,10 @@ struct ShellLifecycleReducer<'a> {
 
 impl<'a> ShellLifecycleReducer<'a> {
     fn from_state(state: &'a mut AppState) -> Self {
+        let target = current_shell_slide_target(state);
         Self {
-            panel_rows: panel_rows(state),
+            panel_rows: panel_rows(state, target),
+            page_spec: column_page_spec(state.frontend.wol.as_ref(), target),
             active_shell: &mut state.frontend.shell_slide_active_shell,
             first_paint_slide: &mut state.frontend.shell_first_paint_slide,
             slide_generation: &mut state.frontend.shell_slide_generation,
@@ -440,10 +634,13 @@ impl<'a> ShellLifecycleReducer<'a> {
                     }
                     ShellFrameWave::new_presented_main_menu(
                         *self.slide_generation,
-                        kind.column(self.panel_rows),
+                        kind.column(self.panel_rows, self.page_spec),
                     )
                 } else {
-                    ShellFrameWave::new_first_paint_slide(kind.column(self.panel_rows), now)
+                    ShellFrameWave::new_first_paint_slide(
+                        kind.column(self.panel_rows, self.page_spec),
+                        now,
+                    )
                 });
                 ShellEntryEffect::Started(kind)
             }
@@ -474,16 +671,31 @@ impl<'a> ShellLifecycleReducer<'a> {
             ShellSlideKind::SinglePlayer
             | ShellSlideKind::MoviesAndCredits
             | ShellSlideKind::MovieList
+            | ShellSlideKind::Mods
             | ShellSlideKind::Campaign
             | ShellSlideKind::LoadSavedGame
             | ShellSlideKind::Options
             | ShellSlideKind::WolWelcome
-            | ShellSlideKind::Keyboard => ShellWaveCompletion::MenuPage,
+            | ShellSlideKind::WolLogin
+            | ShellSlideKind::WolLobby
+            | ShellSlideKind::WolOptions
+            | ShellSlideKind::WolSoundOptions
+            | ShellSlideKind::WolAutoLoginQuery
+            | ShellSlideKind::WolLocale
+            | ShellSlideKind::WolMyInformation
+            | ShellSlideKind::WolBuddyList
+            | ShellSlideKind::WolQuickMatch
+            | ShellSlideKind::WolAddBuddyQuery
+            | ShellSlideKind::Keyboard
+            | ShellSlideKind::LanLobby => ShellWaveCompletion::MenuPage,
+            ShellSlideKind::NetworkSetup(_) => ShellWaveCompletion::MultiplayerSetup,
             ShellSlideKind::Skirmish => ShellWaveCompletion::Skirmish,
             ShellSlideKind::ChooseMap => ShellWaveCompletion::ChooseMap,
             ShellSlideKind::RandomMap => ShellWaveCompletion::RandomMap,
             ShellSlideKind::Score => ShellWaveCompletion::Score,
-            ShellSlideKind::CampaignScore => ShellWaveCompletion::CampaignScore,
+            ShellSlideKind::CampaignScore | ShellSlideKind::CampaignEnd => {
+                ShellWaveCompletion::CampaignScore
+            }
         })
     }
 
@@ -526,16 +738,13 @@ impl<'a> ShellLifecycleReducer<'a> {
 pub(crate) fn invalidate_main_menu_dialog_instance(state: &mut AppState) {
     ShellLifecycleReducer::from_state(state).invalidate_main_menu_dialog_instance();
     // A new 0xE2 starts with no press or hover: its status line stays empty
-    // until a hover message arrives from the real cursor position.
-    let menu = &mut state.frontend.main_menu_shell_state;
-    menu.pressed_owner_draw_button = None;
-    menu.hovered_owner_draw_button = None;
-    if state.frontend.shell_controller.top_id() == Some(DialogId(0x00E2)) {
-        state
-            .frontend
-            .shell_controller
-            .reset_to(DialogId(0x00E2), false);
-    }
+    // until a hover message arrives from the real cursor position. The
+    // controller's 0xE2 instance is cleared wherever it sits, under a message
+    // box included.
+    state
+        .frontend
+        .shell_controller
+        .restart_instance(crate::ui::main_menu_shell::MAIN_MENU_DIALOG);
 }
 
 /// Deliver the kind-1 timer only while the bare 0xE2 dialog owns steady paint.
@@ -591,9 +800,37 @@ pub(crate) fn blocks_shell_input(state: &AppState) -> bool {
     // The graceful quit cascade also freezes shell input (the original processes
     // no input during its blocking teardown), so a stray click can't re-enter the
     // menu mid-fade.
+    #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+    if state.frontend.browser_exit_pending {
+        return true;
+    }
     state.frontend.quit_cascade.is_some()
         || state.frontend.shell_exit.is_some()
         || transition_blocks_shell_input(state.frontend.shell_first_paint_slide.as_ref())
+        || external_menu_wait(state).is_some()
+}
+
+/// Why an external network launch (docs/spawn.md) is at the main menu. It
+/// shows the empty menu backdrop there and takes no shell input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExternalMenuWait {
+    /// Admission, before the match first reaches the screen.
+    Joining,
+    /// The match ran; the launch is reporting it.
+    Reporting,
+}
+
+pub(crate) fn external_menu_wait(state: &AppState) -> Option<ExternalMenuWait> {
+    let external = state.frontend.screen == crate::ui::game_screen::GameScreen::MainMenu
+        && (crate::app::shell_wol::spawned_visit(state)
+            || crate::app::shell_network_setup::external(state));
+    external.then(|| {
+        if state.frontend.external_progress.match_started.is_none() {
+            ExternalMenuWait::Joining
+        } else {
+            ExternalMenuWait::Reporting
+        }
+    })
 }
 
 pub(crate) fn transition_blocks_shell_input(transition: Option<&ShellFrameWave>) -> bool {
@@ -630,10 +867,14 @@ pub(crate) fn current_shell_slide_target(state: &AppState) -> Option<ShellSlideK
                 .then_some(ShellSlideKind::Score);
         }
         if crate::app::App::campaign_score_shell_active(state) {
-            return crate::ui::shell::slide::is_slide_eligible(
-                ShellSlideKind::CampaignScore.dialog_id(),
-            )
-            .then_some(ShellSlideKind::CampaignScore);
+            let kind = ShellSlideKind::campaign_score(
+                state
+                    .frontend
+                    .campaign_score_page
+                    .as_ref()
+                    .map_or_else(Default::default, |page| page.dialog),
+            );
+            return crate::ui::shell::slide::is_slide_eligible(kind.dialog_id()).then_some(kind);
         }
         return None;
     }
@@ -649,13 +890,20 @@ pub(crate) fn current_shell_slide_target(state: &AppState) -> Option<ShellSlideK
     // `0x0052DDAB`); state 0x12 builds a new `0xE2` when it closes. Its
     // Keyboard page `0xA3` runs after `0xD5` is destroyed (`0x0055FD06`) and
     // slides like it. The Exit confirmation (state 6) and the quit after it
-    // (state 7) run without a family dialog.
+    // (state 7) run without a family dialog. VERA's Esc menu asks over the
+    // showing dialog, which stays the target.
     if let Some(dialog) = state.frontend.keyboard_dialog.as_ref() {
         return (dialog.parent == crate::ui::shell::keyboard::KeyboardParent::Launcher)
             .then_some(ShellSlideKind::Keyboard)
             .filter(|kind| crate::ui::shell::slide::is_slide_eligible(kind.dialog_id()));
     }
-    if state.frontend.exit_confirm_modal.is_some() || state.frontend.quit_cascade.is_some() {
+    if state
+        .frontend
+        .shell_message_box
+        .as_ref()
+        .is_some_and(|message_box| !message_box.keeps_page())
+        || state.frontend.quit_cascade.is_some()
+    {
         return None;
     }
     // Only the native page slides; the assetless fallback does not.
@@ -666,27 +914,74 @@ pub(crate) fn current_shell_slide_target(state: &AppState) -> Option<ShellSlideK
     }
     let candidate = if state.frontend.shell_route.skirmish() {
         skirmish_slide_target(&state.frontend.skirmish_shell_state)?
+    } else if state.frontend.shell_route.lan_lobby() {
+        ShellSlideKind::LanLobby
+    } else if state.frontend.shell_route.network_setup() {
+        if state
+            .frontend
+            .skirmish_shell_state
+            .choose_map_modal
+            .is_some()
+        {
+            skirmish_slide_target(&state.frontend.skirmish_shell_state)?
+        } else {
+            ShellSlideKind::NetworkSetup(crate::app::shell_network_setup::dialog(state))
+        }
     } else if state.frontend.shell_route.single_player() {
         ShellSlideKind::SinglePlayer
     } else if state.frontend.shell_route.movies_and_credits() {
         ShellSlideKind::MoviesAndCredits
     } else if state.frontend.shell_route.movie_list() {
         ShellSlideKind::MovieList
+    } else if state.frontend.shell_route.mods() {
+        ShellSlideKind::Mods
     } else if state.frontend.shell_route.campaign() {
         ShellSlideKind::Campaign
     } else if state.frontend.shell_route.load_saved_game() {
         ShellSlideKind::LoadSavedGame
-    } else if state.frontend.shell_route.wol_welcome() {
-        // The TXT_APIMISSING box runs after 0x10E is destroyed.
-        if state
+    } else if state.frontend.shell_route.wol() {
+        // The waits and boxes run after a WOL dialog is destroyed, over the
+        // empty backdrop.
+        match state.frontend.wol.as_ref().map(|visit| &visit.page) {
+            Some(crate::app::shell_wol::WolPage::Welcome) => ShellSlideKind::WolWelcome,
+            Some(crate::app::shell_wol::WolPage::Login(_)) => ShellSlideKind::WolLogin,
+            Some(crate::app::shell_wol::WolPage::AutoLoginQuery(_)) => {
+                ShellSlideKind::WolAutoLoginQuery
+            }
+            Some(crate::app::shell_wol::WolPage::Locale(_)) => ShellSlideKind::WolLocale,
+            Some(crate::app::shell_wol::WolPage::MyInformation(_)) => {
+                ShellSlideKind::WolMyInformation
+            }
+            Some(crate::app::shell_wol::WolPage::Buddy(_)) => ShellSlideKind::WolBuddyList,
+            Some(crate::app::shell_wol::WolPage::QuickMatch(_)) => ShellSlideKind::WolQuickMatch,
+            Some(crate::app::shell_wol::WolPage::AddBuddyQuery(_)) => {
+                ShellSlideKind::WolAddBuddyQuery
+            }
+            _ => return None,
+        }
+    } else if state.frontend.shell_route.wol_lobby() {
+        // 0x2BC and its 0xD6 run over the hidden lobby.
+        if let Some(crate::app::shell_wol::WolPage::Options(page)) =
+            state.frontend.wol.as_ref().map(|visit| &visit.page)
+        {
+            let kind = if page.sound.is_some() {
+                ShellSlideKind::WolSoundOptions
+            } else {
+                ShellSlideKind::WolOptions
+            };
+            return crate::ui::shell::slide::is_slide_eligible(kind.dialog_id()).then_some(kind);
+        }
+        // 0x113 is created hidden and hidden again for a game join.
+        if !state
             .frontend
-            .wol_welcome
+            .wol
             .as_ref()
-            .is_some_and(|wol| wol.api_missing.is_some())
+            .and_then(|visit| visit.lobby())
+            .is_some_and(|lobby| lobby.shown)
         {
             return None;
         }
-        ShellSlideKind::WolWelcome
+        ShellSlideKind::WolLobby
     } else if state.frontend.main_menu_shell_error.is_none() {
         ShellSlideKind::MainMenu
     } else {
@@ -745,8 +1040,7 @@ pub(crate) fn poll_main_menu_first_paint_before_acquire(
             let generation = wave
                 .presented_generation()
                 .expect("presented poll has generation");
-            // Active-retail stock leaves ShellButtonSlideSound empty, but the
-            // completion hook remains a named lifecycle edge.
+            // The slide-in's end cue precedes its SHOW completion (`0x00607F59`).
             crate::app::App::play_shell_slide_completion_sound(state);
             let title = crate::app::frontend::main_menu_shell_render::main_menu_title_text(state)
                 .into_owned();
@@ -854,6 +1148,9 @@ pub(crate) fn render_shell_first_paint_slide(
                 destination,
             )?
         }
+        ShellSlideKind::Mods => {
+            crate::app::frontend::mods_render::render_mods_page(state, encoder, destination)?
+        }
         ShellSlideKind::Campaign => {
             crate::app::frontend::campaign_shell_render::render_campaign_page(
                 state,
@@ -868,12 +1165,18 @@ pub(crate) fn render_shell_first_paint_slide(
                 destination,
             )?
         }
-        ShellSlideKind::WolWelcome => {
-            crate::app::frontend::wol_welcome_render::render_wol_welcome_page(
-                state,
-                encoder,
-                destination,
-            )?
+        ShellSlideKind::WolWelcome
+        | ShellSlideKind::WolLogin
+        | ShellSlideKind::WolLobby
+        | ShellSlideKind::WolOptions
+        | ShellSlideKind::WolSoundOptions
+        | ShellSlideKind::WolAutoLoginQuery
+        | ShellSlideKind::WolLocale
+        | ShellSlideKind::WolMyInformation
+        | ShellSlideKind::WolBuddyList
+        | ShellSlideKind::WolQuickMatch
+        | ShellSlideKind::WolAddBuddyQuery => {
+            crate::app::frontend::wol_welcome_render::render_wol_page(state, encoder, destination)?
         }
         ShellSlideKind::Options => {
             crate::app::App::native_launcher_options_active(state) && {
@@ -893,12 +1196,28 @@ pub(crate) fn render_shell_first_paint_slide(
             )?;
             true
         }
+        ShellSlideKind::LanLobby => {
+            crate::app::frontend::skirmish_shell_render::render_lan_lobby(
+                state,
+                encoder,
+                destination,
+            )?;
+            true
+        }
+        ShellSlideKind::NetworkSetup(_) => {
+            crate::app::frontend::skirmish_shell_render::render_multiplayer_setup(
+                state,
+                encoder,
+                destination,
+            )?;
+            true
+        }
         ShellSlideKind::Score => crate::app::frontend::score_shell_render::render_score_page(
             state,
             encoder,
             destination,
         )?,
-        ShellSlideKind::CampaignScore => {
+        ShellSlideKind::CampaignScore | ShellSlideKind::CampaignEnd => {
             crate::app::frontend::campaign_score_shell_render::render_campaign_score_page(
                 state,
                 encoder,
@@ -924,9 +1243,16 @@ pub(crate) fn render_shell_first_paint_slide(
     }
 
     let completion = ShellLifecycleReducer::from_state(state).finish_completed_wave(kind);
+    // The slide-in's end cue precedes its SHOW completion (`0x00607F59`).
+    if completion.is_some() {
+        crate::app::App::play_shell_slide_completion_sound(state);
+    }
     match completion {
         // `0x102`'s SHOW completion: its own statics start, or repaint when
         // the dialog shows again after Choose Map.
+        Some(ShellWaveCompletion::MultiplayerSetup) => {
+            crate::app::shell_network_setup::show_statics(state);
+        }
         Some(ShellWaveCompletion::Skirmish) => {
             let now = Instant::now();
             let (title, game_type, map_label) =
@@ -988,6 +1314,7 @@ pub(crate) fn render_shell_first_paint_slide(
         }
         // 0x103's SHOW completion (`0x4EC` on the dialog) starts every kind-1
         // static and, after playing ScoreAnimSound, the 0x72B kind-4 timer.
+        // 0xBC7's (`0x00470D30`) plays no sound.
         Some(ShellWaveCompletion::CampaignScore) => {
             let now = Instant::now();
             let frames = state
@@ -996,8 +1323,16 @@ pub(crate) fn render_shell_first_paint_slide(
                 .as_ref()
                 .and_then(|art| art.scra.as_ref())
                 .map_or(0, |strip| strip.frames.len());
+            let victory = state
+                .frontend
+                .campaign_score_page
+                .as_ref()
+                .is_some_and(|page| {
+                    page.dialog == crate::ui::campaign_score_shell::CampaignScoreDialog::Victory
+                });
             let sound = state
                 .rules()
+                .filter(|_| victory)
                 .and_then(|rules| rules.general.score_anim_sound())
                 .map(str::to_owned);
             if let Some(page) = state.frontend.campaign_score_page.as_mut() {
@@ -1015,7 +1350,7 @@ pub(crate) fn render_shell_first_paint_slide(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_frontend))]
 mod tests {
     use super::*;
     use crate::ui::shell::static_reveal::{Kind1PaintWindow, Kind1StaticReveal};
@@ -1057,7 +1392,7 @@ mod tests {
     #[test]
     fn the_skirmish_stack_slides_only_the_dialog_that_shows() {
         use crate::ui::skirmish_shell::{
-            ChooseMapModalState, ChooseMapSelection, EjectPrompt, RandomMapSetupModalState,
+            ChooseMapModalState, ChooseMapPrompt, ChooseMapSelection, RandomMapSetupModalState,
             SavedSeedBrowserState, SavedSeedMode, SkirmishShellState,
             compute_choose_map_modal_layout,
         };
@@ -1067,7 +1402,14 @@ mod tests {
             Some(ShellSlideKind::Skirmish)
         );
         let chooser = compute_choose_map_modal_layout(800, 600);
-        shell.choose_map_modal = Some(ChooseMapModalState::open(1, None, &[], &[], &chooser));
+        shell.choose_map_modal = Some(ChooseMapModalState::open(
+            crate::ui::skirmish_shell::ChooseMapContext::Skirmish,
+            1,
+            None,
+            &[],
+            &[],
+            &chooser,
+        ));
         assert_eq!(
             skirmish_slide_target(&shell),
             Some(ShellSlideKind::ChooseMap)
@@ -1104,12 +1446,13 @@ mod tests {
         // and OK closes the chooser at once.
         shell.random_map_setup_modal = None;
         let chooser = shell.choose_map_modal.as_mut().unwrap();
-        chooser.eject_prompt = Some(EjectPrompt {
+        chooser.message_box = Some(ChooseMapPrompt {
             selection: ChooseMapSelection {
                 mode_id: 1,
                 record_index: Some(0),
             },
             pressed: None,
+            kind: crate::ui::skirmish_shell::ChooseMapPromptKind::EjectAi,
         });
         assert_eq!(skirmish_slide_target(&shell), None);
         assert_eq!(
@@ -1118,7 +1461,7 @@ mod tests {
         );
         // Cancel shows the chooser again; its first paint slides it in
         // (`0x005E6B47`, `0x005E6B51`).
-        assert!(shell.choose_map_modal.as_mut().unwrap().decline_eject());
+        assert!(shell.choose_map_modal.as_mut().unwrap().close_prompt());
         assert_eq!(
             skirmish_slide_target(&shell),
             Some(ShellSlideKind::ChooseMap)
@@ -1141,11 +1484,12 @@ mod tests {
             ShellExitThen::MovieListBack.dialog(),
             ShellSlideKind::MovieList
         );
+        assert_eq!(ShellExitThen::UpdateCheck.dialog(), ShellSlideKind::Options);
     }
 
     /// Last presented tick of a `0xE2` entry at 800x600 (9 tile rows).
     fn main_menu_terminal_tick() -> u8 {
-        ShellSlideKind::MainMenu.column(9).total_ticks() as u8 - 1
+        ShellSlideKind::MainMenu.column(9, None).total_ticks() as u8 - 1
     }
 
     #[test]
@@ -1153,7 +1497,7 @@ mod tests {
         // Movie list 0x129 at 800x600: 9 tile rows, 9 + 9 = 18 ticks of 30 ms.
         let t0 = Instant::now();
         let mut exit = ShellExit {
-            wave: ShellFrameWave::new_slide_out(ShellSlideKind::MovieList.column(9), t0),
+            wave: ShellFrameWave::new_slide_out(ShellSlideKind::MovieList.column(9, None), t0),
             then: ShellExitThen::MovieListBack,
             completed_at: None,
         };
@@ -1179,10 +1523,11 @@ mod tests {
     #[test]
     fn shell_kinds_resolve_their_slide_columns() {
         let top_and_bottom = |kind: ShellSlideKind| {
-            let column = kind.column(9);
+            let column = kind.column(9, None);
             (column.top_buttons, column.bottom_button, column.map_button)
         };
         assert_eq!(top_and_bottom(ShellSlideKind::MainMenu), (5, true, false));
+        assert_eq!(top_and_bottom(ShellSlideKind::Mods), (2, true, false));
         assert_eq!(
             top_and_bottom(ShellSlideKind::SinglePlayer),
             (3, true, false)
@@ -1192,7 +1537,36 @@ mod tests {
             (3, true, false)
         );
         assert_eq!(top_and_bottom(ShellSlideKind::MovieList), (1, true, false));
-        assert_eq!(top_and_bottom(ShellSlideKind::Skirmish), (2, true, true));
+        // Retail `0x102` slides Start Game and Choose Map; VERA's Game Options
+        // slides between them.
+        assert_eq!(top_and_bottom(ShellSlideKind::Skirmish), (3, true, true));
+        // Retail `0xD5` slides Keyboard and Network; VERA leaves Network out
+        // and slides its six page buttons under Keyboard, then its Mods
+        // button where the build has mods.
+        assert_eq!(
+            crate::ui::shell::slide::slide_spec_for(DialogId(0x00D5))
+                .unwrap()
+                .top_buttons,
+            2
+        );
+        let mods = u32::from(crate::ui::main_menu_dialogs::options::HAS_MODS);
+        assert_eq!(
+            top_and_bottom(ShellSlideKind::Options),
+            (7 + mods, true, false)
+        );
+    }
+
+    #[test]
+    fn modern_wol_slides_only_animate_the_visible_button_faces() {
+        let lobby = crate::ui::wol_lobby::WolLobbyState::new(false, true);
+        let column = ShellSlideKind::WolLobby.column(9, Some(lobby.page_spec()));
+        assert_eq!(
+            (column.top_buttons, column.bottom_button, column.top_panel),
+            (4, true, false)
+        );
+        assert_eq!(ShellSlideKind::WolWelcome.column(9, None).top_buttons, 6);
+        let retail = ShellSlideKind::WolLobby.column(9, None);
+        assert_eq!((retail.top_buttons, retail.top_panel), (8, true));
     }
 
     #[test]
@@ -1251,6 +1625,7 @@ mod tests {
         // Open 0x100: 0xE2 is destroyed, but no 0x100 frame is allowed to run.
         ShellLifecycleReducer {
             panel_rows: 9,
+            page_spec: None,
             active_shell: &mut active_shell,
             first_paint_slide: &mut first_paint_slide,
             slide_generation: &mut slide_generation,
@@ -1268,6 +1643,7 @@ mod tests {
         // Queued Back destroys 0x100 and recreates 0xE2 before the frame driver.
         ShellLifecycleReducer {
             panel_rows: 9,
+            page_spec: None,
             active_shell: &mut active_shell,
             first_paint_slide: &mut first_paint_slide,
             slide_generation: &mut slide_generation,
@@ -1284,6 +1660,7 @@ mod tests {
         // wave or sound ever existed; exactly one fresh 0xE2 entry edge does.
         let effect = ShellLifecycleReducer {
             panel_rows: 9,
+            page_spec: None,
             active_shell: &mut active_shell,
             first_paint_slide: &mut first_paint_slide,
             slide_generation: &mut slide_generation,
@@ -1345,6 +1722,7 @@ mod tests {
         assert!(
             ShellLifecycleReducer {
                 panel_rows: 9,
+                page_spec: None,
                 active_shell: &mut active_shell,
                 first_paint_slide: &mut first_paint_slide,
                 slide_generation: &mut slide_generation,
@@ -1401,6 +1779,7 @@ mod tests {
         let later = t0 + Duration::from_secs(1);
         let effect = ShellLifecycleReducer {
             panel_rows: 9,
+            page_spec: None,
             active_shell: &mut active_shell,
             first_paint_slide: &mut first_paint_slide,
             slide_generation: &mut slide_generation,
@@ -1425,7 +1804,7 @@ mod tests {
         let mut active_shell = Some(ShellSlideKind::MainMenu);
         let mut first_paint_slide = Some(ShellFrameWave::new_presented_main_menu(
             52,
-            ShellSlideKind::MainMenu.column(9),
+            ShellSlideKind::MainMenu.column(9, None),
         ));
         let mut slide_generation = 52;
         let mut title_reveal = Kind1StaticReveal::default();
@@ -1457,6 +1836,7 @@ mod tests {
         assert!(
             !ShellLifecycleReducer {
                 panel_rows: 9,
+                page_spec: None,
                 active_shell: &mut active_shell,
                 first_paint_slide: &mut first_paint_slide,
                 slide_generation: &mut slide_generation,

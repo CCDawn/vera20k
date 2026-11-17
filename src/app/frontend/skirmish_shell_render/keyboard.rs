@@ -1,6 +1,8 @@
 //! Keyboard A3: shared launcher/active frame and native control composition.
 use super::chrome::*;
-use super::controls::{ControlPaint, paint_control};
+#[cfg(test)]
+use super::controls::frame_segments;
+use super::controls::{ControlPaint, group_box_geometry, paint_control, push_group_or_plain_frame};
 use super::in_game_shell::{self, InGameShellFrame, ShellFrameArt, ShellFrameOverlay};
 use super::text::{localized_label, rect_to_text_rect};
 use super::{
@@ -10,78 +12,18 @@ use super::{
 };
 use crate::app::AppState;
 use crate::app::input::{hotkeys::catalog::registered_commands, keyboard::key_name};
-use crate::render::batch::SpriteInstance;
 use crate::render::bit_font::BitFont;
 use crate::render::shell_text_reveal::PathAReveal;
-use crate::render::skirmish_shell_chrome::SkirmishShellChromeAtlas;
 use crate::render::{
     shell_paint,
     shell_text::{self, ShellAlign, ShellTextDraw},
 };
-use crate::ui::shell::geom::RectPx;
+use crate::ui::shell::geom::{RectPx, ShellScale};
 use crate::ui::shell::keyboard::{KEYBOARD_PAGE, KeyboardButton, KeyboardParent};
 use crate::ui::shell::list::ListMetrics;
 use crate::ui::shell::list::ShellListGeometry;
 use crate::ui::shell::static_reveal::Kind1PaintWindow;
-use std::time::Instant;
-
-/// Original61E700 group and6208F0 plain frames both use two bevel rings and
-/// averaged mixed corners. A group's top edge leaves the native caption gap.
-fn frame_segments(
-    rect: RectPx,
-    caption_width: Option<i32>,
-    outer_light: bool,
-) -> Vec<(RectPx, [u8; 3])> {
-    let light = [0xc5, 0xbe, 0xa7];
-    let dark = [0x80, 0x7a, 0x68];
-    let mixed = [0xa2, 0x9c, 0x87];
-    let mut out = Vec::new();
-    for ring in 0..2 {
-        let l = rect.x + ring;
-        let t = rect.y + ring;
-        let r = rect.x + rect.w - ring - 1;
-        let b = rect.y + rect.h - ring - 1;
-        let (tl, br) = if outer_light == (ring == 0) {
-            (light, dark)
-        } else {
-            (dark, light)
-        };
-        if let Some(width) = caption_width.filter(|width| *width > 0) {
-            out.push((RectPx::new(l, t, rect.x + 8 - l + 1, 1), tl));
-            let start = rect.x + width + 12;
-            out.push((RectPx::new(start, t, (r - start + 1).max(0), 1), tl));
-        } else {
-            out.push((RectPx::new(l, t, r - l, 1), tl));
-        }
-        out.push((RectPx::new(l, t + 1, 1, b - t), tl));
-        out.push((RectPx::new(l, b, r - l + 1, 1), br));
-        out.push((RectPx::new(r, t + 1, 1, (b - t - 1).max(0)), br));
-        out.push((RectPx::new(r, t, 1, 1), mixed));
-        out.push((RectPx::new(l, b, 1, 1), mixed));
-    }
-    out
-}
-
-fn push_frame(
-    out: &mut Vec<SpriteInstance>,
-    atlas: &SkirmishShellChromeAtlas,
-    rect: RectPx,
-    caption_width: Option<i32>,
-    outer_light: bool,
-) {
-    for (index, (rect, rgb)) in frame_segments(rect, caption_width, outer_light)
-        .into_iter()
-        .enumerate()
-    {
-        push_solid_rect(
-            out,
-            atlas,
-            rect,
-            rgb.map(|c| f32::from(c) / 255.0),
-            SHELL_CONTROL_DEPTH - index as f32 * 0.0000001,
-        );
-    }
-}
+use crate::util::time::Instant;
 
 pub(crate) fn render_keyboard_shell(
     state: &mut AppState,
@@ -288,23 +230,20 @@ pub(crate) fn render_keyboard_shell(
         )
     };
     let group_caption = localized_label(state, "GUI:Description", "Description");
-    let group_top = (font.cell_height() * glyph_scale).round() as i32 / 2;
-    push_frame(
+    let cell = font.cell_height() as i32;
+    let (group_frame, group_caption_rect) = group_box_geometry(layout.group, cell, layout.scale);
+    push_group_or_plain_frame(
         &mut controls,
-        atlas,
-        RectPx::new(
-            layout.group.x,
-            layout.group.y + group_top,
-            layout.group.w,
-            layout.group.h - group_top,
-        ),
+        atlas.white_pixel,
+        group_frame,
         Some(font.text_width(&group_caption) as i32),
         false,
+        layout.scale,
     );
     //61ED86..88 adds one to the window extents before6208F0 expands border2.
-    push_frame(
+    push_group_or_plain_frame(
         &mut controls,
-        atlas,
+        atlas.white_pixel,
         RectPx::new(
             layout.capture.x - 2,
             layout.capture.y - 2,
@@ -313,6 +252,7 @@ pub(crate) fn render_keyboard_shell(
         ),
         None,
         true,
+        ShellScale::RETAIL,
     );
     let buttons =
         [KeyboardButton::Assign, KeyboardButton::ResetAll].map(|id| shell_paint::ModalButton {
@@ -334,11 +274,11 @@ pub(crate) fn render_keyboard_shell(
     ));
     let mut texts = Vec::new();
     if let Some(window) = title {
-        texts.push(shell_text::draw_in_rect_path_a(
+        texts.push(shell_text::draw_in_rect_path_a_scaled(
             font,
             &title_text,
             rect_to_text_rect(layout.title),
-            ShellAlign::H_CENTER,
+            ShellAlign::PANEL_TITLE,
             [0.0; 2],
             SHELL_CONTROL_TEXT_DEPTH,
             PathAReveal {
@@ -347,6 +287,7 @@ pub(crate) fn render_keyboard_shell(
                 base_rgb: [255, 255, 0],
                 highlight_rgb: [255; 3],
             },
+            glyph_scale,
         ));
     }
     for (key, rect, centered) in layout.labels {
@@ -388,12 +329,7 @@ pub(crate) fn render_keyboard_shell(
     texts.push(text(
         font,
         &group_caption,
-        RectPx::new(
-            layout.group.x + 10,
-            layout.group.y,
-            layout.group.w - 10,
-            font.cell_height() as i32,
-        ),
+        group_caption_rect,
         ShellAlign::NONE,
         SHELL_CONTROL_TEXT_DEPTH,
     ));
@@ -494,9 +430,12 @@ pub(crate) fn render_keyboard_shell(
             SHELL_CONTROL_TEXT_DEPTH,
         ));
     }
-    texts.extend(shell_paint::paint_labels(
+    // The status line is a family static like the heading: it scales with the
+    // page, as `paint_labels_scaled` does for every other family page.
+    texts.extend(shell_paint::paint_labels_scaled(
         font,
         &status_label.into_iter().collect::<Vec<_>>(),
+        layout.scale.factor(),
     ));
     let mut overlay = ShellFrameOverlay::default();
     if dialog.category_open {
@@ -565,7 +504,7 @@ pub(crate) fn render_keyboard_shell(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_frontend))]
 mod tests {
     use super::*;
 
@@ -586,6 +525,31 @@ mod tests {
             (RectPx::new(96, 168, 8, 1), [0xc5, 0xbe, 0xa7])
         );
         assert!(segments.contains(&(RectPx::new(301, 167, 1, 1), [0xa2, 0x9c, 0x87])));
+    }
+
+    #[test]
+    fn stretched_group_caption_and_frame_keep_native_geometry() {
+        use crate::render::skirmish_shell_chrome::SkirmishShellChromeEntry;
+
+        let scale = ShellScale::from_screen(1600, 1200);
+        let group = scale.scale_rect(RectPx::new(95, 159, 207, 154));
+        let (frame, caption) = group_box_geometry(group, 17, scale);
+        assert_eq!(caption, RectPx::new(210, 318, 394, 34));
+        assert_eq!(frame, RectPx::new(190, 334, 414, 292));
+        let white = SkirmishShellChromeEntry {
+            uv_origin: [0.0; 2],
+            uv_size: [1.0; 2],
+            pixel_size: [1.0; 2],
+        };
+        let mut sprites = Vec::new();
+        push_group_or_plain_frame(&mut sprites, Some(white), frame, Some(66), false, scale);
+        assert_eq!(sprites.len(), 14);
+        assert_eq!(sprites[0].position, [190.0, 334.0]);
+        assert_eq!(sprites[0].size, [18.0, 2.0]);
+        assert_eq!(sprites[1].position, [346.0, 334.0]);
+        assert_eq!(sprites[1].size, [258.0, 2.0]);
+        assert_eq!(sprites[7].position, [192.0, 336.0]);
+        assert_eq!(sprites[7].size, [16.0, 2.0]);
     }
 
     #[test]

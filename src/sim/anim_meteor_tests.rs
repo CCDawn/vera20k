@@ -36,16 +36,16 @@ pub(in crate::sim) fn formed_sim(seed: u64, level: u8) -> Simulation {
         c.level = level;
         c.allows_tiberium = true;
         //Declared passable Clear-land input, including the actual 89EA40 row.
-        c.speed_costs.track = Some(100);
-        c.base_speed_costs.track = Some(100);
+        c.speed_costs.track = Some(crate::util::native_x87::NativeF32Bits::ONE);
+        c.base_speed_costs.track = Some(crate::util::native_x87::NativeF32Bits::ONE);
         c
     });
     terrain.shared_cell_dummy().set_level_slope(level as i8, 0);
     sim.install_resolved_terrain_for_new_map(terrain);
     sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(128, 128));
-    sim.session.map_width = 128;
-    sim.session.map_height = 128;
-    sim.session.binary_frame = 1000;
+    sim.session.set_map_width_for_test(128);
+    sim.session.set_map_height_for_test(128);
+    sim.session.set_binary_frame_for_test(1000);
     sim
 }
 
@@ -93,7 +93,7 @@ fn original_meteor_shower_controls_preserve_signed_spread_and_interleaved_constr
             ),
             expected["result"] == 1
         );
-        let actual:Vec<_>=sim.anims().map(|(_, anim)|serde_json::json!({"type":sim.interner.resolve(anim.type_id),"location":[anim.world_coord.x,anim.world_coord.y,anim.world_coord.z],"velocity_bits":anim.bounce.unwrap().velocity.map(|v|v.bits())})).collect();
+        let actual:Vec<_>=sim.anims().map(|(_, anim)|serde_json::json!({"type":sim.interner.resolve(anim.type_id),"location":[anim.world_coord.x,anim.world_coord.y,anim.world_coord.z],"velocity_bits":anim.bounce.unwrap().velocity().map(|v|v.bits())})).collect();
         let pieces:Vec<_>=expected["pieces"].as_array().unwrap().iter().map(|p|serde_json::json!({"type":p["type"],"location":p["location"],"velocity_bits":p["velocity_bits"]})).collect();
         assert_eq!(actual, pieces, "{input}");
         assert_rng(&sim, expected, "after");
@@ -111,13 +111,18 @@ fn original_anim_ore_loop_keeps_direction_aliasing_density_and_constructor_refus
     let rows = corpus["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 14);
     let text = "[OverlayTypes]\n0=TIB01\n1=TIB02\n2=TIB03\n3=TIB04\n[TIB01]\nTiberium=yes\nLand=Clear\n[TIB02]\nTiberium=yes\nLand=Clear\n[TIB03]\nTiberium=yes\nLand=Clear\n[TIB04]\nTiberium=yes\nLand=Clear\n[Clear]\nTrack=100%\n";
-    let ini = IniFile::from_str(text);
+    let ini = crate::rules::tiberium_type::with_tiberium_image_slots(&IniFile::from_str(&format!(
+        "{text}\n[Tiberiums]\n0=Riparius\n[Riparius]\nImage=1\nValue=25\n"
+    )));
     let registry = OverlayTypeRegistry::from_ini(&ini, None);
-    let rules = formed_rules("");
+    let mut rules = formed_rules("");
+    rules.tiberium_types = crate::rules::tiberium_type::TiberiumTypeRegistry::from_ini(&ini);
     for row in rows {
         let input = &row["input"];
         let expected = &row["expected"];
         let mut sim = formed_sim(input["seed"].as_u64().unwrap(), 0);
+        sim.native_unique_ids =
+            Some(crate::sim::native_identity::NativeUniqueIdCursor::test_at_current_value(0));
         let mut config = rules.art().anim_runtime_config("METSMALL").unwrap().clone();
         config.tiberium_spread_radius = input["radius"].as_i64().unwrap() as i32;
         config.is_tiberium = input["ore"].as_bool().unwrap();
@@ -139,13 +144,16 @@ fn original_anim_ore_loop_keeps_direction_aliasing_density_and_constructor_refus
             position.z = BRIDGE_DECK_HEIGHT_LEPTONS;
         }
         assert_rng(&sim, expected, "before");
-        assert!(!sim.anim_bounce_landing(
-            &config,
-            &rules,
-            Some(&registry),
-            position,
-            FrameEffects::empty()
-        ));
+        assert!(
+            !sim.anim_bounce_landing(
+                &config,
+                &rules,
+                Some(&registry),
+                position,
+                FrameEffects::empty()
+            )
+            .unwrap()
+        );
         assert_rng(&sim, expected, "after");
         for cell in expected["cells"].as_array().unwrap() {
             let x = cell["cell"][0].as_u64().unwrap() as u16;
@@ -186,13 +194,16 @@ fn meteor_landing_runs_children_without_expire_and_uses_last_water_splash() {
     assert!(count > 0);
     assert_eq!(config.spawns.as_deref(), Some("CHILD"));
     assert_eq!(config.spawn_count, 3);
-    assert!(!sim.anim_bounce_landing(
-        config,
-        &rules,
-        None,
-        glam::IVec3::new(10368, 10368, 0),
-        FrameEffects::empty()
-    ));
+    assert!(
+        !sim.anim_bounce_landing(
+            config,
+            &rules,
+            None,
+            glam::IVec3::new(10368, 10368, 0),
+            FrameEffects::empty()
+        )
+        .unwrap()
+    );
     assert_eq!(sim.anims().count(), count as usize);
     assert_eq!(
         sim.scenario_rng.native_state_hex(),
@@ -203,16 +214,20 @@ fn meteor_landing_runs_children_without_expire_and_uses_last_water_splash() {
         .resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(40, 40)
+        .cell_mut_for_test(40, 40)
         .unwrap()
         .land_type = 2;
-    assert!(!water.anim_bounce_landing(
-        config,
-        &rules,
-        None,
-        glam::IVec3::new(10368, 10368, 0),
-        FrameEffects::empty()
-    ));
+    assert!(
+        !water
+            .anim_bounce_landing(
+                config,
+                &rules,
+                None,
+                glam::IVec3::new(10368, 10368, 0),
+                FrameEffects::empty()
+            )
+            .unwrap()
+    );
     let anims: Vec<_> = water.anims().map(|(_, a)| a).collect();
     assert_eq!(anims.len(), 1);
     assert_eq!(water.interner.resolve(anims[0].type_id), "SPLASH2");
@@ -266,27 +281,23 @@ fn retail_meteor_profiles_keep_missing_stock_images_explicit() {
             .is_meteor
     );
     for name in ["METSMALL", "METLARGE"] {
-        let error = fixture
+        fixture
             .rules
-            .bind_scheduler_anim_assets(&[name.to_string()], &assets, "TEM", "TEMPERATE")
-            .unwrap_err();
-        assert!(
-            matches!(error, crate::rules::art_data::AnimAssetBindError::MissingShp(ref missing) if missing == name),
-            "{error}"
-        );
-        assert!(
+            .bind_scheduler_anim_assets(&[name.to_string()], &assets, "TEM", "TEMPERATE");
+        assert_eq!(
             fixture
                 .rules
                 .art()
                 .anim_runtime_config(name)
                 .unwrap()
-                .raw_shp_frame_count
-                .is_none()
+                .raw_shp_frame_count,
+            Some(0),
+            "native null image is a bound zero-frame result"
         );
     }
-    //The bounded stock Battle install lacks these SHPs. No substitute images
-    //or invented frame counts are admitted; numeric/flight tests supply their
-    //own explicit formed profiles and image bounds.
+    // The bounded stock Battle install lacks these SHPs. Native loading keeps
+    // null images; no substitute image or invented positive frame count is used.
+    // Numeric/flight tests supply their own formed image profiles and bounds.
     let registry = OverlayTypeRegistry::from_ini(&rules_ini, Some(&art));
     let roots = crate::map::resolved_terrain::scheduler_anim_roots(&fixture.rules, &registry, &[]);
     for name in ["CRYSTAL1", "CRYSTAL2", "CRYSTAL3", "CRYSTAL4"] {
@@ -317,7 +328,8 @@ fn meteor_flight_restores_native_rng_prior_and_cleans_up() {
     assert!(sim.trigger_meteor_shower(&rules, 0, 7));
     let ids: Vec<_> = sim.anims().map(|(&id, _)| id).collect();
     assert!(!ids.is_empty());
-    sim.visit_anim(ids[0], &rules, None, FrameEffects::empty());
+    sim.visit_anim(ids[0], &rules, None, FrameEffects::empty())
+        .unwrap();
     let bytes =
         crate::sim::snapshot::GameSnapshot::save_validated(&sim, 17, 23, "meteor flight", 0);
     let mut restored = crate::sim::snapshot::GameSnapshot::load_validated(&bytes, 17, 23, "")
@@ -353,9 +365,13 @@ fn meteor_flight_restores_native_rng_prior_and_cleans_up() {
     ];
     for _ in 0..100 {
         for world in [&mut sim, &mut restored] {
-            world.session.binary_frame = world.session.binary_frame.wrapping_add(1);
+            world
+                .session
+                .set_binary_frame_for_test(world.session.binary_frame().wrapping_add(1));
             for &id in &ids {
-                world.visit_anim(id, &rules, None, FrameEffects::empty());
+                world
+                    .visit_anim(id, &rules, None, FrameEffects::empty())
+                    .unwrap();
             }
             world.flush_pending_delete();
         }
@@ -384,9 +400,7 @@ fn strict_and_tolerant_spawn_closures_bind_cycles_with_explicit_custom_images() 
         rules.install_art_fixture(ArtRegistry::from_ini(&art));
         let roots = vec!["METSMALL".to_string()];
         if strict {
-            rules
-                .bind_scheduler_anim_assets(&roots, &assets, "TEM", "TEMPERATE")
-                .unwrap();
+            rules.bind_scheduler_anim_assets(&roots, &assets, "TEM", "TEMPERATE");
         } else {
             assert_eq!(
                 rules.bind_anim_class_assets(&roots, &assets, "TEM", "TEMPERATE"),

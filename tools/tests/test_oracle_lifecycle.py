@@ -1,4 +1,5 @@
 """Oracle imports and help must never execute native code or publish references."""
+import ast
 import os
 from pathlib import Path
 import subprocess
@@ -20,8 +21,21 @@ PRODUCERS = tuple('tools.projectile_oracle.' + name for name in (
      'tools.control_group_text_oracle',
      'tools.spatial_oracle.rearm_timer', 'tools.spatial_oracle.distributed_fire',
      'tools.spatial_oracle.fly_landing_phase',
-     'tools.procedural_drawing_oracle.airstrike_beam')
+     'tools.spatial_oracle.magnetron_aircraft_lift',
+     'tools.spatial_oracle.foot_path_window',
+     'tools.spatial_oracle.captured_building_sale',
+     'tools.spatial_oracle.anim_translucency',
+     'tools.spatial_oracle.building_anim_translucency',
+     'tools.spatial_oracle.building_sale_triggers',
+     'tools.spatial_oracle.campaign_hunt',
+     'tools.spatial_oracle.building_anim_detail',
+     'tools.spatial_oracle.squid_grapple_light',
+     'tools.spatial_oracle.flaming_guy',
+     'tools.procedural_drawing_oracle.airstrike_beam',
+     'tools.storage_oracle.ini_crc')
 HELPERS = ('tools.native_slope', 'tools.projectile_oracle.collision_fixture',
+           'tools.spatial_oracle.building_anim_translucency_setup',
+           'tools.spatial_oracle.building_anim_detail_setup',
            'tools.palette_oracle.check')
 
 
@@ -55,7 +69,6 @@ with ExitStack() as stack:
         guards.extend(stack.enter_context(patch.object(owner, name,
                       side_effect=RuntimeError('forbidden cache operation: ' + name)))
                       for owner, name in ((native_oracle, 'configured_gamemd'),
-                                          (native_oracle, 'image_sha256'),
                                           (Path, 'read_bytes'),
                                           (pickle, 'load'), (pickle, 'loads')))
     if module == 'tools.control_group_text_oracle':
@@ -88,6 +101,33 @@ with ExitStack() as stack:
 
 
 class OracleLifecycleTests(unittest.TestCase):
+    def test_named_asset_inputs_exclude_unrequested_files_and_directories(self):
+        from unittest.mock import patch
+        from tools.rules_oracle.bridge_anim_inputs import read_asset_inputs
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selected = root / 'dragon.shp'
+            selected.write_bytes(b'named input')
+            (root / 'audio.bag').write_bytes(b'unrequested')
+            (root / 'private.json').write_bytes(b'unrequested')
+            (root / 'subdirectory').mkdir()
+            original = Path.read_bytes
+            reads = []
+            def guarded(path):
+                self.assertEqual(path, selected)
+                reads.append(path.name)
+                return original(path)
+            with patch.object(Path, 'read_bytes', guarded):
+                self.assertEqual(read_asset_inputs(root, ()), {})
+                self.assertEqual(read_asset_inputs(root, ('DRAGON.SHP',)), {'DRAGON.SHP': b'named input'})
+            self.assertEqual(reads, ['dragon.shp'])
+
+    def test_airburst_retained_import_and_help_are_inert(self):
+        for operation in ('import', 'help'):
+            for optimized in (False, True):
+                with self.subTest(operation=operation, optimized=optimized):
+                    self.check_lifecycle(operation, 'tools.projectile_oracle.airburst_retained', optimized)
+
     def check_lifecycle(self, operation, module, optimized, *, arguments=(), environment=None):
         command = [sys.executable] + (['-O'] if optimized else [])
         child_environment = absent_retail_environment()
@@ -117,6 +157,97 @@ class OracleLifecycleTests(unittest.TestCase):
             for module in PRODUCERS:
                 with self.subTest(module=module, optimized=optimized):
                     self.check_lifecycle('help', module, optimized)
+
+    def test_fixture_checks_and_source_edits_fail_in_optimized_python(self):
+        # A missing or repeated edit anchor, or a failed fixture check, stops the
+        # producer even where `python -O` strips assert statements.
+        script = (
+            'from tools.native_oracle import OracleError, edited_source, require\n'
+            'if "pass" not in edited_source(require, ("raise OracleError(message)", "pass")):\n'
+            '    raise SystemExit("edit not applied")\n'
+            'for attempt in (lambda: edited_source(require, ("condition", "")),\n'
+            '                lambda: edited_source(require, ("absent anchor", "")),\n'
+            '                lambda: require(False, "fixture")):\n'
+            '    try:\n        attempt()\n    except OracleError:\n        continue\n'
+            '    raise SystemExit("accepted")\n')
+        result = subprocess.run([sys.executable, '-O', '-c', script], cwd=ROOT,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual((result.returncode, result.stderr), (0, ''))
+
+    def test_producer_asserts_never_execute_native_code_or_consume_rows(self):
+        # `python -O` strips asserts, and with them any native call or row pop
+        # inside one: a producer must use native_oracle.require instead.
+        effects = {'invoke', 'call', 'run', 'emu_start', 'pop', 'cstring', 'light_constructor'}
+        found = []
+        for path in sorted((ROOT / 'tools').rglob('*.py')):
+            if 'tests' in path.relative_to(ROOT).parts:
+                continue
+            for node in ast.walk(ast.parse(path.read_bytes(), str(path))):
+                if not isinstance(node, ast.Assert):
+                    continue
+                for part in ast.walk(node.test):
+                    name = getattr(getattr(part, 'func', None), 'attr',
+                                   getattr(getattr(part, 'func', None), 'id', None))
+                    if isinstance(part, ast.NamedExpr) or (isinstance(part, ast.Call)
+                                                          and name in effects):
+                        found.append(f'{path.relative_to(ROOT)}:{node.lineno}')
+        self.assertEqual(found, [])
+
+    def test_anim_translucency_import_and_help_are_inert(self):
+        for operation in ('import', 'help'):
+            for optimized in (False, True):
+                with self.subTest(operation=operation, optimized=optimized):
+                    self.check_lifecycle(operation, 'tools.spatial_oracle.anim_translucency',
+                                         optimized)
+
+    def test_flaming_guy_import_and_help_are_inert(self):
+        for operation in ('import', 'help'):
+            for optimized in (False, True):
+                with self.subTest(operation=operation, optimized=optimized):
+                    self.check_lifecycle(operation, 'tools.spatial_oracle.flaming_guy',
+                                         optimized)
+
+    def test_building_anim_translucency_import_and_help_are_inert(self):
+        for operation in ('import', 'help'):
+            for optimized in (False, True):
+                with self.subTest(operation=operation, optimized=optimized):
+                    self.check_lifecycle(operation,
+                                         'tools.spatial_oracle.building_anim_translucency',
+                                         optimized)
+        for optimized in (False, True):
+            with self.subTest(helper=True, optimized=optimized):
+                self.check_lifecycle('import',
+                                     'tools.spatial_oracle.building_anim_translucency_setup',
+                                     optimized)
+
+    def test_building_anim_detail_import_and_help_are_inert(self):
+        for operation in ('import', 'help'):
+            for optimized in (False, True):
+                with self.subTest(operation=operation, optimized=optimized):
+                    self.check_lifecycle(operation,
+                                         'tools.spatial_oracle.building_anim_detail',
+                                         optimized)
+        for optimized in (False, True):
+            with self.subTest(helper=True, optimized=optimized):
+                self.check_lifecycle('import',
+                                     'tools.spatial_oracle.building_anim_detail_setup',
+                                     optimized)
+
+    def test_squid_grapple_light_import_and_help_are_inert(self):
+        for operation in ('import', 'help'):
+            for optimized in (False, True):
+                with self.subTest(operation=operation, optimized=optimized):
+                    self.check_lifecycle(operation,
+                                         'tools.spatial_oracle.squid_grapple_light',
+                                         optimized)
+
+    def test_building_flh_direct_import_and_help_are_inert(self):
+        for operation in ('import', 'help'):
+            for optimized in (False, True):
+                with self.subTest(operation=operation, optimized=optimized):
+                    self.check_lifecycle(operation,
+                                         'tools.spatial_oracle.building_flh_direct',
+                                         optimized)
 
     def test_explosion_rejects_retired_cache_before_inputs_deserialization_or_publication(self):
         module = 'tools.spatial_oracle.trigger_action_values'

@@ -23,6 +23,17 @@ pub(crate) use countdown::ScenarioTimerAction;
 /// the binary's only store to it) and no INI key reads it.
 pub const NUKE_LEVEL_UNITS: i32 = 100;
 
+/// ScenarioClass Set_Defaults68375F..68378E anchors both map-regrowth
+/// timers at the current frame, zero on a fresh start, with zero duration.
+const fn initial_map_regrowth_timer() -> CdTimer {
+    CdTimer::started(0, 0)
+}
+
+/// `ScenarioClass::Set_Defaults @ 0x00683610` stores true.
+const fn tiberium_death_to_visceroid_default() -> bool {
+    true
+}
+
 /// One map-authored global lighting profile in the native integer scales.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ScenarioLightProfileUnits {
@@ -167,9 +178,15 @@ impl NukeFlash {
 
     /// The timer test of `LightningStorm::Process`'s head (`0x0053A6D1..
     /// 0x0053A6EA`): a running timer whose start plus duration (wrapping) is
-    /// less than the frame (signed).
+    /// less than the frame (signed). Installed Ares's rewrite of that head
+    /// (`10037330`, hook `0x53A6CF`) runs only a nonnegative duration, so a
+    /// `NukeFlash.Duration` below -1 never ends the flash there.
     fn ran_out(&self, frame: i32) -> bool {
-        self.duration != -1 && self.start.wrapping_add(self.duration) < frame
+        // Ares' test runs in every game: without Ares the duration is only
+        // -1, 15 or 30, where it is stock's `!= -1`; another one comes only
+        // from Ares' impact hook (`start_nuke_flash_for`).
+        let running = self.duration >= 0;
+        running && self.start.wrapping_add(self.duration) < frame
     }
 }
 
@@ -180,19 +197,19 @@ impl NukeFlash {
 /// belong to lockstep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ScenarioLightingState {
-    pub normal: ScenarioLightProfileUnits,
-    pub ion: ScenarioLightProfileUnits,
+    normal: ScenarioLightProfileUnits,
+    ion: ScenarioLightProfileUnits,
     /// `Dominator*=` (`ScenarioClass+0x357C..+0x3590`).
-    pub dominator: ScenarioLightProfileUnits,
+    dominator: ScenarioLightProfileUnits,
     /// `DominatorAmbientChangeRate=` (`+0x3594`): the fade interval while
     /// the Psychic Dominator is active.
-    pub dominator_change_rate: i32,
-    pub current_ambient: i32,
-    pub target_ambient: i32,
+    dominator_change_rate: i32,
+    current_ambient: i32,
+    target_ambient: i32,
     /// The profile the last `UpdateLighting` selected: its ambient is the
     /// target and its RGB the alternate tint.
-    pub selected_profile: ScenarioLightingProfile,
-    pub transition_timer: CdTimer,
+    selected_profile: ScenarioLightingProfile,
+    transition_timer: CdTimer,
     /// `NukeAmbientChangeRate=` (`+0x3578`): the fade interval while the
     /// nuke flash runs.
     nuke_change_rate: i32,
@@ -201,9 +218,81 @@ pub struct ScenarioLightingState {
     /// supplies untouched inputs; retirement returns writes to the process
     /// Rules owner before its next prefix/read/reset sequence.
     ambient_change_overrides: [Option<NativeF64Bits>; 2],
+    /// Ares UpdateLightingColor's `Light.Ambient`/`.Red`/`.Green`/`.Blue`
+    /// over the selected profile (SWTypeExt of the active superweapon), set
+    /// by [`Self::select_ares`]; `None` after a stock [`Self::select`].
+    #[serde(default)]
+    ares_light: Option<[Option<i32>; 4]>,
 }
 
 impl ScenarioLightingState {
+    pub const fn normal(&self) -> ScenarioLightProfileUnits {
+        self.normal
+    }
+
+    pub const fn ion(&self) -> ScenarioLightProfileUnits {
+        self.ion
+    }
+
+    pub const fn dominator(&self) -> ScenarioLightProfileUnits {
+        self.dominator
+    }
+
+    pub const fn dominator_change_rate(&self) -> i32 {
+        self.dominator_change_rate
+    }
+
+    pub const fn current_ambient(&self) -> i32 {
+        self.current_ambient
+    }
+
+    pub const fn target_ambient(&self) -> i32 {
+        self.target_ambient
+    }
+
+    pub const fn selected_profile(&self) -> ScenarioLightingProfile {
+        self.selected_profile
+    }
+
+    pub const fn transition_timer(&self) -> &CdTimer {
+        &self.transition_timer
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_current_ambient_for_test(&mut self, value: i32) {
+        self.current_ambient = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_target_ambient_for_test(&mut self, value: i32) {
+        self.target_ambient = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_selected_profile_for_test(&mut self, value: ScenarioLightingProfile) {
+        self.selected_profile = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_transition_timer_for_test(&mut self, value: CdTimer) {
+        self.transition_timer = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_normal_for_test(&mut self, value: ScenarioLightProfileUnits) {
+        self.normal = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn normal_mut_for_test(&mut self) -> &mut ScenarioLightProfileUnits {
+        &mut self.normal
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn ion_mut_for_test(&mut self) -> &mut ScenarioLightProfileUnits {
+        &mut self.ion
+    }
+
     /// Construct a tick-zero scenario from its map-authored profiles.
     pub const fn new(
         normal: ScenarioLightProfileUnits,
@@ -226,6 +315,7 @@ impl ScenarioLightingState {
             nuke_change_rate,
             nuke_flash: NukeFlash::OFF,
             ambient_change_overrides: [None; 2],
+            ares_light: None,
         }
     }
 
@@ -238,6 +328,22 @@ impl ScenarioLightingState {
             profiles.dominator_change_rate,
             profiles.nuke_change_rate,
         )
+    }
+
+    /// InitMap's direct writes (0059A54E/565/592/5BF/5EC), after synthetic
+    /// Full_Init and before generated constructors. Keep current/target ambient,
+    /// Ground, alternate profiles and transition state from that earlier phase.
+    pub(crate) fn install_generated_lighting(
+        &mut self,
+        value: crate::map::construction_trace::GeneratedLightingOverride,
+    ) {
+        self.normal.ambient_percent = value.ambient_percent;
+        [
+            self.normal.red_percent,
+            self.normal.green_percent,
+            self.normal.blue_percent,
+        ] = value.rgb_percent;
+        self.normal.level_units = value.level_units;
     }
 
     pub fn profile(&self, profile: ScenarioLightingProfile) -> ScenarioLightProfileUnits {
@@ -260,10 +366,17 @@ impl ScenarioLightingState {
     /// with its RGB times 10 and 1): [`Self::select`] of
     /// [`ScenarioLightingProfile::Nuke`]. The caller publishes the relight.
     pub(crate) fn start_nuke_flash(&mut self, frame: i32) {
+        self.start_nuke_flash_for(frame, 30);
+    }
+
+    /// [`Self::start_nuke_flash`] fading in for `duration` frames: Ares's
+    /// impact hook (467E59, 10036960) writes the status, start and duration
+    /// itself.
+    pub(crate) fn start_nuke_flash_for(&mut self, frame: i32, duration: i32) {
         self.nuke_flash = NukeFlash {
             status: NukeFlashStatus::FadingIn,
             start: frame,
-            duration: 30,
+            duration,
         };
         self.transition_timer.start(frame, 1);
         self.select(ScenarioLightingProfile::Nuke);
@@ -352,12 +465,38 @@ impl ScenarioLightingState {
     pub fn select(&mut self, profile: ScenarioLightingProfile) {
         self.selected_profile = profile;
         self.target_ambient = self.profile(profile).ambient_percent;
+        self.ares_light = None;
+    }
+
+    /// Ares SWTypeExt::GetLightingColor (hook 53C280, 10037B50) for a special
+    /// `profile` whose superweapon type has `light`: `Light.Enabled=no`
+    /// leaves no value, so the default lighting returns (the target is the
+    /// normal ambient, RecalcLighting restores); otherwise the type's set,
+    /// nonnegative overrides replace the profile's ambient (x1) and RGB
+    /// (x10 in RecalcLighting).
+    pub(crate) fn select_ares(
+        &mut self,
+        profile: ScenarioLightingProfile,
+        light: Option<crate::rules::superweapon_type::AresSuperWeaponLighting>,
+    ) {
+        match light {
+            Some(light) if !light.enabled() => self.select(ScenarioLightingProfile::Normal),
+            Some(light) => {
+                self.select(profile);
+                let overrides = light.overrides();
+                if let Some(ambient) = overrides[0] {
+                    self.target_ambient = ambient;
+                }
+                self.ares_light = Some(overrides);
+            }
+            None => self.select(profile),
+        }
     }
 
     /// Execute1426E2E60 /1436E2EB0 /1446E2F00 retains the raw signed
     /// percentage at3534/3538/353C. RecalcLighting takes all three normal
     /// percentages times10 with32-bit wrapping, independently of the selected
-    /// alternate profile. Original Steam gamemd3e81a617..08600;30 executed
+    /// alternate profile. Original Steam gamemd;30 executed
     /// controls cover the reader, call arguments and post-call field stores.
     pub(crate) fn retint_normal_component(&mut self, component: usize, value: i32) -> [i32; 3] {
         match component {
@@ -383,7 +522,7 @@ impl ScenarioLightingState {
     /// Execute71@6DF250 and72@6DF271 load +90 as binary32, not as an
     /// integer value, and store binary64 to Rules+1670/+1668. The existing
     /// integer action reader remains authoritative. No timer/RNG/detach or
-    /// immediate relight occurs. Steam gamemd3e81a617..08600, original
+    /// immediate relight occurs. Steam gamemd, original
     /// constructor/read/Execute and Logic controls in the nearby tests.
     pub(crate) fn set_ambient_change_input(&mut self, rate: bool, bits: i32) {
         self.ambient_change_overrides[usize::from(!rate)] =
@@ -427,8 +566,17 @@ impl ScenarioLightingState {
     /// alternate profile's percentages times 10, none for the ordinary one
     /// (`-1, -1, -1`).
     pub fn alternate_rgb(&self) -> Option<[i32; 3]> {
-        (self.selected_profile != ScenarioLightingProfile::Normal)
-            .then(|| self.profile(self.selected_profile).alternate_rgb())
+        (self.selected_profile != ScenarioLightingProfile::Normal).then(|| {
+            let mut rgb = self.profile(self.selected_profile).alternate_rgb();
+            if let Some([_, red, green, blue]) = self.ares_light {
+                for (slot, value) in rgb.iter_mut().zip([red, green, blue]) {
+                    if let Some(value) = value {
+                        *slot = value.wrapping_mul(10);
+                    }
+                }
+            }
+            rgb
+        })
     }
 
     /// Restart the ambient fade timer (`ScenarioClass+0x1248`), as
@@ -485,6 +633,69 @@ impl Default for ScenarioLightingState {
     }
 }
 
+/// SessionClass GameMode A8B238. The exact active mode survives startup and
+/// save/restore; zero/nonzero tests are projections of this single value.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum ScenarioGameMode {
+    #[default]
+    Campaign,
+    Lan,
+    Wol,
+    Skirmish,
+    Other,
+}
+
+impl ScenarioGameMode {
+    pub const fn from_game_mode(raw: i32) -> Self {
+        match raw {
+            0 => Self::Campaign,
+            3 => Self::Lan,
+            4 => Self::Wol,
+            5 => Self::Skirmish,
+            _ => Self::Other,
+        }
+    }
+    /// Compatibility input for callers that only described offline sessions.
+    pub const fn from_legacy_nonzero(nonzero: bool) -> Self {
+        if nonzero {
+            Self::Skirmish
+        } else {
+            Self::Campaign
+        }
+    }
+    /// `g_GameMode` 0 or 5: campaign or skirmish.
+    pub const fn is_single_player(self) -> bool {
+        matches!(self, Self::Campaign | Self::Skirmish)
+    }
+    pub const fn is_network(self) -> bool {
+        matches!(self, Self::Lan | Self::Wol)
+    }
+    pub const fn is_nonzero(self) -> bool {
+        !matches!(self, Self::Campaign)
+    }
+    /// The stable wire spelling shared by every consumer that names a session's
+    /// `GameMode` as text (dashboard telemetry).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Campaign => "campaign",
+            Self::Lan => "lan",
+            Self::Wol => "wol",
+            Self::Skirmish => "skirmish",
+            Self::Other => "other",
+        }
+    }
+    /// Queue_AI647260 routes the active LAN/WOL values to its multiplayer body.
+    pub const fn command_queue_route(self) -> crate::sim::world::CommandQueueRoute {
+        if self.is_network() {
+            crate::sim::world::CommandQueueRoute::Multiplayer
+        } else {
+            crate::sim::world::CommandQueueRoute::SinglePlayer
+        }
+    }
+}
+
 /// Everything the app layer decides about a session before the sim exists.
 /// Built from the lobby/launch flow and the selected map file — never
 /// hardcoded inside sim/.
@@ -511,6 +722,12 @@ pub struct ScenarioDescriptor {
     pub free_radar: bool,
     /// Map `[Basic] IgnoreGlobalAITriggers`, native Scenario+34B4.
     pub ignore_global_ai_triggers: bool,
+    /// Map Basic.TimerInherit, reset false at683875.
+    pub timer_inherit: bool,
+    /// Basic68A175/68A1B2, consumed by EvadeClass::Do4C6210 after startup.
+    /// None resolves to fresh SetDefaults68381E/68382A's zero values.
+    pub carry_over_money: Option<crate::util::native_x87::NativeF64Bits>,
+    pub carry_over_cap: Option<i32>,
     /// Map Basic.TrainCrate / TruckCrate, reset false by683842/68388D.
     pub train_crate: bool,
     pub truck_crate: bool,
@@ -531,6 +748,19 @@ pub struct ScenarioDescriptor {
     /// by the same skirmish/multiplayer sites. Gates
     /// `CellClass::CanSpreadTiberium @ 0x00483690`.
     pub tiberium_spreads_flag: bool,
+    /// Native `ScenarioClass` flags bit `0x800`. Campaign reads the map's
+    /// `[SpecialFlags] HarvesterImmune=` (`0x006B8EBF..0x006B8ED7`); a
+    /// nonzero game mode replaces the map's flags with the session's staging
+    /// word (`0x00687C16..0x00687C29`), whose `PregameSetup` arm stores the
+    /// session's Harvester Truce byte `0x00A8B31D` in this bit
+    /// (`0x005E7495..0x005E74D4`). The skirmish dialog clears the truce byte
+    /// (`0x006AD89D`), so every skirmish leaves it off; LAN/WOL lobbies can
+    /// set it. While set, a Unit whose type is in Rules' `HarvesterUnit=`
+    /// list ([`Self::truce_harvester_types`]) is refused by
+    /// `Evaluate_Candidate` (`0x006F8009..0x006F8047`) and gets no
+    /// `Apply_area_damage` record (`0x00489710..0x00489759`); the
+    /// hunter-seeker skips `Harvester=` units (`0x004CFFB9`).
+    pub harvester_immune: bool,
     /// Map-authored global-light profiles plus their tick-zero mutable state.
     pub lighting: ScenarioLightingState,
     /// Shared gameplay conversion profile; independent of every client's window.
@@ -561,6 +791,7 @@ impl ScenarioDescriptor {
             no_damage: header.special_flags & 0x20 != 0,
             tiberium_grows_flag: header.special_flags & 0x40 != 0,
             tiberium_spreads_flag: header.special_flags & 0x80 != 0,
+            harvester_immune: header.special_flags & 0x800 != 0,
             ..Self::default()
         }
     }
@@ -572,6 +803,13 @@ impl ScenarioDescriptor {
 /// TechLevel. Keeping these on Session avoids a second launch-settings owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 struct CampaignScenarioState {
+    /// Start_Scenario683B0A writes Scenario+34CC. ScenarioSave689310 /
+    /// ScenarioLoad689470 retain it, including on a cold load of a later map.
+    campaign_index: i32,
+    /// ContentSave67D31B / ContentLoad67E804 retain the separate 8A38E0
+    /// record (4C6340 / 4C6320). Restart restores this incoming record,
+    /// not globals/difficulty changed while playing the saved mission.
+    restart_carry_over: crate::sim::campaign_carry_over::CampaignCarryOver,
     mission_counter: i32,
     player_difficulty: HouseDifficulty,
     computer_difficulty: HouseDifficulty,
@@ -597,16 +835,60 @@ pub enum CampaignScenarioStartupError {
 pub struct ScenarioSession {
     /// Construction seed — the negotiated per-match value; the replay header
     /// records it. Stored widened (the negotiated value is 32-bit).
-    pub seed: u64,
+    seed: u64,
     /// Scenario identity: map file name (with `[Basic]` Name fallback).
-    pub map_name: String,
+    map_name: String,
     /// Theater name from the map header.
-    pub theater: String,
-    /// Persisted native zero/nonzero GameMode classification.
+    theater: String,
+    /// Exact native GameMode; the former boolean is now a derived query.
     #[serde(default)]
-    pub game_mode_nonzero: bool,
+    game_mode: ScenarioGameMode,
+    /// Accepted MPMode factory class. Runtime completion queries its virtual
+    /// policy directly; no independent cooperative-win flag is retained.
+    multiplayer_mode_class: Option<crate::skirmish_modes::MpModeClass>,
+    /// Native `[0xAC1198]`, assigned by each observer's CreateHouses688116:
+    /// one pointer, so the last observer in House creation order owns the
+    /// observer's presentation. VERA's own game rooms admit several observers,
+    /// so this holds every observer House in creation order and each gets it.
+    observer_houses: Vec<InternedId>,
+    /// Native Session+318/A8B550, admitted from the start/timing service.
+    /// It is independent of local command scheduling preferences.
+    network_max_ahead_frames: Option<i32>,
+    /// Values changed only by admitted TIMING / PROCESS_TIME events. Startup
+    /// installs their roster once; a new scenario discards the old measurements.
+    #[serde(default)]
+    network_command_timing: Option<crate::sim::command_queue::NetworkCommandTiming>,
+    /// VERA shared control: the House index each command sender (network
+    /// source) controls, when players share Houses. Empty otherwise: every
+    /// sender is then its House index, as in gamemd. Launch installs it once.
+    #[serde(default)]
+    shared_house_sources: Vec<u8>,
+    /// This process's own sender while players share Houses; `None`
+    /// otherwise, when its sender is its current House's index. Local
+    /// identity, like `current_house`.
+    #[serde(default)]
+    local_shared_house_source: Option<i8>,
+    /// VERA watching (docs/Networking.md "Watching"): this process watches
+    /// the match and sends no command records, so no record's sender is its
+    /// own, not even the followed player's. Local identity, like
+    /// `current_house`, outside the shared hash.
+    #[serde(default)]
+    watcher: bool,
+    /// VERA watching: the watcher shows the observer's sidebar, Tab's stop
+    /// after the last player ([`crate::sim::world::Simulation::observe`]),
+    /// while its world keeps the House it last followed. Local identity, like
+    /// the current House, outside the shared hash.
+    #[serde(default)]
+    watcher_observes: bool,
+    /// Scenario+11E4 is included in Save689372's complete Scenario block and
+    /// retained by Load6894A8/NoInit683560. Fresh Clear_Scene starts at4.
+    #[serde(default)]
+    start_header: crate::map::preview::ScenarioStartHeader,
     #[serde(default)]
     campaign: Option<CampaignScenarioState>,
+    /// Scenario+35A0: SetDefaults6839C7 clears the raw stage word. MapSelect
+    /// 5AE1FA/5AE0B8 writes the selected index; Scenario save/load retains it.
+    campaign_map_stage: u16,
     /// Scenario+35A2. Trigger actions46/47 own this retained input lock;
     /// presentation reads it and applies the ordered mouse/keyboard effects.
     #[serde(default)]
@@ -618,6 +900,11 @@ pub struct ScenarioSession {
     /// belong to the countdown owner; UI consumes only its retained view.
     #[serde(default)]
     scenario_countdown: countdown::ScenarioCountdown,
+    /// Destination Scenario+1C78/+1C80; immutable after its Basic read.
+    #[serde(default)]
+    carry_over_money: Option<crate::util::native_x87::NativeF64Bits>,
+    #[serde(default)]
+    carry_over_cap: i32,
     /// Process scenario-active byte A8ED5C. StartScenario683E75 publishes1;
     /// MainGame48CEBF clears it on exit, and LoadGame67E6C4 republishes1.
     /// It is reconstructed by the committed load/start route, not inferred
@@ -626,10 +913,10 @@ pub struct ScenarioSession {
     started: bool,
     /// Persisted native `ScenarioClass` flags bit `0x20`.
     #[serde(default)]
-    pub no_damage: bool,
+    no_damage: bool,
     /// Persistent native Scenario+34A4, included by original CRC at 0068BC16.
     #[serde(default)]
-    pub free_radar: bool,
+    free_radar: bool,
     /// Persistent native Scenario+34B4 (`[Basic] IgnoreGlobalAITriggers`).
     #[serde(default)]
     ignore_global_ai_triggers: bool,
@@ -638,6 +925,12 @@ pub struct ScenarioSession {
     train_crate: bool,
     #[serde(default)]
     truck_crate: bool,
+    /// Scenario+0x34B3, map `[Basic] TiberiumDeathToVisceroid`
+    /// (`BasicSection`): `Set_Defaults @ 0x00683610` stores true and a map
+    /// key replaces it. Ares' tiberium death visceroid (`TechnoExt::
+    /// SpawnVisceroid @ 100468B0`) is its only reader.
+    #[serde(default = "tiberium_death_to_visceroid_default")]
+    tiberium_death_to_visceroid: bool,
     /// Scenario+34A8. Execute87 stores the literal low byte at6DDBE1;
     /// Basic's bool reader normalizes only when it actually reads a value.
     /// Retain the byte even though no ice-growth simulation leaf is ported.
@@ -648,27 +941,45 @@ pub struct ScenarioSession {
     /// Persisted native `ScenarioClass` flags bit `0x40` (`TiberiumGrows`);
     /// see the descriptor field of the same name.
     #[serde(default)]
-    pub tiberium_grows_flag: bool,
+    tiberium_grows_flag: bool,
     /// Persisted native `ScenarioClass` flags bit `0x80` (`TiberiumSpreads`).
     #[serde(default)]
-    pub tiberium_spreads_flag: bool,
+    tiberium_spreads_flag: bool,
+    /// Persisted native `ScenarioClass` flags bit `0x800` (HarvesterImmune /
+    /// Harvester Truce); see the descriptor field of the same name.
+    #[serde(default)]
+    harvester_immune: bool,
     /// Scenario+11E0: a computer slot has a team. Cleared at `0x00683A3A`;
     /// `Create_Houses` sets it for a computer slot whose team (`+0x60`) is
     /// not -1 (`0x006881F5..0x00688209`). Computer_Paranoid is its only
     /// reader (`0x0050166D`).
     #[serde(default)]
     computer_slot_has_team: bool,
+    /// `[0xB779C4]`: OnGameStart's copy of the WOL channel's tournament
+    /// value `+0x14`, or 2 in a clan room (`0x007A7D0E..0x007A7D49`). Its
+    /// in-match readers all gate on GameMode 4 ([`Self::wol_tournament_game`]).
+    #[serde(default)]
+    wol_tournament: i32,
+    /// `[0xB77A04]`/`[0xB76568]`: Start Game Now's two clan name lists
+    /// (`0x00795250..0x0079546E`), read by [`Simulation::apply_squad_alliances`].
+    #[serde(default)]
+    wol_squad_lists: [Vec<String>; 2],
+    /// Scenario flags bit `0x400` (FixedAlliance): set by Apply_Squad_Alliances
+    /// (`0x0069B4DB..0x0069B4E5`); it refuses the Ally requests `0x00731840`
+    /// and `0x007318F0`.
+    #[serde(default)]
+    fixed_alliance: bool,
     /// Persistent fixed-integer global-light configuration and transition state.
-    pub lighting: ScenarioLightingState,
+    lighting: ScenarioLightingState,
     /// Saved match authority for Building and Tile animation coordinates.
-    pub pixel_conversion_bounds: crate::util::pixel_conversion::PixelConversionBounds,
+    pixel_conversion_bounds: crate::util::pixel_conversion::PixelConversionBounds,
     /// Authoritative map bounds in the canonical cell-array frame (max cell
     /// rx/ry + 1); see the descriptor field of the same name. Seeds the fog
     /// grid dimensions at construction.
-    pub map_width: u16,
-    pub map_height: u16,
+    map_width: u16,
+    map_height: u16,
     /// MP start waypoints (index -> cell) from the map `[Waypoints]` list.
-    pub mp_start_waypoints: BTreeMap<u32, (u16, u16)>,
+    mp_start_waypoints: BTreeMap<u32, (u16, u16)>,
     /// Scenario68BDC0's complete waypoint authority. The map parser is the
     /// source transaction; Team movement and trigger callbacks read this one
     /// private, saved table rather than maintaining subsystem copies. Omitted
@@ -677,36 +988,584 @@ pub struct ScenarioSession {
     waypoints: BTreeMap<u32, (i16, i16)>,
     /// Start waypoint index -> owning house, filled during launch application
     /// (after the random-assignment draws), before tick 0.
-    pub start_slot_houses: BTreeMap<u32, InternedId>,
-    /// HouseClass array registration order. Native house ids are indices into
-    /// this vector; map ordering by name/id is not an equivalent substitute.
-    pub house_order: Vec<InternedId>,
+    start_slot_houses: BTreeMap<u32, InternedId>,
     /// Native A83D4C: this process's current HouseClass identity. Campaign
     /// Basic.Player and multiplayer participant index0 choose it at creation;
     /// 67F802/67F9F3 save/load the pointer and 67FA0E swizzles it. It is not
     /// the presentation viewer and cannot be rebound from selection each frame.
     /// Evidence: docs/research/PHASE3_CURRENT_HOUSE_IDENTITY_GHIDRA_REPORT.md.
-    pub current_house: Option<InternedId>,
+    current_house: Option<InternedId>,
+    /// Process result requests A83D49/A8ECD0. HouseClass::AI @0x004F8440
+    /// clears Won at4F8657 before raising victory; later House flag/timer
+    /// writes cannot revoke it. Main_Game__Route_Scenario_Termination
+    /// @0x0055CFD0 selects victory first at55D059.
+    #[serde(default)]
+    victory_requested: bool,
+    #[serde(default)]
+    defeat_requested: bool,
+    /// Scenario+34B8: saved signed Side, independent of current House and
+    /// process Vox selection. SetDefaults68389F initializes0; Full_Init
+    /// 687819/68782D/68792A/687938 installs the fresh value. Load67E75B
+    /// reads this datum before the separate current-House globals restore.
+    scenario_side: i32,
     /// Per-match game settings (the lobby options card). Set once at game
     /// start, read-only during gameplay.
-    pub game_options: GameOptions,
+    game_options: GameOptions,
+    /// Scenario+1218/+1220, reloaded before GrowShroud by Logic55B26E..278.
+    /// Save689378/Load6894B7 retain both dwords; NoInit683560 leaves them.
+    #[serde(default = "initial_map_regrowth_timer")]
+    shroud_growth_timer: CdTimer,
+    /// Scenario+1224/+122C, restarted before RegrowFog by
+    /// LogicClass::AI55B2DF..55B326. Save/load retains its frame anchor.
+    #[serde(default = "initial_map_regrowth_timer")]
+    fog_regrow_timer: CdTimer,
     /// Monotonic Rust-side simulation ordinal. This is kept separately from
     /// the wrapping native frame so long-running diagnostics and command
     /// bookkeeping do not lose their ordering at the 32-bit wrap.
-    pub tick: u64,
+    tick: u64,
     /// Diagnostic accumulation of the nominal milliseconds supplied by the
     /// host for each admitted frame. Gameplay must not derive timer state,
     /// cadence, or the native frame from this value.
-    pub total_sim_ms: u64,
+    total_sim_ms: u64,
     /// Wrapping native gameplay-frame counter. One admitted `advance_tick`
     /// executes entirely under frame N, then commits N+1 at the late tail.
     ///
     /// The field keeps its historical name until all persistence and app
     /// surfaces can be renamed together; it is not a synthetic 15 Hz clock.
-    pub binary_frame: u32,
+    binary_frame: u32,
 }
 
 impl ScenarioSession {
+    // ---- Reads -----------------------------------------------------------
+
+    /// Construction seed — the negotiated per-match value.
+    pub const fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    pub fn map_name(&self) -> &str {
+        &self.map_name
+    }
+
+    pub fn theater(&self) -> &str {
+        &self.theater
+    }
+
+    pub const fn no_damage(&self) -> bool {
+        self.no_damage
+    }
+
+    pub const fn free_radar(&self) -> bool {
+        self.free_radar
+    }
+
+    pub const fn tiberium_grows_flag(&self) -> bool {
+        self.tiberium_grows_flag
+    }
+
+    pub const fn tiberium_spreads_flag(&self) -> bool {
+        self.tiberium_spreads_flag
+    }
+
+    pub const fn harvester_immune(&self) -> bool {
+        self.harvester_immune
+    }
+
+    /// The Rules `[General] HarvesterUnit=` types (`+0xB3C`, filled at
+    /// `0x0066F973`, VehicleTypes only) that bit `0x800` protects, as
+    /// interned ids for native's type-pointer compares; empty while the bit
+    /// is clear.
+    pub fn truce_harvester_types(
+        &self,
+        rules: &crate::rules::ruleset::RuleSet,
+        interner: &crate::sim::intern::StringInterner,
+    ) -> Vec<InternedId> {
+        if !self.harvester_immune {
+            return Vec::new();
+        }
+        rules
+            .harvester_unit_types
+            .iter()
+            .filter_map(|type_id| interner.get(type_id))
+            .collect()
+    }
+
+    pub const fn lighting(&self) -> &ScenarioLightingState {
+        &self.lighting
+    }
+
+    /// The lighting owner; its operations carry the transition rules.
+    pub fn lighting_mut(&mut self) -> &mut ScenarioLightingState {
+        &mut self.lighting
+    }
+
+    pub const fn pixel_conversion_bounds(
+        &self,
+    ) -> crate::util::pixel_conversion::PixelConversionBounds {
+        self.pixel_conversion_bounds
+    }
+
+    pub const fn map_width(&self) -> u16 {
+        self.map_width
+    }
+
+    pub const fn map_height(&self) -> u16 {
+        self.map_height
+    }
+
+    pub const fn mp_start_waypoints(&self) -> &BTreeMap<u32, (u16, u16)> {
+        &self.mp_start_waypoints
+    }
+
+    pub const fn start_slot_houses(&self) -> &BTreeMap<u32, InternedId> {
+        &self.start_slot_houses
+    }
+
+    pub const fn game_options(&self) -> &GameOptions {
+        &self.game_options
+    }
+
+    pub const fn fog_regrow_timer(&self) -> CdTimer {
+        self.fog_regrow_timer
+    }
+
+    pub const fn shroud_growth_timer(&self) -> CdTimer {
+        self.shroud_growth_timer
+    }
+
+    pub const fn tick(&self) -> u64 {
+        self.tick
+    }
+
+    pub const fn total_sim_ms(&self) -> u64 {
+        self.total_sim_ms
+    }
+
+    pub const fn binary_frame(&self) -> u32 {
+        self.binary_frame
+    }
+
+    // ---- Operations ------------------------------------------------------
+
+    /// The late frame commit (Main_Tick's tail): the wrapping native frame
+    /// advances after every phase observed frame N; host milliseconds are
+    /// diagnostic only.
+    pub(crate) fn commit_native_frame(&mut self, tick_ms: u32) {
+        self.total_sim_ms = self.total_sim_ms.saturating_add(u64::from(tick_ms));
+        self.binary_frame = self.binary_frame.wrapping_add(1);
+    }
+
+    /// The Rust tick ordinal reaches the executed tick after the drain.
+    pub(crate) fn complete_tick(&mut self, execute_tick: u64) {
+        self.tick = execute_tick;
+    }
+
+    /// Init_Random_Number_System and load retention record the seed the
+    /// Scenario stream was seeded from.
+    pub(crate) fn record_random_seed(&mut self, seed: u64) {
+        self.seed = seed;
+    }
+
+    /// Per-match options from the accepted launch, before House creation.
+    pub(crate) fn install_game_options(&mut self, options: GameOptions) {
+        self.game_options = options;
+    }
+
+    /// Full_Init686BA2 clears the campaign bit before the map's
+    /// Read_SpecialFlags6B8E69..6B8E89 installs its override.
+    pub(super) fn install_campaign_fog_of_war(&mut self, enabled: bool) {
+        self.game_options.fog_of_war = enabled;
+    }
+
+    /// LogicClass::AI55B2DF..55B323: test against the native frame and
+    /// restart before the caller runs RegrowFog. Flag/rate admission belongs
+    /// to that caller, so a disabled flag/rate leaves this timer untouched.
+    pub(crate) fn poll_fog_regrowth(&mut self, interval_frames: i32) -> bool {
+        let frame = self.binary_frame as i32;
+        if !self.fog_regrow_timer.expired(frame) {
+            return false;
+        }
+        self.fog_regrow_timer.start(frame, interval_frames);
+        true
+    }
+
+    /// LogicClass::AI55B228..55B278: restart before the shared GrowShroud
+    /// body can raise discovery callbacks. Admission leaves disabled timers alone.
+    pub(crate) fn poll_shroud_growth(&mut self, interval_frames: i32) -> bool {
+        let frame = self.binary_frame as i32;
+        if !self.shroud_growth_timer.expired(frame) {
+            return false;
+        }
+        self.shroud_growth_timer.start(frame, interval_frames);
+        true
+    }
+
+    /// In-game Options speed transition (accepted only within range).
+    pub(crate) fn apply_in_game_speed(&mut self, speed: u8) -> bool {
+        self.game_options.apply_in_game_speed(speed)
+    }
+
+    /// A83D4C at House creation: the launch participant index0 or the
+    /// campaign's Basic.Player. Never rebound from selection.
+    pub(crate) fn install_current_house(&mut self, owner: Option<InternedId>) {
+        self.current_house = owner;
+    }
+
+    /// Fresh Scenario identity; ownership/viewer changes do not rebind it.
+    pub(crate) fn install_scenario_side(&mut self, side: i32) {
+        self.scenario_side = side;
+    }
+
+    /// The start-slot -> House table filled after the random assignment.
+    pub(crate) fn install_start_slot_houses(
+        &mut self,
+        table: impl IntoIterator<Item = (u32, InternedId)>,
+    ) {
+        self.start_slot_houses = table.into_iter().collect();
+    }
+
+    // ---- Fixture operations ----------------------------------------------
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_seed_for_test(&mut self, value: u64) {
+        self.seed = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_no_damage_for_test(&mut self, value: bool) {
+        self.no_damage = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_free_radar_for_test(&mut self, value: bool) {
+        self.free_radar = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_tiberium_grows_flag_for_test(&mut self, value: bool) {
+        self.tiberium_grows_flag = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_tiberium_spreads_flag_for_test(&mut self, value: bool) {
+        self.tiberium_spreads_flag = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_harvester_immune_for_test(&mut self, value: bool) {
+        self.harvester_immune = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_pixel_conversion_bounds_for_test(
+        &mut self,
+        value: crate::util::pixel_conversion::PixelConversionBounds,
+    ) {
+        self.pixel_conversion_bounds = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_map_width_for_test(&mut self, value: u16) {
+        self.map_width = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_map_height_for_test(&mut self, value: u16) {
+        self.map_height = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_current_house_for_test(&mut self, value: Option<InternedId>) {
+        self.current_house = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_shared_house_sources_for_test(
+        &mut self,
+        source_houses: Vec<u8>,
+        local_source: Option<i8>,
+    ) {
+        self.install_shared_house_sources(source_houses, local_source);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_observer_houses_for_test(&mut self, observers: Vec<InternedId>) {
+        self.observer_houses = observers;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_scenario_side_for_test(&mut self, side: i32) {
+        self.install_scenario_side(side);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_tick_for_test(&mut self, value: u64) {
+        self.tick = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_total_sim_ms_for_test(&mut self, value: u64) {
+        self.total_sim_ms = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_binary_frame_for_test(&mut self, value: u32) {
+        self.binary_frame = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_lighting_for_test(&mut self, value: ScenarioLightingState) {
+        self.lighting = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_map_name_for_test(&mut self, value: String) {
+        self.map_name = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_theater_for_test(&mut self, value: String) {
+        self.theater = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_game_options_for_test(&mut self, value: GameOptions) {
+        self.game_options = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn game_options_mut_for_test(&mut self) -> &mut GameOptions {
+        &mut self.game_options
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn start_slot_houses_mut_for_test(&mut self) -> &mut BTreeMap<u32, InternedId> {
+        &mut self.start_slot_houses
+    }
+
+    pub const fn game_mode(&self) -> ScenarioGameMode {
+        self.game_mode
+    }
+    pub const fn game_mode_nonzero(&self) -> bool {
+        self.game_mode.is_nonzero()
+    }
+    /// Fresh accepted startup or admitted saved-session mode, never a frame-local
+    /// UI projection. Descriptor compatibility callers are converted at construction.
+    pub fn set_game_mode(&mut self, mode: ScenarioGameMode) {
+        self.game_mode = mode;
+        if !mode.is_network() {
+            self.network_max_ahead_frames = None;
+            self.network_command_timing = None;
+        }
+    }
+    pub fn install_network_timing(&mut self, max_ahead_frames: i32) {
+        assert!(
+            self.game_mode.is_network(),
+            "network timing needs an admitted network mode"
+        );
+        self.network_max_ahead_frames = Some(max_ahead_frames);
+    }
+
+    pub fn install_network_command_timing(
+        &mut self,
+        host_house: i8,
+        frame_send_rate: std::num::NonZeroU8,
+        houses: impl IntoIterator<Item = i8>,
+    ) {
+        let ahead = self
+            .network_max_ahead_frames
+            .expect("admitted network timing");
+        self.network_command_timing = Some(crate::sim::command_queue::NetworkCommandTiming::new(
+            host_house,
+            frame_send_rate,
+            ahead as u16,
+            houses,
+        ));
+    }
+
+    pub fn network_command_timing(
+        &self,
+    ) -> Option<&crate::sim::command_queue::NetworkCommandTiming> {
+        self.network_command_timing.as_ref()
+    }
+
+    /// EventClass::Add @0x00652230 (gamemd.exe instructions65223A..652258):
+    /// generated DoList events use the next send boundary, without MaxAhead.
+    /// Currently admitted sessions use native protocol2 (Session6973FF).
+    /// Offline keeps the constructor's FrameSendRate5 (6975DF); network
+    /// admission and TIMING already own its overrides, including relay rate1.
+    pub(crate) fn generated_event_frame(&self) -> u32 {
+        let rate = self
+            .network_command_timing()
+            .map_or(5, |timing| u32::from(timing.frame_send_rate().get()));
+        self.binary_frame
+            .wrapping_add(rate)
+            .wrapping_div(rate)
+            .wrapping_mul(rate)
+    }
+
+    pub(crate) fn configure_sequenced_clock(&mut self, frames_per_second: u16) {
+        let ahead = self.network_max_ahead_frames.expect("installed timing") as u16;
+        let timing = self
+            .network_command_timing
+            .as_mut()
+            .expect("installed timing");
+        timing.apply(
+            crate::sim::command::TimingRecord {
+                house_id: timing.host_house(),
+                frame: 0,
+                max_ahead: ahead,
+                frames_per_second,
+                frame_send_rate: std::num::NonZeroU8::new(1).unwrap(),
+            },
+            ahead,
+        );
+    }
+
+    pub(crate) fn install_shared_house_sources(
+        &mut self,
+        source_houses: Vec<u8>,
+        local_source: Option<i8>,
+    ) {
+        self.shared_house_sources = source_houses;
+        self.local_shared_house_source = local_source;
+    }
+
+    /// VERA shared control: whether any players share a House, so that
+    /// senders differ from House indices.
+    pub fn shares_houses(&self) -> bool {
+        !self.shared_house_sources.is_empty()
+    }
+
+    /// The House index a command record's sender controls. VERA shared
+    /// control: a sender is a network source, which is its House index
+    /// unless players share Houses.
+    pub fn network_source_house(&self, source: i8) -> Option<usize> {
+        let source = usize::try_from(source).ok()?;
+        if self.shared_house_sources.is_empty() {
+            return Some(source);
+        }
+        self.shared_house_sources
+            .get(source)
+            .map(|&house| usize::from(house))
+    }
+
+    /// Every command sender with the House index it controls, in source
+    /// order: each of the `house_count` Houses unless players share Houses.
+    pub fn network_sources(&self, house_count: usize) -> impl Iterator<Item = (i8, usize)> + '_ {
+        let count = if self.shared_house_sources.is_empty() {
+            house_count
+        } else {
+            self.shared_house_sources.len()
+        };
+        (0..count).filter_map(|source| {
+            let source = i8::try_from(source).ok()?;
+            Some((source, self.network_source_house(source)?))
+        })
+    }
+
+    /// This process's sender while players share Houses.
+    pub(crate) fn local_shared_house_source(&self) -> Option<i8> {
+        self.local_shared_house_source
+    }
+
+    /// VERA watching: this process watches the match and sends nothing.
+    pub fn watcher(&self) -> bool {
+        self.watcher
+    }
+
+    pub(crate) fn install_watcher(&mut self) {
+        self.watcher = true;
+    }
+
+    /// VERA watching: the watcher shows the observer's sidebar.
+    pub fn watcher_observes(&self) -> bool {
+        self.watcher_observes
+    }
+
+    /// The watcher's Tab moves between a player's sidebar and the observer's.
+    pub(crate) fn show_observer_sidebar(&mut self, shown: bool) {
+        self.watcher_observes = shown;
+    }
+
+    /// Retire the existing admitted timing row at a shared EXIT/REMOVEPLAYER
+    /// tail. Local transport loss alone must not change shared timing state.
+    pub(crate) fn retire_network_command_source(&mut self, house: i8) {
+        if let Some(timing) = self.network_command_timing.as_mut() {
+            timing.retire_source(house);
+        }
+    }
+
+    /// EventClass::Execute4C800C / 4C80B1. Transport validates source headers;
+    /// Simulation supplies the same live publisher decision used by the local
+    /// producer. No wall clock enters this owner. Execute_DoList supplies its
+    /// persistent retiming window. Returns the actual receiver admission for
+    /// borrowed post-dispatch diagnostics; this adds no timing policy.
+    pub(crate) fn apply_network_timing_record(
+        &mut self,
+        record: &crate::sim::command::CommandRecord,
+        window: &mut crate::sim::command_queue::DoListRetimeWindow,
+        publisher: Option<i8>,
+    ) -> bool {
+        let Some(timing) = self.network_command_timing.as_mut() else {
+            return false;
+        };
+        if let Some(event) = crate::sim::command::TimingRecord::decode(record) {
+            if publisher != Some(event.house_id) {
+                return false;
+            }
+            let ahead = window.apply_timing_update(
+                event.frame,
+                self.network_max_ahead_frames.expect("admitted timing") as u16,
+                timing.frame_send_rate(),
+                event.max_ahead,
+                event.frame_send_rate,
+                // Full_Init687C16 copies the session flags into Scenario for
+                // network games; its bit1000 is the existing FogOfWar option.
+                self.game_options.fog_of_war,
+            );
+            self.network_max_ahead_frames = Some(i32::from(ahead));
+            timing.apply(event, ahead);
+            true
+        } else if let Some(event) = crate::sim::command::ProcessTimeRecord::decode(record) {
+            timing.record_processing_millis(event.house_id, event.milliseconds)
+        } else {
+            false
+        }
+    }
+    pub const fn start_header(&self) -> crate::map::preview::ScenarioStartHeader {
+        self.start_header
+    }
+
+    pub(crate) fn install_start_header(
+        &mut self,
+        header: crate::map::preview::ScenarioStartHeader,
+    ) {
+        self.start_header = header;
+    }
+
+    pub const fn network_max_ahead_frames(&self) -> Option<i32> {
+        self.network_max_ahead_frames
+    }
+    pub const fn multiplayer_mode_class(&self) -> Option<crate::skirmish_modes::MpModeClass> {
+        self.multiplayer_mode_class
+    }
+    /// Whether `house` is an observer's (`[0xAC1198]`).
+    pub fn is_observer_house(&self, house: InternedId) -> bool {
+        self.observer_houses.contains(&house)
+    }
+    pub fn observer_houses(&self) -> &[InternedId] {
+        &self.observer_houses
+    }
+    pub(crate) fn install_multiplayer_house_identity(
+        &mut self,
+        class: crate::skirmish_modes::MpModeClass,
+        observers: Vec<InternedId>,
+    ) {
+        self.multiplayer_mode_class = Some(class);
+        self.observer_houses = observers;
+    }
+
     pub fn install_waypoints(
         &mut self,
         waypoints: &std::collections::HashMap<u32, crate::map::waypoints::Waypoint>,
@@ -723,15 +1582,16 @@ impl ScenarioSession {
     /// unset valid slot is (0,0); reading outside its702-slot allocation is
     /// not a deterministic malformed-map contract and is rejected here.
     pub fn waypoint_cell(&self, index: i32) -> Option<(i16, i16)> {
-        let index = u32::try_from(index).ok()?;
-        (index < crate::map::waypoints::WAYPOINT_SLOT_COUNT)
-            .then(|| self.waypoints.get(&index).copied().unwrap_or((0, 0)))
+        let index = crate::map::waypoints::waypoint_slot(index)?;
+        Some(self.waypoints.get(&index).copied().unwrap_or((0, 0)))
     }
 
     /// Scenario IsWaypointValid68BD80: a bounded slot whose packed pair is
     /// different from the initialized empty cell B05458=(0,0).
     pub(crate) fn waypoint_is_valid(&self, index: i32) -> bool {
-        self.waypoint_cell(index).is_some_and(|cell| cell != (0, 0))
+        crate::map::waypoints::waypoint_is_defined(index, |index| {
+            self.waypoints.get(&index).copied()
+        })
     }
 
     pub fn first_multiplayer_start(&self) -> Option<crate::map::waypoints::Waypoint> {
@@ -753,11 +1613,50 @@ impl ScenarioSession {
         self.computer_slot_has_team = true;
     }
 
+    /// The WOL start's tournament value and clan name lists, installed with
+    /// the accepted network start.
+    pub fn install_wol_start(&mut self, tournament: i32, squad_lists: [Vec<String>; 2]) {
+        self.wol_tournament = tournament;
+        self.wol_squad_lists = squad_lists;
+    }
+
+    /// GameMode 4 and `[0xB779C4]` nonzero: the gate every in-match reader
+    /// of the tournament value tests (`0x004F16C0`, `0x0064AB6A`,
+    /// `0x005DA8F7`, `0x004C7BBF`).
+    pub fn wol_tournament_game(&self) -> bool {
+        self.game_mode == ScenarioGameMode::Wol && self.wol_tournament != 0
+    }
+
+    pub(crate) fn wol_squad_lists(&self) -> &[Vec<String>; 2] {
+        &self.wol_squad_lists
+    }
+
+    /// Scenario flag `0x400`.
+    pub const fn fixed_alliance(&self) -> bool {
+        self.fixed_alliance
+    }
+
+    pub(crate) fn set_fixed_alliance(&mut self, fixed: bool) {
+        self.fixed_alliance = fixed;
+    }
+
     pub const fn input_locked(&self) -> bool {
         self.input_locked
     }
 
-    pub fn set_input_locked(&mut self, locked: bool) {
+    /// Trigger action46 and the campaign Flag announcement lock Scenario+35A2.
+    /// Returns the previous lock for the ordered presentation effect.
+    pub(crate) fn lock_input(&mut self) -> bool {
+        std::mem::replace(&mut self.input_locked, true)
+    }
+
+    /// Trigger action47 unlocks Scenario+35A2. Returns the previous lock.
+    pub(crate) fn unlock_input(&mut self) -> bool {
+        std::mem::replace(&mut self.input_locked, false)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_input_locked_for_test(&mut self, locked: bool) {
         self.input_locked = locked;
     }
 
@@ -791,16 +1690,26 @@ impl ScenarioSession {
         self.started
     }
 
-    pub fn set_started(&mut self, started: bool) {
-        self.started = started;
+    /// StartScenario683E75 and a committed LoadGame67E6C4 publish A8ED5C=1.
+    pub fn publish_started(&mut self) {
+        self.started = true;
+    }
+
+    /// MainGame48CEBF clears A8ED5C when the match returns; a restart clears
+    /// it at686424.
+    pub fn retire_started(&mut self) {
+        self.started = false;
     }
 
     pub(super) fn initialize_campaign_startup(
         &mut self,
         difficulty: i32,
         mission_counter: i32,
+        game_options: Option<&GameOptions>,
+        campaign_index: i32,
+        restart_carry_over: crate::sim::campaign_carry_over::CampaignCarryOver,
     ) -> Result<(), CampaignScenarioStartupError> {
-        if self.game_mode_nonzero {
+        if self.game_mode_nonzero() {
             return Err(CampaignScenarioStartupError::NonCampaignMode);
         }
         if self.campaign.is_some() {
@@ -810,7 +1719,22 @@ impl ScenarioSession {
             .ok_or(CampaignScenarioStartupError::InvalidDifficulty(difficulty))?;
         let computer_difficulty = HouseDifficulty::from_native(2 - difficulty)
             .expect("the admitted menu row has a complementary computer row");
+        // External launch input enters before House/terrain constructors. The
+        // existing session remains the sole live owner of per-match options.
+        // RESIDUAL: gamemd's BuildOffAlly (0x00A8B264) is a process global that only
+        // option setup writes (e.g. `0x0052D20D`, the skirmish dialog's `0x006AD803`),
+        // so a campaign inherits the last game's value; VERA keeps this session's.
+        if let Some(options) = game_options {
+            self.game_options = options.clone();
+        } else {
+            // Main_Tick55D767..55D796 forces ordinary campaigns to two
+            // 16-ms buckets, independently of the multiplayer default.
+            // Explicit external launch settings retain their selected speed.
+            self.game_options.game_speed = 2;
+        }
         self.campaign = Some(CampaignScenarioState {
+            campaign_index,
+            restart_carry_over,
             mission_counter,
             player_difficulty,
             computer_difficulty,
@@ -822,6 +1746,35 @@ impl ScenarioSession {
     /// progression input. Offline sessions do not synthesize this value.
     pub fn campaign_mission_counter(&self) -> Option<i32> {
         self.campaign.map(|campaign| campaign.mission_counter)
+    }
+
+    pub fn campaign_index(&self) -> Option<i32> {
+        self.campaign.map(|campaign| campaign.campaign_index)
+    }
+
+    pub fn campaign_map_stage(&self) -> u16 {
+        self.campaign_map_stage
+    }
+
+    pub(super) fn set_campaign_map_stage(&mut self, stage: u16) {
+        self.campaign_map_stage = stage;
+    }
+
+    pub fn campaign_restart_carry_over(
+        &self,
+    ) -> Option<crate::sim::campaign_carry_over::CampaignCarryOver> {
+        self.campaign.map(|campaign| campaign.restart_carry_over)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn initialize_campaign_for_test(
+        &mut self,
+        index: i32,
+        counter: i32,
+        record: crate::sim::campaign_carry_over::CampaignCarryOver,
+    ) {
+        self.initialize_campaign_startup(1, counter, None, index, record)
+            .expect("synthetic campaign admission");
     }
 
     /// Main_Game55D283 calls BattleControlTerminated686570 on shell exit;
@@ -842,20 +1795,71 @@ impl ScenarioSession {
         self.current_house
     }
 
+    pub(crate) const fn outcome_request(
+        &self,
+    ) -> Option<crate::sim::house_state::HouseOutcomeKind> {
+        use crate::sim::house_state::HouseOutcomeKind;
+        if self.victory_requested {
+            Some(HouseOutcomeKind::Victory)
+        } else if self.defeat_requested {
+            Some(HouseOutcomeKind::Defeat)
+        } else {
+            None
+        }
+    }
+
+    /// HouseClass::AI @0x004F8440 (4F8692/4F87B2) raises the request after
+    /// its Vox wait. Other House callbacks cannot revoke an admitted result.
+    pub(crate) fn admit_outcome(&mut self, kind: crate::sim::house_state::HouseOutcomeKind) {
+        match kind {
+            crate::sim::house_state::HouseOutcomeKind::Victory => self.victory_requested = true,
+            crate::sim::house_state::HouseOutcomeKind::Defeat => self.defeat_requested = true,
+        }
+    }
+
+    pub const fn scenario_side(&self) -> i32 {
+        self.scenario_side
+    }
+
     /// Session identity/bounds/waypoints — appended AFTER the legacy folds so
     /// the pre-session hash prefix order is preserved (SC-2). The clock and
     /// game options keep their original fold positions above; this fold adds
     /// only the fields new to the session aggregate. Order is part of the
     /// hash contract and must never change.
-    pub(crate) fn fold_identity(&self, hasher: &mut impl std::hash::Hasher) {
+    /// `house_order` is the House array's registration order, which keeps
+    /// its place in this stream although [`crate::sim::houses::Houses`]
+    /// owns it.
+    pub(crate) fn fold_identity(
+        &self,
+        house_order: &[InternedId],
+        hasher: &mut impl std::hash::Hasher,
+    ) {
         let s = self;
         s.seed.hash(hasher);
         s.map_name.hash(hasher);
         s.theater.hash(hasher);
-        s.game_mode_nonzero.hash(hasher);
+        s.game_mode.hash(hasher);
+        s.multiplayer_mode_class.hash(hasher);
+        s.network_max_ahead_frames.hash(hasher);
+        if let Some(timing) = &s.network_command_timing {
+            b"network-command-timing-v1".hash(hasher);
+            timing.hash(hasher);
+        }
+        s.start_header.hash(hasher);
+        // observer_houses, like current_house, selects process-local presentation
+        // and accepted outcome, and skips the observer's terminal score draw
+        // (every peer holds the same node data, and the RNG state is hashed).
+        // VERA's network_ai_alone also asks it of every House for the shared
+        // MPlayer_Defeated and Computer_Paranoid decisions; every peer holds
+        // the same list, built from the room's roster.
+        // It is saved and reference-validated, not shared CRC input.
         if let Some(campaign) = s.campaign {
             b"scenario-campaign-startup-v1".hash(hasher);
             campaign.hash(hasher);
+        }
+        if s.campaign_map_stage != 0 {
+            b"scenario-map-stage-v1".hash(hasher);
+            s.campaign_map_stage.hash(hasher);
         }
         if s.scenario_paused() || s.scenario_pause_timed() {
             b"scenario-pause-v1".hash(hasher);
@@ -872,12 +1876,27 @@ impl ScenarioSession {
             b"scenario-countdown-v1".hash(hasher);
             s.scenario_countdown.hash(hasher);
         }
+        if s.shroud_growth_timer != initial_map_regrowth_timer() {
+            b"scenario-shroud-growth-timer-v1".hash(hasher);
+            s.shroud_growth_timer.hash(hasher);
+        }
+        if s.fog_regrow_timer != initial_map_regrowth_timer() {
+            b"scenario-fog-regrow-timer-v1".hash(hasher);
+            s.fog_regrow_timer.hash(hasher);
+        }
+        let (money, cap) = s.campaign_money_policy();
+        if money != crate::util::native_x87::NativeF64Bits::POSITIVE_ZERO || cap != 0 {
+            b"scenario-campaign-money-policy-v1".hash(hasher);
+            money.hash(hasher);
+            cap.hash(hasher);
+        }
         if !s.waypoints.is_empty() {
             b"scenario-waypoints-v1".hash(hasher);
             s.waypoints.hash(hasher);
         }
-        // current_house is persisted process input, deliberately absent from
-        // the shared peer hash: native64DAB0 does not fold A83D4C, and different
+        // current_house, scenario_side and result requests A83D49/A8ECD0 are
+        // persisted process inputs, absent from the shared peer hash:
+        // native64DAB0 does not fold these globals, and different
         // participants legitimately select different current houses. Gameplay
         // mutations made by current-house callbacks retain their own hash owners.
         // This is not a claim that Rust's stronger hash equals native's CRC.
@@ -900,6 +1919,9 @@ impl ScenarioSession {
         if s.truck_crate {
             b"scenario-truck-crate-v1".hash(hasher);
         }
+        if !s.tiberium_death_to_visceroid {
+            b"scenario-no-tiberium-death-to-visceroid-v1".hash(hasher);
+        }
         if s.vein_growth != 1 {
             b"scenario-vein-growth".hash(hasher);
             s.vein_growth.hash(hasher);
@@ -915,8 +1937,20 @@ impl ScenarioSession {
         if s.tiberium_spreads_flag {
             b"scenario-tiberium-spreads-v1".hash(hasher);
         }
+        // The gate the HarvesterImmune bit drives is gameplay-active, so a
+        // session that differs in it must diverge the desync detector.
+        if s.harvester_immune {
+            b"scenario-harvester-immune-v1".hash(hasher);
+        }
         if s.computer_slot_has_team {
             b"scenario-computer-slot-team-v1".hash(hasher);
+        }
+        if s.wol_tournament != 0 {
+            b"scenario-wol-tournament-v1".hash(hasher);
+            s.wol_tournament.hash(hasher);
+        }
+        if s.fixed_alliance {
+            b"scenario-fixed-alliance-v1".hash(hasher);
         }
         (s.map_width, s.map_height).hash(hasher);
         s.mp_start_waypoints.len().hash(hasher);
@@ -929,7 +1963,7 @@ impl ScenarioSession {
             idx.hash(hasher);
             owner.hash(hasher);
         }
-        s.house_order.hash(hasher);
+        house_order.hash(hasher);
 
         let lighting = &s.lighting;
         lighting.normal.ambient_percent.hash(hasher);
@@ -977,6 +2011,10 @@ impl ScenarioSession {
             0x1668u16.hash(hasher);
             lighting.ambient_change_overrides.hash(hasher);
         }
+        if let Some(light) = lighting.ares_light {
+            b"ares-sw-light-v1".hash(hasher);
+            light.hash(hasher);
+        }
     }
 
     /// Hash per-match game options for lockstep verification.
@@ -995,6 +2033,7 @@ impl ScenarioSession {
         opts.multi_engineer.hash(hasher);
         opts.harvester_truce.hash(hasher);
         opts.ally_change_allowed.hash(hasher);
+        opts.bans.hash(hasher);
         opts.starting_credits.hash(hasher);
         opts.unit_count.hash(hasher);
         opts.tech_level.hash(hasher);
@@ -1015,6 +2054,18 @@ impl ScenarioSession {
 
     pub const fn truck_crate(&self) -> bool {
         self.truck_crate
+    }
+
+    /// Scenario+0x34B3 (`TiberiumDeathToVisceroid`).
+    pub(crate) const fn tiberium_death_to_visceroid(&self) -> bool {
+        self.tiberium_death_to_visceroid
+    }
+
+    /// `ScenarioClass::Read_INI_Basic @ 0x00689E90`: the map's
+    /// `TiberiumDeathToVisceroid`, else the fresh `Set_Defaults` true.
+    pub(crate) fn read_map_tiberium_death_to_visceroid(&mut self, map_value: Option<bool>) {
+        self.tiberium_death_to_visceroid =
+            map_value.unwrap_or(tiberium_death_to_visceroid_default());
     }
 
     /// Retained native Scenario+34A8; not a claim of an active ice grower.
@@ -1042,28 +2093,54 @@ impl ScenarioSession {
         self.ice_growth = value as u8;
     }
 
+    /// Destination Basic policy, retained with the scenario across save/load.
+    pub(crate) fn campaign_money_policy(&self) -> (crate::util::native_x87::NativeF64Bits, i32) {
+        (
+            self.carry_over_money
+                .unwrap_or(crate::util::native_x87::NativeF64Bits::POSITIVE_ZERO),
+            self.carry_over_cap,
+        )
+    }
+
     pub fn from_descriptor(desc: &ScenarioDescriptor) -> Self {
         Self {
             seed: u64::from(desc.seed),
-            map_name: desc.map_name.clone(),
+            map_name: crate::map::source::portable_map_name(&desc.map_name).to_owned(),
             theater: desc.theater.clone(),
-            game_mode_nonzero: desc.game_mode_nonzero,
+            game_mode: ScenarioGameMode::from_legacy_nonzero(desc.game_mode_nonzero),
+            multiplayer_mode_class: None,
+            observer_houses: Vec::new(),
+            network_max_ahead_frames: None,
+            network_command_timing: None,
+            shared_house_sources: Vec::new(),
+            local_shared_house_source: None,
+            watcher: false,
+            watcher_observes: false,
+            start_header: crate::map::preview::ScenarioStartHeader::default(),
             campaign: None,
+            campaign_map_stage: 0,
             input_locked: false,
             chrono_screen: crate::sim::superweapon::chrono_screen::ChronoScreenState::default(),
             scenario_pause: pause::ScenarioPause::default(),
-            scenario_countdown: countdown::ScenarioCountdown::default(),
+            scenario_countdown: countdown::ScenarioCountdown::new(desc.timer_inherit),
+            carry_over_money: desc.carry_over_money,
+            carry_over_cap: desc.carry_over_cap.unwrap_or(0),
             started: false,
             no_damage: desc.no_damage,
             free_radar: desc.free_radar,
             ignore_global_ai_triggers: desc.ignore_global_ai_triggers,
             train_crate: desc.train_crate,
             truck_crate: desc.truck_crate,
+            tiberium_death_to_visceroid: tiberium_death_to_visceroid_default(),
             ice_growth: u8::from(desc.ice_growth_enabled.unwrap_or(true)),
             vein_growth: u8::from(desc.vein_growth_enabled.unwrap_or(true)),
             tiberium_grows_flag: desc.tiberium_grows_flag,
             tiberium_spreads_flag: desc.tiberium_spreads_flag,
+            harvester_immune: desc.harvester_immune,
             computer_slot_has_team: false,
+            wol_tournament: 0,
+            wol_squad_lists: Default::default(),
+            fixed_alliance: false,
             lighting: desc.lighting,
             pixel_conversion_bounds: desc.pixel_conversion_bounds,
             map_width: desc.map_width,
@@ -1071,9 +2148,13 @@ impl ScenarioSession {
             mp_start_waypoints: desc.mp_start_waypoints.clone(),
             waypoints: BTreeMap::new(),
             start_slot_houses: BTreeMap::new(),
-            house_order: Vec::new(),
             current_house: None,
+            victory_requested: false,
+            defeat_requested: false,
+            scenario_side: 0,
             game_options: GameOptions::default(),
+            shroud_growth_timer: initial_map_regrowth_timer(),
+            fog_regrow_timer: initial_map_regrowth_timer(),
             tick: 0,
             total_sim_ms: 0,
             binary_frame: 0,
@@ -1081,7 +2162,7 @@ impl ScenarioSession {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 mod tests {
     use super::*;
     use crate::sim::world::Simulation;
@@ -1092,8 +2173,19 @@ mod tests {
             let mut sim = Simulation::from_descriptor(&ScenarioDescriptor::default());
             let hash_before = sim.state_hash();
             sim.session
-                .initialize_campaign_startup(difficulty, 7)
+                .initialize_campaign_startup(
+                    difficulty,
+                    7,
+                    None,
+                    0,
+                    crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
+                )
                 .unwrap();
+            assert_eq!(
+                sim.projected_in_game_options_speed(),
+                Some(2),
+                "ordinary campaigns use Main_Tick's two-bucket speed"
+            );
             assert_eq!(sim.session.campaign_mission_counter(), Some(7));
             assert_eq!(
                 sim.session.campaign_house_difficulties(),
@@ -1112,7 +2204,13 @@ mod tests {
             assert_eq!(sim.session.current_house(), Some(current));
             assert_eq!(sim.state_hash(), hash);
             assert_eq!(
-                sim.session.initialize_campaign_startup(difficulty, 1),
+                sim.session.initialize_campaign_startup(
+                    difficulty,
+                    1,
+                    None,
+                    0,
+                    crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED
+                ),
                 Err(CampaignScenarioStartupError::AlreadyInstalled)
             );
             sim.session.reset_campaign_mission_counter_on_shell_exit();
@@ -1136,7 +2234,13 @@ mod tests {
         });
         let hash = offline.state_hash();
         assert_eq!(
-            offline.session.initialize_campaign_startup(1, 1),
+            offline.session.initialize_campaign_startup(
+                1,
+                1,
+                None,
+                0,
+                crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED
+            ),
             Err(CampaignScenarioStartupError::NonCampaignMode)
         );
         assert_eq!(offline.state_hash(), hash);
@@ -1150,12 +2254,64 @@ mod tests {
             let mut sim = Simulation::from_descriptor(&ScenarioDescriptor::default());
             let hash = sim.state_hash();
             assert_eq!(
-                sim.session.initialize_campaign_startup(difficulty, 1),
+                sim.session.initialize_campaign_startup(
+                    difficulty,
+                    1,
+                    None,
+                    0,
+                    crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED
+                ),
                 Err(CampaignScenarioStartupError::InvalidDifficulty(difficulty))
             );
             assert_eq!(sim.state_hash(), hash);
             assert_eq!(sim.session.campaign_mission_counter(), None);
         }
+    }
+
+    #[test]
+    fn cncnet_campaign_options_enter_the_session_owner_and_survive_persistence() {
+        let mut sim = Simulation::from_descriptor(&ScenarioDescriptor::default());
+        let options = GameOptions {
+            game_speed: 5,
+            build_off_ally: false,
+            ..Default::default()
+        };
+        sim.session
+            .initialize_campaign_startup(
+                1,
+                1,
+                Some(&options),
+                0,
+                crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
+            )
+            .unwrap();
+        assert_eq!(sim.projected_in_game_options_speed(), Some(5));
+        assert!(!sim.session.game_options.build_off_ally);
+        let hash = sim.state_hash();
+        let encoded = serde_json::to_vec(&sim.session).unwrap();
+        sim.session = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(sim.state_hash(), hash);
+        assert_eq!(sim.projected_in_game_options_speed(), Some(5));
+        let other = GameOptions {
+            game_speed: 2,
+            ..Default::default()
+        };
+        assert!(
+            sim.session
+                .initialize_campaign_startup(
+                    1,
+                    1,
+                    Some(&other),
+                    0,
+                    crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED
+                )
+                .is_err()
+        );
+        assert_eq!(
+            sim.state_hash(),
+            hash,
+            "failed admission must not overwrite live options"
+        );
     }
 
     #[test]
@@ -1230,9 +2386,10 @@ mod tests {
     #[test]
     fn mp_sibling_rng_state_matches_after_seed_sync() {
         use crate::map::entities::{EntityCategory, MapEntity};
+        use crate::rules::{ini_parser::IniFile, ruleset::RuleSet};
         use crate::sim::command::{Command, CommandEnvelope};
 
-        fn build(seed: u32) -> Simulation {
+        fn build(seed: u32, rules: &RuleSet) -> Simulation {
             let mut sim = Simulation::from_descriptor(&ScenarioDescriptor {
                 seed,
                 ..Default::default()
@@ -1240,6 +2397,7 @@ mod tests {
             // This synthetic fixture omits the production native Rules prefix.
             sim.native_unique_ids =
                 Some(crate::sim::native_identity::NativeUniqueIdCursor::for_synthetic_simulation());
+            crate::sim::arena_fixture::flat_ground(&mut sim, rules);
             let entity = MapEntity {
                 owner: "Americans".to_string(),
                 type_id: "MTNK".to_string(),
@@ -1254,16 +2412,18 @@ mod tests {
                 mission: None,
                 recruitable_a: true,
                 recruitable_b: true,
-                structure_upgrades: [None, None, None],
+                group: -1,
+                follows: None,
+                structure_columns: Default::default(),
                 structure_ai_sellable: false,
                 structure_ai_repairable: false,
                 structure_online: true,
                 trigger_tag: None,
             };
-            sim.spawn_from_map(&[entity], None);
+            sim.spawn_from_map(&[entity], Some(rules));
             sim
         }
-        fn run_300(sim: &mut Simulation) -> Vec<Option<u64>> {
+        fn run_300(sim: &mut Simulation, rules: &RuleSet) -> Vec<Option<u64>> {
             let owner = sim.interner.get("Americans").expect("owner interned");
             (0..300u64)
                 .map(|t| {
@@ -1280,23 +2440,29 @@ mod tests {
                     } else {
                         Vec::new()
                     };
-                    sim.advance_tick(&cmds, None, None, None, 67).state_hash
+                    sim.advance_tick(&cmds, Some(rules), None, None, 67)
+                        .state_hash
                 })
                 .collect()
         }
 
-        let (mut a, mut b) = (build(0xA5EED), build(0xA5EED));
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[VehicleTypes]\n0=MTNK\n[MTNK]\nStrength=400\nSpeed=6\nSpeedType=Track\n\
+             MovementZone=Normal\nLocomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n",
+        ))
+        .expect("seed-sync fixture rules");
+        let (mut a, mut b) = (build(0xA5EED, &rules), build(0xA5EED, &rules));
         assert_eq!(
-            run_300(&mut a),
-            run_300(&mut b),
+            run_300(&mut a, &rules),
+            run_300(&mut b, &rules),
             "same descriptor seed must produce an identical hash timeline"
         );
         assert_eq!(a.scenario_rng.state(), b.scenario_rng.state());
         assert_eq!(a.main_rng.state(), b.main_rng.state());
         assert_eq!(a.mapgen_rng.state(), b.mapgen_rng.state());
 
-        let mut c = build(0xA5EED + 1);
-        run_300(&mut c);
+        let mut c = build(0xA5EED + 1, &rules);
+        run_300(&mut c, &rules);
         assert_ne!(
             a.state_hash(),
             c.state_hash(),
@@ -1311,23 +2477,27 @@ mod tests {
         );
     }
 
-    /// AT-5: authoritative bounds are queryable before any advance_tick — no
-    /// zero-dim fog window between construction and the first vision pass.
-    #[test]
-    fn map_bounds_known_before_first_tick() {
-        let desc = ScenarioDescriptor {
-            seed: 7,
-            map_width: 80,
-            map_height: 60,
-            ..Default::default()
-        };
-        let sim = Simulation::from_descriptor(&desc);
-        assert_eq!((sim.fog.width, sim.fog.height), (80, 60));
-        assert_eq!((sim.session.map_width, sim.session.map_height), (80, 60));
-    }
-
     /// AT-4: scenario identity (map name, theater) is sim-resident and
     /// survives a snapshot round-trip.
+    /// A -SPAWN map's rooted path differs per launch; the hash must not.
+    #[test]
+    fn rooted_map_paths_share_the_scenario_name_and_hash() {
+        let hash = |map_name: &str| {
+            let sim = Simulation::from_descriptor(&ScenarioDescriptor {
+                map_name: map_name.into(),
+                ..Default::default()
+            });
+            assert_eq!(sim.session().map_name(), "spawnmap.ini");
+            sim.state_hash()
+        };
+        let rooted = if cfg!(windows) {
+            "C:\\a\\spawnmap.ini"
+        } else {
+            "/a/spawnmap.ini"
+        };
+        assert_eq!(hash(rooted), hash("spawnmap.ini"));
+    }
+
     #[test]
     fn scenario_identity_is_sim_resident() {
         let desc = ScenarioDescriptor {
@@ -1394,16 +2564,6 @@ mod tests {
             .expect("snapshot load")
             .sim;
         assert_eq!(restored.state_hash(), a.state_hash());
-    }
-
-    #[test]
-    fn native_replay_header_starts_normal_scenario_descriptor() {
-        let header = crate::sim::replay::NativeReplayHeader::new(0x1234_5678, "arena.map");
-        let descriptor = ScenarioDescriptor::from_native_replay_header(&header);
-        assert_eq!(descriptor.seed, 0x1234_5678);
-        assert_eq!(descriptor.map_name, "arena.map");
-        assert_eq!(descriptor.map_width, 0);
-        assert_eq!(descriptor.map_height, 0);
     }
 
     #[test]
@@ -1502,6 +2662,44 @@ mod tests {
             .sim;
         assert!(restored.session.tiberium_grows_flag && restored.session.tiberium_spreads_flag);
         assert_eq!(restored.state_hash(), forced.state_hash());
+    }
+
+    /// Scenario bit `0x800` (HarvesterImmune / Harvester Truce) reaches the
+    /// session from the descriptor and the native replay header, is
+    /// lockstep-visible — its gate refuses candidates, so a differing
+    /// session must diverge the desync detector — and survives a snapshot,
+    /// with the field defaulting clear like an older snapshot's absent word.
+    #[test]
+    fn scenario_harvester_immune_bit_roundtrips_and_changes_hash() {
+        let mut header = crate::sim::replay::NativeReplayHeader::new(0x1234_5678, "truce.map");
+        header.special_flags = 0x800;
+        let descriptor = ScenarioDescriptor::from_native_replay_header(&header);
+        assert!(descriptor.harvester_immune);
+
+        let mut immune = Simulation::from_descriptor(&descriptor);
+        assert!(immune.session.harvester_immune);
+        let clear = Simulation::from_descriptor(&ScenarioDescriptor {
+            harvester_immune: false,
+            ..descriptor.clone()
+        });
+        assert_ne!(immune.state_hash(), clear.state_hash());
+
+        // Native in-scenario load restarts Scenario RNG from Seed0; isolate
+        // the bit's persistence after the independent hash check.
+        immune.scenario_rng = crate::sim::rng::SimRng::new(0);
+        let bytes = crate::sim::snapshot::GameSnapshot::save(&immune, 1, 2, "truce.map", 0);
+        let restored = crate::sim::snapshot::GameSnapshot::load(&bytes)
+            .expect("snapshot load")
+            .sim;
+        assert!(restored.session.harvester_immune);
+        assert_eq!(restored.state_hash(), immune.state_hash());
+
+        // A snapshot written before the field existed loads with the bit
+        // clear, the retained cold-Scenario value of the native word.
+        let mut json = serde_json::to_value(&immune.session).unwrap();
+        json.as_object_mut().unwrap().remove("harvester_immune");
+        let missing: ScenarioSession = serde_json::from_value(json).unwrap();
+        assert!(!missing.harvester_immune);
     }
 }
 

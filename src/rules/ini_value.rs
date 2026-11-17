@@ -20,6 +20,7 @@
 //! | `read_string`, `read_name`, `read_type_name` | `CCINIClass::ReadString` 0x00528A10 |
 //! | `read_movie` | `CCINIClass::ReadMovie` 0x004757D0 |
 //! | `read_pip` | `CCINIClass::ReadPip` 0x004748A0 |
+//! | `read_action_name` | `CCINIClass::ReadAction` 0x00474EE0 |
 //! | `read_edge` | `CCINIClass::ReadEdge` 0x00475980 |
 //! | `read_color_scheme` | `CCINIClass::ReadColor` 0x00474A90 |
 //! | `read_list` | ReadString, then `strtok(",")` (every type, house, sound and ability list) |
@@ -29,6 +30,7 @@
 //! | `read_int_fields` (`_complete`) | ReadString, then `sscanf("%d,%d,...")` over the current fields |
 //! | `read_int_list` | `DifficultyClass::ReadINI_IntVector` 0x00475D70 |
 //! | `read_coord3` | `CCINIClass::Read3Int` 0x00529CA0, `sscanf("%d,%d,%d")` |
+//! | `read_coord3_fold` | the same scan folded across rules passes (self-default) |
 //! | `read_coord_tokens` | `0x00476420`: three `strtok(",")` + `atoi` |
 //! | `read_float_tokens` | `0x00476340`: three `strtok(",")` + `atof` |
 //! | `read_color_list` | `0x00476B20`: `strtok(",")` in `(r,g,b)` groups |
@@ -70,8 +72,86 @@ const STRTRIM_MAX: u8 = 0x20;
 /// (`DAT_00817F70`).
 const COMMA: &[char] = &[','];
 
+/// ActionType names at7E4C50, in ReadAction474EE0's numeric order.
+/// The scan accepts these whole names only; unknown text is action0.
+const ACTION_NAMES: [&str; 73] = [
+    "None",
+    "Move",
+    "NoMove",
+    "Enter",
+    "Self",
+    "Attack",
+    "Harvest",
+    "Select",
+    "ToggleSelect",
+    "Capture",
+    "Eaten",
+    "Repair",
+    "Sell",
+    "SellUnit",
+    "NoSell",
+    "NoRepair",
+    "Sabotage",
+    "Tote",
+    "DontUse2",
+    "DontUse3",
+    "Nuke",
+    "DontUse4",
+    "DontUse5",
+    "DontUse6",
+    "DontUse7",
+    "DontUse8",
+    "GuardArea",
+    "Heal",
+    "Damage",
+    "GRepair",
+    "NoDeploy",
+    "NoEnter",
+    "NoGRepair",
+    "TogglePower",
+    "NoTogglePower",
+    "EnterTunnel",
+    "NoEnterTunnel",
+    "IronCurtain",
+    "LightningStorm",
+    "ChronoSphere",
+    "ChronoWarp",
+    "ParaDrop",
+    "PlaceWaypoint",
+    "TibSunBug",
+    "EnterWaypointMode",
+    "FollowWaypoint",
+    "SelectWaypoint",
+    "LoopWaypointPath",
+    "DragWaypoint",
+    "AttackWaypoint",
+    "EnterWaypoint",
+    "PatrolWaypoint",
+    "AreaAttack",
+    "IvanBomb",
+    "NoIvanBomb",
+    "Detonate",
+    "DetonateAll",
+    "DisarmBomb",
+    "SelectNode",
+    "AttackSupport",
+    "PlaceBeacon",
+    "SelectBeacon",
+    "AttackMoveNav",
+    "AttackMoveTar",
+    "Demolish",
+    "AmerParaDrop",
+    "PsychicDominator",
+    "SpyPlane",
+    "GeneticConverter",
+    "ForceShield",
+    "NoForceShield",
+    "Airstrike",
+    "PsychicReveal",
+];
+
 /// AbstractType_From_Name40DCE0's compiled table at816EE0, read from Steam
-/// gamemd3e81a617..08600. Values are explicit: Temporal precedes RadSite in
+/// gamemd. Values are explicit: Temporal precedes RadSite in
 /// the name table but their RTTI values are70 and69, respectively.
 const ABSTRACT_TYPES: &[(&str, i32)] = &[
     ("<none>", 0),
@@ -150,7 +230,106 @@ const ABSTRACT_TYPES: &[(&str, i32)] = &[
     ("DiskLaser", 73),
 ];
 
+/// Native `TechnoType+0x3BC` `Category=` value. Keep this enum and its name
+/// mapping with the shared `ReadCategory`-style INI reader, separate from the
+/// Rust registry family in `ObjectCategory`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(i32)]
+pub enum TechnoTypeCategory {
+    #[default]
+    Unknown = -1,
+    Soldier = 0,
+    Civilian = 1,
+    VipAgent = 2,
+    ReconVehicle = 3,
+    ArmoredFightingVehicle = 4,
+    InfantryFightingVehicle = 5,
+    LongRangeFireSupport = 6,
+    MiscSupportVehicle = 7,
+    TransportVehicle = 8,
+    AirCombatSupport = 9,
+    AirTransport = 10,
+}
+
+/// `Category_From_Name @0x00473980`, table at `0x0081B7C8`; native compares
+/// both the display label and the abbreviated token with case-insensitive
+/// `strcmpi`.
+const TECHNO_TYPE_CATEGORY_NAMES: [(&str, &str, TechnoTypeCategory); 11] = [
+    ("Soldier", "Soldier", TechnoTypeCategory::Soldier),
+    ("Civilian", "Civilian", TechnoTypeCategory::Civilian),
+    ("VIP/Agent", "VIP", TechnoTypeCategory::VipAgent),
+    ("Recon Vehicle", "Recon", TechnoTypeCategory::ReconVehicle),
+    (
+        "Armored Fighting Vehicle",
+        "AFV",
+        TechnoTypeCategory::ArmoredFightingVehicle,
+    ),
+    (
+        "Infantry Fighting Vehicle",
+        "IFV",
+        TechnoTypeCategory::InfantryFightingVehicle,
+    ),
+    (
+        "Indirect Fire Support",
+        "LRFS",
+        TechnoTypeCategory::LongRangeFireSupport,
+    ),
+    (
+        "Misc. Support Vehicle",
+        "Support",
+        TechnoTypeCategory::MiscSupportVehicle,
+    ),
+    (
+        "Transport Vehicle",
+        "Transport",
+        TechnoTypeCategory::TransportVehicle,
+    ),
+    (
+        "Air Combat Support",
+        "AirPower",
+        TechnoTypeCategory::AirCombatSupport,
+    ),
+    ("Air Transport", "AirLift", TechnoTypeCategory::AirTransport),
+];
+
 impl IniSection {
+    /// ReadAction474EE0 copies31 native bytes and compares the entire trimmed
+    /// buffer case-insensitively against all73 names. Unknown names reset to
+    /// None0; they do not retain the previous action. SuperWeaponType ReadINI
+    /// calls it at6CEA9B with its current action as default (constructor0).
+    /// Missing physical keys retain the preceding pass; the physical loader
+    /// omits empty values. A supplied empty cache entry instead maps to0.
+    /// This projection keeps an absent constructor value as Option::None and
+    /// returns canonical names for actual reads, including action0's "None".
+    pub(crate) fn read_action_name(&self, key: &str) -> Option<&'static str> {
+        self.fold_rules_values(key, None, |_, raw| {
+            let name = strtrim_ascii(truncate_native_bytes(raw, 0x1f));
+            Some(
+                ACTION_NAMES
+                    .iter()
+                    .copied()
+                    .find(|candidate| candidate.eq_ignore_ascii_case(name))
+                    .unwrap_or(ACTION_NAMES[0]),
+            )
+        })
+    }
+
+    /// `INIClass::ReadCategory @0x004749E0`: ReadString[0x20] defaults from
+    /// the current integer's token, then Category_From_Name maps either name
+    /// column. Missing/empty therefore retains current; unknown text returns
+    /// -1. Called by `TechnoTypeClass::ReadINI @0x00712170`.
+    pub fn read_techno_type_category(&self, current: TechnoTypeCategory) -> TechnoTypeCategory {
+        self.read_string_with("Category", 0x20, current, |_, value| {
+            TECHNO_TYPE_CATEGORY_NAMES
+                .iter()
+                .find_map(|(display_name, token, category)| {
+                    (value.eq_ignore_ascii_case(display_name) || value.eq_ignore_ascii_case(token))
+                        .then_some(*category)
+                })
+                .unwrap_or(TechnoTypeCategory::Unknown)
+        })
+    }
+
     /// ReadPip4748A0: the default is a TABLE INDEX; the result is a frame.
     /// ReadString32 always runs, including missing/empty cache entries, then
     /// an11-entry case-insensitive scan returns1 for an unknown name. Returned
@@ -233,12 +412,63 @@ impl IniSection {
             })
     }
 
+    /// Ares `ValueableIdx<ColorScheme>` 1001CC70: ReadString 2048, then
+    /// `find`, the ColorScheme Find 1001BB30 with shade count 1. A found
+    /// scheme stores its index and `none`/`<none>` (10003950) stores -1;
+    /// anything else, or an absent key, keeps `current`. Phobos's
+    /// `ValueableIdx<ColorScheme>::Read` (`Utilities/TemplateDef.h`) is the
+    /// same read over `ColorScheme::FindIndex(name, 1)` and `IsBlank`.
+    pub(crate) fn read_ares_color_scheme_index(
+        &self,
+        key: &str,
+        current: i32,
+        find: impl Fn(&str) -> Option<i32>,
+    ) -> i32 {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_ares_found_index(key, current, find)
+    }
+
+    /// Ares 3.0 `detail::read<MouseCursorType>` 1000FB50, the same read as
+    /// 1001CC70 over the `[MouseCursors]` list
+    /// ([`crate::rules::ares_mouse_cursor::MouseCursors::find`]): a named
+    /// entry stores its index, `none`/`<none>` stores -1, anything else keeps
+    /// `current`.
+    pub(crate) fn read_ares_mouse_cursor(
+        &self,
+        key: &str,
+        current: i32,
+        find: impl Fn(&str) -> Option<i32>,
+    ) -> i32 {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_ares_found_index(key, current, find)
+    }
+
+    fn read_ares_found_index(
+        &self,
+        key: &str,
+        current: i32,
+        find: impl Fn(&str) -> Option<i32>,
+    ) -> i32 {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        let Some(name) = self.read_name(key, 2048) else {
+            return current;
+        };
+        find(name).unwrap_or(
+            if crate::rules::ini_parser::is_native_none_type_name(name) {
+                -1
+            } else {
+                current
+            },
+        )
+    }
+
     /// CCINIClass::ReadEdge475980: ReadString into128 bytes with an empty
-    /// default. Empty retains the caller's value; case-insensitive cardinal
-    /// names map to0..3 and every other nonempty name returns literal-1.
+    /// default. Empty retains the caller's value; Edge_From_Name 0x0048DB80
+    /// matches the five names of table 0x007E1B60 case-insensitively (North,
+    /// East, South, West, Air → 0..4) and every other nonempty name returns -1.
     pub fn read_edge(&self, key: &str, default: i32) -> i32 {
         self.read_string_with(key, 128, default, |_, value| {
-            ["North", "East", "South", "West"]
+            ["North", "East", "South", "West", "Air"]
                 .iter()
                 .position(|name| name.eq_ignore_ascii_case(value))
                 .map_or(-1, |index| index as i32)
@@ -270,7 +500,7 @@ impl IniSection {
                 .iter()
                 .fold(default, |current, raw| apply(current, raw))
         } else {
-            match self.get(key) {
+            match self.value(key) {
                 Some(raw) => apply(default, raw),
                 None => default,
             }
@@ -283,6 +513,16 @@ impl IniSection {
         self.fold_rules_values(key, default, parse_read_int)
     }
 
+    /// ReadInt5276D0 with its default supplied later: absent keys and failed
+    /// hexadecimal scans retain the default. Decimal text still uses C-atoi,
+    /// so present nonnumeric text is a concrete zero. Preserve prior successful
+    /// reads when this section represents multiple retained rules passes.
+    pub fn read_int_value(&self, key: &str) -> Option<i32> {
+        self.fold_rules_values(key, None, |current, raw| {
+            parse_read_int_value(raw).or(current)
+        })
+    }
+
     /// Ares Valueable<int>: ReadString(2048), then Parser<int>::TryParse.
     /// Absent, empty or failed conversions keep the current value. The `$`
     /// branch scans decimal (`$%d`), while a final `h`/`H` scans hex (`%xh`).
@@ -290,19 +530,191 @@ impl IniSection {
     /// Scanner overflow keeps VERA's deterministic low-32-bit convention;
     /// out-of-range Ares CRT behavior is not claimed equivalent.
     pub fn read_ares_int(&self, key: &str, default: i32) -> i32 {
+        let _ares = crate::rules::ares_switch::ares_reads();
         self.read_string_with(key, 2048, default, |current, value| {
-            let parsed = if let Some(decimal) = value.strip_prefix('$') {
-                scan_decimal_i32(&mut decimal.as_bytes())
-            } else if value
-                .as_bytes()
-                .last()
-                .is_some_and(|last| last.eq_ignore_ascii_case(&b'h'))
-            {
-                scan_hex_u32(value.as_bytes()).map(|value| value as i32)
+            parse_ares_int(value).unwrap_or(current)
+        })
+    }
+
+    /// Ares Nullable<int>::Read 10008CC0 (SideExt SurvivorDivisor at 1002E59F,
+    /// TechnoTypeExt TurretROT at 1003F267) sets presence only after its
+    /// Valueable<int> read succeeds. Absent, empty and invalid input keep the
+    /// previous value and presence.
+    pub fn read_ares_nullable_int(&self, key: &str, current: Option<i32>) -> Option<i32> {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, current, |previous, value| {
+            parse_ares_int(value).or(previous)
+        })
+    }
+
+    /// Ares/Phobos `PartialVector2D<int>` (`Utilities/TemplateDef.h`'s
+    /// `read<PartialVector2D<int>>` over `MultiParser<int>::Parse(value, out, 2)`):
+    /// ReadString(2048), then at most two comma-separated [`parse_ares_int`]
+    /// tokens. Each token is space-trimmed on both sides and the scan stops at
+    /// the first token that does not convert, so a one-token read leaves the
+    /// second slot at its previous value and marks the pair single. A zero-token
+    /// scan writes neither slot and leaves the count, so the whole pair retains.
+    pub fn read_ares_partial_int_pair(&self, key: &str, current: PartialIntPair) -> PartialIntPair {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, current, |previous, value| {
+            let mut fields = [previous.low, previous.high];
+            let values = scan_partial_int_fields(value, &mut fields);
+            if values == 0 {
+                return previous;
+            }
+            PartialIntPair {
+                low: fields[0],
+                high: fields[1],
+                values,
+            }
+        })
+    }
+
+    /// Ares coordinate reader100406D0 -> MultiParser1000C7E0. Each comma
+    /// token uses the shared Parser<int> and a 128-byte scanf_s buffer.
+    /// A partial native parse copies uninitialized trailing locals; retain
+    /// the prior coordinate for that malformed-input boundary in Rust.
+    pub(crate) fn read_ares_coord3(&self, key: &str, current: [i32; 3]) -> [i32; 3] {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, current, |previous, value| {
+            parse_ares_coord3(value).unwrap_or(previous)
+        })
+    }
+
+    /// Ares `Nullable<Vector3D<int>>::Read` 10055C70 over the same
+    /// coordinate reader 100406D0 as [`Self::read_ares_coord3`]: a read
+    /// that converts sets the value and its presence, anything else retains
+    /// both (the partial-parse boundary keeps the prior pair here).
+    pub(crate) fn read_ares_nullable_coord3(
+        &self,
+        key: &str,
+        current: Option<[i32; 3]>,
+    ) -> Option<[i32; 3]> {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, current, |previous, value| {
+            parse_ares_coord3(value).or(previous)
+        })
+    }
+
+    /// Ares `Valueable<CSFText>::Read` (CsfText::Read 10076510 over
+    /// ReadString 2048): a present value replaces the label with its first
+    /// 31 bytes; absent or empty keeps it.
+    pub(crate) fn read_ares_csf_label(&self, key: &str, current: &str) -> String {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, current.to_owned(), |_, name| {
+            truncate_native_bytes(name, 31).to_owned()
+        })
+    }
+
+    /// Ares `Nullable<ColorStruct>::Read` 10008D20 -> detail::read<ColorStruct>
+    /// 10008EE0: ReadString(2048), then `detail::parse<unsigned char>`
+    /// 100089C0 must convert all three channels. Only then are the color and
+    /// its presence set; absent, empty and invalid text retain both.
+    pub(crate) fn read_ares_nullable_color(
+        &self,
+        key: &str,
+        current: Option<[u8; 3]>,
+    ) -> Option<[u8; 3]> {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, current, |previous, value| {
+            parse_ares_color(value).or(previous)
+        })
+    }
+
+    /// Ares/Phobos `ValueableVector<int>` (`detail::parse_values<int>` over
+    /// `strtok(",")`): ReadString(2048), split on commas, and each token
+    /// through [`parse_ares_int`]. A token that does not convert is skipped, so
+    /// the list keeps the index alignment its caller pairs with another list
+    /// only over the tokens that parsed. An absent key keeps the caller's list;
+    /// a present one replaces it, even with no usable token.
+    pub fn read_ares_int_list(&self, key: &str) -> Option<Vec<i32>> {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        Some(
+            self.read_list(key, 2048)?
+                .iter()
+                .filter_map(|token| parse_ares_int(token))
+                .collect(),
+        )
+    }
+
+    /// Ares Valueable<double>1000EB00/10076B60: the native string-sized
+    /// reader scans binary64, not ReadDouble's intermediate binary32. An
+    /// unsuccessful scan retains the old field; a percent anywhere scales it.
+    /// The shared scanner/percent kernel also serves the stock reader.
+    pub fn read_ares_double_bits(&self, key: &str, default: NativeF64Bits) -> NativeF64Bits {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, default, |current, value| {
+            parse_ares_double_bits(value).unwrap_or(current)
+        })
+    }
+
+    /// Ares `read<Leptons>` (Utilities/TemplateDef.h): INI_EX::ReadDouble
+    /// (the [`Self::read_ares_double_bits`] scan, cells), then
+    /// `Game::F2I(cells * 256.0)`. A failed read keeps the current leptons.
+    pub fn read_ares_leptons(&self, key: &str, current: i32) -> i32 {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, current, |current, value| {
+            parse_ares_double_bits(value).map_or(current, |cells| {
+                crate::util::native_x87::X87Chop53::ftol_f64_low_masked(
+                    f64::from_bits(cells.bits()) * 256.0,
+                )
+            })
+        })
+    }
+
+    /// Ares `Nullable<Leptons>::Read @ 10019660` over the same
+    /// `detail::read<Leptons> @ 1000A6D0` as [`Self::read_ares_leptons`]:
+    /// only a successful parse sets the value and its presence.
+    pub fn read_ares_nullable_leptons(&self, key: &str, current: Option<i32>) -> Option<i32> {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, current, |current, value| {
+            parse_ares_double_bits(value)
+                .map(|cells| {
+                    crate::util::native_x87::X87Chop53::ftol_f64_low_masked(
+                        f64::from_bits(cells.bits()) * 256.0,
+                    )
+                })
+                .or(current)
+        })
+    }
+
+    /// Ares Valueable<float>1000EAE0 -> detail::read<float>1000FA90 ->
+    /// Parser<float>10076B00: the same binary64 scan and percent scale as
+    /// [`Self::read_ares_double_bits`], stored to the float field (`FSTP
+    /// dword`). An unsuccessful scan retains the old field.
+    pub fn read_ares_float_bits(&self, key: &str, default: NativeF32Bits) -> NativeF32Bits {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, default, |current, value| {
+            parse_ares_double_bits(value).map_or(current, |number| {
+                MaskedX87Chop53::store_f32_masked_chop(MaskedX87Chop53::load_f64(number))
+            })
+        })
+    }
+
+    /// Ares Nullable<double>10008CE0 ->10008E90 ->10076B60: only a
+    /// successful shared double parse sets presence. `none` is invalid,
+    /// so it retains the pair instead of clearing a prior value.
+    pub fn read_ares_nullable_double_bits(
+        &self,
+        key: &str,
+        current: Option<NativeF64Bits>,
+    ) -> Option<NativeF64Bits> {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, current, |current, value| {
+            parse_ares_double_bits(value).or(current)
+        })
+    }
+
+    /// Ares TechnoType EMP.Threshold: inair, int TryParse, then a boolean
+    /// scratch initialized false. Missing/empty keeps the current field.
+    pub fn read_ares_emp_threshold(&self, key: &str, default: i32) -> i32 {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, default, |_, value| {
+            if value.eq_ignore_ascii_case("inair") {
+                -1
             } else {
-                scan_decimal_i32(&mut value.as_bytes())
-            };
-            parsed.unwrap_or(current)
+                parse_ares_int(value).unwrap_or_else(|| i32::from(parse_read_bool(false, value)))
+            }
         })
     }
 
@@ -321,6 +733,155 @@ impl IniSection {
     /// Present-empty (no first char) -> default.
     pub fn read_bool(&self, key: &str, default: bool) -> bool {
         self.fold_rules_values(key, default, parse_read_bool)
+    }
+
+    /// Ares Valueable<bool>: ReadString(2048), then the same first-byte
+    /// verdict as ReadBool. The string reader trims the copied buffer;
+    /// absent, empty and invalid values retain the current field.
+    /// Ares3.0 1000EBF0 -> 1000FC50 -> 10007860 -> 10076CC0;
+    /// tools/spatial_oracle/no_manual_fire.json records executed controls.
+    pub fn read_ares_bool(&self, key: &str, default: bool) -> bool {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, default, parse_read_bool)
+    }
+
+    /// Ares Nullable<bool>1000E9B0: successful reads set both the value and
+    /// presence; absent, empty and invalid reads retain the previous pair.
+    /// `none` parses as false, whereas `<none>` is invalid, not an unset token.
+    pub fn read_ares_nullable_bool(&self, key: &str, default: Option<bool>) -> Option<bool> {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_string_with(key, 2048, default, |current, raw| {
+            read_bool_decision(raw).or(current)
+        })
+    }
+
+    /// Phobos `Nullable<T>::Read<false, false>`: `<default>`, `none` and
+    /// `<none>` clear the value; absent, empty and rejected reads retain it.
+    /// Source: Phobos b90ab4bc, Utilities/TemplateDef.h:1878..1892,
+    /// Utilities/Template.h (`allowNone=false`) and Phobos.h (`readLength`).
+    /// `none`/`<none>` are exactly what `INIClass::IsBlank` accepts (YRpp
+    /// `CCINIClass.h`: case-insensitive equality with those two literals, the
+    /// tokens the type factories also answer null for); empty text never
+    /// reaches it because `ReadString` returns zero. `read_string_with`
+    /// retains the ordered passes in a projected section.
+    pub(crate) fn read_phobos_nullable_with<T>(
+        &self,
+        key: &str,
+        current: Option<T>,
+        mut parse: impl FnMut(&str) -> Option<T>,
+    ) -> Option<T> {
+        self.read_string_with(key, 2048, current, |current, raw| {
+            if raw.eq_ignore_ascii_case("<default>") || is_native_none_type_name(raw) {
+                None
+            } else {
+                parse(raw).or(current)
+            }
+        })
+    }
+
+    /// Phobos `Valueable<Point2D>`: `INI_EX::Read2Integers` (ReadString(2048),
+    /// then `Parser<int, 2>`, the [`scan_partial_int_fields`] scan) converts
+    /// each token straight into the value, so a one-token read changes only X
+    /// and a read that converts nothing keeps both.
+    pub fn read_phobos_int_pair(&self, key: &str, current: [i32; 2]) -> [i32; 2] {
+        self.read_string_with(key, 2048, current, |current, raw| {
+            let mut fields = current;
+            scan_partial_int_fields(raw, &mut fields);
+            fields
+        })
+    }
+
+    /// Phobos `Nullable<Point2D>`: the clearing tokens of
+    /// [`Self::read_phobos_nullable_with`], then the same in-place
+    /// `Read2Integers` scan. Only a read that converts both tokens sets the
+    /// value; a partial read updates a value that is already set.
+    pub fn read_phobos_nullable_int_pair(
+        &self,
+        key: &str,
+        current: Option<[i32; 2]>,
+    ) -> Option<[i32; 2]> {
+        self.read_string_with(key, 2048, current, |current, raw| {
+            if raw.eq_ignore_ascii_case("<default>") || is_native_none_type_name(raw) {
+                return None;
+            }
+            let mut fields = current.unwrap_or_default();
+            let values = scan_partial_int_fields(raw, &mut fields);
+            (values == 2 || current.is_some()).then_some(fields)
+        })
+    }
+
+    /// Phobos shares Ares's `Parser<int>::TryParse`, including `$%d`.
+    pub fn read_phobos_nullable_int(&self, key: &str, current: Option<i32>) -> Option<i32> {
+        self.read_phobos_nullable_with(key, current, parse_ares_int)
+    }
+
+    /// Phobos `Valueable<int>`: `INI_EX::ReadInteger` is ReadString(2048),
+    /// then `Read<int, 1>`, whose `Parser<int, 1>::Parse`
+    /// (`src/Utilities/Parser.h` at c783774a) converts only the text before
+    /// the first comma, through the `Parser<int>::TryParse` it shares with
+    /// Ares (`$%d` included): the [`scan_ares_fields`] scan with one slot.
+    /// Absent, empty and failed reads keep the current value.
+    pub fn read_phobos_int(&self, key: &str, current: i32) -> i32 {
+        self.read_string_with(key, 2048, current, |current, raw| {
+            let mut value = [current];
+            scan_ares_fields(raw, &mut value);
+            value[0]
+        })
+    }
+
+    /// Phobos `Valueable<ColorStruct>` (`INI_EX::Read3Bytes`, then
+    /// `Parser<BYTE,3>` at `src/Utilities/TemplateDef.h`): a comma-separated
+    /// `R,G,B` needs all three channels inside `0..=255`. Absent, empty and
+    /// rejected text keep the current color.
+    #[cfg(feature = "phobos")]
+    pub(crate) fn read_phobos_color(&self, key: &str, current: [u8; 3]) -> [u8; 3] {
+        self.read_string_with(key, 2048, current, |current, raw| {
+            parse_phobos_color(raw).unwrap_or(current)
+        })
+    }
+
+    /// Phobos `Nullable<ColorStruct>`: the clearing tokens of
+    /// [`Self::read_phobos_nullable_with`], then [`parse_phobos_color`].
+    #[cfg(feature = "phobos")]
+    pub(crate) fn read_phobos_nullable_color(
+        &self,
+        key: &str,
+        current: Option<[u8; 3]>,
+    ) -> Option<[u8; 3]> {
+        self.read_phobos_nullable_with(key, current, parse_phobos_color)
+    }
+
+    pub fn read_phobos_nullable_bool(&self, key: &str, current: Option<bool>) -> Option<bool> {
+        self.read_phobos_nullable_with(key, current, read_bool_decision)
+    }
+
+    /// Phobos `Nullable<double>`: the clearing tokens of
+    /// [`Self::read_phobos_nullable_with`], then [`parse_phobos_double`].
+    /// Unlike stock ReadDouble, a failed conversion keeps the old nullable.
+    pub fn read_phobos_nullable_double(&self, key: &str, current: Option<f64>) -> Option<f64> {
+        self.read_phobos_nullable_with(key, current, parse_phobos_double)
+    }
+
+    /// Phobos `Valueable<double>` (`INI_EX::ReadDouble`): ReadString(2048),
+    /// then [`parse_phobos_double`]. Absent, empty and failed reads keep the
+    /// current value.
+    pub fn read_phobos_double(&self, key: &str, current: f64) -> f64 {
+        self.read_string_with(key, 2048, current, |current, raw| {
+            parse_phobos_double(raw).unwrap_or(current)
+        })
+    }
+
+    /// Phobos `read<Leptons>` (`Utilities/TemplateDef.h`): `ReadDouble` in
+    /// cells, then `Game::F2I(cells * Unsorted::LeptonsPerCell)`. The
+    /// `Valueable<Leptons>` field keeps its current leptons on a failed read.
+    pub fn read_phobos_leptons(&self, key: &str, current: i32) -> i32 {
+        self.read_string_with(key, 2048, current, |current, raw| {
+            parse_phobos_double(raw).map_or(current, |cells| {
+                crate::util::native_x87::X87Chop53::ftol_f64_low_masked(
+                    cells * f64::from(crate::util::lepton::LEPTONS_PER_CELL_I32),
+                )
+            })
+        })
     }
 
     /// [`Self::read_bool`] where the caller supplies the default later: `None`
@@ -367,7 +928,7 @@ impl IniSection {
 
     /// ReadGeneral671E3B..671E81: unsigned current ticks * the native f32
     /// reciprocal of60, ReadDouble5283D0, then *60 and ftol low32. This runs
-    /// even for an omitted key on an admitted General pass. Steam3e81a617.
+    /// even for an omitted key on an admitted General pass. Steam gamemd.
     pub(crate) fn read_talk_bubble_time(&self, current: i32) -> i32 {
         let default = MaskedX87Chop53::mul(
             MaskedX87Chop53::load_f64(NativeF64Bits::from_bits(
@@ -426,7 +987,7 @@ impl IniSection {
             return String::new();
         };
         strtrim_ascii(truncate_native_bytes(
-            self.get(key).unwrap_or(default),
+            self.value(key).unwrap_or(default),
             payload,
         ))
         .to_string()
@@ -446,9 +1007,28 @@ impl IniSection {
                 .rev()
                 .map(String::as_str)
                 .find(|raw| copy(raw))?,
-            None => self.get(key).filter(|raw| copy(raw))?,
+            None => self.value(key).filter(|raw| copy(raw))?,
         };
         Some(strtrim_ascii(truncate_native_bytes(raw, payload)))
+    }
+
+    /// `ObjectTypeClass::ReadINI @ 0x005F92D0` reads AlphaImage into its
+    /// 25-byte field with the current text as default; missing/empty reads
+    /// retain it, while literals such as `NONE` remain ordinary names.
+    pub(crate) fn read_object_alpha_image(&self, current: &str) -> String {
+        self.read_string_with("AlphaImage", 0x19, current.to_owned(), |_, value| {
+            value.to_owned()
+        })
+    }
+
+    /// Ares 3.0 PCXFile reader100762C0: ReadString through the shared 2048-byte
+    /// buffer, then copy31 bytes into char[32] and lowercase. An absent/empty
+    /// read retains the previous filename (the projected read_name policy).
+    /// Original reader controls: tools/sidebar_oracle/pcx_cameos.json.
+    pub(crate) fn read_ares_pcx_filename(&self, key: &str) -> Option<String> {
+        let _ares = crate::rules::ares_switch::ares_reads();
+        self.read_name(key, 0x800)
+            .map(|name| truncate_native_bytes(name, 0x1f).to_ascii_lowercase())
     }
 
     /// [`Self::read_name`] for a name a type factory resolves: `None` also for
@@ -478,13 +1058,20 @@ impl IniSection {
     /// caller's byte-exact House::FromName50C170 lookup. An unknown (-1)
     /// index sets bit31 through x86's masked shift. Missing/empty keeps the
     /// supplied mask. House array order, not token order, consumes this mask.
+    /// Ares hooks47527C/475297 expand only the buffer to0x800; lookup,
+    /// delimiters and directional bits remain with this same reader.
     pub(crate) fn read_houses_list(
         &self,
         key: &str,
         default: u32,
         mut find_house: impl FnMut(&str) -> Option<usize>,
     ) -> u32 {
-        let Some(tokens) = self.read_list(key, 0x80) else {
+        let capacity = if crate::rules::ares_switch::ares_way() {
+            0x800
+        } else {
+            0x80
+        };
+        let Some(tokens) = self.read_list(key, capacity) else {
             return default;
         };
         tokens.into_iter().fold(0, |mask, token| {
@@ -554,9 +1141,23 @@ impl IniSection {
         capacity: usize,
         current: [i32; N],
     ) -> [i32; N] {
-        self.read_string_with(key, capacity, current, |mut out, value| {
+        self.read_int_fields_present(key, capacity, current)
+            .unwrap_or(current)
+    }
+
+    /// The same partial decimal scan, retaining ReadString's presence result.
+    /// Ares custom-foundation lists terminate on a missing/empty string, not
+    /// on a failed numeric conversion (which still contributes zeroes).
+    pub fn read_int_fields_present<const N: usize>(
+        &self,
+        key: &str,
+        capacity: usize,
+        current: [i32; N],
+    ) -> Option<[i32; N]> {
+        self.read_string_with(key, capacity, None, |retained, value| {
+            let mut out = retained.unwrap_or(current);
             scan_int_fields(value, &mut out);
-            out
+            Some(out)
         })
     }
 
@@ -583,16 +1184,20 @@ impl IniSection {
 
     /// `0x00476340` (ParticleSystemType `SpawnDirection=`): ReadString into
     /// 0x200 bytes, then three `strtok(",")` tokens through CRT `atof`
-    /// ([`parse_leading_f64`]) into a float vector. Absent keeps `default`;
-    /// a missing token reads as 0 where native passes NULL to `atof`.
-    pub fn read_float_tokens(&self, key: &str, default: [f32; 3]) -> [f32; 3] {
+    /// ([`parse_leading_f64`]) into a float vector, each stored with `FSTP
+    /// float` (`0x004763A1`, `0x004763B7`, `0x004763D8`). Absent keeps
+    /// `default`; a missing token reads as 0 where native passes NULL to `atof`.
+    pub fn read_float_tokens(&self, key: &str, default: [NativeF32Bits; 3]) -> [NativeF32Bits; 3] {
         let Some(tokens) = self.read_list(key, 0x200) else {
             return default;
         };
         std::array::from_fn(|index| {
-            tokens
+            let value = tokens
                 .get(index)
-                .map_or(0.0, |token| parse_leading_f64(token) as f32)
+                .map_or(0.0, |token| parse_leading_f64(token));
+            MaskedX87Chop53::store_f32_masked_chop(MaskedX87Chop53::load_f64(
+                NativeF64Bits::from_bits(value.to_bits()),
+            ))
         })
     }
 
@@ -690,6 +1295,23 @@ impl IniSection {
         })
     }
 
+    /// [`Self::read_coord3`]'s `Read3Int @ 0x00529CA0` scan folded across the
+    /// retained rules passes: `BuildingTypeClass::ReadINI @ 0x0045FE50` reads
+    /// the `VoxelBarrelOffsetTo*` keys (`0x00464697..0x00464734`) once per
+    /// layer with the destination's current content as the default, so a
+    /// missing or malformed later read keeps the earlier layer's triple. The
+    /// first pass's native default is uninitialized type memory (the
+    /// constructor `0x0045DD90` never writes the triples), which callers
+    /// replace with `(0,0,0)`. Each rules pass supplies its prior triple.
+    pub fn read_coord3_fold(&self, key: &str, default: [i32; 3]) -> [i32; 3] {
+        self.fold_rules_values(key, default, |current, raw| {
+            let mut out = [0; 3];
+            let complete = scan_int_fields(strtrim_ascii(truncate_native_bytes(raw, 63)), &mut out)
+                == out.len();
+            if complete { out } else { current }
+        })
+    }
+
     /// `INIClass::ReadRect @ 0x00527CC0`: a missing key scans the reader's
     /// literal `"0,0,0,0"` (`0x00825BC8`) whatever the caller's default. A
     /// present value is cut to 63 bytes, trimmed, and scanned with
@@ -722,20 +1344,35 @@ impl IniSection {
         mut scan_locals: Option<&mut [i32; 3]>,
     ) -> [u8; 3] {
         self.fold_rules_values(key, default, |current, raw| {
-            let value = strtrim_ascii(truncate_native_bytes(raw, 63));
-            if value.is_empty() {
-                return current;
-            }
-            let retained = scan_locals.is_some();
-            let mut fresh = [0; 3];
-            let out = scan_locals.as_deref_mut().unwrap_or(&mut fresh);
-            let assigned = scan_int_fields(value, out);
-            if retained || assigned == out.len() {
-                out.map(|component| component as u8)
-            } else {
-                current
-            }
+            Self::read_color_rgb_raw(raw, current, scan_locals.as_deref_mut())
         })
+    }
+
+    /// One native ReadColorRGB @0x00474B50 input with the caller's current
+    /// color as its default. TerrainTypeClass defers this read until its
+    /// Image's SHP frame-0 header color has been bound.
+    pub(crate) fn read_color_rgb_value(raw: &str, default: [u8; 3]) -> [u8; 3] {
+        Self::read_color_rgb_raw(raw, default, None)
+    }
+
+    fn read_color_rgb_raw(
+        raw: &str,
+        current: [u8; 3],
+        mut scan_locals: Option<&mut [i32; 3]>,
+    ) -> [u8; 3] {
+        let value = strtrim_ascii(truncate_native_bytes(raw, 63));
+        if value.is_empty() {
+            return current;
+        }
+        let retained = scan_locals.is_some();
+        let mut fresh = [0; 3];
+        let out = scan_locals.as_deref_mut().unwrap_or(&mut fresh);
+        let assigned = scan_int_fields(value, out);
+        if retained || assigned == out.len() {
+            out.map(|component| component as u8)
+        } else {
+            current
+        }
     }
 
     /// ReadSpeed (P19): `read_int(-1)` sentinel; -1 -> default; else clamp 0..100,
@@ -820,11 +1457,12 @@ impl IniSection {
     }
 
     /// `ReadINIBase64BinarySectionSourceOrder @ 0x00526FB0` (IsoMapPack5,
-    /// OverlayPack, OverlayDataPack, PreviewPack): every entry's value in
-    /// source order, each cut to 127 bytes and trimmed, joined for the Base64
-    /// decoder. Entry names are not parsed or sorted.
+    /// OverlayPack, OverlayDataPack, PreviewPack, Digest): each physical entry
+    /// name queries the shared value index, including duplicate occurrences.
+    /// Values are cut to 127 bytes and trimmed, then joined for Base64Pipe.
+    /// Entry names are not parsed or sorted.
     pub fn read_packed_text(&self) -> String {
-        self.keys()
+        self.physical_keys()
             .filter_map(|key| self.get(key))
             .map(|value| strtrim_ascii(truncate_native_bytes(value, 0x7F)))
             .collect()
@@ -836,7 +1474,7 @@ impl IniSection {
     pub fn read_comma_hex_utf16(&self, key: &str, default: &[u16], max_units: usize) -> Vec<u16> {
         let name: Vec<u8> = self.name.chars().map(|character| character as u8).collect();
         read_comma_hex_utf16(
-            self.get(key),
+            self.value(key),
             default,
             max_units,
             crate::assets::mix_hash::crc_engine(&name),
@@ -943,9 +1581,9 @@ fn read_comma_hex_utf16(
     units
 }
 
-/// CRT `sscanf("%x")` for one comma token: optional whitespace and sign, an
+/// CRT `sscanf("%x")` for one token: optional whitespace and sign, an
 /// optional `0x` prefix only when digits follow, then hex digits.
-fn scan_hex_u32(token: &[u8]) -> Option<u32> {
+pub fn scan_hex_u32(token: &[u8]) -> Option<u32> {
     let start = token.iter().position(|b| !is_crt_space(*b))?;
     let mut bytes = &token[start..];
     let negative = bytes.first() == Some(&b'-');
@@ -1013,7 +1651,7 @@ pub(crate) fn parse_read_bool(default: bool, raw: &str) -> bool {
 
 /// ReadBool's verdict on the stored value's untrimmed first byte
 /// (`0x0052976B`): `None` where it returns its default.
-fn read_bool_decision(raw: &str) -> Option<bool> {
+pub(crate) fn read_bool_decision(raw: &str) -> Option<bool> {
     match raw.bytes().next().map(|byte| byte.to_ascii_uppercase()) {
         Some(b'1') | Some(b'T') | Some(b'Y') => Some(true),
         Some(b'0') | Some(b'F') | Some(b'N') => Some(false),
@@ -1087,7 +1725,7 @@ pub(crate) fn strtrim_ascii(s: &str) -> &str {
 /// runs of non-delimiter characters, so leading, repeated and trailing
 /// delimiters produce no empty token, and no token is trimmed. Every native
 /// comma list passes `","`; the sound registry passes `" \t\n"`.
-pub(crate) fn strtok<'a>(value: &'a str, delimiters: &'a [char]) -> impl Iterator<Item = &'a str> {
+pub fn strtok<'a>(value: &'a str, delimiters: &'a [char]) -> impl Iterator<Item = &'a str> {
     value.split(delimiters).filter(|token| !token.is_empty())
 }
 
@@ -1188,10 +1826,247 @@ pub(crate) fn parse_leading_f32(s: &str) -> f32 {
 /// bridge_landing_inputs.json; arbitrary extreme CRT rounding/range behavior
 /// is not certified here.
 pub(crate) fn parse_leading_f64(s: &str) -> f64 {
+    try_parse_leading_f64(s, FloatScanRounding::Nearest).unwrap_or(0.0)
+}
+
+#[derive(Clone, Copy)]
+enum FloatScanRounding {
+    /// Keep the existing stock atof projection independently of Ares %lf.
+    Nearest,
+    AresChop,
+}
+
+fn try_parse_leading_f64(s: &str, rounding: FloatScanRounding) -> Option<f64> {
     let s = s.trim_start_matches(['\t', '\n', '\x0b', '\x0c', '\r', ' ']);
-    leading_float_token(s)
-        .and_then(|token| token.parse::<f64>().ok())
-        .unwrap_or(0.0)
+    let token = leading_float_token(s)?;
+    let nearest = token.parse::<f64>().ok()?;
+    Some(match rounding {
+        FloatScanRounding::Nearest => nearest,
+        FloatScanRounding::AresChop => chop_decimal_f64(token, nearest),
+    })
+}
+
+/// Ares ValueableDouble1000EB00 ->10076B60 ->CRT10010040/10083A57
+/// retains ambient PC53/chop (WinMain6BBFB7..6BBFCE; canonical startup
+/// producer tools/rules_oracle/read_double_percent.py). Reuse the one lexical
+/// prefix and binary64 parser, comparing its nearest result exactly against
+/// the decimal magnitude before adjusting toward zero. This deterministic
+/// numerical policy matches the bounded native EMP reader corpus; arbitrary
+/// long-decimal/legacy CRT intermediate double rounding is not certified.
+/// It deliberately does not change the existing stock atof reader mode.
+fn chop_decimal_f64(token: &str, nearest: f64) -> f64 {
+    use num_bigint::BigUint;
+    if !nearest.is_finite() || nearest == 0.0 {
+        // Native scanner overflow remains infinity (not maximum finite),
+        // and a signed zero must retain its original sign bit.
+        return nearest;
+    }
+    let unsigned = token.trim_start_matches(['+', '-']);
+    let (mantissa, exponent) =
+        unsigned
+            .split_once(['e', 'E'])
+            .map_or((unsigned, 0), |(mantissa, exponent)| {
+                // A nonzero finite parse bounds this exponent by the token's
+                // digit count plus the binary64 range. It fits the native scanner.
+                (
+                    mantissa,
+                    scan_decimal_i32(&mut exponent.as_bytes()).expect("valid float exponent"),
+                )
+            });
+    let fractional_digits = mantissa.find('.').map_or(0, |dot| mantissa.len() - dot - 1);
+    let digits: Vec<u8> = mantissa.bytes().filter(|byte| *byte != b'.').collect();
+    let mut decimal = BigUint::parse_bytes(&digits, 10).expect("validated float mantissa");
+    let decimal_exponent = exponent - fractional_digits as i32;
+    let ten = BigUint::from(10u8);
+    let denominator = if decimal_exponent < 0 {
+        ten.pow(decimal_exponent.unsigned_abs())
+    } else {
+        decimal *= ten.pow(decimal_exponent as u32);
+        BigUint::from(1u8)
+    };
+    let bits = nearest.to_bits();
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (significand, binary_exponent) = if exponent_bits == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | (1u64 << 52), exponent_bits - 1023 - 52)
+    };
+    let mut binary = BigUint::from(significand) * denominator;
+    if binary_exponent >= 0 {
+        binary <<= binary_exponent as usize;
+    } else {
+        decimal <<= binary_exponent.unsigned_abs() as usize;
+    }
+    if binary > decimal {
+        // Decreasing the magnitude bits moves either sign toward zero,
+        // including a subnormal's transition to its signed zero.
+        f64::from_bits(bits - 1)
+    } else {
+        nearest
+    }
+}
+
+/// Ares/Phobos `PartialVector2D<int>` storage: the two scanned slots plus how
+/// many the last successful read wrote. `values < 2` means the second slot is
+/// stale, so every ranged consumer must use [`Self::low`] and draw nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct PartialIntPair {
+    pub low: i32,
+    pub high: i32,
+    pub values: u8,
+}
+
+impl PartialIntPair {
+    /// A one-value spelling: Phobos' `PartialVector2D<int>{ 3 }` initializer.
+    pub const fn single(value: i32) -> Self {
+        Self {
+            low: value,
+            high: 0,
+            values: 1,
+        }
+    }
+
+    /// `GeneralUtils::GetRangedRandomOrSingleValue`'s non-random arm: the
+    /// consumer takes `low` and draws nothing when this is true.
+    pub const fn is_single(&self) -> bool {
+        self.values < 2 || self.low >= self.high
+    }
+}
+
+/// Phobos b90ab4bc Utilities/Parser.h:248..271 `Parser<double>`: `strtod`,
+/// cast to binary32, optional binary32 percent scaling, then widen to double.
+/// `None` where `strtod` converts nothing or reports ERANGE.
+fn parse_phobos_double(raw: &str) -> Option<f64> {
+    let parsed = try_parse_leading_f64(raw, FloatScanRounding::Nearest)?;
+    // strtod reports ERANGE on overflow and underflow. Reuse the decimal
+    // scanner's token to distinguish underflow from literal 0.
+    let token = leading_float_token(raw)?;
+    let mantissa = token.split(['e', 'E']).next().unwrap_or(token);
+    if !parsed.is_finite()
+        || (parsed != 0.0 && parsed.abs() < f64::MIN_POSITIVE)
+        || (parsed == 0.0 && mantissa.bytes().any(|byte| matches!(byte, b'1'..=b'9')))
+    {
+        return None;
+    }
+    let mut value = parsed as f32;
+    if raw.contains('%') {
+        value *= 0.01_f32;
+    }
+    Some(f64::from(value))
+}
+
+/// Installed Ares Parser<double>10076B60, shared by value and nullable reads.
+fn parse_ares_double_bits(value: &str) -> Option<NativeF64Bits> {
+    let number = try_parse_leading_f64(value, FloatScanRounding::AresChop)?;
+    Some(NativeF64Bits::from_bits(if value.contains('%') {
+        scale_percent(number).to_bits()
+    } else {
+        number.to_bits()
+    }))
+}
+
+/// The single Ares Parser<int> core, also used by compound int/bool readers.
+pub(crate) fn parse_ares_int(value: &str) -> Option<i32> {
+    if let Some(decimal) = value.strip_prefix('$') {
+        scan_decimal_i32(&mut decimal.as_bytes())
+    } else if value
+        .as_bytes()
+        .last()
+        .is_some_and(|last| last.eq_ignore_ascii_case(&b'h'))
+    {
+        scan_hex_u32(value.as_bytes()).map(|value| value as i32)
+    } else {
+        scan_decimal_i32(&mut value.as_bytes())
+    }
+}
+
+/// Phobos `Parser<BYTE,3>::Parse`: three comma-separated channels, each
+/// converted with the `BYTE` scan that rejects values above 255. All three
+/// must convert; otherwise no color is produced.
+#[cfg(feature = "phobos")]
+fn parse_phobos_color(value: &str) -> Option<[u8; 3]> {
+    let mut channels = [0i32; 3];
+    (scan_int_fields(value, &mut channels) == 3
+        && channels.iter().all(|channel| (0..=255).contains(channel)))
+    .then(|| channels.map(|channel| channel as u8))
+}
+
+/// Ares 3.0 `detail::parse<T>(value, out, count)` (1000C7E0 for int,
+/// 100089C0 for BYTE): [`scan_partial_int_fields`], except that NextToken's
+/// `sscanf_s("%[^,]")` into its 0x80-byte buffer fails on a token of 128
+/// bytes or more (after the leading spaces), which ends the scan there.
+fn scan_ares_fields(value: &str, out: &mut [i32]) -> u8 {
+    let limit = value
+        .split(',')
+        .take(out.len())
+        .position(|token| {
+            token
+                .as_bytes()
+                .iter()
+                .skip_while(|byte| is_crt_space(**byte))
+                .count()
+                >= 128
+        })
+        .unwrap_or(out.len());
+    scan_partial_int_fields(value, &mut out[..limit])
+}
+
+/// The three-value coordinate reader 100406D0, when all three convert.
+fn parse_ares_coord3(value: &str) -> Option<[i32; 3]> {
+    let mut fields = [0; 3];
+    (scan_ares_fields(value, &mut fields) == 3).then_some(fields)
+}
+
+/// `detail::parse<unsigned char>` 100089C0 with three channels:
+/// `Parser<BYTE>::TryParse` (10076A10) scans the token like `Parser<int>`
+/// (`$%hu`, `%hxh`, `%hu`) into a WORD, keeping its low 16 bits, and accepts
+/// it only up to 255.
+fn parse_ares_color(value: &str) -> Option<[u8; 3]> {
+    let mut fields = [0; 3];
+    if scan_ares_fields(value, &mut fields) != 3 {
+        return None;
+    }
+    let channel = |field: i32| u8::try_from(field as u16).ok();
+    Some([
+        channel(fields[0])?,
+        channel(fields[1])?,
+        channel(fields[2])?,
+    ])
+}
+
+/// `MultiParser<int>::Parse(pValue, outValue, count)`: for each slot skip the
+/// leading spaces, take everything up to the next comma (`%[^,]`, which needs
+/// at least one character), trim the token's trailing spaces and convert it
+/// with `Parser<int>::TryParse`. The scan returns at the first slot that yields
+/// no token or no conversion, so a trailing comma counts as one parsed value.
+fn scan_partial_int_fields(value: &str, out: &mut [i32]) -> u8 {
+    let mut rest = value.as_bytes();
+    for (index, slot) in out.iter_mut().enumerate() {
+        while rest.first().is_some_and(|byte| is_crt_space(*byte)) {
+            rest = &rest[1..];
+        }
+        let token_end = rest
+            .iter()
+            .position(|byte| *byte == b',')
+            .unwrap_or(rest.len());
+        if token_end == 0 {
+            return index as u8;
+        }
+        let mut token = &rest[..token_end];
+        while token.last().is_some_and(|byte| is_crt_space(*byte)) {
+            token = &token[..token.len() - 1];
+        }
+        let parsed = std::str::from_utf8(token).ok().and_then(parse_ares_int);
+        let Some(parsed) = parsed else {
+            return index as u8;
+        };
+        *slot = parsed;
+        rest = rest[token_end..]
+            .strip_prefix(b",")
+            .unwrap_or(&rest[token_end..]);
+    }
+    out.len() as u8
 }
 
 fn leading_float_token(s: &str) -> Option<&str> {
@@ -1232,13 +2107,28 @@ fn leading_float_token(s: &str) -> Option<&str> {
     Some(&s[..end])
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_a_n))]
 mod tests {
     use super::{crt_atoi, parse_leading_f32, strtok, truncate_native_bytes};
     use crate::rules::ini_parser::{IniFile, IniSection};
+    use crate::util::native_x87::NativeF32Bits;
+
+    /// Phobos' `Read<int, 1>` converts the text before the first comma, so a
+    /// hex value with more text after it still reads, and a piece of 128
+    /// bytes or more fails its `%[^,]` scan into 0x80 bytes and keeps the
+    /// value.
+    #[test]
+    fn phobos_integer_reader_converts_the_first_comma_piece() {
+        for (value, expected) in [("Ah ,0".to_owned(), 10), (format!("{:0>128},1", 7), -1)] {
+            let ini = IniFile::from_str(&format!("[AI]\nKey={value}\n"));
+            let ai = ini.section("AI").expect("section");
+            assert_eq!(ai.read_phobos_int("Key", -1), expected, "{value:?}");
+        }
+    }
 
     #[test]
     fn ares_integer_reader_retains_failed_values_and_uses_ares_dollar_decimal() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
         use crate::rules::native_processing::{RulesLayerKind, RulesLayerStack};
 
         for (value, expected) in [
@@ -1276,6 +2166,54 @@ mod tests {
     }
 
     #[test]
+    fn action_reader_keeps_physical_defaults_but_resets_unknown_names() {
+        use crate::rules::native_processing::{RulesLayerKind, RulesLayerStack};
+        use crate::rules::ruleset::RuleSet;
+
+        // ReadAction474EE0, called by SuperWeaponType ReadINI6CEA9B. A Type no
+        // Ares handler takes keeps the stock read either way (read the Ares
+        // way, the Lightning Storm is redirected; its Initialize installs its
+        // action).
+        let mut layers = RulesLayerStack::new(sec(
+            "[SuperWeaponTypes]\n0=Strike\n[Strike]\nType=PsychicReveal\nAction=nUkE\n",
+        ));
+        let action = |layers: &RulesLayerStack| {
+            let processed = layers.process_with_fixed_art(&IniFile::empty()).unwrap();
+            RuleSet::from_processed_rules(&processed)
+                .unwrap()
+                .super_weapon("Strike")
+                .unwrap()
+                .action
+                .clone()
+        };
+        assert_eq!(action(&layers).as_deref(), Some("Nuke"));
+        layers.push(
+            RulesLayerKind::GameMode,
+            sec("[Strike]\nAction= ; physically omitted\nRechargeTime=2\n"),
+        );
+        assert_eq!(action(&layers).as_deref(), Some("Nuke"));
+        layers.push(
+            RulesLayerKind::Scenario,
+            sec("[Strike]\nAction=NotAnAction\n"),
+        );
+        assert_eq!(action(&layers).as_deref(), Some("None"));
+
+        // Whole-buffer names, no numeric, quote or comma aliases. ReadString's
+        // cut precedes trim, so text beyond byte31 cannot invalidate Nuke.
+        let ini = sec("[S]\nNumeric=20\nQuoted=\"Nuke\"\nList=Nuke,Attack\n");
+        let section = ini.section("S").unwrap();
+        assert_eq!(section.read_action_name("Numeric"), Some("None"));
+        assert_eq!(section.read_action_name("Quoted"), Some("None"));
+        assert_eq!(section.read_action_name("List"), Some("None"));
+        assert_eq!(section.read_action_name("Missing"), None);
+        let mut cache = IniSection::new("S".to_owned());
+        cache.set("Action", &format!("Nuke{}Attack", " ".repeat(27)));
+        assert_eq!(cache.read_action_name("Action"), Some("Nuke"));
+        cache.set("Action", "");
+        assert_eq!(cache.read_action_name("Action"), Some("None"));
+    }
+
+    #[test]
     fn read_factory_matches_original_full_rtti_table_and_layer_defaults() {
         let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
             "tools/spatial_oracle/trigger_no_factories_events.json",
@@ -1310,6 +2248,13 @@ mod tests {
                 "{row}"
             );
         }
+    }
+
+    #[test]
+    fn read_edge_maps_air_to_the_fifth_table_name() {
+        let mut section = IniSection::new("Control".to_string());
+        section.set("Edge", "air");
+        assert_eq!(section.read_edge("Edge", -1), 4);
     }
 
     #[test]
@@ -1381,6 +2326,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_int_value_preserves_deferred_default_and_successful_prior_pass() {
+        let mut section = IniSection::new("Header".to_owned());
+        assert_eq!(section.read_int_value("NumCoopHumanStartSpots"), None);
+        section.set("NumCoopHumanStartSpots", "$invalid");
+        assert_eq!(section.read_int_value("NumCoopHumanStartSpots"), None);
+        section.set("NumCoopHumanStartSpots", "garbage");
+        assert_eq!(section.read_int_value("NumCoopHumanStartSpots"), Some(0));
+        let mut patch = IniSection::new("Header".to_owned());
+        patch.set("NumCoopHumanStartSpots", "2");
+        section.overlay_rules_pass(&patch);
+        patch.set("NumCoopHumanStartSpots", "$invalid");
+        section.overlay_rules_pass(&patch);
+        assert_eq!(section.read_int_value("NumCoopHumanStartSpots"), Some(2));
+        assert_eq!(section.read_int("NumCoopHumanStartSpots", 4), 2);
+    }
+
     #[test] // P1/P2
     fn test_read_int_hex() {
         let ini = sec("[S]\nA=$1A\nB=1Ah\nC=0FFH\nD=$0\nE=$FF\nF=$0xFF\nG=0xFFh\nH=$-1\n");
@@ -1393,25 +2355,6 @@ mod tests {
         assert_eq!(s.read_int("F", -9), 255);
         assert_eq!(s.read_int("G", -9), 255);
         assert_eq!(s.read_int("H", -9), -1);
-    }
-
-    #[test] // P3/P4/P18
-    fn test_read_int_atoi_leniency() {
-        let ini = sec("[S]\nA=5cells\nB=abc\nC=-50\nD=\nE=  7 \n");
-        let s = ini.section("S").unwrap();
-        assert_eq!(s.read_int("A", -9), 5);
-        assert_eq!(s.read_int("B", -9), 0); // present-nonnumeric -> 0, NOT default
-        assert_eq!(s.read_int("C", -9), -50);
-        assert_eq!(s.read_int("D", -9), -9); // empty values are omitted
-        assert_eq!(s.read_int("E", -9), 7);
-        assert_eq!(s.read_int("MISSING", -9), -9); // absent -> default
-    }
-
-    #[test] // OQ3: 0x is NOT hex via atoi fallback
-    fn test_read_int_0x_prefix_is_zero() {
-        let ini = sec("[S]\nA=0x1A\n");
-        // atoi("0x1A") = 0 (stops at 'x'); $/h branches don't fire.
-        assert_eq!(ini.section("S").unwrap().read_int("A", -9), 0);
     }
 
     #[test]
@@ -1428,60 +2371,6 @@ mod tests {
         assert_eq!(section.read_campaign_score_time("Negative", 0), -208_620);
     }
 
-    #[test]
-    fn test_read_int_signs_and_edges() {
-        let ini = sec("[S]\nA=+9\nB=-0\nC=$\nD=h\nE=$junk\nF=junkh\n");
-        let s = ini.section("S").unwrap();
-        assert_eq!(s.read_int("A", -1), 9);
-        assert_eq!(s.read_int("B", -1), 0);
-        assert_eq!(s.read_int("C", -1), -1);
-        assert_eq!(s.read_int("D", -1), -1);
-        assert_eq!(s.read_int("E", -1), -1);
-        assert_eq!(s.read_int("F", -1), -1);
-    }
-
-    #[test] // P6/P18
-    fn test_read_bool_first_char() {
-        let ini = sec(
-            "[S]\nA=yes\nB=Y\nC=T\nD=true\nE=1\nF=no\nG=N\nH=F\nI=false\nJ=0\nK=off\nL=xyz\nM=\n",
-        );
-        let s = ini.section("S").unwrap();
-        for k in ["A", "B", "C", "D", "E"] {
-            assert!(s.read_bool(k, false), "{k}");
-        }
-        for k in ["F", "G", "H", "I", "J"] {
-            assert!(!s.read_bool(k, true), "{k}");
-        }
-        assert!(s.read_bool("K", true)); // 'off' first char 'o' -> default
-        assert!(s.read_bool("L", true)); // xyz -> default
-        assert!(s.read_bool("M", true)); // empty values are omitted -> default
-        assert!(s.read_bool("MISSING", true)); // absent -> default
-    }
-
-    #[test] // P7 (after the S0 gate pins precision)
-    fn test_read_double_percent() {
-        let ini = sec("[S]\nA=50%\nB=100%\nC=7\nD=0.5\nE=12.5%\n");
-        let s = ini.section("S").unwrap();
-        assert!((s.read_double("A", -1.0) - 0.5).abs() < 1e-6);
-        assert!((s.read_double("B", -1.0) - 1.0).abs() < 1e-6);
-        assert!((s.read_double("C", -1.0) - 7.0).abs() < 1e-6);
-        assert!((s.read_double("D", -1.0) - 0.5).abs() < 1e-6);
-        assert!((s.read_double("E", -1.0) - 0.125).abs() < 1e-6);
-        assert!((s.read_double("MISSING", -42.0) + 42.0).abs() < 1e-9); // absent -> default
-    }
-
-    #[test] // P5/P18
-    fn test_read_string_trim_default() {
-        let ini = sec("[S]\nA=  hello  \nB=\n");
-        let s = ini.section("S").unwrap();
-        assert_eq!(s.read_string("A", "D", 32), "hello");
-        assert_eq!(s.read_string("A", "D", 4), "hel");
-        assert_eq!(s.read_string("B", "D", 32), "D"); // empty values are omitted
-        assert_eq!(s.read_string("MISSING", "D", 32), "D");
-        assert_eq!(s.read_string("MISSING", " default ", 6), "defa");
-        assert_eq!(s.read_string("A", "D", 0), "");
-    }
-
     /// `strncpy` counts source bytes, and the store widens each byte to one
     /// character: a `0xE9` byte is one of the 3 bytes a capacity of 4 keeps.
     #[test]
@@ -1490,18 +2379,6 @@ mod tests {
         let s = ini.section("S").unwrap();
         assert_eq!(s.read_string("A", "", 4), "\u{e9}t\u{e9}");
         assert_eq!(truncate_native_bytes("\u{e9}\u{e9}", 1), "\u{e9}");
-    }
-
-    /// ReadString returns 0 only for an absent key; `read_name` keeps that
-    /// distinction so callers retain their current field.
-    #[test]
-    fn read_name_is_present_value_after_cut_and_trim() {
-        let ini = sec("[S]\nA=  GAPOWR \nB=0123456789\n");
-        let s = ini.section("S").unwrap();
-        assert_eq!(s.read_name("A", 0x80), Some("GAPOWR"));
-        assert_eq!(s.read_name("B", 5), Some("0123"));
-        assert_eq!(s.read_name("MISSING", 0x80), None);
-        assert_eq!(s.read_name("A", 0), None);
     }
 
     /// `strtok(",")`: empty fields collapse, tokens keep their spaces, the
@@ -1522,33 +2399,65 @@ mod tests {
     }
 
     #[test]
-    fn read_houses_list_matches_original_exact_lookup_and_default_controls() {
-        let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
-            "tools/input_oracle/campaign_start_houses.json",
-        ))
-        .unwrap();
-        let controls = &native["allies_reader_controls"];
-        assert_eq!(controls["delimiter_hex"], "2c00");
-        let names: Vec<_> = controls["registry"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_str().unwrap())
-            .collect();
-        let rows = controls["rows"].as_array().unwrap();
-        assert_eq!(rows.len(), 27);
-        for row in rows {
-            let mut ini = IniFile::empty();
-            let section = ini.projection_section_mut("Control");
-            for (key, value) in row["sections"]["Control"].as_object().unwrap() {
-                section.set(key, value.as_str().unwrap());
+    fn read_houses_list_matches_native_exact_lookup_and_default_controls() {
+        for ares_way in [false, true] {
+            let _ares = crate::rules::ares_switch::read_ares_way(ares_way);
+            let native = crate::test_fixture::json(if ares_way {
+                "tools/input_oracle/ares_allies_reader.json"
+            } else {
+                "tools/input_oracle/campaign_start_houses.json"
+            });
+            let controls = &native["allies_reader_controls"];
+            assert_eq!(controls["delimiter_hex"], "2c00");
+            let names: Vec<_> = controls["registry"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect();
+            let rows = controls["rows"].as_array().unwrap();
+            assert_eq!(rows.len(), 27);
+            for row in rows {
+                let mut ini = IniFile::empty();
+                let section = ini.projection_section_mut("Control");
+                for (key, value) in row["sections"]["Control"].as_object().unwrap() {
+                    section.set(key, value.as_str().unwrap());
+                }
+                let actual = section.read_houses_list(
+                    "Allies",
+                    row["default"].as_u64().unwrap() as u32,
+                    |name| names.iter().position(|candidate| *candidate == name),
+                );
+                assert_eq!(actual, row["result"].as_u64().unwrap() as u32, "{row}");
             }
-            let actual = section.read_houses_list(
-                "Allies",
-                row["default"].as_u64().unwrap() as u32,
-                |name| names.iter().position(|candidate| *candidate == name),
-            );
-            assert_eq!(actual, row["result"].as_u64().unwrap() as u32, "{row}");
+        }
+    }
+
+    #[test]
+    fn read_houses_list_matches_extended_native_buffer_controls() {
+        for ares_way in [false, true] {
+            let _ares = crate::rules::ares_switch::read_ares_way(ares_way);
+            let native = crate::test_fixture::json("tools/input_oracle/ares_allies_reader.json");
+            let feature = if ares_way { "ares" } else { "stock" };
+            for row in native["extended_controls"].as_array().unwrap() {
+                // Exercise ReadString's buffer limit directly. Physical INI line
+                // admission belongs to the lexer, independently of this reader.
+                let mut ini = IniFile::empty();
+                let section = ini.projection_section_mut("Control");
+                section.set("Allies", row["value"].as_str().unwrap());
+                let names = row["registry"].as_array().unwrap();
+                let actual = section.read_houses_list("Allies", 0, |name| {
+                    names
+                        .iter()
+                        .position(|candidate| candidate.as_str() == Some(name))
+                });
+                assert_eq!(
+                    actual,
+                    row["observations"][feature]["result"].as_u64().unwrap() as u32,
+                    "{} ({feature})",
+                    row["name"],
+                );
+            }
         }
     }
 
@@ -1594,11 +2503,15 @@ mod tests {
     /// `0x00476340` reads three `atof` tokens.
     #[test]
     fn read_float_tokens_atofs_three_tokens() {
-        let ini = sec("[S]\nV=0.5, -1,2e1\nShort=3\n");
+        let ini = sec("[S]\nV=0.5, -1,2e1\nShort=3\nChop=0.1\n");
         let s = ini.section("S").unwrap();
-        assert_eq!(s.read_float_tokens("V", [9.0; 3]), [0.5, -1.0, 20.0]);
-        assert_eq!(s.read_float_tokens("Short", [9.0; 3]), [3.0, 0.0, 0.0]);
-        assert_eq!(s.read_float_tokens("MISSING", [9.0; 3]), [9.0; 3]);
+        let read = |key| s.read_float_tokens(key, [NativeF32Bits::from_bits(9.0f32.to_bits()); 3]);
+        let floats = |values: [f32; 3]| values.map(|v| NativeF32Bits::from_bits(v.to_bits()));
+        assert_eq!(read("V"), floats([0.5, -1.0, 20.0]));
+        assert_eq!(read("Short"), floats([3.0, 0.0, 0.0]));
+        assert_eq!(read("MISSING"), floats([9.0; 3]));
+        // FSTP float chops: 0.1 stores 0x3DCCCCCC, not the nearest 0x3DCCCCCD.
+        assert_eq!(read("Chop")[0].bits(), 0x3DCC_CCCC);
     }
 
     /// `0x00476420` tokenizes where `read_coord3` scans: stock
@@ -1753,5 +2666,33 @@ mod tests {
             [0xA741, 0x41, 0x42]
         );
         assert_eq!(s.read_comma_hex_utf16("MISSING", &[1, 2, 0, 3], 8), [1, 2]);
+    }
+}
+
+#[cfg(all(test, tests_rules_a_n))]
+mod pcx_cameo_tests {
+    #[test]
+    fn filename_projection_matches_original_ares_reader_controls() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/sidebar_oracle/pcx_cameos.json",
+        ))
+        .unwrap();
+        for control in corpus["readers"].as_array().unwrap() {
+            let value = control["value"].as_str().unwrap_or("");
+            let ini = crate::rules::ini_parser::IniFile::from_str(&format!(
+                "[SYNTHETIC]\nDummy=1\nCameoPCX={value}\n"
+            ));
+            let section = ini.section("SYNTHETIC").unwrap();
+            let projected = section
+                .read_ares_pcx_filename("CameoPCX")
+                .unwrap_or_else(|| "prior.pcx".to_owned());
+            assert_eq!(
+                projected,
+                control["filename"].as_str().unwrap(),
+                "{}",
+                control["name"]
+            );
+        }
     }
 }

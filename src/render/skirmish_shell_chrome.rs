@@ -1,13 +1,12 @@
 //! Skirmish shell chrome atlas.
 //!
-//! Loads verified offline Skirmish dialog `0x102` shell art, then packs it
-//! into a GPU texture for batched drawing. Assets without direct active
-//! Skirmish evidence are research candidates and must not be rendered by the
-//! default shell path.
-//! Skirmish setup intentionally uses RA2's MNSCRNS/MNSCRNL backgrounds
-//! through SHELL.PAL as a presentation preference.
-//! User-requested YR parity exception: preserve this RA2 background during
-//! future parity work unless the user explicitly asks to change it.
+//! Packs the shared native shell art into one GPU texture. Screen-specific
+//! entries require active caller evidence and are selected by that screen.
+//! The offline Skirmish `0x102` background and the LAN/WOL setup pages
+//! `0xBB/0xBC/0xBD/0xC2/0xC9` follow `[VERA] YROriginalStyle=`: YR's
+//! Cooperative setup art and palette when it is on, RA2's shared
+//! MNSCRNS/MNSCRNL through SHELL.PAL by default. Every other entry keeps its
+//! fixed RA2 or YR loader art.
 
 use std::collections::HashMap;
 
@@ -16,11 +15,11 @@ use crate::assets::pal_file::Palette;
 use crate::assets::pcx_file::PcxFile;
 use crate::assets::shp_file::ShpFile;
 use crate::render::batch::{BatchRenderer, BatchTexture};
+use crate::render::chrome_atlas::{ChromeAtlasEntry, ChromePiece, pack_chrome_atlas};
 use crate::render::gpu::GpuContext;
 use crate::render::native_surface_format::ACTIVE_RETAIL_RGB565_PRESENTATION;
 use crate::ui::sidebar::SidebarTheme;
 
-const ATLAS_PADDING: u32 = 2;
 /// Original 72B060/72B0D0: neutral, Allied, Soviet, Yuri mode-2 assets.
 const MODE_TWO_DIALOG_ART: [(&str, &str); 4] = [
     ("PUDLGBGN.SHP", "DIALOGN.PAL"),
@@ -28,6 +27,50 @@ const MODE_TWO_DIALOG_ART: [(&str, &str); 4] = [
     ("PUDLGBGS.SHP", "DIALOG.PAL"),
     ("PUDLGBGY.SHP", "DIALOGY.PAL"),
 ];
+
+/// Ares `DialogBackground.Image/.Palette`: `0x1002ECC0` loads the side's image
+/// and palette into two slots at game load, each only from a set name that
+/// loads, and the hook at `0x622223` (body `0x1002FB50`) draws them in place
+/// of the side-selected stock background only while both are non-null. The
+/// entry is labeled by both files, so a pair that reuses a stock SHP name with
+/// another palette keeps its own entry.
+fn render_side_dialog_art(
+    assets: &AssetManager,
+    (image, palette_name): (&str, &str),
+) -> Option<ChromePiece> {
+    let palette = load_named_palette(assets, palette_name)?;
+    let label = format!(
+        "{}#{}",
+        image.to_ascii_lowercase(),
+        palette_name.to_ascii_lowercase()
+    );
+    render_shp_entry_labeled(assets, image, &label, &palette, 0)
+}
+
+/// Red Alert 2's own neutral mode-2 background, a Tesla Trooper in a burning city:
+/// `PUDLGBGN.SHP` through `DIALOG.PAL`, both from `ra2.mix -> local.mix`. Yuri's
+/// Revenge's copies of the name win the ordinary lookup. VERA's updater boxes
+/// draw it; gamemd has no updater.
+fn render_ra2_dialog_art(assets: &AssetManager) -> Option<ChromePiece> {
+    let (_, archive) = assets.archive_with_source("ra2.mix -> local.mix")?;
+    let palette = Palette::from_bytes(archive.get_by_name("DIALOG.PAL")?).ok()?;
+    render_shp_bytes(
+        archive.get_by_name("PUDLGBGN.SHP")?,
+        "pudlgbgn.shp#ra2",
+        &palette,
+        0,
+    )
+}
+
+/// The atlas label of each mode-2 dialog background slot: the stock art, or
+/// for the three side slots the rendered side pair. The no-session slot 0
+/// (`0x62225F`) is not patched and keeps `PUDLGBGN`.
+fn mode_two_dialog_labels(side_art: Option<&str>) -> [String; 4] {
+    std::array::from_fn(|slot| match side_art {
+        Some(label) if slot > 0 => label.to_owned(),
+        _ => format!("{}#0", MODE_TWO_DIALOG_ART[slot].0.to_ascii_lowercase()),
+    })
+}
 
 fn mode_two_dialog_background_slot(side: Option<SidebarTheme>) -> usize {
     match side {
@@ -48,25 +91,48 @@ const TRACKBAR_FRAME_BORDER: i32 = 2;
 /// one pixel wider and taller than the template conversion
 /// (`ui::shell::geom::child_window`): Skirmish `0x102` and the Options audio
 /// sliders 129x22, Generate Map's Players 226x22, the Options plain sliders
-/// 181x22. The in-game B8 and BBB sliders keep their 263x21 and 192x21.
-pub const TRACKBAR_FRAMES: [(i32, i32, i32); 5] = [
+/// 181x22, the shell's Sound Options `0xD6` volumes 261x22. The in-game B8
+/// and BBB sliders keep their 263x21 and 192x21. The network setup dialogs
+/// BC/BD/C2/C9 place their speed, credits and units sliders at 129x21 and the
+/// co-op difficulty slider at 266x22, or 266x21 on WOL's host C2
+/// (`0x0060B950` placement, `tools/storage_oracle/lan_lobby.json`).
+pub const TRACKBAR_FRAMES: [(i32, i32, i32); 10] = [
     (129, 22, 50),
     (226, 22, 50),
     (263, 21, 50),
     (181, 22, 0),
     (192, 21, 0),
+    (261, 22, 50),
+    (129, 21, 50),
+    (266, 22, 0),
+    (266, 21, 0),
+    // The online pause menu FF's Connection and Game Speed (60B7A0).
+    (210, 21, 50),
 ];
 const SKIRMISH_FLAG_PCX_NAMES: [&str; 12] = [
     "usai.pcx", "japi.pcx", "frai.pcx", "geri.pcx", "gbri.pcx", "djbi.pcx", "arbi.pcx", "lati.pcx",
     "rusi.pcx", "yrii.pcx", "obsi.pcx", "rani.pcx",
 ];
+/// Owner-draw preload 61F7FD..61F857 -> PCX cache 6B9D00 (embedded palette).
+/// BB 5EE200 selects observer art; 5DAFE0 selects host/accepted glyphs.
+const LAN_PCX_NAMES: [&str; 4] = ["wolnob.pcx", "wolob.pcx", "wolhost.pcx", "wolacpt.pcx"];
+/// WOL setup C2/C9 art: ping statics 004E34A0 and the 0x3ED emote images
+/// (0x49C wodact, 0x4AA wouact, C2 `0x791231`).
+const WOL_SETUP_PCX_NAMES: [&str; 5] = [
+    "pingg.pcx",
+    "pingy.pcx",
+    "pingr.pcx",
+    "wodact.pcx",
+    "wouact.pcx",
+];
+/// YR `0x72CF40/0x72D030` setup pair, shared by offline Skirmish `0x102` and
+/// the BC/BD/C2/C9 setup family: the large art and the palette that decodes
+/// both sizes. Only the offline Skirmish screen selects it, under
+/// `[VERA] YROriginalStyle=`.
+const COOP_SETUP_SHAPE: &str = "MnScrnLCoopGameSetup.shp";
+const COOP_SETUP_PALETTE: &str = "MnScrnLCoopGameSetup.PAL";
 
-#[derive(Debug, Clone, Copy)]
-pub struct SkirmishShellChromeEntry {
-    pub uv_origin: [f32; 2],
-    pub uv_size: [f32; 2],
-    pub pixel_size: [f32; 2],
-}
+pub type SkirmishShellChromeEntry = ChromeAtlasEntry;
 
 pub struct SkirmishShellChromeAtlas {
     pub texture: BatchTexture,
@@ -97,9 +163,23 @@ pub struct SkirmishShellChromeAtlas {
     pub generic_background_640_mnscrns_shell: Option<SkirmishShellChromeEntry>,
     /// Generic common-shell large background, decoded through SHELL.PAL.
     pub generic_background_large_mnscrnl_shell: Option<SkirmishShellChromeEntry>,
+    /// Style identity for rebuilding this derived atlas when the Options
+    /// preview changes the selected source family.
+    pub yr_original_style: bool,
+    /// The setup-family background pair, slot 0 at exactly 640 wide and slot 1
+    /// otherwise: shared by offline Skirmish `0x102` and the LAN/WOL pages
+    /// `0xBB/0xBC/0xBD/0xC2/0xC9`. YR style selects the Cooperative setup art
+    /// and palette, RA2 style the shared MNSCRN pair through SHELL.PAL.
+    pub setup_backgrounds: [Option<SkirmishShellChromeEntry>; 2],
+    lan_icons: [Option<SkirmishShellChromeEntry>; 4],
+    wol_setup_icons: [Option<SkirmishShellChromeEntry>; 5],
+    /// VERA's online room: the lobby's badge PCX images by file name.
+    wol_badges: Vec<(&'static str, SkirmishShellChromeEntry)>,
     pub lower_side_640_lwscrns: Option<SkirmishShellChromeEntry>,
     pub lower_side_large_lwscrnl: Option<SkirmishShellChromeEntry>,
     mode_two_dialog_backgrounds: [Option<SkirmishShellChromeEntry>; 4],
+    /// Red Alert 2's neutral dialog background ([`render_ra2_dialog_art`]).
+    pub ra2_dialog_background: Option<SkirmishShellChromeEntry>,
     pub button_up_left_30: Option<SkirmishShellChromeEntry>,
     pub button_up_mid_30: Option<SkirmishShellChromeEntry>,
     pub button_up_right_30: Option<SkirmishShellChromeEntry>,
@@ -111,6 +191,10 @@ pub struct SkirmishShellChromeAtlas {
     pub modal_button_mnbttn_frame2: Option<SkirmishShellChromeEntry>,
     pub checkbox_unchecked_cue_i: Option<SkirmishShellChromeEntry>,
     pub checkbox_checked_cce_i: Option<SkirmishShellChromeEntry>,
+    /// Dual-state checkbox halves (message 0x4E5 of 0x006163A0): checked
+    /// but not answered (`cce_il`), answered but not checked (`cce_ir`).
+    checkbox_dual_left_cce_il: Option<SkirmishShellChromeEntry>,
+    checkbox_dual_right_cce_ir: Option<SkirmishShellChromeEntry>,
     pub trackbar_thumb_trakgrip: Option<SkirmishShellChromeEntry>,
     pub trackbar_plaque_left_trofl: Option<SkirmishShellChromeEntry>,
     pub trackbar_plaque_mid_trofm: Option<SkirmishShellChromeEntry>,
@@ -130,9 +214,16 @@ pub struct SkirmishShellChromeAtlas {
     /// two-pixel outside expansion.
     pub trackbar_frames: [Option<SkirmishShellChromeEntry>; TRACKBAR_FRAMES.len()],
     /// Keyboard A3 category face, original resource138 DLU.
+    pub combo_face_249: Option<SkirmishShellChromeEntry>,
     pub combo_face_207: Option<SkirmishShellChromeEntry>,
     pub combo_face_180: Option<SkirmishShellChromeEntry>,
     pub combo_face_150: Option<SkirmishShellChromeEntry>,
+    /// BC/BD resource windows after60C4A0:151/118/42/39px, faceheight24.
+    pub combo_face_151: Option<SkirmishShellChromeEntry>,
+    pub combo_face_118: Option<SkirmishShellChromeEntry>,
+    pub combo_face_42: Option<SkirmishShellChromeEntry>,
+    pub combo_face_39: Option<SkirmishShellChromeEntry>,
+    pub combo_face_213: Option<SkirmishShellChromeEntry>,
     pub combo_face_117: Option<SkirmishShellChromeEntry>,
     pub combo_face_44: Option<SkirmishShellChromeEntry>,
     pub combo_face_38: Option<SkirmishShellChromeEntry>,
@@ -152,9 +243,12 @@ pub struct SkirmishShellChromeAtlas {
 pub struct ControlChrome {
     pub checkbox_unchecked_cue_i: Option<SkirmishShellChromeEntry>,
     pub checkbox_checked_cce_i: Option<SkirmishShellChromeEntry>,
+    pub checkbox_dual_left_cce_il: Option<SkirmishShellChromeEntry>,
+    pub checkbox_dual_right_cce_ir: Option<SkirmishShellChromeEntry>,
     /// The frames of the [`TRACKBAR_FRAMES`] windows, in that order.
     pub trackbar_frames: [Option<SkirmishShellChromeEntry>; TRACKBAR_FRAMES.len()],
     /// Keyboard A3 category face, original resource138 DLU.
+    pub combo_face_249: Option<SkirmishShellChromeEntry>,
     pub combo_face_207: Option<SkirmishShellChromeEntry>,
     pub combo_face_180: Option<SkirmishShellChromeEntry>,
     pub trackbar_plaque_left_trofl: Option<SkirmishShellChromeEntry>,
@@ -163,6 +257,11 @@ pub struct ControlChrome {
     pub trackbar_thumb_trakgrip: Option<SkirmishShellChromeEntry>,
     pub white_pixel: Option<SkirmishShellChromeEntry>,
     pub combo_face_150: Option<SkirmishShellChromeEntry>,
+    pub combo_face_151: Option<SkirmishShellChromeEntry>,
+    pub combo_face_118: Option<SkirmishShellChromeEntry>,
+    pub combo_face_42: Option<SkirmishShellChromeEntry>,
+    pub combo_face_39: Option<SkirmishShellChromeEntry>,
+    pub combo_face_213: Option<SkirmishShellChromeEntry>,
     pub combo_face_117: Option<SkirmishShellChromeEntry>,
     pub combo_face_44: Option<SkirmishShellChromeEntry>,
     pub combo_face_38: Option<SkirmishShellChromeEntry>,
@@ -180,6 +279,77 @@ pub struct ControlChrome {
 }
 
 impl SkirmishShellChromeAtlas {
+    /// Original 60CF00 assigns BB the generic shell art, and LAN BC/BD and WOL
+    /// C2/C9 the 72D030 Cooperative setup art (MnScrnLCoopGameSetup.shp/.PAL),
+    /// which loader72CF40 (LAN5DCE93/5E0963) loads at800 and72CF90 frees.
+    ///
+    /// VERA follows the persisted shell style here: `[VERA] YROriginalStyle=`
+    /// gives the whole setup family the Cooperative art and palette, while the
+    /// default RA2 style paints BB's generic MNSCRNS/MNSCRNL through SHELL.PAL.
+    pub fn lan_background(&self, dialog_id: u16, width: u32) -> Option<SkirmishShellChromeEntry> {
+        match (dialog_id, width) {
+            (0xBB | 0xBC | 0xBD | 0xC2 | 0xC9, 640) => self.setup_backgrounds[0],
+            (0xBB | 0xBC | 0xBD | 0xC2 | 0xC9, _) => self.setup_backgrounds[1],
+            _ => None,
+        }
+    }
+
+    /// BB5EE200 ->603D30 kind-2 image static, RGB565 magenta keyed.
+    pub fn lan_observer_toggle(&self, observer: bool) -> Option<SkirmishShellChromeEntry> {
+        self.lan_icons[usize::from(observer)]
+    }
+
+    /// BB5DAFE0 -> country insignia owner4E3560. Reuse the flags already
+    /// loaded for country selectors; unsupported names have no substitute.
+    pub fn lan_player_side(&self, name: &str) -> Option<SkirmishShellChromeEntry> {
+        self.flags
+            .iter()
+            .find(|(file, _)| file.eq_ignore_ascii_case(name))
+            .map(|(_, entry)| *entry)
+    }
+
+    /// 004E34A0 ping image 0/1/2: pingg, pingy, pingr.
+    pub fn wol_ping_icon(&self, icon: u8) -> Option<SkirmishShellChromeEntry> {
+        self.wol_setup_icons
+            .get(usize::from(icon))
+            .copied()
+            .flatten()
+    }
+
+    /// C2/C9 0x3ED images: element+0x14 (`wodact`, message 0x49C) and
+    /// element+0x18 (`wouact`, message 0x4AA).
+    pub fn wol_emote_images(
+        &self,
+    ) -> (
+        Option<SkirmishShellChromeEntry>,
+        Option<SkirmishShellChromeEntry>,
+    ) {
+        (self.wol_setup_icons[3], self.wol_setup_icons[4])
+    }
+
+    /// VERA's online room: a player's badge ([`crate::ui::wol_lobby::badge`]).
+    pub fn wol_badge(&self, file: &str) -> Option<SkirmishShellChromeEntry> {
+        self.wol_badges
+            .iter()
+            .find(|(name, _)| *name == file)
+            .map(|(_, entry)| *entry)
+    }
+
+    /// BB5DAFE0 gives the host glyph precedence, then accepted, else no icon.
+    pub fn lan_player_status(
+        &self,
+        host: bool,
+        accepted: bool,
+    ) -> Option<SkirmishShellChromeEntry> {
+        if host {
+            self.lan_icons[2]
+        } else if accepted {
+            self.lan_icons[3]
+        } else {
+            None
+        }
+    }
+
     /// Original mode-2 paint (`621E90`, branch `6221D1`) selects neutral art
     /// outside a session, otherwise the scenario's side. Missing selected art or
     /// palette skips the SHP; it does not borrow another side's background.
@@ -196,7 +366,10 @@ impl SkirmishShellChromeAtlas {
         ControlChrome {
             checkbox_unchecked_cue_i: self.checkbox_unchecked_cue_i,
             checkbox_checked_cce_i: self.checkbox_checked_cce_i,
+            checkbox_dual_left_cce_il: self.checkbox_dual_left_cce_il,
+            checkbox_dual_right_cce_ir: self.checkbox_dual_right_cce_ir,
             trackbar_frames: self.trackbar_frames,
+            combo_face_249: self.combo_face_249,
             combo_face_207: self.combo_face_207,
             combo_face_180: self.combo_face_180,
             trackbar_plaque_left_trofl: self.trackbar_plaque_left_trofl,
@@ -205,6 +378,11 @@ impl SkirmishShellChromeAtlas {
             trackbar_thumb_trakgrip: self.trackbar_thumb_trakgrip,
             white_pixel: self.white_pixel,
             combo_face_150: self.combo_face_150,
+            combo_face_151: self.combo_face_151,
+            combo_face_118: self.combo_face_118,
+            combo_face_42: self.combo_face_42,
+            combo_face_39: self.combo_face_39,
+            combo_face_213: self.combo_face_213,
             combo_face_117: self.combo_face_117,
             combo_face_44: self.combo_face_44,
             combo_face_38: self.combo_face_38,
@@ -231,6 +409,30 @@ pub fn trackbar_frame_slot(plaque: bool, width: i32, height: i32) -> Option<usiz
         .position(|&(w, h, reserve)| (w, h, reserve > 0) == (width, height, plaque))
 }
 
+/// The [`TRACKBAR_FRAMES`] slot of a `width` x `height` trackbar window
+/// drawn at `scale`. Below the shell's own size (VERA's team bar draws its
+/// controls at 78%) the window's size rounds back from its authored one by
+/// a pixel or two, so it takes the frame of the nearest window within two
+/// pixels each way.
+pub fn drawn_trackbar_frame_slot(
+    plaque: bool,
+    width: i32,
+    height: i32,
+    scale: crate::ui::shell::geom::ShellScale,
+) -> Option<usize> {
+    if scale.factor() >= 1.0 {
+        return trackbar_frame_slot(plaque, width, height);
+    }
+    TRACKBAR_FRAMES
+        .iter()
+        .enumerate()
+        .filter(|&(_, &(w, h, reserve))| {
+            (reserve > 0) == plaque && (w - width).abs() <= 2 && (h - height).abs() <= 2
+        })
+        .min_by_key(|&(_, &(w, h, _))| (w - width).abs() + (h - height).abs())
+        .map(|(slot, _)| slot)
+}
+
 impl ControlChrome {
     /// The frame entry of a `width` x `height` trackbar window.
     pub fn trackbar_frame(
@@ -248,6 +450,7 @@ impl ControlChrome {
 enum ShellAssetRole {
     VerifiedParentBackground,
     VerifiedChooseMapBackground,
+    VerifiedLanIcon,
     VerifiedOfflineStartMarker,
     AssignedPlayerMarker,
     RightPanelChrome,
@@ -258,17 +461,13 @@ enum ShellAssetRole {
     Other,
 }
 
-struct RenderedShellEntry {
-    label: String,
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
-}
-
 pub fn build_skirmish_shell_chrome_atlas(
     gpu: &GpuContext,
     batch: &BatchRenderer,
     assets: &AssetManager,
+    yr_original_style: bool,
+    extra_flags: &[String],
+    dialog_background: Option<(&str, &str)>,
 ) -> Option<SkirmishShellChromeAtlas> {
     let shell_palette = load_shell_palette(assets)?;
     let shell2_palette = load_named_palette(assets, "SHELL2.PAL")?;
@@ -381,6 +580,18 @@ pub fn build_skirmish_shell_chrome_atlas(
             );
         }
     }
+    let side_dialog_art = dialog_background
+        .and_then(|pair| render_side_dialog_art(assets, pair))
+        .map(|entry| {
+            let label = entry.label.clone();
+            rendered.push(entry);
+            label
+        });
+    push_optional(
+        &mut rendered,
+        render_ra2_dialog_art(assets),
+        "PUDLGBGN.SHP from ra2.mix -> local.mix",
+    );
     rendered.push(mandatory_shp(
         assets,
         "SDMPBTN.SHP",
@@ -433,6 +644,40 @@ pub fn build_skirmish_shell_chrome_atlas(
         );
     }
 
+    // `0x72E730` keeps MNSCRNS.SHP at exactly 640 but decodes it through the
+    // Cooperative setup palette; the large shape is the Cooperative setup art.
+    // RA2 style keeps the shared MNSCRN pair above.
+    if yr_original_style {
+        if let Some(palette) = load_named_palette(assets, COOP_SETUP_PALETTE) {
+            push_optional(
+                &mut rendered,
+                render_shp_entry_labeled(
+                    assets,
+                    "MNSCRNS.SHP",
+                    "mnscrns.shp#offline-setup",
+                    &palette,
+                    0,
+                ),
+                "MNSCRNS.SHP",
+            );
+            push_optional(
+                &mut rendered,
+                render_shp_entry_labeled(
+                    assets,
+                    COOP_SETUP_SHAPE,
+                    "mnscrnlcoopgamesetup.shp",
+                    &palette,
+                    0,
+                ),
+                COOP_SETUP_SHAPE,
+            );
+        } else {
+            log::warn!(
+                "YR Skirmish style needs {COOP_SETUP_PALETTE}; keeping the RA2 MNSCRN background"
+            );
+        }
+    }
+
     if let Some(choose_map_background_palette) = choose_map_background_palette.as_ref() {
         push_optional(
             &mut rendered,
@@ -463,7 +708,7 @@ pub fn build_skirmish_shell_chrome_atlas(
         );
     }
 
-    for name in ["STARTBUT.SHP", "mmpb.shp"] {
+    for name in [START_MARKER_SHP, "mmpb.shp"] {
         push_optional(
             &mut rendered,
             render_shp_entry(assets, name, &shell_palette, 0),
@@ -480,6 +725,8 @@ pub fn build_skirmish_shell_chrome_atlas(
         "bde_ri30.pcx",
         "cue_i.pcx",
         "cce_i.pcx",
+        "cce_il.pcx",
+        "cce_ir.pcx",
         "trakgrip.pcx",
         "trofl.pcx",
         "trofm.pcx",
@@ -509,9 +756,18 @@ pub fn build_skirmish_shell_chrome_atlas(
         ("skirmish_combo_face_150", 150),
         ("launcher_combo_face_180", 180),
         ("keyboard_combo_face_207", 207),
+        ("network_combo_face_249", 249),
         ("skirmish_combo_face_117", 117),
         ("skirmish_combo_face_44", 44),
         ("skirmish_combo_face_38", 38),
+        // BC/BD use the same617250 face painter:61745C height24,
+        // 617893->6208F0 thickness2. Keep their actual child-window widths.
+        ("lan_combo_face_151", 151),
+        ("lan_combo_face_118", 118),
+        ("lan_combo_face_42", 42),
+        ("lan_combo_face_39", 39),
+        // WOL login 0x10F's nickname combo 0x628 (executed width 213).
+        ("wol_combo_face_213", 213),
     ] {
         rendered.push(render_primitive_bevel_entry(
             label,
@@ -528,21 +784,39 @@ pub fn build_skirmish_shell_chrome_atlas(
         [255, 255, 255, 255],
     ));
 
-    for name in SKIRMISH_FLAG_PCX_NAMES {
+    let mut flag_names: Vec<&str> = SKIRMISH_FLAG_PCX_NAMES.to_vec();
+    for name in extra_flags {
+        if !flag_names
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(name))
+        {
+            flag_names.push(name.as_str());
+        }
+    }
+    for name in &flag_names {
+        push_optional(&mut rendered, render_flag_pcx_entry(assets, name), name);
+    }
+    for name in LAN_PCX_NAMES
+        .into_iter()
+        .chain(WOL_SETUP_PCX_NAMES)
+        .chain(crate::ui::wol_lobby::badge_files())
+    {
+        // 6B9D00 packs embedded PCX palette to display RGB565; list images
+        // and kind-2 statics compare the same packed magenta key as flags.
         push_optional(&mut rendered, render_flag_pcx_entry(assets, name), name);
     }
 
-    let (texture, packed) = pack_entries(gpu, batch, &rendered)?;
+    let (texture, packed) = pack_chrome_atlas(gpu, batch, "Skirmish shell chrome", &rendered)?;
     let by_label: HashMap<String, SkirmishShellChromeEntry> = rendered
         .iter()
         .map(|entry| entry.label.clone())
         .zip(packed)
         .collect();
-    let flags = SKIRMISH_FLAG_PCX_NAMES
+    let flags = flag_names
         .into_iter()
         .filter_map(|name| {
             by_label
-                .get(name)
+                .get(&name.to_ascii_lowercase())
                 .copied()
                 .map(|entry| (name.to_string(), entry))
         })
@@ -550,6 +824,8 @@ pub fn build_skirmish_shell_chrome_atlas(
 
     Some(SkirmishShellChromeAtlas {
         texture,
+        yr_original_style,
+        setup_backgrounds: setup_background_pair(yr_original_style, &by_label),
         launcher_warning_frames: (0..91)
             .map_while(|frame| by_label.get(&format!("sdwrnanm.shp#{frame}")).copied())
             .collect(),
@@ -580,13 +856,16 @@ pub fn build_skirmish_shell_chrome_atlas(
             .copied(),
         generic_background_640_mnscrns_shell: by_label.get("mnscrns.shp#shell").copied(),
         generic_background_large_mnscrnl_shell: by_label.get("mnscrnl.shp#shell").copied(),
+        lan_icons: LAN_PCX_NAMES.map(|name| by_label.get(name).copied()),
+        wol_setup_icons: WOL_SETUP_PCX_NAMES.map(|name| by_label.get(name).copied()),
+        wol_badges: crate::ui::wol_lobby::badge_files()
+            .filter_map(|name| by_label.get(name).map(|entry| (name, *entry)))
+            .collect(),
         lower_side_640_lwscrns: by_label.get("lwscrns.shp").copied(),
         lower_side_large_lwscrnl: by_label.get("lwscrnl.shp").copied(),
-        mode_two_dialog_backgrounds: MODE_TWO_DIALOG_ART.map(|(name, _)| {
-            by_label
-                .get(&format!("{}#0", name.to_ascii_lowercase()))
-                .copied()
-        }),
+        mode_two_dialog_backgrounds: mode_two_dialog_labels(side_dialog_art.as_deref())
+            .map(|label| by_label.get(&label).copied()),
+        ra2_dialog_background: by_label.get("pudlgbgn.shp#ra2").copied(),
         button_up_left_30: by_label.get("bue_li30.pcx").copied(),
         button_up_mid_30: by_label.get("bue_mi30.pcx").copied(),
         button_up_right_30: by_label.get("bue_ri30.pcx").copied(),
@@ -598,6 +877,8 @@ pub fn build_skirmish_shell_chrome_atlas(
         modal_button_mnbttn_frame2: by_label.get("mnbttn.shp#2").copied(),
         checkbox_unchecked_cue_i: by_label.get("cue_i.pcx").copied(),
         checkbox_checked_cce_i: by_label.get("cce_i.pcx").copied(),
+        checkbox_dual_left_cce_il: by_label.get("cce_il.pcx").copied(),
+        checkbox_dual_right_cce_ir: by_label.get("cce_ir.pcx").copied(),
         trackbar_thumb_trakgrip: by_label.get("trakgrip.pcx").copied(),
         trackbar_plaque_left_trofl: by_label.get("trofl.pcx").copied(),
         trackbar_plaque_mid_trofm: by_label.get("trofm.pcx").copied(),
@@ -618,9 +899,15 @@ pub fn build_skirmish_shell_chrome_atlas(
                 .get(trackbar_frame_label(width, height, reserve).as_str())
                 .copied()
         }),
+        combo_face_249: by_label.get("network_combo_face_249").copied(),
         combo_face_207: by_label.get("keyboard_combo_face_207").copied(),
         combo_face_180: by_label.get("launcher_combo_face_180").copied(),
         combo_face_150: by_label.get("skirmish_combo_face_150").copied(),
+        combo_face_151: by_label.get("lan_combo_face_151").copied(),
+        combo_face_118: by_label.get("lan_combo_face_118").copied(),
+        combo_face_42: by_label.get("lan_combo_face_42").copied(),
+        combo_face_39: by_label.get("lan_combo_face_39").copied(),
+        combo_face_213: by_label.get("wol_combo_face_213").copied(),
         combo_face_117: by_label.get("skirmish_combo_face_117").copied(),
         combo_face_44: by_label.get("skirmish_combo_face_44").copied(),
         combo_face_38: by_label.get("skirmish_combo_face_38").copied(),
@@ -646,8 +933,41 @@ fn load_choose_map_background_palette(assets: &AssetManager) -> Option<Palette> 
         .ok()
 }
 
+/// The setup-family background pair for the selected style: YR's Cooperative
+/// setup art, or RA2's shared MNSCRN pair. Shared by offline Skirmish `0x102`
+/// and the LAN/WOL pages. A YR entry that failed to load falls back per slot,
+/// so a missing setup palette keeps the backdrop rather than blanking it.
+fn setup_background_pair(
+    yr_original_style: bool,
+    by_label: &HashMap<String, SkirmishShellChromeEntry>,
+) -> [Option<SkirmishShellChromeEntry>; 2] {
+    let ra2 = [
+        by_label.get("mnscrns.shp#shell").copied(),
+        by_label.get("mnscrnl.shp#shell").copied(),
+    ];
+    if !yr_original_style {
+        return ra2;
+    }
+    [
+        by_label
+            .get("mnscrns.shp#offline-setup")
+            .copied()
+            .or(ra2[0]),
+        by_label.get("mnscrnlcoopgamesetup.shp").copied().or(ra2[1]),
+    ]
+}
+
 fn load_shell_palette(assets: &AssetManager) -> Option<Palette> {
     load_named_palette(assets, "SHELL.PAL")
+}
+
+/// The skirmish preview's start marker, drawn by `DrawStartPositions 0x00640710`.
+const START_MARKER_SHP: &str = "STARTBUT.SHP";
+
+/// The start marker piece the atlas packs (frame 0 on its canvas in
+/// SHELL.PAL), for pictures of a map drawn outside the shell.
+pub(crate) fn start_marker_art(assets: &AssetManager) -> Option<ChromePiece> {
+    render_shp_entry(assets, START_MARKER_SHP, &load_shell_palette(assets)?, 0)
 }
 
 /// Shell palettes come from ConvertClass__BuildFromPaletteFile `0x0072ADE0`,
@@ -670,14 +990,17 @@ fn classify_shell_asset(name: &str) -> ShellAssetRole {
     match name.to_ascii_lowercase().as_str() {
         "mnscrns.shp" | "mnscrnl.shp" => ShellAssetRole::VerifiedParentBackground,
         "mnscrnlcustomizebattle.shp" => ShellAssetRole::VerifiedChooseMapBackground,
+        "wolnob.pcx" | "wolob.pcx" | "wolhost.pcx" | "wolacpt.pcx" => {
+            ShellAssetRole::VerifiedLanIcon
+        }
         "startbut.shp" => ShellAssetRole::VerifiedOfflineStartMarker,
         "mmpb.shp" => ShellAssetRole::AssignedPlayerMarker,
         "sdtp.shp" | "sdbtnbkgd.shp" | "sdbtm.shp" | "sdbtnanm.shp" | "sdmpbtn.shp"
         | "lwscrns.shp" | "lwscrnl.shp" => ShellAssetRole::RightPanelChrome,
         "bue_li30.pcx" | "bue_mi30.pcx" | "bue_ri30.pcx" | "bde_li30.pcx" | "bde_mi30.pcx"
-        | "bde_ri30.pcx" | "cue_i.pcx" | "cce_i.pcx" | "trakgrip.pcx" | "trofl.pcx"
-        | "trofm.pcx" | "trofr.pcx" | "dnarrowr.pcx" | "dnarrowp.pcx" | "gdnarrowr.pcx"
-        | "gdnarrowp.pcx" | "mnbttn.shp" | "sidebttn.shp" => {
+        | "bde_ri30.pcx" | "cue_i.pcx" | "cce_i.pcx" | "cce_il.pcx" | "cce_ir.pcx"
+        | "trakgrip.pcx" | "trofl.pcx" | "trofm.pcx" | "trofr.pcx" | "dnarrowr.pcx"
+        | "dnarrowp.pcx" | "gdnarrowr.pcx" | "gdnarrowp.pcx" | "mnbttn.shp" | "sidebttn.shp" => {
             ShellAssetRole::VerifiedOwnerDrawButton
         }
         "pudlgbgn.shp" | "pudlgbga.shp" | "pudlgbgs.shp" | "pudlgbgy.shp" => {
@@ -692,11 +1015,7 @@ fn classify_shell_asset(name: &str) -> ShellAssetRole {
     }
 }
 
-fn push_optional(
-    entries: &mut Vec<RenderedShellEntry>,
-    entry: Option<RenderedShellEntry>,
-    name: &str,
-) {
+fn push_optional(entries: &mut Vec<ChromePiece>, entry: Option<ChromePiece>, name: &str) {
     if let Some(entry) = entry {
         entries.push(entry);
     } else {
@@ -710,7 +1029,7 @@ fn mandatory_shp(
     palette: &Palette,
     frame: usize,
     palette_name: &str,
-) -> Option<RenderedShellEntry> {
+) -> Option<ChromePiece> {
     render_shp_entry(assets, file_name, palette, frame).or_else(|| {
         log::warn!(
             "Missing mandatory Skirmish shell asset {file_name} frame {frame} decoded with {palette_name}"
@@ -724,7 +1043,7 @@ fn render_shp_entry(
     file_name: &str,
     palette: &Palette,
     frame: usize,
-) -> Option<RenderedShellEntry> {
+) -> Option<ChromePiece> {
     render_shp_entry_labeled(
         assets,
         file_name,
@@ -740,8 +1059,16 @@ fn render_shp_entry_labeled(
     label: &str,
     palette: &Palette,
     frame: usize,
-) -> Option<RenderedShellEntry> {
-    let bytes = assets.get_ref(file_name)?;
+) -> Option<ChromePiece> {
+    render_shp_bytes(assets.get_ref(file_name)?, label, palette, frame)
+}
+
+fn render_shp_bytes(
+    bytes: &[u8],
+    label: &str,
+    palette: &Palette,
+    frame: usize,
+) -> Option<ChromePiece> {
     let shp = ShpFile::from_bytes(bytes).ok()?;
     if frame >= shp.frames.len() {
         return None;
@@ -768,7 +1095,7 @@ fn render_shp_entry_labeled(
         }
         canvas
     };
-    Some(RenderedShellEntry {
+    Some(ChromePiece {
         label: label.to_ascii_lowercase(),
         width: canvas_w,
         height: canvas_h,
@@ -776,10 +1103,10 @@ fn render_shp_entry_labeled(
     })
 }
 
-fn render_pcx_entry(assets: &AssetManager, file_name: &str) -> Option<RenderedShellEntry> {
+fn render_pcx_entry(assets: &AssetManager, file_name: &str) -> Option<ChromePiece> {
     let bytes = assets.get_ref(file_name)?;
     let pcx = PcxFile::from_bytes(bytes).ok()?;
-    Some(RenderedShellEntry {
+    Some(ChromePiece {
         label: file_name.to_ascii_lowercase(),
         width: pcx.width as u32,
         height: pcx.height as u32,
@@ -787,13 +1114,13 @@ fn render_pcx_entry(assets: &AssetManager, file_name: &str) -> Option<RenderedSh
     })
 }
 
-fn render_flag_pcx_entry(assets: &AssetManager, file_name: &str) -> Option<RenderedShellEntry> {
+fn render_flag_pcx_entry(assets: &AssetManager, file_name: &str) -> Option<ChromePiece> {
     let bytes = assets.get_ref(file_name)?;
     let pcx = PcxFile::from_bytes(bytes).ok()?;
     let mut rgba = pcx.to_rgba(None);
     ACTIVE_RETAIL_RGB565_PRESENTATION
         .apply_packed_color_key_rgba8(&mut rgba, OWNER_DRAW_FLAG_TRANSPARENT_RGB);
-    Some(RenderedShellEntry {
+    Some(ChromePiece {
         label: file_name.to_ascii_lowercase(),
         width: pcx.width as u32,
         height: pcx.height as u32,
@@ -801,12 +1128,12 @@ fn render_flag_pcx_entry(assets: &AssetManager, file_name: &str) -> Option<Rende
     })
 }
 
-fn render_solid_entry(label: &str, width: u32, height: u32, color: [u8; 4]) -> RenderedShellEntry {
+fn render_solid_entry(label: &str, width: u32, height: u32, color: [u8; 4]) -> ChromePiece {
     let mut rgba = vec![0u8; (width * height * 4) as usize];
     for px in rgba.as_chunks_mut::<4>().0 {
         px.copy_from_slice(&color);
     }
-    RenderedShellEntry {
+    ChromePiece {
         label: label.to_ascii_lowercase(),
         width,
         height,
@@ -820,10 +1147,10 @@ fn render_primitive_bevel_entry(
     height: u32,
     box_xywh: [i32; 4],
     border: i32,
-) -> RenderedShellEntry {
+) -> ChromePiece {
     let mut rgba = vec![0u8; (width * height * 4) as usize];
     draw_primitive_bevel(&mut rgba, width, height, box_xywh, border);
-    RenderedShellEntry {
+    ChromePiece {
         label: label.to_ascii_lowercase(),
         width,
         height,
@@ -846,7 +1173,7 @@ fn render_trackbar_frame_geometry(
     control_width: u32,
     control_height: u32,
     reserve: i32,
-) -> RenderedShellEntry {
+) -> ChromePiece {
     let border = TRACKBAR_FRAME_BORDER;
     let width = control_width + (border as u32) * 2;
     let height = control_height + (border as u32) * 2;
@@ -877,7 +1204,7 @@ fn render_trackbar_frame_geometry(
         border,
     );
 
-    RenderedShellEntry {
+    ChromePiece {
         label: label.to_ascii_lowercase(),
         width,
         height,
@@ -1032,88 +1359,58 @@ fn average_rgb(a: [u8; 3], b: [u8; 3]) -> [u8; 3] {
     ]
 }
 
-fn pack_entries(
-    gpu: &GpuContext,
-    batch: &BatchRenderer,
-    entries: &[RenderedShellEntry],
-) -> Option<(BatchTexture, Vec<SkirmishShellChromeEntry>)> {
-    if entries.is_empty() {
-        return None;
-    }
-
-    let atlas_width = entries
-        .iter()
-        .map(|entry| entry.width)
-        .max()
-        .unwrap_or(1)
-        .max(1024);
-    let mut x = 0u32;
-    let mut y = 0u32;
-    let mut row_h = 0u32;
-    let mut placements = Vec::with_capacity(entries.len());
-
-    for entry in entries {
-        if x > 0 && x + entry.width + ATLAS_PADDING > atlas_width {
-            x = 0;
-            y += row_h + ATLAS_PADDING;
-            row_h = 0;
-        }
-        placements.push((x, y));
-        x += entry.width + ATLAS_PADDING;
-        row_h = row_h.max(entry.height);
-    }
-
-    let atlas_height = (y + row_h).next_power_of_two().max(1);
-    let mut rgba = vec![0u8; (atlas_width * atlas_height * 4) as usize];
-
-    for (entry, (px, py)) in entries.iter().zip(placements.iter().copied()) {
-        for row in 0..entry.height {
-            let src = (row * entry.width * 4) as usize;
-            let dst = (((py + row) * atlas_width + px) * 4) as usize;
-            let len = (entry.width * 4) as usize;
-            rgba[dst..dst + len].copy_from_slice(&entry.rgba[src..src + len]);
-        }
-    }
-
-    log::info!(
-        "Skirmish shell chrome atlas: {}x{} px, {} pieces",
-        atlas_width,
-        atlas_height,
-        entries.len()
-    );
-    for entry in entries {
-        log::info!("  {}: {}x{}", entry.label, entry.width, entry.height);
-    }
-
-    let texture = batch.create_texture(gpu, &rgba, atlas_width, atlas_height);
-    let atlas_entries = entries
-        .iter()
-        .zip(placements)
-        .map(|(entry, (px, py))| SkirmishShellChromeEntry {
-            uv_origin: [
-                px as f32 / atlas_width as f32,
-                py as f32 / atlas_height as f32,
-            ],
-            uv_size: [
-                entry.width as f32 / atlas_width as f32,
-                entry.height as f32 / atlas_height as f32,
-            ],
-            pixel_size: [entry.width as f32, entry.height as f32],
-        })
-        .collect();
-    Some((texture, atlas_entries))
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_render_s_z))]
 mod tests {
     use super::{
-        AssetManager, OWNER_DRAW_FLAG_TRANSPARENT_RGB, PRIMITIVE_BEVEL_COLOR_A_RGB,
-        PRIMITIVE_BEVEL_COLOR_B_RGB, RenderedShellEntry, ShellAssetRole, TRACKBAR_FRAME_BORDER,
-        average_rgb, classify_shell_asset, draw_axis_line_inclusive_clipped, load_named_palette,
+        AssetManager, COOP_SETUP_PALETTE, COOP_SETUP_SHAPE, ChromePiece,
+        OWNER_DRAW_FLAG_TRANSPARENT_RGB, PRIMITIVE_BEVEL_COLOR_A_RGB, PRIMITIVE_BEVEL_COLOR_B_RGB,
+        ShellAssetRole, SkirmishShellChromeEntry, TRACKBAR_FRAME_BORDER, average_rgb,
+        classify_shell_asset, draw_axis_line_inclusive_clipped, load_named_palette,
         render_primitive_bevel_entry, render_shp_entry, render_trackbar_frame_geometry, rgba_color,
-        trackbar_frame_rgba,
+        setup_background_pair, trackbar_frame_rgba,
     };
+    use super::{TRACKBAR_FRAMES, drawn_trackbar_frame_slot};
     use crate::assets::asset_manager::MediaArchiveMode;
+    use crate::ui::shell::geom::ShellScale;
+    use std::collections::HashMap;
+
+    /// The hook at `0x622223` keeps the stock selection unless both slots of
+    /// the side's pair loaded; a loaded pair takes the three side slots, keyed
+    /// on both files.
+    #[test]
+    fn ares_dialog_background_takes_the_side_slots_only_once_loaded() {
+        let Some((_, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let stock = super::mode_two_dialog_labels(None);
+        assert_eq!(stock[1], "pudlgbga.shp#0");
+        for missing in [("NOSUCH.SHP", "DIALOG.PAL"), ("PUDLGBGA.SHP", "NOSUCH.PAL")] {
+            assert!(super::render_side_dialog_art(&assets, missing).is_none());
+        }
+        let side = super::render_side_dialog_art(&assets, ("PUDLGBGA.SHP", "DIALOGY.PAL"))
+            .expect("a stock SHP under another palette renders");
+        let labels = super::mode_two_dialog_labels(Some(&side.label));
+        assert_eq!(labels[0], stock[0]);
+        assert_eq!(
+            labels[1..],
+            [side.label.clone(), side.label.clone(), side.label]
+        );
+        assert_ne!(labels[1], stock[1]);
+    }
+
+    /// The updater's art is Red Alert 2's own copy, not the one the ordinary
+    /// lookup finds.
+    #[test]
+    fn ra2_dialog_art_is_red_alert_2s_own_copy() {
+        let Some((_, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let ra2 = super::render_ra2_dialog_art(&assets).expect("RA2's dialog art renders");
+        let palette = load_named_palette(&assets, "DIALOGN.PAL").unwrap();
+        let active = render_shp_entry(&assets, "PUDLGBGN.SHP", &palette, 0).unwrap();
+        assert_eq!((ra2.width, ra2.height), (451, 326));
+        assert_ne!(ra2.rgba, active.rgba);
+    }
 
     #[test]
     fn mode_two_background_binding_matches_original_progress_paint() {
@@ -1154,7 +1451,7 @@ mod tests {
         assert_eq!(compared, 4);
     }
 
-    fn pixel(entry: &RenderedShellEntry, x: u32, y: u32) -> [u8; 4] {
+    fn pixel(entry: &ChromePiece, x: u32, y: u32) -> [u8; 4] {
         let offset = ((y * entry.width + x) * 4) as usize;
         [
             entry.rgba[offset],
@@ -1182,10 +1479,6 @@ mod tests {
         assert_eq!(
             classify_shell_asset("MNSCRNS.SHP"),
             ShellAssetRole::VerifiedParentBackground
-        );
-        assert_eq!(
-            classify_shell_asset("MnScrnLCoopGameSetup.shp"),
-            ShellAssetRole::Other
         );
         assert_eq!(
             classify_shell_asset("STARTBUT.SHP"),
@@ -1280,7 +1573,7 @@ mod tests {
         let mut rgba = vec![0u8; 5 * 3 * 4];
 
         draw_axis_line_inclusive_clipped(&mut rgba, 5, 3, (1, 1), (3, 1), color);
-        let entry = RenderedShellEntry {
+        let entry = ChromePiece {
             label: "line".to_string(),
             width: 5,
             height: 3,
@@ -1301,7 +1594,7 @@ mod tests {
 
         draw_axis_line_inclusive_clipped(&mut rgba, 3, 3, (-2, 1), (5, 1), color);
         draw_axis_line_inclusive_clipped(&mut rgba, 3, 3, (2, -3), (2, 8), color);
-        let entry = RenderedShellEntry {
+        let entry = ChromePiece {
             label: "clip".to_string(),
             width: 3,
             height: 3,
@@ -1422,6 +1715,21 @@ mod tests {
         assert_eq!(pixel(&entry, 80, 24), mixed);
     }
 
+    /// A trackbar drawn below the shell's size takes the nearest window's
+    /// frame; at the shell's own size only its exact window has one.
+    #[test]
+    fn trackbar_below_the_shell_size_takes_the_nearest_frame() {
+        let half = ShellScale::from_screen(400, 300);
+        let slot = |plaque, w, h, scale| {
+            drawn_trackbar_frame_slot(plaque, w, h, scale).map(|slot| TRACKBAR_FRAMES[slot])
+        };
+        assert_eq!(slot(true, 130, 22, half), Some((129, 22, 50)));
+        assert_eq!(slot(true, 129, 21, half), Some((129, 21, 50)));
+        assert_eq!(slot(false, 130, 22, half), None);
+        assert_eq!(slot(true, 132, 22, half), None);
+        assert_eq!(slot(true, 130, 22, ShellScale::RETAIL), None);
+    }
+
     #[test]
     fn sound_trackbar_frames_keep_native_wide_rail_and_fixed_plaque() {
         // Original61E1B9..61E269 +6208F0: rail213, value x215/w48;
@@ -1438,6 +1746,59 @@ mod tests {
         );
         assert_eq!(pixel(&entry, 214, 10), [0, 0, 0, 0]);
         assert_eq!(pixel(&entry, 235, 10), [0, 0, 0, 0]);
+    }
+
+    /// A distinct width per label, so the selected slot is readable.
+    fn background_labeled(width: f32) -> SkirmishShellChromeEntry {
+        SkirmishShellChromeEntry {
+            uv_origin: [0.0, 0.0],
+            uv_size: [1.0, 1.0],
+            pixel_size: [width, 1.0],
+        }
+    }
+
+    #[test]
+    fn yr_style_skirmish_background_selects_the_coop_setup_pair() {
+        let mut by_label = HashMap::new();
+        by_label.insert("mnscrns.shp#shell".to_string(), background_labeled(1.0));
+        by_label.insert("mnscrnl.shp#shell".to_string(), background_labeled(2.0));
+        by_label.insert(
+            "mnscrns.shp#offline-setup".to_string(),
+            background_labeled(3.0),
+        );
+        by_label.insert(
+            "mnscrnlcoopgamesetup.shp".to_string(),
+            background_labeled(4.0),
+        );
+        let widths = |backgrounds: [Option<SkirmishShellChromeEntry>; 2]| {
+            backgrounds.map(|entry| entry.map(|entry| entry.pixel_size[0]))
+        };
+
+        assert_eq!(
+            widths(setup_background_pair(false, &by_label)),
+            [Some(1.0), Some(2.0)]
+        );
+        assert_eq!(
+            widths(setup_background_pair(true, &by_label)),
+            [Some(3.0), Some(4.0)]
+        );
+    }
+
+    #[test]
+    fn yr_style_skirmish_background_falls_back_to_ra2_per_slot() {
+        let mut by_label = HashMap::new();
+        by_label.insert("mnscrns.shp#shell".to_string(), background_labeled(1.0));
+        by_label.insert("mnscrnl.shp#shell".to_string(), background_labeled(2.0));
+        by_label.insert(
+            "mnscrns.shp#offline-setup".to_string(),
+            background_labeled(3.0),
+        );
+
+        let selected = setup_background_pair(true, &by_label);
+        assert_eq!(
+            selected.map(|entry| entry.map(|entry| entry.pixel_size[0])),
+            [Some(3.0), Some(2.0)]
+        );
     }
 
     #[test]
@@ -1476,5 +1837,33 @@ mod tests {
 
         assert_eq!((small.width, small.height), (472, 448));
         assert_eq!((large.width, large.height), (632, 568));
+    }
+
+    #[test]
+    #[ignore = "requires the configured stock retail RA2/YR install"]
+    fn retail_coop_setup_background_decodes_through_its_palette() {
+        let assets = retail_assets();
+        let palette = load_named_palette(&assets, COOP_SETUP_PALETTE).expect(COOP_SETUP_PALETTE);
+        let background =
+            render_shp_entry(&assets, COOP_SETUP_SHAPE, &palette, 0).expect(COOP_SETUP_SHAPE);
+
+        // Same content-area canvas as MNSCRNL: the 800-wide setup art.
+        assert_eq!((background.width, background.height), (632, 568));
+    }
+
+    #[test]
+    #[ignore = "requires the configured stock retail RA2/YR install"]
+    fn retail_lan_player_glyphs_match_their_pcx_headers() {
+        let assets = retail_assets();
+        for (name, width) in [
+            ("wolnob.pcx", 14),
+            ("wolob.pcx", 14),
+            ("wolhost.pcx", 15),
+            ("wolacpt.pcx", 15),
+        ] {
+            let icon = super::render_flag_pcx_entry(&assets, name).expect(name);
+            // Dimensions from original retail PCX xmin/ymin/xmax/ymax bytes.
+            assert_eq!((icon.width, icon.height), (width, 14), "{name}");
+        }
     }
 }

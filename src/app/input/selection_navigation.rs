@@ -8,7 +8,7 @@ use crate::assets::csf_file::{CsfArg, format_csf};
 use crate::map::entities::EntityCategory;
 use crate::sim::combat::health_category;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_d_z))]
 #[path = "selection_navigation_tests.rs"]
 mod object_tests;
 
@@ -43,9 +43,9 @@ fn next_object(
                 entity,
                 sim.entities(),
                 rules,
-                Some(&sim.interner),
+                Some(sim.interner()),
             )
-            && sim.object_is_selectable(id, rules)
+            && rules.is_some_and(|rules| sim.object_is_selectable(id, rules))
     };
     match direction {
         ObjectDirection::Next => after_anchor(ids, anchor, eligible),
@@ -84,7 +84,7 @@ pub(super) fn execute_object_navigation(state: &mut AppState, direction: ObjectD
     let Some(sim) = state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .map(|rt| &rt.simulation)
     else {
         return;
@@ -107,7 +107,6 @@ pub(super) fn execute_object_navigation(state: &mut AppState, direction: ObjectD
             select: vec![id],
             ..Default::default()
         },
-        true,
         super::SelectionVoicePolicy::EveryAdded,
     );
     crate::app::input::camera::center_view_on_selection(state);
@@ -124,23 +123,8 @@ struct CombatantSelection {
 /// House4FC1B0..4FC205 sets it only for PlayerPtr; session52DA94 and
 /// cooperative setup5C38A8..5C3ABE clear it. The House defeat owner supplies
 /// this state; input keeps no competing defeat flag.
-fn selection_navigation_allowed(sim: &crate::sim::world::Simulation) -> bool {
+pub(super) fn selection_navigation_allowed(sim: &crate::sim::world::Simulation) -> bool {
     !sim.local_player_defeated()
-}
-
-/// Shared owner arm of the P732580 and Health/Y7335F0 source predicates.
-/// Campaign reads only House+1ED; otherwise use the existing50B6F0 port.
-fn navigation_owner_controlled(
-    sim: &crate::sim::world::Simulation,
-    owner: crate::sim::intern::InternedId,
-) -> bool {
-    if sim.session.game_mode_nonzero {
-        sim.house_is_human_player(owner)
-    } else {
-        sim.houses
-            .get(&owner)
-            .is_some_and(|house| house.player_control)
-    }
 }
 
 /// P732280's local/alive collection precedes its combatant/dynamic screen
@@ -159,7 +143,7 @@ fn combatant_selection(
         clear: replace,
         ..Default::default()
     };
-    let player_owned = |owner| navigation_owner_controlled(sim, owner);
+    let player_owned = |owner| sim.house_controls_selection(owner);
     // Tactical6DA770 drops a lone non-player-controlled selection before
     // testing the shared mode. Deselect clears Follow but retains that mode.
     let dropped = selected.first().copied().filter(|id| {
@@ -185,16 +169,16 @@ fn combatant_selection(
         sim.entities().get(*id).is_some_and(|entity| {
             entity.category() != EntityCategory::Structure
                 && sim
-                    .interner
+                    .interner()
                     .object_type(entity.type_ref(), rules)
                     .is_some_and(|object| object.is_selectable_combatant)
                 && crate::app::input::entity_pick::selection_dynamic_prefix(
                     entity,
                     sim.entities(),
                     Some(rules),
-                    Some(&sim.interner),
+                    Some(sim.interner()),
                 )
-                && sim.object_is_selectable(*id, Some(rules))
+                && sim.object_is_selectable(*id, rules)
         })
     };
     let screen: Vec<_> = if across_map {
@@ -224,7 +208,7 @@ pub(super) fn execute_combatant_selection(state: &mut AppState) {
     if state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .is_none_or(|rt| !selection_navigation_allowed(&rt.simulation))
     {
         return;
@@ -238,7 +222,7 @@ pub(super) fn execute_combatant_selection(state: &mut AppState) {
         let Some(sim) = state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.simulation)
         else {
             return;
@@ -265,14 +249,13 @@ pub(super) fn execute_combatant_selection(state: &mut AppState) {
     super::apply_selection_mutation(
         state,
         result.mutation,
-        false,
         super::SelectionVoicePolicy::EveryAdded,
     );
     let selected = super::selected_stable_ids_in_order(
         state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.simulation),
         state.rules(),
         &state.match_state.input.selection_order,
@@ -374,6 +357,8 @@ pub(crate) fn reset_for_world_replacement(input: &mut crate::app::input::state::
     input.category_navigation.candidates.clear();
     input.selection_order.clear();
     input.selection_order_pending = false;
+    // The committed ledger named the outgoing world's objects.
+    input.selection_committed = None;
 }
 
 fn category_key(kind: CategoryNavigationKind, category: u8) -> &'static str {
@@ -396,7 +381,7 @@ fn entity_navigation_category(
     let entity = sim.entities().get(id)?;
     match kind {
         CategoryNavigationKind::Health => {
-            let object = sim.interner.object_type(entity.type_ref(), rules)?;
+            let object = sim.interner().object_type(entity.type_ref(), rules)?;
             Some(health_category(
                 entity.health.current(),
                 object.strength,
@@ -446,7 +431,7 @@ fn category_selection(
                 sim.entities().get(*id).is_some_and(|entity| {
                     entity.lifecycle.object_alive()
                         && entity.category() != EntityCategory::Structure
-                        && navigation_owner_controlled(sim, entity.owner())
+                        && sim.house_controls_selection(entity.owner())
                 })
             })
             .collect()
@@ -477,7 +462,7 @@ pub(super) fn execute_category_navigation(state: &mut AppState, kind: CategoryNa
     if state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .is_none_or(|rt| !selection_navigation_allowed(&rt.simulation))
     {
         return;
@@ -486,7 +471,7 @@ pub(super) fn execute_category_navigation(state: &mut AppState, kind: CategoryNa
         state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|runtime| &runtime.simulation),
         state.rules(),
         &state.match_state.input.selection_order,
@@ -504,7 +489,7 @@ pub(super) fn execute_category_navigation(state: &mut AppState, kind: CategoryNa
         Vec::new()
     };
     let result = {
-        let runtime = state.match_state.sim_runtime.as_ref().unwrap();
+        let runtime = state.match_state.sim_runtime.runtime().unwrap();
         let rules = &runtime.resources.rules;
         let input = &mut state.match_state.input;
         category_selection(
@@ -524,7 +509,6 @@ pub(super) fn execute_category_navigation(state: &mut AppState, kind: CategoryNa
     super::apply_selection_mutation(
         state,
         result.mutation,
-        false,
         super::SelectionVoicePolicy::EveryAdded,
     );
     // The native direct Select calls do not start the mouse action-line timer.
@@ -533,13 +517,13 @@ pub(super) fn execute_category_navigation(state: &mut AppState, kind: CategoryNa
         state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.simulation),
         state.rules(),
         &state.match_state.input.selection_order,
         state.match_state.input.selection_order_pending,
     );
-    let sim = &state.match_state.sim_runtime.as_ref().unwrap().simulation;
+    let sim = &state.match_state.sim_runtime.runtime().unwrap().simulation;
     let rules = state.rules().unwrap();
     let mixed = selected.iter().any(|id| {
         entity_navigation_category(sim, rules, *id, kind)
@@ -560,7 +544,7 @@ pub(super) fn execute_category_navigation(state: &mut AppState, kind: CategoryNa
         .filter_map(|id| sim.entities().get(*id))
         .filter_map(|entity| {
             let rules = state.rules()?;
-            let object = sim.interner.object_type(entity.type_ref(), rules)?;
+            let object = sim.interner().object_type(entity.type_ref(), rules)?;
             Some(sim.cost_of(entity.owner(), object, rules))
         })
         .fold(0_i32, |total, cost| total.wrapping_add(cost));
@@ -619,7 +603,7 @@ fn navigation_feedback(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_d_z))]
 mod tests {
     use super::*;
 
@@ -637,24 +621,6 @@ mod tests {
                 "{row:?}"
             );
         }
-    }
-
-    #[test]
-    fn health_bands_include_thresholds_and_recheck_current_damage() {
-        let bands: Vec<_> = [0, 1, 25, 26, 50, 51, 100]
-            .into_iter()
-            .map(|hp| health_category(hp, 100, 0.25, 0.5))
-            .collect();
-        assert_eq!(bands, [2, 0, 0, 1, 1, 2, 2]);
-    }
-
-    #[test]
-    fn health_bands_keep_signed_actual_and_live_strength_width() {
-        assert_eq!(health_category(70_000, 100_000, 0.25, 0.5), 2);
-        assert_eq!(health_category(70_000, 200_000, 0.25, 0.5), 1);
-        assert_eq!(health_category(70_000, 400_000, 0.25, 0.5), 0);
-        assert_eq!(health_category(-1, 100_000, 0.25, 0.5), 2);
-        assert_eq!(health_category(i32::MAX, i32::MAX, 0.25, 0.5), 2);
     }
 
     #[test]
@@ -755,10 +721,10 @@ mod tests {
         .unwrap();
         for conceal in [false, true] {
             let mut sim = Simulation::new();
-            let owner = sim.interner.intern("Americans");
-            let type_id = sim.interner.intern("MTNK");
+            let owner = sim.intern("Americans");
+            let type_id = sim.intern("MTNK");
             for id in [10, 20, 30] {
-                sim.entities_mut()
+                sim.entities_mut_for_test()
                     .insert(GameEntity::new_at_frame_zero_for_test(
                         id,
                         2,
@@ -777,7 +743,7 @@ mod tests {
             sim.reveal(20);
             sim.advance_app_frame(
                 &[],
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
                 None,
                 67,
                 TickLane::Ordinary,
@@ -803,12 +769,12 @@ mod tests {
             input.type_select.across_map = true;
             input.selection_order = vec![20];
             // Deselect and its normal app reconciliation have no expiry fact.
-            sim.entities_mut()
+            sim.entities_mut_for_test()
                 .get_mut(20)
                 .unwrap()
                 .selection
                 .set_selected_for_test(false);
-            super::super::reconcile_selection_order_for_sim(&mut input, &sim, Some(&rules));
+            super::super::reconcile_selection_order_for_sim(&mut input, &sim, Some(&rules), &[]);
             assert_eq!(input.category_navigation.candidates, [10, 20, 30]);
 
             if conceal {
@@ -820,7 +786,7 @@ mod tests {
             let frame = sim
                 .advance_app_frame(
                     &[],
-                    None,
+                    crate::rules::ruleset::RuleSet::empty_for_test(),
                     None,
                     67,
                     TickLane::Ordinary,
@@ -852,14 +818,18 @@ mod tests {
                         )
                     })
                     .unwrap();
-                let display = frame
+                // Conceal detaches the attached anims once Display let go.
+                let detach = frame
                     .lifecycle_outputs
                     .iter()
                     .position(|output| {
-                        matches!(output, LifecycleOutput::DisplayRemove { stable_id: 20 })
+                        matches!(
+                            output,
+                            LifecycleOutput::DetachAttachedAnims { stable_id: 20 }
+                        )
                     })
                     .unwrap();
-                assert!(expiry < display);
+                assert!(expiry < detach);
             }
             // Consume actual lifecycle producer facts through the same owner
             // sim_tick calls, without constructing a windowed AppState. This
@@ -881,7 +851,7 @@ mod tests {
             let next = sim
                 .advance_app_frame(
                     &[],
-                    None,
+                    crate::rules::ruleset::RuleSet::empty_for_test(),
                     None,
                     67,
                     TickLane::Ordinary,

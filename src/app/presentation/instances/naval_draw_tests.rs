@@ -1,5 +1,6 @@
 //! Physical AEGIS type -> production model/raster -> parent waterline input.
 use super::*;
+use crate::app::presentation::frame::ObjectRecord;
 use crate::render::sinking::SinkingWaterlines;
 use crate::util::sha256::sha256_hex;
 
@@ -39,6 +40,25 @@ fn native_camera(input: &serde_json::Value) -> [f32; 2] {
     ]
 }
 
+/// `unit_draw_anchor` with the battlefield at the frame's corner, `viewport`
+/// across, and the render view the battlefield.
+fn anchor_in(
+    entity: &crate::sim::game_entity::GameEntity,
+    camera: [f32; 2],
+    viewport: [f32; 2],
+    shadow_anchor: Option<[f32; 2]>,
+) -> Option<[f32; 2]> {
+    unit_draw_anchor(
+        &ObjectRecord::of_test(entity),
+        crate::app::presentation::instances::TacticalAdmission {
+            corner: camera,
+            size: viewport,
+        },
+        [camera[0], camera[1], viewport[0], viewport[1]],
+        shadow_anchor,
+    )
+}
+
 #[test]
 fn sinking_unit_draw_admission_matches_original_projection_boundaries() {
     let corpus = admission_corpus();
@@ -49,7 +69,7 @@ fn sinking_unit_draw_admission_matches_original_projection_boundaries() {
         let entity = native_draw_entity(input);
         let viewport = std::array::from_fn(|i| input["viewport"][i].as_i64().unwrap() as f32);
         let camera = native_camera(input);
-        let anchor = unit_draw_anchor(&entity, camera, viewport);
+        let anchor = anchor_in(&entity, camera, viewport, None);
         assert_eq!(
             anchor.is_some(),
             row["output"]["admitted"].as_bool().unwrap(),
@@ -62,6 +82,24 @@ fn sinking_unit_draw_admission_matches_original_projection_boundaries() {
             );
         }
     }
+}
+
+#[test]
+fn visible_ground_shadow_keeps_high_aircraft_in_the_draw_plan() {
+    let mut entity = crate::sim::game_entity::GameEntity::test_default_of_category(
+        1,
+        "ORCA",
+        "Americans",
+        10,
+        10,
+        EntityCategory::Aircraft,
+    );
+    entity.position.set_exact_z_leptons_for_test(Some(10000));
+    let camera = [-320.0, 215.0];
+    let viewport = [640.0, 480.0];
+    assert!(anchor_in(&entity, camera, viewport, None).is_none());
+    assert!(anchor_in(&entity, camera, viewport, Some([0.0, 330.0])).is_some());
+    assert!(anchor_in(&entity, [5000.0, 5000.0], viewport, Some([0.0, 330.0])).is_none());
 }
 
 #[test]
@@ -81,14 +119,15 @@ fn offscreen_first_sinking_draw_survives_descent_camera_pan_and_save_load() {
     };
     let mut cache = SinkingWaterlines::default();
     let mut sim = crate::sim::world::Simulation::new();
-    sim.session.map_name = "DRAW-ADMISSION.MAP".into();
-    sim.scenario_rng = crate::sim::rng::SimRng::new(0);
+    sim.session_mut_for_test()
+        .set_map_name_for_test("DRAW-ADMISSION.MAP".into());
+    *sim.scenario_rng_mut_for_test() = crate::sim::rng::SimRng::new(0);
     let hash = sim.state_hash();
     for step in corpus["sequence"].as_array().unwrap() {
         let input = &step["input"];
         let entity = native_draw_entity(input);
         let viewport = std::array::from_fn(|i| input["viewport"][i].as_i64().unwrap() as f32);
-        let anchor = unit_draw_anchor(&entity, native_camera(input), viewport)
+        let anchor = anchor_in(&entity, native_camera(input), viewport, None)
             .expect("original Unit DrawIt admits this offscreen or camera-panned anchor");
         let bounds = composite_draw_bounds([(entry, anchor)]);
         let clip = bounds.unit_waterline(&mut cache, entity.stable_id(), true);
@@ -116,6 +155,7 @@ fn offscreen_first_sinking_draw_survives_descent_camera_pan_and_save_load() {
             "offscreen sinking",
             3,
             &cache.saved(),
+            &[],
             None,
             None,
             None,

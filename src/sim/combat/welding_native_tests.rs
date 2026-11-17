@@ -54,9 +54,9 @@ fn target_role(roles: &Roles, target: Option<TargetKind>) -> Value {
 
 fn scene(rules: &RuleSet, cursor: &Value) -> (Simulation, Roles) {
     let mut sim = Simulation::new();
-    sim.session.binary_frame = 36;
-    sim.session.map_width = 64;
-    sim.session.map_height = 64;
+    sim.session.set_binary_frame_for_test(36);
+    sim.session.set_map_width_for_test(64);
+    sim.session.set_map_height_for_test(64);
     sim.install_resolved_terrain_for_new_map(crate::map::resolved_terrain::test_grid(
         64,
         64,
@@ -65,14 +65,13 @@ fn scene(rules: &RuleSet, cursor: &Value) -> (Simulation, Roles) {
     sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(64, 64));
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
-    sim.session.house_order.push(owner);
+        .register(HouseState::new(owner, 0, None, true, 0, 10));
     sim.intern_rule_type_ids(rules);
     sim.resolve_type_handles(rules);
     let mut roles = Roles::new();
     for row in native()["constructor_priors"].as_array().unwrap() {
         let position = xyz(&row["position"]);
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         let mut entity = GameEntity::test_default(
             id,
             row["type_id"].as_str().unwrap(),
@@ -107,18 +106,18 @@ fn scene(rules: &RuleSet, cursor: &Value) -> (Simulation, Roles) {
 
 fn system_state(system: &ParticleSystem, roles: &Roles) -> Value {
     json!({
-        "native_id":system.native_unique_id(), "position":system.coords.to_array(),
-        "offset":system.offset.to_array(), "target_coords":system.target_coords.to_array(),
-        "owner":system.owner_entity.map(|id|roles.iter().find(|(_,value)|**value==id).unwrap().0),
-        "retained_target":target_role(roles,system.target_ref),
-        "owner_house_present":system.owner_house.is_some(), "lifetime":system.lifetime,
-        "spark_spawn_frames":system.spark_spawn_frames, "stage":system.facing,
-        "spawn_timer_f32_bits":system.spawn_timer().bits(), "done":system.done_spawning,
+        "native_id":system.native_unique_id(), "position":system.coords().to_array(),
+        "offset":system.offset().to_array(), "target_coords":system.target_coords().to_array(),
+        "owner":system.owner_entity().map(|id|roles.iter().find(|(_,value)|**value==id).unwrap().0),
+        "retained_target":target_role(roles,system.target_ref()),
+        "owner_house_present":system.owner_house().is_some(), "lifetime":system.lifetime(),
+        "spark_spawn_frames":system.spark_spawn_frames(), "stage":system.facing(),
+        "spawn_timer_f32_bits":system.spawn_timer().bits(), "done":system.done_spawning(),
         // Original ctor62DD0A writes zero; the retained Spark owner documents
         // the absence of an active setter and does not store a second flag.
-        "direction_used":false, "particle_count":system.particles.len(),
-        "particle_native_ids":system.particles.iter().map(|p|p.native_unique_id()).collect::<Vec<_>>(),
-        "alive":system.alive(), "logic":system.in_logic_vector,
+        "direction_used":false, "particle_count":system.particles().len(),
+        "particle_native_ids":system.particles().iter().map(|p|p.native_unique_id()).collect::<Vec<_>>(),
+        "alive":system.alive(), "logic":system.in_logic_vector(),
     })
 }
 
@@ -130,6 +129,7 @@ fn rng(sim: &Simulation) -> [String; 3] {
     ]
 }
 
+#[cfg(not(feature = "phobos"))]
 fn restore_rng(sim: &mut Simulation, state: &Value) {
     sim.main_rng = SimRng::from_native_state_hex_for_test(state["main"].as_str().unwrap()).into();
     sim.scenario_rng = SimRng::from_native_state_hex_for_test(state["scenario"].as_str().unwrap());
@@ -171,12 +171,7 @@ fn physical_repair_and_particle_readers_match_original_layers_and_constructor_de
             ),
             (
                 "spawn_direction_bits",
-                json!(
-                    system
-                        .spawn_direction
-                        .to_array()
-                        .map(|value| (value as f32).to_bits())
-                ),
+                json!(system.spawn_direction.map(|value| value.bits())),
             ),
         ] {
             assert_eq!(
@@ -290,7 +285,7 @@ fn original_particle_constructor_separates_supplied_coordinate_from_owner_target
             sim.resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(44, 48)
+                .cell_mut_for_test(44, 48)
                 .unwrap()
                 .bridge_facts
                 .raw_flags = crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL;
@@ -463,7 +458,8 @@ fn original_welding_pointer_expiry_and_target_setters_preserve_their_distinct_au
             // Original62FE90 does not read the removal-control argument.
             // Broadcast integration (both controls) also has lifecycle tests.
             assert!(
-                sim.particle_systems_mut()
+                sim.substrate
+                    .particle_systems
                     .pointer_expired(id, roles[input["expired"].as_str().unwrap()])
             );
             assert_eq!(
@@ -485,7 +481,7 @@ fn original_welding_pointer_expiry_and_target_setters_preserve_their_distinct_au
                 sim.assign_target_represented(
                     roles["owner"],
                     target(&roles, requested),
-                    Some(rules),
+                    rules,
                     None,
                     crate::sim::world::FrameEffects::default(),
                 )
@@ -554,7 +550,7 @@ fn native_id(sim: &Simulation, id: u64) -> i32 {
     }
     sim.particle_systems()
         .iter()
-        .flat_map(|(_, system)| &system.particles)
+        .flat_map(|(_, system)| system.particles())
         .find(|particle| particle.stable_id() == id)
         .unwrap()
         .native_unique_id()
@@ -608,6 +604,8 @@ fn assert_logical_state(sim: &Simulation, roles: &Roles, id: u64, expected: &Val
     );
 }
 
+// Ares simulates this Spark system itself (hooks 0x62DF05, 0x62FD60) and
+// builds no ParticleClass children.
 #[test]
 fn original_welding_live_logic_boundaries_match_rng_ids_children_and_same_pass_link_expiry() {
     let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
@@ -630,21 +628,21 @@ fn original_welding_live_logic_boundaries_match_rng_ids_children_and_same_pass_l
     let retirement = &row["retirement_before_drain"];
     let mut compared_produced_child = false;
     for tick in 1..=last {
-        sim.session.binary_frame = int(&row["input"]["first_frame"]) as u32 + tick as u32 - 1;
+        sim.session
+            .set_binary_frame_for_test(int(&row["input"]["first_frame"]) as u32 + tick as u32 - 1);
         sim.object_ai_stage(Some(&retail.rules));
         if !compared_produced_child
             && let Some(particle) = sim
                 .particle_systems()
                 .get(id)
-                .and_then(|system| system.particles.first())
+                .and_then(|system| system.particles().first())
         {
-            let spark = particle.spark.unwrap();
             let expected = &row["first_produced_particle"];
-            assert_eq!(json!(particle.coords.to_array()), expected["world"]);
-            assert_eq!(json!(spark.start_rgb), expected["start_rgb"]);
-            assert_eq!(json!(spark.color_index), expected["color_index"]);
+            assert_eq!(json!(particle.coords().to_array()), expected["world"]);
+            assert_eq!(json!(particle.start_rgb()), expected["start_rgb"]);
+            assert_eq!(json!(particle.color_index()), expected["color_index"]);
             assert_eq!(
-                format!("{:016x}", spark.color_accumulator.bits()),
+                format!("{:016x}", particle.color_accumulator().bits()),
                 expected["color_accumulator_f64_bits"].as_str().unwrap()
             );
             compared_produced_child = true;
@@ -675,7 +673,7 @@ fn original_welding_live_logic_boundaries_match_rng_ids_children_and_same_pass_l
                 for (field, actual) in [
                     ("alive", alive),
                     ("in_limbo", in_limbo),
-                    ("marked_for_deletion", particle.marked_for_deletion),
+                    ("marked_for_deletion", particle.marked_for_deletion()),
                     (
                         "display_registered",
                         sim.display_layers().layer_of(child_id).is_some(),
@@ -687,7 +685,7 @@ fn original_welding_live_logic_boundaries_match_rng_ids_children_and_same_pass_l
                     (
                         "in_parent_vector",
                         sim.particle_systems().iter().any(|(_, system)| {
-                            system.particles.iter().any(|p| p.stable_id() == child_id)
+                            system.particles().iter().any(|p| p.stable_id() == child_id)
                         }),
                     ),
                     ("object_registered", body_retained),
@@ -734,6 +732,8 @@ fn original_welding_live_logic_boundaries_match_rng_ids_children_and_same_pass_l
 
 /// Rust persistence regression, separate from the original executable's
 /// queue/AI comparison above. Native in-scenario load owns RNG reseeding.
+// Ares simulates this Spark system itself (hooks 0x62DF05, 0x62FD60) and
+// builds no ParticleClass children.
 #[test]
 fn detached_particle_snapshot_keeps_bodies_and_queue_until_the_common_drain() {
     let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
@@ -746,7 +746,9 @@ fn detached_particle_snapshot_keeps_bodies_and_queue_until_the_common_drain() {
     );
     let last = int(&native["retirement_before_drain"]["tick"]);
     for tick in 1..=last {
-        sim.session.binary_frame = int(&native["input"]["first_frame"]) as u32 + tick as u32 - 1;
+        sim.session.set_binary_frame_for_test(
+            int(&native["input"]["first_frame"]) as u32 + tick as u32 - 1,
+        );
         sim.object_ai_stage(Some(&retail.rules));
         if tick != last {
             sim.process_pending_delete();
@@ -809,6 +811,8 @@ fn detached_particle_snapshot_keeps_bodies_and_queue_until_the_common_drain() {
 
 /// SystemPointerExpired62FEA4..62FEE2 removes a reference, independently
 /// of UnInit. Its stable vector erase must not destroy the allocated body.
+// Ares simulates this Spark system itself (hooks 0x62DF05, 0x62FD60) and
+// builds no ParticleClass children.
 #[test]
 fn system_child_reference_expiry_retains_the_live_body_until_common_uninit() {
     let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
@@ -823,7 +827,7 @@ fn system_child_reference_expiry_retains_the_live_body_until_common_uninit() {
         .particle_systems()
         .get(system_id)
         .unwrap()
-        .particles
+        .particles()
         .iter()
         .map(|particle| particle.stable_id())
         .collect();
@@ -831,14 +835,15 @@ fn system_child_reference_expiry_retains_the_live_body_until_common_uninit() {
     assert!(sim.display_layers().layer_of(child_id).is_some());
     let queues = sim.substrate.pending_delete.object_ids().to_vec();
     assert!(
-        sim.particle_systems_mut()
+        sim.substrate
+            .particle_systems
             .pointer_expired(system_id, child_id)
     );
     assert_eq!(
         sim.particle_systems()
             .get(system_id)
             .unwrap()
-            .particles
+            .particles()
             .iter()
             .map(|particle| particle.stable_id())
             .collect::<Vec<_>>(),
@@ -856,6 +861,22 @@ fn system_child_reference_expiry_retains_the_live_body_until_common_uninit() {
         sim.particle_systems()
             .display_particles()
             .any(|(system, particle)| { system.is_none() && particle.stable_id() == child_id })
+    );
+    // Each Display particle, in a system or detached, is found again at its
+    // place, in the same order.
+    let store = sim.particle_systems();
+    let listed = |found: Option<(Option<&ParticleSystem>, &crate::sim::particles::Particle)>| {
+        found.map(|(system, particle)| (system.is_some(), particle.stable_id()))
+    };
+    assert_eq!(
+        store
+            .display_particle_places()
+            .map(|(id, place)| listed(store.display_particle_at(id, place)))
+            .collect::<Vec<_>>(),
+        store
+            .display_particles()
+            .map(|found| listed(Some(found)))
+            .collect::<Vec<_>>()
     );
     sim.scenario_rng = SimRng::new(0);
     let bytes = crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "welding-detached", 0);
@@ -931,6 +952,9 @@ fn system_child_reference_expiry_retains_the_live_body_until_common_uninit() {
     assert_eq!(restored.state_hash(), sim.state_hash());
 }
 
+// Phobos `ROF.RandomDelay` (`0x006FD0B5`) redraws the full-rearm jitter, so
+// this stock golden only holds without the capability.
+#[cfg(not(feature = "phobos"))]
 #[test]
 fn original_live_spark_rof_and_fireat_rearm_use_the_retained_link_and_exact_rng() {
     let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
@@ -964,16 +988,25 @@ fn original_live_spark_rof_and_fireat_rearm_use_the_retained_link_and_exact_rng(
         );
         let ((rof, rearm), draws) = crate::sim::rng::trace_draws(|| {
             let rof = fireat_get_rof(
-                &mut sim,
+                &mut sim.scenario_rng,
+                &sim.substrate,
+                &sim.houses,
                 rules,
                 &snap,
                 object,
-                &weapon,
                 Some(&weapon),
                 int(&row["input"]["queried_burst"]),
             );
-            let tail_rof =
-                fireat_get_rof(&mut sim, rules, &snap, object, &weapon, Some(&weapon), 1);
+            let tail_rof = fireat_get_rof(
+                &mut sim.scenario_rng,
+                &sim.substrate,
+                &sim.houses,
+                rules,
+                &snap,
+                object,
+                Some(&weapon),
+                1,
+            );
             let rearm = fireat_rearm_frames(tail_rof, row["input"]["berserk"].as_bool().unwrap());
             let actor = sim.substrate.entities.get_mut(owner).unwrap();
             actor.rearm_after_fire(int(&row["input"]["frame"]), rearm);

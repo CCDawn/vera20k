@@ -4,6 +4,7 @@
 use super::*;
 use crate::rules::ini_parser::IniFile;
 use crate::sim::ai_buildable::country_bit;
+use crate::sim::base_plan::BasePlanNode;
 use crate::sim::house_state::{HouseDifficulty, HouseState};
 use serde_json::Value;
 
@@ -174,7 +175,12 @@ const DEFENSE_AI: &str = "AlliedBaseDefenses=PILL,SAM,TESL,GGUN,FORN,HITK,BUNK,N
     SovietBaseDefenses=BUNK,PILL,SAM,PILL\nThirdBaseDefenses=GGUN\n\
     BuildPower=POWR\nBuildRefinery=YARD\nBuildBarracks=YARD\nBuildWeapons=YARD\n\
     BuildRadar=TECH\nBuildTech=TECH\n";
-const DEFENSE_COUNTRIES: &str = "[Countries]\n0=C0\n1=C1\n2=C2\n3=C3\n";
+// The native choice fixture supplies the current country as its parent. A
+// registered Country with no reached INI section instead retains ctor-empty
+// ParentCountry, so initialize the same names through the production reader.
+const DEFENSE_COUNTRIES: &str = "[Countries]\n0=C0\n1=C1\n2=C2\n3=C3\n\
+    [C0]\nParentCountry=C0\n[C1]\nParentCountry=C1\n\
+    [C2]\nParentCountry=C2\n[C3]\nParentCountry=C3\n";
 
 /// The `[BuildingTypes]` list and sections of [`DEFENSE_TYPES`].
 fn defense_building_types() -> String {
@@ -199,6 +205,14 @@ fn defense_rules(wall_tower: Option<&str>) -> RuleSet {
     if let Some(wall_tower) = wall_tower {
         text += &format!("WallTower={wall_tower}\n");
     }
+    // Installed Ares 10024520 (hook 0x505360) checks generic groups through
+    // ListContainsAll10008370, whose POWER members come from [General]
+    // PrerequisitePower rather than the stock [AI] BuildPower family; name the
+    // same member so BUNK's POWER meets the native run's answer. Ares coverage:
+    // `base_plan_generation::ares_tests::generic_stock_groups_replace_ai_families_and_ignore_alternates`.
+    if crate::rules::ares_switch::ares_way() {
+        text += "PrerequisitePower=POWR\n";
+    }
     text += &format!(
         "[AI]\n{DEFENSE_AI}{DEFENSE_COUNTRIES}[InfantryTypes]\n[VehicleTypes]\n[AircraftTypes]\n{}",
         defense_building_types()
@@ -219,7 +233,9 @@ fn node(value: &Value) -> BasePlanNode {
 /// search call (type, key, argument and the grid the key reads) in native
 /// order, then, given the native site, the result and the node writes.
 /// Whether it placed a defense.
-fn check_choice(row: &Value, choice: &DefenseChoice, mut nodes: Vec<BasePlanNode>) -> bool {
+fn check_choice(row: &Value, choice: &DefenseChoice, nodes: Vec<BasePlanNode>) -> bool {
+    let mut plan = crate::sim::base_plan::BasePlanState::default();
+    plan.set_nodes_for_test(nodes);
     let label = row["label"].as_str().unwrap();
     let events = row["events"].as_array().unwrap();
     let draw_events = events
@@ -264,7 +280,11 @@ fn check_choice(row: &Value, choice: &DefenseChoice, mut nodes: Vec<BasePlanNode
             if site == (0, 0) {
                 false
             } else {
-                write_nodes(&mut nodes, index, pick.defense, site);
+                plan.place_defense(
+                    index,
+                    pick.defense.base_plan_type_index,
+                    pack_base_plan_cell(i32::from(site.0), i32::from(site.1)),
+                );
                 true
             }
         }
@@ -276,7 +296,7 @@ fn check_choice(row: &Value, choice: &DefenseChoice, mut nodes: Vec<BasePlanNode
         .iter()
         .map(node)
         .collect();
-    assert_eq!(nodes, after, "{label}");
+    assert_eq!(plan.nodes(), after.as_slice(), "{label}");
     assert_eq!(int(&row["grid_after"]), 0, "{label}");
     placed
 }
@@ -309,11 +329,11 @@ fn whole_choices_match_native() {
             center: cell(&row["center"]),
             bounds: rect(&row["rect"]),
             buildings,
-            side_index: int(&row["side"]) as u8,
+            side_index: int(&row["side"]) as i32,
             country_bit: country_bit(country),
             tech_level: int(&row["tech"]) as i32,
             candidate_tech_levels: rules
-                .base_defense_types(int(&row["side"]) as u8)
+                .base_defense_types(int(&row["side"]) as i32)
                 .iter()
                 .map(|id| {
                     rules
@@ -377,27 +397,23 @@ fn production_state_feeds_the_choice_as_native() {
     let (left, top, width, height) = rect(&row["rect"]);
     let mut house = HouseState::new(
         owner,
-        int(&row["side"]) as u8,
+        int(&row["side"]) as i32,
         Some(country),
         false,
         0,
         int(&row["tech"]) as i32,
     );
-    house.difficulty = HouseDifficulty::from_native(int(&row["difficulty"]) as i32).unwrap();
-    house.base_plan_center = ((x - SHIFT) as u16, (y - SHIFT) as u16);
-    house.base_reservation.update_bounds(
-        left - i32::from(SHIFT),
-        top - i32::from(SHIFT),
-        width,
-        height,
+    house.set_difficulty_for_test(
+        HouseDifficulty::from_native(int(&row["difficulty"]) as i32).unwrap(),
     );
-    house.base_plan.nodes = row_nodes(row);
-    house.enemy_house = Some(enemy);
+    house.set_base_plan_center_for_test(((x - SHIFT) as u16, (y - SHIFT) as u16));
+    house.base_plan_mut().set_nodes_for_test(row_nodes(row));
+    house.set_enemy_house_for_test(Some(enemy));
     house.project_country_mults(&rules, &sim.interner);
-    sim.houses.insert(owner, house);
+    sim.houses.register(house);
     let mut enemy_house = HouseState::new(enemy, 1, None, false, 0, 10);
     enemy_house.project_country_mults(&rules, &sim.interner);
-    sim.houses.insert(enemy, enemy_house);
+    sim.houses.register(enemy_house);
     for building in row["buildings"].as_array().unwrap() {
         let (x, y) = cell(&building[1]);
         let name = building[0].as_str().unwrap();
@@ -415,6 +431,16 @@ fn production_state_feeds_the_choice_as_native() {
         sim.spawn_object(kind, "C0", 14 + 2 * index as u16, 14, 0, &rules)
             .unwrap_or_else(|| panic!("{kind} spawns"));
     }
+    // The row's bounds are the reservation the native call read; the spawns
+    // above marked the arena's own.
+    let reservation = sim.houses.get_mut(&owner).unwrap().base_reservation_mut();
+    *reservation = Default::default();
+    reservation.update_bounds(
+        left - i32::from(SHIFT),
+        top - i32::from(SHIFT),
+        width,
+        height,
+    );
 
     let choice = DefenseChoice::of_house(&sim, &rules, owner, int(&row["index"]) as usize)
         .expect("the house's choice");

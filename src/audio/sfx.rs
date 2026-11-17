@@ -28,44 +28,58 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZero;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use rodio::Player;
 use rodio::buffer::SamplesBuffer;
-use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player};
+use rodio::source::EmptyCallback;
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+use rodio::{DeviceSinkBuilder, MixerDeviceSink};
+
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+type SfxOutput = MixerDeviceSink;
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+type SfxOutput = crate::audio::web_output::WebAudioSink;
 
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::aud_file;
 use crate::audio::arbiter::{
     self, ArbiterAction, EntryFacts, EventId, EventToken, HandleOwner, PlayRequest,
-    PlaybackService, PlayoutEnd, SoundArbiter, combine_linear,
+    PlaybackService, PlayoutEnd, SoundArbiter, VolumeInterp, combine_linear,
 };
 use crate::audio::events::SoundSource;
 use crate::audio::voice_queue::VoiceQueue;
 use crate::audio::vox::{VoxNode, VoxQueue, VoxRequest};
+#[cfg(test)]
+use crate::rules::sound_ini::EvaSide;
 use crate::rules::sound_ini::{
-    EvaPriority, EvaRegistry, EvaSide, EvaType, SoundEntry, SoundRegistry, VOLUME_SCALE, control,
-    sound_type,
+    EvaPriority, EvaRegistry, EvaType, SoundEntry, SoundRegistry, VOLUME_SCALE, control, sound_type,
 };
+use crate::sim::snapshot::scenario_resources::SavedStaticSound;
 use crate::util::native_x87::X87Chop53;
 
+mod clip_cache;
 mod observation;
 mod playback;
 mod sample_queue;
+use clip_cache::ClipCache;
 use playback::{PlaybackControl, PlaylistCursor, RingSource};
 use sample_queue::SampleQueue;
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
 mod ambient_playout_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
 mod coordinate_playback_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
 mod coordinate_sound_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
 mod gattling_loop_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
 mod house_cue_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
+mod ring_resample_tests;
+#[cfg(all(test, tests_audio))]
 mod unit_voice_lifecycle_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
 mod unit_voice_tests;
 pub(crate) use observation::{PcmObservationConfig, PcmObservationContext, PcmObservationReport};
 use observation::{PcmObserver, VoiceLatchState};
@@ -227,21 +241,10 @@ impl SpatialGain {
 ///   (`0x00750AD6..0x00750B06`), `maxRange = Range * 0x3C` as float.
 /// - `Type=SHROUD` (`0x800`): a sound in a cell whose shroud flags
 ///   (`CellClass+0x12C & 0x18`) are both clear returns 0 (`0x00750B2D..
-///   0x00750BAA`). The cell test is the caller's: `shrouded`.
-///   RESIDUAL — the sentinel-cell early-out ahead of it is not modelled.
-///   `0x00750B51 CMP CX,[0x00b1d310]` / `0x00750B6C CMP AX,[0x00b1d312]`
-///   return 0.0f when the sound's cell equals that `CellStruct` pair, i.e.
-///   *before* the `CellClass` lookup at `0x00750B8F`. `get_xrefs_to` on both
-///   words shows one read (this site) and one write — the three-instruction
-///   setter at `0x007502B0` (`XOR EAX,EAX; MOV [0x00b1d310],AX; MOV
-///   [0x00b1d312],AX`), reached only through the vtable slot at `0x0081562C`
-///   — and the image bytes are already `00 00 00 00`, so the pair is the null
-///   cell `(0,0)` for the whole process lifetime. Trigger: a `Type=SHROUD`
-///   cue whose object sits on map cell `(0,0)`. Player effect: that one cue is
-///   silent. Frequency: never in ordinary play — cell `(0,0)` is outside every
-///   map's playable rectangle, and the 11 stock `SHROUD` cues are super-weapon
-///   ready/open sounds that VERA does not emit yet. Downstream risk: none; it
-///   is an early-out, so modelling it can only add silence.
+///   0x00750BAA`), as does the null cell `(0,0)` ahead of that lookup
+///   (`0x00750B51..0x00750B73`). The cell test is the caller's: `shrouded`.
+///   RESIDUAL: a cell outside the map reads native's shared Dummy cell
+///   (`0x005657A0` returns `0x00ABDC50`); VERA treats it as never seen.
 /// - `offsetX = clientX - halfW` kept as float (`FST [ESP+0x10]`); the
 ///   distances are `|ftol(clientX - halfW)|` and `|ftol(clientY - halfH)|`
 ///   (`0x00750BBE..0x00750BF6`), the abs taken by the wrapping `CDQ; XOR; SUB`
@@ -665,32 +668,33 @@ impl LoadedSampleIndices {
 
 /// Decoded audio ready for rodio playback.
 /// Holds interleaved f32 stereo samples, sample rate, and channel count.
+/// A clone shares the samples, so every start of a clip the [`ClipCache`]
+/// keeps plays one decode.
 #[derive(Clone)]
 pub(crate) struct DecodedAudio {
     /// Interleaved stereo f32 samples (L, R, L, R, ...).
-    pub(crate) samples: Vec<f32>,
+    pub(crate) samples: Arc<[f32]>,
     pub(crate) sample_rate: u32,
     /// Always 2 (stereo) — we upmix mono sources for consistency.
     pub(crate) channels: u16,
-    /// Native decoded PCM frame width before mono is upmixed for rodio.
-    pub(crate) native_frame_bytes: u16,
+    /// The native format's channel count and bytes per sample before mono is
+    /// upmixed for rodio: descriptor `+0xC` and `+0x10`, filled by
+    /// `WAV__ParseHeader @ 0x00408610` (`0x0040876A..0x00408792`) and
+    /// `AudioIndex__GetFormat @ 0x00401640`. IMA ADPCM decodes to 2 bytes.
+    pub(crate) native_channels: u16,
+    pub(crate) native_sample_bytes: u16,
 }
 
 impl DecodedAudio {
-    /// Append another clip; the native playlist chains buffers back to back.
-    /// A rate mismatch keeps the first clip (RESIDUAL: native streams each
-    /// buffer at its own rate; no stock attack/decay set mixes rates).
+    /// Append another clip; the native playlist chains buffers back to back,
+    /// each in the first clip's format (see [`playback::chained_samples`]).
     #[cfg(test)]
-    fn append(&mut self, mut other: DecodedAudio) {
-        if other.sample_rate != self.sample_rate || other.channels != self.channels {
-            log::warn!(
-                "SFX: dropped chained sample with mismatched format ({} Hz vs {} Hz)",
-                other.sample_rate,
-                self.sample_rate
-            );
-            return;
-        }
-        self.samples.append(&mut other.samples);
+    fn append(&mut self, other: DecodedAudio) {
+        let layout = (self.native_channels, self.native_sample_bytes);
+        let chained = playback::chained_samples(&other, layout);
+        let mut samples = self.samples.to_vec();
+        samples.extend_from_slice(chained.as_deref().unwrap_or(&other.samples));
+        self.samples = samples.into();
     }
 }
 
@@ -736,19 +740,27 @@ struct ResolvedPlayback {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SfxChannel {
     Sound,
-    /// The EVA stream: Voice master only. `[0x0087E750]` is taken as unity —
-    /// RESIDUAL: its only writers are the score dialog's fades
-    /// (`0x005BEE27..0x005BF5A8`), which VERA's score screen does not run.
-    /// Trigger: an EVA line during the score dialog. Player effect: none
-    /// reachable today. Frequency: never. Downstream risk: none.
+    /// The EVA stream: the Voice group `+0x94` and `[0x0087E750]` at `+0x9C`.
     EvaStream,
+    /// The taunt stream `[0x00B1D4D8]`: SpeechSystem::Init (`0x00752AD0`)
+    /// links none of its channel's groups (the constructor `0x00407860`
+    /// zeroes `+0x90..+0x9C`, and its `0x00407B40` / `0x00407B50` calls at
+    /// `0x00752B07..0x00752B1E` rebind the EVA stream `[0x00B1D4CC]`), so
+    /// neither master nor the exit fade reaches it; CombineInterps skips the
+    /// null groups (`0x00402252..0x00402292`).
+    TauntStream,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SfxOutputScales {
     sound_volume: f32,
     voice_volume: f32,
-    lifecycle_scale: f32,
+    /// The effects master `[0x0087E758]` (`ch+0x9C` of every Voc channel):
+    /// the movie holds and scenario exits write it.
+    sound_master_linear: i32,
+    /// `[0x0087E750]` (`ch+0x9C` of the EVA stream): only the movie holds
+    /// write it.
+    eva_master_linear: i32,
     focus_output_scale: f32,
     /// The many-sounds master scaler, `g_ManySoundsVolumeGroup @ 0x0087E1B8`,
     /// chained into every channel at `ch+0x98` and multiplied in by
@@ -759,19 +771,21 @@ struct SfxOutputScales {
 /// Master-independent gain retained beside one live secondary output.
 ///
 /// `base_linear` is the native linear volume (`0..=0x4000`) of everything
-/// below the user master: spatial volume and entry volume. The separate
-/// buffer interp holds the per-play `VShift=` reduction. The master joins that product
-/// before the DirectSound curve — `DSoundBuffer::CombineInterps FUN_004010C0`
-/// multiplies the buffer, event and group interps (`FUN_00402220`; the sound
-/// group at `DAT_0087E758`, `SoundEvent::UpdateState 0x0040571E`) and only
-/// then `FUN_0040A6D0` converts to decibels — so `effective` recomposes the
-/// product each time rather than scaling an amplitude. The VERA-internal
-/// lifecycle and foreground gates multiply the amplitude afterwards.
+/// below the user volume: spatial volume and entry volume (the event group,
+/// `ch+0x90`). The separate buffer interp (`ch+0x10`) holds the per-play
+/// `VShift=` reduction. `DSoundBuffer::CombineInterps @ 0x00402220`
+/// multiplies `+0x10`, `+0x90`, `+0x94`, `+0x98` and `+0x9C` in that order
+/// (`FUN_004010C0`, `(a * b) >> 14`) and only then `FUN_0040A6D0` converts to
+/// decibels, so `effective` recomposes the product each time rather than
+/// scaling an amplitude. The VERA-internal foreground gate multiplies the
+/// amplitude afterwards (primary-buffer stop, see `set_focus_output_active`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SfxOutputGain {
     base_linear: i32,
-    /// Channel-local VShift4054A0; it never changes the event gain used by
-    /// Limit/priority in4041D0.
+    /// The channel's own `+0x10` interp. For Voc it holds the per-play
+    /// VShift (`0x004054A0`), which never changes the event gain used by
+    /// Limit/priority in4041D0; for the EVA and taunt streams it is the
+    /// stream's own volume interp (see `SfxPlayer::eva_stream_volume`).
     buffer_linear: i32,
     channel: SfxChannel,
 }
@@ -786,27 +800,37 @@ impl SfxOutputGain {
     }
 
     fn effective(self, scales: SfxOutputScales) -> f32 {
-        let master = match self.channel {
+        native_volume_amplitude(self.combined_linear(scales)) * scales.focus_output_scale
+    }
+
+    /// The linear product `0x0040A6D0` converts: for a Voc channel, the
+    /// value of `ch+0xD8` that `FindAvailable` ranks (`[ch+0xDC] >> 16`).
+    fn combined_linear(self, scales: SfxOutputScales) -> i32 {
+        let user = match self.channel {
             SfxChannel::Sound => scales.sound_volume,
             SfxChannel::EvaStream => scales.voice_volume,
+            SfxChannel::TauntStream => return combine_linear(self.buffer_linear, self.base_linear),
         };
-        let master_linear = X87Chop53::ftol_f64_low_masked(
-            f64::from(master.clamp(0.0, 1.0)) * f64::from(VOLUME_SCALE),
+        let user_linear = X87Chop53::ftol_f64_low_masked(
+            f64::from(user.clamp(0.0, 1.0)) * f64::from(VOLUME_SCALE),
         );
         if self.channel == SfxChannel::EvaStream {
-            // The stream has no many-sounds scaler and no audio master, so
-            // the scenario-exit fade (`lifecycle_scale`) leaves it alone.
-            return native_volume_amplitude(combine_linear(self.base_linear, master_linear))
-                * scales.focus_output_scale;
+            // VoxClass::Init: Voice `[0x0087E740]` at `+0x94` (`0x00752316`)
+            // and `[0x0087E750]` at `+0x9C` (`0x00752327`); no many-sounds
+            // scaler and no effects master, so the scenario exits' fade
+            // (`0x00686605`) leaves an announcement they queue (`0x00686616`)
+            // at full volume.
+            let own = combine_linear(self.buffer_linear, self.base_linear);
+            combine_linear(combine_linear(own, user_linear), scales.eva_master_linear)
+        } else {
+            // Voc: Sound `[0x0087E748]` at `+0x94` (`0x00405B91..0x00405B96`),
+            // many-sounds at `+0x98` (`0x0040570E`), the effects master
+            // `[0x0087E758]` at `+0x9C` (`0x0040571E`, `0x00405B9C`).
+            let event = combine_linear(self.buffer_linear, self.base_linear);
+            let with_user = combine_linear(event, user_linear);
+            let with_limiter = combine_linear(with_user, scales.many_sounds_linear);
+            combine_linear(with_limiter, scales.sound_master_linear)
         }
-        // The channel multiplies the event group (`ch+0x90`), the many-sounds
-        // scaler (`ch+0x98`) and the user volume group (`ch+0x9C`) together
-        // before `FUN_0040A6D0` converts to decibels.
-        let with_buffer = combine_linear(self.buffer_linear, self.base_linear);
-        let with_limiter = combine_linear(with_buffer, scales.many_sounds_linear);
-        native_volume_amplitude(combine_linear(with_limiter, master_linear))
-            * scales.lifecycle_scale
-            * scales.focus_output_scale
     }
 }
 
@@ -1090,14 +1114,25 @@ impl LoadedPlayback {
 struct PendingSampleService<'a> {
     pending: &'a mut BTreeMap<EventId, PendingPlayback>,
     live: &'a BTreeMap<EventId, LiveSfxOutput>,
+    /// The scales the live outputs last applied.
+    scales: SfxOutputScales,
     registry: &'a SoundRegistry,
     assets: &'a AssetManager,
     audio_index: Option<&'a crate::assets::audio_bag::AudioIndex>,
+    clips: &'a mut ClipCache,
     rng: &'a mut PlaybackDraws,
     observer: Option<&'a mut PcmObserver>,
 }
 
 impl PlaybackService for PendingSampleService<'_> {
+    /// An allocation runs before this pass starts anything, so every playing
+    /// channel already has its output; one without reads as silent.
+    fn channel_volume(&self, event: EventId) -> i32 {
+        self.live
+            .get(&event)
+            .map_or(0, |output| output.gain.combined_linear(self.scales))
+    }
+
     fn stop_playout(&mut self, event: EventId) {
         if let Some(output) = self.live.get(&event) {
             output.stop();
@@ -1131,21 +1166,21 @@ impl PlaybackService for PendingSampleService<'_> {
             return true;
         }
         let Some(entry) = self.registry.get(&pending.key) else {
-            pending.prepared =
-                load_sfx(&pending.key, self.assets, self.audio_index).map(|decoded| {
-                    ResolvedPlayback {
-                        decoded,
-                        observed_samples: self
-                            .observer
-                            .as_ref()
-                            .is_some_and(|observer| observer.contains(pending.token))
-                            .then(|| vec![pending.key.clone()]),
-                    }
+            pending.prepared = self
+                .clips
+                .load(&pending.key, self.assets, self.audio_index)
+                .map(|decoded| ResolvedPlayback {
+                    decoded,
+                    observed_samples: self
+                        .observer
+                        .as_ref()
+                        .is_some_and(|observer| observer.contains(pending.token))
+                        .then(|| vec![pending.key.clone()]),
                 });
             return pending.prepared.is_some();
         };
         pending.load_entry_samples(entry, plays_attack, self.rng, |name| {
-            load_sfx(name, self.assets, self.audio_index)
+            self.clips.load(name, self.assets, self.audio_index)
         })
     }
 
@@ -1178,10 +1213,7 @@ impl PlaybackService for PendingSampleService<'_> {
         ) else {
             return false;
         };
-        let rate = pending
-            .shifts
-            .expect("admitted channel")
-            .shifted_sample_rate(loaded.clips[&initial].sample_rate);
+        let shifts = pending.shifts.expect("admitted channel");
         let observed_names = self
             .observer
             .as_ref()
@@ -1193,7 +1225,7 @@ impl PlaybackService for PendingSampleService<'_> {
             cursor,
             initial,
             self.rng.clone(),
-            rate,
+            shifts,
             pan,
             observed_names,
         );
@@ -1211,7 +1243,10 @@ impl PlaybackService for PendingSampleService<'_> {
 /// plus the separate EVA streaming output.
 pub struct SfxPlayer {
     /// rodio mixer device sink — must be kept alive or all audio stops.
-    _device: MixerDeviceSink,
+    _device: SfxOutput,
+    /// Set by the stream's error callback when the device goes away.
+    #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+    health: crate::audio::output_health::OutputHealth,
     /// The decision half: channel pool, `Priority=`, `Limit=`, pre-delay,
     /// looping leash, ramps and the many-sounds limiter.
     arbiter: SoundArbiter,
@@ -1224,6 +1259,8 @@ pub struct SfxPlayer {
     pending: BTreeMap<EventId, PendingPlayback>,
     /// Started outputs, keyed by the arbiter event holding the channel.
     live: BTreeMap<EventId, LiveSfxOutput>,
+    /// The decoded samples every start and announcement loads through.
+    clips: ClipCache,
     /// Presentation diagnostics only; absent in ordinary play. It never
     /// supplies an arbiter, sample-selection or simulation decision.
     pcm_observer: Option<PcmObserver>,
@@ -1241,6 +1278,21 @@ pub struct SfxPlayer {
     /// [`Self::advance_voice_queue`] observes it finished and reports the end
     /// time to `vox` (`StreamPlayer::GetEndTime` stand-in).
     eva_player: Option<LiveSfxOutput>,
+    /// Set on the mixer thread the moment the current EVA sample runs out,
+    /// as the channel's done callback `0x00407A30` stamps the stream's end
+    /// time `+0x20` on the audio thread rather than at the next pump.
+    eva_ran_out: Option<Arc<OnceLock<crate::util::time::Instant>>>,
+    /// The taunt stream `[0x00B1D4D8]` ("Taunt Stream", `0x00752AD0`): a
+    /// second StreamPlayer beside EVA's. `PlayFile` stops what it plays, so
+    /// a new taunt cuts the last one.
+    taunt_player: Option<LiveSfxOutput>,
+    /// The EVA and taunt streams' own `+0x10` interps, as Theme's in
+    /// `MusicPlayer`: each `StreamPlayer__PlayFile` snaps one to full
+    /// (`0x00407E7D`), the radar-movie pre-fade glides both to zero
+    /// (`0x00408390`) and every hold release glides them back
+    /// (`0x004083D0`). They outlive the lines they scale.
+    eva_stream_volume: VolumeInterp,
+    taunt_stream_volume: VolumeInterp,
     /// The per-object voice latch: `TechnoClass::Queue_Voice @ 0x00708D90`
     /// writes it, `TechnoClass::AI_Update @ 0x006F9EBB` drains it.
     voice_queue: VoiceQueue,
@@ -1248,8 +1300,9 @@ pub struct SfxPlayer {
     sound_volume: f64,
     /// EVA announcement master volume (0.0 to 1.0).
     voice_volume: f64,
-    /// Temporary app-lifecycle multiplier over every live SFX/voice output.
-    output_scale: f32,
+    /// Current `[0x0087E758]` / `[0x0087E750]` linears; see [`Self::set_master_groups`].
+    sound_master_linear: i32,
+    eva_master_linear: i32,
     /// Foreground-owned primary-output gate. Secondary Players stay running so
     /// their playback cursors continue while global output is suppressed.
     focus_output_scale: f32,
@@ -1257,10 +1310,19 @@ pub struct SfxPlayer {
     /// edge the way `GamePause::Enter`/`Exit` do.
     paused: bool,
     movie_held: bool,
+    movie_sounds_suspended: bool,
+    /// `-X…Q` (`0x00A8ED64`), set once at startup: `PlayNextQueued
+    /// @ 0x00752760` returns before its dequeue. Theme reads the same switch
+    /// through `ThemeGates`.
+    eva_quiet: bool,
     ///7518C0 gates Voc admission; it neither pauses Theme nor ends buffers.
     voc_enabled: bool,
     ///53BAD0 excludes the SFX half of GamePause, not its EVA stream half.
     chrono_screen_active: bool,
+    /// Whether the open game pause suspended the sounds: `GamePause::Enter
+    /// @ 0x00406F00` skips them while ChronoScreen runs (`0x0053BAD0`), and
+    /// `Exit` resumes them whatever the effect does by then.
+    game_pause_suspends_sounds: bool,
 }
 
 /// Native750E20 copies +20/+24/+28 and initializes nested suspend depth+30.
@@ -1290,6 +1352,7 @@ const MAX_COORDINATE_REQUESTS: usize = 200;
 /// device ever rendered them. DirectSound starts a secondary buffer as it is
 /// played, so native ticks are audible. A period below the pump interval lets
 /// each cue reach the device first. Clamped to the device's supported range.
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
 fn sfx_buffer_frames(sample_rate: u32, supported: &rodio::cpal::SupportedBufferSize) -> u32 {
     let target = (sample_rate / 100).max(1).next_power_of_two();
     match *supported {
@@ -1300,7 +1363,10 @@ fn sfx_buffer_frames(sample_rate: u32, supported: &rodio::cpal::SupportedBufferS
 
 /// Open the default output with [`sfx_buffer_frames`], falling back to
 /// rodio's own default sink when the device refuses that period.
-fn open_sfx_sink() -> Result<MixerDeviceSink, rodio::DeviceSinkError> {
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+fn open_sfx_sink(
+    health: &crate::audio::output_health::OutputHealth,
+) -> Result<SfxOutput, rodio::DeviceSinkError> {
     use rodio::cpal::traits::{DeviceTrait, HostTrait};
 
     let low_latency = rodio::cpal::default_host()
@@ -1311,6 +1377,7 @@ fn open_sfx_sink() -> Result<MixerDeviceSink, rodio::DeviceSinkError> {
             DeviceSinkBuilder::from_device(device)
                 .ok()?
                 .with_buffer_size(rodio::cpal::BufferSize::Fixed(frames))
+                .with_error_callback(health.callback("SFX"))
                 .open_stream()
                 .inspect(|_| {
                     log::info!(
@@ -1323,37 +1390,71 @@ fn open_sfx_sink() -> Result<MixerDeviceSink, rodio::DeviceSinkError> {
         });
     match low_latency {
         Some(sink) => Ok(sink),
-        None => DeviceSinkBuilder::open_default_sink(),
+        // With no usable default device, rodio's own opener tries every other.
+        None => DeviceSinkBuilder::from_default_device()
+            .and_then(|builder| {
+                builder
+                    .with_error_callback(health.callback("SFX"))
+                    .open_sink_or_fallback()
+            })
+            .or_else(|_| DeviceSinkBuilder::open_default_sink()),
     }
+}
+
+/// The browser keeps short blocks with a deeper queue; see
+/// [`crate::audio::web_output`].
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+fn open_sfx_sink() -> Result<SfxOutput, String> {
+    crate::audio::web_output::WebAudioSink::open().map_err(|error| format!("{error:?}"))
 }
 
 impl SfxPlayer {
     /// Create a new SfxPlayer. Returns None if audio output cannot be opened.
     pub fn new() -> Option<Self> {
-        let device = open_sfx_sink()
+        #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+        let health = crate::audio::output_health::OutputHealth::default();
+        #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+        let opened = open_sfx_sink(&health);
+        #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+        let opened = open_sfx_sink();
+        let device = opened
             .map_err(|e| log::error!("Failed to initialize SFX audio: {}", e))
             .ok()?;
 
         Some(Self {
             _device: device,
+            #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+            health,
             arbiter: SoundArbiter::new(0),
             coordinate_requests: Vec::with_capacity(MAX_COORDINATE_REQUESTS),
             next_coordinate_request: 1,
             pending: BTreeMap::new(),
             live: BTreeMap::new(),
+            clips: ClipCache::default(),
             pcm_observer: None,
             now_ms: 0,
             vox: VoxQueue::new(),
             eva_player: None,
+            eva_ran_out: None,
+            taunt_player: None,
+            eva_stream_volume: VolumeInterp::new(VOLUME_SCALE, 0),
+            taunt_stream_volume: VolumeInterp::new(VOLUME_SCALE, 0),
             voice_queue: VoiceQueue::new(),
+            // Until startup applies the Options profile
+            // (`apply_startup_audio_profile`): `OptionsClass__SetDefaults
+            // @ 0x005FA350`'s 0.7; the profile is the persisted authority.
             sound_volume: 0.7,
             voice_volume: 0.7,
-            output_scale: 1.0,
+            sound_master_linear: VOLUME_SCALE,
+            eva_master_linear: VOLUME_SCALE,
             focus_output_scale: 1.0,
             paused: false,
             movie_held: false,
+            movie_sounds_suspended: false,
+            eva_quiet: false,
             voc_enabled: true,
             chrono_screen_active: false,
+            game_pause_suspends_sounds: false,
         })
     }
 
@@ -1361,7 +1462,8 @@ impl SfxPlayer {
         SfxOutputScales {
             sound_volume: self.sound_volume as f32,
             voice_volume: self.voice_volume as f32,
-            lifecycle_scale: self.output_scale,
+            sound_master_linear: self.sound_master_linear,
+            eva_master_linear: self.eva_master_linear,
             focus_output_scale: self.focus_output_scale,
             many_sounds_linear: self.arbiter.many_sounds_linear(),
         }
@@ -1621,6 +1723,51 @@ impl SfxPlayer {
         }
     }
 
+    /// `VocClass::SaveStaticSounds @ 0x00751620`: every retained node's sound
+    /// and Coord, in list order. A node whose handle names no sound any more
+    /// (native writes no usable index for it) is left out.
+    pub(crate) fn saved_static_sounds(&self) -> Vec<SavedStaticSound> {
+        self.coordinate_requests
+            .iter()
+            .filter_map(|request| {
+                let owner = HandleOwner::Coordinate(request.id);
+                Some(SavedStaticSound {
+                    sound_id: self.arbiter.handle_sound_key(owner)?.to_owned(),
+                    coordinate: request.coordinate,
+                })
+            })
+            .collect()
+    }
+
+    /// `VocClass::LoadStaticSounds @ 0x00751710`, after its clear
+    /// ([`Self::stop_all`]): each saved node whose sound is still registered
+    /// and loopable (`AudioEventClass::IsLoopable @ 0x00406650`) is retained
+    /// again with flags 0 and depth 0 and played at its Coord. Flags 0 means
+    /// StopAtCoord750F40 no longer matches a restored node, as in gamemd.
+    ///
+    /// RESIDUAL: native plays it at once (`VocClass::PlayAt @ 0x007509E0`).
+    /// The listener is not restored yet here, so the node starts on the next
+    /// sound service through 750D40, which skips an `attack` sample; heard
+    /// once per load on a loop that has one and is in earshot.
+    pub(crate) fn restore_static_sounds(
+        &mut self,
+        saved: &[SavedStaticSound],
+        registry: &SoundRegistry,
+    ) {
+        for node in saved {
+            if entry_facts(&node.sound_id, registry).is_loopable() {
+                self.play_sound_at_coord(
+                    &node.sound_id,
+                    node.coordinate,
+                    0,
+                    SoundSource::from_coordinate(node.coordinate),
+                    None,
+                    registry,
+                );
+            }
+        }
+    }
+
     /// Refresh this derived gain cache from the current listener/shroud.
     /// The app owns that context; audio retains only immutable source facts.
     /// Applying the gain and retiring requests remain in admitted750EC0.
@@ -1844,6 +1991,17 @@ impl SfxPlayer {
         }
     }
 
+    /// A deploy conversion's voice hand-off (`UnitClass::Deploy @
+    /// 0x00739971..0x007399B2`, unit to building; `BuildingClass::
+    /// Mission_Selling @ 0x0044A0D4..0x0044A115`, building to unit): the new
+    /// object takes the handle, pending and playing slots and the old one is
+    /// left empty, so its destructor stops nothing and the line plays on.
+    pub(crate) fn move_unit_voice(&mut self, from: u64, to: u64) {
+        self.arbiter
+            .move_loop_handle(HandleOwner::UnitVoice(from), HandleOwner::UnitVoice(to));
+        self.voice_queue.move_owner(from, to);
+    }
+
     /// Techno destructor6F4607 -> VocHandle405C00 hard-stops this handle's
     /// event, then destroys pending/last with the Techno. Other owners survive.
     pub(crate) fn destroy_unit_voice(&mut self, owner: u64) {
@@ -1876,16 +2034,15 @@ impl SfxPlayer {
     /// priority is always the entry's own. QueueVoice owns the guarded
     /// PlayNextQueued call, including after a duplicate request.
     ///
-    /// `side` is the session column `VoxClass::SetSide @ 0x007534E0` stored;
-    /// an empty column is still queued and fails at the later PlayFile of
+    /// The process Vox owner retains the bound voice selection. The event's
+    /// sample column is read only when PlayNextQueued dequeues its identity.
+    /// An empty column is still queued and fails at the later PlayFile of
     /// `".WAV"`. Returns whether the request entered a queue/pending slot.
     pub fn play_eva(
         &mut self,
         event: &str,
         type_override: Option<EvaType>,
         eva_registry: &EvaRegistry,
-        side: EvaSide,
-        registry: &SoundRegistry,
         assets: &AssetManager,
         audio_index: Option<&crate::assets::audio_bag::AudioIndex>,
     ) -> bool {
@@ -1894,8 +2051,6 @@ impl SfxPlayer {
             type_override,
             None,
             eva_registry,
-            side,
-            registry,
             assets,
             audio_index,
         )
@@ -1912,8 +2067,6 @@ impl SfxPlayer {
         type_override: Option<EvaType>,
         priority_override: Option<EvaPriority>,
         eva_registry: &EvaRegistry,
-        side: EvaSide,
-        registry: &SoundRegistry,
         assets: &AssetManager,
         audio_index: Option<&crate::assets::audio_bag::AudioIndex>,
     ) -> bool {
@@ -1923,7 +2076,6 @@ impl SfxPlayer {
         let effect = self.vox.queue_voice(
             VoxRequest {
                 event: &entry.name,
-                sample: entry.column(side).unwrap_or(""),
                 eva_type: entry.eva_type,
                 priority: entry.priority,
             },
@@ -1936,15 +2088,86 @@ impl SfxPlayer {
             self.stop_eva_stream();
         }
         if effect.advance_queue {
-            self.advance_voice_queue(registry, assets, audio_index);
+            self.advance_voice_queue(eva_registry, assets, audio_index);
         }
         effect.inserted
     }
 
-    /// `StreamPlayer::Stop` on the announcement stream, if one is open.
+    /// `SpeechSystem::PlayTaunt` `0x00752B70` for the taunt byte
+    /// `(country << 4) | n`: n must be 1..8 and the country 0..9, which
+    /// picks `taunts\tau{am,ko,fr,ge,br,li,ir,cu,ru,yu}%02i.wav` (jump table
+    /// `0x00752C6C`). `StreamPlayer::PlayFile(name, 0)` `0x00407B60` tries
+    /// the loose file first, then CCFile; a new taunt stops the last one.
+    /// Under a movie's stop hold (`+0x88`) Stop and PlayFile both do
+    /// nothing, so the paused taunt stays and the new one is dropped. A
+    /// paused stream otherwise plays a new file at once: PlayFile sets the
+    /// playing bit whatever the pause count `+0x80`.
+    /// PlayTaunt's suppress counter `[0x00B1D480]` stays 0 in retail, so its
+    /// `== 0` test always passes: SpeechSystem init zeroes it (`0x00752B23`),
+    /// and the increment and decrement, `0x00753520`/`0x00753540`, have no
+    /// references (no call, jump or stored pointer).
+    pub(crate) fn play_taunt(&mut self, byte: u8, assets: &AssetManager, pattern: Option<&str>) {
+        const COUNTRIES: [&str; 10] = ["am", "ko", "fr", "ge", "br", "li", "ir", "cu", "ru", "yu"];
+        let number = byte & 0xF;
+        if !(1..=8).contains(&number) {
+            return;
+        }
+        let name = match pattern {
+            Some(pattern) => taunt_filename(pattern, number),
+            None => {
+                let Some(country) = COUNTRIES.get(usize::from(byte >> 4)) else {
+                    return;
+                };
+                format!("taunts\\tau{country}{number:02}.wav")
+            }
+        };
+        if self.movie_held {
+            return;
+        }
+        if let Some(output) = self.taunt_player.take() {
+            output.player.stop();
+        }
+        let decoded = match assets.read_install_file(&name) {
+            Some(bytes) => decode_wav(&bytes, &name),
+            None => assets
+                .get_ref(&name)
+                .and_then(|bytes| decode_wav(bytes, &name)),
+        };
+        let Some(decoded) = decoded else {
+            log::debug!("Taunt {name} is missing");
+            return;
+        };
+        self.taunt_stream_volume.set_target_immediate(VOLUME_SCALE);
+        self.taunt_stream_volume.tick(self.now_ms);
+        let Some(output) = self.start_voice_output(decoded, VOLUME_SCALE, SfxChannel::TauntStream)
+        else {
+            return;
+        };
+        self.taunt_player = Some(output);
+    }
+
+    /// Whether the taunt stream has audio left to play.
+    pub(crate) fn taunt_stream_busy(&self) -> bool {
+        self.taunt_player
+            .as_ref()
+            .is_some_and(|output| !output.player.empty())
+    }
+
+    /// `StreamPlayer::Stop @ 0x00407F40` on the announcement stream, if one
+    /// is open. A movie's stop hold (`+0x88`) refuses it: the paused line
+    /// plays on after the movie. The stop stamps the stream's end time
+    /// (`0x00407A60`), which the next line's gap counts from.
     fn stop_eva_stream(&mut self) {
+        if !self.movie_held {
+            self.drop_eva_stream();
+        }
+    }
+
+    fn drop_eva_stream(&mut self) {
         if let Some(output) = self.eva_player.take() {
             output.player.stop();
+            self.eva_ran_out = None;
+            self.vox.stream_ended(self.now_ms);
         }
     }
 
@@ -1968,16 +2191,40 @@ impl SfxPlayer {
     pub(crate) fn set_chrono_screen_active(&mut self, active: bool) {
         self.chrono_screen_active = active;
     }
+    /// `RadarClass::AI`'s pass outside its prelude: `ResumeEVA @ 0x00753580`
+    /// unless ChronoScreen holds the screen (`0x0053BAE0` at
+    /// `0x006539AE..0x006539B7`).
+    pub(crate) fn resume_eva_unless_chrono_screen(&mut self) {
+        if !self.chrono_screen_active {
+            self.vox.resume();
+        }
+    }
+    pub(crate) fn set_eva_quiet(&mut self, quiet: bool) {
+        self.eva_quiet = quiet;
+    }
     pub(crate) fn suspend_eva(&mut self) {
         self.vox.suspend();
     }
     pub(crate) fn resume_eva(&mut self) {
         self.vox.resume();
     }
+
+    /// InitSideMixFiles534FAC / successful-load67E761 bind the incoming
+    /// Scenario.Side; ordinary requests never infer it from a live House.
+    pub(crate) fn set_eva_side(&mut self, side: i32, rules: &crate::rules::ruleset::RuleSet) {
+        self.vox.set_side(side, rules);
+    }
+    /// Ares trigger action 148's voice selection ([`super::vox::VoxQueue::set_trigger_voice`]).
+    pub(crate) fn set_trigger_eva_voice(&mut self, index: i32, registry: &EvaRegistry) {
+        self.vox.set_trigger_voice(index, registry);
+    }
     pub(crate) fn eva_entry_done(&self, index: i32, registry: &EvaRegistry) -> bool {
         registry
             .entry_by_index(index)
             .is_none_or(|entry| self.vox.entry_done(&entry.name))
+    }
+    pub(crate) fn current_eva_event(&self) -> Option<&str> {
+        self.vox.current().map(|node| node.event.as_str())
     }
     pub(crate) fn mixer(&self) -> &rodio::mixer::Mixer {
         self._device.mixer()
@@ -1997,9 +2244,9 @@ impl SfxPlayer {
     /// The native gate is `IsPlaying() == 0 && now > GetEndTime() + gap &&
     /// DAT_00b1d428 == 0` (`0x00752794..0x007527D5`); [`VoxQueue::take_next`]
     /// owns it. The stream's end time is reported here the first time the
-    /// stream is seen empty after an EVA line started, so the 500 ms gap runs
-    /// from the observed end (a paused line therefore still gets its gap
-    /// after it resumes and finishes).
+    /// stream is seen empty after an EVA line started, back-dated to when the
+    /// sample ran out, so the 500 ms gap runs from the real end (a paused
+    /// line therefore still gets its gap after it resumes and finishes).
     ///
     /// Then the sample is loaded and started — `StreamPlayer::PlayFile(name,
     /// 1)` at `0x0075295C`; a failed load drops the node without touching
@@ -2007,46 +2254,68 @@ impl SfxPlayer {
     /// (the stock `Dummy` columns of `EVA_PsychicDominatorActivated`).
     pub fn advance_voice_queue(
         &mut self,
-        registry: &SoundRegistry,
+        eva_registry: &EvaRegistry,
         assets: &AssetManager,
         audio_index: Option<&crate::assets::audio_bag::AudioIndex>,
     ) {
+        if self.eva_quiet {
+            return;
+        }
         let busy = self.eva_stream_busy();
         if !busy && self.eva_player.take().is_some() {
-            self.vox.stream_ended(self.now_ms);
+            // Back-date to when the sample ran out: the pump sees it a pass
+            // or a stalled frame later.
+            let ran_out_ago = self
+                .eva_ran_out
+                .take()
+                .and_then(|stamp| stamp.get().map(|at| at.elapsed().as_millis()))
+                .map_or(0, |ago| u64::try_from(ago).unwrap_or(u64::MAX));
+            self.vox
+                .stream_ended(self.now_ms.saturating_sub(ran_out_ago));
         }
         let Some(node) = self.vox.take_next(self.now_ms, busy) else {
             return;
         };
-        self.start_eva_node(node, registry, assets, audio_index);
+        self.start_eva_node(node, eva_registry, assets, audio_index);
     }
 
     fn start_eva_node(
         &mut self,
         node: VoxNode,
-        registry: &SoundRegistry,
+        eva_registry: &EvaRegistry,
         assets: &AssetManager,
         audio_index: Option<&crate::assets::audio_bag::AudioIndex>,
     ) {
-        let _ = registry;
         // Native PlayFile(".WAV",1) fails after dequeue for an empty column.
         // It must not prevent QueueVoice from interrupting an existing line.
-        if node.sample.is_empty() {
+        let Some(sample) = self
+            .vox
+            .sample_for(&node, eva_registry)
+            .filter(|sample| !sample.is_empty())
+        else {
             return;
-        }
+        };
         // Vox75295C plays the column's physical filename directly. It does
         // not resolve a Voc entry or consume Main sample-selection draws.
-        let Some(decoded) = load_sfx(&node.sample, assets, audio_index) else {
-            log::debug!("EVA {} has no sample {}", node.event, node.sample);
+        let Some(decoded) = self.clips.load(sample, assets, audio_index) else {
+            log::debug!("EVA {} has no sample {}", node.event, sample);
             return;
         };
         // `take_next` only hands out a node once the stream is not playing,
         // and `advance_voice_queue` has already retired it by then.
         debug_assert!(self.eva_player.is_none());
+        self.eva_stream_volume.set_target_immediate(VOLUME_SCALE);
+        self.eva_stream_volume.tick(self.now_ms);
         let Some(output) = self.start_voice_output(decoded, VOLUME_SCALE, SfxChannel::EvaStream)
         else {
             return;
         };
+        let ran_out = Arc::new(OnceLock::new());
+        let stamp = Arc::clone(&ran_out);
+        output.player.append(EmptyCallback::new(Box::new(move || {
+            let _ = stamp.set(crate::util::time::Instant::now());
+        })));
+        self.eva_ran_out = Some(ran_out);
         self.eva_player = Some(output);
         self.vox.started(node);
     }
@@ -2071,7 +2340,8 @@ impl SfxPlayer {
         );
         let channels = NonZero::new(decoded.channels)?;
         let sample_rate = NonZero::new(decoded.sample_rate)?;
-        let source = SamplesBuffer::new(channels, sample_rate, decoded.samples);
+        // rodio 0.22.2 `SamplesBuffer::new` takes its samples only as a `Vec`.
+        let source = SamplesBuffer::new(channels, sample_rate, decoded.samples.to_vec());
         let player: Player = Player::connect_new(self._device.mixer());
         let output = LiveSfxOutput::new(player, gain, initial_volume);
         output.player.append(source);
@@ -2115,20 +2385,89 @@ impl SfxPlayer {
 
     /// Observe the device queues between `AudioSystem::Pump` passes.
     ///
-    /// The app calls this every frame, *unconditionally* — native's pump
-    /// hangs off `Network_ServiceLoop @ 0x0048D080`, whose callers include
-    /// `Main::ThrottleFrame @ 0x0055E160`, `ProcessModalServicePump @
-    /// 0x00623120`, `ShellDialog::RunUntilResult @ 0x0060D380` and the
-    /// loading-screen paths, so the audio service keeps running in menus,
-    /// modal dialogs and while the frame pacer idles. Pause is expressed
-    /// separately, by suspending events ([`Self::set_paused`]).
+    /// The app calls this every frame, *unconditionally*, including the
+    /// offline passes whose pump belongs to Main_Tick. Native's pump hangs off
+    /// `Network_ServiceLoop @ 0x0048D080`, whose callers include `Main_Tick`,
+    /// the network modes' `Main::ThrottleFrame @ 0x0055E160`,
+    /// `ProcessModalServicePump @ 0x00623120`, `ShellDialog::RunUntilResult
+    /// @ 0x0060D380` and the loading-screen paths, so the audio service keeps
+    /// running in menus and modal dialogs. Pause is expressed separately, by
+    /// suspending events ([`Self::set_paused`]).
     ///
     /// The app's shared `AudioServiceClock` separately gates Sound/Vox/Theme;
     /// completion observation also runs between admitted main-thread passes.
     /// PCM quarter refill is driven by the continuous source.
     pub(crate) fn service_device_outputs(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+        #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+        self.reopen_lost_output(now_ms);
         self.report_finished_outputs();
+        self.tick_stream_volumes(now_ms);
+    }
+
+    /// VERA-only: when the device went away, open the default device again.
+    /// Sounds on the dead stream would never finish, so they are stopped the
+    /// way a world change stops them; sounds asked for from here on are heard.
+    #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+    fn reopen_lost_output(&mut self, now_ms: u64) {
+        if !self.health.reopen_due(now_ms) {
+            return;
+        }
+        let health = crate::audio::output_health::OutputHealth::default();
+        let Ok(device) = open_sfx_sink(&health) else {
+            return;
+        };
+        log::info!("SFX output reopened on the default device");
+        self.clear_sound_pool();
+        // The lost device took the stream with it, held or not.
+        self.drop_eva_stream();
+        if let Some(output) = self.taunt_player.take() {
+            output.player.stop();
+        }
+        self._device = device;
+        self.health = health;
+    }
+
+    fn tick_stream_volumes(&mut self, now_ms: u64) {
+        let eva_moved = self.eva_stream_volume.tick(now_ms);
+        let taunt_moved = self.taunt_stream_volume.tick(now_ms);
+        if !(eva_moved || taunt_moved) {
+            return;
+        }
+        let scales = self.output_scales();
+        for (output, volume) in [
+            (self.eva_player.as_mut(), &self.eva_stream_volume),
+            (self.taunt_player.as_mut(), &self.taunt_stream_volume),
+        ] {
+            if let Some(output) = output {
+                output.gain.buffer_linear = volume.value();
+                output.apply_scales(scales);
+            }
+        }
+    }
+
+    /// The radar-movie pre-fade `0x00408390` for the EVA and taunt streams
+    /// (Theme's is `MusicPlayer::fade_stream_out`).
+    pub(crate) fn fade_streams_out(&mut self, now_ms: u64) {
+        self.eva_stream_volume.set_target(0, now_ms);
+        self.taunt_stream_volume.set_target(0, now_ms);
+    }
+
+    /// `StreamPlayers__RestoreVolumeTargets @ 0x004083D0` for the EVA and
+    /// taunt streams.
+    pub(crate) fn restore_stream_volumes(&mut self, now_ms: u64) {
+        self.eva_stream_volume.set_target(VOLUME_SCALE, now_ms);
+        self.taunt_stream_volume.set_target(VOLUME_SCALE, now_ms);
+    }
+
+    /// `0x00408410`: no playing stream's own interp is still moving.
+    pub(crate) fn streams_settled(&self) -> bool {
+        [
+            (&self.eva_player, &self.eva_stream_volume),
+            (&self.taunt_player, &self.taunt_stream_volume),
+        ]
+        .into_iter()
+        .all(|(output, volume)| !(stream_playing(output) && volume.moving()))
     }
 
     /// The app's one AudioServiceClock admits Sound4041D0, then Vox752760,
@@ -2137,19 +2476,23 @@ impl SfxPlayer {
         &mut self,
         now_ms: u64,
         registry: &SoundRegistry,
+        eva_registry: &EvaRegistry,
         assets: &AssetManager,
         audio_index: Option<&crate::assets::audio_bag::AudioIndex>,
         rng: &mut PlaybackDraws,
     ) {
         self.now_ms = now_ms;
+        let applied_scales = self.output_scales();
         let actions = self.arbiter.update_tick(
             now_ms,
             &mut PendingSampleService {
                 pending: &mut self.pending,
                 live: &self.live,
+                scales: applied_scales,
                 registry,
                 assets,
                 audio_index,
+                clips: &mut self.clips,
                 rng,
                 observer: self.pcm_observer.as_mut(),
             },
@@ -2197,7 +2540,7 @@ impl SfxPlayer {
         // oracle's UnitReady consumer controls; its single native selector
         // supplies the stock device regression below.
         // PlayEVA and explicit voice wait loops have their own immediate calls.
-        self.advance_voice_queue(registry, assets, audio_index);
+        self.advance_voice_queue(eva_registry, assets, audio_index);
     }
 
     /// Attach the source prepared synchronously in StartPlayback4054A0's
@@ -2233,8 +2576,7 @@ impl SfxPlayer {
             output.control = Some(control);
             output.player.append(source);
         } else if let Some(resolved) = pending.prepared.take() {
-            let mut decoded = resolved.decoded;
-            apply_pan(&mut decoded.samples, pan);
+            let decoded = resolved.decoded;
             let (Some(channels), Some(rate)) = (
                 NonZero::new(decoded.channels),
                 NonZero::new(decoded.sample_rate),
@@ -2242,12 +2584,16 @@ impl SfxPlayer {
                 self.arbiter.stop(event);
                 return;
             };
+            // The pan goes into this start's own copy; the cached clip stays
+            // as decoded.
+            let mut samples = decoded.samples.to_vec();
+            apply_pan(&mut samples, pan);
             if let Some(observer) = &mut self.pcm_observer {
-                observer.samples(token, resolved.observed_samples, decoded.samples.len());
+                observer.samples(token, resolved.observed_samples, samples.len());
             }
             output
                 .player
-                .append(SamplesBuffer::new(channels, rate, decoded.samples));
+                .append(SamplesBuffer::new(channels, rate, samples));
         } else {
             self.arbiter.stop(event);
             return;
@@ -2329,9 +2675,13 @@ impl SfxPlayer {
     /// 0x00753500` (`StreamPlayer::Pause` again for the speech stream);
     /// `Exit` calls `SpeechSystem::Resume @ 0x00753510` then
     /// `VoxClass::UnpauseEVA @ 0x00753620`. Neither call sits behind the
-    /// `FUN_0053bad0` gate that the SFX half does. The SFX half covers the
+    /// `0x0053BAD0` ChronoScreen gate that `Enter`'s SFX half does. `Exit`'s
+    /// SFX half has no gate: its resumes (`0x004037C0`, `0x00405040`,
+    /// `0x00751080`) each do nothing where nothing was paused. The SFX half covers the
     /// unit voice events (Voc channels natively); the stream half is
-    /// `eva_player`.
+    /// `eva_player`, and the speech stream SpeechSystem pauses is
+    /// `taunt_player`; movie holds pause both streams too
+    /// ([`Self::set_movie_held`]).
     ///
     /// Idempotent — call it with the current pause state every frame.
     pub fn set_paused(&mut self, paused: bool, now_ms: u64) {
@@ -2340,37 +2690,82 @@ impl SfxPlayer {
             return;
         }
         self.paused = paused;
-        self.apply_pause_edge(paused, now_ms, !self.chrono_screen_active);
+        let sounds = !paused || !self.chrono_screen_active;
+        if sounds {
+            self.game_pause_suspends_sounds = paused;
+        }
+        self.apply_pause_edge(paused, now_ms, sounds);
     }
-    ///5BF580/5BF530 own a distinct idempotent hold. Each source enters the
-    ///existing nested Sound/Vox owners; releasing a movie cannot resume a menu.
+    /// `Audio__PauseForMovie @ 0x005BF580` / `Audio__ResumeAfterMovie @
+    /// 0x005BF530`, the hold every movie takes: `VoxClass__PauseEVA` and
+    /// `Audio__PauseAllStreamPlayers @ 0x00408270`, which walks the stream
+    /// list `0x0087E810` that every `StreamPlayer` joins (`0x0040799E`): the
+    /// EVA and taunt streams here, Theme in `MusicPlayer`. Voc events keep
+    /// playing (at the halved effects master the caller sets) and new ones
+    /// still start; only full-screen `Play_Movie` also suspends them, through
+    /// [`Self::set_movie_sounds_suspended`].
     pub(crate) fn set_movie_held(&mut self, held: bool, now_ms: u64) {
+        self.now_ms = now_ms;
         if held == self.movie_held {
             return;
         }
         self.movie_held = held;
-        self.apply_pause_edge(held, now_ms, true);
+        self.vox.set_paused(held);
+        self.apply_output_pauses();
     }
+
+    /// `Audio__SuspendSoundEventsForMovie @ 0x00406EA0` /
+    /// `Audio__ResumeSoundEventsAfterMovie @ 0x00406EC0`, called only by
+    /// full-screen `Play_Movie` (`0x005BEE3E`/`0x005BEE62`,
+    /// `0x005BF09F`/`0x005BF0C9`): the same kind-1 channel pause and
+    /// `SoundSystem` / `VocClass` suspension as `GamePause::Enter`, without its
+    /// ChronoScreen gate.
+    pub(crate) fn set_movie_sounds_suspended(&mut self, suspended: bool, now_ms: u64) {
+        self.now_ms = now_ms;
+        if suspended == self.movie_sounds_suspended {
+            return;
+        }
+        self.movie_sounds_suspended = suspended;
+        self.set_sounds_suspended(suspended, now_ms);
+        self.apply_output_pauses();
+    }
+
     /// Both native callers enter the existing nested owners. The final output
     ///gate combines their reasons; neither caller owns another event pool.
     fn apply_pause_edge(&mut self, entering: bool, now_ms: u64, suspend_sounds: bool) {
         self.vox.set_paused(entering);
-        if entering && suspend_sounds {
+        if suspend_sounds {
+            self.set_sounds_suspended(entering, now_ms);
+        }
+        self.apply_output_pauses();
+    }
+
+    fn set_sounds_suspended(&mut self, entering: bool, now_ms: u64) {
+        if entering {
             self.arbiter.suspend_all(now_ms);
             self.suspend_coordinate_sounds(now_ms);
-        } else if suspend_sounds {
+        } else {
             self.resume_coordinate_sounds(now_ms);
             self.arbiter.resume_all(now_ms);
         }
+    }
+
+    fn streams_paused(&self) -> bool {
+        self.movie_held || self.paused
+    }
+
+    fn apply_output_pauses(&self) {
+        let voc_paused = self.movie_sounds_suspended || self.game_pause_suspends_sounds;
         for output in self.live.values() {
-            if self.movie_held || (self.paused && !self.chrono_screen_active) {
+            if voc_paused {
                 output.player.pause();
             } else {
                 output.player.play();
             }
         }
-        if let Some(output) = &self.eva_player {
-            if self.movie_held || self.paused {
+        let streams_paused = self.streams_paused();
+        for output in self.eva_player.iter().chain(self.taunt_player.iter()) {
+            if streams_paused {
                 output.player.pause();
             } else {
                 output.player.play();
@@ -2398,13 +2793,18 @@ impl SfxPlayer {
         self.apply_live_output_scales();
     }
 
-    /// The audio master `[0x0087E758]`: a multiplier over every live Voc
-    /// channel output (SFX and unit voices) without changing the saved
-    /// settings or foreground gate. The EVA stream is not chained to it (see
-    /// [`SfxChannel`]), so the scenario exits' fade to zero leaves an
-    /// announcement they queue audible to its end.
-    pub fn set_output_scale(&mut self, scale: f64) {
-        self.output_scale = scale.clamp(0.0, 1.0) as f32;
+    /// The process volume groups only lifecycle code writes: the effects
+    /// master `[0x0087E758]` over every Voc channel (SFX and unit voices) and
+    /// `[0x0087E750]` over the EVA stream, as current `0..=0x4000` linears.
+    /// Neither changes the saved settings or the foreground gate.
+    pub(crate) fn set_master_groups(&mut self, sound_master_linear: i32, eva_master_linear: i32) {
+        if (sound_master_linear, eva_master_linear)
+            == (self.sound_master_linear, self.eva_master_linear)
+        {
+            return;
+        }
+        self.sound_master_linear = sound_master_linear;
+        self.eva_master_linear = eva_master_linear;
         self.apply_live_output_scales();
     }
 
@@ -2422,7 +2822,12 @@ impl SfxPlayer {
 
     fn apply_live_output_scales(&self) {
         let scales = self.output_scales();
-        for output in self.live.values().chain(self.eva_player.iter()) {
+        for output in self
+            .live
+            .values()
+            .chain(self.eva_player.iter())
+            .chain(self.taunt_player.iter())
+        {
             output.apply_scales(scales);
         }
     }
@@ -2431,11 +2836,11 @@ impl SfxPlayer {
     /// remains, mirroring the poll performed inside native exit wait loops.
     pub fn pump_and_check_voices(
         &mut self,
-        registry: &SoundRegistry,
+        eva_registry: &EvaRegistry,
         assets: &AssetManager,
         audio_index: Option<&crate::assets::audio_bag::AudioIndex>,
     ) -> bool {
-        self.advance_voice_queue(registry, assets, audio_index);
+        self.advance_voice_queue(eva_registry, assets, audio_index);
         self.voices_active()
     }
 
@@ -2452,10 +2857,24 @@ impl SfxPlayer {
         // World replacement owns the wider Techno/Vox reset; the screen
         // effect's406E80 call only clears the shared event pool.
         self.voice_queue = VoiceQueue::new();
+        // The teardown drops a movie's stop hold with everything else, so
+        // it no longer keeps the streams it stops.
+        self.movie_held = false;
         self.stop_eva_stream();
+        // SpeechSystem::Stop `0x00752CA0`: every scenario exit and the
+        // restart stop the taunt stream.
+        if let Some(output) = self.taunt_player.take() {
+            output.player.stop();
+        }
+        // Every scenario end runs `0x0069BB40` (`ResetAll` at `0x0069BB82`)
+        // before GameExit's `StopAll(1)`: `Route_Scenario_Termination
+        // @ 0x0055D145`, `0x0055D1D3`, `0x0055D231`, `0x0055D27E`; so do
+        // Main_Game's exit `0x0048CEB4` and LoadMission `0x00559DBC`. Both
+        // depths go to zero.
         self.vox.reset_all();
         self.paused = false;
-        self.movie_held = false;
+        self.game_pause_suspends_sounds = false;
+        self.movie_sounds_suspended = false;
         self.voc_enabled = true;
         self.chrono_screen_active = false;
     }
@@ -2544,10 +2963,9 @@ impl SfxPlayer {
     }
 
     /// The identity one owner's handle names, live or kept.
-    pub fn handle_sound_id(&self, owner: u64) -> Option<String> {
+    pub fn handle_sound_id(&self, owner: u64) -> Option<&str> {
         self.arbiter
             .handle_sound_key(HandleOwner::Positional(owner))
-            .map(str::to_owned)
     }
 
     /// Number of live sound events — native `g_LiveSoundEventCount @
@@ -2562,12 +2980,21 @@ impl SfxPlayer {
     }
 
     /// `VoxClass::PumpAndCheckActive @ 0x007529E0`'s answer: the stream is
-    /// playing or a node waits in any queue. Non-blocking (rodio
-    /// `Player::empty()` is a poll). Used by the quit cascade and the
-    /// victory/defeat savour wait.
+    /// playing (a paused line is not, `0x00408070`) or a node waits in any
+    /// queue. Non-blocking (rodio `Player::empty()` is a poll). Used by the
+    /// quit cascade and the victory/defeat savour wait.
     pub fn voices_active(&self) -> bool {
-        self.vox.is_active(self.eva_stream_busy())
+        self.vox.is_active(stream_playing(&self.eva_player))
     }
+}
+
+/// `StreamPlayer::IsPlaying @ 0x00408070` reads the playing bit, which
+/// `Pause @ 0x00407FB0` and the movie pause `0x00408270` move to the paused
+/// bit: a stream with audio left plays only while unpaused.
+fn stream_playing(output: &Option<LiveSfxOutput>) -> bool {
+    output
+        .as_ref()
+        .is_some_and(|output| !output.player.empty() && !output.player.is_paused())
 }
 
 /// The registry entry for a Voc identity, or `None` for an unknown name — a
@@ -2596,9 +3023,8 @@ impl From<&SoundEntry> for EntryFacts {
             loop_count: entry.loop_count,
             delay_ms: entry.delay_ms,
             entry_volume_linear: entry.volume_linear,
-            // VERA reads `Sounds=` names without the audio index, so `+0x0C`
-            // (every name resolved, `AddSample @ 0x004064A0`) is not modelled.
-            samples_ok: !entry.sounds.is_empty(),
+            samples_ok: !entry.sounds.is_empty() && entry.samples_resolved,
+            samples_resolved: entry.samples_resolved,
         }
     }
 }
@@ -2627,6 +3053,7 @@ fn entry_facts(sound_id: &str, registry: &SoundRegistry) -> EntryFacts {
         delay_ms: (0, 0),
         entry_volume_linear: VOLUME_SCALE,
         samples_ok: true,
+        samples_resolved: true,
     }
 }
 
@@ -2662,40 +3089,44 @@ fn resolve_entry_playback_pass(
     )
 }
 
-/// Load a sound effect file and decode it to interleaved f32 stereo samples.
-///
-/// Resolution order:
-/// 1. Try the selected audio.bag index (most voice/EVA sounds live here)
-/// 2. Try MIX asset lookup by exact name
-/// 3. Try MIX asset lookup with .wav extension appended
-///
-/// Supports .wav (raw PCM), .aud (IMA ADPCM), and audio.bag formats.
+/// A sample decoded from its file bytes, without the [`ClipCache`]: what
+/// [`ClipCache::load`] gives for a name it has not kept.
+#[cfg(test)]
 fn load_sfx(
     filename: &str,
     assets: &AssetManager,
     audio_index: Option<&crate::assets::audio_bag::AudioIndex>,
 ) -> Option<DecodedAudio> {
-    // Try the selected audio.bag index first (voices, EVA announcements).
-    if let Some(index) = audio_index
-        && let Some((entry, data)) = index.get(filename)
-        && let Some(bag_audio) = crate::assets::audio_bag::decode_bag_audio(entry, data)
-    {
-        // Convert i16 → f32 stereo.
-        let stereo = upmix_i16_to_f32_stereo(&bag_audio.samples_i16, bag_audio.channels);
-        return Some(DecodedAudio {
-            samples: stereo,
-            sample_rate: bag_audio.sample_rate,
-            channels: 2,
-            native_frame_bytes: bag_audio.channels
-                * if entry.is_16bit() || entry.is_ima_adpcm() {
-                    2
-                } else {
-                    1
-                },
-        });
-    }
+    ClipCache::default().load(filename, assets, audio_index)
+}
 
-    // Try MIX asset lookup (exact name, then with .wav extension).
+/// Decode a sample from the selected audio.bag index (sound effects, voices
+/// and EVA announcements) to interleaved f32 stereo.
+fn decode_index_clip(
+    filename: &str,
+    index: &crate::assets::audio_bag::AudioIndex,
+) -> Option<DecodedAudio> {
+    let (entry, data) = index.get(filename)?;
+    let bag_audio = crate::assets::audio_bag::decode_bag_audio(entry, data)?;
+    let mut stereo = Vec::new();
+    upmix_i16_to_f32_stereo(&mut stereo, &bag_audio.samples_i16, bag_audio.channels);
+    Some(DecodedAudio {
+        samples: stereo.into(),
+        sample_rate: bag_audio.sample_rate,
+        channels: 2,
+        native_channels: bag_audio.channels,
+        native_sample_bytes: if entry.is_16bit() || entry.is_ima_adpcm() {
+            2
+        } else {
+            1
+        },
+    })
+}
+
+/// Decode a sample the audio index lacks from the MIX archives or loose
+/// files: the exact name, then with `.wav` appended; `.wav` (PCM or IMA
+/// ADPCM) or `.aud`.
+fn decode_archive_clip(filename: &str, assets: &AssetManager) -> Option<DecodedAudio> {
     let exact_name = format!("{}.wav", filename);
     let data: &[u8] = assets
         .get_ref(filename)
@@ -2713,30 +3144,30 @@ fn load_sfx(
     }
 
     // AUD is always mono — upmix to stereo for rodio.
-    let stereo = upmix_i16_to_f32_stereo(&samples, 1);
+    let mut stereo = Vec::new();
+    upmix_i16_to_f32_stereo(&mut stereo, &samples, 1);
     Some(DecodedAudio {
-        samples: stereo,
+        samples: stereo.into(),
         sample_rate: header.sample_rate as u32,
         channels: 2,
-        native_frame_bytes: 2,
+        native_channels: 1,
+        native_sample_bytes: 2,
     })
 }
 
-/// Convert i16 PCM samples to interleaved f32 stereo.
+/// Append i16 PCM samples to `out` as interleaved f32 stereo.
 /// Mono input is duplicated to both channels.
-fn upmix_i16_to_f32_stereo(samples: &[i16], channels: u16) -> Vec<f32> {
+pub(crate) fn upmix_i16_to_f32_stereo(out: &mut Vec<f32>, samples: &[i16], channels: u16) {
     if channels >= 2 {
         // Already stereo (or more) — just convert to f32.
-        samples.iter().map(|&s| s as f32 / 32768.0).collect()
+        out.extend(samples.iter().map(|&s| s as f32 / 32768.0));
     } else {
         // Mono → stereo: duplicate each sample.
-        samples
-            .iter()
-            .flat_map(|&s| {
-                let f = s as f32 / 32768.0;
-                [f, f]
-            })
-            .collect()
+        out.reserve(samples.len() * 2);
+        out.extend(samples.iter().flat_map(|&s| {
+            let f = s as f32 / 32768.0;
+            [f, f]
+        }));
     }
 }
 
@@ -2747,72 +3178,47 @@ fn upmix_i16_to_f32_stereo(samples: &[i16], channels: u16) -> Vec<f32> {
 /// Mono or stereo. This covers all RA2 sound effects and EVA voices.
 pub(crate) fn decode_wav(data: &[u8], filename: &str) -> Option<DecodedAudio> {
     let wav = crate::assets::wav_file::WavFile::parse(data)?;
-    let samples = match wav.format_tag {
-        1 => decode_pcm(wav.data, wav.channels, wav.bits_per_sample),
-        0x11 => decode_ima_adpcm(wav.data, wav.channels, wav.block_align),
-        _ => {
-            log::trace!(
-                "WAV: unsupported format tag {} for {}",
-                wav.format_tag,
-                filename
-            );
-            return None;
-        }
+    let Some(mut cursor) = crate::assets::wav_file::WavPcmCursor::new(&wav) else {
+        log::trace!(
+            "WAV: unsupported format tag {} ({}-bit) for {}",
+            wav.format_tag,
+            wav.bits_per_sample,
+            filename
+        );
+        return None;
     };
-    if samples.is_empty() {
+    let mut pcm = Vec::new();
+    while cursor.decode_next(wav.data, &mut pcm) {}
+    if pcm.is_empty() {
         return None;
     }
-    let stereo = if wav.channels == 1 {
-        samples.iter().flat_map(|&s| [s, s]).collect()
-    } else {
-        samples
-    };
+    let mut samples = Vec::new();
+    upmix_i16_to_f32_stereo(&mut samples, &pcm, wav.channels);
     Some(DecodedAudio {
-        samples: stereo,
+        samples: samples.into(),
         sample_rate: wav.sample_rate,
         channels: 2,
-        native_frame_bytes: wav.channels
-            * if wav.format_tag == 0x11 {
-                2
-            } else {
-                wav.bits_per_sample / 8
-            },
+        native_channels: wav.channels,
+        native_sample_bytes: if wav.format_tag == 0x11 {
+            2
+        } else {
+            wav.bits_per_sample / 8
+        },
     })
 }
 
-/// Decode IMA ADPCM WAV data into interleaved f32 samples.
-///
-/// `WAV__ParseHeader @ 0x00408610` maps `wFormatTag == 0x11` onto the same audio
-/// format descriptor the bag index fills, taking the block stride from the fmt
-/// chunk's `nBlockAlign` (`psVar6[6]`). `FUN_00409C40 @ 0x00409C40` then installs
-/// the one block decoder in the image, `IMA_ADPCM__DecodeBlock @ 0x0040AA70`, so
-/// WAV and bag IMA share a decoder natively and share `ima_adpcm::decode_blocks`
-/// here.
-fn decode_ima_adpcm(data: &[u8], channels: u16, block_align: u16) -> Vec<f32> {
-    crate::assets::ima_adpcm::decode_blocks(data, channels, block_align as u32)
-        .into_iter()
-        .map(|s| s as f32 / 32768.0)
-        .collect()
-}
-
-/// Convert raw PCM bytes to f32 samples. Output channel count matches input.
-fn decode_pcm(pcm: &[u8], channels: u16, bits_per_sample: u16) -> Vec<f32> {
-    match (bits_per_sample, channels) {
-        (16, _) => pcm
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
-            .collect(),
-        (8, _) => pcm.iter().map(|&b| (b as f32 - 128.0) / 128.0).collect(),
-        _ => {
-            log::trace!("WAV: unsupported {}bit {}ch PCM", bits_per_sample, channels);
-            Vec::new()
-        }
+/// Ares `File.Taunt=` uses the literal `~~` marker; the stock defaults use
+/// `%02i`. Either placeholder receives the two-digit taunt number.
+fn taunt_filename(pattern: &str, number: u8) -> String {
+    let number = format!("{number:02}");
+    if pattern.contains("~~") {
+        pattern.replace("~~", &number)
+    } else {
+        pattern.replace("%02i", &number)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
 mod tests {
     use super::*;
 
@@ -2836,6 +3242,7 @@ mod tests {
             player: &mut SfxPlayer,
             now: u64,
             registry: &SoundRegistry,
+            eva_registry: &EvaRegistry,
             assets: &AssetManager,
             index: Option<&crate::assets::audio_bag::AudioIndex>,
         ) {
@@ -2843,7 +3250,7 @@ mod tests {
             let mut draw = PlaybackDraws::new(move |low, high| main.ranged(low, high));
             player.service_device_outputs(now);
             if self.clock.admit(now) {
-                player.service_events(now, registry, assets, index, &mut draw);
+                player.service_events(now, registry, eva_registry, assets, index, &mut draw);
             }
         }
     }
@@ -3131,24 +3538,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn spatial_gain_volume_linear_is_ftol_capped_at_the_scale() {
-        assert_eq!(SpatialGain::CENTRED_FULL.volume_linear(), VOLUME_SCALE);
-        let half = SpatialGain {
-            volume: 0.5,
-            pan: PAN_CENTRE,
-        };
-        assert_eq!(half.volume_linear(), 8192);
-        let odd = SpatialGain {
-            volume: 400.0 / 600.0,
-            pan: PAN_CENTRE,
-        };
-        assert_eq!(
-            odd.volume_linear(),
-            X87Chop53::ftol_f64_low_masked(f64::from(400.0f32 / 600.0) * 16384.0)
-        );
-    }
-
     /// The `0x00816380` table (machine-read) against `round(1000 * log2(i /
     /// 100))` and the index arithmetic of `FUN_0040A6D0`.
     #[test]
@@ -3268,6 +3657,41 @@ mod tests {
         assert_eq!(facts.delay_ms, (0, 400));
     }
 
+    /// `VocClass::AddSample @ 0x004064A0`: a `Sounds=` name the audio index
+    /// lacks stores nothing and clears the entry's `+0x0C` (`0x00406510`), so
+    /// `AllocateFromPool @ 0x00405190` refuses every play (`0x004051B6`) even
+    /// though another name resolved. A 33rd token is refused before its lookup.
+    /// Read the stock way: Ares' AddSample (`0x1005AFA0`) never clears `+0x0C`.
+    #[test]
+    fn one_unresolvable_sample_name_silences_the_whole_entry() {
+        use crate::assets::audio_bag::{AudioIndex, test_support::build_idx};
+        use crate::rules::sound_ini::MAX_SAMPLES;
+        let index =
+            AudioIndex::from_idx_bag(&build_idx(&[("known", 0, 0, 22050, 0)]), Vec::new()).unwrap();
+        let full = vec!["known"; MAX_SAMPLES].join(" ");
+        let registry = SoundRegistry::from_ini_admitting(
+            &IniFile::from_str(&format!(
+                "[SoundList]\n1=Mixed\n2=Clean\n3=Full\n[Mixed]\nSounds=$known missing\n\
+                 [Clean]\nSounds=#KNOWN\n[Full]\nSounds={full} missing\n"
+            )),
+            Some(&index),
+        );
+        assert_eq!(registry.get("Mixed").unwrap().sounds, ["known"]);
+        let mut arbiter = SoundArbiter::new(0);
+        let mut play = |id: &str| {
+            let request = PlayRequest {
+                key: registry_key(id),
+                facts: entry_facts(id, &registry),
+                volume_linear: VOLUME_SCALE,
+                pan: VOLUME_SCALE / 2,
+            };
+            arbiter.submit(&request, 0).is_some()
+        };
+        assert!(!play("Mixed"));
+        assert!(play("Clean"));
+        assert!(play("Full"));
+    }
+
     /// `Control=random` over three samples: one `RandomRanged(0, 2)` draw and
     /// the equal-bounds pick that follows draws nothing.
     #[test]
@@ -3324,10 +3748,11 @@ mod tests {
 
     fn clip(value: f32, frames: usize, sample_rate: u32) -> DecodedAudio {
         DecodedAudio {
-            samples: vec![value; frames * 2],
+            samples: vec![value; frames * 2].into(),
             sample_rate,
             channels: 2,
-            native_frame_bytes: 2,
+            native_channels: 1,
+            native_sample_bytes: 2,
         }
     }
 
@@ -3342,18 +3767,20 @@ mod tests {
             _ => unreachable!(),
         })
         .expect("resolved");
-        assert_eq!(resolved.decoded.samples, vec![0.1, 0.1, 0.1, 0.1, 0.3, 0.3]);
+        assert_eq!(*resolved.decoded.samples, [0.1, 0.1, 0.1, 0.1, 0.3, 0.3]);
         assert_eq!(resolved.decoded.sample_rate, 22050 * 110 / 100);
         assert_eq!(rng.requests, vec![(0, 50)]);
 
-        // A rate mismatch keeps the first clip only.
+        // A rate mismatch chains at the first clip's rate (Fill409880 sets no
+        // new frequency).
         let mut rng = ScriptedRng::new(&[0]);
         let resolved = resolve_entry_playback(&e, &mut rng, |name| match name {
             "a" => Some(clip(0.1, 1, 22050)),
             _ => Some(clip(0.2, 1, 11025)),
         })
         .expect("resolved");
-        assert_eq!(resolved.decoded.samples, vec![0.1, 0.1]);
+        assert_eq!(*resolved.decoded.samples, [0.1, 0.1, 0.2, 0.2, 0.2, 0.2]);
+        assert_eq!(resolved.decoded.sample_rate, 22050 * 110 / 100);
 
         // Nothing loadable resolves to nothing.
         assert!(resolve_entry_playback(&e, &mut rng, |_| None).is_none());
@@ -3378,23 +3805,25 @@ mod tests {
 
     fn test_decoded_audio() -> DecodedAudio {
         DecodedAudio {
-            samples: vec![0.0, 0.0],
+            samples: vec![0.0, 0.0].into(),
             sample_rate: 22_050,
             channels: 2,
-            native_frame_bytes: 2,
+            native_channels: 1,
+            native_sample_bytes: 2,
         }
     }
 
     fn test_output_scales(
         sound_volume: f32,
         voice_volume: f32,
-        lifecycle_scale: f32,
+        sound_master_linear: i32,
         focus_output_scale: f32,
     ) -> SfxOutputScales {
         SfxOutputScales {
             sound_volume,
             voice_volume,
-            lifecycle_scale,
+            sound_master_linear,
+            eva_master_linear: VOLUME_SCALE,
             focus_output_scale,
             // The limiter idles at full scale until the summed authored
             // `Volume=` budget of the live events passes 100.
@@ -3404,21 +3833,15 @@ mod tests {
 
     #[test]
     fn gsi_01_02_focus_gate_restores_distinct_live_sfx_gains_absolutely() {
-        let inactive = test_output_scales(1.0, 0.4, 0.6, 0.0);
+        let inactive = test_output_scales(1.0, 0.4, VOLUME_SCALE, 0.0);
         let quiet = prepare_normal_sfx_output(test_decoded_audio(), 3277, inactive);
         let loud = prepare_normal_sfx_output(test_decoded_audio(), 12288, inactive);
 
         assert_eq!(quiet.initial_volume, 0.0);
         assert_eq!(loud.initial_volume, 0.0);
-        let active = test_output_scales(1.0, 0.4, 0.6, 1.0);
-        assert!(
-            (quiet.gain.effective(active) - native_volume_amplitude(3277) * 0.6).abs()
-                < f32::EPSILON
-        );
-        assert!(
-            (loud.gain.effective(active) - native_volume_amplitude(12288) * 0.6).abs()
-                < f32::EPSILON
-        );
+        let active = test_output_scales(1.0, 0.4, VOLUME_SCALE, 1.0);
+        assert_eq!(quiet.gain.effective(active), native_volume_amplitude(3277));
+        assert_eq!(loud.gain.effective(active), native_volume_amplitude(12288));
     }
 
     #[test]
@@ -3428,14 +3851,14 @@ mod tests {
         let armed_while_inactive = prepare_normal_sfx_output(
             test_decoded_audio(),
             5734,
-            test_output_scales(1.0, 0.4, 1.0, 0.0),
+            test_output_scales(1.0, 0.4, VOLUME_SCALE, 0.0),
         );
 
         assert_eq!(armed_while_inactive.initial_volume, 0.0);
         assert!(
             (armed_while_inactive
                 .gain
-                .effective(test_output_scales(1.0, 0.4, 1.0, 1.0))
+                .effective(test_output_scales(1.0, 0.4, VOLUME_SCALE, 1.0))
                 - native_volume_amplitude(5734))
             .abs()
                 < f32::EPSILON
@@ -3450,7 +3873,7 @@ mod tests {
         for (sound_volume, voice_volume, expected_sound, expected_voice) in
             [(0.0, 1.0, 0.0, half), (1.0, 0.0, half, 0.0)]
         {
-            let scales = test_output_scales(sound_volume, voice_volume, 1.0, 1.0);
+            let scales = test_output_scales(sound_volume, voice_volume, VOLUME_SCALE, 1.0);
             let sound = prepare_normal_sfx_output(test_decoded_audio(), 8192, scales);
             let eva = prepare_eva_stream_output(test_decoded_audio(), 8192, scales);
 
@@ -3460,7 +3883,7 @@ mod tests {
         let full = prepare_normal_sfx_output(
             test_decoded_audio(),
             VOLUME_SCALE,
-            test_output_scales(0.5, 1.0, 1.0, 1.0),
+            test_output_scales(0.5, 1.0, VOLUME_SCALE, 1.0),
         );
         assert_eq!(full.initial_volume, half);
     }
@@ -3473,7 +3896,7 @@ mod tests {
         let started_with_voice_enabled = prepare_eva_stream_output(
             test_decoded_audio(),
             13107,
-            test_output_scales(0.0, 1.0, 1.0, 1.0),
+            test_output_scales(0.0, 1.0, VOLUME_SCALE, 1.0),
         );
         assert!(
             (started_with_voice_enabled.initial_volume - native_volume_amplitude(13107)).abs()
@@ -3482,25 +3905,29 @@ mod tests {
         let started_with_voice_muted = prepare_eva_stream_output(
             test_decoded_audio(),
             13107,
-            test_output_scales(1.0, 0.0, 1.0, 1.0),
+            test_output_scales(1.0, 0.0, VOLUME_SCALE, 1.0),
         );
         assert_eq!(started_with_voice_muted.initial_volume, 0.0);
     }
 
-    /// The scenario exits fade the audio master `[0x0087E758]` to zero before
-    /// queueing their announcement (`0x00686605` then `0x00686616`). That
-    /// master is chained into Voc channels only, so a unit voice follows it
-    /// and the EVA stream does not; the many-sounds scaler is Voc-only too.
+    /// The scenario exits fade the effects master `[0x0087E758]` to zero
+    /// before queueing their announcement (`0x00686605` then `0x00686616`).
+    /// That master is `ch+0x9C` of Voc channels only, inside the linear
+    /// product before the DirectSound curve (`0x00402220` -> `0x0040A6D0`): a
+    /// quarter master on a 0.8 sound is table index 19 (-23.96 dB), not a
+    /// quarter of index 79's amplitude. The EVA stream and the many-sounds
+    /// scaler do not take it.
     #[test]
     fn scenario_exit_master_fade_leaves_the_eva_stream_alone() {
         let full = native_volume_amplitude(13107);
-        let faded = test_output_scales(1.0, 1.0, 0.25, 1.0);
+        let faded = test_output_scales(1.0, 1.0, 4096, 1.0);
         let voice = prepare_normal_sfx_output(test_decoded_audio(), 13107, faded);
-        assert!((voice.initial_volume - full * 0.25).abs() < f32::EPSILON);
+        assert_eq!(voice.initial_volume, native_volume_amplitude(3276));
+        assert!((20.0 * voice.initial_volume.log10() - -23.96).abs() < 0.01);
         let eva = prepare_eva_stream_output(test_decoded_audio(), 13107, faded);
         assert!((eva.initial_volume - full).abs() < f32::EPSILON);
 
-        let silenced = test_output_scales(1.0, 1.0, 0.0, 1.0);
+        let silenced = test_output_scales(1.0, 1.0, 0, 1.0);
         assert_eq!(
             prepare_normal_sfx_output(test_decoded_audio(), 13107, silenced).initial_volume,
             0.0
@@ -3514,7 +3941,7 @@ mod tests {
 
         let limited = SfxOutputScales {
             many_sounds_linear: VOLUME_SCALE / 2,
-            ..test_output_scales(1.0, 1.0, 1.0, 1.0)
+            ..test_output_scales(1.0, 1.0, VOLUME_SCALE, 1.0)
         };
         assert!(
             prepare_normal_sfx_output(test_decoded_audio(), 13107, limited).initial_volume < full
@@ -3526,21 +3953,26 @@ mod tests {
         );
 
         // The foreground gate is the primary buffer: it still silences both.
-        let background = test_output_scales(1.0, 1.0, 1.0, 0.0);
+        let background = test_output_scales(1.0, 1.0, VOLUME_SCALE, 0.0);
         assert_eq!(
             prepare_eva_stream_output(test_decoded_audio(), 13107, background).initial_volume,
             0.0
         );
     }
 
-    /// An empty voice pool and EVA queue report no active voices. Skips
-    /// gracefully when no audio device is available (CI).
     #[test]
-    fn voices_active_false_when_idle() {
-        let Some(player) = SfxPlayer::new() else {
-            return;
-        };
-        assert!(!player.voices_active());
+    fn the_taunt_stream_takes_no_master_and_no_exit_fade() {
+        let silent_masters = test_output_scales(0.0, 0.0, 0, 1.0);
+        let gain = SfxOutputGain::new(VOLUME_SCALE, SfxChannel::TauntStream);
+        assert_eq!(
+            gain.effective(silent_masters),
+            native_volume_amplitude(VOLUME_SCALE)
+        );
+        // The foreground gate is the primary buffer: it still silences it.
+        assert_eq!(
+            gain.effective(test_output_scales(1.0, 1.0, VOLUME_SCALE, 0.0)),
+            0.0
+        );
     }
 
     /// Original action21 lookup/admission controls, through the process's
@@ -3581,11 +4013,14 @@ mod tests {
                     })
                     .sum::<usize>();
             assert!(expected_count <= 1);
-            for (side_index, side) in [
-                (0, EvaSide::Allied),
-                (1, EvaSide::Russian),
-                (2, EvaSide::Yuri),
-            ] {
+            let rules = crate::rules::ruleset::RuleSet::from_ini(
+                &crate::rules::ini_parser::IniFile::from_str(
+                    "[Sides]\nGDI=ONE\nNod=TWO\nThirdSide=THREE\n",
+                ),
+            )
+            .unwrap();
+            for side_index in 0..3 {
+                player.set_eva_side(side_index, &rules);
                 player.stop_all();
                 player.set_paused(false, 1);
                 player.set_paused(true, 1);
@@ -3595,8 +4030,6 @@ mod tests {
                         Some(EvaType::Interrupt),
                         None,
                         definitions.eva(),
-                        side,
-                        definitions.sounds(),
                         &assets,
                         None
                     ),
@@ -3612,8 +4045,6 @@ mod tests {
                     name,
                     Some(EvaType::Interrupt),
                     definitions.eva(),
-                    side,
-                    definitions.sounds(),
                     &assets,
                     None
                 ));
@@ -3631,7 +4062,10 @@ mod tests {
                         row["entry"]["priority"].as_i64().unwrap() as i32
                     );
                     assert_eq!(
-                        node.sample,
+                        player
+                            .vox
+                            .sample_for(&node, definitions.eva())
+                            .unwrap_or(""),
                         row["entry"]["columns"][side_index.to_string()]
                             .as_str()
                             .unwrap()
@@ -3688,16 +4122,15 @@ mod tests {
             .unwrap();
         player.queue_unit_voice(7, "GIMove");
         player.visit_unit_voice(7, definitions.sounds());
-        service.pump(&mut player, now, definitions.sounds(), &assets, index);
-        assert!(player.play_eva(
-            "EVA_UnitReady",
-            None,
-            definitions.eva(),
-            EvaSide::Allied,
+        service.pump(
+            &mut player,
+            now,
             definitions.sounds(),
+            definitions.eva(),
             &assets,
             index,
-        ));
+        );
+        assert!(player.play_eva("EVA_UnitReady", None, definitions.eva(), &assets, index));
         assert_eq!(
             player.eva_player.as_ref().unwrap().player.volume() > 0.0,
             voice_volume > 0.0,
@@ -3766,6 +4199,7 @@ mod tests {
             &mut player,
             now + 1_000,
             definitions.sounds(),
+            definitions.eva(),
             &assets,
             index,
         );
@@ -3775,6 +4209,187 @@ mod tests {
                 .validate_loop_handle(HandleOwner::UnitVoice(7))
                 .is_some()
         );
+        player.stop_all();
+    }
+
+    /// A radar movie's hold (`0x005BF580`) pauses the EVA stream and leaves a
+    /// playing Voc sound running; only full-screen `Play_Movie` also
+    /// suspends it (`0x00406EA0`).
+    #[test]
+    fn movie_hold_pauses_eva_but_not_a_playing_sound() {
+        let Some((_root, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let Some(mut player) = SfxPlayer::new() else {
+            return;
+        };
+        let definitions = crate::rules::retail_ini_fixture::retail_audio_definitions()
+            .expect("retail audio definitions");
+        let loaded_index = crate::rules::retail_ini_fixture::retail_audio_index();
+        let index = loaded_index.map(|loaded| &loaded.index);
+        let mut service = TestAudioService::default();
+        player.set_volume(0.0);
+        player.queue_unit_voice(7, "GIMove");
+        player.visit_unit_voice(7, definitions.sounds());
+        service.pump(
+            &mut player,
+            1_000,
+            definitions.sounds(),
+            definitions.eva(),
+            &assets,
+            index,
+        );
+        let event = player
+            .arbiter
+            .validate_loop_handle(HandleOwner::UnitVoice(7))
+            .expect("reached head has an admitted handle");
+        assert!(player.play_eva("EVA_UnitReady", None, definitions.eva(), &assets, index));
+
+        player.set_movie_held(true, 1_000);
+        assert!(!player.live[&event].player.is_paused());
+        assert!(player.eva_player.as_ref().unwrap().player.is_paused());
+        player.set_movie_sounds_suspended(true, 1_000);
+        assert!(player.live[&event].player.is_paused());
+        player.stop_all();
+    }
+
+    /// A movie's stop hold (`+0x88`) refuses `StreamPlayer::Stop @
+    /// 0x00407F40`, so ChronoScreen's EVA stop (`0x007529A0`) leaves the
+    /// paused line; paused, it does not count as playing (`0x00408070`).
+    #[test]
+    fn movie_hold_keeps_the_paused_eva_line_through_a_stop() {
+        let Some((_root, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let Some(mut player) = output_player() else {
+            return;
+        };
+        let definitions = crate::rules::retail_ini_fixture::retail_audio_definitions()
+            .expect("retail audio definitions");
+        let loaded_index = crate::rules::retail_ini_fixture::retail_audio_index();
+        let index = loaded_index.map(|loaded| &loaded.index);
+        player.set_volume(0.0);
+        player.set_paused(false, 1_000);
+        assert!(player.play_eva("EVA_UnitReady", None, definitions.eva(), &assets, index));
+        player.set_movie_held(true, 1_000);
+        assert!(!player.voices_active());
+        player.stop_eva(true);
+        assert!(player.eva_player.is_some());
+        player.set_movie_held(false, 1_000);
+        assert!(player.voices_active());
+        player.stop_eva(true);
+        assert!(player.eva_player.is_none());
+        player.stop_all();
+    }
+
+    /// `PlayFile @ 0x00407B60` does nothing under a movie's stop hold, and
+    /// otherwise sets the playing bit whatever the pause count `+0x80`: a
+    /// taunt sent during a game pause plays at once.
+    #[test]
+    fn a_taunt_waits_out_no_pause_but_a_movie_hold_drops_it() {
+        let Some((_root, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let Some(mut player) = output_player() else {
+            return;
+        };
+        player.set_volume(0.0);
+        player.set_movie_held(true, 1_000);
+        player.play_taunt(0x01, &assets, None);
+        assert!(player.taunt_player.is_none());
+        player.set_movie_held(false, 1_000);
+        player.set_paused(true, 1_000);
+        player.play_taunt(0x01, &assets, None);
+        let taunt = player.taunt_player.as_ref().expect("retail TAUAM01.WAV");
+        assert!(!taunt.player.is_paused());
+        player.stop_all();
+    }
+
+    /// An output device, or `None` after a `SKIPPED` line: these tests need
+    /// a real stream to tell playing from paused.
+    fn output_player() -> Option<SfxPlayer> {
+        let player = SfxPlayer::new();
+        if player.is_none() {
+            eprintln!("SKIPPED: no audio output device");
+        }
+        player
+    }
+
+    /// The radar pass lifts a suspend (`0x006539AE..0x006539B7`) only while
+    /// ChronoScreen does not hold the screen; ChronoScreen's Finish resumes
+    /// on its own (`0x0053B714`).
+    #[test]
+    fn the_radar_pass_lifts_an_eva_suspend_unless_chrono_screen_holds() {
+        let Some((_root, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let Some(mut player) = output_player() else {
+            return;
+        };
+        let definitions = crate::rules::retail_ini_fixture::retail_audio_definitions()
+            .expect("retail audio definitions");
+        let eva = definitions.eva();
+        player.set_volume(0.0);
+        player.suspend_eva();
+        player.set_chrono_screen_active(true);
+        player.resume_eva_unless_chrono_screen();
+        assert!(!player.play_eva("EVA_UnitReady", None, eva, &assets, None));
+        player.set_chrono_screen_active(false);
+        player.resume_eva_unless_chrono_screen();
+        assert!(player.play_eva("EVA_UnitReady", None, eva, &assets, None));
+        player.stop_all();
+    }
+
+    /// `-X…Q` (`0x00A8ED64`) stops `PlayNextQueued @ 0x00752760` before its
+    /// dequeue; queueing still succeeds.
+    #[test]
+    fn the_quiet_switch_queues_eva_but_never_plays_it() {
+        let Some((_root, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let Some(mut player) = output_player() else {
+            return;
+        };
+        let definitions = crate::rules::retail_ini_fixture::retail_audio_definitions()
+            .expect("retail audio definitions");
+        let loaded_index = crate::rules::retail_ini_fixture::retail_audio_index();
+        let index = loaded_index.map(|loaded| &loaded.index);
+        player.set_volume(0.0);
+        player.set_paused(false, 1_000);
+        player.set_eva_quiet(true);
+        assert!(player.play_eva("EVA_UnitReady", None, definitions.eva(), &assets, index));
+        assert!(player.eva_player.is_none());
+        player.stop_all();
+    }
+
+    /// The done callback `0x00407A30` stamps the end time when the sample
+    /// runs out, so a pump that comes 600 ms late finds the 500 ms gap
+    /// (`0x00752794..0x007527D5`) already passed and starts the next line.
+    #[test]
+    fn a_late_pump_measures_the_eva_gap_from_the_real_end() {
+        let Some((_root, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let Some(mut player) = output_player() else {
+            return;
+        };
+        let definitions = crate::rules::retail_ini_fixture::retail_audio_definitions()
+            .expect("retail audio definitions");
+        let loaded_index = crate::rules::retail_ini_fixture::retail_audio_index();
+        let index = loaded_index.map(|loaded| &loaded.index);
+        let eva = definitions.eva();
+        player.set_volume(0.0);
+        let started = crate::util::time::Instant::now();
+        player.set_paused(false, 1_000);
+        assert!(player.play_eva("EVA_UnitReady", None, eva, &assets, index));
+        assert!(player.play_eva("EVA_ConstructionComplete", None, eva, &assets, index));
+        assert_eq!(player.current_eva_event(), Some("EVA_UNITREADY"));
+        player.eva_player.as_ref().unwrap().player.sleep_until_end();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap();
+        player.set_paused(false, 1_000 + elapsed);
+        player.advance_voice_queue(eva, &assets, index);
+        assert_eq!(player.current_eva_event(), Some("EVA_CONSTRUCTIONCOMPLETE"));
         player.stop_all();
     }
 
@@ -3799,6 +4414,44 @@ mod tests {
             "both Techno+4DC handles must own shared-pool events before service"
         );
         assert_eq!(player.arbiter.busy_channel_count(), 0);
+        player.stop_all();
+    }
+
+    /// `UnitClass::Deploy @ 0x00739971..0x007399B2` gives the building the
+    /// unit's voice handle and latch before the unit's destructor
+    /// (`0x006F4607` -> `0x00405C00`) runs, so the line an MCV is speaking
+    /// plays on and a held line still waits behind it.
+    #[test]
+    fn a_deploy_conversion_keeps_the_speaking_units_line() {
+        let Some(definitions) = crate::rules::retail_ini_fixture::retail_audio_definitions() else {
+            return;
+        };
+        let Some(mut player) = SfxPlayer::new() else {
+            return;
+        };
+        player.set_volume(0.0);
+        player.queue_unit_voice(3, "GISelect");
+        player.visit_unit_voice(3, definitions.sounds());
+        player.queue_unit_voice(3, "GIMove");
+        player.visit_unit_voice(3, definitions.sounds());
+        let line = player
+            .arbiter
+            .validate_loop_handle(HandleOwner::UnitVoice(3));
+        assert!(line.is_some());
+
+        player.move_unit_voice(3, 9);
+        player.destroy_unit_voice(3);
+
+        assert_eq!(
+            player
+                .arbiter
+                .validate_loop_handle(HandleOwner::UnitVoice(9)),
+            line,
+            "the unit's destructor must not stop the line the building took"
+        );
+        assert_eq!(player.voice_queue.playing_for(9), Some("GISELECT"));
+        assert_eq!(player.voice_queue.pending_for(9), Some("GIMOVE"));
+        assert_eq!(player.pending_unit_voice_owners(), BTreeSet::from([9]));
         player.stop_all();
     }
 
@@ -3827,6 +4480,7 @@ mod tests {
             &mut player,
             1_000,
             definitions.sounds(),
+            definitions.eva(),
             &assets,
             audio_index,
         );
@@ -3834,10 +4488,8 @@ mod tests {
             "EVA_UnitReady",
             None,
             definitions.eva(),
-            EvaSide::Allied,
-            definitions.sounds(),
             &assets,
-            audio_index,
+            audio_index
         ));
         assert!(player.eva_stream_busy());
         let eva_current = player.vox.current().cloned();
@@ -3866,6 +4518,61 @@ mod tests {
                 .validate_loop_handle(HandleOwner::UnitVoice(7))
                 .is_some()
         );
+        player.stop_all();
+    }
+
+    /// The time jump's `Speech__StopPlayback` (`0x007529A0`, from
+    /// `0x0053B508`) stops a playing line; `StreamPlayer::Stop` stamps the
+    /// stop moment as its end (`0x00407A60`), so a line queued next starts
+    /// once `PlayNextQueued`'s 500 ms gap has run (`0x007527A7..0x007527CF`).
+    /// SOV01's radar-movie announcement waited for the next jump without it.
+    /// Needs retail assets and an audio device; skips without either.
+    #[test]
+    fn stopped_eva_line_lets_the_queue_resume_after_the_gap() {
+        let Some((_root, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let Some(mut player) = SfxPlayer::new() else {
+            return;
+        };
+        player.set_volume(0.0);
+        let mut service = TestAudioService::default();
+        let definitions = crate::rules::retail_ini_fixture::retail_audio_definitions()
+            .expect("retail audio definitions");
+        let loaded_index = crate::rules::retail_ini_fixture::retail_audio_index();
+        let audio_index = loaded_index.map(|loaded| &loaded.index);
+        let mut pump = |player: &mut SfxPlayer, now| {
+            service.pump(
+                player,
+                now,
+                definitions.sounds(),
+                definitions.eva(),
+                &assets,
+                audio_index,
+            );
+        };
+        pump(&mut player, 1_000);
+        assert!(player.play_eva(
+            "EVA_UnitReady",
+            None,
+            definitions.eva(),
+            &assets,
+            audio_index
+        ));
+        assert!(player.eva_stream_busy());
+        pump(&mut player, 1_100);
+        player.stop_eva(true);
+        assert!(player.play_eva(
+            "EVA_LowPower",
+            None,
+            definitions.eva(),
+            &assets,
+            audio_index
+        ));
+        pump(&mut player, 1_600);
+        assert!(player.vox.current().is_none(), "the gap runs from the stop");
+        pump(&mut player, 1_700);
+        assert_eq!(player.current_eva_event(), Some("EVA_LOWPOWER"));
         player.stop_all();
     }
 
@@ -3930,6 +4637,106 @@ mod tests {
 
     #[test]
     #[ignore = "requires active-retail RA2_DIR and an audio output device"]
+    fn retail_power_on_position_stop_precedes_one_shot_release() {
+        use std::time::{Duration, Instant};
+
+        // Building43FC34 calls750D40 before destructor43BD1A Release. The
+        // former hard-stops a live positional one-shot at zero gain; the
+        // latter alone leaves its current buffer playing (406096..4060E7).
+        let (_, assets) = crate::rules::retail_ini_fixture::retail_assets().unwrap();
+        let definitions = crate::rules::retail_ini_fixture::retail_audio_definitions().unwrap();
+        let loaded_index = crate::rules::retail_ini_fixture::retail_audio_index();
+        let audio_index = loaded_index.map(|loaded| &loaded.index);
+        let entry = definitions.sounds().get("PowerOn").unwrap();
+        assert_eq!(entry.control, 0);
+        assert_eq!(entry.sounds, ["gpowon"]);
+        let mut player = SfxPlayer::new().expect("selected regression requires audio output");
+        let mut service = TestAudioService::default();
+        let epoch = Instant::now();
+        for position_first in [false, true] {
+            player.stop_all();
+            player
+                .observe_pcm(PcmObservationConfig {
+                    sound_ids: vec!["PowerOn".into()],
+                    max_events: 1,
+                    max_samples_per_event: 262_144,
+                })
+                .unwrap();
+            assert!(player.play_animation_sound_spatial(
+                7,
+                "PowerOn",
+                SpatialGain::CENTRED_FULL,
+                definitions.sounds(),
+            ));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                service.pump(
+                    &mut player,
+                    epoch.elapsed().as_millis() as u64,
+                    definitions.sounds(),
+                    definitions.eva(),
+                    &assets,
+                    audio_index,
+                );
+                if player.pcm_observer.as_ref().unwrap().pulled_nonzero() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "the device did not pull PowerOn");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let before = player.pcm_observer.as_ref().unwrap().recorded_samples();
+            if position_first {
+                player.update_looping_sound(7, None, definitions.sounds());
+            }
+            player.release_animation_sound(7);
+            assert!(player.handle_sound_id(7).is_none());
+            while !player.observed_pcm_settled() {
+                service.pump(
+                    &mut player,
+                    epoch.elapsed().as_millis() as u64,
+                    definitions.sounds(),
+                    definitions.eva(),
+                    &assets,
+                    audio_index,
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "the device did not finish PowerOn"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let report = player.finish_pcm_observation().unwrap();
+            assert!(!report.truncated);
+            assert_eq!(report.outputs.len(), 1);
+            let output = &report.outputs[0];
+            assert!(output.source_ended && !output.truncated);
+            assert_eq!(output.resolved_samples, ["gpowon"]);
+            if position_first {
+                assert!(
+                    output.sample_bits.len() < output.source_sample_count,
+                    "zero-gain position must cut the actual source short before Release"
+                );
+            } else {
+                assert!(output.sample_bits.len() >= output.source_sample_count);
+                assert!(
+                    output.sample_bits[before..]
+                        .iter()
+                        .any(|bits| f32::from_bits(*bits) != 0.0),
+                    "Release alone leaves the current one-shot audible"
+                );
+                assert_eq!(output.actions.last().unwrap().kind, "completed");
+            }
+            eprintln!(
+                "PowerOn position_first={position_first}: before={before} pulled={} decoded={}",
+                output.sample_bits.len(),
+                output.source_sample_count
+            );
+        }
+        player.stop_all();
+    }
+
+    #[test]
+    #[ignore = "requires active-retail RA2_DIR and an audio output device"]
     fn retail_squid_one_shot_device_release_detach_and_hard_stop() {
         let mut service = TestAudioService::default();
         use std::io::Write;
@@ -3974,6 +4781,7 @@ mod tests {
                     &mut player,
                     epoch.elapsed().as_millis() as u64,
                     definitions.sounds(),
+                    definitions.eva(),
                     &assets,
                     audio_index,
                 );
@@ -3998,6 +4806,7 @@ mod tests {
                     &mut player,
                     epoch.elapsed().as_millis() as u64,
                     definitions.sounds(),
+                    definitions.eva(),
                     &assets,
                     audio_index,
                 );
@@ -4124,6 +4933,7 @@ mod tests {
                 player,
                 epoch.elapsed().as_millis() as u64,
                 sounds,
+                definitions.eva(),
                 &assets,
                 audio_index,
             );
@@ -4187,7 +4997,7 @@ mod tests {
             assert_eq!(prior["frequency"], 1_000_000);
             prior["counter"].as_u64().unwrap() / 1_000
         };
-        let compare = |player: &SfxPlayer, row: &serde_json::Value| {
+        let compare = |player: &SfxPlayer, row: &serde_json::Value, registry: &EvaRegistry| {
             let after = &row["after"];
             let label = row["label"].as_str().unwrap();
             assert_eq!(
@@ -4217,7 +5027,10 @@ mod tests {
                     current.event,
                     selected["name"].as_str().unwrap().to_ascii_uppercase()
                 );
-                assert_eq!(current.sample, selected["allied"].as_str().unwrap());
+                assert_eq!(
+                    player.vox.sample_for(current, registry).unwrap_or(""),
+                    selected["allied"].as_str().unwrap()
+                );
             }
             // The stream is not a Voc channel: the shared Voc pool stays free.
             assert!(
@@ -4263,22 +5076,21 @@ mod tests {
             "EVA_UnitReady",
             None,
             definitions.eva(),
-            EvaSide::Allied,
-            definitions.sounds(),
             &assets,
-            audio_index,
+            audio_index
         ));
         service.pump(
             &mut player,
             now_ms(paused),
             definitions.sounds(),
+            definitions.eva(),
             &assets,
             audio_index,
         );
-        compare(&player, paused);
+        compare(&player, paused, definitions.eva());
         let unpaused = step("cadence", "original_unpause_keeps_native_pending");
         player.set_paused(false, now_ms(unpaused));
-        compare(&player, unpaused);
+        compare(&player, unpaused, definitions.eva());
         for label in [
             "whole_periodic_service_exact_33ms",
             "whole_periodic_service_34ms_real_stock_wave",
@@ -4288,16 +5100,21 @@ mod tests {
                 &mut player,
                 now_ms(native),
                 definitions.sounds(),
+                definitions.eva(),
                 &assets,
                 audio_index,
             );
-            compare(&player, native);
+            compare(&player, native, definitions.eva());
         }
         // Let the actual stock decoder/mixer queue finish. The controlled
         // wall-clock input2089 matches the native completed-stream witness;
         // no simulated playback-completion answer is supplied to this owner.
         player.eva_player.as_ref().unwrap().player.sleep_until_end();
         assert!(!player.eva_stream_busy());
+        // This test's clock is the native capture's, not real time: its
+        // worker saw the end at the next 2089 ms visit, so drop the
+        // real-time stamp rather than back-date into the synthetic clock.
+        player.eva_ran_out = None;
         for label in [
             "original_payload_worker_2089ms",
             "original_payload_end_exact_gap_queue_visit",
@@ -4307,18 +5124,19 @@ mod tests {
                 &mut player,
                 now_ms(native),
                 definitions.sounds(),
+                definitions.eva(),
                 &assets,
                 audio_index,
             );
-            compare(&player, native);
+            compare(&player, native, definitions.eva());
         }
         // The explicit voice wait-loop caller advances independently of the
         // periodic pass. Native752760 at2590 retires current/state2 even though
         // that is only1ms after the last periodic pass.
         let retired = step("buffer", "original_payload_end_after_gap_queue_visit");
         player.set_paused(false, now_ms(retired));
-        assert!(!player.pump_and_check_voices(definitions.sounds(), &assets, audio_index));
-        compare(&player, retired);
+        assert!(!player.pump_and_check_voices(definitions.eva(), &assets, audio_index));
+        compare(&player, retired, definitions.eva());
         player.stop_all();
         assert_eq!(player.vox.queued_count(), 0);
         assert!(player.vox.current().is_none());
@@ -4326,7 +5144,12 @@ mod tests {
         assert!(player.arbiter.live_event_count() == 0);
     }
 
-    fn build_test_wav(sample_rate: u32, bits: u16, channels: u16, samples: &[u8]) -> Vec<u8> {
+    pub(super) fn build_test_wav(
+        sample_rate: u32,
+        bits: u16,
+        channels: u16,
+        samples: &[u8],
+    ) -> Vec<u8> {
         let data_size: u32 = samples.len() as u32;
         let fmt_size: u32 = 16;
         let byte_rate: u32 = sample_rate * channels as u32 * bits as u32 / 8;
@@ -4360,25 +5183,6 @@ mod tests {
         assert_eq!(decoded.sample_rate, 22050);
         assert_eq!(decoded.channels, 2);
         assert_eq!(decoded.samples.len(), 8); // 4 mono → 4 stereo pairs
-    }
-
-    #[test]
-    fn test_decode_wav_8bit_mono() {
-        let pcm: Vec<u8> = vec![128, 128, 128, 128];
-        let wav = build_test_wav(11025, 8, 1, &pcm);
-        let decoded = decode_wav(&wav, "test.wav").expect("should decode");
-        assert_eq!(decoded.sample_rate, 11025);
-        for s in &decoded.samples {
-            assert!(s.abs() < 0.01);
-        }
-    }
-
-    #[test]
-    fn test_decode_wav_16bit_stereo() {
-        let pcm: Vec<u8> = vec![0xE8, 0x03, 0x18, 0xFC, 0x00, 0x00, 0x00, 0x00];
-        let wav = build_test_wav(44100, 16, 2, &pcm);
-        let decoded = decode_wav(&wav, "test.wav").expect("should decode");
-        assert_eq!(decoded.samples.len(), 4); // 2 stereo frames, already 2ch
     }
 
     /// Build a `wFormatTag == 0x11` (IMA ADPCM) WAV around a raw block payload.
@@ -4459,15 +5263,22 @@ mod tests {
             .collect();
         assert_eq!(got, want);
     }
+}
+
+#[cfg(all(test, tests_audio))]
+mod country_taunt_tests {
+    use super::taunt_filename;
 
     #[test]
-    fn test_decode_wav_too_short() {
-        assert!(decode_wav(&[0u8; 10], "short.wav").is_none());
-    }
-
-    #[test]
-    fn test_decode_pcm_empty() {
-        let samples = decode_pcm(&[], 1, 16);
-        assert!(samples.is_empty());
+    fn ares_and_stock_taunt_placeholders_both_take_the_number() {
+        assert_eq!(
+            taunt_filename("Taunts\tauam~~.wav", 3),
+            "Taunts\tauam03.wav"
+        );
+        assert_eq!(
+            taunt_filename("taunts\tauam%02i.wav", 8),
+            "taunts\tauam08.wav"
+        );
+        assert_eq!(taunt_filename("taunts\\fixed.wav", 1), "taunts\\fixed.wav");
     }
 }

@@ -31,8 +31,8 @@ hut gameplay projection remains identical: every hut byte, RNG word, callback,
 shot, impact and repair field above is unchanged. Raw FV timers/residuals and
 redundant frame-7 movement calls change as detailed in the [parent package](../README.md).
 The active source is `hut_joined_drive_crt.json.gz` and the active projection is
-`hut_drive_crt_vectors.json`. The prior packet and projection remain immutable
-superseded evidence; the same generator entrypoints target the corrected files. Huts join **after** the FV command; this does not establish ScenarioLoad
+`hut_drive_crt_vectors.json`. The prior projection is no longer in the
+repository (`promotion.json` keeps its digest); the same generator entrypoints target the corrected files. Huts join **after** the FV command; this does not establish ScenarioLoad
 population order. Other Buildings, Units, Infantry, initial ambient Anims, live
 Terrain AI, global Scenario/House phases and audio remain excluded. The source
 uses the inherited supplied human House; Neutral is the only fully constructed
@@ -69,7 +69,7 @@ publication owner and retains every executed state, RNG value and ordered trace.
 `projection.py` reuses the paid projection's raw decoders and selects literal
 native fields without recomputing gameplay.
 
-`original_execution.meta.json` preserves the completed external fresh write
-and independent fresh check's original source identities. Current corrected source pins are in `hut_joined_drive_crt.meta.json`.
+`original_execution.meta.json` preserves the original execution's scope,
+boundaries and payload identity.
 The previous `hut_joined.meta.json` and `receipt.json` remain historical records
 of the original relocation, not validation of corrected Drive startup.

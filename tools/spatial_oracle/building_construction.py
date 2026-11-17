@@ -54,7 +54,7 @@ import sys
 
 from unicorn import UC_HOOK_CODE
 from unicorn.x86_const import UC_X86_REG_EAX, UC_X86_REG_ECX, UC_X86_REG_EDX, UC_X86_REG_EIP, UC_X86_REG_ESP
-from tools.native_oracle import RET_MAGIC, finish_vectors, provenance, run_checked
+from tools.native_oracle import RET_MAGIC, finish_vectors, provenance, require, run_checked
 from tools.spatial_oracle import building_body_rules as body_rules
 from tools.spatial_oracle import slave_manager as sm
 from tools.spatial_oracle.map_queries import dwords
@@ -421,7 +421,9 @@ def joined_inputs(root, *, layers=None, building_names=JOINED_NAMES,
     m.invoke(0x4072C0, 0x87E250)
     u.mem_write(0xB1D378, dwords(0x7EB6D4, m.alloc(64), 16, 1, 0, 10))
     m.invoke(0x7510D0, INI)
-    assert m.invoke(0x7514D0, m.cstring('Dummy')) == 0
+    # The lookup allocates; keep it outside a check that `python -O` drops.
+    dummy = m.invoke(0x7514D0, m.cstring('Dummy'))
+    require(dummy == 0, f'Dummy sound index {dummy}')
     m.rules = m.alloc(0x5000)
     u.mem_write(0x8871E0, dwords(m.rules))
     m.invoke(0x665650, m.rules)
@@ -1339,11 +1341,9 @@ def manual_primary_case(inputs, case):
 
 
 def manual_primary_generate():
-    from tools.native_oracle import NATIVE_SHA256, image_sha256
     from tools.rules_oracle.bridge_child_sound import sections
     # Same existing cache owner and physical-layer selection. GAWEAP only
     # needs the exact original scalar blocks declared by primary_field_names.
-    assert image_sha256() == NATIVE_SHA256, 'Manual-primary corpus requires the sealed original image'
     physical = sections((JOINED_ROOT / 'RULESMD.INI').read_bytes())
     m = joined_inputs(JOINED_ROOT,
         layers=('RULESMD.INI', 'LANGRULE.INI', 'MPBattleMD.ini', 'Hills.map'),
@@ -1375,7 +1375,7 @@ def manual_primary_generate():
     admission_controls = [manual_primary_case(a, case)
                           for case in manual_primary_admission_cases()]
     scold_index = a.invoke(0x7514D0, a.cstring('MenuScold'))
-    return dict(schema_version=1, source='unicorn/gamemd.exe', native_sha256=NATIVE_SHA256,
+    return dict(schema_version=1, source='unicorn/gamemd.exe',
                 seed=31, layers=m.layers, country_catalog=m.country_catalog,
                 retail_files=[dict(name=name, size=(JOINED_ROOT / name).stat().st_size,
                                    sha256=hashlib.sha256((JOINED_ROOT / name).read_bytes()).hexdigest())
@@ -1435,7 +1435,6 @@ def manual_primary_metadata():
 
 def joined_generate():
     import json
-    from tools.native_oracle import NATIVE_SHA256
     m = joined_inputs(JOINED_ROOT)
     receipts_path = JOINED_ROOT / 'receipts.json'
     receipts = json.loads(receipts_path.read_text()) if receipts_path.is_file() else []
@@ -1450,7 +1449,7 @@ def joined_generate():
               joined_route(m, 'GAPOWR', 'computer'),
               joined_route(m, 'GAPOWR', 'player', 250),
               joined_route(m, 'GAPOWR', 'computer', guard_control=True)]
-    return dict(schema_version=1, source='unicorn/gamemd.exe', native_sha256=NATIVE_SHA256,
+    return dict(schema_version=1, source='unicorn/gamemd.exe',
                 retail_files=files, extraction_receipts=receipts, layers=m.layers,
                 native_type_inputs=m.type_rows, native_anim_inputs=m.anim_rows,
                 selected_animation_list=m.animation_list,

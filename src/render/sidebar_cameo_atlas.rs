@@ -1,7 +1,7 @@
 //! Sidebar cameo atlas.
 //!
-//! Loads build-palette cameo SHPs at map load time and packs them into a single
-//! GPU texture so the custom sidebar can draw real art in one batch.
+//! Loads build-palette cameo SHPs, or Ares PCXs with their embedded palettes,
+//! and packs them into one GPU texture for the sidebar's ordinary batch.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,8 +9,11 @@ use std::path::Path;
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::pal_file::Palette;
 use crate::assets::shp_file::ShpFile;
+use crate::i18n::cameo_labels::{CAMEO_HEIGHT, CAMEO_WIDTH, CameoLabel};
+use crate::render::atlas_growth;
 use crate::render::batch::{BatchRenderer, BatchTexture};
 use crate::render::gpu::GpuContext;
+use crate::render::sidebar_smoothing::{self, SmoothCopy, SmoothSource};
 use crate::rules::ruleset::RuleSet;
 
 const CAMEO_PADDING: u32 = 2;
@@ -35,28 +38,74 @@ pub struct SidebarCameoAtlas {
     entries: HashMap<String, SidebarCameoEntry>,
     /// Each type's `AltCameo=` image that loaded, by type id.
     alt_entries: HashMap<String, SidebarCameoEntry>,
+    /// Per-SuperWeaponType icons, independent of object IDs and filenames.
+    superweapon_entries: HashMap<String, SidebarCameoEntry>,
+    /// The atlas image and its cameos, kept for VERA's smooth sidebar
+    /// (`render::sidebar_smoothing`).
+    smooth_source: SmoothSource,
+    /// Their copy at the sidebar's draw scale while it is on.
+    smooth: Option<SmoothCopy>,
 }
 
 impl SidebarCameoAtlas {
+    /// Follow the smooth sidebar's scale; None draws the atlas's own pixels.
+    pub fn set_smooth_scale(
+        &mut self,
+        gpu: &GpuContext,
+        batch: &BatchRenderer,
+        scale: Option<u32>,
+    ) {
+        sidebar_smoothing::follow_scale(&mut self.smooth, &self.smooth_source, scale, gpu, batch);
+    }
+
+    /// The texture the sidebar draws its cameos from: the smooth copy when
+    /// there is one. It keeps the atlas's layout, so entries map unchanged.
+    pub fn sidebar_texture(&self) -> &BatchTexture {
+        self.smooth
+            .as_ref()
+            .and_then(SmoothCopy::texture)
+            .unwrap_or(&self.texture)
+    }
+
+    pub fn superweapon(&self, type_id: &str) -> Option<&SidebarCameoEntry> {
+        crate::util::native_string::with_ascii_uppercase(type_id, |key| {
+            self.superweapon_entries.get(key)
+        })
+    }
+
     pub fn get(&self, type_id: &str) -> Option<&SidebarCameoEntry> {
-        self.entries.get(&type_id.to_ascii_uppercase())
+        crate::util::native_string::with_ascii_uppercase(type_id, |key| self.entries.get(key))
+    }
+
+    /// Loaded-art admission for the shared alternate-cameo selector.
+    pub fn has_alternate(&self, type_id: &str) -> bool {
+        crate::util::native_string::with_ascii_uppercase(type_id, |key| {
+            self.alt_entries.contains_key(key)
+        })
     }
 
     /// The cameo `TechnoTypeClass::GetCameo @ 0x00712040` returns: the
     /// type's `AltCameo=` image when `alt` holds and it loaded
     /// (`pAltCameo != NULL`), else its plain cameo.
     pub fn cameo(&self, type_id: &str, alt: bool) -> Option<&SidebarCameoEntry> {
-        let key = type_id.to_ascii_uppercase();
-        alt.then(|| self.alt_entries.get(&key))
-            .flatten()
-            .or_else(|| self.entries.get(&key))
+        crate::util::native_string::with_ascii_uppercase(type_id, |key| {
+            alt.then(|| self.alt_entries.get(key))
+                .flatten()
+                .or_else(|| self.entries.get(key))
+        })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CameoKind {
+    Ordinary,
+    Promoted,
+    SuperWeapon,
 }
 
 struct RenderedCameo {
     type_id: String,
-    /// An `AltCameo=` image, packed into [`SidebarCameoAtlas::alt_entries`].
-    alt: bool,
+    kind: CameoKind,
     rgba: Vec<u8>,
     width: u32,
     height: u32,
@@ -64,6 +113,9 @@ struct RenderedCameo {
     canvas_height: u32,
     crop_x: u32,
     crop_y: u32,
+    /// Its baked-in name (`sidebar_smoothing::cameo_name_pixels`), one flag
+    /// per pixel of `rgba`; empty when it has none.
+    sharp: Vec<bool>,
 }
 
 pub fn build_sidebar_cameo_atlas(
@@ -73,6 +125,26 @@ pub fn build_sidebar_cameo_atlas(
     rules: &RuleSet,
     palette: &Palette,
 ) -> Option<SidebarCameoAtlas> {
+    let rendered = collect_sidebar_cameos(asset_manager, rules, palette);
+    if rendered.is_empty() {
+        log::warn!("Sidebar cameo atlas: no cameo art found");
+        return None;
+    }
+    let atlas = pack_cameos(gpu, batch, &rendered)?;
+    log::info!(
+        "Sidebar cameo atlas built: {} entries, {}x{} px",
+        atlas.entries.len() + atlas.superweapon_entries.len(),
+        atlas.texture.width,
+        atlas.texture.height
+    );
+    Some(atlas)
+}
+
+fn collect_sidebar_cameos(
+    asset_manager: &AssetManager,
+    rules: &RuleSet,
+    palette: &Palette,
+) -> Vec<RenderedCameo> {
     let mut rendered: Vec<RenderedCameo> = Vec::new();
     let type_ids = rules
         .building_ids
@@ -90,34 +162,14 @@ pub fn build_sidebar_cameo_atlas(
         }
     }
 
-    // Load superweapon sidebar images (e.g. BOLTICON, CHROICON).
-    // These are standalone SHP files in cameo(md).mix, not referenced in art.ini.
+    // Ares1005E410 selects a surface owned by this SuperWeaponType's extension.
+    // A shared invalid PCX filename may have a different SHP fallback per type.
     for sw in rules.super_weapons.values() {
-        if let Some(ref image_name) = sw.sidebar_image {
-            let upper = image_name.to_ascii_uppercase();
-            // Skip if already loaded (e.g. SPYPICON reused as unit cameo).
-            if rendered.iter().any(|r| !r.alt && r.type_id == upper) {
-                continue;
-            }
-            if let Some(cameo) = render_sw_cameo(&upper, asset_manager, palette) {
-                rendered.push(cameo);
-            }
+        if let Some(cameo) = render_superweapon_cameo(sw, asset_manager, palette, rules) {
+            rendered.push(cameo);
         }
     }
-
-    if rendered.is_empty() {
-        log::warn!("Sidebar cameo atlas: no cameo art found");
-        return None;
-    }
-
-    let atlas = pack_cameos(gpu, batch, &rendered)?;
-    log::info!(
-        "Sidebar cameo atlas built: {} entries, {}x{} px",
-        atlas.entries.len(),
-        atlas.texture.width,
-        atlas.texture.height
-    );
-    Some(atlas)
+    rendered
 }
 
 /// Export a side-by-side palette comparison sheet for a few cameos.
@@ -229,29 +281,59 @@ fn render_cameo(
         .object(type_id)
         .map(|obj| obj.image.clone())
         .unwrap_or_else(|| type_id.to_string());
-    let resolved_image = rules
-        .art()
-        .resolve_effective_image_id(type_id, &rules_image);
-    let resolved_cameo = rules.art().resolve_declared_cameo_id(type_id, &rules_image);
-
-    let mut candidates: Vec<String> = Vec::with_capacity(8);
-    push_unique(&mut candidates, format!("{resolved_cameo}.SHP"));
-    if !resolved_image.eq_ignore_ascii_case(&resolved_cameo) {
-        push_unique(&mut candidates, format!("{resolved_image}.SHP"));
+    let ares = rules.ares();
+    if ares
+        && let [Some(name), _] = rules
+            .art()
+            .resolve_declared_pcx_cameos(type_id, &rules_image)
+        && let Some(cameo) = render_pcx_cameo(type_id, name, asset_manager)
+    {
+        return Some(cameo);
     }
-    candidates.extend(legacy_cameo_fallback_candidates(
-        type_id,
-        &resolved_image,
-        &resolved_cameo,
-    ));
-
-    let (data, file_name) = candidates
-        .iter()
-        .find_map(|name| asset_manager.get_ref(name).map(|data| (data, name.clone())))?;
-    let cameo = render_shp_frame0(type_id, data, palette)?;
-    log::debug!("Sidebar cameo {} loaded from {}", type_id, file_name);
-    Some(cameo)
+    let custom = if ares {
+        techno_cameo_palette(type_id, &rules_image, rules, asset_manager)
+    } else {
+        None
+    };
+    let palette = custom.as_ref().unwrap_or(palette);
+    // `TechnoTypeClass::ReadINI` loads `<Cameo>.SHP` (`0x00715A1D..0x00715A3D`)
+    // and nothing else before the stock placeholder.
+    if let Some(declared) = rules.art().resolve_declared_cameo_id(type_id, &rules_image) {
+        let file_name = format!("{declared}.SHP");
+        if let Some(data) = asset_manager.get_ref(&file_name) {
+            let cameo = render_cameo_file(type_id, &file_name, data, palette)?;
+            log::debug!("Sidebar cameo {} loaded from {}", type_id, file_name);
+            return Some(cameo);
+        }
+    }
+    render_placeholder_cameo(type_id, rules, asset_manager, palette)
 }
+
+/// The picture of a type whose own cameo did not load: the stock
+/// `XXICON.SHP` that `TechnoTypeClass::ReadINI` (`0x00715A4F`), its savegame
+/// reload (`0x00716D15`) and `SuperWeaponTypeClass::ReadINI` (`0x006CEE33`)
+/// load then, or Phobos's `MissingCameo=` in its place.
+fn render_placeholder_cameo(
+    key: &str,
+    rules: &RuleSet,
+    asset_manager: &AssetManager,
+    palette: &Palette,
+) -> Option<RenderedCameo> {
+    #[cfg(feature = "phobos")]
+    {
+        render_missing_cameo(key, rules.missing_cameo(), asset_manager, palette)
+    }
+    #[cfg(not(feature = "phobos"))]
+    {
+        let _ = rules;
+        let cameo = render_shp_frame0(key, asset_manager.get_ref(XXICON)?, palette)?;
+        log::debug!("Sidebar cameo {key} fell back to {XXICON}");
+        Some(cameo)
+    }
+}
+
+/// The stock placeholder cameo (`0x008204FC`).
+const XXICON: &str = "XXICON.SHP";
 
 /// A type's `AltCameo=` image: `<AltCameo>.SHP`, read from the type's image
 /// section only (`TechnoTypeClass::ReadINI`, section `+0x1F8` at
@@ -266,37 +348,202 @@ fn render_alt_cameo(
         .object(type_id)
         .map(|obj| obj.image.clone())
         .unwrap_or_else(|| type_id.to_string());
+    // Ares3.0 Cameos1005E430..1005E470: use promoted PCX only if loaded;
+    // otherwise the ordinary PCX still takes precedence over an AltCameo SHP.
+    let ares = rules.ares();
+    if ares {
+        let [normal, promoted] = rules
+            .art()
+            .resolve_declared_pcx_cameos(type_id, &rules_image);
+        for name in [promoted, normal].into_iter().flatten() {
+            if let Some(mut cameo) = render_pcx_cameo(type_id, name, asset_manager) {
+                cameo.kind = CameoKind::Promoted;
+                return Some(cameo);
+            }
+        }
+    }
+    let custom = if ares {
+        techno_cameo_palette(type_id, &rules_image, rules, asset_manager)
+    } else {
+        None
+    };
+    let palette = custom.as_ref().unwrap_or(palette);
     let alt_cameo = rules
         .art()
         .resolve_declared_alt_cameo_id(type_id, &rules_image)?;
     let shp_name = format!("{alt_cameo}.SHP");
-    let mut cameo = render_shp_frame0(type_id, asset_manager.get_ref(&shp_name)?, palette)?;
-    cameo.alt = true;
+    let mut cameo = render_cameo_file(
+        type_id,
+        &shp_name,
+        asset_manager.get_ref(&shp_name)?,
+        palette,
+    )?;
+    cameo.kind = CameoKind::Promoted;
     log::debug!("Sidebar alt cameo {} loaded from {}", type_id, shp_name);
     Some(cameo)
+}
+
+/// Ares StripClass_Draw_Main (1005E390, hook 0x6A9A2A): a techno's SHP
+/// cameo draws with its art `CameoPalette` when that file loads, else
+/// CAMEO.PAL. The `~~~` theater placeholder is not resolved here (the atlas
+/// is not built per theater), so such a name keeps CAMEO.PAL.
+fn techno_cameo_palette(
+    type_id: &str,
+    rules_image: &str,
+    rules: &RuleSet,
+    asset_manager: &AssetManager,
+) -> Option<Palette> {
+    rules
+        .art()
+        .resolve_declared_cameo_palette(type_id, rules_image)
+        .and_then(|name| asset_manager.get_ref(name))
+        .and_then(|data| Palette::from_bytes(data).ok())
 }
 
 /// Load a superweapon sidebar image SHP directly by name.
 ///
 /// SW sidebar images are standalone SHP files (e.g. `BOLTICON.SHP`) in
 /// `cameo(md).mix`, not referenced in art.ini. No image/cameo resolution needed.
-fn render_sw_cameo(
-    image_name: &str,
+fn render_superweapon_cameo(
+    sw: &crate::rules::superweapon_type::SuperWeaponType,
     asset_manager: &AssetManager,
     palette: &Palette,
+    rules: &RuleSet,
 ) -> Option<RenderedCameo> {
-    let shp_name = format!("{image_name}.SHP");
-    let cameo = render_shp_frame0(image_name, asset_manager.get_ref(&shp_name)?, palette)?;
-    log::debug!("SW sidebar cameo {} loaded from {}", image_name, shp_name);
+    let key = &sw.id;
+    let ares = rules.ares();
+    if ares
+        && let Some(name) = sw.sidebar_pcx()
+        && let Some(mut cameo) = render_pcx_cameo(key, name, asset_manager)
+    {
+        cameo.kind = CameoKind::SuperWeapon;
+        return Some(cameo);
+    }
+    // Ares SidebarPalette (hooks 6A9948/6A9A2A): the type's own palette for
+    // its SHP cameo when the file loads, else CAMEO.PAL.
+    let custom = if ares {
+        sw.sidebar_palette()
+            .and_then(|name| asset_manager.get_ref(name))
+            .and_then(|data| Palette::from_bytes(data).ok())
+    } else {
+        None
+    };
+    let palette = custom.as_ref().unwrap_or(palette);
+    if let Some(image_name) = sw.sidebar_image.as_deref() {
+        let shp_name = format!("{image_name}.SHP");
+        if let Some(data) = asset_manager.get_ref(&shp_name)
+            && let Some(mut cameo) = render_cameo_file(key, &shp_name, data, palette)
+        {
+            cameo.kind = CameoKind::SuperWeapon;
+            log::debug!("SW sidebar cameo {} loaded from {}", image_name, shp_name);
+            return Some(cameo);
+        }
+    }
+    // `SuperWeaponTypeClass::ReadINI` loads `<SidebarImage>.SHP`
+    // (`0x006CEE0F..0x006CEE26`), else the placeholder.
+    let mut cameo = render_placeholder_cameo(key, rules, asset_manager, palette)?;
+    cameo.kind = CameoKind::SuperWeapon;
     Some(cameo)
+}
+
+/// One PCX as gamemd's PCX blit6BA580 draws it.
+pub(crate) struct NativePcxImage {
+    pub(crate) rgba: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+/// gamemd PCX blit 6BA580: embedded palette, then RGB(255,0,255) keyed in the
+/// packed surface-word domain. No house remap or cameo.pal applies. Ares PCX
+/// cameos and Phobos' superweapon sidebar art (`PCX::BlitToSurface`) both draw
+/// through it.
+///
+/// 8-bit indexed files always load. A 3-plane 24-bit file loads only with
+/// Phobos: 630310 packs its red, green and blue planes into the display word
+/// (630619..630665), and Phobos `RGB_PCX_Loader` (6B9D9C,
+/// `src/Misc/Hooks.PCX.cpp`) has the PCX cache load 6B9D00 keep that 16-bit
+/// surface. Without Phobos, the load's palette conversion (6B9DA3..6B9EC1)
+/// reads it as one byte per pixel and garbles it; VERA keeps the SHP fallback
+/// instead.
+pub(crate) fn decode_native_pcx(bytes: &[u8]) -> Option<NativePcxImage> {
+    let image = crate::assets::pcx_file::PcxFile::from_bytes(bytes).ok()?;
+    #[cfg(not(feature = "phobos"))]
+    if !image.is_indexed() {
+        return None;
+    }
+    let mut rgba = image.to_rgba(None);
+    crate::render::native_surface_format::ACTIVE_RETAIL_RGB565_PRESENTATION
+        .apply_packed_color_key_rgba8(&mut rgba, [255, 0, 255]);
+    Some(NativePcxImage {
+        rgba,
+        width: u32::from(image.width),
+        height: u32::from(image.height),
+    })
+}
+
+/// Ares3.0 Cameos1005E32D..1005E366 through `decode_native_pcx`. Normal,
+/// promoted and superweapon consumers share this decoder. Ares supplies
+/// a60x48 destination canvas;6BA5EF..600 uses source dimensions without scaling.
+/// https://ares-developers.github.io/Ares-docs/new/pcxcameos.html
+/// Phobos `MissingCameo=` reaches the same blit when it names a `.pcx`.
+fn render_pcx_cameo(
+    key: &str,
+    filename: &str,
+    asset_manager: &AssetManager,
+) -> Option<RenderedCameo> {
+    let image = decode_native_pcx(asset_manager.get_ref(filename)?)?;
+    log::debug!("Sidebar PCX cameo {key} loaded from {filename}");
+    // A loaded surface remains selected even if every word is keyed out.
+    // Cropping it to None would incorrectly select the legacy SHP instead.
+    Some(RenderedCameo {
+        type_id: key.to_ascii_uppercase(),
+        kind: CameoKind::Ordinary,
+        rgba: image.rgba,
+        width: image.width,
+        height: image.height,
+        canvas_width: 60,
+        canvas_height: 48,
+        crop_x: 0,
+        crop_y: 0,
+        sharp: Vec::new(),
+    })
+}
+
+/// Frame 0 of cameo file `file`, with the name the interface language draws
+/// on it, if any.
+fn render_cameo_file(
+    key: &str,
+    file: &str,
+    data: &[u8],
+    palette: &Palette,
+) -> Option<RenderedCameo> {
+    let label = crate::i18n::cameo_label(file);
+    render_labelled_frame0(key, data, palette, label.as_deref())
 }
 
 /// Frame 0 of a cameo SHP on its full canvas, keyed by `key`.
 fn render_shp_frame0(key: &str, data: &[u8], palette: &Palette) -> Option<RenderedCameo> {
-    let shp = ShpFile::from_bytes(data).ok()?;
+    render_labelled_frame0(key, data, palette, None)
+}
+
+/// [`render_shp_frame0`] with `label` drawn over the name in the picture,
+/// when the picture is the retail one it was made for.
+fn render_labelled_frame0(
+    key: &str,
+    data: &[u8],
+    palette: &Palette,
+    label: Option<&CameoLabel>,
+) -> Option<RenderedCameo> {
+    let mut shp = ShpFile::from_bytes(data).ok()?;
     if shp.frames.is_empty() {
         return None;
     }
+    let full_canvas = (usize::from(shp.width), usize::from(shp.height))
+        == (CAMEO_WIDTH, CAMEO_HEIGHT)
+        && (shp.frames[0].frame_x, shp.frames[0].frame_y) == (0, 0);
+    let label_row = label
+        .filter(|label| full_canvas && label.apply(&mut shp.frames[0].pixels))
+        .map(CameoLabel::first_row);
     let frame_rgba = shp.frame_to_rgba(0, palette).ok()?;
     let frame = &shp.frames[0];
     let full_w = shp.width as u32;
@@ -305,58 +552,79 @@ fn render_shp_frame0(key: &str, data: &[u8], palette: &Palette) -> Option<Render
         return None;
     }
     let mut full_rgba = vec![0u8; (full_w * full_h * 4) as usize];
-    blit_frame_into_full_bounds(&mut full_rgba, full_w, full_h, frame, &frame_rgba);
-    rendered_cameo_from_canvas(key, full_rgba, full_w, full_h)
-}
-
-/// Repo-only fallback guesses kept out of `rules::art_data`.
-///
-/// `needs verification`: these guesses match current repo behavior and common RA2
-/// sidebar conventions, but they are not part of exact art-data resolution.
-fn legacy_cameo_fallback_candidates(
-    type_id: &str,
-    resolved_image: &str,
-    resolved_cameo: &str,
-) -> Vec<String> {
-    let upper_type = type_id.to_ascii_uppercase();
-    let mut candidates: Vec<String> = Vec::with_capacity(8);
-
-    if !resolved_cameo.to_ascii_uppercase().ends_with("ICON") {
-        push_unique(&mut candidates, format!("{resolved_cameo}ICON.SHP"));
-    }
-    push_unique(&mut candidates, format!("{resolved_image}ICON.SHP"));
-
-    if !upper_type.eq_ignore_ascii_case(resolved_cameo)
-        && !upper_type.eq_ignore_ascii_case(resolved_image)
-    {
-        push_unique(&mut candidates, format!("{upper_type}ICON.SHP"));
-        push_unique(&mut candidates, format!("{upper_type}.SHP"));
-    }
-
-    for name in [&upper_type, resolved_image] {
-        if name.len() > 2 {
-            let prefix = &name[..2];
-            if matches!(prefix, "GA" | "NA" | "YA" | "CA") {
-                push_unique(&mut candidates, format!("{}ICON.SHP", &name[2..]));
-            }
+    blit_frame_into_full_bounds(&mut full_rgba, full_w, full_h, frame, &frame_rgba, 4);
+    let mut cameo = rendered_cameo_from_canvas(key, full_rgba, full_w, full_h)?;
+    let mut indices = vec![0u8; (full_w * full_h) as usize];
+    blit_frame_into_full_bounds(&mut indices, full_w, full_h, frame, &frame.pixels, 1);
+    // A label's band stays sharp whole: its letters are not Westwood's font.
+    let name = match label_row {
+        Some(row) => {
+            let mut sharp = vec![false; indices.len()];
+            sharp[row * full_w as usize..].fill(true);
+            sharp
         }
-    }
-
-    candidates
+        None => sidebar_smoothing::cameo_name_pixels(
+            &indices,
+            full_w as usize,
+            full_h as usize,
+            palette,
+        ),
+    };
+    cameo.sharp = (cameo.crop_y..cameo.crop_y + cameo.height)
+        .flat_map(|y| {
+            let start = (y * full_w + cameo.crop_x) as usize;
+            name[start..start + cameo.width as usize].iter().copied()
+        })
+        .collect();
+    Some(cameo)
 }
 
-fn push_unique(candidates: &mut Vec<String>, candidate: String) {
-    if !candidates.contains(&candidate) {
-        candidates.push(candidate);
+/// Phobos `[AudioVisual] MissingCameo=` for a type whose own cameo did not
+/// load, in place of the stock `XXICON.SHP` the game loads then.
+///
+/// `Replace_XXICON_With_New` (`0x715A4D` and `0x716D13` for TechnoTypes,
+/// `0x6CE8AA` and `0x6CEE31` for SuperWeaponTypes) loads a lowercased name
+/// other than `xxicon.shp` that contains `.shp` instead of the stock file.
+/// Over the stock handle, `StripClass_Draw_DrawMissing` (`0x6A99F3`) blits a
+/// name containing `.pcx` into the 60x48 cell. Otherwise, or when the
+/// configured file does not load, the stock `XXICON.SHP` draws.
+#[cfg(feature = "phobos")]
+fn render_missing_cameo(
+    key: &str,
+    name: &str,
+    asset_manager: &AssetManager,
+    palette: &Palette,
+) -> Option<RenderedCameo> {
+    let lower = name.to_ascii_lowercase();
+    if lower != "xxicon.shp"
+        && lower.contains(".shp")
+        && let Some(cameo) = asset_manager
+            .get_ref(name)
+            .and_then(|data| render_shp_frame0(key, data, palette))
+    {
+        log::debug!("Sidebar cameo {key} fell back to {name}");
+        return Some(cameo);
     }
+    let stock = asset_manager.get_ref(XXICON)?;
+    if lower.contains(".pcx")
+        && let Some(cameo) = render_pcx_cameo(key, name, asset_manager)
+    {
+        log::debug!("Sidebar cameo {key} fell back to {name}");
+        return Some(cameo);
+    }
+    let cameo = render_shp_frame0(key, stock, palette)?;
+    log::debug!("Sidebar cameo {key} fell back to {XXICON}");
+    Some(cameo)
 }
 
+/// Place a frame's pixels, `bytes` bytes each, on its SHP's full canvas.
 fn blit_frame_into_full_bounds(
-    full_rgba: &mut [u8],
+    full: &mut [u8],
     full_w: u32,
     full_h: u32,
     frame: &crate::assets::shp_file::ShpFrame,
-    frame_rgba: &[u8],
+    frame_pixels: &[u8],
+    bytes: u32,
 ) {
     let fw = frame.frame_width as u32;
     let fh = frame.frame_height as u32;
@@ -367,13 +635,13 @@ fn blit_frame_into_full_bounds(
         if dst_y >= full_h {
             break;
         }
-        let src_start = (y * fw * 4) as usize;
-        let dst_start = ((dst_y * full_w + fx) * 4) as usize;
+        let src_start = (y * fw * bytes) as usize;
+        let dst_start = ((dst_y * full_w + fx) * bytes) as usize;
         let copy_w = fw.min(full_w.saturating_sub(fx));
-        let byte_count = (copy_w * 4) as usize;
-        if src_start + byte_count <= frame_rgba.len() && dst_start + byte_count <= full_rgba.len() {
-            full_rgba[dst_start..dst_start + byte_count]
-                .copy_from_slice(&frame_rgba[src_start..src_start + byte_count]);
+        let byte_count = (copy_w * bytes) as usize;
+        if src_start + byte_count <= frame_pixels.len() && dst_start + byte_count <= full.len() {
+            full[dst_start..dst_start + byte_count]
+                .copy_from_slice(&frame_pixels[src_start..src_start + byte_count]);
         }
     }
 }
@@ -388,7 +656,7 @@ fn rendered_cameo_from_canvas(
         crop_visible_bounds(&full_rgba, canvas_width, canvas_height)?;
     Some(RenderedCameo {
         type_id: type_id.to_ascii_uppercase(),
-        alt: false,
+        kind: CameoKind::Ordinary,
         rgba,
         width,
         height,
@@ -396,6 +664,7 @@ fn rendered_cameo_from_canvas(
         canvas_height,
         crop_x,
         crop_y,
+        sharp: Vec::new(),
     })
 }
 
@@ -474,48 +743,53 @@ fn pack_cameos(
     batch: &BatchRenderer,
     cameos: &[RenderedCameo],
 ) -> Option<SidebarCameoAtlas> {
-    let mut indices: Vec<usize> = (0..cameos.len()).collect();
-    indices.sort_by(|&a, &b| cameos[b].height.cmp(&cameos[a].height));
-
-    let total_area: u64 = cameos
-        .iter()
-        .map(|cameo| {
-            (cameo.width as u64 + CAMEO_PADDING as u64)
-                * (cameo.height as u64 + CAMEO_PADDING as u64)
-        })
-        .sum();
     let max_texture_dim = gpu.device.limits().max_texture_dimension_2d;
-    let widest_cameo = cameos.iter().map(|cameo| cameo.width).max().unwrap_or(1);
-    let mut atlas_width =
-        ((total_area as f64).sqrt().ceil() as u32).clamp(widest_cameo.max(64), max_texture_dim);
-    let placements;
-    let atlas_height;
-
-    loop {
-        let (trial_placements, trial_height) = shelf_pack(cameos, &indices, atlas_width);
-        if trial_height <= max_texture_dim {
-            placements = trial_placements;
-            atlas_height = trial_height;
-            break;
-        }
-        if atlas_width >= max_texture_dim {
-            log::error!(
-                "Sidebar cameo atlas exceeds GPU limit even at max width: height={} limit={}",
-                trial_height,
-                max_texture_dim
-            );
-            return None;
-        }
-        atlas_width = (atlas_width.saturating_mul(2)).min(max_texture_dim);
+    let (pictures, picture_of) = distinct_pictures(cameos);
+    let widest_cameo = pictures
+        .iter()
+        .map(|&index| cameos[index].width)
+        .max()
+        .unwrap_or(1);
+    if widest_cameo > max_texture_dim {
+        log::error!("Sidebar cameo width {widest_cameo} exceeds GPU limit {max_texture_dim}");
+        return None;
+    }
+    let sizes: Vec<[u32; 2]> = pictures
+        .iter()
+        .map(|&index| [cameos[index].width, cameos[index].height])
+        .collect();
+    let plan = atlas_growth::plan_initial_shelves(
+        &sizes,
+        atlas_growth::InitialShelfPolicy {
+            padding: CAMEO_PADDING,
+            max_dim: max_texture_dim,
+            split_pages: false,
+        },
+    );
+    let atlas_width = plan.width;
+    let atlas_height = plan.single_page_height();
+    if atlas_height > max_texture_dim {
+        log::error!(
+            "Sidebar cameo atlas exceeds GPU limit even at max width: height={} limit={}",
+            atlas_height,
+            max_texture_dim
+        );
+        return None;
     }
     let mut rgba = vec![0u8; (atlas_width * atlas_height * 4) as usize];
+    let mut sharp = vec![false; (atlas_width * atlas_height) as usize];
+    let mut pieces = Vec::with_capacity(pictures.len());
+    let mut origins = vec![[0u32; 2]; pictures.len()];
     let mut entries = HashMap::with_capacity(cameos.len());
     let mut alt_entries = HashMap::new();
+    let mut superweapon_entries = HashMap::new();
     let aw = atlas_width as f32;
     let ah = atlas_height as f32;
 
-    for (idx, px, py) in placements {
-        let cameo = &cameos[idx];
+    for placed in &plan.placements {
+        let [px, py] = placed.origin;
+        origins[placed.index] = placed.origin;
+        let cameo = &cameos[pictures[placed.index]];
         for y in 0..cameo.height {
             let src_start = (y * cameo.width * 4) as usize;
             let dst_start = (((py + y) * atlas_width + px) * 4) as usize;
@@ -523,10 +797,18 @@ fn pack_cameos(
             rgba[dst_start..dst_start + byte_count]
                 .copy_from_slice(&cameo.rgba[src_start..src_start + byte_count]);
         }
-        let target = if cameo.alt {
-            &mut alt_entries
-        } else {
-            &mut entries
+        for (y, flags) in cameo.sharp.chunks_exact(cameo.width as usize).enumerate() {
+            let start = ((py as usize + y) * atlas_width as usize) + px as usize;
+            sharp[start..start + flags.len()].copy_from_slice(flags);
+        }
+        pieces.push([px, py, cameo.width, cameo.height]);
+    }
+    for (cameo, &picture) in cameos.iter().zip(&picture_of) {
+        let [px, py] = origins[picture];
+        let target = match cameo.kind {
+            CameoKind::Ordinary => &mut entries,
+            CameoKind::Promoted => &mut alt_entries,
+            CameoKind::SuperWeapon => &mut superweapon_entries,
         };
         target.insert(
             cameo.type_id.clone(),
@@ -544,47 +826,178 @@ fn pack_cameos(
         texture: batch.create_texture(gpu, &rgba, atlas_width, atlas_height),
         entries,
         alt_entries,
+        superweapon_entries,
+        smooth_source: SmoothSource::new(rgba, [atlas_width, atlas_height], pieces)
+            .with_sharp_pixels(sharp),
+        smooth: None,
     })
 }
 
-fn shelf_pack(
-    cameos: &[RenderedCameo],
-    indices: &[usize],
-    atlas_width: u32,
-) -> (Vec<(usize, u32, u32)>, u32) {
-    let mut placements: Vec<(usize, u32, u32)> = Vec::with_capacity(cameos.len());
-    let mut cursor_x = 0;
-    let mut cursor_y = 0;
-    let mut shelf_height = 0;
-    for &idx in indices {
-        let cameo = &cameos[idx];
-        if cursor_x + cameo.width > atlas_width {
-            cursor_y += shelf_height + CAMEO_PADDING;
-            cursor_x = 0;
-            shelf_height = 0;
-        }
-        placements.push((idx, cursor_x, cursor_y));
-        cursor_x += cameo.width + CAMEO_PADDING;
-        shelf_height = shelf_height.max(cameo.height);
-    }
-    let atlas_height = placements
+/// The distinct pictures among `cameos` (an index of each one's first cameo)
+/// and each cameo's picture: the many types that fall back to one placeholder
+/// share its atlas cell.
+fn distinct_pictures(cameos: &[RenderedCameo]) -> (Vec<usize>, Vec<usize>) {
+    type Picture<'a> = (&'a [u8], &'a [bool], [u32; 6]);
+    let mut first: HashMap<Picture<'_>, usize> = HashMap::with_capacity(cameos.len());
+    let mut pictures = Vec::new();
+    let picture_of = cameos
         .iter()
-        .map(|(idx, _, py)| py + cameos[*idx].height)
-        .max()
-        .unwrap_or(1);
-    (placements, atlas_height)
+        .enumerate()
+        .map(|(index, cameo)| {
+            let key = (
+                cameo.rgba.as_slice(),
+                cameo.sharp.as_slice(),
+                [
+                    cameo.width,
+                    cameo.height,
+                    cameo.canvas_width,
+                    cameo.canvas_height,
+                    cameo.crop_x,
+                    cameo.crop_y,
+                ],
+            );
+            *first.entry(key).or_insert_with(|| {
+                pictures.push(index);
+                pictures.len() - 1
+            })
+        })
+        .collect();
+    (pictures, picture_of)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_s_z))]
 mod tests {
-    use super::{legacy_cameo_fallback_candidates, rendered_cameo_from_canvas};
+    use super::rendered_cameo_from_canvas;
 
+    /// A 60x48, one-frame SHP of `pixels`.
+    fn full_cameo_shp(pixels: &[u8]) -> Vec<u8> {
+        let mut shp = Vec::new();
+        for word in [0u16, 60, 48, 1] {
+            shp.extend_from_slice(&word.to_le_bytes());
+        }
+        let mut frame = [0u8; 24];
+        frame[4..6].copy_from_slice(&60u16.to_le_bytes());
+        frame[6..8].copy_from_slice(&48u16.to_le_bytes());
+        frame[8] = 1;
+        frame[20..24].copy_from_slice(&32u32.to_le_bytes());
+        shp.extend_from_slice(&frame);
+        shp.extend_from_slice(pixels);
+        shp
+    }
+
+    /// A language's label redraws its retail cameo's name band and keeps the
+    /// band sharp; a picture that is not that retail one draws as it is.
     #[test]
-    fn test_legacy_cameo_fallbacks_start_after_declared_candidates() {
-        let candidates = legacy_cameo_fallback_candidates("GACNST", "GACNST", "CIVICON");
-        assert_eq!(candidates[0], "GACNSTICON.SHP");
-        assert!(candidates.contains(&"CNSTICON.SHP".to_string()));
-        assert!(!candidates.contains(&"CIVICONICON.SHP".to_string()));
+    fn a_language_label_redraws_the_retail_cameos_name_band() {
+        use super::{render_labelled_frame0, render_shp_frame0};
+        use crate::assets::pal_file::Palette;
+        use crate::i18n::cameo_labels::{CAMEO_HEIGHT, CAMEO_WIDTH, parse, test_support};
+
+        const BAND: usize = 40;
+        let palette = Palette::from_rgb(|index| [index, index, index]);
+        let retail = vec![1u8; CAMEO_WIDTH * CAMEO_HEIGHT];
+        let mut translated = retail.clone();
+        translated[BAND * CAMEO_WIDTH..].fill(2);
+        let labels = parse(&test_support::label_file(
+            "x.shp",
+            BAND,
+            &retail,
+            &translated,
+        ))
+        .unwrap();
+        let label = Some(labels["x.shp"].as_ref());
+
+        let drawn = render_labelled_frame0("X", &full_cameo_shp(&retail), &palette, label).unwrap();
+        let expected = render_shp_frame0("X", &full_cameo_shp(&translated), &palette).unwrap();
+        assert_eq!(drawn.rgba, expected.rgba);
+        assert!(!drawn.sharp[BAND * CAMEO_WIDTH - 1]);
+        assert!(drawn.sharp[BAND * CAMEO_WIDTH..].iter().all(|&sharp| sharp));
+
+        let other = full_cameo_shp(&vec![3u8; CAMEO_WIDTH * CAMEO_HEIGHT]);
+        let drawn = render_labelled_frame0("X", &other, &palette, label).unwrap();
+        assert_eq!(
+            drawn.rgba,
+            render_shp_frame0("X", &other, &palette).unwrap().rgba
+        );
+    }
+
+    #[cfg(feature = "phobos")]
+    fn missing_cameo_rules(name: &str, art: &str) -> crate::rules::ruleset::RuleSet {
+        use crate::rules::{ini_parser::IniFile, ruleset::RuleSet};
+        let ini = IniFile::from_str(&format!(
+            "[AudioVisual]\nMissingCameo={name}\n[BuildingTypes]\n0=NOART\n[NOART]\n"
+        ));
+        let art = IniFile::from_str(art);
+        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
+        rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
+        rules
+    }
+
+    /// `Replace_XXICON_With_New` (`0x715A4D`) loads a configured `.shp` in
+    /// place of the stock `XXICON.SHP`; one that does not load leaves the
+    /// stock file.
+    #[cfg(feature = "phobos")]
+    #[test]
+    fn a_type_without_art_takes_the_configured_shp_else_the_stock_xxicon() {
+        use crate::{
+            assets::asset_manager::AssetManager, assets::pal_file::Palette,
+            map::source::test_support::TestDirectory,
+        };
+        let palette = Palette::from_rgb(|_| [1, 2, 3]);
+        let rules = missing_cameo_rules("PLACEHOLDER.SHP", "[NOART]\n");
+        assert_eq!(rules.missing_cameo(), "PLACEHOLDER.SHP");
+        let dir = TestDirectory::new("cameo-missing-shp");
+        write_small_shp(&dir, "placeholder.shp");
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let cameo = super::render_cameo("NOART", &assets, &rules, &palette).unwrap();
+        assert_eq!([cameo.canvas_width, cameo.canvas_height], [2, 2]);
+
+        let stock = TestDirectory::new("cameo-missing-shp-stock");
+        write_small_shp(&stock, "xxicon.shp");
+        let assets = AssetManager::from_loose_root_for_test(stock.path());
+        assert!(super::render_cameo("NOART", &assets, &rules, &palette).is_some());
+    }
+
+    /// `StripClass_Draw_DrawMissing` (`0x6A99F3`) blits a configured `.pcx`
+    /// over the stock `XXICON.SHP` handle, so it needs that file to load.
+    #[cfg(feature = "phobos")]
+    #[test]
+    fn the_configured_pcx_draws_over_the_stock_xxicon() {
+        use crate::{
+            assets::asset_manager::AssetManager, assets::pal_file::Palette,
+            map::source::test_support::TestDirectory,
+        };
+        let palette = Palette::from_rgb(|_| [1, 2, 3]);
+        let rules = missing_cameo_rules("PLACEHOLDER.PCX", "[NOART]\n");
+        let dir = TestDirectory::new("cameo-missing-pcx");
+        write_pcx(&dir, "placeholder.pcx", [20, 40, 60]);
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        assert!(super::render_cameo("NOART", &assets, &rules, &palette).is_none());
+
+        write_small_shp(&dir, "xxicon.shp");
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let cameo = super::render_cameo("NOART", &assets, &rules, &palette).unwrap();
+        assert_eq!([cameo.canvas_width, cameo.canvas_height], [60, 48]);
+        assert_eq!(&cameo.rgba[8..12], &[20, 40, 60, 255]);
+    }
+
+    #[cfg(feature = "phobos")]
+    #[test]
+    fn declared_cameo_art_still_wins_over_the_missing_cameo() {
+        use crate::{
+            assets::asset_manager::AssetManager, assets::pal_file::Palette,
+            map::source::test_support::TestDirectory,
+        };
+        let dir = TestDirectory::new("cameo-missing-precedence");
+        write_old_cameos(&dir);
+        // A 60x48 placeholder would be unmistakable if it were selected.
+        write_small_shp(&dir, "xxicon.shp");
+        write_pcx(&dir, "placeholder.pcx", [20, 40, 60]);
+        let rules = missing_cameo_rules("PLACEHOLDER.PCX", "[NOART]\nCameo=OLDICON\n");
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let palette = Palette::from_rgb(|_| [1, 2, 3]);
+        let cameo = super::render_cameo("NOART", &assets, &rules, &palette).unwrap();
+        assert_eq!([cameo.canvas_width, cameo.canvas_height], [2, 2]);
     }
 
     #[test]
@@ -607,5 +1020,566 @@ mod tests {
         assert_eq!([cameo.crop_x, cameo.crop_y], [1, 2]);
         assert_eq!([cameo.width, cameo.height], [4, 2]);
         assert_eq!(cameo.rgba.len(), 4 * 2 * 4);
+    }
+
+    /// A type without `Cameo=` and a super weapon without `SidebarImage=` show
+    /// the stock `XXICON.SHP` (`0x00715A4F`, `0x006CEE33`), never the type's
+    /// body art.
+    #[test]
+    fn missing_cameo_art_shows_the_stock_placeholder() {
+        use crate::{
+            assets::asset_manager::AssetManager,
+            assets::pal_file::Palette,
+            map::source::test_support::TestDirectory,
+            rules::{
+                art_data::ArtRegistry, ini_parser::IniFile, ruleset::RuleSet,
+                superweapon_type::SuperWeaponType,
+            },
+        };
+        let dir = TestDirectory::new("cameo-stock-placeholder");
+        write_small_shp(&dir, "body.shp");
+        dir.write(
+            "xxicon.shp",
+            &full_cameo_shp(&[1; super::CAMEO_WIDTH * super::CAMEO_HEIGHT]),
+        );
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let palette = Palette::from_rgb(|_| [1, 2, 3]);
+        let art = IniFile::from_str("[BODY]\n");
+        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+            &IniFile::from_str("[BuildingTypes]\n0=TEST\n[TEST]\nImage=BODY\n"),
+            &art,
+        )
+        .unwrap();
+        rules.install_art_data(ArtRegistry::from_ini(&art));
+        let cameo = super::render_cameo("TEST", &assets, &rules, &palette).unwrap();
+        assert_eq!([cameo.canvas_width, cameo.canvas_height], [60, 48]);
+
+        let ini = IniFile::from_str("[SW]\nType=PsychicReveal\n");
+        let sw = SuperWeaponType::from_ini_section("SW", ini.section("SW").unwrap());
+        let cameo = super::render_superweapon_cameo(&sw, &assets, &palette, &rules).unwrap();
+        assert_eq!([cameo.canvas_width, cameo.canvas_height], [60, 48]);
+    }
+
+    // These run through the production rules/art reader and actual atlas
+    // loader, with a body SHP trap reproducing the reported wrong-art fallback.
+    fn cameo_rules() -> crate::rules::ruleset::RuleSet {
+        use crate::rules::{art_data::ArtRegistry, ini_parser::IniFile, ruleset::RuleSet};
+        let art = IniFile::from_str(
+            "[TEST]\nCameoPCX=wrong-type.pcx\n\
+                 [IMAGE]\nImage=BODY\nCameo=OLDICON\nAltCameo=OLDALT\nCameoPCX=Normal.PCX\nAltCameoPCX=Promoted.PCX\n\
+                 [BODY]\nCameoPCX=wrong-body.pcx\n",
+        );
+        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+            &IniFile::from_str("[BuildingTypes]\n0=TEST\n[TEST]\nImage=IMAGE\n"),
+            &art,
+        )
+        .unwrap();
+        // The production loader installs the metadata after the fixed ART
+        // rules pass; fixed-art input alone does not publish visual metadata.
+        rules.install_art_data(ArtRegistry::from_ini(&art));
+        rules
+    }
+
+    /// A 2x2, one-frame SHP whose four pixels are palette index 1.
+    fn write_small_shp(dir: &crate::map::source::test_support::TestDirectory, name: &str) {
+        let mut shp = Vec::new();
+        for word in [0u16, 2, 2, 1] {
+            shp.extend_from_slice(&word.to_le_bytes());
+        }
+        let mut frame = [0u8; 24];
+        frame[4..6].copy_from_slice(&2u16.to_le_bytes());
+        frame[6..8].copy_from_slice(&2u16.to_le_bytes());
+        frame[8] = 1;
+        frame[20..24].copy_from_slice(&32u32.to_le_bytes());
+        shp.extend_from_slice(&frame);
+        shp.extend_from_slice(&[1; 4]);
+        dir.write(name, &shp);
+    }
+
+    fn write_old_cameos(dir: &crate::map::source::test_support::TestDirectory) {
+        for name in ["oldicon.shp", "oldalt.shp", "body.shp"] {
+            write_small_shp(dir, name);
+        }
+    }
+
+    fn write_pcx(
+        dir: &crate::map::source::test_support::TestDirectory,
+        name: &str,
+        color: [u8; 3],
+    ) {
+        let mut bytes = vec![0u8; 128];
+        bytes[0] = 0x0a;
+        bytes[2] = 1;
+        bytes[3] = 8;
+        bytes[8..10].copy_from_slice(&59u16.to_le_bytes());
+        bytes[10..12].copy_from_slice(&47u16.to_le_bytes());
+        bytes[65] = 1;
+        bytes[66..68].copy_from_slice(&60u16.to_le_bytes());
+        let mut pixels = vec![2u8; 60 * 48];
+        pixels[..6].copy_from_slice(&[0, 1, 2, 3, 4, 5]);
+        bytes.extend_from_slice(&pixels);
+        bytes.push(0x0c);
+        let mut palette = [0u8; 768];
+        palette[0..3].copy_from_slice(&[10, 20, 30]); // index0 remains visible
+        palette[3..6].copy_from_slice(&[255, 0, 255]); // F81F key
+        palette[6..9].copy_from_slice(&color);
+        palette[9..12].copy_from_slice(&[248, 3, 248]); // also F81F after packing
+        palette[12..15].copy_from_slice(&[0, 0, 0]); // opaque black
+        palette[15..18].copy_from_slice(&[248, 0, 240]); // F81E, not the key
+        bytes.extend_from_slice(&palette);
+        dir.write(name, &bytes);
+    }
+
+    /// Runs for a game Ares plays in and one it does not.
+    #[test]
+    fn cameo_pcx_feature_gate_embedded_palette_and_packed_key() {
+        for ares in [false, true] {
+            let _ares = crate::rules::ares_switch::read_ares_way(ares);
+            assert_eq!(cameo_rules().ares(), ares);
+            cameo_pcx_case();
+        }
+    }
+
+    fn cameo_pcx_case() {
+        use crate::{
+            assets::asset_manager::AssetManager, assets::pal_file::Palette,
+            map::source::test_support::TestDirectory,
+        };
+        let dir = TestDirectory::new("cameo-pcx");
+        write_old_cameos(&dir);
+        write_pcx(&dir, "normal.pcx", [17, 41, 83]);
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let wrong_palette = Palette::from_rgb(|_| [200, 10, 180]);
+        let rules = cameo_rules();
+        let cameo = super::render_cameo("TEST", &assets, &rules, &wrong_palette).unwrap();
+        if rules.ares() {
+            assert_eq!([cameo.canvas_width, cameo.canvas_height], [60, 48]);
+            assert_eq!(&cameo.rgba[0..4], &[10, 20, 30, 255]);
+            assert_eq!(&cameo.rgba[4..8], &[255, 0, 255, 0]);
+            assert_eq!(&cameo.rgba[8..12], &[17, 41, 83, 255]);
+            assert_eq!(cameo.rgba[15], 0, "packed F81F is transparent too");
+            // Original6BA580 word control: F81F skips,0000 andF81E write.
+            assert_eq!(&cameo.rgba[16..20], &[0, 0, 0, 255]);
+            assert_eq!(cameo.rgba[23], 255);
+        } else {
+            assert_eq!([cameo.canvas_width, cameo.canvas_height], [2, 2]);
+            assert_eq!(&cameo.rgba[0..4], &[200, 10, 180, 255]);
+        }
+    }
+
+    #[test]
+    fn a_24_bit_pcx_loads_only_with_phobos() {
+        // 2x1 in three RLE planes: magenta, then a colour. `C1 FF` is a
+        // one-byte run; a literal FF would read as a run marker.
+        let mut bytes = vec![0u8; 128];
+        bytes[0] = 0x0a;
+        bytes[2] = 1;
+        bytes[3] = 8;
+        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
+        bytes[65] = 3;
+        bytes[66..68].copy_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&[0xc1, 0xff, 17]); // red plane
+        bytes.extend_from_slice(&[0, 41]); // green plane
+        bytes.extend_from_slice(&[0xc1, 0xff, 83]); // blue plane
+        let image = super::decode_native_pcx(&bytes);
+        #[cfg(feature = "phobos")]
+        {
+            let image = image.unwrap();
+            assert_eq!([image.width, image.height], [2, 1]);
+            assert_eq!(image.rgba, [255, 0, 255, 0, 17, 41, 83, 255]);
+        }
+        #[cfg(not(feature = "phobos"))]
+        {
+            assert!(image.is_none());
+        }
+    }
+
+    /// Ares SidebarPalette (hooks 6A9948/6A9A2A): a loadable palette draws the
+    /// SW cameo SHP; a missing file keeps CAMEO.PAL.
+    #[test]
+    fn superweapon_sidebar_palette_draws_its_cameo() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        use crate::{
+            assets::asset_manager::AssetManager, assets::pal_file::Palette,
+            map::source::test_support::TestDirectory, rules::ini_parser::IniFile,
+            rules::ruleset::RuleSet,
+        };
+        let dir = TestDirectory::new("sw-sidebar-palette");
+        write_small_shp(&dir, "swicon.shp");
+        let mut pal = vec![0u8; 768];
+        pal[3..6].copy_from_slice(&[10, 20, 30]);
+        dir.write("swicon.pal", &pal);
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let cameo = Palette::from_rgb(|_| [1, 2, 3]);
+        let custom = Palette::from_bytes(&pal).unwrap();
+        for (key, palette) in [("swicon.pal", &custom), ("missing.pal", &cameo)] {
+            let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
+                "[SuperWeaponTypes]\n0=Cell\n[Cell]\nSidebarImage=SWICON\nSidebarPalette={key}\n"
+            )))
+            .unwrap();
+            let sw = rules.super_weapon("Cell").unwrap();
+            let drawn = super::render_superweapon_cameo(sw, &assets, &cameo, &rules).unwrap();
+            let shp = assets.get_ref("SWICON.SHP").unwrap();
+            let expected = super::render_shp_frame0("Cell", shp, palette).unwrap();
+            assert_eq!(drawn.rgba, expected.rgba, "{key}");
+        }
+    }
+
+    /// Ares CameoPalette (StripClass_Draw_Main 1005E390, hook 0x6A9A2A): a
+    /// loadable art palette draws the type's SHP cameo and its AltCameo; a
+    /// missing file keeps CAMEO.PAL.
+    #[test]
+    fn techno_cameo_palette_draws_its_shp_cameos() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        use crate::{
+            assets::asset_manager::AssetManager,
+            assets::pal_file::Palette,
+            map::source::test_support::TestDirectory,
+            rules::{art_data::ArtRegistry, ini_parser::IniFile, ruleset::RuleSet},
+        };
+        let dir = TestDirectory::new("techno-cameo-palette");
+        write_old_cameos(&dir);
+        let mut pal = vec![0u8; 768];
+        pal[3..6].copy_from_slice(&[10, 20, 30]);
+        dir.write("tankicon.pal", &pal);
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let cameo = Palette::from_rgb(|_| [1, 2, 3]);
+        let custom = Palette::from_bytes(&pal).unwrap();
+        for (key, palette) in [("tankicon.pal", &custom), ("missing.pal", &cameo)] {
+            let art = IniFile::from_str(&format!(
+                "[TEST]\nCameo=OLDICON\nAltCameo=OLDALT\nCameoPalette={key}\n"
+            ));
+            let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+                &IniFile::from_str("[BuildingTypes]\n0=TEST\n[TEST]\nStrength=1\n"),
+                &art,
+            )
+            .unwrap();
+            rules.install_art_data(ArtRegistry::from_ini(&art));
+            for (drawn, file) in [
+                (
+                    super::render_cameo("TEST", &assets, &rules, &cameo),
+                    "OLDICON.SHP",
+                ),
+                (
+                    super::render_alt_cameo("TEST", &assets, &rules, &cameo),
+                    "OLDALT.SHP",
+                ),
+            ] {
+                let shp = assets.get_ref(file).unwrap();
+                let expected = super::render_shp_frame0("TEST", shp, palette).unwrap();
+                assert_eq!(drawn.unwrap().rgba, expected.rgba, "{key} {file}");
+            }
+        }
+    }
+
+    #[test]
+    fn promoted_pcx_falls_back_to_plain_pcx_before_legacy_alt_shp() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        use crate::{
+            assets::asset_manager::AssetManager, assets::pal_file::Palette,
+            map::source::test_support::TestDirectory,
+        };
+        let dir = TestDirectory::new("cameo-promoted-pcx");
+        write_old_cameos(&dir);
+        write_pcx(&dir, "normal.pcx", [20, 40, 60]);
+        let palette = Palette::from_rgb(|_| [1, 2, 3]);
+        let rules = cameo_rules();
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let normal = super::render_alt_cameo("TEST", &assets, &rules, &palette).unwrap();
+        assert_eq!(normal.kind, super::CameoKind::Promoted);
+        assert_eq!([normal.canvas_width, normal.canvas_height], [60, 48]);
+        assert_eq!(&normal.rgba[8..12], &[20, 40, 60, 255]);
+        write_pcx(&dir, "promoted.pcx", [80, 90, 100]);
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let promoted = super::render_alt_cameo("TEST", &assets, &rules, &palette).unwrap();
+        assert_eq!(promoted.kind, super::CameoKind::Promoted);
+        assert_eq!(&promoted.rgba[8..12], &[80, 90, 100, 255]);
+    }
+
+    #[test]
+    fn missing_and_invalid_pcx_keep_the_existing_shp_path() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        use crate::{
+            assets::asset_manager::AssetManager, assets::pal_file::Palette,
+            map::source::test_support::TestDirectory,
+        };
+        let dir = TestDirectory::new("cameo-invalid-pcx");
+        write_old_cameos(&dir);
+        dir.write("normal.pcx", b"not a PCX");
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let palette = Palette::from_rgb(|_| [1, 2, 3]);
+        let rules = cameo_rules();
+        let normal = super::render_cameo("TEST", &assets, &rules, &palette).unwrap();
+        let promoted = super::render_alt_cameo("TEST", &assets, &rules, &palette).unwrap();
+        assert_eq!([normal.canvas_width, normal.canvas_height], [2, 2]);
+        assert_eq!([promoted.canvas_width, promoted.canvas_height], [2, 2]);
+    }
+
+    /// Runs for a game Ares plays in and one it does not.
+    #[test]
+    fn superweapon_pcx_key_and_shp_fallback_share_the_projected_identity() {
+        for ares in [false, true] {
+            let _ares = crate::rules::ares_switch::read_ares_way(ares);
+            superweapon_pcx_case();
+        }
+    }
+
+    fn superweapon_pcx_case() {
+        use crate::{
+            assets::asset_manager::AssetManager,
+            assets::pal_file::Palette,
+            map::source::test_support::TestDirectory,
+            rules::{ini_parser::IniFile, superweapon_type::SuperWeaponType},
+        };
+        let dir = TestDirectory::new("superweapon-pcx");
+        write_old_cameos(&dir);
+        let ini = IniFile::from_str(
+            "[SW]\nType=PsychicReveal\nSidebarImage=oldicon\nSidebarPCX=Normal.PCX\n",
+        );
+        let sw = SuperWeaponType::from_ini_section("SW", ini.section("SW").unwrap());
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let palette = Palette::from_rgb(|_| [1, 2, 3]);
+        let rules = cameo_rules();
+        let fallback = super::render_superweapon_cameo(&sw, &assets, &palette, &rules).unwrap();
+        assert_eq!([fallback.canvas_width, fallback.canvas_height], [2, 2]);
+        write_pcx(&dir, "normal.pcx", [30, 50, 70]);
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let selected = super::render_superweapon_cameo(&sw, &assets, &palette, &rules).unwrap();
+        if rules.ares() {
+            assert_eq!(fallback.type_id, "SW");
+            assert_eq!(selected.type_id, "SW");
+            assert_eq!([selected.canvas_width, selected.canvas_height], [60, 48]);
+            let ini = IniFile::from_str("[PCXONLY]\nType=PsychicReveal\nSidebarPCX=Normal.PCX\n");
+            let pcx_only =
+                SuperWeaponType::from_ini_section("PCXONLY", ini.section("PCXONLY").unwrap());
+            assert!(
+                super::render_superweapon_cameo(&pcx_only, &assets, &palette, &rules).is_some()
+            );
+        } else {
+            assert_eq!(selected.type_id, "SW");
+            assert_eq!([selected.canvas_width, selected.canvas_height], [2, 2]);
+        }
+    }
+
+    #[test]
+    fn shared_missing_pcx_keeps_per_type_shp_and_object_namespaces() {
+        use crate::{
+            assets::{asset_manager::AssetManager, pal_file::Palette},
+            map::source::test_support::TestDirectory,
+            rules::{ini_parser::IniFile, ruleset::RuleSet},
+        };
+        let dir = TestDirectory::new("cameo-type-identities");
+        write_old_cameos(&dir);
+        let original = std::fs::read(dir.path().join("oldicon.shp")).unwrap();
+        for (name, index) in [("object.shp", 1), ("red.shp", 2), ("blue.shp", 3)] {
+            let mut shp = original.clone();
+            let start = shp.len() - 4;
+            shp[start..].fill(index);
+            dir.write(name, &shp);
+        }
+        let ini = IniFile::from_str(
+            "[VehicleTypes]\n0=SHARED\n[SuperWeaponTypes]\n0=SHARED\n1=OTHER\n\
+             [SHARED]\nType=PsychicReveal\nSidebarImage=red\nSidebarPCX=missing.pcx\n\
+             [OTHER]\nType=PsychicReveal\nSidebarImage=blue\nSidebarPCX=missing.pcx\n",
+        );
+        let art = IniFile::from_str("[SHARED]\nCameo=object\n");
+        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
+        rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let palette = Palette::from_rgb(|index| match index {
+            1 => [10, 20, 30],
+            2 => [200, 20, 30],
+            3 => [10, 20, 230],
+            _ => [0, 0, 0],
+        });
+        let cameos = super::collect_sidebar_cameos(&assets, &rules, &palette);
+        let pixel = |kind, id| {
+            let cameo = cameos
+                .iter()
+                .find(|cameo| cameo.kind == kind && cameo.type_id == id)
+                .unwrap();
+            cameo.rgba[..4].to_vec()
+        };
+        assert_eq!(
+            pixel(super::CameoKind::Ordinary, "SHARED"),
+            [10, 20, 30, 255]
+        );
+        assert_eq!(
+            pixel(super::CameoKind::SuperWeapon, "SHARED"),
+            [200, 20, 30, 255]
+        );
+        assert_eq!(
+            pixel(super::CameoKind::SuperWeapon, "OTHER"),
+            [10, 20, 230, 255]
+        );
+    }
+
+    #[test]
+    fn loaded_transparent_pcx_does_not_select_any_shp_fallback() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        use crate::{
+            assets::{asset_manager::AssetManager, pal_file::Palette},
+            map::source::test_support::TestDirectory,
+        };
+        let dir = TestDirectory::new("cameo-transparent-pcx");
+        write_old_cameos(&dir);
+        write_pcx(&dir, "normal.pcx", [255, 0, 255]);
+        let path = dir.path().join("normal.pcx");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let palette = bytes.len() - 768;
+        for rgb in bytes[palette..].chunks_exact_mut(3) {
+            rgb.copy_from_slice(&[255, 0, 255]);
+        }
+        dir.write("normal.pcx", &bytes);
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let palette = Palette::from_rgb(|_| [1, 2, 3]);
+        let rules = cameo_rules();
+        for cameo in [
+            super::render_cameo("TEST", &assets, &rules, &palette).unwrap(),
+            super::render_alt_cameo("TEST", &assets, &rules, &palette).unwrap(),
+        ] {
+            assert_eq!([cameo.width, cameo.height], [60, 48]);
+            assert!(cameo.rgba.chunks_exact(4).all(|pixel| pixel[3] == 0));
+        }
+    }
+
+    #[test]
+    fn pcx_source_dimensions_do_not_resize_the_native_cameo_canvas() {
+        use crate::{
+            assets::asset_manager::AssetManager, map::source::test_support::TestDirectory,
+        };
+        let dir = TestDirectory::new("cameo-pcx-dimensions");
+        write_pcx(&dir, "wide.pcx", [20, 40, 60]);
+        let bytes = std::fs::read(dir.path().join("wide.pcx")).unwrap();
+        let mut wide = bytes[..128].to_vec();
+        wide[8..10].copy_from_slice(&63u16.to_le_bytes());
+        wide[66..68].copy_from_slice(&64u16.to_le_bytes());
+        wide.extend(std::iter::repeat_n(2, 64 * 48));
+        wide.extend_from_slice(&bytes[bytes.len() - 769..]);
+        dir.write("wide.pcx", &wide);
+        let assets = AssetManager::from_loose_root_for_test(dir.path());
+        let cameo = super::render_pcx_cameo("TEST", "wide.pcx", &assets).unwrap();
+        assert_eq!([cameo.width, cameo.height], [64, 48]);
+        assert_eq!([cameo.canvas_width, cameo.canvas_height], [60, 48]);
+    }
+
+    #[test]
+    fn original_pcx_surface_selectors_choose_the_same_loaded_art() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        use crate::{
+            assets::{asset_manager::AssetManager, pal_file::Palette},
+            map::source::test_support::TestDirectory,
+            rules::{ini_parser::IniFile, superweapon_type::SuperWeaponType},
+        };
+        let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/sidebar_oracle/pcx_cameos.json",
+        ))
+        .unwrap();
+        for (index, control) in native["selectors"].as_array().unwrap().iter().enumerate() {
+            let dir = TestDirectory::new(&format!("pcx-native-selector-{index}"));
+            write_old_cameos(&dir);
+            if control["normal_surface"].as_u64().unwrap() != 0 {
+                write_pcx(&dir, "normal.pcx", [20, 40, 60]);
+            }
+            if control["promoted_surface"].as_u64().unwrap() != 0 {
+                write_pcx(&dir, "promoted.pcx", [80, 90, 100]);
+            }
+            let assets = AssetManager::from_loose_root_for_test(dir.path());
+            let palette = Palette::from_rgb(|_| [1, 2, 3]);
+            let rules = cameo_rules();
+            let selected = if control["elite"].as_bool().unwrap() {
+                super::render_alt_cameo("TEST", &assets, &rules, &palette)
+            } else {
+                super::render_cameo("TEST", &assets, &rules, &palette)
+            }
+            .unwrap();
+            let surface = control["selected_surface"].as_u64().unwrap();
+            if surface == 0 {
+                assert_eq!([selected.width, selected.height], [2, 2], "{control}");
+            } else {
+                let color = if surface == control["normal_surface"].as_u64().unwrap() {
+                    [20, 40, 60]
+                } else {
+                    [80, 90, 100]
+                };
+                assert_eq!(&selected.rgba[8..11], &color, "{control}");
+            }
+        }
+        for (index, control) in native["superweapons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            let dir = TestDirectory::new(&format!("pcx-native-super-{index}"));
+            write_old_cameos(&dir);
+            if control["surface"].as_u64().unwrap() != 0 {
+                write_pcx(&dir, "normal.pcx", [20, 40, 60]);
+            }
+            let ini = IniFile::from_str(
+                "[SW]\nType=PsychicReveal\nSidebarPCX=normal.pcx\nSidebarImage=oldicon\n",
+            );
+            let sw = SuperWeaponType::from_ini_section("SW", ini.section("SW").unwrap());
+            let assets = AssetManager::from_loose_root_for_test(dir.path());
+            let palette = Palette::from_rgb(|_| [1, 2, 3]);
+            let rules = cameo_rules();
+            let selected = super::render_superweapon_cameo(&sw, &assets, &palette, &rules).unwrap();
+            let expected_width = if control["selected_surface"].as_u64().unwrap() == 0 {
+                2
+            } else {
+                60
+            };
+            assert_eq!(selected.width, expected_width, "{control}");
+            assert_eq!(selected.kind, super::CameoKind::SuperWeapon);
+        }
+    }
+
+    #[test]
+    fn original_pcx_palette_and_packed_word_writes_match_rgba_keying() {
+        let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/sidebar_oracle/pcx_cameos.json",
+        ))
+        .unwrap();
+        let presentation = crate::render::native_surface_format::ACTIVE_RETAIL_RGB565_PRESENTATION;
+        let format = presentation.format;
+        for (rgb, word) in native["palette"]["rgb"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(native["palette"]["words"].as_array().unwrap())
+        {
+            let rgb = [
+                rgb[0].as_u64().unwrap() as u8,
+                rgb[1].as_u64().unwrap() as u8,
+                rgb[2].as_u64().unwrap() as u8,
+            ];
+            assert_eq!(u64::from(format.pack_rgb8(rgb)), word.as_u64().unwrap());
+        }
+        for control in native["blits"].as_array().unwrap() {
+            let source = control["source_words"].as_array().unwrap();
+            let mut rgba: Vec<u8> = source
+                .iter()
+                .flat_map(|word| {
+                    let rgb = format.unpack_rgb8(word.as_u64().unwrap() as u16);
+                    [rgb[0], rgb[1], rgb[2], 255]
+                })
+                .collect();
+            presentation.apply_packed_color_key_rgba8(&mut rgba, [255, 0, 255]);
+            let pitch = control["destination_size"][0].as_u64().unwrap() as usize;
+            let width = control["source_size"][0].as_u64().unwrap() as usize;
+            let x = control["rectangle"][0].as_u64().unwrap() as usize;
+            let y = control["rectangle"][1].as_u64().unwrap() as usize;
+            for (index, pixel) in rgba.chunks_exact(4).enumerate() {
+                let destination = (y + index / width) * pitch + x + index % width;
+                let original_wrote =
+                    control["after_words"][destination] != control["before_words"][destination];
+                assert_eq!(
+                    pixel[3] != 0,
+                    original_wrote,
+                    "{} pixel{index}",
+                    control["name"]
+                );
+            }
+        }
     }
 }

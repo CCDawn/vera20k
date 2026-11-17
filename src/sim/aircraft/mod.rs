@@ -10,30 +10,37 @@
 
 mod airfield;
 pub mod attack_mission;
+pub mod carryall;
 pub mod drop_payload;
 pub(crate) mod enter_mission;
 pub(crate) mod fire_at;
 pub(crate) mod guard_mission;
 mod hunt_mission;
 mod idle_entry;
-pub(crate) use idle_entry::enter_idle_mode_for;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use idle_entry::record_idle_calls_for_test;
+pub(crate) use idle_entry::{enter_idle_mode_after_attack, enter_idle_mode_for};
 pub(crate) mod landing_base;
 mod leave_map;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 mod leave_map_tests;
 pub(crate) mod move_mission;
 pub mod paradrop_mission;
+mod patrol_mission;
 mod retreat_mission;
 pub(crate) mod spyplane_mission;
+mod trailer;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
+mod ai_head_tests;
+#[cfg(all(test, tests_sim_a_b))]
 mod dock_cycle_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 mod release_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 mod team_strike_tests;
+#[cfg(all(test, tests_sim_a_b))]
+mod trailer_tests;
 
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
@@ -107,13 +114,68 @@ pub(crate) fn attack_state(entity: &GameEntity) -> Option<u8> {
     .then(|| handler_state(entity))
 }
 
+/// The missions whose `+0x6D2` latch `AircraftClass::AI`'s head keeps: the
+/// zero entries of its byte table `0x004151C0`, indexed by `+0xAC - 1`
+/// (Attack, ParadropOverfly, SpyplaneApproach, SpyplaneOverfly).
+const LATCH_KEEPING_MISSIONS: [MissionType; 4] = [
+    MissionType::Attack,
+    MissionType::ParadropOverfly,
+    MissionType::SpyplaneApproach,
+    MissionType::SpyplaneOverfly,
+];
+
+/// `AircraftClass::AI @ 0x00414BB0`'s head, before its TemporalClass::Update
+/// (`0x00414BDB`): `+0x6D2` clears (`0x00414BD4`) unless the current mission
+/// is one of [`LATCH_KEEPING_MISSIONS`]. The test is `DEC EAX; CMP EAX,0x1E;
+/// JA` on `+0xAC`, so Sleep, NONE and any id past 31 clear too.
+///
+/// Assign_Mission (`0x005B2FD0`), Override_Mission (`0x005B3650`) and
+/// Restore_Mission (`0x004D8F80`) write `+0xAC` without Commence's clear, so a
+/// latched aircraft moved by a damage retaliation or a target expiry's
+/// Restore relies on this clear to become ready (`0x0041B5F0`) again.
+pub(crate) fn ai_head_latch_clear(entity: &mut GameEntity) {
+    if entity.mission_leaf.as_aircraft().is_none() {
+        return;
+    }
+    let keeps = entity
+        .mission
+        .current()
+        .known()
+        .is_some_and(|mission| LATCH_KEEPING_MISSIONS.contains(&mission));
+    if !keeps {
+        entity.mission_leaf.set_aircraft_action_latch(false);
+    }
+}
+
+/// Patrol restarted from its first state: Mission+0xBC 0 and `+0x6D2` clear.
+/// Aircraft Enter_Idle_Mode writes it after restoring Patrol
+/// (`0x00417719..0x00417723`).
+pub(crate) fn restart_patrol(entity: &mut GameEntity) {
+    entity.mission.set_handler_state(0);
+    entity.mission_leaf.set_aircraft_action_latch(false);
+}
+
+/// The aircraft-Patrol arm `TechnoClass` runs after a Restore_Mission (vt+0x1F8)
+/// on a target's detach: an Aircraft (`WhatAmI` vt+0x2C == 2) whose current
+/// mission is now Patrol (0x19) restarts it ([`restart_patrol`]).
+/// PointerExpired's suspended arm (`0x00707A4B..0x00707A6C`) and the detach
+/// sweep (`0x0070D50D..0x0070D532`) share it.
+pub(crate) fn restart_patrol_after_restore(entity: &mut GameEntity) {
+    if entity.category() == EntityCategory::Aircraft
+        && entity.mission.current() == MissionId::from_known(MissionType::Patrol)
+    {
+        restart_patrol(entity);
+    }
+}
+
 /// `MissionClass::AI @ 0x005B3060` for aircraft `id`: an alive aircraft whose
 /// mission timer is due runs its current mission's handler and restarts the
 /// timer with the frames it returns. `FootClass::AI @ 0x004DA530` runs it
 /// before locomotor Process (`+0x40`), so the handlers' Scenario draws and
 /// NavCom reservations interleave with the other objects' AI in Logic order.
 ///
-/// The handlers: Mission_Move (`0x004166E0`, [`move_mission`]),
+/// The handlers: Mission_Move (`0x004166E0`, [`move_mission`]; a Carryall's
+/// `0x00416D50`, [`carryall`]),
 /// Mission_Attack (`0x00417FE0`, [`attack_mission`]), Mission_Guard for
 /// Guard and Sticky and Mission_AreaGuard ([`guard_mission`]), Mission_Enter
 /// ([`enter_mission`]), Mission_Hunt (`0x00414A80`, [`hunt_mission`]),
@@ -133,7 +195,7 @@ pub(crate) fn attack_state(entity: &GameEntity) -> Option<u8> {
 /// 29 for an aircraft: its type refuses to attack-move, so
 /// `Assign_Target_Command` answers Move.
 ///
-/// RESIDUAL: Patrol (`0x00417300`) and the Foot handlers of Capture
+/// RESIDUAL: the Foot handlers of Capture
 /// and Sabotage (`0x004D4B20`), Eaten (`0x004D4CB0`) and Rescue
 /// (`0x004DDF90`) are not run: the timer stays due and nothing happens.
 /// Trigger: a map or trigger giving an aircraft one of those missions; no
@@ -145,7 +207,7 @@ pub(crate) fn dispatch_mission(
     rules: &RuleSet,
     ctx: ObjectAiCtx<'_>,
 ) -> Option<DamageCommitReceipt> {
-    let now = sim.session.binary_frame;
+    let now = sim.session.binary_frame();
     let entity = sim.substrate.entities.get(id)?;
     if entity.category() != EntityCategory::Aircraft || !entity.mission_handler_due(now) {
         return None;
@@ -154,8 +216,14 @@ pub(crate) fn dispatch_mission(
     let delay = match entity.mission.current().known() {
         Some(MissionType::Move) => {
             let state = handler_state(entity);
-            let (next, delay) = sim.aircraft_move(id, state, rules, registry, ctx.effects);
-            write_state(sim, id, state, next);
+            // The Move slot `0x004166C0`: a `Carryall=` type (Type+0xDFC)
+            // tail-jumps to Mission_Move_Carryall `0x00416D50`.
+            let (next, delay) = if sim.is_carryall(id, rules) {
+                sim.aircraft_move_carryall(id, state, rules, registry, ctx.effects)
+            } else {
+                sim.aircraft_move(id, state, rules, registry, ctx.effects)
+            };
+            write_state(&mut sim.substrate, id, state, next);
             delay
         }
         Some(MissionType::Attack) => {
@@ -171,7 +239,7 @@ pub(crate) fn dispatch_mission(
                     ctx.effects,
                 ));
             };
-            write_state(sim, id, state, next);
+            write_state(&mut sim.substrate, id, state, next);
             delay
         }
         Some(MissionType::Guard | MissionType::Sticky) => {
@@ -180,6 +248,7 @@ pub(crate) fn dispatch_mission(
         Some(MissionType::AreaGuard) => sim.aircraft_mission_area_guard(id, rules, ctx),
         Some(MissionType::Enter) => sim.aircraft_mission_enter(id, rules, registry, ctx.effects),
         Some(MissionType::Hunt) => sim.aircraft_mission_hunt(id, rules, ctx),
+        Some(MissionType::Patrol) => sim.aircraft_mission_patrol(id, rules, ctx),
         Some(MissionType::Retreat) => retreat_mission::retreat(sim, id, rules, ctx.effects),
         Some(MissionType::Unload) => {
             crate::sim::transport_unload::mission_unload(sim, id, rules, registry, ctx.effects)
@@ -197,11 +266,7 @@ pub(crate) fn dispatch_mission(
             spyplane_mission::overfly(sim, id, rules, ctx.effects)
         }
         Some(
-            MissionType::Patrol
-            | MissionType::Capture
-            | MissionType::Sabotage
-            | MissionType::Eaten
-            | MissionType::Rescue,
+            MissionType::Capture | MissionType::Sabotage | MissionType::Eaten | MissionType::Rescue,
         ) => return None,
         _ => MISSION_STUB_FRAMES,
     };
@@ -221,7 +286,9 @@ fn target_distance(
     let entities = &sim.substrate.entities;
     target
         .zip(entities.get(id))
-        .and_then(|(target, plane)| crate::sim::combat::object_distance_to(plane, &target, sim))
+        .and_then(|(target, plane)| {
+            crate::sim::combat::object_distance_to(plane.stable_id(), &target, sim)
+        })
         .unwrap_or(0)
 }
 
@@ -234,8 +301,12 @@ fn nav_com_absent(sim: &Simulation, id: u64) -> bool {
 }
 
 /// `Queue_Mission(mission, 0)` (vt+0x1E8 = `0x0041BA90`) of the aircraft `id`.
-pub(crate) fn queue_mission(sim: &mut Simulation, id: u64, mission: MissionType) {
-    if let Some(plane) = sim.substrate.entities.get_mut(id) {
+pub(crate) fn queue_mission(
+    substrate: &mut crate::sim::world::ObjectSubstrate,
+    id: u64,
+    mission: MissionType,
+) {
+    if let Some(plane) = substrate.entities.get_mut(id) {
         crate::sim::mission::authority::queue_entity_mission_deferred(
             plane,
             MissionId::from_known(mission),
@@ -247,11 +318,12 @@ pub(crate) fn queue_mission(sim: &mut Simulation, id: u64, mission: MissionType)
 /// `read` and left `next`. Those handlers write it only where it changes,
 /// and never after their `Enter_Idle_Mode(0, 1)` (vt+0x484), whose Commence
 /// zeroes it. The stores are the handlers' own: Mission_Move_NonCarryall
-/// (`0x004166E0`) at `0x0041675D..0x00416AB6`, Mission_Attack (`0x00417FE0`)
+/// (`0x004166E0`) at `0x0041675D..0x00416AB6`, Mission_Move_Carryall
+/// (`0x00416D50`) at `0x00416EFF..0x004172A6`, Mission_Attack (`0x00417FE0`)
 /// at `0x0041801B..0x00418D17`.
-fn write_state(sim: &mut Simulation, id: u64, read: u8, next: u8) {
+fn write_state(substrate: &mut crate::sim::world::ObjectSubstrate, id: u64, read: u8, next: u8) {
     if next != read
-        && let Some(entity) = sim.substrate.entities.get_mut(id)
+        && let Some(entity) = substrate.entities.get_mut(id)
     {
         entity.mission.set_handler_state(u32::from(next));
     }
@@ -282,6 +354,13 @@ fn attack_visit(
         // State 2 (`0x00418D1D`) is the epilogue alone. Mission_Attack runs
         // as the Attack mission's handler, so its epilogue reads Attack's
         // Rate.
-        state => (state, sim.mission_rate_epilogue(rules, MissionType::Attack)),
+        state => (
+            state,
+            crate::sim::mission::authority::rate_epilogue(
+                rules,
+                MissionType::Attack,
+                &mut sim.scenario_rng,
+            ),
+        ),
     })
 }

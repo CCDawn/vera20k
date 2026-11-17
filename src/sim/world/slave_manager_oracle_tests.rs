@@ -46,7 +46,7 @@ use crate::rules::ini_parser::IniFile;
 use crate::sim::combat::TargetKind;
 use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::miner::{CargoBale, ResourceType};
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::rng::SimRng;
 use crate::sim::slave_manager::{DeployCellSearch, ManagerState, SlaveLink, SlaveNode, SlaveState};
@@ -60,9 +60,6 @@ use std::collections::BTreeMap;
 
 /// Rows whose inputs the Rust scene does not reproduce.
 const SKIPPED: &[&str] = &[
-    // IncomeMult 0.9: VERA's integer credit fold pays 90 where the native
-    // float product truncates to 89 (the economy owner's recorded residual).
-    "dep_income_mult",
     // A supplied Unlimbo refusal on an open cell: the Rust Unlimbo places it.
     "d_unlimbo_refused",
     // FindDeployCell's supplied Find_Nearby_Passable_Cell miss: the scene's
@@ -193,7 +190,15 @@ pub(super) fn row_scene_edited(
         *text = text.replacen("2=GAOREP\n", "2=GAOREP\n3=YAREFN\n", 1);
         *text = text.replacen("1=MTNK\n", "1=MTNK\n2=SMIN\n", 1);
         text.push_str(&slave_rules(&input));
+        if let Some(mult) = input["income_mult"].as_f64() {
+            text.push_str(&format!(
+                "[Countries]\n0=Americans\n[Americans]\nIncomeMult={mult}\n"
+            ));
+        }
         art.merge(&IniFile::from_str("[YAREFN]\nFoundation=2x2\n"));
+        art.merge(&IniFile::from_str(&format!(
+            "[SLAV]\nSequence=SlavSequence\n{SLAVE_SEQUENCE}"
+        )));
         edit(text, art);
     });
     // The oracle's Rules+0x1780.. (ReadRange leptons), KickFrameDelay and
@@ -210,18 +215,9 @@ pub(super) fn row_scene_edited(
     general.slave_miner_scan_correction = ranges[3] * 256;
     general.slave_miner_kick_frame_delay = input["kick_delay"].as_i64().unwrap_or(150) as i32;
     general.approach_target_reset_multiplier = input["approach_reset"].as_i64().unwrap_or(1) as i32;
-    let sequences = crate::rules::infantry_sequence::parse_infantry_sequence_registry(
-        &IniFile::from_str(SLAVE_SEQUENCE),
-    );
-    let mut catalog = scene.rules.animation_sequences().clone();
-    catalog.insert(
-        "SLAV".to_string(),
-        crate::rules::infantry_sequence::build_sequence_set(&sequences["SLAVSEQUENCE"]),
-    );
-    scene.rules.replace_animation_sequences_for_test(catalog);
     let rules = &scene.rules;
     let sim = &mut scene.sim;
-    let frame = sim.session.binary_frame;
+    let frame = sim.session.binary_frame();
     let refinery = sim
         .spawn_object("YAREFN", "Americans", YAREFN_NW.0, YAREFN_NW.1, 0, rules)
         .expect("slave refinery");
@@ -274,7 +270,8 @@ pub(super) fn row_scene_edited(
     };
     // The MissionClass start frame (`+0xC0`) the row supplies.
     let started = (i64::from(frame) + input["mission_start"].as_i64().unwrap_or(0)) as u32;
-    sim.mission_assign_exact(master, MissionId::from_known(owner_mission), started)
+    sim.substrate
+        .mission_assign_exact(master, MissionId::from_known(owner_mission), started)
         .unwrap();
     let mut slaves = BTreeMap::new();
     let mut nodes = Vec::new();
@@ -329,7 +326,7 @@ fn place_slave(
     node: &Value,
     master: u64,
 ) -> u64 {
-    let frame = sim.session.binary_frame;
+    let frame = sim.session.binary_frame();
     let (x, y) = node.get("cell").map_or((15, 15), cell);
     let id = sim
         .construct_object_limbo_at_height(
@@ -376,7 +373,8 @@ fn place_slave(
         );
     }
     let current = mission(node["mission"].as_str().unwrap_or("guard"));
-    sim.mission_assign_exact(id, MissionId::from_known(current), frame)
+    sim.substrate
+        .mission_assign_exact(id, MissionId::from_known(current), frame)
         .unwrap();
     if let Some(queued) = node["queued"].as_str() {
         sim.mission_queue_exact(
@@ -384,7 +382,7 @@ fn place_slave(
             MissionId::from_known(mission(queued)),
             0,
             frame,
-            &EntityReadyInputProvider,
+            &LiveReadyInputProvider { rules },
         )
         .unwrap();
     }
@@ -410,6 +408,7 @@ fn place_slave(
         let count = storage.map_or(0, |s| s[slot].as_f64().unwrap() as usize);
         for _ in 0..count {
             cargo.push(CargoBale {
+                tiberium_type: crate::rules::tiberium_type::TiberiumTypeId(slot as u8),
                 resource_type: kind,
                 value,
             });
@@ -472,7 +471,7 @@ fn compare_state(s: &SlaveScene, row: &Value, context: &str) {
         .slave_manager
         .as_ref()
         .unwrap();
-    let frame = sim.session.binary_frame as i64;
+    let frame = sim.session.binary_frame() as i64;
     let nodes: Vec<Value> = manager
         .nodes()
         .iter()
@@ -677,7 +676,7 @@ fn compare_state(s: &SlaveScene, row: &Value, context: &str) {
     }
     let owner = sim.interner.get("Americans").unwrap();
     assert_eq!(
-        i64::from(sim.houses[&owner].economy.credits()),
+        i64::from(sim.houses[&owner].economy().credits()),
         native["balance"].as_i64().unwrap(),
         "{context}: balance"
     );
@@ -716,51 +715,47 @@ fn ai_update_matches_the_original_node_machine() {
     let corpus = corpus();
     for (row, name) in rows(&corpus, "ai_update") {
         let mut s = row_scene(&row["input"]);
-        s.scene.sim.slave_ai_update(
-            s.master,
-            &s.scene.rules,
-            Some(registry()),
-            crate::sim::world::FrameEffects::default(),
-        );
+        s.scene
+            .sim
+            .slave_ai_update(
+                s.master,
+                &s.scene.rules,
+                Some(registry()),
+                crate::sim::world::FrameEffects::default(),
+            )
+            .unwrap();
         compare_state(&s, row, &name);
     }
 }
 
+/// The building's (`manager`) and the Slave Miner's (`unit_manager`) states,
+/// and state 5 with no ore within `SlaveMinerShortScan` (`relocation`): the
+/// relocation test and, when it passes, the archive, the undeploy (Selling)
+/// and state 6.
 #[test]
-fn manager_machine_matches_the_original_building_owner_states() {
+fn manager_machine_matches_the_original_owner_states_and_relocation() {
     let corpus = corpus();
-    for (row, name) in rows(&corpus, "manager") {
-        let mut s = row_scene(&row["input"]);
-        s.scene.sim.slave_manager_step(
-            s.master,
-            &s.scene.rules,
-            Some(registry()),
-            crate::sim::world::FrameEffects::default(),
-        );
-        compare_state(&s, row, &name);
-    }
-}
-
-/// State 5 with no ore within `SlaveMinerShortScan`: the relocation test
-/// and, when it passes, the archive, the undeploy (Selling) and state 6.
-#[test]
-fn manager_machine_matches_the_original_slave_refinery_relocation() {
-    let corpus = corpus();
-    for (row, name) in rows(&corpus, "relocation") {
-        let mut s = row_scene(&row["input"]);
-        // A supplied Find_Nearby_Passable_Cell miss: the scene's open ground
-        // would offer a cell, so the search is denied the zone map it needs
-        // and FindDeployCell answers the same (0,0) (read at 0x006B00F0).
-        if row["input"]["passable"] == serde_json::json!([null]) {
-            s.scene.sim.zone_grid = None;
+    for group in ["manager", "unit_manager", "relocation"] {
+        for (row, name) in rows(&corpus, group) {
+            let mut s = row_scene(&row["input"]);
+            // A supplied relocation Find_Nearby_Passable_Cell miss: the scene's
+            // open ground would offer a cell, so the search is denied the zone
+            // map it needs and FindDeployCell answers the same (0,0) (read at
+            // 0x006B00F0).
+            if group == "relocation" && row["input"]["passable"] == serde_json::json!([null]) {
+                s.scene.sim.zone_grid = None;
+            }
+            s.scene
+                .sim
+                .slave_manager_step(
+                    s.master,
+                    &s.scene.rules,
+                    Some(registry()),
+                    crate::sim::world::FrameEffects::default(),
+                )
+                .unwrap();
+            compare_state(&s, row, &name);
         }
-        s.scene.sim.slave_manager_step(
-            s.master,
-            &s.scene.rules,
-            Some(registry()),
-            crate::sim::world::FrameEffects::default(),
-        );
-        compare_state(&s, row, &name);
     }
 }
 
@@ -801,14 +796,18 @@ fn slave_mission_harvest_matches_the_original_dig() {
     for (row, name) in rows(&corpus, "slave_harvest") {
         let mut s = row_scene(&row["input"]);
         let slave = s.slaves[&0];
-        let (delay, guard) = s.scene.sim.infantry_mission_harvest(
-            slave,
-            &s.scene.rules,
-            Some(registry()),
-            crate::sim::world::FrameEffects::default(),
-        );
+        let (delay, guard) = s
+            .scene
+            .sim
+            .infantry_mission_harvest(
+                slave,
+                &s.scene.rules,
+                Some(registry()),
+                crate::sim::world::FrameEffects::default(),
+            )
+            .unwrap();
         if guard {
-            let frame = s.scene.sim.session.binary_frame;
+            let frame = s.scene.sim.session.binary_frame();
             s.scene
                 .sim
                 .mission_queue_exact(
@@ -816,7 +815,9 @@ fn slave_mission_harvest_matches_the_original_dig() {
                     MissionId::from_known(MissionType::Guard),
                     0,
                     frame,
-                    &EntityReadyInputProvider,
+                    &LiveReadyInputProvider {
+                        rules: crate::rules::ruleset::RuleSet::empty_for_test(),
+                    },
                 )
                 .unwrap();
         }
@@ -841,21 +842,6 @@ fn slave_deposit_matches_the_original_payment() {
 }
 
 #[test]
-fn manager_machine_matches_the_original_slave_miner_states() {
-    let corpus = corpus();
-    for (row, name) in rows(&corpus, "unit_manager") {
-        let mut s = row_scene(&row["input"]);
-        s.scene.sim.slave_manager_step(
-            s.master,
-            &s.scene.rules,
-            Some(registry()),
-            crate::sim::world::FrameEffects::default(),
-        );
-        compare_state(&s, row, &name);
-    }
-}
-
-#[test]
 fn slave_miner_helpers_match_the_original() {
     let corpus = corpus();
     for (row, name) in rows(&corpus, "unit_helper") {
@@ -864,7 +850,9 @@ fn slave_miner_helpers_match_the_original() {
         let sim = &mut s.scene.sim;
         match row["input"]["helper"].as_str().unwrap() {
             "should_recall" => {
-                let answer = sim.should_recall_slaves(master, rules, Some(registry()));
+                let answer = sim
+                    .should_recall_slaves(master, rules, Some(registry()))
+                    .unwrap();
                 assert_eq!(
                     u64::from(answer),
                     row["answer"].as_u64().unwrap(),
@@ -894,13 +882,17 @@ fn slave_miner_kick_matches_the_original_guard_and_area_guard() {
     for (row, name) in rows(&corpus, "unit_mission") {
         let mut s = row_scene(&row["input"]);
         let mission = mission(row["input"]["owner_mission"].as_str().unwrap());
-        let kicked = s.scene.sim.slave_master_mission_kick(
-            s.master,
-            mission,
-            &s.scene.rules,
-            Some(registry()),
-            crate::sim::world::FrameEffects::default(),
-        );
+        let kicked = s
+            .scene
+            .sim
+            .slave_master_mission_kick(
+                s.master,
+                mission,
+                &s.scene.rules,
+                Some(registry()),
+                crate::sim::world::FrameEffects::default(),
+            )
+            .unwrap();
         assert_eq!(
             kicked.is_some(),
             row["kicked"].as_bool().unwrap(),
@@ -1005,5 +997,5 @@ fn replay_covers_every_row() {
     .map(|group| corpus[*group].as_array().unwrap().len())
     .sum();
     assert_eq!(total, 104);
-    assert_eq!(SKIPPED.len(), 4);
+    assert_eq!(SKIPPED.len(), 3);
 }

@@ -235,8 +235,8 @@ fn origin(row: &Value) -> (i16, i16) {
         0,
         10,
     );
-    house.alternate_base_center = unsigned(cell(&row["alternate"]));
-    house.base_center = Some(unsigned(cell(&row["base"])));
+    house.set_alternate_base_center_for_test(unsigned(cell(&row["alternate"])));
+    house.set_base_center_for_test(Some(unsigned(cell(&row["base"]))));
     signed(house.base_origin())
 }
 
@@ -326,4 +326,60 @@ fn defense_key_searches_repeat_the_native_transcripts() {
         "{} searches, {failed} failed",
         searches.len()
     );
+}
+
+/// Cells from x = 20 east hold the house's reservations; every site is clear,
+/// placeable and at level 0.
+struct EastReserved;
+
+impl SiteWorld for EastReserved {
+    fn reserved(&mut self, cell: (i16, i16)) -> bool {
+        cell.0 >= 20
+    }
+
+    fn level(&mut self, _cell: (i16, i16)) -> i32 {
+        0
+    }
+
+    fn clear(&mut self, _rect: CellRect) -> bool {
+        true
+    }
+
+    fn can_place(&mut self, _site: (i16, i16)) -> bool {
+        true
+    }
+}
+
+fn east_search<'a>(perimeter: &'a [(i16, i16)], key: SiteKey<'a>) -> SiteSearch<'a> {
+    SiteSearch {
+        center: (19, 6),
+        origin: (0, 0),
+        perimeter,
+        spacing: 1,
+        width: 1,
+        height: 1,
+        extra_border: false,
+        game_mode_nonzero: false,
+        key,
+    }
+}
+
+/// The inner-base key (`0x00506329..0x0050640D`) that Ares' `AIInnerBase=`
+/// selects (10023860, hook 0x506306) puts the perimeter cell nearest the
+/// base coordinate first, where the ordinary key puts the one nearest the
+/// plan centre first.
+#[test]
+fn inner_base_key_orders_the_perimeter_by_the_base_coordinate() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let perimeter = [(19, 5), (19, 40)];
+    let ordinary = ordinary_site(
+        &mut EastReserved,
+        &east_search(&perimeter, SiteKey::Ordinary),
+    );
+    let base = [19 * 256 + 128, 39 * 256 + 128, 0];
+    let inner = ordinary_site(
+        &mut EastReserved,
+        &east_search(&perimeter, SiteKey::InnerBase { base }),
+    );
+    assert!(ordinary.1 < 10 && inner.1 > 35, "{ordinary:?} {inner:?}");
 }

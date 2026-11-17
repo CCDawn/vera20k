@@ -4,7 +4,7 @@
 //! sessions, reads the ordinary Windows seed once, and observes an already
 //! initialized `Simulation` without mutating it.
 
-use crate::sim::trigger_runtime::SCENARIO_GLOBAL_COUNT;
+use crate::sim::campaign_carry_over::CampaignCarryOver;
 use crate::sim::world::{Simulation, SimulationRngState};
 use crate::skirmish_launch::{LaunchStartPosition, SKIRMISH_AI_SLOT_COUNT, SkirmishLaunchSession};
 
@@ -22,6 +22,11 @@ pub enum MatchSeedSource {
     WindowsGetTickCount,
     Controlled,
     NonWindowsDevelopmentFallback,
+    /// Seed supplied by the admitted host start, never sampled by a guest.
+    AgreedNetworkHost,
+    /// Retained Scenario seed; reconstructing saved campaign admission does
+    /// not sample a fresh seed. Restart/next mission do so at their own entry.
+    SavedScenario,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,9 +82,164 @@ pub struct PreparedMatchStartup {
     pub session: AcceptedBattleSession,
 }
 
-/// Start_Scenario683AB0's campaign-array selection. This is an immutable
-/// launch projection from the process catalog, separate from multiplayer
-/// session/slot staging. Full_Init686B6A uses Options.Difficulty literally.
+/// Immutable accepted network handoff, shared with the live session owner.
+/// No UI or loading phase keeps a second mutable roster after this freeze.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedNetworkStartup {
+    launch: SkirmishLaunchSession,
+    /// Physical local bytes, independent of the logical map name folded into
+    /// shared scenario state. Cache paths differ legitimately across machines.
+    local_map_source: Option<crate::map::source::LoadedMapSource>,
+    local_map_effective_digest: Option<String>,
+    local_random_map_preview: Option<crate::map::source::LoadedMapSource>,
+    pub(crate) seed: MatchSeed,
+    mode: crate::app::match_runtime::session::SessionMode,
+    host: bool,
+    max_ahead_frames: i32,
+    native_id_prefix: Option<u32>,
+    wol_start: crate::app::match_runtime::session::WolStartTerms,
+    /// A co-op continuation's carry-over record (`0x004C6210` after
+    /// Start_Scenario); a first start restores none.
+    carry_over: Option<CampaignCarryOver>,
+}
+
+impl PreparedNetworkStartup {
+    pub(crate) fn new(
+        launch: SkirmishLaunchSession,
+        seed: u32,
+        mode: crate::app::match_runtime::session::SessionMode,
+        host: bool,
+        max_ahead_frames: i32,
+        wol_start: crate::app::match_runtime::session::WolStartTerms,
+    ) -> Self {
+        let native_id_prefix =
+            crate::sim::native_identity::network_native_id_prefix(mode, launch.humans.len());
+        Self {
+            launch,
+            local_map_source: None,
+            local_map_effective_digest: None,
+            local_random_map_preview: None,
+            seed: MatchSeed {
+                value: seed,
+                source: MatchSeedSource::AgreedNetworkHost,
+                seed_authority_certifying: false,
+            },
+            mode,
+            host,
+            max_ahead_frames,
+            native_id_prefix,
+            wol_start,
+            carry_over: None,
+        }
+    }
+
+    pub(crate) fn with_carry_over(mut self, record: CampaignCarryOver) -> Self {
+        self.carry_over = Some(record);
+        self
+    }
+
+    pub(crate) fn with_local_map_source(
+        mut self,
+        source: Option<crate::map::source::LoadedMapSource>,
+        effective_digest: Option<String>,
+    ) -> Self {
+        self.local_map_source = source;
+        self.local_map_effective_digest = effective_digest;
+        self
+    }
+
+    pub(crate) fn with_random_map_preview(
+        mut self,
+        source: Option<crate::map::source::LoadedMapSource>,
+    ) -> Self {
+        self.local_random_map_preview = source;
+        self
+    }
+    pub(crate) fn random_map_preview(&self) -> Option<&crate::map::source::LoadedMapSource> {
+        self.local_random_map_preview.as_ref()
+    }
+    pub(crate) fn effective_map_digest(&self) -> Option<&str> {
+        self.local_map_effective_digest.as_deref()
+    }
+    pub(crate) fn local_map_source(&self) -> Option<&crate::map::source::LoadedMapSource> {
+        self.local_map_source.as_ref()
+    }
+
+    pub(crate) fn carry_over(&self) -> Option<&CampaignCarryOver> {
+        self.carry_over.as_ref()
+    }
+
+    pub(crate) fn max_ahead_frames(&self) -> i32 {
+        self.max_ahead_frames
+    }
+    pub(crate) fn native_id_prefix(&self) -> Option<u32> {
+        self.native_id_prefix
+    }
+    pub(crate) fn wol_start(&self) -> &crate::app::match_runtime::session::WolStartTerms {
+        &self.wol_start
+    }
+    pub fn launch_session(&self) -> &SkirmishLaunchSession {
+        &self.launch
+    }
+    pub(crate) fn mode(&self) -> crate::app::match_runtime::session::SessionMode {
+        self.mode
+    }
+    pub(crate) fn host(&self) -> bool {
+        self.host
+    }
+}
+
+/// Explicit campaign settings, from a client or the process speed-control flag.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CampaignLaunchOptions {
+    pub game_speed: i32,
+    pub build_off_ally: bool,
+    /// External client map root, independent of the retail asset directory.
+    pub scenario_directory: Option<std::path::PathBuf>,
+}
+
+impl CampaignLaunchOptions {
+    /// Main_Tick55D767..55D796 skips the ordinary speed2 store when the
+    /// Parse_Command_Line52F94B flag is set. Reuse the existing launch path;
+    /// ScenarioSession remains the only live game-speed owner.
+    pub(crate) fn for_speed_control(enabled: bool, game_speed: i32) -> Option<Self> {
+        enabled.then(|| Self {
+            game_speed,
+            build_off_ally: crate::sim::game_options::GameOptions::default().build_off_ally,
+            scenario_directory: None,
+        })
+    }
+
+    fn loose_scenario_file(&self, scenario: &str) -> Option<String> {
+        let path = self.scenario_directory.as_ref()?.join(scenario);
+        path.is_file().then(|| path.to_string_lossy().into_owned())
+    }
+}
+
+/// StartScenario683B26..683B62 copies Scenario+125C and uppercases it via
+/// 7DCFC4 before the exact-case MISSIONMD reads (original gamemd.exe).
+/// Keep the supplied physical spelling for case-sensitive loose-file lookup.
+fn prepare_campaign_scenario(
+    scenario: &str,
+    campaign: &crate::rules::campaigns::CampaignDefinition,
+    launch_options: Option<&CampaignLaunchOptions>,
+) -> (String, Option<String>) {
+    // Start_Scenario683AC8..683AF8: a null/empty requested name falls back
+    // to the retained campaign entry, including after failed MapSelect.
+    let scenario = if scenario.is_empty() {
+        campaign.scenario()
+    } else {
+        scenario
+    };
+    let logical_name = scenario.to_ascii_uppercase();
+    let source = launch_options
+        .and_then(|options| options.loose_scenario_file(scenario))
+        .or_else(|| (logical_name != scenario).then(|| scenario.to_owned()));
+    (logical_name, source)
+}
+
+/// Start_Scenario683AB0's immutable campaign-array selection, separate from
+/// multiplayer slot staging. Full_Init686B6A uses Options.Difficulty literally.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedCampaignStartup {
     campaign_index: usize,
@@ -88,18 +248,78 @@ pub struct PreparedCampaignStartup {
     /// the campaign's Scenario (`0x00683AF8`); a won mission passes the map
     /// MapSelect chose (`0x00685C4E`).
     scenario: String,
+    /// Physical source spelling when it differs from the logical name, or
+    /// the resolved external path. Metadata and continuation use `scenario`.
+    scenario_file: Option<String>,
     /// Scenario+0x1254 for this start. A new campaign starts after
     /// BattleControlTerminated6865B0, whose reset matches the ctor's 1; a won
     /// mission increments it before Start_Scenario (`0x00685AAF`).
     mission_counter: i32,
     difficulty: i32,
-    /// The globals `0x004C6180` saved from the won mission; `0x004C6210`
-    /// writes them back once Start_Scenario has read the next map.
-    carried_globals: Option<[bool; SCENARIO_GLOBAL_COUNT]>,
+    launch_options: Option<CampaignLaunchOptions>,
+    /// The carry-over record `0x004C6210` writes back once Start_Scenario
+    /// has read the map. A new campaign (Main__PrepareSession) never calls
+    /// it; a won mission, the restart and the defeat retry all do.
+    carry_over: Option<CampaignCarryOver>,
+    /// Start_Scenario's DL argument (`0x00683ABC`), tested at `0x00683D9C`
+    /// before the post-read `[Basic] Action` movie (Scenario+0x1444). A new
+    /// campaign (`0x0052E70C`) and a won mission (`0x00685C45`) pass 1; the
+    /// restart (`0x006864ED`) and the defeat retry (`0x00686287`) pass 0.
+    /// The pre-read Intro/Brief movie does not depend on it.
+    play_action_movie: bool,
     pub seed: MatchSeed,
 }
 
 impl PreparedCampaignStartup {
+    /// Rebuild only the app's continuation inputs after an admitted saved
+    /// world. Native ScenarioLoad689470 retains index+34CC, name+125C and
+    /// counter+1254; ContentLoad67E804 restores the incoming carry-over.
+    /// The re-read process catalog supplies the same indexed Campaign entry.
+    pub(crate) fn from_saved_scenario(
+        campaigns: &crate::rules::campaigns::CampaignRegistry,
+        simulation: &Simulation,
+        source: &crate::map::source::LoadedMapSource,
+    ) -> Option<Self> {
+        let session = simulation.session();
+        if session.game_mode_nonzero() {
+            return None;
+        }
+        let campaign_index = usize::try_from(session.campaign_index()?).ok()?;
+        let campaign = campaigns.get(campaign_index)?.clone();
+        Some(Self {
+            campaign_index,
+            campaign,
+            scenario: session.map_name().to_owned(),
+            scenario_file: match source {
+                crate::map::source::LoadedMapSource::Loose { path, .. } => {
+                    Some(path.to_string_lossy().into_owned())
+                }
+                _ => None,
+            },
+            mission_counter: session.campaign_mission_counter()?,
+            difficulty: session.campaign_house_difficulties()?.0 as i32,
+            // Reuse the saved session's existing options authority. A loose
+            // external campaign also needs its source directory on continuation.
+            launch_options: Some(CampaignLaunchOptions {
+                game_speed: session.game_options().game_speed,
+                build_off_ally: session.game_options().build_off_ally,
+                scenario_directory: match source {
+                    crate::map::source::LoadedMapSource::Loose { path, .. } => {
+                        path.parent().map(std::path::Path::to_path_buf)
+                    }
+                    _ => None,
+                },
+            }),
+            carry_over: session.campaign_restart_carry_over(),
+            play_action_movie: false,
+            seed: MatchSeed {
+                value: session.seed() as u32,
+                source: MatchSeedSource::SavedScenario,
+                seed_authority_certifying: false,
+            },
+        })
+    }
+
     pub fn campaign_index(&self) -> usize {
         self.campaign_index
     }
@@ -112,6 +332,10 @@ impl PreparedCampaignStartup {
         &self.scenario
     }
 
+    pub fn selected_map_file(&self) -> &str {
+        self.scenario_file.as_deref().unwrap_or(&self.scenario)
+    }
+
     pub fn mission_counter(&self) -> i32 {
         self.mission_counter
     }
@@ -120,28 +344,94 @@ impl PreparedCampaignStartup {
         self.difficulty
     }
 
-    pub fn carried_globals(&self) -> Option<&[bool; SCENARIO_GLOBAL_COUNT]> {
-        self.carried_globals.as_ref()
+    /// Only explicit external overrides replace the existing campaign defaults.
+    pub fn game_options(&self) -> Option<crate::sim::game_options::GameOptions> {
+        self.launch_options
+            .as_ref()
+            .map(|options| crate::sim::game_options::GameOptions {
+                game_speed: options.game_speed,
+                build_off_ally: options.build_off_ally,
+                ..Default::default()
+            })
     }
 
-    /// The won mission's Start_Scenario (`0x00685C4E`): the same campaign
-    /// index, the map MapSelect chose, the incremented mission counter and
-    /// the saved globals. Difficulty is Options.Difficulty again.
-    pub fn next_mission(
+    pub fn carry_over(&self) -> Option<&CampaignCarryOver> {
+        self.carry_over.as_ref()
+    }
+
+    pub fn plays_action_movie(&self) -> bool {
+        self.play_action_movie
+    }
+
+    /// Start_Scenario for the same mission: the in-battle Restart
+    /// (`0x006863E0`, call at `0x006864FC`) and the defeat retry (`0x00686296`)
+    /// both pass Scenario+0x125C, DL 0 and the retained campaign index
+    /// Scenario+0x34CC. Neither path touches the mission counter
+    /// Scenario+0x1254 or saves the carry-over record, so the record
+    /// `0x004C6210` writes back afterwards (`0x00686506`, `0x0068639A`) is the
+    /// one this mission started from. Without a won mission the record is the
+    /// one `0x004C6140` cleared at session preparation (`0x0052DF0E`): every
+    /// global false and the player's difficulty row 1, which SetDifficulty
+    /// puts on the player House whatever Options.Difficulty says. The
+    /// computer rows and the session's Options.Difficulty are read again.
+    pub fn restart(
         &self,
-        scenario: String,
-        mission_counter: i32,
         difficulty: i32,
-        carried_globals: [bool; SCENARIO_GLOBAL_COUNT],
+        game_speed: i32,
         clock: &mut impl MatchSeedClock,
     ) -> Self {
         Self {
             campaign_index: self.campaign_index,
             campaign: self.campaign.clone(),
+            scenario: self.scenario.clone(),
+            scenario_file: self.scenario_file.clone(),
+            mission_counter: self.mission_counter,
+            difficulty,
+            launch_options: self
+                .launch_options
+                .as_ref()
+                .map(|options| CampaignLaunchOptions {
+                    game_speed,
+                    ..options.clone()
+                }),
+            carry_over: Some(self.carry_over.unwrap_or(CampaignCarryOver::CLEARED)),
+            play_action_movie: false,
+            seed: read_match_seed(clock),
+        }
+    }
+
+    /// The won mission's Start_Scenario (`0x00685C4E`): the same campaign
+    /// index, the map MapSelect chose, the incremented mission counter and
+    /// the record `0x004C6180` saved from the won mission. Options.Difficulty
+    /// is read again for the session; the player House's row comes from the
+    /// record.
+    pub fn next_mission(
+        &self,
+        scenario: String,
+        mission_counter: i32,
+        difficulty: i32,
+        game_speed: i32,
+        carry_over: CampaignCarryOver,
+        clock: &mut impl MatchSeedClock,
+    ) -> Self {
+        let (scenario, scenario_file) =
+            prepare_campaign_scenario(&scenario, &self.campaign, self.launch_options.as_ref());
+        Self {
+            campaign_index: self.campaign_index,
+            campaign: self.campaign.clone(),
+            scenario_file,
             scenario,
             mission_counter,
             difficulty,
-            carried_globals: Some(carried_globals),
+            launch_options: self
+                .launch_options
+                .as_ref()
+                .map(|options| CampaignLaunchOptions {
+                    game_speed,
+                    ..options.clone()
+                }),
+            carry_over: Some(carry_over),
+            play_action_movie: true,
             seed: read_match_seed(clock),
         }
     }
@@ -151,23 +441,67 @@ pub fn prepare_campaign_startup(
     campaigns: &crate::rules::campaigns::CampaignRegistry,
     name: &str,
     difficulty: i32,
+    scenario: Option<&str>,
+    launch_options: Option<CampaignLaunchOptions>,
     clock: &mut impl MatchSeedClock,
 ) -> Option<PreparedCampaignStartup> {
     let campaign_index = campaigns.find_index(name)?;
+    prepare_campaign_startup_at_index(
+        campaigns,
+        campaign_index,
+        difficulty,
+        scenario,
+        launch_options,
+        clock,
+    )
+}
+
+/// Retain the caller's catalog identity independently of an explicit filename.
+/// Original683AC8..683AFE uses the record's Scenario only for a null/empty
+/// filename;683B0A stores the supplied index. See campaign_start_prefix.json.
+/// Named shell starts and external starts share this constructor and consume
+/// the seed only after checked catalog admission succeeds.
+pub(crate) fn prepare_campaign_startup_at_index(
+    campaigns: &crate::rules::campaigns::CampaignRegistry,
+    campaign_index: usize,
+    difficulty: i32,
+    scenario: Option<&str>,
+    launch_options: Option<CampaignLaunchOptions>,
+    clock: &mut impl MatchSeedClock,
+) -> Option<PreparedCampaignStartup> {
     let campaign = campaigns.get(campaign_index)?.clone();
+    let (scenario, scenario_file) = prepare_campaign_scenario(
+        scenario.unwrap_or_default(),
+        &campaign,
+        launch_options.as_ref(),
+    );
     Some(PreparedCampaignStartup {
         campaign_index,
-        scenario: campaign.scenario().to_owned(),
+        // External mission selectors can enter a later authored scenario while
+        // retaining the selected campaign's final movie and continuation identity.
+        scenario_file,
+        scenario,
         campaign,
         mission_counter: 1,
         difficulty,
-        carried_globals: None,
+        launch_options,
+        carry_over: None,
+        play_action_movie: true,
         seed: read_match_seed(clock),
     })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LoadingStartup {
+    Network(std::sync::Arc<PreparedNetworkStartup>),
+    /// Exact immutable recorded launch. The diagnostics owner retains and
+    /// validates its log; this variant never installs a live network service.
+    Replay {
+        session: SkirmishLaunchSession,
+        seed: MatchSeed,
+        game_mode: crate::sim::scenario_session::ScenarioGameMode,
+        native_id_prefix: u32,
+    },
     Campaign(PreparedCampaignStartup),
     Accepted(PreparedMatchStartup),
     UnverifiedLegacy {
@@ -180,10 +514,52 @@ pub enum LoadingStartup {
 }
 
 impl LoadingStartup {
+    /// The match seed of a typed startup, which `ScenarioBootstrapRng::new`
+    /// seeds the load's Scenario and Main streams with.
+    pub(crate) fn match_seed(&self) -> Option<u32> {
+        match self {
+            Self::Network(startup) => Some(startup.seed.value),
+            Self::Replay { seed, .. } | Self::UnverifiedLegacy { seed, .. } => Some(seed.value),
+            Self::Campaign(startup) => Some(startup.seed.value),
+            Self::Accepted(startup) => Some(startup.seed.value),
+            Self::Generic { .. } => None,
+        }
+    }
+
+    pub(crate) fn native_id_prefix(&self) -> Option<u32> {
+        match self {
+            Self::Network(startup) => startup.native_id_prefix(),
+            Self::Replay {
+                native_id_prefix, ..
+            } => Some(*native_id_prefix),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn physical_map_file(&self) -> &str {
+        if let Self::Network(startup) = self
+            && let Some(crate::map::source::LoadedMapSource::Loose { path, .. }) =
+                startup.local_map_source()
+            && let Some(path) = path.to_str()
+        {
+            return path;
+        }
+        self.selected_map_file()
+    }
+
     pub fn selected_map_file(&self) -> &str {
         match self {
-            Self::Campaign(startup) => startup.scenario(),
+            Self::Network(startup) => startup
+                .launch
+                .selected_map_file
+                .as_deref()
+                .expect("accepted network map"),
+            Self::Campaign(startup) => startup.selected_map_file(),
             Self::Accepted(startup) => startup.session.selected_map_file(),
+            Self::Replay { session, .. } => session
+                .selected_map_file
+                .as_deref()
+                .expect("validated replay map"),
             Self::UnverifiedLegacy { session, .. } => {
                 session.selected_map_file.as_deref().unwrap_or("auto")
             }
@@ -193,8 +569,10 @@ impl LoadingStartup {
 
     pub fn launch_session(&self) -> Option<&SkirmishLaunchSession> {
         match self {
+            Self::Network(startup) => Some(startup.launch_session()),
             Self::Campaign(_) => None,
             Self::Accepted(startup) => Some(startup.session.launch_session()),
+            Self::Replay { session, .. } => Some(session),
             Self::UnverifiedLegacy { session, .. } => Some(session),
             Self::Generic { .. } => None,
         }
@@ -203,7 +581,11 @@ impl LoadingStartup {
     pub fn accepted(&self) -> Option<&PreparedMatchStartup> {
         match self {
             Self::Accepted(startup) => Some(startup),
-            Self::Campaign(_) | Self::UnverifiedLegacy { .. } | Self::Generic { .. } => None,
+            Self::Network(_)
+            | Self::Campaign(_)
+            | Self::Replay { .. }
+            | Self::UnverifiedLegacy { .. }
+            | Self::Generic { .. } => None,
         }
     }
 
@@ -214,13 +596,15 @@ impl LoadingStartup {
         }
     }
 
-    /// The `GameMode` the shell wrote before this launch: 0 for a campaign
-    /// (`0x0052E175`), 5 for every Battle launch (`0x0052E10F`). A generic map
-    /// load has no campaign either, matching the simulation's own
+    /// The `GameMode` admitted before construction: campaign 0 (`0x0052E175`),
+    /// offline Battle 5 (`0x0052E10F`), or the exact network/recorded mode.
+    /// A generic map load has no campaign, matching the simulation's own
     /// `game_mode_nonzero = campaign.is_none()` classification.
     pub(crate) fn session_mode(&self) -> crate::app::match_runtime::session::SessionMode {
         use crate::app::match_runtime::session::SessionMode;
         match self {
+            Self::Network(startup) => startup.mode(),
+            Self::Replay { game_mode, .. } => *game_mode,
             Self::Campaign(_) => SessionMode::Campaign,
             Self::Accepted(_) | Self::UnverifiedLegacy { .. } | Self::Generic { .. } => {
                 SessionMode::Skirmish
@@ -231,8 +615,10 @@ impl LoadingStartup {
     #[cfg(test)]
     pub fn seed_or_else(&self, unverified_fallback: impl FnOnce() -> u32) -> u32 {
         match self {
+            Self::Network(startup) => startup.seed.value,
             Self::Campaign(startup) => startup.seed.value,
             Self::Accepted(startup) => startup.seed.value,
+            Self::Replay { seed, .. } => seed.value,
             Self::UnverifiedLegacy { seed, .. } => seed.value,
             Self::Generic { .. } => unverified_fallback(),
         }
@@ -253,14 +639,8 @@ pub fn classify_startup_session(session: &SkirmishLaunchSession) -> StartupSessi
     }
 
     let mode = &session.mode;
-    let is_stock_battle = mode.id == 1
-        && mode.ui_name_key.eq_ignore_ascii_case("GUI:Battle")
-        && mode.tooltip_key.eq_ignore_ascii_case("STT:ModeBattle")
-        && mode.override_file.eq_ignore_ascii_case("MPBattleMD.ini")
-        && mode.map_filter.eq_ignore_ascii_case("standard")
-        && mode.random_maps_allowed
-        && mode.allies_allowed
-        && !mode.must_ally;
+    let is_stock_battle =
+        mode.id == crate::skirmish_launch::BATTLE_MODE_ID && mode.matching_stock().is_some();
     if !is_stock_battle {
         return StartupSessionClassification::UnverifiedLegacy(
             UnverifiedStartupReason::NonBattleMode,
@@ -273,22 +653,33 @@ pub fn classify_startup_session(session: &SkirmishLaunchSession) -> StartupSessi
             },
         );
     }
-    if session.player_name.is_empty() {
+    if session.humans.len() != 1
+        || session.local_player_index != 0
+        || session.humans[0].is_observer()
+    {
         return StartupSessionClassification::UnverifiedLegacy(
             UnverifiedStartupReason::IncompleteLedger,
         );
     }
-    if session.local.country_random {
+    if session.local_player().name.is_empty() {
+        return StartupSessionClassification::UnverifiedLegacy(
+            UnverifiedStartupReason::IncompleteLedger,
+        );
+    }
+    if session.local_slot().country_random {
         return StartupSessionClassification::UnverifiedLegacy(
             UnverifiedStartupReason::RandomLocalCountry,
         );
     }
-    if session.local.color_random {
+    if session.local_slot().color_random {
         return StartupSessionClassification::UnverifiedLegacy(
             UnverifiedStartupReason::RandomLocalColor,
         );
     }
-    if matches!(session.local.start_position, LaunchStartPosition::Auto) {
+    if matches!(
+        session.local_slot().start_position,
+        LaunchStartPosition::Auto
+    ) {
         return StartupSessionClassification::UnverifiedLegacy(
             UnverifiedStartupReason::AutoLocalStart,
         );
@@ -359,7 +750,7 @@ impl MatchSeedClock for OrdinaryMatchSeedClock {
         }
         #[cfg(not(windows))]
         {
-            use std::time::{SystemTime, UNIX_EPOCH};
+            use crate::util::time::{SystemTime, UNIX_EPOCH};
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
@@ -453,16 +844,16 @@ impl RustL0Observation<'_> {
         if self.startup.correlation != self.active_correlation {
             return Err(RustL0Error::CorrelationMismatch);
         }
-        if self.simulation.session.seed != u64::from(self.startup.seed.value) {
+        if self.simulation.session().seed() != u64::from(self.startup.seed.value) {
             return Err(RustL0Error::SeedMismatch);
         }
-        if self.simulation.session.tick != 0 {
+        if self.simulation.session().tick() != 0 {
             return Err(RustL0Error::NonzeroTick);
         }
-        if self.simulation.session.total_sim_ms != 0 {
+        if self.simulation.session().total_sim_ms() != 0 {
             return Err(RustL0Error::NonzeroSimulationTime);
         }
-        if self.simulation.session.binary_frame != 0 {
+        if self.simulation.session().binary_frame() != 0 {
             return Err(RustL0Error::NonzeroBinaryFrame);
         }
         if !self.screen_is_loading {
@@ -475,9 +866,9 @@ impl RustL0Observation<'_> {
             seed_source: self.startup.seed.source,
             seed_authority_certifying: self.startup.seed.seed_authority_certifying,
             session: self.startup.session.clone(),
-            tick: self.simulation.session.tick,
-            total_sim_ms: self.simulation.session.total_sim_ms,
-            binary_frame: self.simulation.session.binary_frame,
+            tick: self.simulation.session().tick(),
+            total_sim_ms: self.simulation.session().total_sim_ms(),
+            binary_frame: self.simulation.session().binary_frame(),
             rngs: self.simulation.rng_state(),
         })
     }
@@ -503,7 +894,7 @@ pub fn accepted_tick_is_admitted(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
     use crate::skirmish_launch::{
@@ -514,6 +905,7 @@ mod tests {
     fn explicit_session() -> SkirmishLaunchSession {
         SkirmishLaunchSession {
             mode: SkirmishLaunchMode {
+                class: crate::skirmish_modes::MpModeClass::Battle,
                 id: 1,
                 ui_name_key: "GUI:Battle".into(),
                 tooltip_key: "STT:ModeBattle".into(),
@@ -524,16 +916,23 @@ mod tests {
                 must_ally: false,
             },
             selected_map_file: Some("DeepFrze.map".into()),
-            player_name: "Player".into(),
-            local: SkirmishLocalSlot {
-                country: LaunchCountry::America,
-                country_random: false,
-                color_index: 0,
-                color_random: false,
-                start_position: LaunchStartPosition::Position(0),
-                team: LaunchTeam::None,
-            },
+            humans: vec![crate::skirmish_launch::SkirmishHumanSlot {
+                raw_slot_index: Some(0),
+                name: "Player".into(),
+                slot: SkirmishLocalSlot {
+                    country: LaunchCountry::America,
+                    country_random: false,
+                    color_index: 0,
+                    color_random: false,
+                    start_position: LaunchStartPosition::Position(0),
+                    team: LaunchTeam::None,
+                },
+                role: crate::skirmish_launch::LaunchHumanRole::from_observer(false),
+            }],
+            local_player_index: 0,
+            ai_player_count: 1,
             opponents: vec![SkirmishAiSlot {
+                raw_slot_index: 1,
                 country: LaunchCountry::Russia,
                 country_random: false,
                 color_index: 1,
@@ -541,6 +940,7 @@ mod tests {
                 start_position: LaunchStartPosition::Position(1),
                 team: LaunchTeam::None,
                 difficulty: AiDifficulty::Easy,
+                super_tier: None,
             }],
             pre_fill_house_roster:
                 crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(1),
@@ -586,46 +986,210 @@ mod tests {
     }
 
     #[test]
-    fn launch_writes_the_shell_game_mode() {
-        use crate::app::match_runtime::session::SessionMode;
+    fn saved_campaign_keeps_later_map_identity_for_restart_and_victory() {
+        use crate::sim::scenario_session::ScenarioDescriptor;
+        use crate::sim::snapshot::GameSnapshot;
+
+        let mut campaigns = crate::rules::campaigns::CampaignRegistry::default();
+        campaigns.apply_ini(
+            &crate::rules::ini_parser::IniFile::from_str(
+                "[Battles]\n0=ALL1\n1=SOV1\n[ALL1]\nCD=2\nScenario=ALL01UMD.MAP\n[SOV1]\nCD=2\nScenario=SOV01UMD.MAP\n",
+            ),
+            &crate::rules::movies::MovieRegistry::default(),
+        );
+        let mut sim = Simulation::from_descriptor(&ScenarioDescriptor {
+            map_name: "SOV03UMD.MAP".into(),
+            seed: 71,
+            ..Default::default()
+        });
+        sim.session_mut_for_test()
+            .initialize_campaign_for_test(1, 3, CampaignCarryOver::CLEARED);
+        let bytes = GameSnapshot::save(&sim, 0, 0, "SOV03UMD.MAP", 0);
+        let restored = GameSnapshot::load(&bytes).unwrap().sim;
+        let source = crate::map::source::LoadedMapSource::Mix {
+            logical_name: "SOV03UMD.MAP".into(),
+            source_archive: "mapsmd03.mix".into(),
+            entry_id: 0,
+            payload_len: 0,
+            source_sha256: String::new(),
+        };
+        let saved = PreparedCampaignStartup::from_saved_scenario(&campaigns, &restored, &source)
+            .expect("a later map keeps its saved catalog index");
+        assert_eq!(saved.campaign_index(), 1);
+        assert_eq!(saved.campaign().id(), "SOV1");
+        assert_eq!(saved.scenario(), "SOV03UMD.MAP");
+        assert_eq!(saved.mission_counter(), 3);
+        let mut admission = crate::app::match_runtime::startup::MatchStartup::default();
+        admission.acknowledge_saved_load(Some(saved));
+        assert!(admission.restored());
+        assert!(admission.admits_exact_step());
+        assert!(admission.receipt().is_none());
+        assert!(
+            !admission.campaign_installed(),
+            "no fresh-load receipt is fabricated"
+        );
+        let saved = admission.installed_campaign().unwrap();
+        let mut clock = CountingClock {
+            value: 88,
+            reads: 0,
+        };
+        let retry = saved.restart(2, 1, &mut clock);
+        assert_eq!(retry.campaign_index(), 1);
+        assert_eq!(retry.scenario(), "SOV03UMD.MAP");
+        assert_eq!(retry.mission_counter(), 3);
+        assert_eq!(retry.carry_over(), Some(&CampaignCarryOver::CLEARED));
+        assert!(!retry.plays_action_movie());
+        let next = saved.next_mission(
+            "SOV04UMD.MAP".into(),
+            4,
+            2,
+            1,
+            restored.save_campaign_carry_over(),
+            &mut clock,
+        );
+        assert_eq!(next.campaign_index(), 1);
+        assert_eq!(next.scenario(), "SOV04UMD.MAP");
+        assert_eq!(next.mission_counter(), 4);
+        assert!(next.plays_action_movie());
+        assert_eq!(clock.reads, 2, "only the two fresh starts sample a seed");
+    }
+
+    #[test]
+    fn speed_control_campaign_preserves_uncapped_speed_through_start_and_restart() {
+        use crate::app::frontend::startup_options::consume_retail_switches;
         let ini = crate::rules::ini_parser::IniFile::from_str(
             "[Battles]\n0=ALL1\n[ALL1]\nCD=2\nScenario=ALL01UMD.MAP\n",
         );
         let mut campaigns = crate::rules::campaigns::CampaignRegistry::default();
         campaigns.apply_ini(&ini, &crate::rules::movies::MovieRegistry::default());
-        let mut clock = CountingClock { value: 7, reads: 0 };
-        let campaign = prepare_campaign_startup(&campaigns, "ALL1", 1, &mut clock)
-            .expect("synthetic campaign catalog admits a selected campaign");
-        assert_eq!(
-            LoadingStartup::Campaign(campaign).session_mode(),
-            SessionMode::Campaign
+        let (ordinary, _) = consume_retail_switches(Vec::new());
+        assert!(
+            CampaignLaunchOptions::for_speed_control(ordinary.campaign_speed_control, 0).is_none()
         );
+        let (enabled, rest) = consume_retail_switches(vec!["-speedcontrol".into()]);
+        assert!(rest.is_empty());
+        let mut clock = CountingClock {
+            value: 731,
+            reads: 0,
+        };
+        let startup = prepare_campaign_startup(
+            &campaigns,
+            "ALL1",
+            1,
+            None,
+            CampaignLaunchOptions::for_speed_control(enabled.campaign_speed_control, 0),
+            &mut clock,
+        )
+        .unwrap();
+        let options = startup.game_options().unwrap();
+        assert_eq!(options.game_speed, 0);
         assert_eq!(
-            LoadingStartup::Accepted(prepared(9)).session_mode(),
-            SessionMode::Skirmish
+            options.build_off_ally,
+            crate::sim::game_options::GameOptions::default().build_off_ally
         );
-        let seed = prepared(9).seed;
-        assert_eq!(
-            LoadingStartup::UnverifiedLegacy {
-                session: explicit_session(),
-                seed,
-            }
-            .session_mode(),
-            SessionMode::Skirmish
-        );
-        assert_eq!(
-            LoadingStartup::Generic {
-                selected_map_file: "x.map".into()
-            }
-            .session_mode(),
-            SessionMode::Skirmish
-        );
+        let restart = startup.restart(1, 4, &mut clock);
+        assert_eq!(restart.game_options().unwrap().game_speed, 4);
+        assert_eq!(restart.scenario(), startup.scenario());
+        assert_eq!(restart.campaign_index(), startup.campaign_index());
     }
 
-    fn assert_unverified(session: &SkirmishLaunchSession, expected: UnverifiedStartupReason) {
+    #[test]
+    fn cncnet_campaign_enters_a_selected_mission_and_keeps_continuation_identity() {
+        let ini = crate::rules::ini_parser::IniFile::from_str(
+            "[Battles]\n0=ALL1\n[ALL1]\nCD=2\nScenario=ALL01UMD.MAP\n",
+        );
+        let mut campaigns = crate::rules::campaigns::CampaignRegistry::default();
+        campaigns.apply_ini(&ini, &crate::rules::movies::MovieRegistry::default());
+        let mut clock = CountingClock {
+            value: 731,
+            reads: 0,
+        };
+        let startup = prepare_campaign_startup(
+            &campaigns,
+            "ALL1",
+            2,
+            Some("ALL04uMd.map"),
+            Some(CampaignLaunchOptions {
+                game_speed: 2,
+                build_off_ally: false,
+                scenario_directory: None,
+            }),
+            &mut clock,
+        )
+        .expect("campaign admission");
+        assert_eq!(startup.scenario(), "ALL04UMD.MAP");
+        assert_eq!(startup.selected_map_file(), "ALL04uMd.map");
+        assert_eq!(startup.campaign().scenario(), "ALL01UMD.MAP");
+        assert_eq!(startup.campaign().id(), "ALL1");
+        assert_eq!(startup.campaign().cd(), 2);
+        assert_eq!(startup.difficulty(), 2);
+        assert_eq!(startup.game_options().unwrap().game_speed, 2);
+        assert!(!startup.game_options().unwrap().build_off_ally);
+        assert_eq!(startup.seed.value, 731);
+        assert_eq!(clock.reads, 1);
+        let next = startup.next_mission(
+            "ALL05uMd.map".into(),
+            2,
+            2,
+            4,
+            CampaignCarryOver::CLEARED,
+            &mut clock,
+        );
+        assert_eq!(next.campaign_index(), startup.campaign_index());
+        assert_eq!(next.campaign(), startup.campaign());
+        assert_eq!(next.scenario(), "ALL05UMD.MAP");
+        assert_eq!(next.selected_map_file(), "ALL05uMd.map");
+        assert_eq!(next.game_options().unwrap().game_speed, 4);
+        assert!(!next.game_options().unwrap().build_off_ally);
+        assert!(startup.plays_action_movie() && next.plays_action_movie());
+        // SkipMapSelect clears FileName on an unmatched destination. Native
+        // Start_Scenario683AC8..683AF8 then chooses the retained campaign entry.
+        let mut sim = crate::sim::world::Simulation::new();
+        sim.set_campaign_map_stage(17);
+        let record = sim.save_campaign_carry_over();
+        let fallback = next.next_mission(String::new(), 3, 2, 4, record, &mut clock);
+        assert_eq!(fallback.scenario(), "ALL01UMD.MAP");
+        assert_eq!(fallback.campaign_index(), startup.campaign_index());
+        assert_eq!(fallback.mission_counter(), 3);
+        assert_eq!(fallback.carry_over(), Some(&record));
+        assert_eq!(fallback.carry_over().unwrap().map_stage(), 17);
+    }
+
+    /// Restart and the defeat retry re-enter Start_Scenario with the same
+    /// FileName and campaign index, DL 0 and the record this mission
+    /// started from; only the seed and Options.Difficulty are read again.
+    #[test]
+    fn restart_reenters_the_same_mission_without_the_action_movie() {
+        let ini = crate::rules::ini_parser::IniFile::from_str(
+            "[Battles]\n0=ALL1\n1=SOV1\n[ALL1]\nScenario=ALL01UMD.MAP\n[SOV1]\nScenario=SOV01UMD.MAP\n",
+        );
+        let mut campaigns = crate::rules::campaigns::CampaignRegistry::default();
+        campaigns.apply_ini(&ini, &crate::rules::movies::MovieRegistry::default());
+        let mut clock = CountingClock { value: 5, reads: 0 };
+        let first = prepare_campaign_startup(&campaigns, "SOV1", 0, None, None, &mut clock)
+            .expect("campaign admission");
+        let mut won = crate::sim::world::Simulation::new();
+        won.set_trigger_variable_for_test(true, 3, true);
+        let record = won.save_campaign_carry_over();
+        let second = first.next_mission("SOV02SMD.MAP".into(), 2, 0, 1, record, &mut clock);
+        clock.value = 77;
+        let restarted = second.restart(2, 1, &mut clock);
+        assert_eq!(restarted.campaign_index(), second.campaign_index());
+        assert_eq!(restarted.campaign(), second.campaign());
+        assert_eq!(restarted.scenario(), "SOV02SMD.MAP");
+        assert_eq!(restarted.selected_map_file(), second.selected_map_file());
+        assert_eq!(restarted.mission_counter(), 2);
+        assert_eq!(restarted.carry_over(), Some(&record));
+        assert!(restarted.carry_over().unwrap().globals()[3]);
+        assert_eq!(restarted.difficulty(), 2);
+        assert_eq!(restarted.seed.value, 77);
+        assert!(!restarted.plays_action_movie());
+        // A first mission starts without the record but restarts with the
+        // one `0x004C6140` cleared, player row 1 included.
+        assert_eq!(first.carry_over(), None);
         assert_eq!(
-            classify_startup_session(session),
-            StartupSessionClassification::UnverifiedLegacy(expected)
+            first.restart(0, 1, &mut clock).carry_over(),
+            Some(&CampaignCarryOver::CLEARED)
         );
     }
 
@@ -644,14 +1208,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_fixed_battle_session_is_accepted() {
-        assert!(matches!(
-            classify_startup_session(&explicit_session()),
-            StartupSessionClassification::AcceptedExplicitFixedBattle(_)
-        ));
-    }
-
-    #[test]
     fn unresolved_choices_are_unverified() {
         let mut automatic_map = explicit_session();
         automatic_map.selected_map_file = Some("auto".into());
@@ -661,14 +1217,14 @@ mod tests {
         );
 
         let mut session = explicit_session();
-        session.local.country_random = true;
+        session.local_slot_mut().country_random = true;
         assert_eq!(
             classify_startup_session(&session),
             StartupSessionClassification::UnverifiedLegacy(
                 UnverifiedStartupReason::RandomLocalCountry
             )
         );
-        session.local.country_random = false;
+        session.local_slot_mut().country_random = false;
         session.opponents[0].start_position = LaunchStartPosition::Auto;
         assert_eq!(
             classify_startup_session(&session),
@@ -676,105 +1232,6 @@ mod tests {
                 index: 0
             })
         );
-    }
-
-    #[test]
-    fn random_local_country_is_unverified() {
-        let mut session = explicit_session();
-        session.local.country_random = true;
-        assert_unverified(&session, UnverifiedStartupReason::RandomLocalCountry);
-    }
-
-    #[test]
-    fn random_ai_country_is_unverified() {
-        let mut session = explicit_session();
-        session.opponents[0].country_random = true;
-        assert_unverified(
-            &session,
-            UnverifiedStartupReason::RandomAiCountry { index: 0 },
-        );
-    }
-
-    #[test]
-    fn random_local_color_is_unverified() {
-        let mut session = explicit_session();
-        session.local.color_random = true;
-        assert_unverified(&session, UnverifiedStartupReason::RandomLocalColor);
-    }
-
-    #[test]
-    fn random_ai_color_is_unverified() {
-        let mut session = explicit_session();
-        session.opponents[0].color_random = true;
-        assert_unverified(
-            &session,
-            UnverifiedStartupReason::RandomAiColor { index: 0 },
-        );
-    }
-
-    #[test]
-    fn auto_local_start_is_unverified() {
-        let mut session = explicit_session();
-        session.local.start_position = LaunchStartPosition::Auto;
-        assert_unverified(&session, UnverifiedStartupReason::AutoLocalStart);
-    }
-
-    #[test]
-    fn auto_ai_start_is_unverified() {
-        let mut session = explicit_session();
-        session.opponents[0].start_position = LaunchStartPosition::Auto;
-        assert_unverified(&session, UnverifiedStartupReason::AutoAiStart { index: 0 });
-    }
-
-    #[test]
-    fn missing_map_is_unverified() {
-        let mut session = explicit_session();
-        session.selected_map_file = None;
-        assert_unverified(&session, UnverifiedStartupReason::MissingMap);
-    }
-
-    #[test]
-    fn non_battle_mode_is_unverified() {
-        let mut session = explicit_session();
-        session.mode.id = 2;
-        assert_unverified(&session, UnverifiedStartupReason::NonBattleMode);
-    }
-
-    #[test]
-    fn invalid_active_ai_count_is_unverified() {
-        let mut session = explicit_session();
-        let slot = session.opponents[0].clone();
-        session.opponents = vec![slot; SKIRMISH_AI_SLOT_COUNT + 1];
-        assert_unverified(
-            &session,
-            UnverifiedStartupReason::InvalidActiveAiCount {
-                count: SKIRMISH_AI_SLOT_COUNT + 1,
-            },
-        );
-    }
-
-    #[test]
-    fn team_none_is_concrete_and_accepted() {
-        let session = explicit_session();
-        assert_eq!(session.local.team, LaunchTeam::None);
-        assert_eq!(session.opponents[0].team, LaunchTeam::None);
-        assert!(matches!(
-            classify_startup_session(&session),
-            StartupSessionClassification::AcceptedExplicitFixedBattle(_)
-        ));
-    }
-
-    #[test]
-    fn accepted_startup_reads_seed_once_and_preserves_boundaries() {
-        for value in [0, 1, 0x7fff_ffff, u32::MAX] {
-            let mut next = 1;
-            let correlation = allocate_match_correlation(&mut next).unwrap();
-            let mut clock = CountingClock { value, reads: 0 };
-            let startup = prepare_match_startup(correlation, accepted_session(), &mut clock);
-            assert_eq!(clock.reads, 1);
-            assert_eq!(startup.seed.value, value);
-            assert_eq!(startup.seed.source, MatchSeedSource::Controlled);
-        }
     }
 
     #[test]
@@ -795,7 +1252,7 @@ mod tests {
 
             assert_eq!(fallback_calls, 0);
             assert_eq!(descriptor.seed, value);
-            assert_eq!(simulation.session.seed, u64::from(value));
+            assert_eq!(simulation.session().seed(), u64::from(value));
             assert_eq!(simulation.rng_state().scenario, expected_rng);
             assert_eq!(simulation.rng_state().main, expected_rng);
             assert_eq!(simulation.rng_state().mapgen, expected_mapgen);
@@ -803,80 +1260,12 @@ mod tests {
     }
 
     #[test]
-    fn shell_resolved_loading_uses_preselected_seed_while_generic_calls_fallback() {
-        let legacy = LoadingStartup::UnverifiedLegacy {
-            session: explicit_session(),
-            seed: MatchSeed {
-                value: 0x1234_5678,
-                source: MatchSeedSource::Controlled,
-                seed_authority_certifying: true,
-            },
-        };
-        let mut legacy_calls = 0;
-        assert_eq!(
-            legacy.seed_or_else(|| {
-                legacy_calls += 1;
-                0x1234_5678
-            }),
-            0x1234_5678
-        );
-        assert_eq!(legacy_calls, 0);
-
-        let generic = LoadingStartup::Generic {
-            selected_map_file: "DeepFrze.map".into(),
-        };
-        let mut generic_calls = 0;
-        assert_eq!(
-            generic.seed_or_else(|| {
-                generic_calls += 1;
-                0x8765_4321
-            }),
-            0x8765_4321
-        );
-        assert_eq!(generic_calls, 1);
-    }
-
-    #[test]
-    fn correlations_are_monotonic_across_consecutive_attempts() {
-        let mut next = 1;
-        let first = allocate_match_correlation(&mut next).unwrap();
-        let second = allocate_match_correlation(&mut next).unwrap();
-        assert_eq!(first.get(), 1);
-        assert_eq!(second.get(), 2);
-        assert_eq!(next, 3);
-    }
-
-    #[test]
-    fn correlation_exhaustion_fails_without_reuse() {
-        let mut next = u64::MAX;
-        assert_eq!(
-            allocate_match_correlation(&mut next),
-            Err(MatchCorrelationError::Exhausted)
-        );
-        assert_eq!(next, u64::MAX);
-    }
-
-    #[test]
-    fn correlation_exhaustion_fails_without_reading_seed() {
-        let mut next = u64::MAX;
-        let mut clock = CountingClock { value: 7, reads: 0 };
-        assert_eq!(
-            allocate_match_correlation(&mut next),
-            Err(MatchCorrelationError::Exhausted)
-        );
-        assert_eq!(clock.reads, 0);
-        // Keep the clock live so the assertion proves no hidden preparation call.
-        assert_eq!(clock.low_u32(), 7);
-        assert_eq!(clock.reads, 1);
-    }
-
-    #[test]
     fn rust_l0_receipt_captures_each_rng_stream_exactly() {
         let startup = prepared(7);
         let mut simulation = Simulation::with_seed(7);
-        simulation.scenario_rng.next_u32();
-        simulation.main_rng.next_u32();
-        simulation.mapgen_rng.next_u32();
+        simulation.scenario_rng_mut_for_test().next_u32();
+        simulation.main_rng().next_u32();
+        simulation.mapgen_rng_mut_for_test().next_u32();
         let expected = simulation.rng_state();
         let receipt = RustL0Observation {
             startup: &startup,
@@ -890,23 +1279,6 @@ mod tests {
         assert_eq!(receipt.rngs, expected);
         assert!(!accepted_tick_is_admitted(Some(&startup), None));
         assert!(accepted_tick_is_admitted(Some(&startup), Some(&receipt)));
-    }
-
-    #[test]
-    fn rust_l0_rejects_acknowledgement_after_leaving_loading_screen() {
-        let startup = prepared(9);
-        let simulation = Simulation::with_seed(9);
-        assert_eq!(
-            RustL0Observation {
-                startup: &startup,
-                simulation: &simulation,
-                active_correlation: startup.correlation,
-                prior_receipt: None,
-                screen_is_loading: false,
-            }
-            .acknowledge(),
-            Err(RustL0Error::ScreenNotLoading)
-        );
     }
 
     #[test]
@@ -927,39 +1299,6 @@ mod tests {
             }
             .acknowledge(),
             Err(RustL0Error::DuplicateReceipt)
-        );
-    }
-
-    #[test]
-    fn rust_l0_rejects_nonzero_tick() {
-        let startup = prepared(12);
-        let mut simulation = Simulation::with_seed(12);
-        simulation.session.tick = 1;
-        assert_eq!(
-            acknowledge(&startup, &simulation),
-            Err(RustL0Error::NonzeroTick)
-        );
-    }
-
-    #[test]
-    fn rust_l0_rejects_nonzero_sim_time() {
-        let startup = prepared(13);
-        let mut simulation = Simulation::with_seed(13);
-        simulation.session.total_sim_ms = 1;
-        assert_eq!(
-            acknowledge(&startup, &simulation),
-            Err(RustL0Error::NonzeroSimulationTime)
-        );
-    }
-
-    #[test]
-    fn rust_l0_rejects_nonzero_binary_frame() {
-        let startup = prepared(14);
-        let mut simulation = Simulation::with_seed(14);
-        simulation.session.binary_frame = 1;
-        assert_eq!(
-            acknowledge(&startup, &simulation),
-            Err(RustL0Error::NonzeroBinaryFrame)
         );
     }
 
@@ -989,13 +1328,6 @@ mod tests {
     }
 
     #[test]
-    fn accepted_match_tick_is_gated_without_receipt() {
-        let startup = prepared(18);
-        assert!(!accepted_tick_is_admitted(Some(&startup), None));
-        assert!(accepted_tick_is_admitted(None, None));
-    }
-
-    #[test]
     fn accepted_tick_rejects_each_mismatched_receipt_field_and_nonzero_clock() {
         let startup = prepared(20);
         let simulation = Simulation::with_seed(20);
@@ -1021,7 +1353,12 @@ mod tests {
         rejected.push(("seed authority", candidate));
 
         let mut candidate = receipt.clone();
-        candidate.session.launch.player_name.push_str("-other");
+        candidate
+            .session
+            .launch
+            .local_player_mut()
+            .name
+            .push_str("-other");
         rejected.push(("session", candidate));
 
         let mut candidate = receipt.clone();
@@ -1043,21 +1380,5 @@ mod tests {
             );
         }
         assert!(accepted_tick_is_admitted(None, None));
-    }
-
-    #[test]
-    fn second_match_cannot_reuse_first_receipt() {
-        let first = prepared(19);
-        let first_simulation = Simulation::with_seed(19);
-        let receipt = acknowledge(&first, &first_simulation).unwrap();
-
-        let mut next = 2;
-        let second_correlation = allocate_match_correlation(&mut next).unwrap();
-        let mut clock = CountingClock {
-            value: 19,
-            reads: 0,
-        };
-        let second = prepare_match_startup(second_correlation, accepted_session(), &mut clock);
-        assert!(!accepted_tick_is_admitted(Some(&second), Some(&receipt)));
     }
 }

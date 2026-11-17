@@ -14,13 +14,375 @@ fn retail_arena() -> Option<(Simulation, RuleSet, PathGrid)> {
     let mut sim = Simulation::new();
     let grid = crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
     let owner = sim.intern("Americans");
-    sim.houses.insert(
-        owner,
-        crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10),
-    );
-    sim.session.house_order.push(owner);
-    sim.session.current_house = Some(owner);
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 0, 10,
+        ));
+    sim.session.set_current_house_for_test(Some(owner));
     Some((sim, rules, grid))
+}
+
+/// Foot4DA710..4DA7AA refreshes ground edges after the sight pair, using
+/// a full disc when physical height changed and an annulus otherwise.
+#[test]
+fn retail_harrier_flight_refreshes_sight_edges_and_retains_height_across_save() {
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art() else {
+        return;
+    };
+    let mut sim = crate::sim::arena_fixture::rival_arena_with_size(&rules, 17, 128);
+    let owner = sim.intern("Americans");
+    sim.session.set_current_house_for_test(Some(owner));
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+    sim.set_playfield_bounds_for_test(Some(crate::sim::cell_rect::PlayfieldBounds {
+        base: 64,
+        ..crate::sim::arena_fixture::OPEN_PLAYFIELD
+    }));
+    sim.set_playfield_size_height_for_test(Some(64));
+    sim.set_input_delay_ticks(0);
+    for (kind, house, cell) in [
+        ("GAPOWR", "Americans", (40, 48)),
+        ("NAPOWR", "Russians", (90, 80)),
+    ] {
+        sim.spawn_object(kind, house, cell.0, cell.1, 0, &rules)
+            .expect("stock power plants keep both skirmish houses alive");
+    }
+    let grid = sim.path_grid.clone();
+    sim.advance_tick(&[], Some(&rules), grid.as_deref(), None, 33);
+    let plane = sim
+        .spawn_object("ORCA", "Americans", 50, 64, 0, &rules)
+        .expect("a stock Harrier on open ground");
+    let mut commands = vec![CommandEnvelope::new(
+        owner,
+        sim.session.tick(),
+        Command::Move {
+            entity_id: plane,
+            target_rx: 100,
+            target_ry: 64,
+        },
+    )];
+    let mut previous_height = 0;
+    let mut saw_changed_height = false;
+    let mut saved_at_cruise = false;
+    let mut repaired_ground_edge = false;
+    for _ in 0..1200 {
+        let entity = sim.entities().get(plane).expect("the Harrier stays alive");
+        let timer = entity.sight_refresh_timers.timer(owner);
+        let height = crate::sim::movement::air_movement::current_fly_height(
+            entity,
+            sim.resolved_terrain.as_ref(),
+        );
+        let before_ground = {
+            let view = &sim.fog.by_owner_mut_for_test()[&owner];
+            (0..128u16)
+                .flat_map(|y| {
+                    (0..128u16).map(move |x| view.map_cell_edge_cache_for_test((x, y)).0[0])
+                })
+                .collect::<Vec<_>>()
+        };
+        let grid = sim.path_grid.clone();
+        let ((), trace) = trace_reveal_calls(|| {
+            sim.advance_tick(&commands, Some(&rules), grid.as_deref(), None, 33);
+        });
+        commands = sim.take_due_commands();
+        if sim
+            .entities()
+            .get(plane)
+            .unwrap()
+            .sight_refresh_timers
+            .timer(owner)
+            == timer
+        {
+            continue;
+        }
+        assert!(height > 0, "the periodic high-flight refresh ran");
+        let radius = sim.fog.source_sight(plane, owner).unwrap().radius;
+        assert_eq!(radius, 8, "stock Harrier sight at this flight level");
+        let inner = if previous_height == height { 5 } else { 0 };
+        previous_height = height;
+        assert_eq!(
+            trace.border_scans.len(),
+            1,
+            "the Foot sight suffix must run"
+        );
+        let (origin, outer) = trace.border_scans[0];
+        assert_eq!(outer, 11);
+        let expected = vision::sight_border_cells(origin, outer, inner);
+        assert_eq!(expected.len(), if inner == 0 { 369 } else { 308 });
+        assert_eq!(trace.border_receivers, expected);
+        assert_eq!(trace.walks.len(), 2);
+        let walked: std::collections::BTreeSet<_> = trace.walks.iter().flatten().copied().collect();
+        repaired_ground_edge |= trace.edge_visits == 0
+            && expected
+                .iter()
+                .zip(&trace.border_ground_after)
+                .any(|(cell, after)| {
+                    !walked.contains(cell)
+                        && before_ground[usize::from(cell.1) * 128 + usize::from(cell.0)] != *after
+                });
+        saw_changed_height |= inner == 0;
+        if height == rules.general.flight_level && !saved_at_cruise {
+            let retained = sim
+                .entities()
+                .get(plane)
+                .unwrap()
+                .sight_refresh_timers
+                .clone();
+            let bytes =
+                crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "foot-flight-height", 0);
+            sim = crate::sim::snapshot::GameSnapshot::load(&bytes)
+                .unwrap()
+                .sim;
+            sim.restore_after_snapshot_load().unwrap();
+            assert_eq!(
+                sim.entities().get(plane).unwrap().sight_refresh_timers,
+                retained
+            );
+            saved_at_cruise = true;
+        } else if saved_at_cruise && inner == 5 {
+            assert!(saw_changed_height);
+            assert!(
+                repaired_ground_edge,
+                "the border stored an edge outside both reveal walks"
+            );
+            return;
+        }
+    }
+    panic!("the real Move flight must reach a stable-height refresh after save/load");
+}
+
+/// GrowShroud4ADFF0 calls the object's See slot, not UpdateReveal488.
+/// Aircraft41ADF0 forces radius1 at GetHeight==0, even for raw Sight0;
+/// its Map5678E0 final0/final1 pair has no border or retained source write.
+#[test]
+fn aircraft_uncached_ground_sight_uses_one_cell_radius_without_replacing_its_source() {
+    for (kind, sight, resize) in [
+        ("ORCA", 8, false),
+        ("SPYP", 0, false),
+        ("ORCA", 8, true),
+        ("SPYP", 0, true),
+    ] {
+        let Some((mut sim, rules, _)) = retail_arena() else {
+            return;
+        };
+        sim.session
+            .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+        sim.fog = vision::FogState::new(32, 32);
+        assert_eq!(rules.object(kind).unwrap().sight, sight);
+        let owner = sim.intern("Americans");
+        let id = sim
+            .spawn_object(kind, "Americans", 16, 16, 0, &rules)
+            .unwrap();
+        let entity = sim.entities().get(id).unwrap();
+        assert_eq!(entity.category(), EntityCategory::Aircraft);
+        assert_eq!(
+            crate::sim::movement::air_movement::current_fly_height(
+                entity,
+                sim.resolved_terrain.as_ref()
+            ),
+            0
+        );
+        assert!(entity.discovery.discovered_by_current_house());
+        assert!(
+            sim.substrate
+                .display
+                .members(super::super::display_layers::DisplayLayer::GROUND)
+                .contains(&id)
+        );
+        //4ADFF0 admits a known Ground object without consulting3D5;
+        //Aircraft See itself has no Techno70ADC0 playfield gate either.
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .in_playfield
+            .store(false);
+        let held = sim.fog.sight_admissions_for_test().clone();
+        let rng = sim.scenario_rng.native_state_hex();
+        let ((), trace) = trace_reveal_calls(|| {
+            if resize {
+                assert!(
+                    sim.change_visible_map_area([2, 2, 16, 12], UninitContext::with_rules(&rules))
+                );
+                assert!(sim.entities().get(id).unwrap().in_playfield());
+            } else {
+                sim.grow_shroud(UninitContext::with_rules(&rules));
+            }
+        });
+        // Native radius1 offset order, also consumed by reveal_area_tests.
+        let cells = vec![
+            (16, 16),
+            (17, 15),
+            (16, 15),
+            (15, 15),
+            (15, 16),
+            (17, 16),
+            (15, 17),
+            (16, 17),
+            (17, 17),
+        ];
+        assert_eq!(
+            trace.walks,
+            [cells.clone(), cells],
+            "{kind}, resize={resize}"
+        );
+        assert!(
+            trace.border_receivers.is_empty(),
+            "Aircraft See has no567DA0"
+        );
+        assert!(sim.fog.is_ground_unshrouded(owner, 17, 17));
+        assert_eq!(sim.fog.sight_admissions_for_test(), &held);
+        assert_eq!(sim.scenario_rng.native_state_hex(), rng);
+    }
+}
+
+/// Aircraft41AE00 retains raw Type Sight: no Techno elevation scaling.
+/// An airborne zero-Sight plane returns with ordinary skirmish fog disabled.
+#[test]
+fn aircraft_uncached_airborne_sight_uses_raw_type_range_and_skips_zero() {
+    for (kind, sight) in [("ORCA", 8), ("SPYP", 0)] {
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        else {
+            return;
+        };
+        let mut sim = crate::sim::arena_fixture::rival_arena_with_size(&rules, 1, 128);
+        sim.session
+            .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+        let owner = sim.intern("Americans");
+        sim.session.set_current_house_for_test(Some(owner));
+        sim.set_playfield_bounds_for_test(Some(crate::sim::cell_rect::PlayfieldBounds {
+            base: 50,
+            ..crate::sim::arena_fixture::OPEN_PLAYFIELD
+        }));
+        sim.set_playfield_size_height_for_test(Some(50));
+        sim.fog = vision::FogState::new(128, 128);
+        let id = sim
+            .spawn_object(kind, "Americans", 75, 50, 0, &rules)
+            .unwrap();
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .position
+            .put_z(4000);
+        assert_eq!(rules.object(kind).unwrap().sight, sight);
+        assert!(!sim.session.game_options().fog_of_war);
+        let held = sim.fog.sight_admissions_for_test().clone();
+        let ((), trace) = trace_reveal_calls(|| {
+            sim.reveal_uncached_object_sight(
+                id,
+                false,
+                false,
+                None,
+                UninitContext::with_rules(&rules),
+            );
+        });
+        if sight == 0 {
+            assert!(trace.walks.is_empty());
+        } else {
+            assert_eq!(trace.walks.len(), 2);
+            assert_eq!(trace.walks[0], trace.walks[1]);
+            // Original See+Map execution:4000 shifts19 cells, radius8
+            //visits205 cells; Techno's elevation scaling would produce9.
+            assert_eq!(trace.walks[0][0], (56, 31));
+            assert_eq!(trace.walks[0].len(), 205);
+            assert!(trace.walks[0].contains(&(64, 31)));
+            assert!(
+                !trace.walks[0].contains(&(65, 31)),
+                "no elevation-added ninth ring"
+            );
+        }
+        assert!(trace.border_receivers.is_empty());
+        assert_eq!(sim.fog.sight_admissions_for_test(), &held);
+    }
+}
+
+///41AE63..41AE95 rereads live Location and Owner for the second map call,
+/// retaining the first raw radius even if a synchronous notification changes
+/// the source. The supplied callback isolates that transport boundary.
+#[test]
+fn aircraft_uncached_sight_rereads_its_location_between_map_passes() {
+    let Some((mut sim, rules, _)) = retail_arena() else {
+        return;
+    };
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+    let id = sim
+        .spawn_object("ORCA", "Americans", 16, 16, 0, &rules)
+        .unwrap();
+    // Make the first pass produce a fresh CellChangeNotify callback.
+    sim.fog = vision::FogState::new(32, 32);
+    let rng = sim.scenario_rng.native_state_hex();
+    let ((), trace) = trace_reveal_calls(|| {
+        with_first_cell_receiver(
+            move |sim| {
+                let entity = sim.substrate.entities.get_mut(id).unwrap();
+                entity.position.set_rx_for_test(20);
+                entity.position.put_z(416);
+                entity.sight.set_vision_range_for_test(10);
+            },
+            || {
+                sim.reveal_uncached_object_sight(
+                    id,
+                    false,
+                    false,
+                    None,
+                    UninitContext::with_rules(&rules),
+                )
+            },
+        )
+    });
+    assert_eq!(trace.walks.len(), 2);
+    assert_eq!(trace.walks[0][0], (16, 16));
+    assert_eq!(trace.walks[1][0], (18, 14));
+    assert_eq!(trace.walks[0].len(), 9);
+    assert_eq!(
+        trace.walks[1].len(),
+        9,
+        "radius1 was retained before the callback"
+    );
+    assert!(trace.border_receivers.is_empty());
+    assert!(sim.fog.sight_admissions_for_test().is_empty());
+    assert_eq!(sim.scenario_rng.native_state_hex(), rng);
+}
+
+/// The two Map5678E0 calls independently apply their owner/player gate.
+/// The supplied callback changes only the owner-store boundary, without
+/// claiming that native discovery naturally performs an ownership transfer.
+#[test]
+fn aircraft_uncached_sight_rereads_owner_before_the_second_house_admission() {
+    let Some((mut sim, rules, _)) = retail_arena() else {
+        return;
+    };
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+    let other = add_computer_house(&mut sim, "Russians");
+    let id = sim
+        .spawn_object("ORCA", "Americans", 16, 16, 0, &rules)
+        .unwrap();
+    sim.fog = vision::FogState::new(32, 32);
+    let ((), trace) = trace_reveal_calls(|| {
+        with_first_cell_receiver(
+            move |sim| sim.substrate.entities.change_owner(id, other),
+            || {
+                sim.reveal_uncached_object_sight(
+                    id,
+                    false,
+                    false,
+                    None,
+                    UninitContext::with_rules(&rules),
+                )
+            },
+        )
+    });
+    assert_eq!(trace.walks.len(), 2);
+    assert_eq!(
+        trace.notifications.len(),
+        9,
+        "the nonallied second owner cannot notify the player"
+    );
+    assert_eq!(sim.entities().get(id).unwrap().owner(), other);
+    assert!(sim.fog.sight_admissions_for_test().is_empty());
 }
 
 /// The cell source `id`'s own sight was last revealed around.
@@ -28,32 +390,6 @@ fn sight_origin(sim: &Simulation, id: u64) -> (u16, u16) {
     let owner = sim.substrate.entities.get(id).unwrap().owner();
     let admission = &sim.fog.sight_admissions_for_test()[&(id, owner)];
     (admission.origin.0, admission.origin.1)
-}
-
-/// TechnoUnlimbo6F6D27 dispatches70AF50 before AddedToGame/facing/idle,
-/// not from the next Logic frame. Its5678E0 receiver reaches4A9CA0 and
-/// initializes both Cell edge channels even with FogOfWar=no.
-#[test]
-fn successful_unlimbo_reveals_its_cells_before_returning() {
-    let Some((mut sim, rules, _grid)) = retail_arena() else {
-        return;
-    };
-    sim.fog = vision::FogState::new(32, 32);
-    let owner = sim.intern("Americans");
-    sim.session.current_house = Some(owner);
-    assert!(!sim.fog.is_cell_revealed(owner, 16, 16));
-    let id = sim
-        .spawn_object("AMCV", "Americans", 16, 16, 0, &rules)
-        .expect("ordinary successful Unlimbo");
-    assert_eq!(sim.session.tick, 0, "no frame pass supplies the reveal");
-    assert!(sim.entities().get(id).unwrap().in_playfield());
-    assert!(
-        sim.fog.is_cell_revealed(owner, 16, 16),
-        "native Unlimbo opens Cell knowledge synchronously"
-    );
-    assert_eq!(sight_origin(&sim, id), (16, 16));
-    let (_, flags) = sim.fog.by_owner[&owner].map_cell_edge_cache_for_test((16, 16));
-    assert_ne!(flags & 2, 0, "Map4A9CA0 initializes the Cell cache");
 }
 
 /// A tank and an infantryman sent three cells east keep their sight where
@@ -71,7 +407,7 @@ fn a_movers_sight_moves_at_each_cell_arrival() {
         let owner = sim.substrate.entities.get(id).unwrap().owner();
         let order = CommandEnvelope::new(
             owner,
-            sim.session.tick + 1,
+            sim.session.tick() + 1,
             Command::Move {
                 entity_id: id,
                 target_rx: 13,
@@ -127,8 +463,8 @@ fn source_release_retains_its_cached_geometry_until_teardown() {
         cache.cells.is_empty(),
         "inactive cache retains no active footprint index"
     );
-    let config = sim.sight_reveal_config(Some(&rules));
-    sim.refresh_sight_sources(&config, Some(&rules));
+    let config = sim.sight_reveal_config(&rules);
+    sim.refresh_sight_sources(&config, &rules);
     assert_eq!(sim.fog.sight_admissions_for_test()[&(id, owner)], cache);
     let bytes = crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "inactive-sight-cache", 0);
     let mut restored = crate::sim::snapshot::GameSnapshot::load(&bytes)
@@ -165,7 +501,7 @@ fn source_release_retains_its_cached_geometry_until_teardown() {
     // Use that real rules-bearing destructor owner, not a direct store/cache
     // removal or the test-only rules-less flush wrapper.
     restored.process_pending_delete_with(
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default(),
         1,
@@ -197,11 +533,10 @@ fn exact_zero_sight_gate_differs_from_empty_walk_and_override() {
     crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
     sim.fog = vision::FogState::new(32, 32);
     let owner = sim.intern("Americans");
-    sim.houses.insert(
-        owner,
-        crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10),
-    );
-    sim.session.house_order.push(owner);
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 0, 10,
+        ));
     let zero = sim
         .spawn_object("ZERO", "Americans", 16, 16, 0, &rules)
         .unwrap();
@@ -214,7 +549,7 @@ fn exact_zero_sight_gate_differs_from_empty_walk_and_override() {
     assert!(admission.latched);
     assert_eq!(admission.radius, -1);
     assert!(admission.cells.is_empty());
-    sim.refresh_object_sight(zero, Some(&rules), 3);
+    sim.refresh_object_sight(zero, &rules, 3, crate::sim::world::FrameEffects::default());
     assert!(sim.fog.sight_is_latched(zero, owner));
     assert_eq!(
         sim.fog.sight_admissions_for_test()[&(zero, owner)].radius,
@@ -222,8 +557,8 @@ fn exact_zero_sight_gate_differs_from_empty_walk_and_override() {
     );
     assert!(sim.fog.is_cell_revealed(owner, 16, 16));
     let held = sim.fog.sight_admissions_for_test()[&(zero, owner)].clone();
-    let config = sim.sight_reveal_config(Some(&rules));
-    sim.refresh_sight_sources(&config, Some(&rules));
+    let config = sim.sight_reveal_config(&rules);
+    sim.refresh_sight_sources(&config, &rules);
     assert_eq!(
         sim.fog.sight_admissions_for_test()[&(zero, owner)],
         held,
@@ -285,12 +620,12 @@ fn a_nested_source_release_is_not_resurrected_by_outer_walk_or_next_frame() {
             .object_alive()
     );
     let cache = sim.fog.sight_admissions_for_test()[&(id, owner)].clone();
-    let before = sim.fog.by_owner[&owner].shroud_knowledge_raw().to_vec();
-    let config = sim.sight_reveal_config(Some(&rules));
-    sim.refresh_sight_sources(&config, Some(&rules));
+    let before = sim.fog.by_owner()[&owner].shroud_knowledge_raw().to_vec();
+    let config = sim.sight_reveal_config(&rules);
+    sim.refresh_sight_sources(&config, &rules);
     assert_eq!(sim.fog.sight_admissions_for_test()[&(id, owner)], cache);
     assert!(!sim.fog.sight_is_latched(id, owner));
-    assert_eq!(sim.fog.by_owner[&owner].shroud_knowledge_raw(), before);
+    assert_eq!(sim.fog.by_owner()[&owner].shroud_knowledge_raw(), before);
 }
 
 /// Original Techno6F6D04/D0C admits its whole suffix before the first sight
@@ -309,7 +644,9 @@ fn unlimbo_keeps_its_single_alive_admission_across_sight_callbacks() {
     let type_id = sim.substrate.entities.get(id).unwrap().type_ref();
     let category = crate::map::entities::EntityCategory::Unit;
     sim.techno_limbo_with_rules(id, &rules, None);
-    let before = sim.houses[&owner].tracking.active_count(category, type_id);
+    let before = sim.houses[&owner]
+        .tracking()
+        .active_count(category, type_id);
     sim.fog = vision::FogState::new(32, 32);
     with_first_cell_receiver(
         move |sim| {
@@ -330,12 +667,14 @@ fn unlimbo_keeps_its_single_alive_admission_across_sight_callbacks() {
     let source = sim.substrate.entities.get(id).unwrap();
     assert!(!source.lifecycle.object_alive());
     assert_eq!(
-        sim.houses[&owner].tracking.active_count(category, type_id),
+        sim.houses[&owner]
+            .tracking()
+            .active_count(category, type_id),
         before + 1,
         "6F6D8F Added_To_Game follows the pre-callback alive admission"
     );
     assert_eq!(
-        source.body_facing_current(sim.session.binary_frame),
+        source.body_facing_current(sim.session.binary_frame()),
         u16::from(37_u8) << 8,
         "6F6DAA facing belongs to the same admitted suffix"
     );
@@ -355,9 +694,9 @@ fn retail_goldst_initial_scenario() -> crate::headless_scenario::HeadlessScenari
         "GoldSt.mmx",
         &[(LaunchCountry::France, AiDifficulty::Easy)],
     );
-    session.player_name = "VERA-OBSERVER".to_owned();
-    session.local.country = LaunchCountry::America;
-    session.local.start_position = LaunchStartPosition::Position(3);
+    session.local_player_mut().name = "VERA-OBSERVER".to_owned();
+    session.local_slot_mut().country = LaunchCountry::America;
+    session.local_slot_mut().start_position = LaunchStartPosition::Position(3);
     session.opponents[0].start_position = LaunchStartPosition::Position(0);
     session.options = SkirmishLaunchOptions {
         starting_credits: 10_000,
@@ -378,6 +717,11 @@ fn retail_goldst_initial_scenario() -> crate::headless_scenario::HeadlessScenari
         multi_engineer: false,
         harvester_truce: false,
         ally_change_allowed: true,
+        bans: Default::default(),
+        teams: None,
+        auto_balance: false,
+        queue: Vec::new(),
+        host_rules: Default::default(),
     };
     let scenario =
         crate::headless_scenario::load_session(&retail, "GoldSt.mmx", 0x1234_5678, session)
@@ -385,19 +729,47 @@ fn retail_goldst_initial_scenario() -> crate::headless_scenario::HeadlessScenari
     scenario
 }
 
+/// [`retail_goldst_initial_scenario`], with its starting AMCV held to the
+/// oracle's rows ([`assert_retail_goldst_initial_amcv`]) where the oracle
+/// read them: after the unit's Unlimbo, which is all the oracle ran, and
+/// before `ScenarioClass::Post_Map_Init @ 0x00686890` allies the Special
+/// house (`0x006869D2..0x00686ACE`). Each `HouseClass::Make_Ally @
+/// 0x004F9B70` that loop admits walks the unit's footprint twice more (`Map
+/// 0x004ADEE0` at `0x004F9B9A`, `Map 0x004ADCD0` at `0x004F9F4F`), and
+/// `MapCell 0x004A9CA0` recomputes both edge frames on every call
+/// (`0x004A9D09`, `0x004A9D41`). The finished load therefore caches the
+/// frames the whole footprint gives, while the rows keep each cell's fog
+/// frame from its one visit, when the cells after it in the walk had no
+/// `+0x140` bit 2 yet. Returns the finished load, the unit and the witness
+/// cells.
+fn retail_goldst_scenario_checked_after_unlimbo() -> (
+    crate::headless_scenario::HeadlessScenario,
+    u64,
+    Vec<(u16, u16)>,
+) {
+    let (scenario, checked) = crate::sim::scenario_post_map::observe_before_special_allies(
+        assert_retail_goldst_initial_amcv,
+        retail_goldst_initial_scenario,
+    );
+    let (id, witnesses) = checked.expect("a Battle load allies the Special house");
+    (scenario, id, witnesses)
+}
+
 /// Normal production GoldSt Battle initialization, before any frame or draw.
 /// Original6F6D27/5678E0/4A9CA0 plus6F6D61/567DA0 observations are retained
 /// by the existing procedural drawing oracle. Its original scene supplies a
 /// cropped physical map and bounded successful placement, not whole-map boot;
-/// this joins only the selected source and eight pre-presentation Cell states.
+/// this joins only the selected source and eight pre-presentation Cell states,
+/// read after the Unlimbo as the oracle read them.
 #[test]
 #[ignore = "requires RA2_DIR with installed retail RA2/YR assets and stock GoldSt.mmx"]
 fn retail_goldst_initial_amcv_matches_native_before_presentation() {
-    let scenario = retail_goldst_initial_scenario();
-    let _ = assert_retail_goldst_initial_amcv(scenario.sim());
+    let _ = retail_goldst_scenario_checked_after_unlimbo();
 }
 
-/// Shared native1777 prerequisites, before either normal-map experiment runs.
+/// Shared native1777 prerequisites of both normal-map experiments, for the
+/// load as the starting AMCV's Unlimbo left it
+/// ([`retail_goldst_scenario_checked_after_unlimbo`]).
 fn assert_retail_goldst_initial_amcv(sim: &Simulation) -> (u64, Vec<(u16, u16)>) {
     use serde_json::json;
     let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
@@ -408,12 +780,13 @@ fn assert_retail_goldst_initial_amcv(sim: &Simulation) -> (u64, Vec<(u16, u16)>)
     let history = &corpus["histories"][0];
     assert_eq!(history["name"], "initial_amcv");
     assert_eq!(
-        sim.session.tick, 0,
+        sim.session.tick(),
+        0,
         "no Logic frame supplies initial knowledge"
     );
-    assert!(sim.session.game_options.shroud);
-    assert!(!sim.session.game_options.fog_of_war);
-    let owner = sim.session.current_house.expect("normal local player");
+    assert!(sim.session.game_options().shroud);
+    assert!(!sim.session.game_options().fog_of_war);
+    let owner = sim.session.current_house().expect("normal local player");
     assert_eq!(sim.interner.resolve(owner), "VERA-OBSERVER");
     let amcv = sim.interner.get("AMCV").expect("retail AMCV type");
     let sources: Vec<_> = sim
@@ -458,7 +831,7 @@ fn assert_retail_goldst_initial_amcv(sim: &Simulation) -> (u64, Vec<(u16, u16)>)
         i64::from(cache.origin.2),
         expected["xyz"][2].as_i64().unwrap()
     );
-    let view = &sim.fog.by_owner[&owner];
+    let view = &sim.fog.by_owner()[&owner];
     let rows = history["before_draw_cells"].as_array().unwrap();
     assert_eq!(rows.len(), 8);
     let mut witnesses = Vec::with_capacity(rows.len());
@@ -468,7 +841,7 @@ fn assert_retail_goldst_initial_amcv(sim: &Simulation) -> (u64, Vec<(u16, u16)>)
             row["cell"][1].as_u64().unwrap() as u16,
         );
         witnesses.push(cell);
-        let index = usize::from(cell.1) * usize::from(sim.fog.width) + usize::from(cell.0);
+        let index = usize::from(cell.1) * usize::from(sim.fog.width()) + usize::from(cell.0);
         let state = view.shroud_knowledge_raw()[index];
         let (frames, flags) = view.map_cell_edge_cache_for_test(cell);
         assert_eq!(json!(frames), row["cache"], "edge cache at {cell:?}");
@@ -478,12 +851,12 @@ fn assert_retail_goldst_initial_amcv(sim: &Simulation) -> (u64, Vec<(u16, u16)>)
             "140 at {cell:?}"
         );
         assert_eq!(
-            i64::from(state.counter),
+            i64::from(state.counter()),
             row["counter"].as_i64().unwrap(),
             "counter at {cell:?}"
         );
         assert_eq!(
-            i64::from(state.gap_counter),
+            i64::from(state.gap_counter()),
             row["gap"].as_i64().unwrap(),
             "gap at {cell:?}"
         );
@@ -494,12 +867,12 @@ fn assert_retail_goldst_initial_amcv(sim: &Simulation) -> (u64, Vec<(u16, u16)>)
             "12C ground at {cell:?}"
         );
         assert_eq!(
-            state.open,
+            state.open(),
             native_flags & 8 != 0,
             "knowledge open at {cell:?}"
         );
         assert_eq!(
-            state.pending,
+            state.pending(),
             row["flags"].as_u64().unwrap() & 0x20 != 0,
             "pending at {cell:?}"
         );
@@ -517,13 +890,15 @@ fn assert_retail_goldst_initial_amcv(sim: &Simulation) -> (u64, Vec<(u16, u16)>)
         );
     }
     // No refresh, terrain edits, visibility hooks, commands or presentation
-    // ran between normal load and these producer/cache observations.
+    // ran between the unit's Unlimbo and these producer/cache observations.
     (id, witnesses)
 }
 
 /// Ordinary runtime Move -> two Unit arrivals -> Stop/idle on stock GoldSt.
-/// Native1777 supplies the initial prerequisites; the independently executed
-/// moving corpus supplies event-relative Drive/Unit cache and Cell witnesses.
+/// Native1777 supplies the initial prerequisites, read after the Unlimbo
+/// ([`retail_goldst_scenario_checked_after_unlimbo`]); the independently
+/// executed moving corpus supplies event-relative Drive/Unit cache and Cell
+/// witnesses for the moves, which run from the finished load.
 /// Prepared native startup timing is not a whole-match timing golden.
 #[test]
 #[ignore = "requires RA2_DIR with installed retail RA2/YR assets and stock GoldSt.mmx"]
@@ -594,35 +969,40 @@ fn retail_goldst_amcv_sight_follows_arrivals_then_survives_stop() {
                 .all(|&(_, viewer)| viewer != owner),
             "this control has no alternate local sight source"
         );
-        let view = &sim.fog.by_owner[&owner];
+        let view = &sim.fog.by_owner()[&owner];
         // The normal frame already validates the whole derived source
         // index. Keep this integration observation on named Cell controls.
         let cells = selected
             .iter()
             .copied()
             .map(|cell| {
-                let index = usize::from(cell.1) * usize::from(sim.fog.width) + usize::from(cell.0);
+                let index =
+                    usize::from(cell.1) * usize::from(sim.fog.width()) + usize::from(cell.0);
                 let state = view.shroud_knowledge_raw()[index];
                 assert_eq!(
-                    state.local_sources,
+                    state.local_sources(),
                     u32::from(admission.cells.contains(&cell)),
                     "tick{}: retained source index at{cell:?}",
-                    sim.session.tick,
+                    sim.session.tick(),
                 );
-                assert_eq!(state.allied_sources, 0, "no allied source at{cell:?}");
-                if state.local_sources == 1 {
-                    assert_eq!(state.counter, -1, "one Cell487630 contribution at{cell:?}");
-                    assert_eq!(state.gap_counter, 0);
-                    assert!(state.open);
+                assert_eq!(state.allied_sources(), 0, "no allied source at{cell:?}");
+                if state.local_sources() == 1 {
+                    assert_eq!(
+                        state.counter(),
+                        -1,
+                        "one Cell487630 contribution at{cell:?}"
+                    );
+                    assert_eq!(state.gap_counter(), 0);
+                    assert!(state.open());
                 }
                 CellObservation {
                     cell,
-                    counter: state.counter,
-                    gap: state.gap_counter,
-                    local_sources: state.local_sources,
-                    allied_sources: state.allied_sources,
-                    open: state.open,
-                    pending: state.pending,
+                    counter: state.counter(),
+                    gap: state.gap_counter(),
+                    local_sources: state.local_sources(),
+                    allied_sources: state.allied_sources(),
+                    open: state.open(),
+                    pending: state.pending(),
                     ground: view.ground_flags_raw()[index],
                     edge: view.map_cell_edge_cache_for_test(cell),
                 }
@@ -630,7 +1010,7 @@ fn retail_goldst_amcv_sight_follows_arrivals_then_survives_stop() {
             .collect();
         let loco = source.locomotor.as_ref().expect("retail AMCV Drive");
         Observation {
-            tick: sim.session.tick,
+            tick: sim.session.tick(),
             xyz: object_location(source, sim.resolved_terrain.as_ref()),
             physical_cell: (source.position.rx(), source.position.ry()),
             admission,
@@ -642,9 +1022,8 @@ fn retail_goldst_amcv_sight_follows_arrivals_then_survives_stop() {
         }
     }
 
-    let mut scene = retail_goldst_initial_scenario();
-    let (id, mut selected) = assert_retail_goldst_initial_amcv(scene.sim());
-    let owner = scene.sim().session.current_house.unwrap();
+    let (mut scene, id, mut selected) = retail_goldst_scenario_checked_after_unlimbo();
+    let owner = scene.sim().session.current_house().unwrap();
     let cache = &scene.sim().fog.sight_admissions_for_test()[&(id, owner)];
     let left = *cache.cells.iter().min().unwrap();
     let right = *cache.cells.iter().max().unwrap();
@@ -670,7 +1049,7 @@ fn retail_goldst_amcv_sight_follows_arrivals_then_survives_stop() {
     let z = initial.xyz.z;
     let order = CommandEnvelope::new(
         owner,
-        scene.sim().session.tick + 1,
+        scene.sim().session.tick() + 1,
         Command::Move {
             entity_id: id,
             target_rx: 111,
@@ -936,14 +1315,14 @@ fn retail_goldst_amcv_sight_follows_arrivals_then_survives_stop() {
     );
     let stop = CommandEnvelope::new(
         owner,
-        scene.sim().session.tick + 1,
+        scene.sim().session.tick() + 1,
         Command::Stop { entity_id: id },
     );
-    let until_boundary = (120 - scene.sim().session.binary_frame % 120) % 120;
+    let until_boundary = (120 - scene.sim().session.binary_frame() % 120) % 120;
     let idle_frames = (until_boundary + 2).max(8);
     let mut crossed_boundary = false;
     for idle in 0..idle_frames {
-        let binary_frame = scene.sim().session.binary_frame;
+        let binary_frame = scene.sim().session.binary_frame();
         crossed_boundary |= binary_frame % 120 == 0;
         let commands = if idle == 0 {
             std::slice::from_ref(&stop)
@@ -998,13 +1377,15 @@ fn a_source_event_keeps_one_notification_admission_across_logical_planes() {
         owner < ally,
         "the fixture visits the original player plane first"
     );
-    sim.houses.insert(
-        ally,
-        crate::sim::house_state::HouseState::new(ally, 0, None, false, 0, 10),
-    );
+    // A human ally: its client map is a logical plane of its own (a
+    // computer house has none).
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            ally, 0, None, true, 0, 10,
+        ));
     // Supplied direct alliance prestate; the test exercises source event
     // admission, not the separate diplomacy producer.
-    sim.house_alliances
+    sim.house_alliances_mut_for_test()
         .entry("AMERICANS".into())
         .or_default()
         .insert("ALLIANCE".into());
@@ -1016,13 +1397,13 @@ fn a_source_event_keeps_one_notification_admission_across_logical_planes() {
     sim.fog = vision::FogState::new(32, 32);
     let ((), calls) = trace_reveal_calls(|| {
         with_first_cell_receiver(
-            move |sim| sim.session.current_house = Some(ally),
+            move |sim| sim.session.set_current_house_for_test(Some(ally)),
             || {
                 sim.reveal_entity_with_context(id, UninitContext::with_rules(&rules));
             },
         );
     });
-    assert_eq!(sim.session.current_house, Some(ally), "the callback ran");
+    assert_eq!(sim.session.current_house(), Some(ally), "the callback ran");
     let source = &sim.fog.sight_admissions_for_test()[&(id, owner)];
     assert!(source.cells.len() > 1);
     assert_eq!(
@@ -1059,7 +1440,7 @@ fn retail_goldst_uncached_reveal_border_matches_native_admission_and_transport()
         let runtime = &mut scenario.runtime;
         let rules = &runtime.resources.rules;
         let sim = &mut runtime.simulation;
-        let local = sim.session.current_house.unwrap();
+        let local = sim.session.current_house().unwrap();
         let amcv = sim.interner.get("AMCV").unwrap();
         let id = sim
             .entities()
@@ -1069,8 +1450,8 @@ fn retail_goldst_uncached_reveal_border_matches_native_admission_and_transport()
             })
             .unwrap();
         let foreign = sim
-            .session
-            .house_order
+            .houses
+            .order()
             .iter()
             .copied()
             .find(|owner| *owner != local)
@@ -1122,25 +1503,31 @@ fn retail_goldst_uncached_reveal_border_matches_native_admission_and_transport()
             // iterator is also the existing PathGrid reader's authority.
             let coords: Vec<_> = terrain.iter().map(|cell| (cell.rx, cell.ry)).collect();
             for (x, y) in coords {
-                terrain.cell_mut(x, y).unwrap().level = level;
+                terrain.cell_mut_for_test(x, y).unwrap().level = level;
             }
             // Derive the LOS cache through its actual existing terrain reader.
             // Full Rust map vs sparse native crop is bounded to these receivers.
             sim.path_grid = Some(std::sync::Arc::new(
-                PathGrid::from_resolved_terrain_with_bridges(terrain),
+                PathGrid::from_resolved_terrain_with_bridges(terrain, sim.overlay_grid.as_ref()),
             ));
         }
-        let before_view = serde_json::to_value(&sim.fog.by_owner[&local]).unwrap();
+        let before_view = serde_json::to_value(&sim.fog.by_owner()[&local]).unwrap();
         let before_rng = (
             sim.scenario_rng.native_state_hex(),
             sim.main_rng.native_state_hex(),
             sim.mapgen_rng.native_state_hex(),
         );
         let ((), trace) = trace_reveal_calls(|| {
-            sim.reveal_uncached_object_sight(id, UninitContext::with_rules(rules));
+            sim.reveal_uncached_object_sight(
+                id,
+                false,
+                false,
+                None,
+                UninitContext::with_rules(rules),
+            );
         });
         assert_eq!(
-            trace.walks.len(),
+            trace.map_calls,
             case["map_calls"].as_array().unwrap().len(),
             "Map call count {name}"
         );
@@ -1210,7 +1597,7 @@ fn retail_goldst_uncached_reveal_border_matches_native_admission_and_transport()
                     .is_empty()
             );
             assert_eq!(
-                serde_json::to_value(&sim.fog.by_owner[&local]).unwrap(),
+                serde_json::to_value(&sim.fog.by_owner()[&local]).unwrap(),
                 before_view,
                 "native rejected call has no current-player cache/knowledge effect {name}"
             );
@@ -1271,7 +1658,7 @@ fn retail_goldst_cold_fire_borders_and_conceal_notifications_match_native() {
         let mut scenario = retail_goldst_initial_scenario();
         let rules = &scenario.runtime.resources.rules;
         let sim = &mut scenario.runtime.simulation;
-        let viewer = sim.session.current_house.unwrap();
+        let viewer = sim.session.current_house().unwrap();
         let coord = |v: &Value| (v[0].as_i64().unwrap() as u16, v[1].as_i64().unwrap() as u16);
         let row = |v: &Value| {
             json!({
@@ -1352,7 +1739,7 @@ fn retail_goldst_cold_fire_borders_and_conceal_notifications_match_native() {
         }
         let topology = json!({
             "allocated_cells": expected.values().collect::<Vec<_>>(),
-            "dimensions": [sim.fog.width,sim.fog.height],
+            "dimensions": [sim.fog.width(),sim.fog.height()],
             // Existing executed receiver fixture supplies the unexamined Dummy.
             "dummy_prior": vision::discovery_corpus()["cache_controls"]["topology"]["dummy_prior"],
         });
@@ -1378,7 +1765,7 @@ fn retail_goldst_cold_fire_borders_and_conceal_notifications_match_native() {
             (actual_xyz.1 / 256) as u16,
             actual_xyz.2 as i32,
         );
-        let config = sim.sight_reveal_config(Some(rules));
+        let config = sim.sight_reveal_config(rules);
         let heights = sim.sight_height_grid(&config);
         let context = UninitContext::with_rules(rules);
         let rng = (
@@ -1451,7 +1838,14 @@ fn retail_goldst_cold_fire_borders_and_conceal_notifications_match_native() {
             compare_stage(sim);
             for (border_origin, radius) in [(local.unwrap(), 6), (origin, 4)] {
                 let (_, trace) = trace_reveal_calls(|| {
-                    sim.refresh_sight_border(viewer, border_origin, radius, context)
+                    Simulation::refresh_sight_border(
+                        &mut sim.fog,
+                        &sim.resolved_terrain,
+                        viewer,
+                        border_origin,
+                        radius,
+                        context,
+                    )
                 });
                 let border = native["borders"]
                     .as_array()
@@ -1478,7 +1872,7 @@ fn retail_goldst_cold_fire_borders_and_conceal_notifications_match_native() {
             }
         }
         for frame in [119, 120, 240] {
-            sim.session.binary_frame = frame;
+            sim.session.set_binary_frame_for_test(frame);
             let (_, trace) = trace_reveal_calls(|| sim.tick_pending_shroud_conceal(context));
             if frame == 120 {
                 if indexed {
@@ -1542,18 +1936,14 @@ fn an_infantry_corpse_keeps_its_sight_until_its_uninit() {
     );
     let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-    );
     let mut sim = Simulation::new();
     crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
     sim.fog = vision::FogState::new(32, 32);
     let owner = sim.intern("Americans");
-    sim.houses.insert(
-        owner,
-        crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10),
-    );
-    sim.session.house_order.push(owner);
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 0, 10,
+        ));
     let id = sim
         .spawn_object("E1", "Americans", 16, 16, 0, &rules)
         .unwrap();
@@ -1592,12 +1982,11 @@ fn an_infantry_corpse_keeps_its_sight_until_its_uninit() {
 /// A computer House added to the arena's House array.
 fn add_computer_house(sim: &mut Simulation, name: &str) -> crate::sim::intern::InternedId {
     let id = sim.intern(name);
-    let side = sim.session.house_order.len() as u8;
-    sim.houses.insert(
-        id,
-        crate::sim::house_state::HouseState::new(id, side, None, false, 0, 10),
-    );
-    sim.session.house_order.push(id);
+    let side = sim.houses.order().len() as u8;
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            id, side, None, false, 0, 10,
+        ));
     id
 }
 
@@ -1622,7 +2011,7 @@ fn a_reveal_before_navigation_publication_tests_the_cell_heights() {
     // published.
     let terrain = sim.resolved_terrain.as_mut().unwrap();
     for y in 0..32 {
-        terrain.cell_mut(15, y).unwrap().level = 8;
+        terrain.cell_mut_for_test(15, y).unwrap().level = 8;
     }
     sim.path_grid = None;
     sim.reveal_entity_with_context(id, UninitContext::with_rules(&rules));
@@ -1631,15 +2020,15 @@ fn a_reveal_before_navigation_publication_tests_the_cell_heights() {
     assert_ne!(early, flat, "the cliff hides cells before publication");
     let grid = PathGrid::from_resolved_terrain(sim.resolved_terrain.as_ref().unwrap());
     sim.install_fixture_path_grid(Some(&grid));
-    sim.refresh_object_sight(id, Some(&rules), 0);
+    sim.refresh_object_sight(id, &rules, 0, crate::sim::world::FrameEffects::default());
     assert_eq!(
         sim.fog.sight_admission(id, owner).unwrap().cells,
         early,
         "the same cells after publication"
     );
     sim.techno_limbo_with_rules(id, &rules, None);
-    let config = sim.sight_reveal_config(Some(&rules));
-    sim.refresh_sight_sources(&config, Some(&rules));
+    let config = sim.sight_reveal_config(&rules);
+    sim.refresh_sight_sources(&config, &rules);
     for y in 0..32 {
         for x in 0..32 {
             assert!(!sim.fog.is_cell_visible(owner, x, y), "({x}, {y})");
@@ -1649,8 +2038,8 @@ fn a_reveal_before_navigation_publication_tests_the_cell_heights() {
 
 /// `TechnoClass::ChangeOwner @ 0x007014A0` moves an object's sight within
 /// the call: its ReReveal before the owner store (`0x0070172F`) takes it
-/// off the old owner's map, and its UpdateReveal (`0x0070187B`) opens it on
-/// the new owner's.
+/// off the old owner's map, and its UpdateReveal (`0x0070187B`) would open
+/// it on the new owner's, which a computer house does not have.
 #[test]
 fn an_owner_change_moves_the_sight_to_the_new_owner_within_the_call() {
     let Some((mut sim, rules, _)) = retail_arena() else {
@@ -1665,9 +2054,11 @@ fn an_owner_change_moves_the_sight_to_the_new_owner_within_the_call() {
     assert!(sim.fog.sight_is_latched(id, americans));
     sim.change_owner_with_rules(id, russians, &rules, None, FrameEffects::default());
     assert!(!sim.fog.sight_is_latched(id, americans), "0x0070172F");
-    assert!(sim.fog.sight_is_latched(id, russians), "0x0070187B");
     assert!(!sim.fog.is_cell_visible(americans, 16, 16));
-    assert!(sim.fog.is_cell_visible(russians, 16, 16));
+    // 0x0070187B's UpdateReveal passes the computer owner to RevealArea,
+    // whose gate opens no map for it: it is no client.
+    assert!(!sim.fog.sight_is_latched(id, russians));
+    assert!(!sim.fog.by_owner().contains_key(&russians));
 }
 
 /// MakeAlly and MakeEnemy bracket their ally-bit write with the map
@@ -1697,29 +2088,59 @@ fn an_alliance_moves_the_allys_building_sight_within_the_call() {
         .spawn_object("MTNK", "Russians", 8, 22, 0, &rules)
         .unwrap();
     // The Spy Plane's kind of reveal: a radius that replaces its Sight=.
-    sim.refresh_object_sight(tank, Some(&rules), 7);
-    let tank_sight = sim.fog.sight_admission(tank, russians).unwrap().clone();
-    assert_eq!(tank_sight.radius, 7);
+    sim.refresh_object_sight(tank, &rules, 7, crate::sim::world::FrameEffects::default());
+    let tank_source = sim
+        .fog
+        .source_sight(tank, americans)
+        .expect("the American logical client ran UpdateReveal before its map gate");
+    assert_eq!(tank_source.radius, 7);
+    assert!(
+        !sim.fog.by_owner().contains_key(&russians),
+        "a computer house has no map (0x00567AB0..0x00567B12)"
+    );
     assert!(!sim.fog.sight_is_latched(standing, americans));
+    let american_source = sim
+        .fog
+        .source_sight(standing, americans)
+        .expect("the American logical client ran UpdateReveal before its map gate");
+    assert!(american_source.latched);
+    assert!(sim.fog.sight_admission(standing, americans).is_none());
+    let owner_origin = american_source.origin;
 
-    sim.make_ally(russians, americans, &rules, None, FrameEffects::default());
-    // RESIDUAL (`Simulation::admit_allied_building_sight`): native's latch
-    // (`+0x250`), set by the plant's Unlimbo, makes this `UpdateReveal`
-    // return (`0x0070B0B1`); VERA opens it here.
-    assert!(sim.fog.sight_is_latched(standing, americans));
+    sim.make_ally(
+        russians,
+        americans,
+        &rules,
+        None,
+        FrameEffects::default(),
+        false,
+    );
+    assert_eq!(
+        sim.fog.source_sight(standing, americans),
+        Some(american_source),
+        "MakeAlly cannot reopen a source already latched for that client"
+    );
+    assert!(
+        sim.fog.sight_admission(standing, americans).is_none(),
+        "UpdateReveal @0x0070AF50 returns at +0x250 before RevealArea"
+    );
+    assert!(
+        !sim.fog
+            .is_cell_visible(americans, owner_origin.0, owner_origin.1)
+    );
     // The re-admission gives a computer House's non-Building only its gap
     // callback (`0x004ADE2D..0x004ADEBF`).
     assert!(!sim.fog.sight_is_latched(tank, americans));
-    let config = sim.sight_reveal_config(Some(&rules));
-    sim.refresh_sight_sources(&config, Some(&rules));
+    let config = sim.sight_reveal_config(&rules);
+    sim.refresh_sight_sources(&config, &rules);
     assert!(
         !sim.fog.sight_is_latched(tank, americans),
         "the frame pass reveals nothing"
     );
     assert_eq!(
-        sim.fog.sight_admission(tank, russians),
-        Some(&tank_sight),
-        "the frame pass keeps the last reveal's footprint"
+        sim.fog.source_sight(tank, americans),
+        Some(tank_source),
+        "the frame pass keeps the last reveal's source"
     );
 
     // A plant placed while the alliance stands opens on the ally's map at
@@ -1728,19 +2149,42 @@ fn an_alliance_moves_the_allys_building_sight_within_the_call() {
     let plant = sim
         .spawn_object("NAPOWR", "Russians", 22, 22, 0, &rules)
         .unwrap();
-    let origin = sim.fog.sight_admission(plant, russians).unwrap().origin;
+    let origin = sim.fog.sight_admission(plant, americans).unwrap().origin;
     assert!(sim.fog.sight_is_latched(plant, americans));
     assert!(sim.fog.is_cell_visible(americans, origin.0, origin.1));
 
-    sim.make_enemy(russians, americans, &rules);
+    let ((), release_trace) = trace_reveal_calls(|| {
+        sim.make_enemy(
+            russians,
+            americans,
+            &rules,
+            None,
+            FrameEffects::default(),
+            false,
+        );
+    });
+    assert!(
+        release_trace
+            .walks
+            .iter()
+            .any(|cells| cells.contains(&(owner_origin.0, owner_origin.1))),
+        "the latched American source releases its cached area even without an American contribution receipt"
+    );
+    assert!(!sim.fog.source_sight_is_latched(standing, americans));
     assert!(
         !sim.fog.sight_is_latched(plant, americans),
         "0x004F9FD8's release precedes the bit write"
     );
     assert!(!sim.fog.is_cell_visible(americans, origin.0, origin.1));
-    assert!(sim.fog.sight_is_latched(plant, russians));
 
-    sim.make_ally(russians, americans, &rules, None, FrameEffects::default());
+    sim.make_ally(
+        russians,
+        americans,
+        &rules,
+        None,
+        FrameEffects::default(),
+        false,
+    );
     assert!(
         sim.fog.sight_is_latched(plant, americans),
         "0x004ADDE4 passes UpdateReveal's latch test"
@@ -1749,50 +2193,105 @@ fn an_alliance_moves_the_allys_building_sight_within_the_call() {
     assert!(!sim.fog.sight_is_latched(tank, americans));
 }
 
-/// A team skirmish forms its alliances after it places its starting units
-/// (`ScenarioClass::Post_Map_Init`: Generate_Starting_Units at `0x00686937`,
-/// the mode's alliances at `0x00686AE4`). The brackets give an ally's
-/// mobiles no sight callback, so a starting unit's sight reaches its new
-/// ally's map at its next cell arrival, whose reveal RevealArea's house
-/// gate admits for the ally under `AllyReveal=` (`0x00567AEF`).
+/// The map release at a mobile's next arrival still passes through
+/// `RevealArea @ 0x005678E0`; after MakeEnemy its former ally fails that
+/// house gate, so the previous footprint remains counted there.
 #[test]
-fn launch_alliances_open_an_allys_starting_unit_at_its_next_arrival() {
-    let Some((mut sim, rules, _)) = retail_arena() else {
+fn an_ex_ally_keeps_a_mobile_footprint_after_its_next_cell_arrival() {
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
         return;
     };
-    sim.fog = vision::FogState::new(32, 32);
+    let rules = retail.rules;
+    assert!(rules.general.allies_allowed);
+    assert!(rules.general.ally_reveal);
+    let mut sim = Simulation::new();
+    let grid = crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
     let americans = sim.intern("Americans");
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            americans, 0, None, true, 0, 10,
+        ));
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+    sim.session.set_current_house_for_test(Some(americans));
+    sim.fog = vision::FogState::new(32, 32);
     let russians = add_computer_house(&mut sim, "Russians");
     add_computer_house(&mut sim, "Confederation");
-    let ours = sim
-        .spawn_object("MTNK", "Americans", 8, 8, 0, &rules)
+
+    let tank = sim
+        .spawn_object("MTNK", "Russians", 10, 10, 0, &rules)
         .unwrap();
-    let theirs = sim
-        .spawn_object("MTNK", "Russians", 22, 22, 0, &rules)
-        .unwrap();
-    let team = crate::map::houses::HouseAllianceMap::from([
-        ("AMERICANS".to_string(), ["RUSSIANS".to_string()].into()),
-        ("RUSSIANS".to_string(), ["AMERICANS".to_string()].into()),
-    ]);
-    sim.install_house_alliances(
-        crate::sim::house_diplomacy::HouseAllianceAdmission::Admitted(team),
+    sim.make_ally(
+        russians,
+        americans,
         &rules,
+        None,
+        FrameEffects::default(),
+        false,
     );
-    assert!(sim.fog.sight_is_latched(ours, americans));
-    assert!(!sim.fog.sight_is_latched(theirs, americans));
-    assert!(!sim.fog.sight_is_latched(ours, russians));
-    let config = sim.sight_reveal_config(Some(&rules));
-    sim.refresh_sight_sources(&config, Some(&rules));
+    let arrive = |sim: &mut Simulation| {
+        let entity = sim.substrate.entities.get_mut(tank).unwrap();
+        entity
+            .position
+            .set_rx_for_test(entity.position.rx().saturating_add(1));
+        sim.per_cell_process(
+            tank,
+            crate::sim::movement::PerCellReason::Arrival,
+            &rules,
+            None,
+            FrameEffects::default(),
+        )
+        .unwrap();
+    };
+    let _ = sim.advance_tick(&[], Some(&rules), Some(&grid), None, 67);
+    arrive(&mut sim);
+    let old_sight = sim
+        .fog
+        .sight_admission(tank, americans)
+        .expect("the allied mobile's arrival reveals to the human map")
+        .clone();
+    let old_cell = (old_sight.origin.0, old_sight.origin.1);
+    assert!(sim.fog.source_sight_is_latched(tank, americans));
+    assert!(sim.fog.is_cell_visible(americans, old_cell.0, old_cell.1));
+
+    sim.make_enemy(
+        russians,
+        americans,
+        &rules,
+        None,
+        FrameEffects::default(),
+        false,
+    );
     assert!(
-        !sim.fog.sight_is_latched(theirs, americans),
-        "the frame pass reveals nothing"
+        sim.fog.is_cell_visible(americans, old_cell.0, old_cell.1),
+        "MakeEnemy's mobile arm leaves the prior map footprint"
     );
-    // Its next cell arrival: ReReveal, then UpdateReveal (Unit `0x0073AC5F`,
-    // `0x0073AC74`).
-    sim.refresh_object_sight(theirs, Some(&rules), 0);
-    assert!(sim.fog.sight_is_latched(theirs, americans));
-    let origin = sim.fog.sight_admission(theirs, americans).unwrap().origin;
-    assert!(sim.fog.is_cell_visible(americans, origin.0, origin.1));
+    assert!(sim.fog.source_sight_is_latched(tank, americans));
+
+    let owner_plane = &sim.fog.by_owner()[&americans];
+    let old_index =
+        usize::from(old_cell.1) * usize::from(sim.fog.width()) + usize::from(old_cell.0);
+    let old_allied_sources = owner_plane.shroud_knowledge_raw()[old_index].allied_sources();
+    assert!(old_allied_sources > 0);
+
+    arrive(&mut sim);
+    assert!(sim.fog.source_sight_is_latched(tank, americans));
+    assert!(
+        sim.fog.sight_admission(tank, americans).is_none(),
+        "the rejected release retires its contribution index while the next UpdateReveal still latches"
+    );
+    assert!(
+        sim.fog.is_cell_visible(americans, old_cell.0, old_cell.1),
+        "native ReReveal's rejected former-ally area walk leaves old sight counted"
+    );
+    let config = sim.sight_reveal_config(&rules);
+    sim.refresh_sight_sources(&config, &rules);
+    assert!(sim.fog.is_cell_visible(americans, old_cell.0, old_cell.1));
+    assert_eq!(
+        sim.fog.by_owner()[&americans].shroud_knowledge_raw()[old_index].allied_sources(),
+        old_allied_sources,
+        "the abandoned map contribution survives frame rebuilds without another source count"
+    );
 }
 
 /// Playfield promotion (`0x006F511A`) follows the arrival's reveal (Unit
@@ -1819,7 +2318,7 @@ fn a_tank_promoted_into_the_playfield_reveals_at_its_next_arrival() {
         .set_in_playfield(false);
     let order = CommandEnvelope::new(
         owner,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::Move {
             entity_id: id,
             target_rx: 13,
@@ -1843,49 +2342,80 @@ fn a_tank_promoted_into_the_playfield_reveals_at_its_next_arrival() {
     assert_eq!(sight_at, Some((12, 10)), "its sight opens at the next one");
 }
 
-/// VERA's SHP death sequence of an aircraft defers the UnInit whose Limbo
-/// releases a dead object's sight (`0x006F6B16`), so the sequence's start
-/// releases it. (A dying Unit's receiver UnInits it at once; no retail
-/// aircraft is SHP.)
+/// Infantry Per_Cell_Process ends its reveal with the Map567DA0 border
+/// (`0x0051A8F1..0x0051A925`): around his current XYZ, out to his cached
+/// radius (`+0x260`) + 3, as the Unit tail's (`0x0073AC7A..0x0073ACAE`).
 #[test]
-fn an_shp_aircraft_releases_its_sight_when_its_death_sequence_starts() {
-    let ini = crate::sim::arena_fixture::clear_ground_ini(
-        "[InfantryTypes]\n[VehicleTypes]\n[AircraftTypes]\n0=SHPA\n[BuildingTypes]\n\
-         [Warheads]\n0=SA\n[SHPA]\nStrength=100\nSight=5\n\
-         [SA]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
-    );
-    let art = crate::rules::ini_parser::IniFile::from_str("[SHPA]\nVoxel=no\n");
-    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
-    rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-    let mut sim = Simulation::new();
-    crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
-    sim.fog = vision::FogState::new(32, 32);
-    let owner = sim.intern("Americans");
-    sim.houses.insert(
-        owner,
-        crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10),
-    );
-    sim.session.house_order.push(owner);
-    let id = sim
-        .spawn_object("SHPA", "Americans", 16, 16, 0, &rules)
+fn an_infantry_arrival_refreshes_its_sight_border() {
+    let Some((mut sim, rules, grid)) = retail_arena() else {
+        return;
+    };
+    let man = sim
+        .spawn_object("E1", "Americans", 12, 12, 0, &rules)
         .unwrap();
-    assert!(sim.substrate.entities.get(id).unwrap().animation.is_some());
-    assert!(sim.fog.sight_is_latched(id, owner));
-    let hit = crate::sim::combat::EntityDamageEvent::direct_receiver(
-        id,
-        100,
-        0,
-        crate::sim::combat::RAD_NO_ATTACKER,
-        None,
-        sim.intern("SA"),
-        crate::sim::combat::ReceiverCallFlags {
-            ignore_defenses: true,
-            arg6: false,
-        },
+    let _ = sim.advance_tick(&[], Some(&rules), Some(&grid), None, 67);
+    let ((), trace) = trace_reveal_calls(|| {
+        sim.per_cell_process(
+            man,
+            crate::sim::movement::PerCellReason::Arrival,
+            &rules,
+            None,
+            FrameEffects::default(),
+        )
+        .unwrap();
+    });
+
+    let owner = sim.substrate.entities.get(man).unwrap().owner();
+    let radius = sim.fog.sight_admission(man, owner).unwrap().radius;
+    assert!(radius > 0);
+    let z = crate::sim::movement::ground_pose::object_world_z_leptons(
+        sim.substrate.entities.get(man).unwrap(),
+        sim.resolved_terrain.as_ref(),
     );
-    sim.commit_direct_damage_receiver(&rules, None, hit, FrameEffects::default());
-    let wreck = sim.substrate.entities.get(id).unwrap();
-    assert!(wreck.death.is_dying(), "its death sequence started");
-    assert!(!wreck.lifecycle.in_limbo(), "before its UnInit");
-    assert!(!sim.fog.sight_is_latched(id, owner));
+    let border = vision::sight_border_cells((12, 12, z), radius + 3, 0);
+    assert!(!border.is_empty());
+    assert_eq!(trace.border_receivers, border);
+}
+
+#[test]
+fn make_ally_refreshes_own_sight_after_admission_and_skips_a_refused_repeat() {
+    let Some((mut sim, rules, _)) = retail_arena() else {
+        return;
+    };
+    sim.fog = vision::FogState::new(32, 32);
+    let player = sim.intern("Americans");
+    let other = add_computer_house(&mut sim, "Russians");
+    add_computer_house(&mut sim, "Confederation");
+    let id = sim
+        .spawn_object("MTNK", "Americans", 8, 22, 0, &rules)
+        .unwrap();
+    assert!(
+        sim.entities()
+            .get(id)
+            .unwrap()
+            .discovery
+            .discovered_by_current_house()
+    );
+    sim.refresh_object_sight(id, &rules, 7, crate::sim::world::FrameEffects::default());
+    let before = sim.fog.sight_admission(id, player).unwrap().clone();
+    assert_eq!(before.radius, 7);
+    sim.substrate
+        .entities
+        .get_mut(id)
+        .unwrap()
+        .position
+        .set_rx_for_test(9);
+    sim.make_ally(other, player, &rules, None, FrameEffects::default(), false);
+    let refreshed = sim.fog.sight_admission(id, player).unwrap().clone();
+    assert_eq!((refreshed.origin.0, refreshed.origin.1), (9, 22));
+    assert_eq!(refreshed.radius, rules.object("MTNK").unwrap().sight);
+    sim.substrate
+        .entities
+        .get_mut(id)
+        .unwrap()
+        .position
+        .set_rx_for_test(10);
+    // CanAlly rejects the existing edge before the pre-release visitor.
+    sim.make_ally(other, player, &rules, None, FrameEffects::default(), false);
+    assert_eq!(sim.fog.sight_admission(id, player), Some(&refreshed));
 }

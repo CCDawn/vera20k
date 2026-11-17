@@ -76,13 +76,13 @@ fn ordinary_drive_retires_selector_before_entering_an_explicit_tube() {
     assert!(
         accepted
             .navigation
-            .path_replay
+            .path_replay()
             .remaining_directions()
             .is_empty()
     );
     assert!(committed_track_head(accepted).is_none());
     sim.resolved_terrain = Some(terrain.clone());
-    sim.zone_grid = Some(zones.clone());
+    sim.zone_grid = Some(zones.clone().into());
     crate::sim::arena_fixture::supply_native_map(&mut sim);
     let rules = drive_type_rules();
     sim.process_ground_locomotor_for_test(1, Some(&rules), Some(&grid), None)
@@ -90,10 +90,13 @@ fn ordinary_drive_retires_selector_before_entering_an_explicit_tube() {
     let accepted = sim.substrate.entities.get(1).unwrap();
     // Find_Path installed (0,0)->(1,0)->tube->(5,0); the fresh head
     // acceptance popped the east word and re-referenced at the head cell.
-    assert_eq!(accepted.navigation.path_replay.directions(), [2, 8]);
-    assert_eq!(accepted.navigation.path_replay.remaining_directions(), [8]);
+    assert_eq!(accepted.navigation.path_replay().directions(), [2, 8]);
     assert_eq!(
-        accepted.navigation.path_replay.reference_cell(),
+        accepted.navigation.path_replay().remaining_directions(),
+        [8]
+    );
+    assert_eq!(
+        accepted.navigation.path_replay().reference_cell(),
         Some((1, 0))
     );
     assert_eq!(movement_goal_cell(accepted), Some((5, 0)));
@@ -112,7 +115,7 @@ fn ordinary_drive_retires_selector_before_entering_an_explicit_tube() {
 
     let mut entry_frame = None;
     for frame in 1..160 {
-        sim.session.binary_frame = frame;
+        sim.session.set_binary_frame_for_test(frame);
         sim.process_ground_locomotor_for_test(1, Some(&rules), Some(&grid), None)
             .unwrap();
         let entity = sim.substrate.entities.get(1).unwrap();
@@ -138,8 +141,11 @@ fn ordinary_drive_retires_selector_before_entering_an_explicit_tube() {
             );
             assert_eq!((entity.position.rx(), entity.position.ry()), (1, 0));
             assert_eq!(tube.cursor(), 0);
-            assert_eq!(entity.navigation.path_replay.cursor(), 2);
-            assert_eq!(entity.navigation.path_replay.reference_cell(), Some((1, 0)));
+            assert_eq!(entity.navigation.path_replay().cursor(), 2);
+            assert_eq!(
+                entity.navigation.path_replay().reference_cell(),
+                Some((1, 0))
+            );
             assert_eq!(
                 entity
                     .locomotor
@@ -166,7 +172,7 @@ fn ordinary_drive_retires_selector_before_entering_an_explicit_tube() {
             assert!(
                 entity
                     .navigation
-                    .path_replay
+                    .path_replay()
                     .remaining_directions()
                     .is_empty()
             );
@@ -205,7 +211,7 @@ fn ordinary_drive_retires_selector_before_entering_an_explicit_tube() {
     };
 
     for frame in entry_frame + 1..entry_frame + 400 {
-        sim.session.binary_frame = frame;
+        sim.session.set_binary_frame_for_test(frame);
         sim.process_ground_locomotor_for_test(1, Some(&rules), Some(&grid), None)
             .unwrap();
         if sim
@@ -250,9 +256,9 @@ fn ordinary_drive_retires_selector_before_entering_an_explicit_tube() {
         true,
         crate::sim::world::FrameEffects::default(),
     );
-    let exit_frame = sim.session.binary_frame;
+    let exit_frame = sim.session.binary_frame();
     let arrived = (exit_frame + 1..exit_frame + 300).any(|frame| {
-        sim.session.binary_frame = frame;
+        sim.session.set_binary_frame_for_test(frame);
         sim.process_ground_locomotor_for_test(1, Some(&rules), Some(&grid), None)
             .unwrap();
         let entity = sim.substrate.entities.get(1).unwrap();
@@ -311,8 +317,7 @@ fn test_drive_arrival_clears_navcom_same_tick() {
 
     // A track that ends at the owner destination stops immediately: the owner
     // destination pair clears on the SAME movement tick, not a deferred pass.
-    let mut lifecycle_requests = Vec::new();
-    tick_movement(&mut entities, &mut test_interner(), &mut lifecycle_requests);
+    tick_movement(&mut entities, &mut test_interner());
     let entity = entities.get(1).expect("entity exists");
     assert!(crate::sim::movement::motion_query::is_moving(&entity) != Some(true));
     assert_eq!(entity.navigation.nav_com(), None);
@@ -344,8 +349,8 @@ fn gsi_04_05_tick_production_movement(
     path_grid: Option<&PathGrid>,
     native_frame: u32,
 ) {
-    sim.session.tick = u64::from(native_frame);
-    sim.session.binary_frame = native_frame;
+    sim.session.set_tick_for_test(u64::from(native_frame));
+    sim.session.set_binary_frame_for_test(native_frame);
     sim.process_ground_locomotor_for_test(1, Some(&drive_type_rules()), path_grid, None)
         .unwrap();
 }
@@ -364,7 +369,7 @@ fn walk_path_timer_waits_without_double_aging_or_losing_owner_state() {
             .get_mut(1)
             .unwrap()
             .navigation
-            .path_replay
+            .path_replay_mut()
             .clear_live_head();
         assert!(prepare_walk_destination(
             entities,
@@ -397,10 +402,10 @@ fn walk_path_timer_waits_without_double_aging_or_losing_owner_state() {
         let mut retained = FootPathRuntime::at_frame(0);
         retained.set_movement_timer_for_test(timer);
         retained.set_blocked_timer_for_test(CdTimer::started(100, 60));
-        retained.set_path_blocked(true);
-        retained.set_retries_left(u32::MAX);
+        retained.set_path_blocked_for_test(true);
+        retained.set_retries_left_for_test(u32::MAX);
         let actor = sim.substrate.entities.get_mut(1).unwrap();
-        actor.navigation.path_runtime = retained;
+        actor.navigation.set_path_runtime_for_test(retained);
         let position = actor.position;
         let rng = sim.scenario_rng.logical_state();
         // A hut Scatter Process and an ordinary Process can share a frame.
@@ -408,7 +413,7 @@ fn walk_path_timer_waits_without_double_aging_or_losing_owner_state() {
         for _ in 0..2 {
             gsi_04_05_tick_production_movement(&mut sim, Some(&grid), frame);
             let actor = sim.substrate.entities.get(1).unwrap();
-            assert_eq!(actor.navigation.path_runtime, retained);
+            assert_eq!(actor.navigation.path_runtime().clone(), retained);
             assert_eq!(
                 serde_json::to_value(actor.position).unwrap(),
                 serde_json::to_value(position).unwrap()
@@ -416,7 +421,7 @@ fn walk_path_timer_waits_without_double_aging_or_losing_owner_state() {
             assert!(
                 actor
                     .navigation
-                    .path_replay
+                    .path_replay()
                     .remaining_directions()
                     .is_empty()
             );
@@ -426,35 +431,35 @@ fn walk_path_timer_waits_without_double_aging_or_losing_owner_state() {
 
         // Native null setter writes persistent timers; the next accepted order
         // must not recreate or truncate the dword count.
-        sim.session.binary_frame = 200;
+        sim.session.set_binary_frame_for_test(200);
         assert!(sim.set_infantry_null_destination(
             1,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             None,
             crate::sim::world::FrameEffects::default()
         ));
         let actor = sim.substrate.entities.get(1).unwrap();
         assert_eq!(
-            actor.navigation.path_runtime.movement_timer(),
+            actor.navigation.path_runtime().movement_timer(),
             CdTimer::started(200, 0)
         );
         assert_eq!(
-            actor.navigation.path_runtime.blocked_timer(),
+            actor.navigation.path_runtime().blocked_timer(),
             CdTimer::started(200, 60)
         );
-        assert!(!actor.navigation.path_runtime.path_blocked());
-        assert_eq!(actor.navigation.path_runtime.retries_left(), u32::MAX);
+        assert!(!actor.navigation.path_runtime().path_blocked());
+        assert_eq!(actor.navigation.path_runtime().retries_left(), u32::MAX);
         order(&mut sim, (21, 10), DestinationTiming::new(201, 22));
         let actor = sim.substrate.entities.get(1).unwrap();
         assert_eq!(
-            actor.navigation.path_runtime.movement_timer(),
+            actor.navigation.path_runtime().movement_timer(),
             CdTimer::started(201, 0)
         );
         assert_eq!(
-            actor.navigation.path_runtime.blocked_timer(),
+            actor.navigation.path_runtime().blocked_timer(),
             CdTimer::started(201, 22)
         );
-        assert_eq!(actor.navigation.path_runtime.retries_left(), u32::MAX);
+        assert_eq!(actor.navigation.path_runtime().retries_left(), u32::MAX);
         assert_eq!(
             actor.locomotor.as_ref().unwrap().walk_destination_cell(),
             Some((21, 10))
@@ -494,7 +499,8 @@ fn drivable_slope_cell(
     slope_type: u8,
 ) -> crate::map::resolved_terrain::ResolvedTerrainCell {
     let clear = crate::rules::terrain_rules::SpeedCostProfile {
-        track: Some(100),
+        track: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
         ..Default::default()
     };
     crate::map::resolved_terrain::ResolvedTerrainCell {
@@ -609,7 +615,7 @@ fn drive_slope_boundary_is_detected_on_process_after_forced_track_crossing() {
         1,
         0x47,
         DriveCoord { x: 0, y: 256, z: 0 },
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default()
     ));
@@ -622,7 +628,7 @@ fn drive_slope_boundary_is_detected_on_process_after_forced_track_crossing() {
 
     let crossing_frame = (40..120)
         .find(|frame| {
-            sim.session.binary_frame = *frame;
+            sim.session.set_binary_frame_for_test(*frame);
             sim.process_ground_locomotor_for_test(1, Some(&rules), None, None)
                 .unwrap();
             sim.substrate.entities.get(1).unwrap().position.ry() == 1
@@ -637,7 +643,7 @@ fn drive_slope_boundary_is_detected_on_process_after_forced_track_crossing() {
         (4, 4, 0, 0),
         "the crossing frame samples before the forced track advances"
     );
-    sim.session.binary_frame = crossing_frame + 1;
+    sim.session.set_binary_frame_for_test(crossing_frame + 1);
     sim.process_ground_locomotor_for_test(1, Some(&rules), None, None)
         .unwrap();
     assert_eq!(
@@ -735,7 +741,8 @@ fn walk_arrival_keeps_list_order_and_snapshot_continuation() {
             .flat_map(|ry| {
                 (0..6).map(move |rx| {
                     let costs = SpeedCostProfile {
-                        foot: Some(100),
+                        foot: Some(crate::util::native_x87::NativeF32Bits::ONE),
+                        winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
                         ..Default::default()
                     };
                     let mut cell = drive_speed_test_cell(rx, ry, costs);
@@ -795,8 +802,8 @@ fn walk_arrival_keeps_list_order_and_snapshot_continuation() {
         Ok(true)
     );
     let walk_tick = |sim: &mut Simulation, frame: u32| {
-        sim.session.tick = u64::from(frame);
-        sim.session.binary_frame = frame;
+        sim.session.set_tick_for_test(u64::from(frame));
+        sim.session.set_binary_frame_for_test(frame);
         sim.process_ground_locomotor_for_test(walker, Some(&rules), Some(&grid), None)
             .unwrap();
     };
@@ -815,7 +822,7 @@ fn walk_arrival_keeps_list_order_and_snapshot_continuation() {
             .get(walker)
             .unwrap()
             .navigation
-            .path_replay
+            .path_replay()
             .clone();
         walk_tick(&mut sim, frame);
         if let Some(loaded) = restored.as_mut() {
@@ -869,7 +876,7 @@ fn walk_arrival_keeps_list_order_and_snapshot_continuation() {
                 assert!(loaded.zone_grid.as_ref().unwrap().is_native_load_pending());
                 loaded.rebuild_caches_after_load(
                     terrain.clone(),
-                    sim.terrain_speed_config.clone(),
+                    sim.terrain_speed_config().clone(),
                     &rules,
                 );
                 assert!(loaded.rebuild_dynamic_navigation(&rules));
@@ -911,7 +918,7 @@ fn walk_arrival_keeps_list_order_and_snapshot_continuation() {
             // 75BD89 consumes the completed head's Foot+5E0 word, if any.
             assert!(
                 before_route.remaining_directions().is_empty()
-                    || entity.navigation.path_replay.cursor() > before_route.cursor()
+                    || entity.navigation.path_replay().cursor() > before_route.cursor()
             );
         }
         trace.push((
@@ -921,7 +928,7 @@ fn walk_arrival_keeps_list_order_and_snapshot_continuation() {
             entity.sub_cell(),
             sim.scenario_rng.state(),
             entity.locomotor.as_ref().and_then(|l| l.step_head()),
-            entity.navigation.path_replay.clone(),
+            entity.navigation.path_replay().clone(),
         ));
         if crate::sim::movement::motion_query::is_moving(&entity) != Some(true) {
             break;
@@ -1000,7 +1007,7 @@ fn forced_track_object_turn_relinks_each_committed_cell() {
         1,
         0x47,
         head,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default()
     ));
@@ -1023,7 +1030,7 @@ fn forced_track_object_turn_relinks_each_committed_cell() {
     let mut previous_cell = (13, 11);
     let mut crossed = false;
     for frame in 0..128 {
-        sim.session.binary_frame = frame;
+        sim.session.set_binary_frame_for_test(frame);
         sim.process_ground_locomotor_for_test(1, Some(&rules), None, None)
             .unwrap();
         let entity = sim.substrate.entities.get(1).unwrap();
@@ -1033,7 +1040,7 @@ fn forced_track_object_turn_relinks_each_committed_cell() {
             committed_track_head(entity).is_none()
                 || entity
                     .navigation
-                    .path_replay
+                    .path_replay()
                     .remaining_directions()
                     .is_empty()
         );
@@ -1124,7 +1131,7 @@ fn drive_first_process_route(start: (u16, u16), goal: (u16, u16)) -> RouteAndGoa
     assert!(
         accepted
             .navigation
-            .path_replay
+            .path_replay()
             .remaining_directions()
             .is_empty(),
         "the order installs no route"
@@ -1133,7 +1140,7 @@ fn drive_first_process_route(start: (u16, u16), goal: (u16, u16)) -> RouteAndGoa
         .unwrap();
     let entity = sim.substrate.entities.get(1).unwrap();
     (
-        entity.navigation.path_replay.installed_cells(start),
+        entity.navigation.path_replay().installed_cells(start),
         movement_goal_cell(entity),
     )
 }
@@ -1198,7 +1205,7 @@ fn tree_speed_test_cell(
     bits: u8,
 ) -> crate::map::resolved_terrain::ResolvedTerrainCell {
     crate::map::resolved_terrain::ResolvedTerrainCell {
-        terrain_object_occupation: Some(bits),
+        terrain_object_occupation: Some(i32::from(bits)),
         terrain_object_blocks: bits != 0,
         ground_walk_blocked: bits != 0,
         base_ground_walk_blocked: false,
@@ -1239,11 +1246,10 @@ fn walk_scene(
     sim.intern_rule_type_ids(&rules);
     sim.resolve_type_handles(&rules);
     let owner = sim.interner.intern("Americans");
-    sim.houses.insert(
-        owner,
-        crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 0),
-    );
-    sim.session.house_order.push(owner);
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 0, 0,
+        ));
     if let Some(terrain) = terrain {
         sim.install_resolved_terrain_for_new_map(terrain);
     }
@@ -1264,7 +1270,7 @@ fn walk_move(
             target_rx: to.0,
             target_ry: to.1,
         },
-        Some(rules),
+        rules,
         None,
         crate::sim::world::FrameEffects::default(),
     ));
@@ -1275,16 +1281,15 @@ fn walk_frame(sim: &mut Simulation, rules: &crate::rules::ruleset::RuleSet) {
     sim.advance_tick(&[], Some(rules), grid.as_deref(), None, 67);
 }
 
-/// Order one infantryman from (0,0) to (2,0) on a 3x1 corridor whose middle
-/// cell is `middle`, through the production Move command and frame. Returns
-/// the distinct cells he stood in, in order.
-fn walk_infantry_corridor(
+/// A 3x1 corridor of clear cells whose middle cell is `middle`.
+fn walk_corridor(
     middle: crate::map::resolved_terrain::ResolvedTerrainCell,
-) -> Vec<(u16, u16)> {
+) -> crate::map::resolved_terrain::ResolvedTerrainGrid {
     let clear_costs = crate::rules::terrain_rules::SpeedCostProfile {
-        foot: Some(100),
-        track: Some(100),
-        wheel: Some(100),
+        foot: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        track: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
         ..Default::default()
     };
     let clear = |cell: crate::map::resolved_terrain::ResolvedTerrainCell| {
@@ -1294,7 +1299,7 @@ fn walk_infantry_corridor(
             ..cell
         }
     };
-    let terrain = crate::map::resolved_terrain::ResolvedTerrainGrid::from_cells(
+    crate::map::resolved_terrain::ResolvedTerrainGrid::from_cells(
         3,
         1,
         vec![
@@ -1302,8 +1307,16 @@ fn walk_infantry_corridor(
             clear(middle),
             clear(crate::map::resolved_terrain::test_flat_cell(2, 0)),
         ],
-    );
-    let (mut sim, rules) = walk_scene(0x75bd25, Some(terrain));
+    )
+}
+
+/// Order one infantryman from (0,0) to (2,0) on a 3x1 corridor whose middle
+/// cell is `middle`, through the production Move command and frame. Returns
+/// the distinct cells he stood in, in order.
+fn walk_infantry_corridor(
+    middle: crate::map::resolved_terrain::ResolvedTerrainCell,
+) -> Vec<(u16, u16)> {
+    let (mut sim, rules) = walk_scene(0x75bd25, Some(walk_corridor(middle)));
     let id = sim
         .spawn_object("E1", "Americans", 0, 0, 0, &rules)
         .unwrap();
@@ -1333,6 +1346,28 @@ fn infantry_walks_a_plain_corridor_end_to_end() {
         Some((2, 0)),
         "control walker must cross a corridor with no terrain object: {visited:?}",
     );
+}
+
+/// The stats panel's object rows come from the real pass: a walker's path
+/// search and steps land in their own slots, and the slots still add up.
+#[test]
+fn a_profiled_walk_fills_the_object_pass_slots() {
+    use crate::sim::frame_profile::phase;
+    let middle = crate::map::resolved_terrain::test_flat_cell(1, 0);
+    let (mut sim, rules) = walk_scene(0x75bd25, Some(walk_corridor(middle)));
+    let id = sim
+        .spawn_object("E1", "Americans", 0, 0, 0, &rules)
+        .unwrap();
+    sim.set_frame_profiling(true);
+    walk_move(&mut sim, &rules, id, (2, 0));
+    for _ in 0..30 {
+        walk_frame(&mut sim, &rules);
+    }
+    let report = sim.frame_profile().report().unwrap();
+    for slot in [phase::PATHFINDING, phase::MOVEMENT, phase::UNIT_AI] {
+        assert!(report.phases_ms[slot] > 0.0, "slot {slot} stayed empty");
+    }
+    assert!((report.phases_ms.iter().sum::<f64>() - report.mean_frame_ms).abs() < 1e-6);
 }
 
 /// The search and the runtime step-in have to be ONE predicate, the way the
@@ -1379,7 +1414,7 @@ fn gsi_04_10_crusher_and_omnicrusher_never_enter_or_crush_a_terrain_object_cell(
         let mut tank = GameEntity::test_default(1, "HTNK", "Americans", 0, 0);
         tank.set_category_for_test(EntityCategory::Unit);
         tank.lifecycle.set_in_limbo_for_test(false);
-        tank.lifecycle.set_cell_marked(true);
+        tank.lifecycle.set_cell_marked_for_test(true);
         let mut locomotor = make_drive_loco_for_test();
         locomotor.set_movement_zone_for_test(movement_zone);
         tank.locomotor = Some(locomotor);
@@ -1391,7 +1426,6 @@ fn gsi_04_10_crusher_and_omnicrusher_never_enter_or_crush_a_terrain_object_cell(
         );
         entities.insert(tank);
 
-        let mut lifecycle_requests = Vec::new();
         let mut occupancy = OccupancyGrid::new();
         let mut rng = SimRng::new(0);
         let mut interner = test_interner();
@@ -1404,9 +1438,7 @@ fn gsi_04_10_crusher_and_omnicrusher_never_enter_or_crush_a_terrain_object_cell(
                 &mut rng,
                 tick,
                 &mut interner,
-                &mut lifecycle_requests,
             );
-            assert!(lifecycle_requests.is_empty());
             let p = &entities.get(1).expect("tank exists").position;
             assert_ne!(
                 (p.rx(), p.ry()),
@@ -1483,7 +1515,7 @@ fn sharp_turn_preserves_path_node_count() {
         "the null-curve substitute should have started a straight drive track"
     );
     assert_eq!(
-        entity.navigation.path_replay.cursor(),
+        entity.navigation.path_replay().cursor(),
         1,
         "the substitute must consume exactly one path node, not two"
     );
@@ -1524,7 +1556,7 @@ fn off_octant_hull_turns_before_any_curve_is_selected() {
         .and_then(|l| l.selected_drive_runtime())
         .and_then(|r| r.retained())
         .cloned();
-    assert_eq!(entity.navigation.path_replay.cursor(), 0);
+    assert_eq!(entity.navigation.path_replay().cursor(), 0);
 
     assert!(
         drive_locomotion.as_ref().unwrap().head_to().is_none(),
@@ -1554,13 +1586,14 @@ fn gsi_06_13_fixture_mover(
     e.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
     e.body_facing.snap(u16::from(facing) << 8, 0);
     e.lifecycle.set_in_limbo_for_test(false);
-    e.lifecycle.set_cell_marked(true);
+    e.lifecycle.set_cell_marked_for_test(true);
     let goal = *path.last().expect("non-empty path");
-    e.navigation.path_replay = crate::sim::components::FootPathQueue::for_test(
-        directions,
-        0,
-        Some((start.0 as i16, start.1 as i16)),
-    );
+    e.navigation
+        .set_path_replay_for_test(crate::sim::components::FootPathQueue::for_test(
+            directions,
+            0,
+            Some((start.0 as i16, start.1 as i16)),
+        ));
     e.foot_speed.set_speed_fraction(SIM_ONE);
     assert!(
         e.locomotor

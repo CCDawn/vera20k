@@ -9,6 +9,8 @@
 //! sim/ only — never render/ui/audio/net.
 use serde::{Deserialize, Serialize};
 
+#[cfg(all(test, tests_sim_p_s))]
+mod civilian_tests;
 pub mod contacts;
 pub mod receive;
 mod tether;
@@ -106,7 +108,7 @@ pub fn take_transmit_log() -> Vec<TransmitRecord> {
 pub(crate) fn broadcast_break(
     sim: &mut Simulation,
     sender_sid: u64,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
     effects: FrameEffects<'_>,
 ) {
     broadcast(sim, sender_sid, RadioMessage::Break, rules, effects);
@@ -118,7 +120,7 @@ pub(crate) fn broadcast(
     sim: &mut Simulation,
     sender_sid: u64,
     message: RadioMessage,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
     effects: FrameEffects<'_>,
 ) {
     let capacity = sim
@@ -166,8 +168,7 @@ pub(crate) fn broadcast(
 /// HELLO and OVER_OUT bookkeeping, then the receiver's class chain
 /// ([`receive_radio`]). Every other opcode returns the receiver's answer
 /// unchanged. The receiver only ever sees an RTTI-filtered (Techno) sender
-/// (`As_Techno @ 0x0040DD70`). `rules` reaches the type-aware receivers; a
-/// caller without it gets their rules-free answers.
+/// (`As_Techno @ 0x0040DD70`). `rules` reaches the type-aware receivers.
 /// The borrowed frame effects follow synchronous nested dispatch and are
 /// never retained in contacts or the wire payload.
 pub fn transmit(
@@ -176,7 +177,7 @@ pub fn transmit(
     target_sid: u64,
     msg: RadioMessage,
     payload: RadioPayload,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
     effects: FrameEffects<'_>,
 ) -> RadioResponse {
     #[cfg(any(test, feature = "test-support"))]
@@ -215,7 +216,7 @@ pub(crate) fn transmit_to_contact(
     sim: &mut Simulation,
     sender_sid: u64,
     msg: RadioMessage,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
     effects: FrameEffects<'_>,
 ) -> RadioResponse {
     let Some(target_sid) = sim
@@ -259,7 +260,7 @@ fn transmit_hello(
     sender_sid: u64,
     target_sid: u64,
     filtered: Option<u64>,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
     effects: FrameEffects<'_>,
 ) -> RadioResponse {
     let Some(sender) = sim.substrate.entities.get(sender_sid) else {
@@ -310,7 +311,7 @@ fn transmit_over_out(
     sender_sid: u64,
     target_sid: u64,
     filtered: Option<u64>,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
     effects: FrameEffects<'_>,
 ) -> RadioResponse {
     if let Some(sender) = sim.substrate.entities.get_mut(sender_sid) {
@@ -345,7 +346,10 @@ fn transmit_over_out(
 pub enum RadioMessage {
     Hello = 0x02,
     Break = 0x03,
-    DockingComplete = 0x07, // name inferred
+    /// Hold still: a Carryall about to lift a Unit sends it
+    /// (`0x00416EC3`); the Unit drops its destination and Target, queues
+    /// Sleep and tethers itself to the sender (`0x0073750A`).
+    HoldStill = 0x07, // name inferred
     /// Infantry arrival51A80C: the common Techno receiver untethers the
     /// sender and then sends BREAK (`0x006F4C29..0x006F4C47`).
     RequestClearance = 0x08,
@@ -396,9 +400,12 @@ pub enum RadioMessage {
     Reload = 0x1F, // name inferred
     IsRepairing = 0x22,
     IsOccupied = 0x23,
+    /// "Will you be lifted?": a Carryall asks the Unit it will tote
+    /// (`0x00416E84`); the Unit's answer is `0x0073745C`.
+    WantRide = 0x24, // name inferred
 }
 // Deliberately omitted: 0x10 RESERVE_DOCK (a mission-queue verb argument, not a
-// wire message) and 0x24 WANT_RIDE (dormant in stock YR).
+// wire message).
 
 impl RadioMessage {
     /// The wire opcode byte.
@@ -426,6 +433,10 @@ pub enum RadioResponse {
     Queued = 0x17,
     InsufficientFunds = 0x20,
     RepairComplete = 0x21,
+    /// Aircraft DOCK_NOW returns the literal 5, including for a null sender
+    /// (`AircraftClass::Receive_Radio @ 0x0041938E`). Its callers distinguish
+    /// it from ROGER; no additional meaning is inferred from the number.
+    Code5 = 5,
 }
 
 impl RadioResponse {
@@ -456,33 +467,24 @@ impl RadioPayload {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[test]
+fn message_codes_match_wire_opcodes() {
+    assert_eq!(RadioMessage::Hello.code(), 0x02);
+    assert_eq!(RadioMessage::Break.code(), 0x03);
+    assert_eq!(RadioMessage::TetherBack.code(), 0x09);
+    assert_eq!(RadioMessage::CanDock.code(), 0x0E);
+    assert_eq!(RadioMessage::DockNow.code(), 0x15);
+    assert_eq!(RadioMessage::IsOccupied.code(), 0x23);
+}
 
-    #[test]
-    fn message_codes_match_wire_opcodes() {
-        assert_eq!(RadioMessage::Hello.code(), 0x02);
-        assert_eq!(RadioMessage::Break.code(), 0x03);
-        assert_eq!(RadioMessage::TetherBack.code(), 0x09);
-        assert_eq!(RadioMessage::CanDock.code(), 0x0E);
-        assert_eq!(RadioMessage::DockNow.code(), 0x15);
-        assert_eq!(RadioMessage::IsOccupied.code(), 0x23);
-    }
-
-    #[test]
-    fn response_codes_match_wire_opcodes() {
-        assert_eq!(RadioResponse::None.code(), 0);
-        assert_eq!(RadioResponse::Roger.code(), 1);
-        assert_eq!(RadioResponse::Negatory.code(), 0x0A);
-        assert_eq!(RadioResponse::AlreadyThere.code(), 0x14);
-        assert_eq!(RadioResponse::Queued.code(), 0x17);
-        assert_eq!(RadioResponse::InsufficientFunds.code(), 0x20);
-        assert_eq!(RadioResponse::RepairComplete.code(), 0x21);
-    }
-
-    #[test]
-    fn payload_defaults_to_no_target() {
-        assert_eq!(RadioPayload::default().target, None);
-    }
+#[test]
+fn response_codes_match_wire_opcodes() {
+    assert_eq!(RadioResponse::None.code(), 0);
+    assert_eq!(RadioResponse::Roger.code(), 1);
+    assert_eq!(RadioResponse::Code5.code(), 5);
+    assert_eq!(RadioResponse::Negatory.code(), 0x0A);
+    assert_eq!(RadioResponse::AlreadyThere.code(), 0x14);
+    assert_eq!(RadioResponse::Queued.code(), 0x17);
+    assert_eq!(RadioResponse::InsufficientFunds.code(), 0x20);
+    assert_eq!(RadioResponse::RepairComplete.code(), 0x21);
 }

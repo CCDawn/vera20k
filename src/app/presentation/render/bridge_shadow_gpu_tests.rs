@@ -128,6 +128,7 @@ fn bridge_shadow_submission_matches_native_color_depth_and_repeat() {
 use crate::app::presentation::instances::bridges::{
     build_bridge_body_instances_inner, build_bridge_shadow_instances_inner,
 };
+use crate::app::presentation::instances::{CellBodyDraw, submit_cell_body_sweep};
 use crate::assets::asset_manager::{AssetManager, MediaArchiveMode};
 use crate::map::resolved_terrain::{test_flat_cell, test_grid};
 use crate::render::batch::{CameraUniform, SpriteInstance};
@@ -157,28 +158,14 @@ fn retail_wall_shadow_atlas_covers_physical_material_domains() {
         if !flags.wall {
             continue;
         }
-        let image = fixture
-            .rules
-            .art()
-            .resolve_overlay_image_id(name, &fixture.rules_ini);
-        // The independent native-loader filename owner admits one primary and
-        // one generic retry, unlike the atlas's compatibility candidate list.
-        let candidates = crate::rules::art_data::native_overlay_shp_names(
-            fixture.rules.art(),
-            &image,
+        let (winner, shp) = crate::rules::effect_asset_catalog::load_overlay_shape(
+            &fixture.assets,
+            &fixture.registry,
+            name,
             fixture.theater.extension,
             "TEMPERATE",
-        );
-        let (winner, bytes) = candidates
-            .iter()
-            .find_map(|candidate| {
-                fixture
-                    .assets
-                    .get_ref(candidate)
-                    .map(|bytes| (candidate, bytes))
-            })
-            .expect("physical Wall SHP");
-        let shp = crate::assets::shp_file::ShpFile::from_bytes(bytes).unwrap();
+        )
+        .expect("physical Wall SHP selected by the processed image plan");
         let half = shp.frames.len() / 2;
         let mut populated = 0;
         for state in 0..=u8::MAX {
@@ -205,6 +192,10 @@ fn retail_wall_shadow_atlas_covers_physical_material_domains() {
             assert!(atlas.shadow_entry(name, 47).is_some());
         }
         if name == "GAFWLL" {
+            let candidates =
+                fixture
+                    .registry
+                    .shp_candidates(name, fixture.theater.extension, "TEMPERATE");
             assert!(fixture.assets.get_ref(&candidates[0]).is_none());
             assert_eq!(winner.as_str(), "GGFWLL.SHP");
         }
@@ -221,11 +212,137 @@ fn retail_wall_shadow_atlas_covers_physical_material_domains() {
     );
 }
 
+#[test]
+#[ignore = "requires retail assets and GPU; generated rock shadow binding, live erase and restore"]
+fn retail_rock_shadow_admits_generated_live_and_restored_overlay() {
+    use crate::map::overlay::{OverlayDataPack, OverlayEntry};
+    use crate::sim::snapshot::GameSnapshot;
+    use crate::sim::world::Simulation;
+
+    let mut fixture = RetailBridgeFixture::load(native_bridge_packet());
+    fixture.names = crate::render::overlay_assets::render_overlay_names(&fixture.registry);
+    let id = fixture.registry.id_for_name("TROCK05").unwrap();
+    let flags = fixture.registry.flags(id).unwrap();
+    assert!(!flags.wall && !flags.crate_type && !flags.is_rubble);
+    let shp = crate::assets::shp_file::ShpFile::from_bytes(
+        fixture.assets.get_ref("TROCK05.TEM").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(shp.frames.len(), 2);
+    let shadow = &shp.frames[1];
+    assert_eq!(
+        [
+            shadow.frame_x,
+            shadow.frame_y,
+            shadow.frame_width,
+            shadow.frame_height
+        ],
+        [34, 46, 30, 11]
+    );
+    assert_eq!(
+        shadow.pixels.iter().filter(|&&index| index != 0).count(),
+        67
+    );
+
+    let gpu = Gpu::new();
+    let batch = BatchRenderer::new_with_device(
+        &gpu.device,
+        &gpu.queue,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+    );
+    let atlas = fixture.atlas(&gpu, &batch);
+    assert_eq!(
+        atlas
+            .shadow_entry("TROCK05", 0)
+            .expect("ordinary rock shadow frame1")
+            .pixel_size,
+        [30.0, 11.0]
+    );
+    assert!(
+        atlas.body_entry("TROCK05", 0).is_none(),
+        "OverlayAtlas still owns the body"
+    );
+    assert!(
+        atlas.shadow_entry("TIB01", 0).is_none(),
+        "empty physical shadow frames stay absent"
+    );
+
+    let entry = OverlayEntry {
+        rx: 4,
+        ry: 4,
+        overlay_id: id,
+        frame: 0,
+    };
+    let mut terrain = test_grid(8, 8, test_flat_cell);
+    let grid = crate::sim::overlay_grid::OverlayGrid::from_generated_overlays(
+        std::slice::from_ref(&entry),
+        &OverlayDataPack::from_cells([(4, 4, 0)]),
+        &mut terrain,
+        &fixture.registry,
+    );
+    let mut sim = Simulation::new();
+    sim.install_resolved_terrain_for_new_map(terrain.clone());
+    sim.install_overlay_grid_for_load(grid);
+    let point = crate::map::terrain::iso_to_screen(4, 4, 0);
+    let build = |sim: &Simulation, atlas: &BridgeAtlas| {
+        let mut instances = Vec::new();
+        build_bridge_shadow_instances_inner(
+            crate::render::cell_window::CellWindow::Whole,
+            sim.resolved_terrain().unwrap(),
+            atlas,
+            &fixture.names,
+            std::slice::from_ref(&entry),
+            sim.overlay_grid(),
+            Some(&fixture.registry),
+            None,
+            -100.0,
+            1000.0,
+            point.0 - 64.0,
+            point.1 - 64.0,
+            128.0,
+            128.0,
+            &mut instances,
+        );
+        instances
+    };
+    let before = build(&sim, &atlas);
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].size, [30.0, 11.0]);
+    assert_eq!(before[0].z_adjust, -2.0);
+    assert_eq!(
+        before[0].z_gradient,
+        crate::render::native_z::ZGradient::Flat as u32
+    );
+    let saved = GameSnapshot::save(&sim, 0, 0, "generated rock", 0);
+    assert_eq!(
+        sim.overlay_grid_mut_for_test()
+            .as_mut()
+            .unwrap()
+            .clear_overlay(4, 4),
+        Some(id)
+    );
+    assert!(
+        build(&sim, &atlas).is_empty(),
+        "live erasure defeats the stale published anchor"
+    );
+    let mut restored = GameSnapshot::load(&saved).unwrap().sim;
+    restored.restore_after_snapshot_load().unwrap();
+    restored.rebuild_caches_after_load(terrain, Default::default(), &fixture.rules);
+    restored
+        .restore_map_authority_after_snapshot_load(&fixture.rules, &fixture.registry, None)
+        .unwrap();
+    let restored_atlas = fixture.atlas(&gpu, &batch);
+    let after = build(&restored, &restored_atlas);
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].position, before[0].position);
+    assert_eq!(after[0].size, before[0].size);
+    assert_eq!(after[0].z_adjust, before[0].z_adjust);
+}
+
 struct RetailBridgeFixture {
     assets: AssetManager,
     theater: crate::map::theater::TheaterData,
     rules: crate::rules::ruleset::RuleSet,
-    rules_ini: IniFile,
     registry: OverlayTypeRegistry,
     names: BTreeMap<u8, String>,
 }
@@ -252,15 +369,14 @@ impl RetailBridgeFixture {
                     IniFile::from_bytes(bytes).unwrap()
                 })
             });
-        let (mut rules, rules_ini, art, _) =
-            crate::app::loading::init_helpers::load_rules_with_merged_ini(
-                &assets,
-                Some(&mode),
-                map.as_ref(),
-            )
-            .unwrap();
+        let (mut rules, _, art, _) = crate::app::loading::init_helpers::load_rules_with_merged_ini(
+            &assets,
+            Some(&mode),
+            map.as_ref(),
+        )
+        .unwrap();
         rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-        let registry = OverlayTypeRegistry::from_ini(&rules_ini, Some(&art));
+        let registry = rules.overlay_registry().clone();
         let theater = crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
         if packet["inputs"]["building"].is_object() {
             // The same loader order as the app: theater archives precede the
@@ -301,7 +417,6 @@ impl RetailBridgeFixture {
             assets,
             theater,
             rules,
-            rules_ini,
             registry,
             names,
         }
@@ -320,8 +435,6 @@ impl RetailBridgeFixture {
             self.theater.extension,
             "TEMPERATE",
             &self.registry,
-            &self.rules_ini,
-            self.rules.art(),
             &rubble_arts,
         )
         .unwrap()
@@ -333,7 +446,7 @@ impl RetailBridgeFixture {
         atlas: &BridgeAtlas,
         size: [u32; 2],
         kind: BridgeFrameKind,
-    ) -> (CameraUniform, Vec<SpriteInstance>) {
+    ) -> (CameraUniform, Vec<SpriteInstance>, Vec<CellBodyDraw>) {
         let cells: Vec<&Value> = input.get("cells").map_or_else(
             || vec![input],
             |cells| cells.as_array().unwrap().iter().collect(),
@@ -358,16 +471,10 @@ impl RetailBridgeFixture {
         );
         for cell_input in &cells {
             let cell = terrain
-                .cell_mut(coords(cell_input, 0), coords(cell_input, 1))
+                .cell_mut_for_test(coords(cell_input, 0), coords(cell_input, 1))
                 .unwrap();
             cell.level = cell_input["level"].as_i64().unwrap() as u8;
             cell.bridge_facts.raw_flags = cell_input["flags"].as_u64().unwrap() as u32;
-            cell.bridge_facts.state_byte = cell_input["state"].as_u64().unwrap() as u8;
-            cell.bridge_facts.overlay_id = Some(
-                self.registry
-                    .id_for_name(cell_input["type"].as_str().unwrap())
-                    .unwrap(),
-            );
         }
         let mut interner = crate::sim::intern::StringInterner::new();
         let mut overlay_entries = Vec::new();
@@ -382,7 +489,8 @@ impl RetailBridgeFixture {
             // A 1x2 foundation has two overlay anchors but only its origin
             // records the BuildingType; the second cell must not duplicate it.
             for y in [ry, ry + 1] {
-                terrain.cell_mut(rx, y).unwrap().level = first["level"].as_i64().unwrap() as u8;
+                terrain.cell_mut_for_test(rx, y).unwrap().level =
+                    first["level"].as_i64().unwrap() as u8;
                 overlay_entries.push(crate::map::overlay::OverlayEntry {
                     rx,
                     ry: y,
@@ -397,7 +505,7 @@ impl RetailBridgeFixture {
             );
             if first["clear_rubble_type"] != true {
                 let type_id = interner.intern(input["building_type"].as_str().unwrap());
-                grid.cell_mut(rx, ry).rubble_building_type = Some(type_id);
+                grid.cell_mut_for_test(rx, ry).rubble_building_type = Some(type_id);
             }
             if first["overlay_id"].as_i64() == Some(-1) {
                 // Preserve the published anchors while the real overlay owner
@@ -432,6 +540,21 @@ impl RetailBridgeFixture {
             }
             live_grid = Some(grid);
         }
+        // Bridge cases carry their live identity and state on the cell itself.
+        let live_grid = live_grid.unwrap_or_else(|| {
+            let mut grid =
+                crate::sim::overlay_grid::OverlayGrid::new(terrain.width(), terrain.height());
+            for cell_input in &cells {
+                let live = grid.cell_mut_for_test(coords(cell_input, 0), coords(cell_input, 1));
+                live.overlay_id = Some(
+                    self.registry
+                        .id_for_name(cell_input["type"].as_str().unwrap())
+                        .unwrap(),
+                );
+                live.overlay_data = cell_input["state"].as_u64().unwrap() as u8;
+            }
+            grid
+        });
         // These original caller cases supply the unraised cell screen point.
         // Align the existing isometric projection with that seam. The actual
         // bridge builder must apply the live signed height, flags and frame.
@@ -445,14 +568,15 @@ impl RetailBridgeFixture {
         ];
         // Native fixture viewport +Y moves the shape; its Z-buffer origin is
         // independently zero. Do not use viewport Y as a second depth bias.
-        let mut instances = Vec::new();
+        let (mut instances, mut draws) = (Vec::new(), Vec::new());
         match kind {
             BridgeFrameKind::Shadow => build_bridge_shadow_instances_inner(
+                crate::render::cell_window::CellWindow::Whole,
                 &terrain,
                 atlas,
                 &self.names,
                 &overlay_entries,
-                live_grid.as_ref(),
+                Some(&live_grid),
                 (is_rubble || is_crate).then_some(&self.registry),
                 is_rubble.then_some((&self.rules, &interner)),
                 camera.world_origin_y,
@@ -463,19 +587,25 @@ impl RetailBridgeFixture {
                 size[1] as f32,
                 &mut instances,
             ),
-            BridgeFrameKind::Body => build_bridge_body_instances_inner(
-                &terrain,
-                atlas,
-                &self.names,
-                &crate::map::lighting::CellLightGrid::new(),
-                camera.world_origin_y,
-                camera.world_height,
-                camera.camera_pos[0],
-                camera.camera_pos[1],
-                size[0] as f32,
-                size[1] as f32,
-                &mut instances,
-            ),
+            BridgeFrameKind::Body => {
+                let mut bodies = Vec::new();
+                build_bridge_body_instances_inner(
+                    &terrain,
+                    Some(&live_grid),
+                    atlas,
+                    &self.names,
+                    &crate::map::lighting::CellLightGrid::new(),
+                    camera.world_origin_y,
+                    camera.world_height,
+                    camera.camera_pos[0],
+                    camera.camera_pos[1],
+                    size[0] as f32,
+                    size[1] as f32,
+                    &mut bodies,
+                );
+                // A scene's bodies take the production sweep's order and draws.
+                submit_cell_body_sweep(bodies, &mut instances, &mut draws);
+            }
         }
         let admitted = input["expect_no_draw"] != true
             && input["expect_clipped"] != true
@@ -486,8 +616,8 @@ impl RetailBridgeFixture {
             "original caller admits {}",
             input["name"]
         );
-        let instances = instances.repeat(input["repeat"].as_u64().unwrap() as usize);
-        (camera, instances)
+        let repeat = input["repeat"].as_u64().unwrap() as usize;
+        (camera, instances.repeat(repeat), draws.repeat(repeat))
     }
 }
 
@@ -507,15 +637,16 @@ fn assert_native_cell_sweep_order(
         .filter(|call| call["piece"] == "shadow")
         .collect();
     let mut terrain = test_grid(32, 32, test_flat_cell);
+    let mut live_grid = crate::sim::overlay_grid::OverlayGrid::new(32, 32);
     let id = fixture.registry.id_for_name("BRIDGE1").unwrap();
     let mut identity_by_position = BTreeMap::new();
     let mut expected = Vec::new();
     for call in calls {
         let coords: [u16; 2] = std::array::from_fn(|i| call["coords"][i].as_u64().unwrap() as u16);
         expected.push(coords);
-        let cell = terrain.cell_mut(coords[0], coords[1]).unwrap();
+        let cell = terrain.cell_mut_for_test(coords[0], coords[1]).unwrap();
         cell.bridge_facts.raw_flags = 0x180;
-        cell.bridge_facts.overlay_id = Some(id);
+        live_grid.cell_mut_for_test(coords[0], coords[1]).overlay_id = Some(id);
         let point = crate::map::terrain::iso_to_screen(coords[0], coords[1], 0);
         // VERA's documented world frame adds fifteen rows to every layer;
         // the camera absorbs that translation. Pin it to original traversal
@@ -527,7 +658,7 @@ fn assert_native_cell_sweep_order(
             "cell_point":[(point.0+600.0) as i32,(point.1-200.0) as i32], "viewport_y":0});
         // A single emitted instance identifies its source cell. The ordering
         // expectation itself is the recorded original Display traversal.
-        let (_, one) = fixture.instances(&input, atlas, [1024, 1024], BridgeFrameKind::Shadow);
+        let (_, one, _) = fixture.instances(&input, atlas, [1024, 1024], BridgeFrameKind::Shadow);
         assert!(
             identity_by_position
                 .insert(one[0].position.map(f32::to_bits), coords)
@@ -536,11 +667,12 @@ fn assert_native_cell_sweep_order(
     }
     let mut instances = Vec::new();
     build_bridge_shadow_instances_inner(
+        crate::render::cell_window::CellWindow::Whole,
         &terrain,
         atlas,
         &fixture.names,
         &[],
-        None,
+        Some(&live_grid),
         None,
         None,
         -100.0,
@@ -595,7 +727,7 @@ fn retail_bridge_caller_matches_native_color_and_depth_attachments() {
         let mut pool = InstanceBufferPool::new();
         for row in packet["rows"].as_array().unwrap() {
             let input = &row["input"];
-            let (camera, instances) =
+            let (camera, instances, _) =
                 fixture.instances(input, &atlas, size, BridgeFrameKind::Shadow);
             batch.write_camera(&gpu.queue, camera);
             terrain.prepare(&gpu.device, &color, &dv, camera);
@@ -698,7 +830,7 @@ fn retail_crate_live_mark_ff_emits_shadow_and_live_removal_wins() {
         input["state"],
         crate::rules::overlay_types::native_mark_overlay_data(flags)
     );
-    let (_, instances) = fixture.instances(&input, &atlas, [192, 160], BridgeFrameKind::Shadow);
+    let (_, instances, _) = fixture.instances(&input, &atlas, [192, 160], BridgeFrameKind::Shadow);
     assert_eq!(
         instances.len(),
         1,
@@ -713,7 +845,7 @@ fn retail_crate_live_mark_ff_emits_shadow_and_live_removal_wins() {
         "body retains the existing OverlayAtlas owner"
     );
     input["overlay_id"] = Value::from(-1);
-    let (_, removed) = fixture.instances(&input, &atlas, [192, 160], BridgeFrameKind::Shadow);
+    let (_, removed, _) = fixture.instances(&input, &atlas, [192, 160], BridgeFrameKind::Shadow);
     assert!(
         removed.is_empty(),
         "live clear defeats the retained published anchor"
@@ -741,7 +873,8 @@ fn assert_native_shadow_rows(
         if let Some(building_type) = building_type {
             input["building_type"] = Value::from(building_type);
         }
-        let (camera, instances) = fixture.instances(&input, atlas, size, BridgeFrameKind::Shadow);
+        let (camera, instances, _) =
+            fixture.instances(&input, atlas, size, BridgeFrameKind::Shadow);
         if row["name"] == "repeat" {
             assert_eq!(instances.len(), 2);
             assert_eq!(row["steps"].as_array().unwrap().len(), 2);
@@ -846,7 +979,7 @@ fn retail_crate_shadow_matches_native_color_depth_and_clear_controls() {
                 - rect["rect"][0].as_i64().unwrap(),
         );
         edge["expect_clipped"] = Value::Bool(true);
-        let (_, instances) = fixture.instances(&edge, &atlas, size, BridgeFrameKind::Shadow);
+        let (_, instances, _) = fixture.instances(&edge, &atlas, size, BridgeFrameKind::Shadow);
         assert!(
             instances.is_empty(),
             "touching viewport boundary has zero area"
@@ -928,7 +1061,7 @@ fn retail_rubble_shadow_matches_native_color_depth_and_clear_controls() {
         input["building_type"] = Value::from(building_type);
         input["state"] = Value::from(255);
         input["expect_no_draw"] = Value::Bool(true);
-        let (_, instances) = fixture.instances(&input, &atlas, size, BridgeFrameKind::Shadow);
+        let (_, instances, _) = fixture.instances(&input, &atlas, size, BridgeFrameKind::Shadow);
         assert!(
             instances.is_empty(),
             "original outer sweep refuses proxy frame256"
@@ -950,7 +1083,7 @@ fn retail_rubble_shadow_matches_native_color_depth_and_clear_controls() {
                 - rect["rect"][0].as_i64().unwrap(),
         );
         input["expect_clipped"] = Value::Bool(true);
-        let (_, instances) = fixture.instances(&input, &atlas, size, BridgeFrameKind::Shadow);
+        let (_, instances, _) = fixture.instances(&input, &atlas, size, BridgeFrameKind::Shadow);
         assert!(
             instances.is_empty(),
             "native proxy rectangle owns outer admission"
@@ -996,7 +1129,7 @@ fn retail_bridge_body_matches_native_color_and_depth_attachments() {
             if let Some(cells) = row.get("cells") {
                 builder_input["cells"] = cells.clone();
             }
-            let (camera, instances) =
+            let (camera, instances, draws) =
                 fixture.instances(&builder_input, &atlas, size, BridgeFrameKind::Body);
             batch.write_camera(&gpu.queue, camera);
             pool.upload_on_device(&gpu.device, &gpu.queue, "bridge-native-body", &instances);
@@ -1029,12 +1162,14 @@ fn retail_bridge_body_matches_native_color_and_depth_attachments() {
                 let clip: [u32; 4] =
                     std::array::from_fn(|i| input["clip"][i].as_u64().unwrap() as u32);
                 pass.set_scissor_rect(clip[0], clip[1], clip[2], clip[3]);
-                super::draw_passes::draw_pooled_bridge_bodies(
+                super::draw_passes::draw_pooled_cell_bodies(
                     &mut pass,
                     &batch,
                     &pool,
+                    None,
                     Some(&atlas),
                     "bridge-native-body",
+                    &draws,
                 );
             }
             let reads = [
@@ -1046,224 +1181,6 @@ fn retail_bridge_body_matches_native_color_and_depth_attachments() {
                 &output, row, format, size,
             );
         }
-    }
-}
-
-#[test]
-#[ignore = "bounded bridge GPU/CPU timing; requires retail assets and an uncontended GPU"]
-fn retail_bridge_shadow_workload_timing() {
-    use std::time::{Duration, Instant};
-    let packet = native_bridge_packet();
-    let fixture = RetailBridgeFixture::load(&packet);
-    let gpu = Gpu::with_features(
-        wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
-    );
-    let size = [800, 600];
-    let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-    let batch = BatchRenderer::new_with_device(&gpu.device, &gpu.queue, format);
-    let atlas = fixture.atlas(&gpu, &batch);
-    let mut input = packet["rows"][0]["input"].clone();
-    input["cell_point"] = serde_json::json!([180, 200]);
-    let (camera, one) = fixture.instances(&input, &atlas, size, BridgeFrameKind::Shadow);
-    batch.write_camera(&gpu.queue, camera);
-    let mut terrain = TerrainDrawRenderer::new(&gpu.device, &gpu.queue, format, &batch);
-    let color = gpu.target(size, format);
-    let cv = color.create_view(&Default::default());
-    let depth = gpu.target(size, wgpu::TextureFormat::Depth32Float);
-    let dv = depth.create_view(&Default::default());
-    let shape = packet["shapes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|shape| shape["image_name"] == "BRIDGE" && shape["frame"] == 18)
-        .unwrap();
-    let rect: [usize; 4] =
-        std::array::from_fn(|i| shape["native_rect"][i].as_u64().unwrap() as usize);
-    let [left, top, width, height] = rect;
-    assert_eq!(one[0].size, [width as f32, height as f32]);
-    // Recreate only the former alpha128 payload from the captured physical
-    // stencil for a dispatch-cost reference. It is never an expected image.
-    let mut legacy_rgba = vec![0; width * height * 4];
-    for run in shape["mask_runs"].as_array().unwrap() {
-        let [x, y, count]: [usize; 3] = std::array::from_fn(|i| run[i].as_u64().unwrap() as usize);
-        for x in x..x + count {
-            legacy_rgba[((y - top) * width + x - left) * 4 + 3] = 128;
-        }
-    }
-    let legacy = batch.create_texture_on_device(
-        &gpu.device,
-        &gpu.queue,
-        &legacy_rgba,
-        width as u32,
-        height as u32,
-        None,
-    );
-    let queries = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
-        label: Some("Bridge shadow dispatch interval"),
-        ty: wgpu::QueryType::Timestamp,
-        count: 2,
-    });
-    let resolved = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: 256,
-        usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let mapped = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: 16,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut pool = InstanceBufferPool::new();
-    let timestamp_period_ns = gpu.queue.get_timestamp_period() as f64;
-    let mut results = Vec::new();
-    for (count, layout) in [(1usize, "single"), (16, "adjacent"), (128, "repeated")] {
-        let instances: Vec<_> = (0..count)
-            .map(|i| {
-                let mut instance = one[0];
-                if layout == "adjacent" {
-                    instance.position[0] += 30.0 * i as f32;
-                    instance.position[1] += 15.0 * i as f32;
-                }
-                instance
-            })
-            .collect();
-        for native in [false, true] {
-            let upload: Vec<_> = instances
-                .iter()
-                .map(|instance| {
-                    let mut instance = *instance;
-                    if !native {
-                        instance.uv_origin = [0.0; 2];
-                        instance.uv_size = [1.0; 2];
-                    }
-                    instance
-                })
-                .collect();
-            pool.upload_on_device(&gpu.device, &gpu.queue, "bridge-perf", &upload);
-            // Complete setup uploads outside the measured interval. Later
-            // samples begin with the preceding sample's completion fence done.
-            let uploaded = gpu.queue.submit([]);
-            gpu.device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(uploaded),
-                    timeout: Some(Duration::from_secs(60)),
-                })
-                .unwrap();
-            for sample in 0..4 {
-                let begin = Instant::now();
-                terrain.prepare(&gpu.device, &color, &dv, camera);
-                let mut encoder = gpu.device.create_command_encoder(&Default::default());
-                encoder.write_timestamp(&queries, 0);
-                clear(
-                    &mut encoder,
-                    &cv,
-                    &dv,
-                    65535,
-                    wgpu::LoadOp::Clear(wgpu::Color::WHITE),
-                );
-                let stats = if native {
-                    draw_bridge_shadows(
-                        &mut encoder,
-                        &cv,
-                        &dv,
-                        &mut terrain,
-                        [0, 0, size[0], size[1]],
-                        &batch,
-                        pool.get("bridge-perf"),
-                        &upload,
-                        Some(&atlas.texture),
-                    )
-                } else {
-                    let mut pass = crate::app::presentation::sidebar_render::begin_main_load_pass(
-                        &mut encoder,
-                        &cv,
-                        &dv,
-                    );
-                    let (buffer, count) = pool.get("bridge-perf").unwrap();
-                    batch.draw_with_buffer_passthrough(&mut pass, &legacy, buffer, count);
-                    drop(pass);
-                    crate::render::terrain_draw::TerrainBatchStats {
-                        pieces: count as usize,
-                        passes: 1,
-                        ..Default::default()
-                    }
-                };
-                encoder.write_timestamp(&queries, 1);
-                let encode_ms = begin.elapsed().as_secs_f64() * 1000.0;
-                encoder.resolve_query_set(&queries, 0..2, &resolved, 0);
-                encoder.copy_buffer_to_buffer(&resolved, 0, &mapped, 0, 16);
-                let final_submit_begin = Instant::now();
-                let submission = gpu.queue.submit([encoder.finish()]);
-                let (tx, rx) = std::sync::mpsc::channel();
-                mapped
-                    .slice(..)
-                    .map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
-                gpu.device
-                    .poll(wgpu::PollType::Wait {
-                        submission_index: Some(submission),
-                        timeout: Some(Duration::from_secs(60)),
-                    })
-                    .unwrap();
-                rx.recv().unwrap().unwrap();
-                let final_submit_to_completion_ms =
-                    final_submit_begin.elapsed().as_secs_f64() * 1000.0;
-                let wall_prepare_to_completion_ms = begin.elapsed().as_secs_f64() * 1000.0;
-                let data = mapped.slice(..).get_mapped_range();
-                let first = u64::from_le_bytes(data[0..8].try_into().unwrap());
-                let last = u64::from_le_bytes(data[8..16].try_into().unwrap());
-                // wgpu27 encoder timestamps can be reordered. The Metal HAL
-                // defers them to later encoders and documents empty-blit
-                // sampling limits; keep raw values, never invent a duration.
-                // https://docs.rs/wgpu/27.0.1/wgpu/struct.CommandEncoder.html#method.write_timestamp
-                // https://docs.rs/wgpu-hal/27.0.4/src/wgpu_hal/metal/command.rs.html
-                let (timestamp_status, encoder_timestamp_ms) =
-                    if first == 0 || last == 0 || first == u64::MAX || last == u64::MAX {
-                        ("unavailable_zero_or_max_sample", None)
-                    } else if last <= first {
-                        ("unavailable_nonincreasing_samples", None)
-                    } else if !timestamp_period_ns.is_finite() || timestamp_period_ns <= 0.0 {
-                        ("unavailable_timestamp_period", None)
-                    } else {
-                        (
-                            "limited_encoder_boundary",
-                            Some((last - first) as f64 * timestamp_period_ns / 1_000_000.0),
-                        )
-                    };
-                eprintln!(
-                    "BRIDGE timing: count={count}, layout={layout}, native={native}, sample={sample}, timestamp_status={timestamp_status}, first={first}, last={last}, period_ns={timestamp_period_ns}, encoder_timestamp_ms={encoder_timestamp_ms:?}, cpu_prepare_encode_ms={encode_ms}, wall_prepare_to_completion_ms={wall_prepare_to_completion_ms}, final_submit_to_completion_ms={final_submit_to_completion_ms}"
-                );
-                drop(data);
-                mapped.unmap();
-                if native && layout == "repeated" {
-                    assert!(
-                        terrain.submissions() > 0,
-                        "large overlapping bridge sweep uses bounded submission"
-                    );
-                }
-                if sample > 0 {
-                    results.push(serde_json::json!({"count":count,"layout":layout,"native":native,"sample":sample,
-                        "pieces":stats.pieces,"waves":stats.waves,"passes":stats.passes,
-                        "tile_dependencies":stats.tile_dependencies,"bounded_submissions":terrain.submissions(),
-                        "timestamp_status":timestamp_status,"timestamp_first":first,"timestamp_last":last,
-                        "timestamp_period_ns":timestamp_period_ns,"encoder_timestamp_ms":encoder_timestamp_ms,
-                        "cpu_prepare_encode_ms":encode_ms,
-                        "wall_prepare_to_completion_ms":wall_prepare_to_completion_ms,
-                        "final_submit_to_completion_ms":final_submit_to_completion_ms}));
-                }
-            }
-        }
-    }
-    let report = serde_json::json!({"target":size,"format":"Bgra8UnormSrgb",
-        "source":"Physical BRIDGE.TEM frame18 through production atlas/builder/bridge dispatch; supplied adjacent and overlap workloads",
-        "reference":"Former alpha128 passthrough dispatch with the same captured physical stencil; reference pixels are not parity expectations",
-        "interval":"CPU preparation/encoding includes terrain preparation, clear, draw scheduling and any bounded intermediate submissions; excludes setup uploads and the final resolve/finish/submit/wait. Wall preparation-to-completion includes that work plus query resolve/readback and the final submission completion fence. Final-submit-to-completion covers only the final finish/submit/map/wait tail. Warmup omitted. No whole-frame or 20000-unit performance claim.",
-        "gpu_timestamp_limit":"Encoder samples are diagnostic: wgpu27 permits backend/driver reordering, so a positive delta is a limited encoder interval, not an exact sum of GPU pass execution. Zero/max or nonincreasing values are reported with null duration; fence-completion wall measurements remain available.",
-        "samples":results});
-    eprintln!("{}", serde_json::to_string_pretty(&report).unwrap());
-    if let Some(path) = std::env::var_os("VERA20K_BRIDGE_SHADOW_PERF_OUTPUT") {
-        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
 }
 
@@ -1318,14 +1235,16 @@ fn retail_high_bridge_damage_and_repair_reach_shadow_pixels() {
         visit_retail_high_bridge_stages(kind, |phase, scene| {
             let sim = scene.sim();
             let before = sim.state_hash();
-            let terrain = sim.resolved_terrain.as_ref().unwrap();
+            let terrain = sim.resolved_terrain().unwrap();
+            let overlays = sim.overlay_grid().unwrap();
             let mut instances = Vec::new();
             build_bridge_shadow_instances_inner(
+                crate::render::cell_window::CellWindow::Whole,
                 terrain,
                 &atlas,
                 &fixture.names,
                 &[],
-                None,
+                Some(overlays),
                 None,
                 None,
                 view.world_origin_y,
@@ -1390,18 +1309,18 @@ fn retail_high_bridge_damage_and_repair_reach_shadow_pixels() {
             let cells: Vec<_> = terrain
                 .iter()
                 .filter(|c| c.rx.abs_diff(center.0) <= 8 && c.ry.abs_diff(center.1) <= 8)
-                .filter(|c| {
-                    c.bridge_facts
-                        .overlay_id
+                .filter_map(|c| {
+                    let live = overlays.cell(c.rx, c.ry);
+                    live.overlay_id
                         .is_some_and(|id| fixture.names.contains_key(&id))
-                })
-                .map(|c| {
-                    serde_json::json!({"coords":[c.rx,c.ry],"level":c.level,
-                "overlay":c.bridge_facts.overlay_id,"state":c.bridge_facts.state_byte,
+                        .then(|| {
+                            serde_json::json!({"coords":[c.rx,c.ry],"level":c.level,
+                "overlay":live.overlay_id,"state":live.overlay_data,
                 "flags":c.bridge_facts.raw_flags})
+                        })
                 })
                 .collect();
-            let receipt = serde_json::json!({"scene":label,"phase":phase,"frame":sim.session.binary_frame,
+            let receipt = serde_json::json!({"scene":label,"phase":phase,"frame":sim.session().binary_frame(),
             "state_hash":format!("{before:016x}"),"cells":cells,"instances":instances.len(),
             "instance_sha256":sha256_hex(bytemuck::cast_slice(&instances)),
             "changed_pixels":changed,"color_sha256":sha256_hex(&output[0]),

@@ -61,7 +61,7 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
             dispatch_timer: crate::sim::mission::MissionDispatchTimer::at_frame(0),
         });
     sim.substrate.entities.insert(entity);
-    sim.substrate.next_stable_object_id = 2;
+    sim.set_next_stable_object_id_for_test(2);
     sim.interner = test_interner();
     sim.set_logic_order_for_test(vec![1]);
     (sim, rules)
@@ -127,9 +127,9 @@ fn aircraft_ai_consumes_pending_after_commence_using_native_current_mission() {
             .unwrap()
             .mission
             .set_handler_state(4);
-        sim.object_ai_post_movement_promote_one(1, Some(&rules));
+        sim.object_ai_post_movement_promote_one(1, &rules);
         assert_native(&sim, row);
-        sim.object_ai_post_movement_promote_one(1, Some(&rules));
+        sim.object_ai_post_movement_promote_one(1, &rules);
         assert_native(&sim, row); // the cleared pending flag prevents a second debit
     }
 }
@@ -144,10 +144,12 @@ fn aircraft_queued_order_debit_observes_successful_and_blocked_commence() {
             MissionId::from_raw(2),
             0,
             0,
-            &crate::sim::mission::authority::EntityReadyInputProvider,
+            &crate::sim::mission::authority::LiveReadyInputProvider {
+                rules: crate::rules::ruleset::RuleSet::empty_for_test(),
+            },
         )
         .unwrap();
-        sim.object_ai_post_movement_promote_one(1, Some(&rules));
+        sim.object_ai_post_movement_promote_one(1, &rules);
         let entity = sim.substrate.entities.get(1).unwrap();
         let ammo = entity.ammo().unwrap();
         assert_eq!(entity.mission.current().raw(), if action { 1 } else { 2 });

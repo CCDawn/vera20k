@@ -17,10 +17,10 @@
 //! Render-agnostic: depends only on `ui::shell` + `std` (no sim/render/assets),
 //! honouring the `ui/` layering rule. The app layer (`app::frontend::shell_transition`) maps
 //! the showing screen to a `DialogId`, drives the wave each frame, and plays the
-//! start cue (`GUIMoveInSound`, stock `MenuSlideIn`); the stock-empty end cue
-//! (`ShellButtonSlideSound`) stays silent.
+//! start cue (`GUIMoveInSound`, stock `MenuSlideIn`) and the end cue
+//! (`ShellButtonSlideSound`, empty in stock rules).
 
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 
 use super::descriptor::DialogId;
 use super::geom::RightPanelRects;
@@ -150,6 +150,51 @@ impl SlideDialogSpec {
 /// (campaign StandaloneScore): only Continue (`0x423`), and its compositor
 /// draws SCRT then SCRBK (`+0xD7`, `0x006229CE`).
 pub(crate) const RENDERED_SHELL_SLIDES: &[SlideDialogSpec] = &[
+    // LAN: visible ownerdraw children classified by60A180/60A250. BB's
+    // Observe6CE is hidden. Record flags6228E4..62298A give BC/BD both
+    // D5(top panel) and D6(map button), and BB neither.
+    SlideDialogSpec {
+        dialog_id: 0x00BB,
+        top_buttons: 2,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    SlideDialogSpec {
+        dialog_id: 0x00BC,
+        top_buttons: 2,
+        bottom_button: true,
+        map_button: true,
+        top_panel: true,
+        campaign_score: false,
+    },
+    SlideDialogSpec {
+        dialog_id: 0x00BD,
+        top_buttons: 1,
+        bottom_button: true,
+        map_button: true,
+        top_panel: true,
+        campaign_score: false,
+    },
+    // WOL setup C2 (Start, Choose Map, Page) and C9 (Accept, Page) keep
+    // BC/BD's top panel and map button.
+    SlideDialogSpec {
+        dialog_id: 0x00C2,
+        top_buttons: 3,
+        bottom_button: true,
+        map_button: true,
+        top_panel: true,
+        campaign_score: false,
+    },
+    SlideDialogSpec {
+        dialog_id: 0x00C9,
+        top_buttons: 2,
+        bottom_button: true,
+        map_button: true,
+        top_panel: true,
+        campaign_score: false,
+    },
     SlideDialogSpec {
         dialog_id: 0x00E2,
         top_buttons: 5,
@@ -222,6 +267,108 @@ pub(crate) const RENDERED_SHELL_SLIDES: &[SlideDialogSpec] = &[
         top_panel: false,
         campaign_score: false,
     },
+    // WOL login 0x10F: Login, Forget Account (disabled, still counted by
+    // 0x0060A180) and Manage Account, then Back. The custom lobby 0x113:
+    // eight top-list buttons (0x00608CD0), Back, and the top panel (+0xD5,
+    // 0x00622820); its runtime button visibility is not yet observed.
+    SlideDialogSpec {
+        dialog_id: 0x010F,
+        top_buttons: 3,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    SlideDialogSpec {
+        dialog_id: 0x0113,
+        top_buttons: 8,
+        bottom_button: true,
+        map_button: false,
+        top_panel: true,
+        campaign_score: false,
+    },
+    // VERA's Mods page: Use This Mod and Open Mods Folder, then Back.
+    SlideDialogSpec {
+        dialog_id: crate::ui::mods_shell::DIALOG.0,
+        top_buttons: 2,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    // WOL Options 0x2BC: OK and Sound Options, then Cancel. Its nested
+    // Sound Options 0xD6: Back only (executed slide records).
+    SlideDialogSpec {
+        dialog_id: 0x02BC,
+        top_buttons: 2,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    // The WOL persona questions 0x112 (Yes, then No) and 0xFE (OK, created
+    // disabled and still counted, then Cancel): executed slide records.
+    SlideDialogSpec {
+        dialog_id: 0x0112,
+        top_buttons: 1,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    // 0x117: Cancel only; 0x122: Yes, then No (executed slide records).
+    SlideDialogSpec {
+        dialog_id: 0x0117,
+        top_buttons: 0,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    SlideDialogSpec {
+        dialog_id: 0x0122,
+        top_buttons: 1,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    // 0x116: Create, Join, Add, Page and Remove, then Back: the executed
+    // slide record.
+    SlideDialogSpec {
+        dialog_id: 0x0116,
+        top_buttons: 5,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    // 0x114: Play Buddy, Clan, Tournament, Forget (template-disabled,
+    // counted) and Manage, then Back: the executed slide record.
+    SlideDialogSpec {
+        dialog_id: 0x0114,
+        top_buttons: 5,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    SlideDialogSpec {
+        dialog_id: 0x00FE,
+        top_buttons: 1,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    SlideDialogSpec {
+        dialog_id: 0x00D6,
+        top_buttons: 0,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
     SlideDialogSpec {
         dialog_id: 0x00A3,
         top_buttons: 0,
@@ -257,6 +404,16 @@ pub(crate) const RENDERED_SHELL_SLIDES: &[SlideDialogSpec] = &[
         top_panel: false,
         campaign_score: true,
     },
+    // The LAN Cooperative campaign end `0xBC7`: the same record, Continue
+    // (`0x6D1`) alone in the bottom list.
+    SlideDialogSpec {
+        dialog_id: 0x0BC7,
+        top_buttons: 0,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: true,
+    },
     // The random-map dialog: Use Map, Load, Save and Delete Map, Cancel, and
     // the top panel (`0x0062290E`).
     SlideDialogSpec {
@@ -271,9 +428,9 @@ pub(crate) const RENDERED_SHELL_SLIDES: &[SlideDialogSpec] = &[
 
 /// Whether a dialog plays the first-paint controls-reveal slide: every
 /// front-end shell with a `RENDERED_SHELL_SLIDES` column. The original's full
-/// list (`0x0060C540`, 55 ids) also marks Options' Network `0xD7`, the
+/// list (`0x0060C540`, 55 ids) also marks the
 /// in-game menu dialogs (`0xB5`, `0xB6`, `0xB8`, `0xBBA`, `0xBBB`)
-/// and the LAN/WOL setup dialogs; none of them slides here yet. `0xB7` slides
+/// and the remaining WOL setup dialogs. `0xB7` slides
 /// only outside a suspended game (`0x00612690`), which is the only place it is
 /// rendered as a family page. Message boxes (`0x120` confirm, `0xCE` body-ok)
 /// are not in it.
@@ -337,16 +494,6 @@ pub(crate) enum PanelArt {
     ScrBackdrop,
 }
 
-/// Top-left of a column row's SDBTNANM frame `shape_w` wide: right-aligned
-/// over the row's tile, as `0x006071E0` draws it (the executed positions in
-/// `tools/storage_oracle/shell_slide_engine.json`).
-pub(crate) fn column_draw_origin(panel: RightPanelRects, row: u32, shape_w: i32) -> (i32, i32) {
-    (
-        panel.tile.x + panel.tile.w - shape_w,
-        panel.tile.y + row as i32 * panel.tile.h,
-    )
-}
-
 /// Top-left of a top-panel shape of `shape_w` x `shape_h`: SDTP and SDWRNTMP
 /// at the panel top; SDMPBTN right-aligned with its bottom on the first tile
 /// row's bottom, where the steady map button also sits.
@@ -375,16 +522,30 @@ impl SlideColumn {
 
     /// The SDBTNANM draws of `tick` in the engine's order (later on top): the
     /// regular rows top to bottom, then the bottom button.
+    /// The engine's start-tick table (`rows + 3` ints, `0x006075A0..`):
+    /// row `c < rows` starts at `c + 1`; slot `rows` (the map button's) is 0,
+    /// `rows + 1` (the top panel's) is `rows + 3` and `rows + 2` is 0. Top
+    /// buttons past the panel (`0x113`'s eight at 640x480) read those slots.
+    fn entry_tick(self, c: u32) -> i32 {
+        let rows = self.rows;
+        match c {
+            c if c < rows => c as i32 + 1,
+            c if c == rows + 1 => rows as i32 + 3,
+            _ => 0,
+        }
+    }
+
     pub(crate) fn button_draws(self, tick: u32, direction: WaveDirection) -> Vec<ColumnDraw> {
         let tick = tick as i32;
         let first = u32::from(self.map_button);
         // Top buttons claim their rows even where the bottom button already
-        // has the last one: `0x10E`'s six top buttons at 640x480 (six rows)
-        // draw row 5 twice, as the executed engine does.
+        // has the last one, and past the panel: `0x10E`'s six top buttons at
+        // 640x480 (six rows) draw row 5 twice, `0x113`'s eight draw rows 6
+        // and 7 below it, as the executed engine does.
         let regular = self
             .rows
             .saturating_sub(u32::from(self.bottom_button))
-            .max(self.top_buttons.min(self.rows));
+            .max(self.top_buttons);
         let mut draws: Vec<ColumnDraw> = (0..regular)
             .map(|c| {
                 let group = if c < self.top_buttons {
@@ -394,7 +555,7 @@ impl SlideColumn {
                 };
                 ColumnDraw {
                     row: first + c,
-                    frame: frame_for_tick(tick, c as i32 + 1, group, direction),
+                    frame: frame_for_tick(tick, self.entry_tick(c), group, direction),
                 }
             })
             .collect();
@@ -827,7 +988,7 @@ fn frame_for_tick(
     frame.max(0) as usize
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
     use crate::ui::shell::geom;
@@ -850,8 +1011,8 @@ mod tests {
     /// position helper, as `CC_Draw_Shape` receives it: `[x, y, frame]`.
     fn button_draw_at(screen: (i32, i32), draw: ColumnDraw) -> [i64; 3] {
         let panel = geom::right_panel_rects(screen.0, screen.1);
-        let (x, y) = column_draw_origin(panel, draw.row, SDBTNANM_SIZE.0);
-        [i64::from(x), i64::from(y), draw.frame as i64]
+        let cell = panel.row_cell(draw.row as i32, SDBTNANM_SIZE.0, SDBTNANM_SIZE.1);
+        [i64::from(cell.x), i64::from(cell.y), draw.frame as i64]
     }
 
     fn art_at(screen: (i32, i32), art: PanelArt) -> (String, i64, i64, i64) {
@@ -894,7 +1055,7 @@ mod tests {
         ))
         .unwrap();
         let cases = fixture["cases"].as_array().unwrap();
-        assert_eq!(cases.len(), 78);
+        assert_eq!(cases.len(), 132);
         for case in cases {
             let dialog = case["dialog"].as_str().unwrap();
             let dialog_id = u16::from_str_radix(dialog.trim_start_matches("0x"), 16).unwrap();

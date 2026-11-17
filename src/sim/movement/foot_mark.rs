@@ -48,11 +48,13 @@
 //! Unlimbo/PerCell/Limbo rather than the lists.
 //!
 //! RESIDUAL: a Jumpjet's hold and cruise leave its lists alone
-//! (`0x0054D0FF..0x0054D134`), so one that sinks below two levels there counts
-//! as listed by that derivation before its next Mark lists it, and
-//! `Simulation::debug_assert_lifecycle_consistent` reports it. Trigger: a
-//! Jumpjet below two levels while it holds or cruises; at a cruise height of
-//! 500 that needs ground three levels higher beneath it before it climbs.
+//! (`0x0054D0FF..0x0054D134`), so one below two levels there counts as listed
+//! by that derivation before its next Mark lists it;
+//! `Simulation::debug_assert_lifecycle_consistent` passes over those two
+//! states. Trigger: a Jumpjet below two levels while it holds or cruises:
+//! ground three levels higher beneath a cruise at 500, a take-off over its
+//! own destination cell (`0x0054BD10`), or a `LandNearby=` re-aim low in its
+//! descent, each until it climbs.
 //! Effect: in a world without an overlay grid, its cell counts toward the
 //! blocker plane before native lists it. Frequency: unmeasured. Risk: a
 //! different hierarchy-gate verdict there, no other state.
@@ -68,7 +70,9 @@ use crate::sim::pathfinding::PathGrid;
 use crate::sim::world::FrameEffects;
 #[cfg(any(test, feature = "test-support"))]
 use crate::sim::world::LifecycleTestEvent;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
+use std::sync::Arc;
 
 /// The spot an infantryman holds in its cell (0–4), which Mark puts into the
 /// cell's lists and the occupancy index projects. gamemd keeps no such field:
@@ -194,23 +198,6 @@ pub(super) fn raw_occupation_plane(
 }
 
 impl Simulation {
-    /// Save/clear/restore Object+74 without changing cell lists. Locomotors
-    /// use this around setters (Jumpjet54D0FF/54D6B4 and54C189/54C1A3, and
-    /// the Drive/Ship track's SetLocation and SetHeight(0) in
-    /// `track_host`).
-    /// This is distinct from Mark4D3780, whose pickup/place callbacks run
-    /// only when the native caller actually invokes Mark.
-    pub(crate) fn replace_foot_marked_byte(&mut self, id: u64, marked: bool) -> bool {
-        let entity = self
-            .substrate
-            .entities
-            .get_mut(id)
-            .expect("marked Foot exists");
-        let was_marked = entity.lifecycle.cell_marked();
-        entity.lifecycle.set_cell_marked(marked);
-        was_marked
-    }
-
     /// The object's Mark(2) virtual dispatch reached by Object radio 0xD
     /// (`0x005F5374`). Foot4D3789 returns true before any lifecycle gate or
     /// Techno Mark, so it cannot recursively transmit 0xD.
@@ -221,10 +208,9 @@ impl Simulation {
     /// VERA does not retain Object+0x80 or invent a dirty-byte predicate.
     /// Evidence: human-infantry-output-downstream-research/mark-radio.native.json,
     /// SHA256 270a1321e3a5509df0eb58500883737f69af2172726da216f7ca107962391127;
-    /// pinned active-retail gamemd SHA256
-    /// 1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c.
-    pub(crate) fn mark_entity_refresh(&mut self, id: u64) -> bool {
-        self.substrate
+    /// active-retail gamemd.
+    pub(crate) fn mark_entity_refresh(substrate: &ObjectSubstrate, id: u64) -> bool {
+        substrate
             .entities
             .get(id)
             .is_some_and(|entity| entity.category() != EntityCategory::Structure)
@@ -236,7 +222,7 @@ impl Simulation {
     pub(crate) fn techno_mark_after_object(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         frame_effects: FrameEffects<'_>,
     ) {
         if self
@@ -261,17 +247,16 @@ impl Simulation {
     pub(crate) fn foot_mark_remove(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
         let Some(entity) = self.substrate.entities.get_mut(id) else {
             return false;
         };
-        if entity.lifecycle.in_limbo() || !entity.lifecycle.cell_marked() {
+        if !entity.lifecycle.admit_mark_up() {
             return false;
         }
-        entity.lifecycle.set_cell_marked(false);
         self.techno_mark_after_object(id, rules, frame_effects);
         self.foot_pick_up(id, rules, registry);
         true
@@ -285,7 +270,7 @@ impl Simulation {
     pub(crate) fn foot_pick_up(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
     ) {
         let Some((cell, layer)) = self.foot_mark_cell(id) else {
@@ -296,7 +281,14 @@ impl Simulation {
             .remove_on_layer(cell.0, cell.1, id, layer);
         #[cfg(any(test, feature = "test-support"))]
         self.trace_lifecycle_for_test(LifecycleTestEvent::RawOccupationListUnlinked);
-        if self.foot_mark_raw(id, false) {
+        if Self::foot_mark_raw(
+            &mut self.substrate,
+            &self.path_grid,
+            &self.resolved_terrain,
+            id,
+            false,
+            rules.ares_form(),
+        ) {
             #[cfg(any(test, feature = "test-support"))]
             self.trace_lifecycle_for_test(LifecycleTestEvent::RawOccupationCleared);
         }
@@ -306,7 +298,7 @@ impl Simulation {
     pub(crate) fn foot_mark_put(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
@@ -319,7 +311,7 @@ impl Simulation {
     pub(super) fn foot_mark_put_observed(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         receive: &mut impl FnMut(&mut Simulation, u64),
         frame_effects: FrameEffects<'_>,
@@ -327,12 +319,11 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get_mut(id) else {
             return false;
         };
-        if entity.lifecycle.in_limbo() || entity.lifecycle.cell_marked() {
+        if !entity.lifecycle.admit_mark_down() {
             return false;
         }
-        entity.lifecycle.set_cell_marked(true);
         self.techno_mark_after_object(id, rules, frame_effects);
-        self.foot_place_down(id, rules, registry, receive);
+        self.foot_place_down(id, rules, registry, receive, frame_effects);
         #[cfg(any(test, feature = "test-support"))]
         self.trace_lifecycle_for_test(LifecycleTestEvent::CellMarked);
         true
@@ -348,9 +339,10 @@ impl Simulation {
     pub(crate) fn foot_place_down(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         receive: &mut impl FnMut(&mut Simulation, u64),
+        frame_effects: FrameEffects<'_>,
     ) {
         let Some((cell, layer)) = self.foot_mark_cell(id) else {
             return;
@@ -365,15 +357,22 @@ impl Simulation {
         self.substrate
             .occupancy
             .add(cell.0, cell.1, id, layer, sub_cell, insertion);
-        self.discover_cell_put_object(
+        self.discover_by_player(
             id,
-            cell,
-            crate::sim::world::UninitContext::new(rules, registry),
+            Some(cell),
+            crate::sim::world::UninitContext::new(rules, registry).with_effects(frame_effects),
         );
         #[cfg(any(test, feature = "test-support"))]
         self.trace_lifecycle_for_test(LifecycleTestEvent::RawOccupationListLinked);
         receive(self, id);
-        if self.foot_mark_raw(id, true) {
+        if Self::foot_mark_raw(
+            &mut self.substrate,
+            &self.path_grid,
+            &self.resolved_terrain,
+            id,
+            true,
+            rules.ares_form(),
+        ) {
             #[cfg(any(test, feature = "test-support"))]
             self.trace_lifecycle_for_test(LifecycleTestEvent::RawOccupationMarked);
         }
@@ -400,18 +399,64 @@ impl Simulation {
         Some((cell, layer))
     }
 
+    /// The raw (Cell, plane) pairs whose vehicle bit Mark(UP) clears for the
+    /// Unit `id` ([`Self::foot_mark_remove`]), read without clearing them:
+    /// once Mark(UP) admits it and [`Self::foot_pick_up`] finds its Cell,
+    /// [`Self::foot_mark_raw`] clears the plane its Location picks, and the
+    /// plane its last mark chose where Ares recorded one
+    /// ([`Self::track_raw_mark_at`]).
+    pub(crate) fn unit_mark_up_raw_cleared(&self, id: u64) -> Vec<((u16, u16), MovementLayer)> {
+        let Some(entity) = self.substrate.entities.get(id) else {
+            return Vec::new();
+        };
+        if entity.category() != EntityCategory::Unit
+            || entity.lifecycle.in_limbo()
+            || !entity.lifecycle.cell_marked()
+            || !entity.foot_occupation_enabled()
+            || self.foot_mark_cell(id).is_none()
+        {
+            return Vec::new();
+        }
+        let (at, layer) = raw_occupation_plane(
+            ground_pose::position_world_coord(&entity.position),
+            false,
+            self.resolved_terrain.as_ref(),
+            self.path_grid.as_deref(),
+        );
+        let mut cleared = vec![(at, layer)];
+        // Only Ares' raw mark records a plane; `None` leaves the stock list.
+        if let Some(deck) = entity.ares_alt_occupation() {
+            let last = if deck {
+                MovementLayer::Bridge
+            } else {
+                MovementLayer::Ground
+            };
+            if last != layer {
+                cleared.push((at, last));
+            }
+        }
+        cleared
+    }
+
     /// Remove/AddContent's receiver tail: Infantry returns first
     /// (`0x0047EAFE` / `0x0047E9EA`), then the Foot enable gates the object's
     /// vt+0xF4/+0xF0 on its stored Location. Whether a receiver ran.
-    fn foot_mark_raw(&mut self, id: u64, put: bool) -> bool {
-        let Some(entity) = self.substrate.entities.get(id) else {
+    fn foot_mark_raw(
+        substrate: &mut ObjectSubstrate,
+        path_grid: &Option<Arc<PathGrid>>,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        id: u64,
+        put: bool,
+        ares: bool,
+    ) -> bool {
+        let Some(entity) = substrate.entities.get(id) else {
             return false;
         };
         if !entity.foot_occupation_enabled() || entity.category() == EntityCategory::Infantry {
             return false;
         }
         let coord = ground_pose::position_world_coord(&entity.position);
-        self.object_raw_receiver_at(id, coord, put)
+        Self::object_raw_receiver_at(substrate, path_grid, resolved_terrain, id, coord, put, ares)
     }
 
     /// The object's own raw occupation receiver on `coord`, vt+0xF0 (PUT) or
@@ -420,26 +465,46 @@ impl Simulation {
     /// `0x005F60A0`/`0x005F6120` (0x40). Mark reaches it through
     /// [`Self::foot_mark_raw`]; a direct call (the Jumpjet grounded reset,
     /// `0x0054D42F`) has no Foot enable gate. Whether a receiver ran.
-    pub(crate) fn object_raw_receiver_at(&mut self, id: u64, coord: DriveCoord, put: bool) -> bool {
-        let Some(entity) = self.substrate.entities.get(id) else {
+    /// `ares` is the game's `RuleSet::ares_form`, for the Unit receiver
+    /// ([`Self::track_raw_mark_at`]).
+    pub(crate) fn object_raw_receiver_at(
+        substrate: &mut ObjectSubstrate,
+        path_grid: &Option<Arc<PathGrid>>,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        id: u64,
+        coord: DriveCoord,
+        put: bool,
+        ares: bool,
+    ) -> bool {
+        let Some(entity) = substrate.entities.get(id) else {
             return false;
         };
         match entity.category() {
             EntityCategory::Unit => {
-                self.track_raw_mark_at(coord, put);
+                Self::track_raw_mark_at(
+                    substrate,
+                    path_grid,
+                    resolved_terrain,
+                    id,
+                    coord,
+                    put,
+                    ares,
+                );
             }
             EntityCategory::Infantry => {
                 let owner = entity.owner();
                 super::walk_head::raw_at(
-                    &mut self.substrate.raw_cell_occupation,
+                    &mut substrate.raw_cell_occupation,
                     owner,
                     coord,
                     put,
-                    self.resolved_terrain.as_ref(),
-                    self.path_grid.as_deref(),
+                    resolved_terrain.as_ref(),
+                    path_grid.as_deref(),
                 );
             }
-            EntityCategory::Aircraft => self.object_raw_mark_at(coord, put),
+            EntityCategory::Aircraft => {
+                Self::object_raw_mark_at(substrate, path_grid, resolved_terrain, coord, put)
+            }
             _ => return false,
         }
         true
@@ -448,14 +513,16 @@ impl Simulation {
     /// Aircraft vt+0xF0/+0xF4, the ObjectClass receivers `0x005F60A0` /
     /// `0x005F6120`: bit 0x40 on the plane [`raw_occupation_plane`] selects,
     /// testing the structural bridge bit on PUT and REMOVE alike.
-    fn object_raw_mark_at(&mut self, coord: DriveCoord, put: bool) {
-        let (at, layer) = raw_occupation_plane(
-            coord,
-            true,
-            self.resolved_terrain.as_ref(),
-            self.path_grid.as_deref(),
-        );
-        let raw = &mut self.substrate.raw_cell_occupation;
+    fn object_raw_mark_at(
+        substrate: &mut ObjectSubstrate,
+        path_grid: &Option<Arc<PathGrid>>,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        coord: DriveCoord,
+        put: bool,
+    ) {
+        let (at, layer) =
+            raw_occupation_plane(coord, true, resolved_terrain.as_ref(), path_grid.as_deref());
+        let raw = &mut substrate.raw_cell_occupation;
         match (put, layer) {
             (true, MovementLayer::Bridge) => raw.mark_deck(at.0, at.1, OBJECT_OCCUPATION_BIT),
             (true, _) => raw.mark_ground(at.0, at.1, OBJECT_OCCUPATION_BIT),
@@ -465,6 +532,19 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+impl crate::sim::world::ObjectSubstrate {
+    /// Save/clear/restore Object+74 without changing cell lists. Locomotors
+    /// use this around setters (Jumpjet54D0FF/54D6B4 and54C189/54C1A3, and
+    /// the Drive/Ship track's SetLocation and SetHeight(0) in
+    /// `track_host`).
+    /// This is distinct from Mark4D3780, whose pickup/place callbacks run
+    /// only when the native caller actually invokes Mark.
+    pub(crate) fn replace_foot_marked_byte(&mut self, id: u64, marked: bool) -> bool {
+        let entity = self.entities.get_mut(id).expect("marked Foot exists");
+        entity.lifecycle.replace_cell_marked(marked)
+    }
+}
+
+#[cfg(all(test, tests_sim_movement))]
 #[path = "foot_mark_tests.rs"]
 mod tests;

@@ -6,6 +6,252 @@ use crate::sim::vision::MapTransition;
 use crate::util::save_codec;
 use serde_json::{Value, json};
 
+/// Compare the fast interior query with the same production query forced
+/// through its allocated-cell lookup path, without a second edge algorithm.
+fn assert_cached_edge_queries(fog: &FogState, viewer: InternedId) {
+    let dense = test_grid(12, 12, test_clear_cell);
+    let mut cells = dense.cells().to_vec();
+    cells.swap(0, 1);
+    let looked_up = ResolvedTerrainGrid::from_cells(12, 12, cells);
+    for cell in [(5, 5), (6, 5)] {
+        for fog_channel in [false, true] {
+            assert_eq!(
+                fog.map_cell_edge_frame(
+                    viewer,
+                    cell,
+                    fog_channel,
+                    Some(&NativeCellQuery::canonical(&dense))
+                ),
+                fog.map_cell_edge_frame(
+                    viewer,
+                    cell,
+                    fog_channel,
+                    Some(&NativeCellQuery::canonical(&looked_up))
+                ),
+                "{cell:?} channel {fog_channel}",
+            );
+        }
+    }
+}
+
+#[test]
+fn cached_edges_follow_immediate_reveal_gap_and_fog_regrowth_writes() {
+    let viewer = crate::sim::intern::test_intern("Player");
+    let mut fog = FogState::new(12, 12);
+    fog.reveal_forced_map_cell(viewer, (5, 5), None);
+    assert_cached_edge_queries(&fog, viewer);
+    fog.reveal_map_cell(viewer, (6, 5), false, None, MapRevealProjection::Transient);
+    assert_cached_edge_queries(&fog, viewer);
+    fog.begin_fog_regrowth_cell(viewer, (6, 5), None);
+    assert_cached_edge_queries(&fog, viewer);
+    fog.begin_fog_reveal(viewer, (6, 5), None);
+    assert_cached_edge_queries(&fog, viewer);
+    let index = fog.by_owner[&viewer].index(6, 5).unwrap();
+    fog.by_owner.get_mut(&viewer).unwrap().add_gap_cell(index);
+    assert_cached_edge_queries(&fog, viewer);
+    fog.by_owner
+        .get_mut(&viewer)
+        .unwrap()
+        .remove_gap_cell(index, true);
+    assert_cached_edge_queries(&fog, viewer);
+}
+
+#[test]
+fn cached_edges_rebuild_after_load_and_clone_mutations_stay_independent() {
+    let viewer = crate::sim::intern::test_intern("Player");
+    let mut fog = FogState::new(12, 12);
+    fog.reveal_forced_map_cell(viewer, (5, 5), None);
+    assert_cached_edge_queries(&fog, viewer);
+    let saved = save_codec::serialize(&fog).unwrap();
+    let mut restored: FogState = save_codec::deserialize(&saved).unwrap();
+    assert_cached_edge_queries(&restored, viewer);
+    assert_eq!(save_codec::serialize(&restored).unwrap(), saved);
+    let mut clone = restored.clone();
+    clone.begin_fog_regrowth_cell(viewer, (5, 5), None);
+    assert_cached_edge_queries(&clone, viewer);
+    assert_eq!(save_codec::serialize(&restored).unwrap(), saved);
+    restored.begin_fog_reveal(viewer, (6, 5), None);
+    assert_cached_edge_queries(&restored, viewer);
+}
+
+#[test]
+fn cached_border_geometry_keeps_height_ring_and_viewer_inputs() {
+    let viewer = crate::sim::intern::test_intern("Player");
+    let other = crate::sim::intern::test_intern("Other");
+    let mut fog = FogState::new(24, 24);
+    for owner in [viewer, other] {
+        for cell in [(12, 12), (13, 12), (11, 11)] {
+            fog.reveal_forced_map_cell(owner, cell, None);
+        }
+    }
+    for (owner, origin, radius, inner) in [
+        (viewer, (12, 12, 0), 3, 0),
+        (other, (12, 12, 0), 3, 0),
+        (viewer, (12, 12, 208), 3, 0),
+        (viewer, (12, 12, 208), 6, 2),
+    ] {
+        let mut direct = fog.clone();
+        let cells = super::super::sight_border_cells(origin, radius, inner);
+        let bounds = CellBounds::of(&cells).unwrap();
+        direct
+            .by_owner
+            .write(owner, (24, 24), PlaneWrite::Border { bounds }, &cells, None);
+        fog.refresh_sight_border(owner, origin, radius, inner, None);
+        assert_eq!(
+            save_codec::serialize(&fog).unwrap(),
+            save_codec::serialize(&direct).unwrap()
+        );
+    }
+}
+
+#[test]
+fn interior_map_receivers_match_general_lookups_after_the_ground_store() {
+    let viewer = crate::sim::intern::test_intern("Player");
+    let terrain = test_grid(12, 12, test_clear_cell);
+    let general = {
+        let mut cells = terrain.cells().to_vec();
+        cells.swap(130, 131); // Far from the receiver; disables the interior proof.
+        ResolvedTerrainGrid::from_cells(12, 12, cells)
+    };
+    let fast_query = NativeCellQuery::canonical(&terrain);
+    let general_query = NativeCellQuery::canonical(&general);
+    let center = (5, 5);
+    let mut fast = FogState::new(12, 12);
+    let mut vis = OwnerVisibility::new(12, 12);
+    vis.ground_flags.fill(GROUND_VISIBLE | GROUND_OPEN);
+    let index = vis.index(center.0, center.1).unwrap();
+    vis.ground_flags[index] = GROUND_VISIBLE;
+    vis.shroud_knowledge[index].set_counter_for_test(7);
+    vis.map_cell_edge_cache[index - 1].initialized = true;
+    assert!(vis.interior_index(center, Some(&fast_query)).is_some());
+    assert!(vis.interior_index(center, Some(&general_query)).is_none());
+    fast.by_owner.insert(viewer, vis);
+    let mut general = fast.clone();
+    for final_pass in [false, true, false] {
+        let notify = |fog: &mut FogState, query| {
+            fog.reveal_map_cell(
+                viewer,
+                center,
+                final_pass,
+                Some(query),
+                MapRevealProjection::Source,
+            )
+            .map(|n| (n.cell, n.fresh, n.clean_fog))
+        };
+        assert_eq!(
+            notify(&mut fast, &fast_query),
+            notify(&mut general, &general_query)
+        );
+        assert_eq!(
+            save_codec::serialize(&fast).unwrap(),
+            save_codec::serialize(&general).unwrap()
+        );
+    }
+    let notify = |fog: &mut FogState, query| {
+        fog.reveal_forced_map_cell(viewer, center, Some(query))
+            .map(|n| (n.cell, n.fresh, n.clean_fog))
+    };
+    assert_eq!(
+        notify(&mut fast, &fast_query),
+        notify(&mut general, &general_query)
+    );
+    assert_eq!(
+        save_codec::serialize(&fast).unwrap(),
+        save_codec::serialize(&general).unwrap()
+    );
+    assert_eq!(
+        fast.by_owner[&viewer].map_cell_edge_cache[index].frames[0],
+        -1
+    );
+}
+
+#[test]
+fn real_map_receiver_with_missing_neighbours_reads_the_retained_dummy() {
+    let viewer = crate::sim::intern::test_intern("Player");
+    let center = (5, 5);
+    let mut terrain = test_grid(12, 12, test_clear_cell);
+    terrain.test_set_native_allocated_cells(&[center]);
+    let query = NativeCellQuery::canonical(&terrain);
+    let mut initial = FogState::new(12, 12);
+    let mut vis = OwnerVisibility::new(12, 12);
+    vis.dummy_visibility.ground = GROUND_VISIBLE | GROUND_OPEN;
+    vis.dummy_visibility.cache.initialized = true;
+    vis.dummy_visibility.cache.fog_open = true;
+    assert!(vis.interior_index(center, Some(&query)).is_none());
+    initial.by_owner.insert(viewer, vis);
+    for forced in [false, true] {
+        let mut fog = initial.clone();
+        if forced {
+            fog.reveal_forced_map_cell(viewer, center, Some(&query));
+        } else {
+            fog.reveal_map_cell(
+                viewer,
+                center,
+                false,
+                Some(&query),
+                MapRevealProjection::Source,
+            );
+        }
+        assert_eq!(
+            fog.by_owner[&viewer].map_cell_edge_cache_for_test(center).0,
+            [-1, -1]
+        );
+        assert_eq!(
+            fog.by_owner[&viewer].dummy_visibility,
+            initial.by_owner[&viewer].dummy_visibility
+        );
+    }
+}
+
+#[test]
+fn counter_updates_preserve_ground_bits_independently_of_projected_sight() {
+    // Display::MapCell4A9CA0 calls Cell487630/487690 before its edge queries.
+    // Positive reveal counters and final releases preserve a prior partial12C.
+    let viewer = crate::sim::intern::test_intern("Player");
+    let mut results = Vec::new();
+    for (final_pass, counter, open) in [
+        (false, 7, false),
+        (true, 2, false),
+        (false, 7, true),
+        (true, 2, true),
+    ] {
+        let mut fog = FogState::new(12, 12);
+        let mut vis = OwnerVisibility::new(12, 12);
+        let index = vis.index(9, 10).unwrap();
+        seed_cell(
+            &mut vis,
+            VisibilityCell::Real(index),
+            &json!({
+                "counter": counter, "gap": 0, "alt": 8,
+                "flags": 2, "cache": [127, 126],
+            }),
+        );
+        vis.shroud_knowledge[index].set_open_for_test(open);
+        fog.by_owner.insert(viewer, vis);
+        let notify = fog
+            .reveal_map_cell(
+                viewer,
+                (9, 10),
+                final_pass,
+                None,
+                MapRevealProjection::Transient,
+            )
+            .unwrap();
+        let vis = &fog.by_owner[&viewer];
+        results.push((
+            vis.shroud_knowledge[index].counter(),
+            vis.ground_flags[index],
+            vis.shroud_knowledge[index].open(),
+        ));
+        assert_eq!(vis.map_cell_edge_cache[index].frames, [-2, -2]);
+        assert!(!notify.fresh);
+    }
+    assert_eq!(
+        results,
+        [(6, 8, false), (0, 8, false), (6, 8, true), (0, 8, true)]
+    );
+}
+
 #[test]
 fn grow_shroud_captures_frontier_before_neighbors_lose_open_and_preserves_counters() {
     let viewer = crate::sim::intern::test_intern("Player");
@@ -21,13 +267,14 @@ fn grow_shroud_captures_frontier_before_neighbors_lose_open_and_preserves_counte
         fog.set_ground_bits_for_test(viewer, cell.0, cell.1, bits);
         let vis = fog.by_owner.get_mut(&viewer).unwrap();
         let index = vis.index(cell.0, cell.1).unwrap();
-        vis.shroud_knowledge[index].counter = -7;
-        vis.shroud_knowledge[index].gap_counter = 3;
-        vis.shroud_knowledge[index].pending = pending;
+        vis.shroud_knowledge[index].set_counter_for_test(-7);
+        vis.shroud_knowledge[index].set_gap_counter_for_test(3);
+        vis.shroud_knowledge[index].set_pending_for_test(pending);
         vis.map_cell_edge_cache[index] = MapCellEdgeCache {
             initialized: true,
             fog_open: true,
             frames: [17, 23],
+            ..Default::default()
         };
         vis.publish_knowledge(index);
     }
@@ -46,14 +293,14 @@ fn grow_shroud_captures_frontier_before_neighbors_lose_open_and_preserves_counte
     ] {
         let i = vis.index(cell.0, cell.1).unwrap();
         assert_eq!(vis.ground_flags[i], bits, "{cell:?}");
-        assert_eq!(vis.shroud_knowledge[i].pending, pending, "{cell:?}");
+        assert_eq!(vis.shroud_knowledge[i].pending(), pending, "{cell:?}");
         assert_eq!(
-            vis.shroud_knowledge[i].counter,
-            before.shroud_knowledge[i].counter
+            vis.shroud_knowledge[i].counter(),
+            before.shroud_knowledge[i].counter()
         );
         assert_eq!(
-            vis.shroud_knowledge[i].gap_counter,
-            before.shroud_knowledge[i].gap_counter
+            vis.shroud_knowledge[i].gap_counter(),
+            before.shroud_knowledge[i].gap_counter()
         );
         assert_eq!(vis.map_cell_edge_cache[i], before.map_cell_edge_cache[i]);
     }
@@ -86,12 +333,13 @@ fn grow_shroud_uses_the_shared_dummy_without_clearing_its_cache() {
     let mut fog = FogState::new(33, 33);
     let mut vis = OwnerVisibility::new(33, 33);
     vis.dummy_visibility.ground = 8;
-    vis.dummy_visibility.knowledge.open = true;
-    vis.dummy_visibility.knowledge.counter = 9;
+    vis.dummy_visibility.knowledge.set_open_for_test(true);
+    vis.dummy_visibility.knowledge.set_counter_for_test(9);
     vis.dummy_visibility.cache = MapCellEdgeCache {
         initialized: true,
         fog_open: true,
         frames: [12, 31],
+        ..Default::default()
     };
     let cache = vis.dummy_visibility.cache;
     fog.by_owner.insert(viewer, vis);
@@ -102,9 +350,9 @@ fn grow_shroud_uses_the_shared_dummy_without_clearing_its_cache() {
     );
     let dummy = fog.by_owner[&viewer].dummy_visibility;
     assert_eq!(dummy.ground, 0);
-    assert!(!dummy.knowledge.pending);
-    assert!(!dummy.knowledge.open);
-    assert_eq!(dummy.knowledge.counter, 9);
+    assert!(!dummy.knowledge.pending());
+    assert!(!dummy.knowledge.open());
+    assert_eq!(dummy.knowledge.counter(), 9);
     assert_eq!(dummy.cache, cache);
 }
 
@@ -208,10 +456,10 @@ fn seed_cell(view: &mut OwnerVisibility, key: VisibilityCell, input: &Value) {
     let (knowledge, ground, cache) = view.map_cell_parts_mut(key);
     let flags = input["flags"].as_u64().unwrap() as u32;
     *ground = input["alt"].as_u64().unwrap() as u8;
-    knowledge.counter = input["counter"].as_i64().unwrap() as i32;
-    knowledge.gap_counter = input["gap"].as_i64().unwrap() as i32;
-    knowledge.open = *ground & 0x18 == 0x18;
-    knowledge.pending = flags & 0x20 != 0;
+    knowledge.set_counter_for_test(input["counter"].as_i64().unwrap() as i32);
+    knowledge.set_gap_counter_for_test(input["gap"].as_i64().unwrap() as i32);
+    knowledge.set_open_for_test(*ground & 0x18 == 0x18);
+    knowledge.set_pending_for_test(flags & 0x20 != 0);
     *cache = MapCellEdgeCache {
         initialized: flags & 2 != 0,
         fog_open: flags & 1 != 0,
@@ -219,7 +467,12 @@ fn seed_cell(view: &mut OwnerVisibility, key: VisibilityCell, input: &Value) {
             input["cache"][0].as_i64().unwrap() as i8,
             input["cache"][1].as_i64().unwrap() as i8,
         ],
+        ..Default::default()
     };
+    // This fixture writes native storage directly, outside the cell writers,
+    // so it drops what they derive.
+    view.edge_inputs_cache.take();
+    view.stale_frames = StaleFrames::default();
     if let VisibilityCell::Real(index) = key {
         view.publish_knowledge(index);
     }
@@ -292,7 +545,7 @@ fn bulk_map_store_shares_forced_reveal_admission_without_changing_frame_bytes() 
     //577ED1/577EE0 writes bits18/3, leaving120/121 and pending20.
     let view = &fog.by_owner[&viewer];
     assert_eq!(view.map_cell_edge_cache_for_test((9, 10)), (frames, 3));
-    assert!(view.shroud_knowledge[view.index(9, 10).unwrap()].pending);
+    assert!(view.shroud_knowledge[view.index(9, 10).unwrap()].pending());
     let notification = fog
         .reveal_forced_map_cell(viewer, (9, 10), Some(&query))
         .unwrap();
@@ -349,12 +602,12 @@ pub(crate) fn assert_native_cell_history(
         VisibilityCell::Dummy => view.dummy_visibility.knowledge,
     };
     assert_eq!(
-        state.counter,
+        state.counter(),
         row["counter"].as_i64().unwrap() as i32,
         "counter at {cell:?}"
     );
     assert_eq!(
-        state.gap_counter,
+        state.gap_counter(),
         row["gap"].as_i64().unwrap() as i32,
         "gap at {cell:?}"
     );
@@ -364,7 +617,7 @@ pub(crate) fn assert_native_cell_history(
         "ground at {cell:?}"
     );
     assert_eq!(
-        state.pending,
+        state.pending(),
         row["flags"].as_u64().unwrap() & 0x20 != 0,
         "pending at {cell:?}"
     );
@@ -523,6 +776,7 @@ fn native_trigger_reveal_edge_channels_match_all_original_masks_and_center_gates
                     view.map_cell_edge_cache[index].initialized = set;
                 }
             }
+            view.edge_inputs_cache.take();
             assert_eq!(
                 i64::from(fog.map_cell_edge_frame(viewer, center, channel != 0, Some(cells))),
                 expected.as_i64().unwrap(),
@@ -541,6 +795,7 @@ fn native_trigger_reveal_edge_channels_match_all_original_masks_and_center_gates
             view.map_cell_edge_cache[index].initialized = value & 2 != 0;
             view.map_cell_edge_cache[index].fog_open = value & 1 != 0;
         }
+        view.edge_inputs_cache.take();
         assert_eq!(
             i64::from(fog.map_cell_edge_frame(viewer, center, channel != 0, Some(&cells))),
             input["returned"].as_i64().unwrap()
@@ -618,7 +873,8 @@ fn reveal_cell_explores_every_cell_and_opens_only_surrounded_ones() {
         let expected = if surrounded { 0x18 } else { 0x08 };
         assert_eq!(view.ground_flags[index], expected, "ground at {x},{y}");
         assert_eq!(
-            view.shroud_knowledge[index].counter, 1,
+            view.shroud_knowledge[index].counter(),
+            1,
             "counter at {x},{y}"
         );
         assert!(fog.is_cell_revealed(viewer, x, y));
@@ -690,7 +946,7 @@ fn reveal_cell_opens_a_surrounded_neighbor_without_storing_its_frame() {
 /// cells whose cache is not initialized, so the state hash covers them too.
 #[test]
 fn uninitialized_edge_cache_fields_move_the_state_hash() {
-    use crate::sim::state_hasher::StateHasher;
+    use crate::util::state_hasher::StateHasher;
     use std::hash::Hasher;
     let hash = |visibility: &OwnerVisibility| {
         let mut hasher = StateHasher::new();
@@ -705,4 +961,171 @@ fn uninitialized_edge_cache_fields_move_the_state_hash() {
     framed.map_cell_edge_cache[5].frames[0] = 3;
     assert_ne!(hash(&open), hash(&base));
     assert_ne!(hash(&framed), hash(&base));
+}
+
+#[test]
+fn explored_frontier_keeps_pending_conceal_until_the_sweep() {
+    // Cell4876F0 -> GAP6FB170 cell write -> RevealCell4AA050 ->
+    // MapCell4A9CA0/Cell487630 -> Map578100 pending-cell sweep.
+    let viewer = crate::sim::intern::test_intern("Player");
+    for frontier in [false, true] {
+        let mut fog = FogState::new(12, 12);
+        fog.reveal_map_cell(viewer, (9, 10), false, None, MapRevealProjection::Fire);
+        let index = fog.by_owner[&viewer].index(9, 10).unwrap();
+        fog.by_owner.get_mut(&viewer).unwrap().add_gap_cell(index);
+        fog.reveal_cell(viewer, (9, 10), None);
+        if !frontier {
+            fog.reveal_map_cell(viewer, (9, 10), false, None, MapRevealProjection::Fire);
+        }
+        let before = &fog.by_owner[&viewer];
+        assert_eq!(before.ground_flags[index], if frontier { 8 } else { 24 });
+        assert_eq!(before.shroud_knowledge[index].counter(), 1);
+        assert_eq!(before.shroud_knowledge[index].gap_counter(), 1);
+        assert!(before.shroud_knowledge[index].open());
+        assert!(before.shroud_knowledge[index].pending());
+        fog.reveal_map_cell(viewer, (9, 10), false, None, MapRevealProjection::Transient);
+        let after = &fog.by_owner[&viewer];
+        assert_eq!(after.shroud_knowledge[index].counter(), -1);
+        assert_eq!(after.ground_flags[index], 24);
+        assert_eq!(after.shroud_knowledge[index].pending(), frontier);
+        fog.sweep_pending_map_cell(viewer, (9, 10), None);
+        let swept = &fog.by_owner[&viewer];
+        assert!(!swept.shroud_knowledge[index].pending());
+        assert_eq!(swept.shroud_knowledge[index].counter(), -1);
+        assert_eq!(swept.ground_flags[index], if frontier { 0 } else { 24 });
+    }
+}
+
+#[test]
+fn border_refresh_interior_matches_native_lookup_fallback() {
+    let terrain = test_grid(12, 12, test_clear_cell);
+    // A distant stored-coordinate alias disables the interior fast path,
+    // without changing any of the queried cells or their neighbours.
+    let mut cells = terrain.cells().to_vec();
+    cells.swap(130, 131);
+    let fallback = ResolvedTerrainGrid::from_cells(12, 12, cells);
+    let mut interior = OwnerVisibility::new(12, 12);
+    seed_cell(
+        &mut interior,
+        VisibilityCell::Real(65),
+        &json!({"counter": -3, "gap": 2, "alt": 8, "flags": 3, "cache": [77, 62]}),
+    );
+    let mut looked_up = interior.clone();
+    assert!(
+        interior
+            .interior_index((5, 5), Some(&NativeCellQuery::canonical(&terrain)))
+            .is_some()
+    );
+    assert!(
+        looked_up
+            .interior_index((5, 5), Some(&NativeCellQuery::canonical(&fallback)))
+            .is_none()
+    );
+    let border = [(5, 5), (6, 5), (5, 5)];
+    let bounds = CellBounds::of(&border).unwrap();
+    interior.refresh_ground_frames(&border, bounds, Some(&NativeCellQuery::canonical(&terrain)));
+    looked_up.refresh_ground_frames(
+        &border,
+        bounds,
+        Some(&NativeCellQuery::canonical(&fallback)),
+    );
+    assert_eq!(
+        save_codec::serialize(&interior).unwrap(),
+        save_codec::serialize(&looked_up).unwrap()
+    );
+    assert_ne!(interior.map_cell_edge_cache[65].frames[0], 77);
+    assert_eq!(interior.map_cell_edge_cache[65].frames[1], 62);
+    assert_eq!(interior.ground_flags[65], 8);
+    assert_eq!(interior.shroud_knowledge[65].counter(), -3);
+    assert_eq!(interior.shroud_knowledge[65].gap_counter(), 2);
+}
+
+/// Each `cells` ground frame on `viewer`'s map is the one its bits give.
+fn assert_border_frames_current(fog: &FogState, viewer: InternedId, cells: &[(u16, u16)]) {
+    for &cell in cells {
+        assert_eq!(
+            fog.by_owner[&viewer].map_cell_edge_cache_for_test(cell).0[0],
+            fog.map_cell_edge_frame(viewer, cell, false, None),
+            "{cell:?}"
+        );
+    }
+}
+
+/// A bulk map shroud (`store_bulk_map_cell`) leaves its cell's and
+/// neighbours' ground frames stale; the next sight border recomputes them,
+/// though the border before it left every frame there current.
+#[test]
+fn a_sight_border_recomputes_the_frames_a_bulk_shroud_left() {
+    let viewer = crate::sim::intern::test_intern("Player");
+    let border = super::super::sight_border_cells((12, 12, 0), 3, 0);
+    let mut fog = FogState::new(24, 24);
+    for cell in [(12, 12), (13, 12), (11, 11)] {
+        fog.reveal_forced_map_cell(viewer, cell, None);
+    }
+    fog.refresh_sight_border(viewer, (12, 12, 0), 3, 0, None);
+    assert_border_frames_current(&fog, viewer, &border);
+    let shrouded = fog.by_owner.get_mut(&viewer).unwrap();
+    shrouded.store_bulk_map_cell((12, 12), true);
+    shrouded.store_bulk_map_cell((13, 12), true);
+    fog.refresh_sight_border(viewer, (12, 12, 0), 3, 0, None);
+    assert_border_frames_current(&fog, viewer, &border);
+}
+
+/// A loaded map's first sight border recomputes every ground frame, the
+/// stale ones its save held included.
+#[test]
+fn a_loaded_maps_first_sight_border_recomputes_its_frames() {
+    let viewer = crate::sim::intern::test_intern("Player");
+    let border = super::super::sight_border_cells((12, 12, 0), 3, 0);
+    let mut fog = FogState::new(24, 24);
+    for cell in [(12, 12), (13, 12), (11, 11)] {
+        fog.reveal_forced_map_cell(viewer, cell, None);
+    }
+    fog.refresh_sight_border(viewer, (12, 12, 0), 3, 0, None);
+    fog.by_owner
+        .get_mut(&viewer)
+        .unwrap()
+        .store_bulk_map_cell((12, 12), true);
+    let mut loaded: FogState =
+        save_codec::deserialize(&save_codec::serialize(&fog).unwrap()).unwrap();
+    assert_ne!(
+        loaded.by_owner[&viewer]
+            .map_cell_edge_cache_for_test((12, 12))
+            .0[0],
+        loaded.map_cell_edge_frame(viewer, (12, 12), false, None)
+    );
+    loaded.refresh_sight_border(viewer, (12, 12, 0), 3, 0, None);
+    assert_border_frames_current(&loaded, viewer, &border);
+}
+
+/// A stale frame on the far column of a sight border's disc is recomputed:
+/// the border's bounds hold every cell of its disc.
+#[test]
+fn a_sight_border_recomputes_a_stale_frame_on_its_edge() {
+    let viewer = crate::sim::intern::test_intern("Player");
+    let border = super::super::sight_border_cells((12, 12, 0), 3, 0);
+    let edge = border.iter().copied().max().unwrap();
+    let east = (edge.0 + 1, edge.1);
+    let mut fog = FogState::new(24, 24);
+    for y in edge.1 - 1..=edge.1 + 1 {
+        for x in edge.0 - 1..=edge.0 + 1 {
+            if (x, y) != east {
+                fog.reveal_forced_map_cell(viewer, (x, y), None);
+            }
+        }
+    }
+    // A wider border leaves every frame within the narrow one's bounds
+    // current; a bulk store, which does not propagate, then leaves only the
+    // edge's column there stale.
+    fog.refresh_sight_border(viewer, (12, 12, 0), 5, 0, None);
+    fog.by_owner
+        .get_mut(&viewer)
+        .unwrap()
+        .store_bulk_map_cell(east, false);
+    assert_ne!(
+        fog.by_owner[&viewer].map_cell_edge_cache_for_test(edge).0[0],
+        fog.map_cell_edge_frame(viewer, edge, false, None)
+    );
+    fog.refresh_sight_border(viewer, (12, 12, 0), 3, 0, None);
+    assert_border_frames_current(&fog, viewer, &border);
 }

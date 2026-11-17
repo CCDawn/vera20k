@@ -8,16 +8,12 @@ does not create a raised deck or change the physical water outside the span.
 This is the LOBRDG01..28 family (OverlayTypes74..101, wooden physical art),
 distinct from LOBRDB01..28 (205..232, native Name `Concrete Low Bridge`).
 
-The native-only corpora use gamemd SHA256
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`:
+The native-only corpora use original `gamemd.exe`:
 
-- `naval_occupants` executes Cell487A10, Unit73F0A0/Foot4D9C10 admission,
-  Ship6A3F50 AtCoord, and Unit737C90→Foot4D7330→Techno701900→Object5F5390.
-  The 22 rows include a resident ship, moving-head neighbors, height-tolerance
-  boundaries, and explicit type/receiver gate controls. A resident on repaired
-  Road reaches Death_Explosion. A ship still on adjacent Water whose head
-  matches the repaired cell returns Health1/Alive1/+3CD1. Main, Scenario and
-  MapGen states remain unchanged during the measured repair receiver.
+- `naval_occupants` is the shared fixture: it sets up Cell487A10,
+  Unit73F0A0/Foot4D9C10 admission, Ship6A3F50 AtCoord, and
+  Unit737C90→Foot4D7330→Techno701900→Object5F5390 for the packets below. Its
+  has no corpus of its own.
 - `naval_sink_tick` executes 15 bounded UnitAI7364A1 visits after that receiver:
   raw Z drops by5, height below -400 calls a second RecordKill before UnInit,
   and nonterminal frames divisible by4 request Y then X Scenario jitter
@@ -51,11 +47,10 @@ With the native-oracle Python environment and original executable configured:
 
 ```sh
 export VERA20K_SHRAPNEL_INPUTS=target/shrapnel-native-inputs/extract
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python tools/spatial_oracle/naval_occupants.py --check
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python tools/spatial_oracle/naval_sink_tick.py --check
 ```
 
-Both default to read-only check; `--write` explicitly regenerates references.
+It defaults to read-only check; `--write` explicitly regenerates references.
 Portable-path integration and correcting the mode filename changed no native
 case output. The metadata preserves original byte slices, reader boundaries,
 allocator/OS seams and complete input provenance. Rust tests bind these outputs
@@ -101,19 +96,13 @@ the old presentation. The shader preserves geometry, UVs, palette conversion and
 depth while discarding below the world row. Sinking suppresses shadows and
 DrawExtras, and the radar tracker consumes the authoritative sinking state.
 
-The single critic found that the former 120px viewport cull delayed the first
-waterline capture. Original Unit73B0B0→Object5F4B10→CoordsToClient2 6D2140 admits
-X[-360,width+360], Y[-180,height+180], including the endpoints. Its dimensions
-come from the tactical rectangle: Set_View_Dimensions4A89B8 and Scenario687620
-pass886FA0 into the writer6D5F60. Unit and Bullet drawing now share this admission
-owner and use the tactical dimensions. Aircraft retain their existing admission.
-The original AEGIS sequence first admits client(840,200) in a640×480 view and
-captures world row2593. At supplied later Z8, then after panning X, the native
-cache still clips at client row228. Delayed capture would instead retain2622.
-Both Rust regressions failed before the fix; they compare all15 boundary cases
-and the production projection/parent-bound/cache adapters, shader inputs and
-neutral snapshot round-trips. These tests do not construct an AppState window;
-the visible application and GPU comparisons provide separate output evidence.
+The first waterline capture depends on the native draw admission: original
+Unit73B0B0→Object5F4B10→CoordsToClient2 6D2140 admits X[-360,width+360],
+Y[-180,height+180] of the tactical rectangle. Unit and Bullet drawing share that
+admission owner in `src/app/presentation/instances/helpers.rs`; Aircraft retain
+their existing admission. The original AEGIS sequence first admits client(840,200)
+in a640×480 view and captures world row2593; at supplied later Z8, then after
+panning X, the native cache still clips at client row228.
 
 ### RNG, timers, detach and loading
 
@@ -151,15 +140,7 @@ area exclusion, firing/target legality, statistics and app cache persistence.
 The ignored physical AEGIS test compares all four native bounds and complete
 palette-byte hashes. The ignored GPU test sends all 16 Unit clip visits through
 real batch lowering, upload and Metal shader, checking every 640×480 pixel and
-unchanged depth. The chain validation record (`tools/spatial_oracle/naval_repair_validation.json`, in git at 1b1a8b43e)
-retains the actual suite/focused results, binary and log hashes, navigation
-comparison, Ghidra readbacks and ordinary visible save/load/sinking captures.
-The final candidate9a176561, including the critic correction and main772808f1,
-passes9,582 retail lib tests with zero failures and181 ignored; clippy exits0.
-The two earlier stale score assertions were corrected and are included in that
-clean full run. Both physical-map tests, the four-facing raster comparison and
-the16-visit Metal comparison also pass again. These bounded passes do not close
-the whole-bridge goal.
+unchanged depth. These checks do not close the whole-bridge goal.
 
 ### Reproduce the additional packets
 
@@ -179,6 +160,5 @@ for packet in naval_lifetime_audio naval_lifetime_cleanup naval_lifetime_control
 done
 ```
 
-The Shrapnel packet records a separate required CliffBack constructor/retention
-follow-up. Other low/raised types and affected gameplay mechanisms remain work
-for the whole-bridge audit.
+Other low/raised types and affected gameplay mechanisms remain work for the
+whole-bridge audit.

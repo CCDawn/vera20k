@@ -45,7 +45,7 @@ fn fixture(row: &Value, rules: &RuleSet) -> (Simulation, Vec<u64>, [u64; 2], Opt
     crate::sim::arena_fixture::flat_arena(&mut sim, rules);
     // Keep the native world-lepton poses without granting this tail fixture
     // a claim about the original map's terrain or preceding placement.
-    let template = sim.resolved_terrain.as_ref().unwrap().cells[0].clone();
+    let template = sim.resolved_terrain.as_ref().unwrap().cells()[0].clone();
     let cells = (0..128)
         .flat_map(|ry| (0..128).map(move |rx| (rx, ry)))
         .map(|(rx, ry)| {
@@ -58,18 +58,18 @@ fn fixture(row: &Value, rules: &RuleSet) -> (Simulation, Vec<u64>, [u64; 2], Opt
     sim.install_resolved_terrain_for_new_map(
         crate::map::resolved_terrain::ResolvedTerrainGrid::from_cells(128, 128, cells),
     );
-    sim.session.map_width = 128;
-    sim.session.map_height = 128;
+    sim.session.set_map_width_for_test(128);
+    sim.session.set_map_height_for_test(128);
     assert!(sim.rebuild_dynamic_navigation(rules));
     sim.intern_rule_type_ids(rules);
     sim.resolve_type_handles(rules);
     let owner = sim.interner.intern("Americans");
-    sim.houses.insert(
-        owner,
-        crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10),
-    );
-    sim.session.house_order = vec![owner];
-    sim.session.binary_frame = integer(&row["supplied"]["frame"]) as u32;
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 0, 10,
+        ));
+    sim.session
+        .set_binary_frame_for_test(integer(&row["supplied"]["frame"]) as u32);
     let targets = [(20, 20), (22, 20)].map(|(rx, ry)| {
         sim.spawn_object_at_height("HTNK", "Americans", rx, ry, 0, 0, rules)
             .unwrap()
@@ -91,7 +91,8 @@ fn fixture(row: &Value, rules: &RuleSet) -> (Simulation, Vec<u64>, [u64; 2], Opt
                     rules,
                 )
                 .unwrap();
-            sim.mission_assign_exact(id, MissionId::from_raw(integer(&before["mission"])), 0)
+            sim.substrate
+                .mission_assign_exact(id, MissionId::from_raw(integer(&before["mission"])), 0)
                 .unwrap();
             assert_eq!(before["queued_mission"], -1);
             assert_eq!(before["burst"], 0);
@@ -141,9 +142,9 @@ fn fixture(row: &Value, rules: &RuleSet) -> (Simulation, Vec<u64>, [u64; 2], Opt
                 }));
             actor
                 .navigation
-                .path_runtime
+                .path_runtime_mut()
                 .set_movement_timer_for_test(timer(&before["movement_timer"]));
-            actor.navigation.path_replay.set_directions_for_test(
+            actor.navigation.path_replay_mut().set_directions_for_test(
                 before["path"]
                     .as_array()
                     .unwrap()
@@ -278,7 +279,7 @@ fn assert_boundary(
             "{name}: dispatch"
         );
         assert_eq!(
-            actor.navigation.path_runtime.movement_timer(),
+            actor.navigation.path_runtime().movement_timer(),
             timer(&after["movement_timer"]),
             "{name}: movement"
         );
@@ -318,7 +319,7 @@ fn assert_boundary(
             .map(|value| u8::try_from(integer(value)).unwrap())
             .collect();
         assert_eq!(
-            actor.navigation.path_replay.remaining_directions(),
+            actor.navigation.path_replay().remaining_directions(),
             directions,
             "{name}: path"
         );
@@ -362,14 +363,7 @@ fn fire_once_tail_matches_12_original_retained_state_and_rng_boundaries() {
     else {
         return;
     };
-    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
-        "tools/projectile_oracle/fire_once.json",
-    ))
-    .unwrap();
-    assert_eq!(
-        corpus["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
+    let corpus = crate::test_fixture::json("tools/projectile_oracle/fire_once.json");
     assert_eq!(corpus["cases"].as_array().unwrap().len(), 13);
     let mut compared = 0;
     for row in corpus["cases"].as_array().unwrap() {

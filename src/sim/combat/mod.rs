@@ -25,13 +25,21 @@
 //! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
 pub mod aim_coord;
+mod airburst;
+mod ares_warhead_effects;
 mod attack_target;
+#[cfg(feature = "phobos")]
+mod phobos_airburst;
 pub(crate) mod base_defense_response;
 pub mod burst;
 pub(crate) mod cell_spread;
 pub(crate) mod combat_aoe;
 pub(crate) mod combat_targeting;
 pub mod combat_weapon;
+#[cfg(feature = "phobos")]
+pub(crate) mod crit;
+#[cfg(all(test, tests_sim_combat_a_c, feature = "phobos"))]
+mod crit_tests;
 pub(crate) mod damage;
 pub(crate) mod destruction_effects;
 pub(crate) mod detonation_anim;
@@ -48,8 +56,11 @@ pub mod laser;
 pub mod line_of_fire;
 mod object_health;
 pub(crate) mod parasite;
+#[cfg(feature = "phobos")]
+mod phobos_airburst;
 mod projectile_delivery;
 pub mod radiation_beam;
+pub(crate) mod railgun;
 mod receiver_call;
 mod receiver_health;
 mod record_kill;
@@ -66,75 +77,94 @@ pub mod veterancy;
 pub mod world_fire;
 pub(crate) mod world_receiver;
 
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 pub(crate) mod receiver_fixture;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_a_c))]
 mod aegis_launch_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_a_c, feature = "phobos"))]
+mod airstrike_target_tests;
+#[cfg(all(test, tests_sim_combat_a_c))]
+mod ares_armor_tests;
+#[cfg(all(test, tests_sim_combat_a_c))]
+mod ares_cliff_tests;
+#[cfg(all(test, tests_sim_combat_a_c))]
+mod ares_warhead_combat_tests;
+#[cfg(all(test, tests_sim_combat_a_c))]
+mod ares_warhead_effects_tests;
+#[cfg(all(test, tests_sim_combat_a_c))]
 mod bridge_cluster_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_a_c))]
 mod bridge_launch_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_a_c))]
 mod bridge_live_chain_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_a_c))]
 mod combat_cloak_damage_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_a_c))]
 mod combat_cloak_fire_tests;
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_combat_a_c, tests_sim_combat_d_z)))]
 mod combat_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_a_c))]
 mod combat_turret_facing_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod electric_bolt_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
+mod fire_particles_tests;
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod fireat_launch_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod garrison_oracle_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod homing_shipyard_tests;
-#[cfg(test)]
+// Phobos `ROF.RandomDelay` (`0x006FD0B5`) redraws the full-rearm jitter, so
+// this stock golden only holds without the capability.
+#[cfg(all(test, tests_sim_combat_d_z, not(feature = "phobos")))]
 mod ifv_fireat_tests;
 /// Ordinary launch-height, resolved impact presentation and damage-effect
 /// wiring. Bridge Cell+58 launch and +48/+58 impact comparisons use the native
 /// oracle cases in `bridge_launch_tests` and `world::projectile_collision`.
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_combat_d_z, tests_sim_combat_a_c)))]
 mod impact_height_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod laser_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod mirage_disguise_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod open_topped_fire_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod prone_damage_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod radiation_beam_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
+mod railgun_tests;
+#[cfg(all(test, tests_sim_combat_d_z))]
+mod screen_shake_tests;
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod shrapnel_chain_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod unit_damage_response_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod walk_attack_tests;
 
 pub use attack_target::{TarCom, TargetKind};
-pub(crate) use attack_target::{object_distance_to, resolve_target_coords, target_present};
+pub use attack_target::object_distance_to;
+pub(crate) use attack_target::{resolve_target_coords, target_present};
 pub(crate) use combat_targeting::build_attacker_snapshot;
 pub(crate) use detonation_anim::projectile_impact_cell;
 pub(crate) use effects::DeathEffects;
 pub use effects::{
-    CombatLightRequest, ExplosionEffect, SmudgeSpawnRequest, TiberiumReductionRequest,
-    UnderAttackEvent, UnitLostEvent,
+    AresUnitLost, CombatLightRequest, ExplosionEffect, ScreenShakeUpdate, SmudgeSpawnRequest,
+    TiberiumReductionRequest, UnderAttackEvent, UnderAttackLine, UnitLostEvent,
 };
 pub use in_range::can_fire_at_target;
-pub use in_range::{can_fire_at_target_in_query, is_within_range_leptons, lepton_distance_sq_raw};
+pub use in_range::{MaplessTarget, can_fire_at_target_in_query, mapless_in_range};
 pub use object_health::{Health, health_category};
-pub(crate) use projectile_delivery::{FiredBullet, admit_fired_bullet};
-pub use receiver_call::TerrainDamageEvent;
+pub(crate) use projectile_delivery::{FiredBullet, admit_fired_bullet, admit_techno_fired_bullet};
 pub(crate) use receiver_call::{
     BaseDefenseResponseCallSite, EntityDamageEvent, RAD_NO_ATTACKER, ReceiverCallFlags,
-    wave_post_object_damage,
+    receiver_divisors, wave_post_object_damage,
 };
+pub use receiver_call::{DamageWriteback, TerrainDamageEvent};
 pub(crate) use receiver_health::BerserkState;
 pub(crate) use record_kill::{KillCallback, KillRecord, KillSource};
 pub use techno_death::FatalLifecycleStage;
@@ -153,13 +183,15 @@ use attack_target::{attack_world_z_leptons, cell_center_coords, target_coords};
 use projectile_delivery::{
     ProjectileDelivery, bullet_type, classify_projectile_delivery, projectile_arm_delay,
 };
+#[cfg(feature = "phobos")]
+use receiver_call::resolve_receive_damage_with_input;
 use receiver_call::{
     BuildingReceivePrelude, ResolvedReceiveDamage, apply_building_receive_prelude,
     area_near_center_ic_isolation_armed, near_center_ic_isolation_armed,
     postmortem_duration_for_event, receiver_anger_delta, resolve_receive_damage,
 };
 use shrapnel::emit_projectile_shrapnel;
-use techno_death::{ConcreteDeathSmudgePlan, append_selected_death_sounds, throw_debris_for_death};
+use techno_death::{ConcreteDeathSmudgePlan, throw_debris_for_death};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use attack_target::{
@@ -184,15 +216,13 @@ pub(crate) use receiver_fixture::{
 #[cfg(any(test, feature = "test-support"))]
 use techno_death::fire_death_weapon_payload;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use self::combat_targeting::{AttackerSnapshot, GarrisonSnapshot};
 use self::combat_weapon::WeaponSlot;
 use crate::map::entities::EntityCategory;
-use crate::map::houses::HouseAllianceMap;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::animation_sequence::SequenceSet;
-use crate::rules::foundation::foundation_dimensions;
 use crate::rules::object_type::ObjectType;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::{HouseCostFactors, RuleSet};
@@ -202,6 +232,7 @@ use crate::sim::bridge_state::BridgeDamageEvent;
 #[cfg(any(test, feature = "test-support"))]
 use crate::sim::bridge_state::BridgeRuntimeState;
 use crate::sim::entity_store::EntityStore;
+use crate::sim::house_diplomacy::HouseAlliances;
 use crate::sim::house_state::HouseState;
 use crate::sim::house_strategy::update_anger_nodes;
 use crate::sim::infantry;
@@ -281,33 +312,24 @@ impl UnitFacingUpdate {
     }
 }
 
-/// Armor type name → Verses index mapping.
-/// Matches the order defined in warhead_type.rs: none(0), flak(1), plate(2),
-/// light(3), medium(4), heavy(5), wood(6), steel(7), concrete(8),
-/// special_1(9), special_2(10).
-const ARMOR_NAMES: &[&str] = &[
-    "none",
-    "flak",
-    "plate",
-    "light",
-    "medium",
-    "heavy",
-    "wood",
-    "steel",
-    "concrete",
-    "special_1",
-    "special_2",
-];
-
-/// Look up the Verses array index for an armor type name.
-/// Returns 0 ("none") for unrecognized armor strings.
-/// Used by combat_weapon.rs for weapon selection.
-pub fn armor_index(armor: &str) -> usize {
-    // The names are lowercase, so this matches the lowercased armor string.
-    ARMOR_NAMES
-        .iter()
-        .position(|name| name.eq_ignore_ascii_case(armor))
-        .unwrap_or(0)
+/// TechnoClass vt+0x80, whether an object counts as a vehicle, by its class:
+/// a Unit that is not `NonVehicle=` (`0x00746400`, UnitType `+0xE1B`), a
+/// building that is a 1x1 `UndeploysInto=` (`0x00457620` → `0x00465D40`,
+/// [`ObjectType::is_1x1_with_undeploy`]), an aircraft its vt+0x50 calls low
+/// (`0x0041B910`), never an infantryman (`0x004263B0`). `low_flying` is that
+/// vt+0x50 in the caller's own map lookup, asked only for an aircraft.
+pub(crate) fn vehicle_like(
+    class: EntityCategory,
+    non_vehicle: bool,
+    is_1x1_with_undeploy: bool,
+    low_flying: impl FnOnce() -> bool,
+) -> bool {
+    match class {
+        EntityCategory::Unit => !non_vehicle,
+        EntityCategory::Structure => is_1x1_with_undeploy,
+        EntityCategory::Aircraft => low_flying(),
+        EntityCategory::Infantry => false,
+    }
 }
 
 /// Call-local arguments of Building Update's two native FireAt sites.
@@ -377,4 +399,56 @@ pub(crate) struct CombatEmit {
 pub(crate) struct LogicProjectileCommit {
     pub(crate) effects: DeathEffects,
     pub(crate) under_attack_events: Vec<UnderAttackEvent>,
+}
+
+/// `TechnoExt::IsHealthInThreshold` (`Ext/Techno/Body.cpp:752..759`): the
+/// interval `(above, below]`, `above` inclusive at zero health; a
+/// zero-health, zero-strength object matches unconditionally. A positive
+/// health over a zero strength is the native `inf` and misses every finite
+/// bound.
+#[cfg(feature = "phobos")]
+pub(crate) fn health_in_threshold(health: i32, strength: i32, above: f64, below: f64) -> bool {
+    if health == 0 && strength == 0 {
+        return true;
+    }
+    let ratio = f64::from(health) / f64::from(strength);
+    (if ratio > 0.0 {
+        ratio > above
+    } else {
+        ratio >= above
+    }) && ratio <= below
+}
+
+/// `EnumFunctions::CanTargetHouse` (`EnumFunctions.cpp:5..16`): `All` always
+/// matches, the owner takes its bucket, a neutral target its Neutral flag, an
+/// ally's, otherwise the enemy's. Presentation's DigitalDisplay visibility
+/// asks it with the viewer as the target.
+#[cfg(feature = "phobos")]
+pub fn can_target_house(
+    flags: crate::rules::phobos_shields::AffectedHouse,
+    source: InternedId,
+    target: InternedId,
+    houses: &crate::sim::houses::Houses,
+    alliances: &HouseAlliances,
+    interner: &StringInterner,
+) -> bool {
+    use crate::rules::phobos_shields::AffectedHouse;
+    if flags == AffectedHouse::ALL {
+        return true;
+    }
+    if source == target {
+        return flags.contains(AffectedHouse::OWNER);
+    }
+    if houses
+        .get(&target)
+        .is_some_and(|house| house.multiplay_passive())
+        && flags.contains(AffectedHouse::NEUTRAL)
+    {
+        return true;
+    }
+    if alliances.is_allied(interner, source, target) {
+        flags.contains(AffectedHouse::ALLIES)
+    } else {
+        flags.contains(AffectedHouse::ENEMIES)
+    }
 }

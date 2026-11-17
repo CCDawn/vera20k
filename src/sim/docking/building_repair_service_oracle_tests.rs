@@ -195,12 +195,12 @@ impl Scene {
             .and_then(|drive| drive.destination())
             .map_or_else(|| json!([0, 0, 0]), |at| json!([at.x, at.y, at.z]));
         json!({
-            "frame": self.sim.session.binary_frame,
+            "frame": self.sim.session.binary_frame(),
             "unit_coordinate": [at.x,at.y,at.z],
             "health": unit.health.current(),
             "estimate": unit.estimated_health.get(),
-            "balance": house.economy.credits(),
-            "spent": house.economy.spent_credits(),
+            "balance": house.economy().credits(),
+            "spent": house.economy().spent_credits(),
             "unit_mission": unit.mission.current().raw(),
             "unit_queued": unit.mission.queued().raw(),
             "unit_nav": self.nav(unit.navigation.nav_com()),
@@ -235,7 +235,7 @@ impl Scene {
         super::dispatch(
             &mut self.sim,
             self.depot,
-            Some(&self.rules),
+            &self.rules,
             ObjectAiCtx::default(),
             &mut false,
         );
@@ -298,7 +298,8 @@ fn scene(golden: &Value, row: &Value) -> Scene {
         "the bounded native scene supplies a stopped Drive"
     );
     let mut sim = Simulation::new();
-    sim.session.binary_frame = int(&before["frame"]) as u32;
+    sim.session
+        .set_binary_frame_for_test(int(&before["frame"]) as u32);
     sim.intern_rule_type_ids(&rules);
     sim.resolve_type_handles(&rules);
     // The shared native source fixture supplies Map+F4/F8=16 and final
@@ -312,13 +313,13 @@ fn scene(golden: &Value, row: &Value) -> Scene {
     );
     sim.playfield_bounds = Some(bounds);
     sim.playfield_size_height = Some(16);
-    sim.session.map_width = 16;
-    sim.session.map_height = 16;
+    sim.session.set_map_width_for_test(16);
+    sim.session.set_map_height_for_test(16);
     let mut terrain = test_flat_ground_grid(32);
     if let Some(level) = case["terrain_level"].as_u64() {
         for y in 0..32 {
             for x in 0..32 {
-                terrain.cell_mut(x, y).unwrap().level = level as u8;
+                terrain.cell_mut_for_test(x, y).unwrap().level = level as u8;
             }
         }
     }
@@ -330,7 +331,7 @@ fn scene(golden: &Value, row: &Value) -> Scene {
             &[],
             Some((16, 16)),
             Some(bounds),
-        ),
+        ).into(),
     );
     sim.path_grid = Some(Arc::new(path));
     sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(32, 32));
@@ -339,8 +340,8 @@ fn scene(golden: &Value, row: &Value) -> Scene {
     // either Techno is constructed. Install that same membership prerequisite.
     let owner = sim.interner.intern("Russians");
     let mut house = crate::sim::house_state::HouseState::new(owner, 1, None, true, 0, 0);
-    house.difficulty = crate::sim::house_state::HouseDifficulty::Hard;
-    sim.houses.insert(owner, house);
+    house.set_difficulty_for_test(crate::sim::house_state::HouseDifficulty::Hard);
+    sim.houses.register(house);
     let depot = sim
         .spawn_object(
             row["building"].as_str().unwrap(),
@@ -468,7 +469,7 @@ fn scene(golden: &Value, row: &Value) -> Scene {
         }
         if row["foot_before"].is_object() {
             let foot = &row["foot_before"];
-            let path = &mut unit.navigation.path_runtime;
+            let path = unit.navigation.path_runtime_mut();
             path.set_movement_timer_for_test(CdTimer::from_raw(
                 int(&foot["movement_timer"][0]),
                 int(&foot["movement_timer"][1]),
@@ -477,8 +478,8 @@ fn scene(golden: &Value, row: &Value) -> Scene {
                 int(&foot["blocked_timer"][0]),
                 int(&foot["blocked_timer"][1]),
             ));
-            path.set_retries_left(foot["retries_left"].as_u64().unwrap() as u32);
-            path.set_path_blocked(foot["path_blocked"].as_bool().unwrap());
+            path.set_retries_left_for_test(foot["retries_left"].as_u64().unwrap() as u32);
+            path.set_path_blocked_for_test(foot["path_blocked"].as_bool().unwrap());
             assert_eq!(unit.in_playfield(), foot["in_playfield"].as_bool().unwrap());
             assert_eq!(
                 unit.is_mission_only(),
@@ -565,8 +566,12 @@ fn scene(golden: &Value, row: &Value) -> Scene {
     }
     let owner = sim.substrate.entities.get(tank).unwrap().owner();
     let house = sim.houses.get_mut(&owner).unwrap();
-    house.economy.set_credits_for_test(int(&before["balance"]));
-    house.economy.set_spent_for_test(int(&before["spent"]));
+    house
+        .economy_mut()
+        .set_credits_for_test(int(&before["balance"]));
+    house
+        .economy_mut()
+        .set_spent_for_test(int(&before["spent"]));
     sim.scenario_rng = if let Some(hex) = row["rng_before"]["scenario"].as_str() {
         SimRng::from_native_state_hex_for_test(hex)
     } else {
@@ -634,7 +639,7 @@ fn native_pending_entry_and_radio_lifecycle_use_shared_command_owners() {
             "unit_null" => {
                 scene.sim.set_unit_null_destination(
                     scene.tank,
-                    Some(&scene.rules),
+                    &scene.rules,
                     None,
                     crate::sim::world::FrameEffects::default(),
                 );
@@ -651,7 +656,7 @@ fn native_pending_entry_and_radio_lifecycle_use_shared_command_owners() {
             "unit_idle" => {
                 let _ = scene.sim.unit_enter_idle_mode(
                     scene.tank,
-                    Some(&scene.rules),
+                    &scene.rules,
                     false,
                     crate::sim::world::FrameEffects::default(),
                 );
@@ -663,7 +668,7 @@ fn native_pending_entry_and_radio_lifecycle_use_shared_command_owners() {
                     MissionType::Move,
                     None,
                     None,
-                    Some(&scene.rules),
+                    &scene.rules,
                     crate::sim::world::FrameEffects::default(),
                 );
             }
@@ -913,7 +918,7 @@ fn native_unit_radio_repair_payment_heal_and_responses() {
             Some(scene.depot),
             RadioMessage::RepairTick,
             RadioPayload::default(),
-            Some(&scene.rules),
+            &scene.rules,
             crate::sim::world::FrameEffects::default(),
         );
         let step = &row["steps"][0];
@@ -988,7 +993,7 @@ fn native_unit_destination_power_tail_uses_raw_cell_and_shared_setters() {
         if row["input"]["null"] == true {
             scene.sim.set_unit_null_destination(
                 scene.tank,
-                Some(&scene.rules),
+                &scene.rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
             );
@@ -1082,7 +1087,12 @@ fn native_ready_prerequisites_use_the_building_commence_owner() {
         for step in row["steps"].as_array().unwrap() {
             match step["entry"].as_str().unwrap() {
                 "0x5b3060" => scene.visit_depot(),
-                "0x43ff91" => super::ready_commence(&mut scene.sim, scene.depot, false),
+                "0x43ff91" => super::ready_commence(
+                    &scene.sim.session,
+                    &mut scene.sim.substrate,
+                    scene.depot,
+                    false,
+                ),
                 "0x43c2d0" => {
                     let reply = radio::receive_radio(
                         &mut scene.sim,
@@ -1090,7 +1100,7 @@ fn native_ready_prerequisites_use_the_building_commence_owner() {
                         Some(scene.tank),
                         RadioMessage::DockNow,
                         RadioPayload::default(),
-                        Some(&scene.rules),
+                        &scene.rules,
                         crate::sim::world::FrameEffects::default(),
                     );
                     assert_eq!(
@@ -1120,7 +1130,7 @@ fn native_paid_retry_full_release_histories_run_mission_dispatch_every_frame() {
                 Some(scene.tank),
                 RadioMessage::DockNow,
                 RadioPayload::default(),
-                Some(&scene.rules),
+                &scene.rules,
                 crate::sim::world::FrameEffects::default(),
             );
             let native = steps.next().unwrap();
@@ -1131,7 +1141,7 @@ fn native_paid_retry_full_release_histories_run_mission_dispatch_every_frame() {
             scene.compare(&native["after"], name);
         }
         for frame in int(&row["before"]["frame"]) as u32..=int(&row["input"]["to_frame"]) as u32 {
-            scene.sim.session.binary_frame = frame;
+            scene.sim.session.set_binary_frame_for_test(frame);
             if let Some(step) = steps.peek()
                 && step["entry"] == "0x65c6d0"
                 && int(&step["after"]["frame"]) as u32 == frame
@@ -1153,7 +1163,7 @@ fn native_paid_retry_full_release_histories_run_mission_dispatch_every_frame() {
                     .unwrap()
                     .owner();
                 crate::sim::credit_income::add_credits(
-                    &mut scene.sim,
+                    &mut scene.sim.houses,
                     owner,
                     int(&row["input"]["deposit"]),
                 );
@@ -1186,7 +1196,7 @@ fn independent_repair_progress_contributes_to_state_hash() {
         .unwrap();
     let mut scene = scene(&golden, row);
     for frame in 200..=279 {
-        scene.sim.session.binary_frame = frame;
+        scene.sim.session.set_binary_frame_for_test(frame);
         scene.visit_depot();
     }
     let progress = *scene

@@ -1,10 +1,10 @@
 # Native tactical fast scrolling
 
-`fast_scroll.py` executes the pinned retail `gamemd.exe` through the shared
+`fast_scroll.py` executes the retail `gamemd.exe` through the shared
 [`native_oracle`](../native_oracle.md) loader and checked runner. It never reads
 VERA's camera implementation or computes a second scrolling algorithm. Its JSON
-contains native observations, and the sidecar identifies the executable,
-Unicorn version, producer/shared-runner hashes, substitutions and payload hash.
+contains native observations, and the sidecar records the substitutions and
+payload hash.
 
 ```sh
 python -m tools.input_oracle.fast_scroll --check
@@ -13,8 +13,6 @@ python -m tools.input_oracle.fast_scroll --write
 ```
 
 Configure `VERA20K_GAMEMD_EXE` or `RA2_DIR` as described by the shared runner.
-Accepted executable SHA-256:
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
 No retail executable is included. Help does not require retail configuration.
 
 ## Executed coverage
@@ -77,7 +75,7 @@ comparison. The full viewport updater executes; no ZBuffer is allocated.
 The existing discovery-geometry startup executes original initializers for the
 independent ground/shroud height scalars and projection constants.
 The margin control reaches the original cursor setter's already-set/null-image
-early return. Sidecars record executable identity, replay and these boundaries,
+early return. Sidecars record replay and these boundaries,
 without repository source hashes.
 
 ## Established native behavior
@@ -323,15 +321,18 @@ OS-specific pointer capture, or network service cadence.
 
 The camera controller in `src/app/input/camera.rs` owns drag polling, the
 method-zero distance calculation and pending scroll requests. The runtime's
-existing `RuntimePassDecision` admits native scrolling once per offline game
-frame. Zoom and placement retain their separate presentation cadence; VERA's
-developer pause still admits camera input. Networking is not live in this build
-and its existing extra-poll policy is not a native cadence claim.
+existing `RuntimePassDecision` admits the native input poll, which writes the
+right-drag latch, once per offline game frame. Scroll movement deliberately
+leaves that cadence: the camera takes the oracle's distances on its own 16 ms
+clock, so the scroll speed is the same at every game speed. Zoom and placement
+retain their separate presentation cadence; VERA's developer pause still admits
+camera input. The network modes' extra-poll policy is not a native cadence claim.
 
 Mouse input is sampled before simulation. At the existing pre-follow seam the
 camera consumes the previous keyboard request and current mouse request in one
-clamp against this frame's playfield authority. Main_Tick's later keyboard
-request remains pending until the next admitted frame. Absolute view changes
+clamp against this frame's playfield authority; a pass without a game frame
+commits through the same clamp. The keyboard request queued at the end of a pass
+remains pending until the next commit. Absolute view changes
 (follow, bookmarks, minimap, loading and VERA zoom) discard pending requests
 through `set_camera_position`. This prevents an outward request at a boundary
 from being discarded before an opposing inward request arrives. The private
@@ -345,8 +346,8 @@ outputs. The camera sequence test enters the production request commit and
 clamp with bounds from the production playfield-geometry owner. It converts the
 native center to VERA's top-left frame using the verified viewport half-extents
 and the existing shared world-row bias. `camera_cadence_tests.rs` also drives the
-real local frame pacer to ensure extra redraws cannot add scroll steps or latch
-a drag between admitted polls.
+real local frame pacer to ensure extra redraws cannot add input polls or latch a
+drag between admitted polls, and that scroll steps do not follow the game speed.
 
 Validation on macOS, 2026-10-01:
 

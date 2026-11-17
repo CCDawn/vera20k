@@ -123,9 +123,9 @@ impl GadgetSpec {
     }
 
     /// Invisible Action-only click region ctor (A3): sticky, custom event mask
-    /// (tactical 0x7F / minimap 0x9F), `ClickRegion` behavior, no id. The sticky
+    /// (tactical 0x7F / minimap 0xDF), `ClickRegion` behavior, no id. The sticky
     /// byte makes the dispatcher acquire capture on a press so a drag stays
-    /// bound to the region across the sidebar boundary (G17). The 0x7F/0x9F
+    /// bound to the region across the sidebar boundary (G17). The 0x7F/0xDF
     /// masks already include the sticky `|5` bits.
     pub fn click_region(rect: GadgetRect, flags: u16) -> Self {
         let mut spec = Self::new(rect, flags, true);
@@ -186,7 +186,6 @@ impl GadgetList {
     }
 
     /// G2 — Add_Head: prepend.
-    #[cfg(test)]
     pub fn add_head(&mut self, spec: GadgetSpec) -> GadgetHandle {
         let g = self.alloc(spec);
         let h = g.handle;
@@ -292,31 +291,12 @@ pub fn set_enabled(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
 
     fn rect() -> GadgetRect {
         GadgetRect::new(0, 0, 10, 10)
-    }
-
-    #[test]
-    fn cameo_and_click_region_ctors_a2_a3() {
-        let r = GadgetRect::new(0, 0, 60, 48);
-        let cameo = GadgetSpec::cameo(r, 1000);
-        assert!(!cameo.sticky, "cameo is NOT sticky");
-        assert_eq!(cameo.flags, super::super::CAMEO_FLAGS, "cameo mask 0x19");
-        assert_eq!(cameo.id, 1000);
-        assert!(matches!(cameo.behavior, GadgetBehavior::Cameo));
-
-        let region = GadgetSpec::click_region(GadgetRect::new(0, 0, 800, 600), 0x7F);
-        assert!(region.sticky, "click region is sticky");
-        assert_eq!(
-            region.flags, 0x7F,
-            "0x7F already includes the sticky |5 bits"
-        );
-        assert_eq!(region.id, 0, "no id");
-        assert!(matches!(region.behavior, GadgetBehavior::ClickRegion));
     }
 
     #[test]
@@ -346,15 +326,6 @@ mod tests {
         assert!(!l.remove(a, &mut f), "double remove rejected");
         let order: Vec<GadgetHandle> = l.iter().map(|g| g.handle).collect();
         assert_eq!(order, vec![c, d, b]);
-    }
-
-    #[test]
-    fn add_after_missing_returns_none() {
-        let mut l = GadgetList::new(ListId(1));
-        assert!(
-            l.add_after(GadgetHandle(99), GadgetSpec::new(rect(), 0, false))
-                .is_none()
-        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 use super::{
     BaseZoneTopology, HierarchyBlock, HierarchyEdgeBuckets, HierarchyTempEdge, base_record_index,
-    native_zone_grid_position,
+    level_gap, native_zone_grid_position,
 };
 use crate::map::resolved_terrain::{ResolvedTerrainGrid, zone_class};
 use crate::sim::bridge_state::BridgeEndpointRecord;
@@ -59,6 +59,25 @@ pub(super) struct HierarchyCells<'a> {
     pub(super) width: u16,
     pub(super) height: u16,
     pub(super) native_scan_offset: Option<i32>,
+    /// Read Levels signed: terrain deformation is on ([`level_gap`]).
+    pub(super) signed_levels: bool,
+}
+
+impl<'a> HierarchyCells<'a> {
+    fn new(
+        base: &'a BaseZoneTopology,
+        terrain: Option<&ResolvedTerrainGrid>,
+        width: u16,
+        height: u16,
+    ) -> Self {
+        Self {
+            base,
+            width,
+            height,
+            native_scan_offset: None,
+            signed_levels: terrain.is_some_and(ResolvedTerrainGrid::terrain_deformation),
+        }
+    }
 }
 
 impl HierarchyCells<'_> {
@@ -126,6 +145,10 @@ impl HierarchyCells<'_> {
         self.cell(x, y).map_or(0, |cell| cell.level)
     }
 
+    fn level_gap(self, a: u8, b: u8) -> u8 {
+        level_gap(a, b, self.signed_levels)
+    }
+
     fn base_id(self, x: i32, y: i32) -> ZoneId {
         self.cell(x, y).map_or(0, |cell| cell.base_id)
     }
@@ -155,12 +178,7 @@ pub(crate) fn build_zone_hierarchy(
     width: u16,
     height: u16,
 ) -> ZoneHierarchy {
-    let cells = HierarchyCells {
-        base,
-        width,
-        height,
-        native_scan_offset: None,
-    };
+    let cells = HierarchyCells::new(base, terrain, width, height);
     build_zone_hierarchy_with_query(base, terrain, records, width, height, &mut |x, y| {
         cells.class(x, y) != zone_class::OUTSIDE
     })
@@ -174,12 +192,7 @@ pub(crate) fn build_zone_hierarchy_with_query(
     height: u16,
     query: &mut impl FnMut(i32, i32) -> bool,
 ) -> ZoneHierarchy {
-    let cells = HierarchyCells {
-        base,
-        width,
-        height,
-        native_scan_offset: None,
-    };
+    let cells = HierarchyCells::new(base, terrain, width, height);
     let level2 = build_hierarchy_level(cells, terrain, records, 2, None, query);
     let level1 = build_hierarchy_level(cells, terrain, records, 1, Some(&level2), query);
     let level0 = build_hierarchy_level(cells, terrain, records, 0, Some(&level1), query);
@@ -205,12 +218,7 @@ pub(crate) fn incremental_rebuild_zone_hierarchy_around_cell(
     width: u16,
     height: u16,
 ) -> LocalHierarchyPatchResult {
-    let cells = HierarchyCells {
-        base,
-        width,
-        height,
-        native_scan_offset: None,
-    };
+    let cells = HierarchyCells::new(base, Some(terrain), width, height);
     patch_zone_hierarchy_with_query(
         hierarchy,
         base,
@@ -238,12 +246,7 @@ pub(crate) fn patch_zone_hierarchy_with_query(
     if !query(x, y) {
         return LocalHierarchyPatchResult::Outside;
     }
-    let cells = HierarchyCells {
-        base,
-        width,
-        height,
-        native_scan_offset: None,
-    };
+    let cells = HierarchyCells::new(base, Some(terrain), width, height);
     for level in (0..3).rev() {
         let size = 1i32 << (level + 1);
         let block = HierarchyBlock {
@@ -330,6 +333,7 @@ fn patch_hierarchy_level(
                 parent_id,
                 cells.class(x, y),
                 (x as i16, y as i16),
+                crate::map::cell_index::CellGrid::for_extent(cells.width, cells.height),
             )) {
                 return false;
             }
@@ -394,17 +398,27 @@ fn build_hierarchy_level(
                 continue;
             }
             let next_zone = graph.record_slot_count();
-            let zone = ZoneId::try_from(next_zone).unwrap_or_else(|_| {
-                panic!(
-                    "zone hierarchy level {level} exceeds ZoneId capacity at real zone {next_zone}"
-                )
-            });
+            // Retail maps keep the native 16-bit zone capacity; extended maps
+            // use the full ZoneId.
+            let zone = ZoneId::try_from(next_zone)
+                .ok()
+                .filter(|&zone| {
+                    crate::map::cell_index::CellGrid::for_extent(cells.width, cells.height)
+                        .is_extended()
+                        || zone <= ZoneId::from(u16::MAX)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "zone hierarchy level {level} exceeds ZoneId capacity at real zone {next_zone}"
+                    )
+                });
             let parent_id = parent.map_or(0, |parent| cells.zone(parent, x, y));
             assert!(graph.append_record(ZoneRecord::from_seed(
                 zone,
                 parent_id,
                 cells.class(x, y),
-                (x as i16, y as i16)
+                (x as i16, y as i16),
+                crate::map::cell_index::CellGrid::for_extent(cells.width, cells.height)
             )));
             let block = HierarchyBlock {
                 x_min: x & !(size - 1),
@@ -540,7 +554,7 @@ pub(super) fn register_bridge_hierarchy_edges_with_lookup(
     for (from, to) in [(a, b), (side_a, side_b), (opposite_a, opposite_b)] {
         let from = zone_at(from);
         let to = zone_at(to);
-        register_native_hierarchy_pair(edge_buckets, from, to, 0);
+        register_native_hierarchy_pair(edge_buckets, from, to, 0, terrain.cell_grid());
     }
 }
 
@@ -612,14 +626,22 @@ pub(super) fn register_native_hierarchy_pair(
     a: ZoneId,
     b: ZoneId,
     flag: u8,
+    grid: crate::map::cell_index::CellGrid,
 ) {
     //582FFD..583012 sign-extends both words before OR. Preserve exact packed
     //transcript, including the native high-bit zone-ID limitation.
     let bucket = (((a & 15) << 4) | (b & 15)) as usize;
-    let packed = (u32::from(a) << 16) | (i32::from(b as i16) as u32);
+    let (existing, current) = if grid.is_extended() {
+        // VERA extension: native word packing corrupts identifiers above 32767
+        // and cannot represent the >65535 records in a literal 500x500 map.
+        (a, b)
+    } else {
+        let packed = ((a as u32) << 16) | (i32::from(b as i16) as u32);
+        ((packed >> 16) as ZoneId, (packed as u16) as ZoneId)
+    };
     let edge = HierarchyTempEdge {
-        existing: (packed >> 16) as u16,
-        current: packed as u16,
+        existing,
+        current,
         flag,
     };
     // No zero/equality filter. First exact key retains its flag and place.
@@ -647,7 +669,7 @@ pub(super) fn flood_fill_hierarchy_scanline(
     while block.contains(left, sy)
         && let Some(cell) = cells.cell(left, sy)
         && cell.base_id == base_id
-        && cell.level.abs_diff(previous) < 2
+        && cells.level_gap(cell.level, previous) < 2
     {
         cell.index.set_zone(graph, zone);
         previous = cell.level;
@@ -668,7 +690,7 @@ pub(super) fn flood_fill_hierarchy_scanline(
     while block.contains(right, sy)
         && let Some(cell) = cells.cell(right, sy)
         && cell.base_id == base_id
-        && cell.level.abs_diff(previous) < 2
+        && cells.level_gap(cell.level, previous) < 2
     {
         cell.index.set_zone(graph, zone);
         previous = cell.level;
@@ -689,7 +711,7 @@ pub(super) fn flood_fill_hierarchy_scanline(
             let rx = cx.clamp(left + 1, right - 1);
             let cell = cells.cell(cx, cy);
             let level = cell.map_or(0, |cell| cell.level);
-            let height_allowed = level.abs_diff(cells.level(rx, sy)) < 2;
+            let height_allowed = cells.level_gap(level, cells.level(rx, sy)) < 2;
             if let Some(cell) = cell
                 && cell.index.zone(graph) == 0
                 && block.contains(cx, cy)
@@ -737,12 +759,20 @@ fn register_hierarchy_horizontal_edge(
     last_neighbor: &mut Option<ZoneId>,
 ) {
     let existing = cells.zone(graph, candidate.0, candidate.1);
-    if existing as i16 > 0
+    // Native tests the signed zone word. VERA extension: extended maps keep
+    // their wide identifiers, as in `register_native_hierarchy_pair`.
+    let positive =
+        if crate::map::cell_index::CellGrid::for_extent(cells.width, cells.height).is_extended() {
+            existing > 0
+        } else {
+            existing as i16 > 0
+        };
+    if positive
         && *last_neighbor != Some(existing)
-        && cells
-            .level(candidate.0, candidate.1)
-            .abs_diff(cells.level(reference.0, reference.1))
-            < 2
+        && cells.level_gap(
+            cells.level(candidate.0, candidate.1),
+            cells.level(reference.0, reference.1),
+        ) < 2
         && query(candidate.0, candidate.1)
         && query(reference.0, reference.1)
     {

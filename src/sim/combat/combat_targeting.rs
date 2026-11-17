@@ -38,12 +38,12 @@ use super::combat_weapon::{
 };
 use super::threat_range::{self, ScanMission};
 use crate::map::entities::EntityCategory;
-use crate::map::houses::HouseAllianceMap;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::object_type::ObjectType;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::game_entity::GameEntity;
+use crate::sim::house_diplomacy::HouseAlliances;
 use crate::sim::intern::{InternedId, StringInterner};
 use crate::sim::vision::FogState;
 use crate::util::fixed_math::SimFixed;
@@ -57,9 +57,9 @@ use crate::util::native_x87::{
 #[derive(Clone)]
 pub(crate) struct GarrisonSnapshot {
     /// `+0x69C`, the firing occupant's index: the shot's muzzle port.
-    pub fire_index: u8,
+    pub fire_index: i32,
     /// The occupant count (`+0x694`), GetROF's divisor.
-    pub occupant_count: u8,
+    pub occupant_count: i32,
 }
 
 /// Snapshot of an attacker's state for target scanning.
@@ -197,7 +197,7 @@ pub(crate) fn calculate_ai_threat_score(
     rules: &RuleSet,
     interner: &StringInterner,
     terrain: Option<&ResolvedTerrainGrid>,
-    alliances: Option<&HouseAllianceMap>,
+    alliances: Option<&HouseAlliances>,
     scorer_enemy_house: Option<crate::sim::intern::InternedId>,
 ) -> Option<MaskedX87Value> {
     let scorer = entities.get(scorer_id)?;
@@ -253,6 +253,16 @@ pub(crate) fn retaliation_weapon_index(
         victim_type,
         &attacker_facts(victim, victim_type),
         Some(&source_as_target),
+        |index| {
+            super::combat_weapon::get_weapon(
+                victim,
+                victim_type,
+                index,
+                &world.substrate.entities,
+                rules,
+                &world.interner,
+            )
+        },
     )
 }
 
@@ -289,10 +299,14 @@ pub(crate) fn should_retaliate(
     };
     let house = world.houses.get(&victim.owner());
     let human =
-        house.is_some_and(|house| house.is_controlled_by_human(world.session.game_mode_nonzero));
+        house.is_some_and(|house| house.is_controlled_by_human(world.session.game_mode_nonzero()));
     // `0x007087DD` CanRetaliate; `0x007087EB` a slave (SlaveOwner `+0x2DC`);
     // `0x007087F9` a slaver (SlaveManager `+0x2D8`). A slave freed by its
     // master's death (`0x006B0B73`) retaliates again.
+    // Ares7087EB ->1004B2D0 refuses a driverless victim before the slave gates.
+    if rules.ares() && victim.driver_killed() {
+        return false;
+    }
     if !victim_type.can_retaliate
         || victim.slave.owner().is_some()
         || victim.slave_manager.is_some()
@@ -301,16 +315,13 @@ pub(crate) fn should_retaliate(
     }
     // `0x00708807..0x0070881F`: draining (`+0x1CC`) for a house that is not
     // human (`House+0x1EC`).
-    if victim.drain.target().is_some() && !house.is_some_and(|house| house.is_human) {
+    if victim.drain.target().is_some() && !house.is_some_and(|house| house.is_human()) {
         return false;
     }
     // `0x0070882F` a full CaptureManager (being controlled is no gate);
     // `0x0070883C` a SpawnManager; `0x0070884A` a human's object that already
     // has a Target; `0x00708867` the mission's `Retaliate=`.
-    if victim
-        .capture_manager
-        .as_ref()
-        .is_some_and(|manager| manager.is_full())
+    if world.capture_manager_is_full(victim.stable_id(), rules)
         || victim.spawn_manager.is_some()
         || (human && victim.attack_target.target().is_some())
         || crate::sim::mission::control::current_control(rules, &victim.mission)
@@ -352,7 +363,15 @@ pub(crate) fn should_retaliate(
     // `0x007088A7` GetWeaponDamageValue(-1) > 0 (a healer never retaliates);
     // `0x007088BC` Is_Armed (`BuildingClass::Is_Armed @ 0x00458DB0` answers
     // true for an occupied building).
-    if subject.weapon_damage_value() <= 0 || !super::combat_weapon::is_armed(victim, victim_type) {
+    if subject.weapon_damage_value() <= 0
+        || !super::combat_weapon::is_armed(
+            victim,
+            victim_type,
+            &world.substrate.entities,
+            rules,
+            interner,
+        )
+    {
         return false;
     }
     // `0x007088CA..0x007088FF`: SelectWeapon(source), then GetFireError
@@ -416,7 +435,7 @@ pub(crate) fn should_retaliate(
     let victim_enemy = world
         .houses
         .get(&victim.owner())
-        .and_then(|house| house.enemy_house);
+        .and_then(|house| house.enemy_house());
     if !human
         && let Some(TargetKind::Entity(current_id)) = victim.attack_target.target()
         && let (Some(current_score), Some(source_score)) = (
@@ -455,9 +474,11 @@ pub(crate) fn should_retaliate(
     // warhead skips the test and retaliates (`0x00708AD4`, `0x00708ADE`).
     subject
         .weapon_at(subject.weapon_index)
-        .and_then(|weapon| super::combat_weapon::warhead_of(rules, weapon))
+        .and_then(|weapon| rules.weapon_warhead(weapon))
         .is_none_or(|warhead| {
-            warhead.verses_f64[super::armor_index(&source_type.armor)] > f64::from(0.01_f32)
+            // Ares 3.0 hook100543E0 replaces only this original threshold
+            // with the independently retained Retaliate flag.
+            warhead.interaction(source_type.armor_id()).can_retaliate()
         })
 }
 

@@ -20,7 +20,7 @@ fn native_bridge_record_geometry_changes_rebuild_and_restore_navigation() {
     let mut sim = Simulation::with_seed(0x56c510);
     let mut terrain = gsi_04_10_clear_terrain(16, 16);
     for y in 0..16 {
-        let cell = terrain.cell_mut(8, y).unwrap();
+        let cell = terrain.cell_mut_for_test(8, y).unwrap();
         cell.zone_type = zone_class::OUTSIDE;
         cell.ground_walk_blocked = true;
         cell.base_ground_walk_blocked = true;
@@ -128,9 +128,9 @@ fn rules_and_overlays() -> (RuleSet, OverlayTypeRegistry) {
     let ini = IniFile::from_str(
         "[Countries]\n0=Americans\n[InfantryTypes]\n[VehicleTypes]\n[AircraftTypes]\n\
          [BuildingTypes]\n0=YARD\n1=HELD\n2=UPGRADE\n\
-         [YARD]\nStrength=500\nBib=yes\nFactory=BuildingType\nOwner=Americans\n\
+         [YARD]\nStrength=500\nBib=yes\nFactory=BuildingType\nOwner=Americans\nUpgrades=1\n\
          [HELD]\nStrength=300\nCost=100\nTechLevel=1\nOwner=Americans\n\
-         [UPGRADE]\nStrength=100\n\
+         [UPGRADE]\nStrength=100\nPowersUpBuilding=YARD\n\
          [OverlayTypes]\n0=ROAD\n[ROAD]\nLand=Road\n\
          [Road]\nFoot=37%\nTrack=100%\n",
     );
@@ -152,7 +152,7 @@ fn recalc_keeps_marked_structure_over_partial_terrain_occupation_and_bridge_deck
     let (rules, _) = rules_and_overlays();
     let mut sim = Simulation::with_seed(47);
     let mut terrain = gsi_04_10_clear_terrain(16, 16);
-    let tree_cell = terrain.cell_mut(6, 6).unwrap();
+    let tree_cell = terrain.cell_mut_for_test(6, 6).unwrap();
     tree_cell.terrain_object_occupation = Some(1);
     tree_cell.terrain_object_blocks = true;
     let ground = crate::sim::pathfinding::PathGrid::from_resolved_terrain(&terrain);
@@ -165,7 +165,7 @@ fn recalc_keeps_marked_structure_over_partial_terrain_occupation_and_bridge_deck
         crate::sim::game_entity::GameEntity::test_default(47, "YARD", "Americans", 6, 6);
     structure.set_category_for_test(EntityCategory::Structure);
     structure.set_type_ref_for_test(sim.interner.intern("YARD"));
-    structure.lifecycle.set_cell_marked(true);
+    structure.lifecycle.set_cell_marked_for_test(true);
     structure.death.set_dying_for_test(true); // Dying still owns its marked footprint.
     sim.substrate.entities.insert(structure);
     assert!(sim.rebuild_dynamic_navigation(&rules));
@@ -176,7 +176,7 @@ fn recalc_keeps_marked_structure_over_partial_terrain_occupation_and_bridge_deck
     );
     let before = sim.path_grid_snapshot().unwrap();
     let terrain = sim.resolved_terrain.as_mut().unwrap();
-    let cell = terrain.cell_mut(6, 6).unwrap();
+    let cell = terrain.cell_mut_for_test(6, 6).unwrap();
     cell.level = 4;
     cell.slope_type = 1;
     cell.bridge_deck_level = 8;
@@ -187,6 +187,7 @@ fn recalc_keeps_marked_structure_over_partial_terrain_occupation_and_bridge_deck
     crate::sim::world::navigation::NavigationCaches {
         zones: &mut sim.zone_grid,
         path: &mut sim.path_grid,
+        overlays: sim.overlay_grid.as_ref(),
         playfield_bounds: sim.playfield_bounds,
     }
     .publish_recalculated_cell(
@@ -242,18 +243,24 @@ fn assert_retained_roles(sim: &Simulation, parent_id: u64, upgrade_id: u64, held
             .lifecycle
             .cell_marked()
     );
-    let upgrade = sim.substrate.entities.get(upgrade_id).unwrap();
-    assert!(!upgrade.lifecycle.in_limbo() && !upgrade.lifecycle.cell_marked());
-    assert!(
-        upgrade
-            .structure_upgrade_link()
-            .is_some_and(|link| link.parent_stable_id() == parent_id)
+    let parent = sim.substrate.entities.get(parent_id).unwrap();
+    assert_eq!(parent.building_upgrades().count(), 1);
+    assert_eq!(
+        parent.building_upgrades().types()[0],
+        sim.interner.get("UPGRADE")
     );
+    // UnInit consumes the temporary immediately; the frame's deferred drain
+    // then removes its physical entry. Neither phase owns a footprint.
+    if let Some(upgrade) = sim.substrate.entities.get(upgrade_id) {
+        assert!(!upgrade.lifecycle.object_alive());
+        assert!(upgrade.lifecycle.in_limbo() && !upgrade.lifecycle.cell_marked());
+        assert!(!upgrade.in_logic_vector.is_member());
+    }
     let held = sim.substrate.entities.get(held_id).unwrap();
     assert!(held.lifecycle.in_limbo() && !held.lifecycle.cell_marked());
     assert_eq!(
         sim.production
-            .factories
+            .factories()
             .view(held.owner(), ProductionCategory::Building)
             .unwrap()
             .object
@@ -265,44 +272,46 @@ fn assert_retained_roles(sim: &Simulation, parent_id: u64, upgrade_id: u64, held
 }
 
 #[test]
-fn held_factory_and_attached_upgrade_stay_off_navigation_through_frame_and_restore() {
+fn held_factory_and_consumed_upgrade_stay_off_navigation_through_frame_and_restore() {
     let (rules, overlays) = rules_and_overlays();
     let mut sim = Simulation::with_seed(0x4D41_524B);
-    sim.session.map_width = 16;
-    sim.session.map_height = 16;
-    sim.session.game_options.crates = false;
-    sim.production.ore_growth_config.grows = false;
-    sim.production.ore_growth_config.spreads = false;
+    sim.session.set_map_width_for_test(16);
+    sim.session.set_map_height_for_test(16);
+    sim.session.game_options_mut_for_test().crates = false;
+    sim.ore_growth_config.set_grows_for_test(false);
+    sim.ore_growth_config.set_spreads_for_test(false);
     let terrain = gsi_04_10_clear_terrain(16, 16);
     sim.install_resolved_terrain_for_new_map(terrain.clone());
     let overlay_grid = OverlayGrid::from_overlay_entries(&[], 16, 16);
     sim.overlay_grid = Some(overlay_grid);
     sim.intern_rule_type_ids(&rules);
     let owner = sim.interner.intern("Americans");
-    sim.houses.insert(
-        owner,
-        crate::sim::house_state::HouseState::new(owner, 0, None, true, 50_000, 10),
-    );
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 50_000, 10,
+        ));
     let mut yard = make_test_entity("YARD", EntityCategory::Structure);
     yard.cell_x = 6;
     yard.cell_y = 6;
-    yard.structure_upgrades = [Some("UPGRADE".to_owned()), None, None];
+    yard.structure_columns.upgrade_count = 1;
+    yard.structure_columns.upgrade_tokens = [Some("UPGRADE".to_owned()), None, None];
     assert_eq!(sim.spawn_from_map(&[yard], Some(&rules)), 2);
     sim.resolve_type_handles(&rules);
     let parent_id = sim
         .substrate
         .entities
         .values()
-        .find(|entity| entity.structure_upgrade_link().is_none())
+        .find(|entity| sim.interner.resolve(entity.type_ref()) == "YARD")
         .unwrap()
         .stable_id();
     let upgrade = sim
         .substrate
         .entities
         .values()
-        .find(|entity| entity.structure_upgrade_link().is_some())
+        .find(|entity| sim.interner.resolve(entity.type_ref()) == "UPGRADE")
         .unwrap();
-    assert!(!upgrade.lifecycle.in_limbo() && !upgrade.lifecycle.cell_marked());
+    assert!(!upgrade.lifecycle.object_alive());
+    assert!(upgrade.lifecycle.in_limbo() && !upgrade.lifecycle.cell_marked());
     let upgrade_id = upgrade.stable_id();
     assert!(enqueue_by_type(
         &mut sim,
@@ -314,7 +323,7 @@ fn held_factory_and_attached_upgrade_stay_off_navigation_through_frame_and_resto
     ));
     let held_id = sim
         .production
-        .factories
+        .factories()
         .view(owner, ProductionCategory::Building)
         .unwrap()
         .object
@@ -338,7 +347,7 @@ fn held_factory_and_attached_upgrade_stay_off_navigation_through_frame_and_resto
     let output = sim
         .advance_app_frame(
             &[],
-            Some(&rules),
+            &rules,
             Some(&overlays),
             67,
             TickLane::Ordinary,
@@ -352,6 +361,11 @@ fn held_factory_and_attached_upgrade_stay_off_navigation_through_frame_and_resto
     );
     assert_only_marked_foundation(&sim);
     assert_retained_roles(&sim, parent_id, upgrade_id, held_id);
+
+    assert!(
+        sim.substrate.entities.get(upgrade_id).is_none(),
+        "the committed frame drains the consumed upgrade"
+    );
 
     let bytes = GameSnapshot::save(&sim, 0, 0, "marked-navigation.map", 0);
     let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
@@ -420,10 +434,10 @@ fn structure_changes_publish_footprint_cells_without_rebuilding_zones() {
         crate::sim::game_entity::GameEntity::test_default(9, "YARD", "Americans", 6, 6);
     structure.set_category_for_test(EntityCategory::Structure);
     structure.set_type_ref_for_test(sim.interner.intern("YARD"));
-    structure.lifecycle.set_cell_marked(true);
+    structure.lifecycle.set_cell_marked_for_test(true);
     sim.substrate.entities.insert(structure);
     assert!(
-        sim.finalize_frame_overlays_and_navigation(Some(&rules), Some(&overlays), false, true)
+        sim.finalize_frame_overlays_and_navigation(&rules, Some(&overlays), false, true)
             .is_empty()
     );
     let placed = sim.path_grid_snapshot().unwrap();
@@ -445,9 +459,9 @@ fn structure_changes_publish_footprint_cells_without_rebuilding_zones() {
         .get_mut(9)
         .unwrap()
         .lifecycle
-        .set_cell_marked(false);
+        .set_cell_marked_for_test(false);
     let zones_before = zone_storage(&sim);
-    sim.finalize_frame_overlays_and_navigation(Some(&rules), Some(&overlays), false, true);
+    sim.finalize_frame_overlays_and_navigation(&rules, Some(&overlays), false, true);
     assert_eq!(*sim.path_grid_snapshot().unwrap(), *open);
     assert_eq!(zone_storage(&sim), zones_before);
 }
@@ -455,7 +469,7 @@ fn structure_changes_publish_footprint_cells_without_rebuilding_zones() {
 #[test]
 fn structure_mark_publishes_presence_and_preserves_other_marked_blockers() {
     let (rules, overlays) = rules_and_overlays();
-    let context = super::UninitContext::new(Some(&rules), Some(&overlays));
+    let context = super::UninitContext::new(&rules, Some(&overlays));
     let mut sim = Simulation::with_seed(0x43f180);
     sim.install_resolved_terrain_for_new_map(gsi_04_10_clear_terrain(16, 16));
     assert!(sim.rebuild_dynamic_navigation(&rules));
@@ -472,7 +486,7 @@ fn structure_mark_publishes_presence_and_preserves_other_marked_blockers() {
         structure.set_type_ref_for_test(sim.interner.intern("YARD"));
         structure
             .type_facts
-            .set_foundation_for_test(rules.object("YARD").unwrap().foundation.clone());
+            .set_foundation_for_test(rules.object("YARD").unwrap().foundation.clone().into());
         sim.substrate.entities.insert(structure);
         assert!(sim.mark_entity_put(id, context));
         assert_only_marked_foundation(&sim);

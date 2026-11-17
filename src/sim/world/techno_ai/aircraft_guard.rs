@@ -76,8 +76,15 @@ impl Simulation {
                 crate::sim::combat::combat_weapon::primary_for_tier(object, entity.veterancy.rank())
                     .is_some()
             }),
-            armed: object
-                .is_some_and(|object| crate::sim::combat::combat_weapon::is_armed(entity, object)),
+            armed: object.is_some_and(|object| {
+                crate::sim::combat::combat_weapon::is_armed(
+                    entity,
+                    object,
+                    &self.substrate.entities,
+                    rules,
+                    &self.interner,
+                )
+            }),
             ammo: entity.ammo().map_or(-1, |ammo| ammo.current()),
             type_ammo: object.map_or(0, |object| object.ammo),
             human: self.owner_is_human(entity.owner()),
@@ -187,7 +194,7 @@ impl GuardHost for WorldGuard<'_> {
     }
 
     fn queue(&mut self, mission: MissionType) {
-        crate::sim::aircraft::queue_mission(self.sim, self.id, mission);
+        crate::sim::aircraft::queue_mission(&mut self.sim.substrate, self.id, mission);
     }
 
     fn rate(&mut self) -> i32 {
@@ -247,7 +254,7 @@ impl GuardHost for WorldGuard<'_> {
             .assign_target_represented(
                 self.id,
                 None,
-                Some(self.rules),
+                self.rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
             )
@@ -287,7 +294,7 @@ impl GuardHost for WorldGuard<'_> {
             .assign_target_represented(
                 self.id,
                 Some(TargetKind::Entity(unit)),
-                Some(self.rules),
+                self.rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
             )

@@ -27,17 +27,14 @@
 //! draws over a repairing building (`app::presentation::ui_overlays`).
 //!
 //! RESIDUALS:
-//! - The wrench byte (`+0x6DE`: set when a repair starts below Strength,
-//!   flipped by every repair step) is read only by the Building CRC
-//!   (`0x00454260`); VERA does not keep it.
+//! - Repair phase `+6DE` is omitted: Building CRC4543EB reads it; the active
+//!   multiplayer checksum64DAB0 does not consume that class CRC.
 //! - Presentation: the repair step's redraw byte (`+0x80`, from
 //!   `BuildingClass::GetCurrentFrame 0x0043EF90`).
 //! - ToggleRepair's sounds and EVA play only for the owner's local player
 //!   (the app's `audible_to` gate), which is `IsHumanPlayer` outside
 //!   campaigns; in a campaign it reads `+0x1EC`/`+0x1ED` instead (dormant
 //!   while campaigns do not launch).
-//! - The REPAIR event resolves any target (`0x004C6ED5`) and needs only its
-//!   `+0x90`; VERA's command also requires the sender to own the building.
 //! - `UnitClass::Deploy` marks the deployed building AI-repairable when its
 //!   owner is not the local player (`IsHumanPlayer`, `0x007397E4`); VERA asks
 //!   whether a human controls the owner, the same in a skirmish. Another
@@ -51,11 +48,11 @@ use crate::map::entities::EntityCategory;
 use crate::rules::object_type::{FactoryType, ObjectType};
 use crate::rules::ruleset::RuleSet;
 use crate::sim::credit_income::{available_money, spend_money};
+use crate::sim::intern::InternedId;
 use crate::sim::world::{FrameEffects, SimSoundEvent, Simulation};
 use crate::util::native_x87::{MaskedX87Chop53 as X87, MaskedX87Ordering, NativeF64Bits};
 
 use super::production_sell::{SellOrder, sell_back, undeploys};
-use crate::rules::foundation::foundation_dimensions;
 
 /// A building's repair byte, `BuildingClass+0x6E8`: the repair step pays for
 /// each `RepairStep=` of health while it is on. The constructor clears it;
@@ -210,31 +207,36 @@ pub fn toggle_repair(
         return false;
     }
     match control {
-        RepairControl::Toggle => entity.repairing.on = !entity.repairing.on,
-        RepairControl::Stop if !entity.repairing.on => return true,
-        RepairControl::Stop => entity.repairing.on = false,
-        RepairControl::Start if entity.repairing.on => return true,
-        RepairControl::Start => entity.repairing.on = true,
+        RepairControl::Toggle => entity.building.repairing.on = !entity.building.repairing.on,
+        RepairControl::Stop if !entity.building.repairing.on => return true,
+        RepairControl::Stop => entity.building.repairing.on = false,
+        RepairControl::Start if entity.building.repairing.on => return true,
+        RepairControl::Start => entity.building.repairing.on = true,
     }
     let owner = entity.owner();
+    // The building being repaired is already resolved here; carry its type
+    // out so the EVA line can name it without a second lookup.
+    let type_id = entity.type_ref();
     let position = entity.position;
-    let sound = if entity.repairing.on && entity.health.current() == strength {
+    let sound = if entity.building.repairing.on && entity.health.current() == strength {
         rules.general.scold_sound.clone()
     } else {
-        if entity.repairing.on {
+        if entity.building.repairing.on {
             // ToggleRepair447082..447091: House50B6F0 admits Building
             // vt+148 Flash(7), before EVA/GenericClick. Reuse the shared
             // disguise/countdown owner, not a separate repair flash timer.
             // Original call arguments: building_repair.json toggle events.
             if owner_is_player {
-                entity.flash_base(7);
+                sim.substrate
+                    .flash_building(id, 7, sim.session.binary_frame());
             }
-            sim.sound_events.push(SimSoundEvent::Repairing { owner });
+            sim.sound_events
+                .emit(SimSoundEvent::Repairing { owner, type_id });
         }
         rules.general.generic_click_sound.clone()
     };
     if let Some(sound) = sound {
-        sim.sound_events.push(SimSoundEvent::voc_at_for(
+        sim.sound_events.emit(SimSoundEvent::voc_at_for(
             sound,
             Some([owner, owner]),
             &position,
@@ -283,7 +285,7 @@ pub(crate) fn engineer_repair(sim: &mut Simulation, rules: &RuleSet, id: u64) ->
         position.put_world_xy([coord.x, coord.y]);
         position.put_z(coord.z);
         sim.sound_events
-            .push(SimSoundEvent::voc_at(sound, &position));
+            .emit(SimSoundEvent::voc_at(sound, &position));
     }
     true
 }
@@ -307,7 +309,59 @@ pub fn can_repair_building(sim: &Simulation, rules: &RuleSet, id: u64) -> bool {
     object.click_repairable
         && object.repairable
         && entity.health.current() != object.strength
-        && !(foundation_dimensions(&object.foundation) == (1, 1) && undeploys(rules, object))
+        && !(object.foundation.dimensions() == (1, 1) && undeploys(rules, object))
+}
+
+/// VERA Auto Repair (`docs/auto-repair.md`): `owner`'s buildings a player
+/// would click with the wrench now, in stored-id order. Each is one the house
+/// may repair ([`can_repair_building`]), on neither Construction nor Selling
+/// and not repairing already: what [`update_repair_and_power`] and the
+/// computer's auto-repair start ask before starting one (`0x00450630`,
+/// `0x004506B2`). The owner's available money also covers a repair step for
+/// each, after the steps of the repairs already running, because the step
+/// stops a repair it cannot pay for (`0x00450813`): more starts than that
+/// would stop again at once. Read only: the player's own game sends each the
+/// ordinary REPAIR event, and stock play never asks.
+pub fn buildings_wanting_repair(sim: &Simulation, rules: &RuleSet, owner: InternedId) -> Vec<u64> {
+    let entities = &sim.substrate.entities;
+    let step_cost = |id: u64| {
+        let entity = entities.get(id)?;
+        let object = sim.object_type(entity.type_ref(), rules)?;
+        Some(i64::from(repair_step_cost(rules, object)))
+    };
+    let owned = entities.owned_ids(owner, EntityCategory::Structure);
+    let running: i64 = owned
+        .iter()
+        .filter(|&&id| {
+            entities
+                .get(id)
+                .is_some_and(|entity| entity.building.repairing.on)
+        })
+        .filter_map(|&id| step_cost(id))
+        .sum();
+    let mut money = i64::from(available_money(&sim.houses, owner)) - running;
+    owned
+        .iter()
+        .copied()
+        .filter(|&id| {
+            let Some(entity) = entities.get(id) else {
+                return false;
+            };
+            if entity.building.repairing.on
+                || entity.constructing_or_selling()
+                || !can_repair_building(sim, rules, id)
+            {
+                return false;
+            }
+            match step_cost(id) {
+                Some(cost) if money >= cost => {
+                    money -= cost;
+                    true
+                }
+                _ => false,
+            }
+        })
+        .collect()
 }
 
 /// Shared TechnoType repair step cost, vt+0xB0 (`0x007120D0`):
@@ -315,18 +369,17 @@ pub fn can_repair_building(sim: &Simulation, rules: &RuleSet, id: u64) -> bool {
 /// `Strength / RepairStep` steps (both IDIV), times `RepairPercent=` under the
 /// ambient PC53/chop x87 word, through `ftol`, and at least 1. Retail 15% is
 /// just below .15, so per-step shares of 20, 40 and 100 cost 2, 5 and 14.
-pub(crate) fn repair_step_cost(rules: &RuleSet, object: &ObjectType) -> i32 {
+pub fn repair_step_cost(rules: &RuleSet, object: &ObjectType) -> i32 {
     let step = rules.general.repair_step;
-    let steps = object.strength.checked_div(step).unwrap_or_else(|| {
-        panic!(
-            "native repair step cost IDIV fault at 007120EC: strength={} step={step}",
-            object.strength
-        )
-    });
+    // gamemd traps at 0x007120EC on `RepairStep=0`; VERA carries on with the
+    // floor of 1 below: no step count exists to share the cost over.
+    let Some(steps) = object.strength.checked_div(step) else {
+        return 1;
+    };
     let cost = rules.type_cost(object);
-    let share = cost.checked_div(steps).unwrap_or_else(|| {
-        panic!("native repair step cost IDIV fault at 007120F7: cost={cost} steps={steps}")
-    });
+    // gamemd traps at 0x007120F7 when Strength is below RepairStep (no whole
+    // step); VERA carries on: the one step that repairs it bears the cost.
+    let share = cost.checked_div(steps).unwrap_or(cost);
     X87::ftol_i32_low_masked(X87::mul(
         X87::load_i32(share),
         X87::load_f64(NativeF64Bits::from_bits(
@@ -358,11 +411,11 @@ pub(crate) fn update_repair_and_power(
     let admitted = sim
         .houses
         .get(&owner)
-        .is_some_and(|house| house.current_iq >= rules.general.iq_repair_sell)
+        .is_some_and(|house| house.current_iq() >= rules.general.iq_repair_sell)
         && !entity.constructing_or_selling()
         && can_repair_building(sim, rules, id);
     if admitted {
-        if available_money(sim, owner) < rules.general.credit_reserve {
+        if available_money(&sim.houses, owner) < rules.general.credit_reserve {
             low_credit_sale(sim, rules, id, registry, effects);
         } else {
             auto_repair_start(sim, rules, id);
@@ -378,7 +431,7 @@ pub(crate) fn update_repair_and_power(
 /// retail `SellBack=2` no skirmish building gets this far and none draws.
 /// Then `RandomRanged(0, 0x32)` on the Scenario stream (`0x004507C4`) must
 /// fall below the owner's TechLevel (unsigned), and a tagged building
-/// (`+0x34`, `0x004507D7`; VERA has no per-object tags), a construction yard
+/// (`Object+0x34`, `0x004507D7..0x004507DC`), a construction yard
 /// (`Factory=BuildingType`, `Type+0xEB8 == 7`, `0x004507DE`) and one at or
 /// above ConditionRed (`0x004507ED`) stay. The rest take [`sell_back`]'s
 /// computer order (`0x0045080D`).
@@ -395,13 +448,13 @@ fn low_credit_sale(
     let Some(house) = sim.houses.get(&entity.owner()) else {
         return;
     };
-    if !((sim.session.game_mode_nonzero || entity.ai_sell_repair.ai_sellable())
+    if !((sim.session.game_mode_nonzero() || entity.ai_sell_repair.ai_sellable())
         && entity.ai_sell_repair.was_attacked_by_enemy()
-        && house.authored_iq as u32 >= rules.general.iq_sell_back as u32)
+        && house.authored_iq() as u32 >= rules.general.iq_sell_back as u32)
     {
         return;
     }
-    let tech_level = house.tech_level;
+    let tech_level = house.tech_level();
     let Some(object) = sim.object_type(entity.type_ref(), rules) else {
         return;
     };
@@ -414,7 +467,9 @@ fn low_credit_sale(
         MaskedX87Ordering::Less | MaskedX87Ordering::Unordered
     );
     let roll = sim.scenario_rng.next_range_u32_inclusive(0, 0x32);
-    if roll >= tech_level as u32 || yard || !below_red {
+    // UpdateRepairAndPower4507D7..4507DC checks raw Object+34 after
+    // the roll: even a disabled Trigger's attached Tag vetoes this order.
+    if roll >= tech_level as u32 || sim.object_has_trigger_tag(id) || yard || !below_red {
         return;
     }
     let _ = sell_back(sim, rules, id, SellOrder::Computer, registry, effects);
@@ -437,18 +492,21 @@ fn auto_repair_start(sim: &mut Simulation, rules: &RuleSet, id: u64) {
     let Some(house) = sim.houses.get(&owner) else {
         return;
     };
-    if house.repair_start_latch || entity.repairing.on {
+    if house.repair_start_latch() || entity.building.repairing.on {
         return;
     }
-    let controlled = house.is_controlled_by_human(sim.session.game_mode_nonzero);
-    if !(entity.has_been_captured.is_set() || entity.ai_sell_repair.ai_repairable() || controlled) {
+    let controlled = house.is_controlled_by_human(sim.session.game_mode_nonzero());
+    if !(entity.building.has_been_captured.is_set()
+        || entity.ai_sell_repair.ai_repairable()
+        || controlled)
+    {
         return;
     }
     let delay = house.repair_delay();
     sim.houses
         .get_mut(&owner)
         .expect("the owner was just read")
-        .repair_start_latch = true;
+        .latch_repair_start();
     toggle_repair(sim, rules, id, RepairControl::Start);
     if controlled {
         return;
@@ -461,9 +519,9 @@ fn auto_repair_start(sim: &mut Simulation, rules: &RuleSet, id: u64) {
     };
     let (longest, shortest) = (scaled(1800), scaled(225));
     let time_left = sim.scenario_rng.next_range_i32_inclusive(shortest, longest);
-    let now = sim.session.binary_frame as i32;
+    let now = sim.session.binary_frame() as i32;
     if let Some(house) = sim.houses.get_mut(&owner) {
-        house.repair_latch_timer.start(now, time_left);
+        house.arm_repair_latch(now, time_left);
     }
 }
 
@@ -480,30 +538,47 @@ fn repair_step(sim: &mut Simulation, rules: &RuleSet, id: u64) {
     let Some(entity) = sim.substrate.entities.get(id) else {
         return;
     };
-    if !entity.repairing.on {
+    if !entity.building.repairing.on {
         return;
     }
     let period =
         crate::sim::combat::veterancy::self_heal_interval_frames(rules.general.repair_rate_minutes);
-    let frame = sim.session.binary_frame as i32;
-    let remainder = frame.checked_rem(period).unwrap_or_else(|| {
-        panic!("native repair step IDIV fault at 0045083F: frame={frame} period={period}")
-    });
-    if remainder != 0 {
+    let frame = sim.session.binary_frame() as i32;
+    // gamemd traps at 0x0045083F on a zero period (`RepairRate` below 1/900
+    // minute); VERA carries on: such a repair is never due.
+    if frame.checked_rem(period) != Some(0) {
         return;
     }
     let Some(object) = sim.object_type(entity.type_ref(), rules) else {
         return;
     };
-    let (strength, cost) = (object.strength, repair_step_cost(rules, object));
-    let owner = entity.owner();
-    if available_money(sim, owner) < cost {
+    // `RepairStep=0` heals nothing (gamemd traps on it in the cost at
+    // 0x007120EC): the repair is switched off, where paying each period for
+    // no health would drain the house.
+    if rules.general.repair_step == 0 {
         if let Some(entity) = sim.substrate.entities.get_mut(id) {
-            entity.repairing.on = false;
+            entity.building.repairing.on = false;
         }
         return;
     }
-    spend_money(sim, owner, cost);
+    let (strength, cost) = (object.strength, repair_step_cost(rules, object));
+    let owner = entity.owner();
+    if available_money(&sim.houses, owner) < cost {
+        // Ares 3.0 10014630 (hook 0x4509B4): with [General]
+        // RepairStopOnInsufficientFunds=no a human-controlled house's repair
+        // stays on (0x4509BB) and retries on a later period.
+        let keeps_repairing = rules.ares_form()
+            && !rules.ares_repair_stop_on_insufficient_funds()
+            && sim
+                .houses
+                .get(&owner)
+                .is_some_and(|house| house.is_controlled_by_human(sim.session.game_mode_nonzero()));
+        if !keeps_repairing && let Some(entity) = sim.substrate.entities.get_mut(id) {
+            entity.building.repairing.on = false;
+        }
+        return;
+    }
+    spend_money(&mut sim.houses, owner, cost);
     let step = rules.general.repair_step;
     let Some(entity) = sim.substrate.entities.get_mut(id) else {
         return;
@@ -513,8 +588,63 @@ fn repair_step(sim: &mut Simulation, rules: &RuleSet, id: u64) {
     if entity.health.current() >= strength {
         entity.health.set(strength);
         entity.estimated_health.reset(strength);
-        entity.repairing.on = false;
+        entity.building.repairing.on = false;
     }
     sim.refresh_building_damage_state(id, rules);
-    sim.retire_damage_smoke_after_heal(id, rules);
+    Simulation::retire_damage_smoke_after_heal(&sim.interner, &mut sim.substrate, id, rules);
+}
+
+#[cfg(all(test, tests_sim_production))]
+mod invalid_rule_tests {
+    use super::*;
+    use crate::rules::ini_parser::IniFile;
+
+    fn cost(general: &str) -> i32 {
+        let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
+            "[General]\nRepairPercent=15%\n{general}[BuildingTypes]\n0=B\n[B]\nStrength=5\nCost=100\n"
+        )))
+        .unwrap();
+        repair_step_cost(&rules, rules.object("B").unwrap())
+    }
+
+    /// gamemd traps at 0x007120EC (`RepairStep=0`) and 0x007120F7
+    /// (`Strength < RepairStep`); VERA charges the floor and the whole share.
+    #[test]
+    fn repair_step_cost_survives_zero_divisors() {
+        assert_eq!(cost("RepairStep=0\n"), 1);
+        assert_eq!(cost("RepairStep=8\n"), 14);
+    }
+
+    /// `RepairRate` below 1/900 minute is a zero period: gamemd traps at
+    /// 0x0045083F, VERA's repair is never due.
+    #[test]
+    fn a_zero_repair_period_is_never_due() {
+        let (mut sim, mut rules, id) = crate::sim::building_art::slot_test_fixture_with("");
+        rules.general.repair_rate_minutes = 0.001;
+        let entity = sim.substrate.entities.get_mut(id).unwrap();
+        entity.health.set_for_test(50);
+        entity.building.repairing.set_for_test(true);
+        repair_step(&mut sim, &rules, id);
+        let entity = sim.substrate.entities.get(id).unwrap();
+        assert_eq!(entity.health.current(), 50);
+        assert!(entity.building.repairing.is_on());
+    }
+
+    /// `RepairStep=0` can never finish a repair, so the step switches it off
+    /// without charging.
+    #[test]
+    fn a_zero_repair_step_switches_the_repair_off_unpaid() {
+        let (mut sim, mut rules, id) = crate::sim::building_art::slot_test_fixture_with("");
+        rules.general.repair_step = 0;
+        let owner = sim.substrate.entities.get(id).unwrap().owner();
+        let money = available_money(&sim.houses, owner);
+        let entity = sim.substrate.entities.get_mut(id).unwrap();
+        entity.health.set_for_test(50);
+        entity.building.repairing.set_for_test(true);
+        repair_step(&mut sim, &rules, id);
+        let entity = sim.substrate.entities.get(id).unwrap();
+        assert_eq!(entity.health.current(), 50);
+        assert!(!entity.building.repairing.is_on());
+        assert_eq!(available_money(&sim.houses, owner), money);
+    }
 }

@@ -1,5 +1,8 @@
 # Optional Ares superweapon building gates
 
+A game that ships `ares.mix` reads and plays these keys in every build ([Ares](ares.md));
+other games keep the original superweapons.
+
 Original implementation by **baixiong443**, who attributes the availability
 logic and regression scenarios to their earlier ra2-mono work and contributes
 this change under VERA's GPLv3. That donor repository was unavailable during

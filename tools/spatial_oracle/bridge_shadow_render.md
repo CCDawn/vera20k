@@ -18,8 +18,6 @@ Set `RA2_DIR` or `VERA20K_GAMEMD_EXE` as described in
 archive input owner. No asset extraction directory or Rust output is required.
 `--write` records a new reference only after original execution succeeds.
 
-The pinned executable SHA-256 is
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
 `bridge_shadow_render.meta.json` records execution boundaries, substitutions
 and the payload digest. Archive, INI, palette and shape hashes are in the data.
 
@@ -224,9 +222,9 @@ or conventional target-path guess supplies capture identity.
 
 ### Rendering cost
 
-`retail_bridge_shadow_workload_timing` uses the same physical source stencil
-through the production atlas, builder and dispatch. On this Apple M4/Metal debug
-harness, median prepare-to-completion wall times (three samples after warmup) were:
+A timing test, since removed, drew the same physical source stencil through the
+production atlas, builder and dispatch. On an Apple M4/Metal debug harness, median
+prepare-to-completion wall times (three samples after warmup) were:
 
 | Supplied workload | Former alpha pass | Corrected pass |
 | --- | ---: | ---: |
@@ -237,12 +235,9 @@ harness, median prepare-to-completion wall times (three samples after warmup) we
 The last row deliberately stresses ordered overlaps and exercises two bounded
 intermediate submissions (128 waves, 256 passes). It is not a representative
 retail frame. These intervals include query readback and waiting for completion;
-they are not release-frame/FPS or 20,000-unit estimates. Every encoder timestamp
-pair returned zero on this backend, so GPU-only duration is unavailable. The test
-retains raw samples and explicitly reports the limitation rather than inventing
-a GPU time. `VERA20K_BRIDGE_SHADOW_PERF_OUTPUT` writes the reproducible receipt. The
-[recorded samples](bridge_shadow_render.timing.json) retain every timestamp and
-completion interval.
+they are not release-frame/FPS or 20,000-unit estimates. The
+[recorded samples](bridge_shadow_render.timing.json) keep the encoder-timestamp
+fields that test wrote.
 
 
 ### Live damage and repair
@@ -270,7 +265,7 @@ CI clippy set passed with `VERA20K_REQUIRE_RETAIL_INI=1`: **9,567 passed,
 0 failed, 231 ignored**; clippy exited 0 with existing repository warnings.
 The simulation field ratchet passed at **2,532 baseline/current fields**.
 The [validation receipt](bridge_shadow_render.validation.json) records exact
-commands, source/log hashes and the corrected lifecycle fixture's separate run.
+commands, log hashes and the corrected lifecycle fixture's separate run.
 
 ```sh
 VERA20K_REQUIRE_RETAIL_INI=1 python -m tools.cargo_run -- test --workspace --lib
@@ -279,10 +274,9 @@ VERA20K_REQUIRE_RETAIL_INI=1 python -m tools.cargo_run -- test -p vera20k --lib 
 ```
 
 The GPU gate is explicit because it requires physical retail assets and a real
-adapter. Set `VERA20K_BRIDGE_SHADOW_LIFECYCLE_OUTPUT` for stage PNGs/receipts,
-and `VERA20K_BRIDGE_SHADOW_PERF_OUTPUT` for timing JSON. Keep previews outside
-sealed [map-observation](../map_observation.md) capture bundles. Run the timing
-case with an uncontended GPU; it includes setup/wait boundaries stated above.
+adapter. Set `VERA20K_BRIDGE_SHADOW_LIFECYCLE_OUTPUT` for stage PNGs/receipts.
+Keep previews outside sealed [map-observation](../map_observation.md) capture
+bundles.
 
 
 ### Independent review and final candidate

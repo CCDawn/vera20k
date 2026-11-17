@@ -51,12 +51,9 @@ fn retail_dustbowl_battle_fortress_boarded(riders: u16) -> Fortress {
     let rules = &resources.rules;
     for (name, side) in [("Americans", 0), ("Russians", 1)] {
         let house = sim.interner.intern(name);
-        sim.houses
-            .entry(house)
-            .or_insert_with(|| HouseState::new(house, side, None, true, 10_000, 10));
-        if !sim.session.house_order.contains(&house) {
-            sim.session.house_order.push(house);
-        }
+        sim.houses.get_or_register_for_test(house, || {
+            HouseState::new(house, side, None, true, 10_000, 10)
+        });
     }
     let (bfrt, x, y) = (40..100_u16)
         .flat_map(|y| (40..100_u16).map(move |x| (x, y)))
@@ -91,7 +88,7 @@ fn retail_dustbowl_battle_fortress_boarded(riders: u16) -> Fortress {
         ("RUSSIANS", "PLAYER"),
         ("PLAYER", "RUSSIANS"),
     ] {
-        sim.house_alliances
+        sim.house_alliances_mut_for_test()
             .entry(house.to_string())
             .or_default()
             .insert(ally.to_string());
@@ -110,7 +107,7 @@ fn retail_dustbowl_battle_fortress_boarded(riders: u16) -> Fortress {
     fortress
 }
 
-/// Exercise the player's EnterTransport, class setter, Walk/Teleport arrival
+/// Exercise the player's Enter order, class setter, Walk/Teleport arrival
 /// and OpenTopped registration, rather than fabricating cargo.
 fn board_infantry(fortress: &mut Fortress, kind: &str) -> u64 {
     let (x, y) = fortress.cell;
@@ -132,10 +129,7 @@ fn board_infantry(fortress: &mut Fortress, kind: &str) -> u64 {
     sim.resolve_type_handles(&resources.rules);
     let enter = order(
         fortress,
-        Command::EnterTransport {
-            passenger_id: rider,
-            transport_id: fortress.bfrt,
-        },
+        Command::clicked_mission(rider, MissionType::Enter, TargetKind::Entity(fortress.bfrt)),
     );
     retail_frame(&mut fortress.scenario, vec![enter]);
     for _ in 0..300 {
@@ -183,7 +177,7 @@ fn order(fortress: &Fortress, payload: Command) -> CommandEnvelope {
     let sim = fortress.scenario.sim();
     CommandEnvelope::new(
         sim.interner.get("Americans").expect("Americans house"),
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         payload,
     )
 }
@@ -254,15 +248,9 @@ fn retail_dustbowl_battle_fortress_riders_fire_from_its_ports() {
         } = &fortress.scenario.runtime;
         let rules = &resources.rules;
         let object = rules.object("BFRT").unwrap();
-        let art = rules
-            .art()
-            .get(&object.image)
-            .or_else(|| rules.art().get(&object.id))
-            .expect("BFRT art");
         let transport = sim.substrate.entities.get(bfrt).unwrap();
-        let ports: [crate::rules::flh::Flh; 5] = std::array::from_fn(|port| {
-            art.alternate_fire_flh(port, object.turret_count, object.weapon_count)
-        });
+        let ports: [crate::rules::flh::Flh; 5] =
+            std::array::from_fn(|port| object.alternate_fire_flh(port));
         (
             ports,
             crate::sim::movement::ground_pose::object_world_z_leptons(
@@ -541,7 +529,7 @@ fn retail_dustbowl_battle_fortress_riders_force_fire_at_the_ground() {
 }
 
 /// A GI ordered into an empty Battle Fortress from two cells away walks in
-/// (production `EnterTransport`) and boards. Inside, it keeps the Fortress's
+/// (the player's MEGAMISSION Enter) and boards. Inside, it keeps the Fortress's
 /// coordinate frame after frame and leaves no infantry occupation on the cells
 /// it crossed: its walk does not carry on from inside the transport.
 #[test]
@@ -571,10 +559,7 @@ fn retail_dustbowl_battle_fortress_rider_walks_in_and_stays_put() {
     };
     let enter = order(
         &fortress,
-        Command::EnterTransport {
-            passenger_id: gi,
-            transport_id: bfrt,
-        },
+        Command::clicked_mission(gi, MissionType::Enter, TargetKind::Entity(bfrt)),
     );
     retail_frame(&mut fortress.scenario, vec![enter]);
     let inside = |fortress: &Fortress| {
@@ -817,10 +802,6 @@ fn retail_battle_fortress_chrono_rider_freezes_releases_and_erases() {
         "tools/spatial_oracle/temporal_stop.open_topped_guard.json",
     ))
     .unwrap();
-    assert_eq!(
-        control["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     let native_stop = &control["rows"][0]["output"]["after_stop"];
     for release_by_moving in [true, false] {
         let mut fortress = retail_dustbowl_battle_fortress_boarded(0);

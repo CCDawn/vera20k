@@ -4,13 +4,14 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import tomllib
 import unittest
 from unittest.mock import patch
 
-from tools import prepare_checkout as checkout
+from tools import cargo_run, prepare_checkout as checkout
 
 SYMLINKS = 'symlink privilege varies on Windows'
 
@@ -151,7 +152,28 @@ class MainCheckoutTests(CheckoutTest):
         checkout.write_config(self.main, self.game)
         text, ready = self.report(self.main, self.main)
         self.assertFalse(ready)
-        self.assertIn('fix: python -m tools.cargo_run -- run --bin extract-ini  (needs a valid ra2_dir)', text)
+        build = next(line.strip().removeprefix('fix: ') for line in text.splitlines()
+                     if 'fix: python -m tools.cargo_run -- ' in line)
+        arguments = shlex.split(build)
+        options = arguments[arguments.index('--') + 1:]
+        self.assertIn('--bin', options)
+        self.assertEqual(options[options.index('--bin') + 1], 'extract-ini')
+        self.assertEqual(cargo_run.cargo_args(options, None)[0], 'build')
+
+    def test_missing_ini_extractor_resolves_its_recorded_debug_binary(self):
+        checkout.write_config(self.main, self.game)
+        text, ready = self.report(self.main, self.main)
+        self.assertFalse(ready)
+        command = next(line.strip().removeprefix('resolve: ') for line in text.splitlines()
+                       if 'resolve: python -m tools.cargo_run ' in line)
+        executable = self.main / 'recorded extractor'
+        with patch.object(cargo_run, 'git', return_value=str(self.main)), \
+             patch.object(cargo_run, 'resolve_binary', return_value=(executable, 'debug')) as resolve, \
+             redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cargo_run.main(shlex.split(command)[3:]), 0)
+            resolve.assert_called_once_with(self.main, 'extract-ini', 'debug')
+            self.assertEqual(output.getvalue().strip(), str(executable))
+        self.assertFalse((self.main / 'ini').exists())
 
     def test_relative_ra2_dir_starts_at_the_config_folder(self):
         # GameConfig::parse_from's rule, which src/util/config.rs tests on the Rust side.
@@ -178,14 +200,10 @@ class MainCheckoutTests(CheckoutTest):
             self.assertIn('fix: point RA2_DIR at the game folder', text)
 
     @unittest.skipUnless(importlib.util.find_spec('unicorn'), 'native oracles need Unicorn')
-    def test_native_oracles_refuse_an_unknown_executable(self):
+    def test_native_oracles_accept_any_executable(self):
         os.environ['RA2_DIR'] = str(self.game)
         text, _ = self.report(self.main, self.main)
-        self.assertIn('problem   native oracles: Unsupported gamemd.exe SHA-256', text)
-        self.assertIn('fix: point RA2_DIR at the folder with the retail gamemd.exe', text)
-        os.environ['VERA20K_GAMEMD_EXE'] = str(self.game / 'gamemd.exe')
-        text, _ = self.report(self.main, self.main)
-        self.assertIn('fix: point VERA20K_GAMEMD_EXE at the retail gamemd.exe, or unset it', text)
+        self.assertIn('ok        native oracles: retail gamemd.exe at', text)
 
     def test_check_and_ra2_dir_conflict(self):
         with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()), \

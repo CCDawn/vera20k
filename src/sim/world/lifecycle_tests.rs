@@ -56,11 +56,13 @@ fn native_trigger_reveal_cell_put_discovers_unshrouded_campaign_resident() {
         let mut sim = Simulation::with_seed(31);
         let player = sim.interner.intern("Player");
         let owner = sim.interner.intern("Other");
-        sim.session.current_house = Some(player);
-        sim.session.game_mode_nonzero = game_mode_nonzero;
+        sim.session.set_current_house_for_test(Some(player));
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(game_mode_nonzero),
+        );
         for house in [player, owner] {
             sim.houses
-                .insert(house, HouseState::new(house, 0, None, true, 0, 10));
+                .register(HouseState::new(house, 0, None, true, 0, 10));
         }
         sim.install_resolved_terrain_for_new_map(crate::map::resolved_terrain::test_grid(
             24,
@@ -72,7 +74,7 @@ fn native_trigger_reveal_cell_put_discovers_unshrouded_campaign_resident() {
         if revealed {
             plane.mark_visible(10, 10);
         }
-        sim.fog.by_owner.insert(player, plane);
+        sim.fog.by_owner_mut_for_test().insert(player, plane);
         let typ = sim.interner.intern("E1");
         let mut actor = GameEntity::new_at_frame_for_test(
             1,
@@ -94,7 +96,7 @@ fn native_trigger_reveal_cell_put_discovers_unshrouded_campaign_resident() {
         let scenario = sim.scenario_rng.native_state_hex();
         let main = sim.main_rng.native_state_hex();
         let mapgen = sim.mapgen_rng.native_state_hex();
-        sim.discover_cell_put_object(id, (10, 10), super::UninitContext::default());
+        sim.discover_by_player(id, Some((10, 10)), super::UninitContext::default());
         let history = sim.substrate.entities.get(id).unwrap().discovery;
         assert_eq!(
             history.discovered_by_current_house(),
@@ -144,19 +146,21 @@ fn constructor_complete_foot_destructors_match_native_team_gate_and_rng() {
                 cell
             },
         ));
-        sim.session.binary_frame = 1;
-        sim.session.game_mode_nonzero = true;
-        sim.session
-            .set_started(input["scenario_started_byte"].as_i64().unwrap() != 0);
+        sim.session.set_binary_frame_for_test(1);
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        if input["scenario_started_byte"].as_i64().unwrap() != 0 {
+            sim.session.publish_started();
+        }
         let owner = sim.interner.intern("Americans");
         sim.houses
-            .insert(owner, HouseState::new(owner, 0, Some(owner), true, 0, 10));
-        sim.session.house_order = vec![owner];
+            .register(HouseState::new(owner, 0, Some(owner), true, 0, 10));
         let definitions = IniFile::from_str(&format!(
             "[TeamTypes]\n0=TT\n[TT]\nHouse=Americans\nScript=S\nTaskForce=F\nWaypoint=E\nMax=-1\n[ScriptTypes]\n0=S\n[S]\n0=3,4\n[TaskForces]\n0=F\n[F]\n0=1,{typ}\n"
         ));
         let registry = TeamAiIniRegistry::from_sources(&definitions, &IniFile::from_str(""), true);
-        sim.install_team_ai_registry(&registry, &rules).unwrap();
+        sim.install_team_ai_registry(&registry, &rules);
         let team_type = sim.interner.get("TT").unwrap();
         let team = sim
             .with_object_placement_scope(|sim| sim.create_team(team_type, Some(owner), &rules))
@@ -346,11 +350,11 @@ fn insert_reservation_building(
     owner_name: &str,
     rx: u16,
     ry: u16,
-    foundation: &str,
+    foundation: &crate::rules::foundation::Foundation,
     spacing: i32,
 ) -> crate::sim::intern::InternedId {
     let owner = sim.interner.intern(owner_name);
-    sim.houses.entry(owner).or_insert_with(|| {
+    sim.houses.get_or_register_for_test(owner, || {
         HouseState::new(
             owner,
             0,
@@ -377,7 +381,7 @@ fn insert_reservation_building(
     );
     entity
         .type_facts
-        .set_foundation_for_test(foundation.to_string());
+        .set_foundation_for_test(foundation.clone());
     entity
         .type_facts
         .set_base_reservation_spacing_for_test(Some(spacing));
@@ -433,7 +437,7 @@ fn packed_reservation_test_coord(x: i32, y: i32) -> u32 {
 
 fn receiver_authority_rules() -> crate::rules::ruleset::RuleSet {
     crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
-        "[VehicleTypes]\n0=TEST\n[BuildingTypes]\n0=BUILDING41\n\
+        "[VehicleTypes]\n0=TEST\n[InfantryTypes]\n0=TEST\n[BuildingTypes]\n0=BUILDING41\n\
          [TEST]\nStrength=100\nArmor=light\n\
          [BUILDING41]\nStrength=100\nArmor=concrete\n\
          [Warheads]\n0=KILLWH\n[KILLWH]\nCellSpread=0\n\
@@ -499,8 +503,7 @@ fn receiver_fatal_limbo_clears_sparse_map_dummy_reservation() {
         .as_mut()
         .unwrap()
         .test_set_native_allocated_cells(&allocated);
-    let owner = insert_reservation_building(&mut sim, 41, "Americans", 10, 10, "1x1", 1);
-    sim.session.house_order.push(owner);
+    insert_reservation_building(&mut sim, 41, "Americans", 10, 10, &"1x1".into(), 1);
     assert!(matches!(
         sim.try_reveal_entity(41, common_raw_request(10, 10, 0, 128, 128)),
         RevealOutcome::Revealed { .. }
@@ -531,8 +534,8 @@ fn receiver_garrison_survivor_keeps_height_aware_playfield_membership() {
     )
     .expect("garrison survivor rules");
     let mut sim = Simulation::new();
-    sim.session.map_width = 16;
-    sim.session.map_height = 16;
+    sim.session.set_map_width_for_test(16);
+    sim.session.set_map_height_for_test(16);
     sim.playfield_bounds =
         Some(crate::sim::cell_rect::PlayfieldBounds::from_normalized_local_size(16, 2, 2, 12, 3));
     install_common_raw_terrain(&mut sim, 16, 16, 4, None);
@@ -540,13 +543,13 @@ fn receiver_garrison_survivor_keeps_height_aware_playfield_membership() {
     // reads the cells' speed rows.
     let terrain = sim.resolved_terrain.as_mut().unwrap();
     for (rx, ry) in (0..16u16).flat_map(|ry| (0..16u16).map(move |rx| (rx, ry))) {
-        let cell = terrain.cell_mut(rx, ry).unwrap();
+        let cell = terrain.cell_mut_for_test(rx, ry).unwrap();
         cell.speed_costs = crate::map::resolved_terrain::TEST_OPEN_SPEED_COSTS;
         cell.base_speed_costs = cell.speed_costs;
     }
-    let building_id = sim.allocate_stable_id();
+    let building_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, building_id, EntityCategory::Structure);
-    let passenger_id = sim.allocate_stable_id();
+    let passenger_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, passenger_id, EntityCategory::Infantry);
     let building_type = sim.interner.intern("GARRISON");
     let passenger_type = sim.interner.intern("OCCUPANT");
@@ -560,10 +563,8 @@ fn receiver_garrison_survivor_keeps_height_aware_playfield_membership() {
         building.set_type_ref_for_test(building_type);
         building
             .type_facts
-            .set_foundation_for_test("2x2".to_string());
-        let mut cargo = PassengerCargo::new(5, 1.0);
-        cargo.board_forced_chain(&[(passenger_id, 1.0)]);
-        building.passenger_role = PassengerRole::transport(cargo);
+            .set_foundation_for_test("2x2".to_string().into());
+        building.passenger_role.occupants_mut().add(passenger_id);
     }
     assert!(matches!(
         sim.try_reveal_entity_with_context(
@@ -657,8 +658,24 @@ fn uninit_clears_aircraft_bridge_occupation() {
 #[test]
 fn gsi_04_11_structure_mark_clears_full_smudge_footprints_and_refinery_hole() {
     let mut sim = Simulation::with_seed(1);
+    let rules =
+        crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+            "[SmudgeTypes]\n0=EMPTY\n1=TWO\n2=ONE\n3=DISTANT\n[TWO]\nWidth=2\nHeight=2\n",
+        ))
+        .unwrap();
+    sim.install_resolved_terrain_for_new_map(crate::map::resolved_terrain::test_flat_ground_grid(
+        16,
+    ));
     let stable_id = 41;
-    insert_reservation_building(&mut sim, stable_id, "Americans", 5, 5, "3x3Refinery", 0);
+    insert_reservation_building(
+        &mut sim,
+        stable_id,
+        "Americans",
+        5,
+        5,
+        &"3x3Refinery".into(),
+        0,
+    );
 
     let mut grid = crate::sim::smudge_grid::SmudgeGrid::new(16, 16);
     for (rx, ry, frame_offset) in [(4, 5, 0), (5, 5, 1), (4, 6, 2), (5, 6, 3)] {
@@ -667,7 +684,6 @@ fn gsi_04_11_structure_mark_clears_full_smudge_footprints_and_refinery_hole() {
             ry,
             crate::sim::smudge_grid::SmudgeCell {
                 type_id: Some(1),
-                footprint_origin: Some((4, 5)),
                 frame_offset,
             },
         );
@@ -677,7 +693,6 @@ fn gsi_04_11_structure_mark_clears_full_smudge_footprints_and_refinery_hole() {
         6,
         crate::sim::smudge_grid::SmudgeCell {
             type_id: Some(2),
-            footprint_origin: Some((7, 6)),
             frame_offset: 0,
         },
     );
@@ -686,7 +701,6 @@ fn gsi_04_11_structure_mark_clears_full_smudge_footprints_and_refinery_hole() {
         9,
         crate::sim::smudge_grid::SmudgeCell {
             type_id: Some(3),
-            footprint_origin: Some((9, 9)),
             frame_offset: 0,
         },
     );
@@ -694,7 +708,11 @@ fn gsi_04_11_structure_mark_clears_full_smudge_footprints_and_refinery_hole() {
     sim.smudge_grid = Some(grid);
 
     assert!(matches!(
-        sim.try_reveal_entity(stable_id, request(5, 5, PlacementEvidence::MarkSucceeded)),
+        sim.try_reveal_entity_with_context(
+            stable_id,
+            request(5, 5, PlacementEvidence::MarkSucceeded),
+            super::UninitContext::with_rules(&rules),
+        ),
         RevealOutcome::Revealed { .. }
     ));
 
@@ -707,9 +725,108 @@ fn gsi_04_11_structure_mark_clears_full_smudge_footprints_and_refinery_hole() {
         "a footprint outside the full refinery rectangle survives"
     );
     let expected = vec![(4, 5), (5, 5), (4, 6), (5, 6), (7, 6)];
-    assert_eq!(sim.tactical_dirty_cells, expected);
-    assert_eq!(sim.radar_terrain_dirty_cells, expected);
-    assert_eq!(sim.radar_terrain_dirty_generation, 5);
+    assert_eq!(sim.dirty_cells.tactical_for_test(), expected);
+    assert!(sim.dirty_cells.radar().is_empty());
+    assert_eq!(sim.dirty_cells.radar_generation(), 0);
+    assert_eq!(grid.cell(5, 5).frame_offset, 1);
+    assert_eq!(grid.cell(5, 6).frame_offset, 3);
+}
+
+/// SmudgePlace6B6080 truncates data to a byte; BuildingMark43F81B decodes
+/// that saved byte with current Width, even when it names a later origin.
+#[test]
+fn wrapped_smudge_data_survives_load_and_controls_building_clear() {
+    use crate::map::map_file::MapSmudgeEntry;
+    use crate::rules::native_processing::{ProcessedRulesLayers, RulesLayerKind, RulesLayerStack};
+    use crate::sim::overlay_grid::OverlayGrid;
+    use crate::sim::smudge_grid::SmudgeGrid;
+
+    let Some((root, art)) = crate::rules::retail_ini_fixture::retail_rules_and_art() else {
+        return;
+    };
+    let mut layers = RulesLayerStack::new(root);
+    layers.push(
+        RulesLayerKind::GameMode,
+        crate::rules::ini_parser::IniFile::from_str("[CRATER11]\nWidth=257\nHeight=3\n"),
+    );
+    layers.push(
+        RulesLayerKind::Scenario,
+        crate::rules::ini_parser::IniFile::from_str("[CRATER11]\nHeight=2\n"),
+    );
+    let processed = layers.process_with_fixed_art(&art).unwrap();
+    let saved_rules = save_codec::serialize(&processed).unwrap();
+    let rules = crate::rules::ruleset::RuleSet::from_processed_rules(&processed).unwrap();
+    let terrain = crate::map::resolved_terrain::test_grid(
+        300,
+        20,
+        crate::map::resolved_terrain::test_smudge_cell,
+    );
+    let overlay = OverlayGrid::new(300, 20);
+    let mut grid = SmudgeGrid::from_map_entries(
+        &[
+            MapSmudgeEntry {
+                type_name: "CRATER11".into(),
+                rx: 1,
+                ry: 10,
+            },
+            MapSmudgeEntry {
+                type_name: "CRATER01".into(),
+                rx: 258,
+                ry: 11,
+            },
+        ],
+        &rules.smudge_types,
+        &terrain,
+        &overlay,
+        300,
+        20,
+    );
+    let wide = rules.smudge_types.find_by_name("CRATER11").unwrap();
+    assert_eq!(grid.cell(257, 10).type_id, Some(wide));
+    assert_eq!(grid.cell(257, 10).frame_offset, 0);
+    assert_eq!(grid.cell(256, 10).frame_offset, 255);
+    let _ = grid.drain_dirty();
+    let mut live = Simulation::with_seed(17);
+    live.install_resolved_terrain_for_new_map(terrain.clone());
+    live.overlay_grid = Some(overlay);
+    live.smudge_grid = Some(grid);
+    let bytes = GameSnapshot::save(&live, 0, rules.simulation_config_hash(), "wide-smudge", 0);
+    let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
+    let saved_rules: ProcessedRulesLayers = save_codec::deserialize(&saved_rules).unwrap();
+    let rules = crate::rules::ruleset::RuleSet::from_processed_rules(&saved_rules).unwrap();
+    let definition = rules.smudge_types.get(wide).unwrap();
+    assert_eq!((definition.width, definition.height), (257, 2));
+    restored.restore_after_snapshot_load().unwrap();
+    restored.rebuild_caches_after_load(terrain, Default::default(), &rules);
+    restored
+        .restore_map_authority_after_snapshot_load(&rules, &rules.overlay_registry(), None)
+        .unwrap();
+
+    // A one-cell Building lands on the later data0. Its decoded rectangle
+    // clears an unrelated mark ahead, while the original data0 remains.
+    insert_reservation_building(&mut restored, 41, "Americans", 257, 10, &"1x1".into(), 0);
+    let rng = restored.scenario_rng.native_state_hex();
+    assert!(matches!(
+        restored.try_reveal_entity_with_context(
+            41,
+            request(257, 10, PlacementEvidence::MarkSucceeded),
+            super::UninitContext::with_rules(&rules),
+        ),
+        RevealOutcome::Revealed { .. }
+    ));
+    let grid = restored.smudge_grid.as_ref().unwrap();
+    assert_eq!(grid.cell(1, 10).type_id, Some(wide));
+    assert_eq!(grid.cell(256, 10).frame_offset, 255);
+    assert!(grid.cell(257, 10).type_id.is_none());
+    assert!(grid.cell(258, 11).type_id.is_none());
+    assert!(restored.dirty_cells.radar().is_empty());
+    assert!(
+        restored
+            .dirty_cells
+            .tactical_for_test()
+            .contains(&(258, 11))
+    );
+    assert_eq!(restored.scenario_rng.native_state_hex(), rng);
 }
 
 fn gsi_04_16_edge_gate_rules() -> crate::rules::ruleset::RuleSet {
@@ -822,7 +939,7 @@ fn grounded_ramp_reveal_commits_native_height_before_occupation() {
             sim.resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(2, 2)
+                .cell_mut_for_test(2, 2)
                 .unwrap()
                 .slope_type = 1;
             insert_entity(&mut sim, 1, category);
@@ -870,7 +987,7 @@ fn a_revealed_building_takes_the_floor_at_its_location_as_its_z() {
         sim.resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(2, 2)
+            .cell_mut_for_test(2, 2)
             .unwrap()
             .slope_type = 1;
         insert_entity(&mut sim, 1, EntityCategory::Structure);
@@ -916,7 +1033,7 @@ fn every_unit_locomotor_takes_the_floor_clamp_at_unlimbo() {
         sim.resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(2, 2)
+            .cell_mut_for_test(2, 2)
             .unwrap()
             .slope_type = 1;
         insert_entity(&mut sim, 1, EntityCategory::Unit);
@@ -988,12 +1105,12 @@ fn grounded_reveal_keeps_headless_inputs_and_the_drop_z() {
 #[test]
 fn grounded_ramp_position_survives_snapshot_and_idle_continuation() {
     let mut sim = Simulation::with_seed(71);
-    assert_eq!(sim.allocate_stable_id(), 1);
+    assert_eq!(sim.substrate.allocate_stable_id(), 1);
     install_common_raw_terrain(&mut sim, 8, 8, 0, None);
     sim.resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(2, 2)
+        .cell_mut_for_test(2, 2)
         .unwrap()
         .slope_type = 1;
     insert_entity(&mut sim, 1, EntityCategory::Unit);
@@ -1016,7 +1133,7 @@ fn grounded_ramp_position_survives_snapshot_and_idle_continuation() {
         .resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(2, 2)
+        .cell_mut_for_test(2, 2)
         .unwrap()
         .slope_type = 1;
     assert_eq!(
@@ -1055,7 +1172,7 @@ fn drive_ship_slope_production_spawn_unlimbo_snaps_without_manual_rocking_state(
         ("TTRAIN", (6, 2), 12, 104),
     ] {
         let mut sim = Simulation::with_seed(0x510fe);
-        sim.session.binary_frame = 37;
+        sim.session.set_binary_frame_for_test(37);
         sim.playfield_bounds = Some(crate::sim::cell_rect::PlayfieldBounds {
             base: 0,
             off_fc: -100,
@@ -1068,17 +1185,18 @@ fn drive_ship_slope_production_spawn_unlimbo_snaps_without_manual_rocking_state(
             .resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(cell.0, cell.1)
+            .cell_mut_for_test(cell.0, cell.1)
             .unwrap();
         terrain_cell.slope_type = slope;
         terrain_cell.speed_costs = SpeedCostProfile {
-            foot: Some(100),
-            track: Some(100),
-            wheel: Some(100),
-            float: Some(100),
-            amphibious: Some(100),
-            float_beach: Some(100),
-            hover: Some(100),
+            foot: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            track: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            float: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            amphibious: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            float_beach: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            hover: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
         };
         terrain_cell.base_speed_costs = terrain_cell.speed_costs;
         let mut expected_rng = sim.scenario_rng.clone();
@@ -1114,7 +1232,7 @@ fn drive_ship_slope_production_spawn_unlimbo_snaps_without_manual_rocking_state(
 fn zero_speed_foot_drive_ship_payloads_survive_all_world_spawn_paths() {
     let rules = zero_speed_drive_ship_slope_rules();
     let mut sim = Simulation::with_seed(0x510fe);
-    sim.session.binary_frame = 71;
+    sim.session.set_binary_frame_for_test(71);
     sim.playfield_bounds = Some(crate::sim::cell_rect::PlayfieldBounds {
         base: 0,
         off_fc: -100,
@@ -1128,17 +1246,18 @@ fn zero_speed_foot_drive_ship_payloads_survive_all_world_spawn_paths() {
             .resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(cell.0, cell.1)
+            .cell_mut_for_test(cell.0, cell.1)
             .unwrap();
         terrain_cell.slope_type = slope;
         terrain_cell.speed_costs = SpeedCostProfile {
-            foot: Some(100),
-            track: Some(100),
-            wheel: Some(100),
-            float: Some(100),
-            amphibious: Some(100),
-            float_beach: Some(100),
-            hover: Some(100),
+            foot: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            track: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            float: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            amphibious: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            float_beach: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            hover: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
         };
         terrain_cell.base_speed_costs = terrain_cell.speed_costs;
     }
@@ -1180,7 +1299,9 @@ fn zero_speed_foot_drive_ship_payloads_survive_all_world_spawn_paths() {
         mission: None,
         recruitable_a: true,
         recruitable_b: true,
-        structure_upgrades: [None, None, None],
+        group: -1,
+        follows: None,
+        structure_columns: Default::default(),
         structure_ai_sellable: false,
         structure_ai_repairable: false,
         structure_online: true,
@@ -1232,12 +1353,12 @@ fn zero_speed_foot_drive_ship_payloads_survive_all_world_spawn_paths() {
 #[test]
 fn drive_ship_slope_failed_reveal_does_not_snap_or_consume_rng() {
     let mut sim = Simulation::with_seed(0x510fe);
-    sim.session.binary_frame = 40;
+    sim.session.set_binary_frame_for_test(40);
     install_common_raw_terrain(&mut sim, 8, 8, 0, None);
     sim.resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(3, 4)
+        .cell_mut_for_test(3, 4)
         .unwrap()
         .slope_type = 8;
     insert_entity(&mut sim, 1, EntityCategory::Unit);
@@ -1430,9 +1551,13 @@ fn gsi_04_12_common_raw_occupation_structural_deck_unit_tracks_live_collapse_fla
 
     let _ = sim.object_conceal(2);
 
+    // Ares 3.0 1004C3E0 (hook 0x00744216) clears the recorded ground too
+    // (`Simulation::track_raw_mark_at`). Reveal and Conceal ran on the empty
+    // rules.
+    let ares = crate::rules::ruleset::RuleSet::empty_for_test().ares_form();
     assert_eq!(
         sim.substrate.raw_cell_occupation.ground_bits(3, 4),
-        0x20,
+        if ares { 0 } else { 0x20 },
         "height-only clear still targets deck after the collapsed mark used ground"
     );
     assert_eq!(sim.substrate.raw_cell_occupation.deck_bits(3, 4), 0);
@@ -1496,9 +1621,14 @@ fn gsi_04_12_common_raw_occupation_high_nonstructural_unit_keeps_native_stale_gr
 
     let _ = sim.object_conceal(1);
 
+    // Ares 3.0 UnitClass_UnmarkOccupationBits 1004C3E0 (hook 0x00744216)
+    // also clears the ground plane UnitClass_MarkOccupationBits recorded
+    // (`Simulation::track_raw_mark_at`). Reveal and Conceal ran on the empty
+    // rules.
+    let ares = crate::rules::ruleset::RuleSet::empty_for_test().ares_form();
     assert_eq!(
         sim.substrate.raw_cell_occupation.ground_bits(3, 4),
-        0x20,
+        if ares { 0 } else { 0x20 },
         "height-only clear targets deck even though nonstructural mark used ground"
     );
     assert_eq!(sim.substrate.raw_cell_occupation.deck_bits(3, 4), 0);
@@ -1621,6 +1751,9 @@ fn teleport_and_grounded_jumpjet_limbo_clear_the_infantrymans_sub_cell() {
 fn hover_limbo_releases_actual_head_claim_and_repeated_limbo_preserves_a_new_resident() {
     use crate::sim::components::DriveCoord;
 
+    // The fixture's entry points run on the empty rules; the direct raw
+    // receivers take the same answer.
+    let ares = crate::rules::ruleset::RuleSet::empty_for_test().ares_form();
     for (head, cell, deck) in [
         (Some(DriveCoord::cell(3, 3, 0)), (3, 3), false),
         (Some(DriveCoord::cell(3, 3, 416)), (3, 3), true),
@@ -1633,7 +1766,15 @@ fn hover_limbo_releases_actual_head_claim_and_repeated_limbo_preserves_a_new_res
             Some(LocomotorState::for_test_kind(LocomotorKind::Hover));
         let _ = sim.try_reveal_entity(1, common_raw_request(2, 3, 0, 128, 128));
         let current = DriveCoord::cell(2, 3, 0);
-        sim.object_raw_receiver_at(1, current, false);
+        Simulation::object_raw_receiver_at(
+            &mut sim.substrate,
+            &sim.path_grid,
+            &sim.resolved_terrain,
+            1,
+            current,
+            false,
+            ares,
+        );
         let entity = sim.substrate.entities.get_mut(1).unwrap();
         entity.set_foot_occupation_enabled(false);
         entity
@@ -1643,7 +1784,15 @@ fn hover_limbo_releases_actual_head_claim_and_repeated_limbo_preserves_a_new_res
             .hover_runtime_mut()
             .unwrap()
             .set_head(head);
-        sim.object_raw_receiver_at(1, head.unwrap_or(current), true);
+        Simulation::object_raw_receiver_at(
+            &mut sim.substrate,
+            &sim.path_grid,
+            &sim.resolved_terrain,
+            1,
+            head.unwrap_or(current),
+            true,
+            ares,
+        );
         let bits = |sim: &Simulation| {
             if deck {
                 sim.substrate.raw_cell_occupation.deck_bits(cell.0, cell.1)
@@ -1672,7 +1821,15 @@ fn hover_limbo_releases_actual_head_claim_and_repeated_limbo_preserves_a_new_res
             "Mark_All(0) preserves the retained head"
         );
         insert_entity(&mut sim, 2, EntityCategory::Unit);
-        sim.object_raw_receiver_at(2, head.unwrap_or(current), true);
+        Simulation::object_raw_receiver_at(
+            &mut sim.substrate,
+            &sim.path_grid,
+            &sim.resolved_terrain,
+            2,
+            head.unwrap_or(current),
+            true,
+            ares,
+        );
         let _ = sim.techno_limbo(1);
         assert_eq!(
             bits(&sim) & 0x20,
@@ -1751,7 +1908,7 @@ fn gsi_04_12_common_raw_occupation_building_foundation_is_ground_only() {
         let building = sim.substrate.entities.get_mut(1).expect("building");
         building
             .type_facts
-            .set_foundation_for_test("2x2".to_string());
+            .set_foundation_for_test("2x2".to_string().into());
         building.set_on_bridge(true);
     }
 
@@ -1778,14 +1935,14 @@ fn gsi_04_12_common_raw_occupation_building_foundation_is_ground_only() {
 #[test]
 fn gsi_04_05_hidden_lifecycle_follows_base_lists_without_expanding_them() {
     let mut sim = Simulation::new();
-    sim.session.map_width = 16;
-    sim.session.map_height = 16;
+    sim.session.set_map_width_for_test(16);
+    sim.session.set_map_height_for_test(16);
     insert_entity(&mut sim, 1, EntityCategory::Structure);
     {
         let building = sim.substrate.entities.get_mut(1).expect("building");
         building
             .type_facts
-            .set_foundation_for_test("2x2".to_string());
+            .set_foundation_for_test("2x2".to_string().into());
         let mut profile = building
             .type_facts
             .building_hidden_occupancy()
@@ -1838,7 +1995,7 @@ fn gsi_04_12_common_raw_occupation_follows_the_layer_query_not_the_path_layer() 
     let mut sim = Simulation::new();
     insert_entity(&mut sim, 2, EntityCategory::Unit);
     let mut locomotor = LocomotorState::for_test_kind(LocomotorKind::Drive);
-    locomotor.set_layer(MovementLayer::Air);
+    locomotor.set_layer_for_test(MovementLayer::Air);
     sim.substrate.entities.get_mut(2).unwrap().locomotor = Some(locomotor);
     let _ = sim.try_reveal_entity(2, common_raw_request(5, 6, 0, 128, 128));
     assert!(sim.substrate.occupancy.contains_entity(5, 6, 2));
@@ -1899,7 +2056,13 @@ fn gsi_04_12_object_raw_occupation_airborne_and_non_fly_aircraft_are_excluded() 
     install_fly_aircraft(&mut sim, 1, SimFixed::from_num(1));
     let _ = sim.try_reveal_entity(1, common_raw_request(3, 4, 0, 128, 128));
     // SetHeight's Mark pair re-lists it at height 1, in the air.
-    sim.set_object_height(1, 1, None, None, crate::sim::world::FrameEffects::default());
+    sim.set_object_height(
+        1,
+        1,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        None,
+        crate::sim::world::FrameEffects::default(),
+    );
 
     insert_entity(&mut sim, 2, EntityCategory::Aircraft);
     sim.substrate.entities.get_mut(2).unwrap().locomotor =
@@ -1989,7 +2152,7 @@ fn gsi_04_12_object_raw_occupation_production_fly_tick_unmarks_takeoff_and_marks
     }
     sim.tick_air_movement_with_cell_lists_one(
         1,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -2030,7 +2193,7 @@ fn gsi_04_12_object_raw_occupation_production_fly_tick_unmarks_takeoff_and_marks
         .set_exact_z_leptons_for_test(Some(1));
     sim.tick_air_movement_with_cell_lists_one(
         1,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -2076,7 +2239,7 @@ fn gsi_05_05_fly_takeoff_commits_absolute_z_after_remove_process() {
     }
     sim.tick_air_movement_with_cell_lists_one(
         1,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -2106,7 +2269,13 @@ fn gsi_05_05_fly_landing_on_bridge_uses_absolute_z_for_deck_put() {
         .set_on_bridge(true);
     let _ = sim.try_reveal_entity(1, common_raw_request(3, 4, 0, 128, 128));
     // SetHeight's Mark pair re-lists it one lepton above the deck, in the air.
-    sim.set_object_height(1, 1, None, None, crate::sim::world::FrameEffects::default());
+    sim.set_object_height(
+        1,
+        1,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        None,
+        crate::sim::world::FrameEffects::default(),
+    );
     assert_eq!(sim.substrate.raw_cell_occupation.ground_bits(3, 4), 0);
     assert_eq!(sim.substrate.raw_cell_occupation.deck_bits(3, 4), 0);
 
@@ -2124,7 +2293,7 @@ fn gsi_05_05_fly_landing_on_bridge_uses_absolute_z_for_deck_put() {
     }
     sim.tick_air_movement_with_cell_lists_one(
         1,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -2156,7 +2325,7 @@ fn gsi_05_05_object_raw_occupation_uses_exact_sloped_ground_z_for_put_and_remove
     sim.resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(3, 4)
+        .cell_mut_for_test(3, 4)
         .unwrap()
         .slope_type = 1;
     install_fly_aircraft(&mut sim, 1, SimFixed::from_num(0));
@@ -2211,7 +2380,7 @@ fn gsi_05_05_mapless_fly_uses_dummy_ground_then_bridge_height() {
     let _ = sim.try_reveal_entity(1, common_raw_request(3, 4, 2, 128, 128));
     // A mapless reveal keeps no exact Z; SetHeight writes one over the Dummy
     // cell's ground zero and the OnBridge deck.
-    sim.set_object_height_unmarked(1, 100);
+    Simulation::set_object_height_unmarked(&mut sim.substrate, &sim.resolved_terrain, 1, 100);
     assert_eq!(
         sim.substrate
             .entities
@@ -2224,7 +2393,7 @@ fn gsi_05_05_mapless_fly_uses_dummy_ground_then_bridge_height() {
 
     sim.tick_air_movement_with_cell_lists_one(
         1,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -2245,8 +2414,8 @@ fn gsi_05_05_mapless_fly_uses_dummy_ground_then_bridge_height() {
 #[test]
 fn gsi_04_07_damage_air_spatial_entry_crossing_and_exit_keep_vector_order() {
     let mut sim = Simulation::new();
-    sim.session.map_width = 40;
-    sim.session.map_height = 40;
+    sim.session.set_map_width_for_test(40);
+    sim.session.set_map_height_for_test(40);
     install_common_raw_terrain(&mut sim, 40, 40, 0, None);
     // Foot Unlimbo4D72B2 adds ConsideredAircraft only above the native
     // high-flight threshold (208 leptons); a Reveal without rules commits no
@@ -2262,11 +2431,11 @@ fn gsi_04_07_damage_air_spatial_entry_crossing_and_exit_keep_vector_order() {
         sim.set_object_height(
             id,
             416,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             None,
             crate::sim::world::FrameEffects::default(),
         );
-        sim.aircraft_tracker_add(id);
+        Simulation::aircraft_tracker_add(&sim.session, &mut sim.substrate, id);
     }
     let first = sim.substrate.entities.get(20).unwrap();
     let second = sim.substrate.entities.get(10).unwrap();
@@ -2282,7 +2451,7 @@ fn gsi_04_07_damage_air_spatial_entry_crossing_and_exit_keep_vector_order() {
 
     sim.tick_air_movement_with_cell_lists_one(
         20,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -2307,10 +2476,10 @@ fn gsi_04_07_damage_air_spatial_entry_crossing_and_exit_keep_vector_order() {
         .unwrap()
         .fly_runtime_mut()
         .unwrap()
-        .set_current_speed(SimFixed::from_num(1));
+        .set_current_speed_for_test(SimFixed::from_num(1));
     sim.tick_air_movement_with_cell_lists_one(
         20,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -2344,8 +2513,8 @@ fn unlimbo_adds_a_high_flying_considered_aircraft_to_the_air_tracker() {
         )
         .expect("Jumpjet VehicleType rules");
         let mut sim = Simulation::new();
-        sim.session.map_width = 40;
-        sim.session.map_height = 40;
+        sim.session.set_map_width_for_test(40);
+        sim.session.set_map_height_for_test(40);
         install_common_raw_terrain(&mut sim, 40, 40, 0, None);
         insert_entity(&mut sim, 30, EntityCategory::Unit);
         let type_ref = sim.interner.intern("JJET");
@@ -2385,6 +2554,7 @@ fn insert_anim(sim: &mut Simulation, stable_id: u64, inactive: bool) {
             constructor_reverse: false,
             inactive,
             paused: false,
+            temporal_paused: false,
         },
     );
     assert!(sim.substrate.anims.insert(anim).is_none());
@@ -2397,7 +2567,7 @@ fn insert_particle_system(sim: &mut Simulation, stable_id: u64) {
             crate::rules::particle_system_type::ParticleSystemTypeId(0),
             IVec3::ZERO,
         );
-        system.facing = 0;
+        system.set_facing_for_test(0);
         system
     });
 }
@@ -2529,7 +2699,7 @@ fn lifecycle_authority_reveal_rejects_an_already_marked_limbo_object() {
         .get_mut(1)
         .unwrap()
         .lifecycle
-        .set_cell_marked(true);
+        .set_cell_marked_for_test(true);
 
     assert_eq!(
         sim.try_reveal_entity(1, request(10, 20, PlacementEvidence::MarkSucceeded)),
@@ -2674,31 +2844,31 @@ fn particle_logic_membership_uses_the_object_local_guard_and_rebuilds_it() {
     let mut sim = Simulation::new();
     insert_particle_system(&mut sim, 7);
 
-    assert!(sim.reveal_particle_system(7, None));
+    assert!(sim.reveal_particle_system(7, crate::rules::ruleset::RuleSet::empty_for_test()));
     assert!(
         sim.substrate
             .particle_systems
             .get(7)
             .unwrap()
-            .in_logic_vector
+            .in_logic_vector()
     );
     assert_eq!(sim.live_object_order_snapshot(), vec![7]);
 
-    assert!(sim.reveal_particle_system(7, None));
+    assert!(sim.reveal_particle_system(7, crate::rules::ruleset::RuleSet::empty_for_test()));
     assert_eq!(sim.live_object_order_snapshot(), vec![7]);
 
     sim.substrate
         .particle_systems
         .get_mut(7)
         .unwrap()
-        .in_logic_vector = false;
+        .set_in_logic_vector_for_test(false);
     sim.rebuild_logic_membership();
     assert!(
         sim.substrate
             .particle_systems
             .get(7)
             .unwrap()
-            .in_logic_vector
+            .in_logic_vector()
     );
     sim.debug_assert_logic_membership_consistent();
 
@@ -2708,7 +2878,7 @@ fn particle_logic_membership_uses_the_object_local_guard_and_rebuilds_it() {
             .particle_systems
             .get(7)
             .unwrap()
-            .in_logic_vector
+            .in_logic_vector()
     );
     assert!(sim.live_object_order_snapshot().is_empty());
 }
@@ -2737,6 +2907,58 @@ fn open_topped_direct_registration_keeps_hidden_passenger_live() {
     assert_eq!(sim.live_object_order_snapshot(), vec![2, 1]);
 }
 
+/// A rider killed inside an open-topped transport is already in limbo, so
+/// UnInit's Limbo returns at its entry guard and leaves it in Logic. Its
+/// destructor takes it out (`ObjectClass::~ObjectClass`, `0x005F3D65..0x005F3D75`);
+/// a slot left behind stops the next multiplayer frame's checksum.
+#[test]
+fn destructor_takes_a_dead_open_topped_rider_out_of_logic() {
+    let mut sim = Simulation::new();
+    insert_entity(&mut sim, 1, EntityCategory::Infantry);
+    insert_entity(&mut sim, 2, EntityCategory::Unit);
+    let _ = sim.reveal(1);
+    let _ = sim.reveal(2);
+    assert_eq!(sim.techno_limbo(1), super::ConcealOutcome::Concealed);
+    sim.substrate.entities.get_mut(1).unwrap().passenger_role =
+        PassengerRole::inside_for_test(2, true);
+    assert!(sim.register_open_topped_passenger(1));
+
+    sim.uninit(1);
+    assert_eq!(sim.live_object_order_snapshot(), vec![2, 1]);
+    sim.process_pending_delete();
+
+    assert!(!sim.substrate.entities.contains(1));
+    assert_eq!(sim.live_object_order_snapshot(), vec![2]);
+    assert!(sim.compute_retail_multiplayer_checksum().is_ok());
+}
+
+/// The Logic walk can reach a rider that died earlier in the frame: it is past
+/// UnInit (`+0x90` clear) but still in the vector until its destructor. Native
+/// `FootClass::AI` returns at the IsAlive test (`0x004DA53E`); the visit must
+/// not UnInit it again.
+#[test]
+fn logic_visit_of_a_dead_open_topped_rider_does_not_uninit_it_again() {
+    let mut sim = Simulation::new();
+    insert_entity(&mut sim, 1, EntityCategory::Infantry);
+    insert_entity(&mut sim, 2, EntityCategory::Unit);
+    let _ = sim.reveal(1);
+    let _ = sim.reveal(2);
+    assert_eq!(sim.techno_limbo(1), super::ConcealOutcome::Concealed);
+    sim.substrate.entities.get_mut(1).unwrap().passenger_role =
+        PassengerRole::inside_for_test(2, true);
+    assert!(sim.register_open_topped_passenger(1));
+    sim.uninit(1);
+
+    let _ = sim.object_ai_visit_one(1, None, ObjectAiCtx::default());
+
+    let uninits = sim
+        .lifecycle_test_events
+        .iter()
+        .filter(|event| **event == LifecycleTestEvent::UninitAliveCleared { stable_id: 1 })
+        .count();
+    assert_eq!(uninits, 1);
+}
+
 #[test]
 fn lifecycle_authority_second_reveal_is_idempotent() {
     let mut sim = Simulation::new();
@@ -2748,7 +2970,7 @@ fn lifecycle_authority_second_reveal_is_idempotent() {
         }
     );
     let first_position = sim.substrate.entities.get(1).unwrap().position;
-    sim.lifecycle_outputs.clear();
+    sim.lifecycle_outputs.clear_for_test();
     sim.lifecycle_test_events.clear();
 
     assert_eq!(
@@ -2784,14 +3006,13 @@ fn lifecycle_authority_conceal_without_dirty_eligibility_still_clears_drawn_stat
     let mut sim = Simulation::new();
     insert_entity(&mut sim, 1, EntityCategory::Unit);
     let _ = sim.reveal(1);
-    sim.lifecycle_outputs.clear();
+    sim.lifecycle_outputs.clear_for_test();
 
     let _ = sim.object_conceal(1);
     assert_eq!(
-        sim.lifecycle_outputs,
+        sim.lifecycle_outputs.as_slice(),
         vec![
             LifecycleOutput::ObjectPointerExpired { stable_id: 1 },
-            LifecycleOutput::DisplayRemove { stable_id: 1 },
             LifecycleOutput::DetachAttachedAnims { stable_id: 1 },
             LifecycleOutput::ClearDrawnState { stable_id: 1 },
             LifecycleOutput::ClearRedraw { stable_id: 1 },
@@ -2810,14 +3031,13 @@ fn lifecycle_authority_conceal_dirty_eligibility_emits_dirty_before_drawn_clear(
         .removal_facts
         .set_dirty_rect_eligible_for_test(true);
     let _ = sim.reveal(1);
-    sim.lifecycle_outputs.clear();
+    sim.lifecycle_outputs.clear_for_test();
 
     let _ = sim.object_conceal(1);
     assert_eq!(
-        sim.lifecycle_outputs,
+        sim.lifecycle_outputs.as_slice(),
         vec![
             LifecycleOutput::ObjectPointerExpired { stable_id: 1 },
-            LifecycleOutput::DisplayRemove { stable_id: 1 },
             LifecycleOutput::DetachAttachedAnims { stable_id: 1 },
             LifecycleOutput::DirtyTacticalRect { stable_id: 1 },
             LifecycleOutput::ClearDrawnState { stable_id: 1 },
@@ -3334,7 +3554,17 @@ fn lifecycle_authority_transport_uninits_passengers_in_cargo_order_before_carrie
     assert!(cargo.passengers().is_empty());
     assert!(cargo.passenger_sizes().is_empty());
     assert_eq!(cargo.total_size(), 0);
-    assert_eq!(cargo.garrison_fire_index(), 0);
+    // A Unit's Cargo teardown has no Building occupant cursor to reset.
+    assert_eq!(
+        sim.substrate
+            .entities
+            .get(1)
+            .unwrap()
+            .passenger_role
+            .occupants()
+            .fire_index(),
+        0
+    );
 }
 
 #[test]
@@ -3387,7 +3617,7 @@ fn nested_transport_parent_expiry_preserves_its_independent_cargo() {
     let rules =
         crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(""))
             .unwrap();
-    // Steam gamemd3e81a617, TechnoPointerExpired7078B2..7078DB compares
+    // Steam gamemd, TechnoPointerExpired7078B2..7078DB compares
     // Object+90, exact Health==0 and ScenarioInit, independently of control.
     // These are controlled receiver priors, not a full transport fixture.
     for (alive, health, placement_scope, retain_inside) in [
@@ -3619,12 +3849,13 @@ fn occupier_capture_retains_live_non_selling_nav_target() {
     insert_entity(&mut sim, 1, EntityCategory::Infantry);
     insert_entity(&mut sim, 2, EntityCategory::Structure);
     let _ = sim.try_reveal_entity(2, request(9, 11, PlacementEvidence::MarkSucceeded));
-    sim.mission_assign_exact(
-        1,
-        MissionId::from_known(MissionType::Capture),
-        sim.session.binary_frame,
-    )
-    .unwrap();
+    sim.substrate
+        .mission_assign_exact(
+            1,
+            MissionId::from_known(MissionType::Capture),
+            sim.session.binary_frame(),
+        )
+        .unwrap();
 
     let listener = sim.substrate.entities.get_mut(1).unwrap();
     listener.removal_facts.set_occupier_for_test(true);
@@ -3662,18 +3893,20 @@ fn selling_target_disables_occupier_capture_nav_retention() {
     insert_entity(&mut sim, 1, EntityCategory::Infantry);
     insert_entity(&mut sim, 2, EntityCategory::Structure);
     let _ = sim.try_reveal_entity(2, request(9, 11, PlacementEvidence::MarkSucceeded));
-    sim.mission_assign_exact(
-        1,
-        MissionId::from_known(MissionType::Capture),
-        sim.session.binary_frame,
-    )
-    .unwrap();
-    sim.mission_assign_exact(
-        2,
-        MissionId::from_known(MissionType::Selling),
-        sim.session.binary_frame,
-    )
-    .unwrap();
+    sim.substrate
+        .mission_assign_exact(
+            1,
+            MissionId::from_known(MissionType::Capture),
+            sim.session.binary_frame(),
+        )
+        .unwrap();
+    sim.substrate
+        .mission_assign_exact(
+            2,
+            MissionId::from_known(MissionType::Selling),
+            sim.session.binary_frame(),
+        )
+        .unwrap();
 
     let listener = sim.substrate.entities.get_mut(1).unwrap();
     listener.removal_facts.set_occupier_for_test(true);
@@ -3693,12 +3926,13 @@ fn selling_target_disables_occupier_capture_nav_retention() {
 
 #[test]
 fn target_expiry_rearms_passive_scan_and_restores_suspended_mission() {
+    let rules = receiver_authority_rules();
     let mut sim = Simulation::with_seed(0x1234);
     insert_entity(&mut sim, 1, EntityCategory::Unit);
     insert_entity(&mut sim, 2, EntityCategory::Unit);
     insert_entity(&mut sim, 3, EntityCategory::Unit);
     let _ = sim.try_reveal_entity(2, request(9, 11, PlacementEvidence::MarkSucceeded));
-    sim.session.binary_frame = 105;
+    sim.session.set_binary_frame_for_test(105);
 
     let listener = sim.substrate.entities.get_mut(1).unwrap();
     listener
@@ -3724,7 +3958,7 @@ fn target_expiry_rearms_passive_scan_and_restores_suspended_mission() {
 
     let mut expected_rng = sim.scenario_rng.clone();
     let delay = expected_rng.next_range_u32_inclusive(4, 8);
-    sim.uninit(2);
+    sim.uninit_with_rules(2, &rules);
 
     let listener = sim.substrate.entities.get(1).unwrap();
     assert_eq!(listener.passive_scan.timer().start_frame(), 105);
@@ -3781,7 +4015,7 @@ fn detach_sensor_guard_applies_to_techno_but_not_constructed_terrain() {
             ),
             1
         );
-        let tree = sim.production.terrain_object_cells[&(16, 16)];
+        let tree = sim.terrain_objects.cell_index()[&(16, 16)];
         let listener = sim
             .spawn_object_at_height("SENSOR", "Americans", 15, 16, 0, 0, &rules)
             .unwrap();
@@ -3805,17 +4039,9 @@ fn detach_sensor_guard_applies_to_techno_but_not_constructed_terrain() {
         };
         let sensing_house = sim.substrate.entities.get(listener).unwrap().owner();
         assert!(sim.fog.has_sensor_for_house(sensing_house, cell.0, cell.1));
-        assert!(
-            sim.substrate
-                .entities
-                .get(listener)
-                .unwrap()
-                .sensor_deposit
-                .is_some()
-        );
-        let sensor_counts = sim.fog.sensors_by_house.clone();
+        let sensor_counts = sim.fog.sensors_by_house().clone();
         let registered = sim.live_object_order_snapshot();
-        sim.session.binary_frame = 105;
+        sim.session.set_binary_frame_for_test(105);
         {
             let actor = sim.substrate.entities.get_mut(listener).unwrap();
             actor
@@ -3888,7 +4114,7 @@ fn detach_sensor_guard_applies_to_techno_but_not_constructed_terrain() {
                 false,
                 owner,
                 PointerExpiryControl::DetachAll,
-                Some(&rules),
+                &rules,
                 None,
                 super::FrameEffects::default(),
             );
@@ -3973,7 +4199,7 @@ fn detach_sensor_guard_applies_to_techno_but_not_constructed_terrain() {
                 false,
                 owner,
                 PointerExpiryControl::DetachAll,
-                Some(&rules),
+                &rules,
                 None,
                 super::FrameEffects::default(),
             );
@@ -3986,9 +4212,9 @@ fn detach_sensor_guard_applies_to_techno_but_not_constructed_terrain() {
             sim.scenario_rng.logical_state(),
             expected_rng.logical_state()
         );
-        assert_eq!(sim.fog.sensors_by_house, sensor_counts);
-        assert_eq!(sim.production.terrain_object_cells[&(16, 16)], tree);
-        assert!(sim.production.terrain_objects[&tree].is_live());
+        assert_eq!(sim.fog.sensors_by_house(), &sensor_counts);
+        assert_eq!(sim.terrain_objects.cell_index()[&(16, 16)], tree);
+        assert!(sim.terrain_objects.objects()[&tree].is_live());
         assert_eq!(sim.live_object_order_snapshot(), registered);
     }
 }
@@ -4004,9 +4230,6 @@ fn infantry_target_expiry_clears_firing_action_before_target() {
     let art = IniFile::from_str(crate::rules::retail_ini_fixture::GI_ART_EXCERPT);
     let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-    );
     // Original 51B20E drops the firing latch before its unforced Ready
     // request. FireUp (4) admits it; Die2 (12) refuses and retains its stage.
     // The corresponding class-target receipts pin this ordering without RNG.
@@ -4072,7 +4295,7 @@ fn particle_system_retirement_clears_only_the_indexed_techno_spark_link() {
         .particle_systems
         .get_mut(1)
         .unwrap()
-        .done_spawning = true;
+        .set_done_spawning_for_test(true);
     let rng = [
         sim.scenario_rng.native_state_hex(),
         sim.main_rng.native_state_hex(),
@@ -4156,7 +4379,7 @@ fn techno_spark_pointer_expiry_is_exact_and_independent_of_control() {
             false,
             None,
             control,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             None,
             super::FrameEffects::default(),
         );
@@ -4191,21 +4414,21 @@ fn pointer_expiry_stops_particle_owner_without_deleting_living_children() {
     insert_particle_system(&mut sim, 4);
     let _ = sim.reveal(3);
     let owned = sim.substrate.particle_systems.get_mut(1).unwrap();
-    owned.owner_entity = Some(3);
+    owned.set_owner_entity_for_test(Some(3));
     let mut child = crate::sim::particles::Particle::test_fixture(
         crate::rules::particle_type::ParticleTypeId(0),
         IVec3::new(500, 700, 90),
     );
-    child.lifetime_remaining = 71;
-    owned.particles.push(child);
+    child.set_lifetime_remaining_for_test(71);
+    owned.particles_mut_for_test().push(child);
     let attached = sim.substrate.particle_systems.get_mut(2).unwrap();
-    attached.owner_entity = Some(3);
-    attached.target_ref = Some(crate::sim::combat::TargetKind::Entity(3));
+    attached.set_owner_entity_for_test(Some(3));
+    attached.set_target_ref_for_test(Some(crate::sim::combat::TargetKind::Entity(3)));
     sim.substrate
         .particle_systems
         .get_mut(4)
         .unwrap()
-        .target_ref = Some(crate::sim::combat::TargetKind::Entity(3));
+        .set_target_ref_for_test(Some(crate::sim::combat::TargetKind::Entity(3)));
     let rng = [
         sim.scenario_rng.native_state_hex(),
         sim.main_rng.native_state_hex(),
@@ -4215,24 +4438,24 @@ fn pointer_expiry_stops_particle_owner_without_deleting_living_children() {
     sim.uninit(3);
 
     let owned = sim.substrate.particle_systems.get(1).unwrap();
-    assert!(owned.owner_entity.is_none());
-    assert!(owned.done_spawning, "owner+E0 expiry sets done+F8");
-    assert_eq!(owned.particles.len(), 1);
-    assert_eq!(owned.particles[0].lifetime_remaining, 71);
-    assert_eq!(owned.particles[0].coords, IVec3::new(500, 700, 90));
-    assert!(!owned.particles[0].marked_for_deletion);
+    assert!(owned.owner_entity().is_none());
+    assert!(owned.done_spawning(), "owner+E0 expiry sets done+F8");
+    assert_eq!(owned.particles().len(), 1);
+    assert_eq!(owned.particles()[0].lifetime_remaining(), 71);
+    assert_eq!(owned.particles()[0].coords(), IVec3::new(500, 700, 90));
+    assert!(!owned.particles()[0].marked_for_deletion());
     assert!(
         owned.alive(),
         "living children retain their system for its own AI"
     );
     let attached = sim.substrate.particle_systems.get(2).unwrap();
-    assert!(attached.owner_entity.is_none());
-    assert!(attached.target_ref.is_none());
-    assert!(attached.done_spawning);
+    assert!(attached.owner_entity().is_none());
+    assert!(attached.target_ref().is_none());
+    assert!(attached.done_spawning());
     let target_only = sim.substrate.particle_systems.get(4).unwrap();
-    assert!(target_only.target_ref.is_none());
+    assert!(target_only.target_ref().is_none());
     assert!(
-        !target_only.done_spawning,
+        !target_only.done_spawning(),
         "target+E4 expiry has no done write"
     );
     assert_eq!(
@@ -4254,13 +4477,13 @@ fn completed_empty_smoke_limbo_clears_every_matching_techno_before_late_drain() 
     }
     for id in [4, 5] {
         insert_particle_system(&mut sim, id);
-        assert!(sim.reveal_particle_system(id, None));
+        assert!(sim.reveal_particle_system(id, crate::rules::ruleset::RuleSet::empty_for_test()));
     }
     sim.substrate
         .particle_systems
         .get_mut(4)
         .unwrap()
-        .owner_entity = Some(1);
+        .set_owner_entity_for_test(Some(1));
     for (id, smoke_id) in [(1, 4), (2, 4), (3, 5)] {
         sim.substrate
             .entities
@@ -4288,9 +4511,9 @@ fn completed_empty_smoke_limbo_clears_every_matching_techno_before_late_drain() 
     assert!(sim.substrate.pending_delete.is_empty());
 
     let system = sim.substrate.particle_systems.get_mut(4).unwrap();
-    system.done_spawning = true;
+    system.set_done_spawning_for_test(true);
     system
-        .particles
+        .particles_mut_for_test()
         .push(crate::sim::particles::Particle::test_fixture(
             crate::rules::particle_type::ParticleTypeId(0),
             IVec3::ZERO,
@@ -4311,7 +4534,7 @@ fn completed_empty_smoke_limbo_clears_every_matching_techno_before_late_drain() 
         .particle_systems
         .get_mut(4)
         .unwrap()
-        .particles
+        .particles_mut_for_test()
         .clear();
     sim.lifecycle_test_events.clear();
     sim.retire_particle_system(4, super::UninitContext::default());
@@ -4340,7 +4563,7 @@ fn completed_empty_smoke_limbo_clears_every_matching_techno_before_late_drain() 
     let system = sim.substrate.particle_systems.get(4).unwrap();
     assert!(!system.alive());
     assert!(system.in_limbo());
-    assert!(!system.in_logic_vector);
+    assert!(!system.in_logic_vector());
     assert_eq!(sim.substrate.pending_delete.object_ids(), vec![4]);
     assert_eq!(sim.substrate.display.layer_of(4), None);
     let visited = sim
@@ -4407,6 +4630,8 @@ fn completed_empty_smoke_limbo_clears_every_matching_techno_before_late_drain() 
     );
 }
 
+// Ares simulates this Smoke system itself (hooks 0x62DF05, 0x62FD60) and
+// builds no ParticleClass children.
 #[test]
 fn particle_system_physical_disposal_removes_retained_child_air_entries() {
     let rules =
@@ -4433,7 +4658,7 @@ fn particle_system_physical_disposal_removes_retained_child_air_entries() {
         system_id,
         crate::sim::world::UninitContext::with_rules(&rules)
     ));
-    let child_id = sim.particle_systems().get(system_id).unwrap().particles[0].stable_id();
+    let child_id = sim.particle_systems().get(system_id).unwrap().particles()[0].stable_id();
     assert_eq!(
         sim.substrate.display.layer_of(child_id),
         Some(super::display_layers::DisplayLayer::AIR)
@@ -4496,10 +4721,15 @@ fn gsi_05_03_duplicate_uninit_repeats_direct_expiry_and_queue_but_finalizes_once
     let mut sim = Simulation::new();
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+        .register(HouseState::new(owner, 0, None, true, 0, 10));
     insert_entity(&mut sim, 1, EntityCategory::Unit);
     // As its construction would: Add_Tracking.
-    sim.update_house_tracking(1, crate::sim::house_tracking::HouseTracking::add_tracking);
+    Simulation::update_house_tracking(
+        &mut sim.substrate,
+        &mut sim.houses,
+        1,
+        crate::sim::house_tracking::HouseTracking::add_tracking,
+    );
     let _ = sim.reveal(1);
 
     sim.lifecycle_test_events.clear();
@@ -4541,7 +4771,7 @@ fn gsi_05_03_duplicate_uninit_repeats_direct_expiry_and_queue_but_finalizes_once
     let repeated_events = &sim.lifecycle_test_events[repeat_start..];
     // Removed_From_Game ran once (the first Limbo); the tracking waits for
     // the destructor at the drain.
-    let tracking = &sim.houses.get(&owner).unwrap().tracking;
+    let tracking = sim.houses.get(&owner).unwrap().tracking();
     assert_eq!(tracking.active_for_test().0, 0);
     assert_eq!(tracking.units_for_test(), 1);
     assert!(
@@ -4619,6 +4849,12 @@ fn gsi_05_03_duplicate_uninit_repeats_direct_expiry_and_queue_but_finalizes_once
             LifecycleTestEvent::DeferredDeleteSelected {
                 ticket: super::DeferredDeleteTicket::Object(1),
             },
+            // The Unit destructor's own Limbo (`0x0073584F`), already in limbo.
+            LifecycleTestEvent::ConcealAlreadyLimboReturn {
+                stable_id: 1,
+                object_alive: false,
+                resolvable: true,
+            },
             LifecycleTestEvent::UninitRemovalListenerVisited {
                 expired_id: 1,
                 listener_id: 1,
@@ -4637,13 +4873,21 @@ fn lifecycle_authority_uninit_records_once_and_the_drain_removes_the_tracking() 
     let mut sim = Simulation::new();
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+        .register(HouseState::new(owner, 0, None, true, 0, 10));
     insert_entity(&mut sim, 1, EntityCategory::Unit);
-    sim.update_house_tracking(1, crate::sim::house_tracking::HouseTracking::add_tracking);
+    Simulation::update_house_tracking(
+        &mut sim.substrate,
+        &mut sim.houses,
+        1,
+        crate::sim::house_tracking::HouseTracking::add_tracking,
+    );
 
     sim.uninit(1);
     sim.uninit(1);
-    assert_eq!(sim.houses.get(&owner).unwrap().tracking.units_for_test(), 1);
+    assert_eq!(
+        sim.houses.get(&owner).unwrap().tracking().units_for_test(),
+        1
+    );
     assert!(
         sim.substrate
             .entities
@@ -4653,14 +4897,16 @@ fn lifecycle_authority_uninit_records_once_and_the_drain_removes_the_tracking() 
             .is_recorded()
     );
     sim.flush_pending_delete();
-    assert_eq!(sim.houses.get(&owner).unwrap().tracking.units_for_test(), 0);
+    assert_eq!(
+        sim.houses.get(&owner).unwrap().tracking().units_for_test(),
+        0
+    );
 }
 
 #[test]
 fn gsi_04_05_reservation_successful_reveal_marks_expanded_rect_after_lists() {
     let mut sim = Simulation::new();
-    let owner = insert_reservation_building(&mut sim, 101, "Americans", 10, 20, "2x3", 1);
-    sim.session.house_order.push(owner);
+    let owner = insert_reservation_building(&mut sim, 101, "Americans", 10, 20, &"2x3".into(), 1);
 
     assert!(matches!(
         sim.try_reveal_entity(101, request(10, 20, PlacementEvidence::MarkSucceeded)),
@@ -4674,9 +4920,9 @@ fn gsi_04_05_reservation_successful_reveal_marks_expanded_rect_after_lists() {
     assert_eq!(sim.substrate.base_reservations.raw_mask(None, 8, 20), 0);
     assert_eq!(sim.substrate.base_reservations.raw_mask(None, 13, 20), 0);
     let house = sim.houses.get(&owner).expect("reservation owner");
-    assert_eq!(house.base_reservation.bounds(), (9, 19, 4, 5));
+    assert_eq!(house.base_reservation().bounds(), (9, 19, 4, 5));
     assert_eq!(
-        house.base_reservation.perimeter_cells(),
+        house.base_reservation().perimeter_cells(),
         &[
             packed_reservation_test_coord(9, 19),
             packed_reservation_test_coord(9, 20),
@@ -4720,24 +4966,16 @@ fn gsi_04_16_dustbowl_conyard_unlimbo_uses_local_size_edge() {
     let rules = gsi_04_16_edge_gate_rules();
     let owner = sim.interner.intern("Americans");
     let mut house = HouseState::new(owner, 0, None, true, 0, 10);
-    house.base_center = Some((70, 116));
-    sim.houses.insert(owner, house);
+    house.set_base_center_for_test(Some((70, 116)));
+    sim.houses.register(house);
 
     let conyard = sim
         .spawn_object("GACNST", "Americans", 69, 115, 0, &rules)
         .expect("GACNST reveals");
-    assert!(
-        sim.substrate
-            .entities
-            .get(conyard)
-            .unwrap()
-            .type_facts
-            .determines_waypoint_edge(),
-        "Factory=BuildingType must freeze onto the entity before Reveal"
-    );
+    assert!(sim.production.is_primary_factory(conyard));
     let house = sim.houses.get(&owner).expect("launch house");
-    assert_eq!(house.base_center, Some((70, 116)));
-    assert_eq!(house.waypoint_edge, 2);
+    assert_eq!(house.base_center(), Some((70, 116)));
+    assert_eq!(house.waypoint_edge(), 2);
 }
 
 #[test]
@@ -4748,19 +4986,20 @@ fn gsi_04_16_committed_structure_owner_change_refreshes_new_house_edge() {
     let old_owner = sim.interner.intern("Americans");
     let new_owner = sim.interner.intern("Soviets");
     sim.houses
-        .insert(old_owner, HouseState::new(old_owner, 0, None, true, 0, 10));
+        .register(HouseState::new(old_owner, 0, None, true, 0, 10));
     let mut new_house = HouseState::new(new_owner, 1, None, false, 0, 10);
-    new_house.base_center = Some((68, 114));
-    sim.houses.insert(new_owner, new_house);
+    new_house.set_base_center_for_test(Some((68, 114)));
+    sim.houses.register(new_house);
     let conyard = sim
         .spawn_object("GACNST", "Americans", 69, 115, 0, &rules)
         .expect("GACNST reveals");
 
-    sim.change_owner(conyard, new_owner);
+    sim.change_owner_with_rules(conyard, new_owner, &rules, None, Default::default());
 
+    assert!(sim.production.is_primary_factory(conyard));
     let new_house = sim.houses.get(&new_owner).expect("new owner house");
-    assert_eq!(new_house.base_center, Some((68, 114)));
-    assert_eq!(new_house.waypoint_edge, 2);
+    assert_eq!(new_house.base_center(), Some((68, 114)));
+    assert_eq!(new_house.waypoint_edge(), 2);
 }
 
 #[test]
@@ -4771,36 +5010,26 @@ fn gsi_04_16_caoild_reveal_and_owner_change_preserve_waypoint_edges() {
     let old_owner = sim.interner.intern("Americans");
     let new_owner = sim.interner.intern("Soviets");
     let mut old_house = HouseState::new(old_owner, 0, None, true, 0, 10);
-    old_house.waypoint_edge = 1;
-    sim.houses.insert(old_owner, old_house);
+    old_house.set_waypoint_edge_for_test(1);
+    sim.houses.register(old_house);
     let mut new_house = HouseState::new(new_owner, 1, None, false, 0, 10);
-    new_house.waypoint_edge = 3;
-    sim.houses.insert(new_owner, new_house);
+    new_house.set_waypoint_edge_for_test(3);
+    sim.houses.register(new_house);
 
     let oil = sim
         .spawn_object("CAOILD", "Americans", 69, 115, 0, &rules)
         .expect("CAOILD reveals");
-    assert!(
-        !sim.substrate
-            .entities
-            .get(oil)
-            .unwrap()
-            .type_facts
-            .determines_waypoint_edge(),
-        "missing Factory= must freeze as an ineligible edge profile"
-    );
-    assert_eq!(sim.houses.get(&old_owner).unwrap().waypoint_edge, 1);
+    assert_eq!(sim.houses.get(&old_owner).unwrap().waypoint_edge(), 1);
 
-    sim.change_owner(oil, new_owner);
+    sim.change_owner_with_rules(oil, new_owner, &rules, None, Default::default());
 
-    assert_eq!(sim.houses.get(&new_owner).unwrap().waypoint_edge, 3);
+    assert_eq!(sim.houses.get(&new_owner).unwrap().waypoint_edge(), 3);
 }
 
 #[test]
 fn gsi_04_05_reservation_failed_reveal_never_writes() {
     let mut sim = Simulation::new();
-    let owner = insert_reservation_building(&mut sim, 102, "Americans", 10, 20, "2x2", 1);
-    sim.session.house_order.push(owner);
+    insert_reservation_building(&mut sim, 102, "Americans", 10, 20, &"2x2".into(), 1);
 
     assert_eq!(
         sim.try_reveal_entity(102, request(10, 20, PlacementEvidence::MarkFailed)),
@@ -4817,21 +5046,20 @@ fn gsi_04_05_reservation_failed_reveal_never_writes() {
 #[test]
 fn gsi_04_05_reservation_clear_removes_perimeter_but_retains_bounds() {
     let mut sim = Simulation::new();
-    let owner = insert_reservation_building(&mut sim, 111, "Americans", 10, 10, "1x1", 1);
-    sim.session.house_order.push(owner);
+    let owner = insert_reservation_building(&mut sim, 111, "Americans", 10, 10, &"1x1".into(), 1);
     let _ = sim.try_reveal_entity(111, request(10, 10, PlacementEvidence::MarkSucceeded));
     assert_eq!(
         sim.houses
             .get(&owner)
             .unwrap()
-            .base_reservation
+            .base_reservation()
             .perimeter_cells()
             .len(),
         8
     );
 
     assert_eq!(sim.techno_limbo(111), super::ConcealOutcome::Concealed);
-    let state = &sim.houses.get(&owner).unwrap().base_reservation;
+    let state = sim.houses.get(&owner).unwrap().base_reservation();
     assert_eq!(state.bounds(), (9, 9, 3, 3));
     assert!(state.perimeter_cells().is_empty());
     assert_eq!(sim.substrate.base_reservations.raw_mask(None, 10, 10), 0);
@@ -4840,10 +5068,12 @@ fn gsi_04_05_reservation_clear_removes_perimeter_but_retains_bounds() {
 #[test]
 fn gsi_04_05_reservation_limbo_clears_before_unlink_repairs_overlap_and_preserves_other_house() {
     let mut sim = Simulation::new();
-    let owner = insert_reservation_building(&mut sim, 103, "Americans", 10, 10, "1x1", 1);
+    insert_reservation_building(&mut sim, 103, "Americans", 10, 10, &"1x1".into(), 1);
     let other = sim.interner.intern("Russians");
-    sim.session.house_order.extend([owner, other]);
-    insert_reservation_building(&mut sim, 104, "Americans", 12, 10, "1x1", 1);
+    sim.houses.get_or_register_for_test(other, || {
+        crate::sim::house_state::HouseState::new(other, 1, None, false, 0, 10)
+    });
+    insert_reservation_building(&mut sim, 104, "Americans", 12, 10, &"1x1".into(), 1);
     let _ = sim.try_reveal_entity(103, request(10, 10, PlacementEvidence::MarkSucceeded));
     let _ = sim.try_reveal_entity(104, request(12, 10, PlacementEvidence::MarkSucceeded));
     sim.substrate.base_reservations.reserve(None, 9, 10, 1);
@@ -4888,9 +5118,8 @@ fn gsi_04_05_reservation_repair_scan_reaches_asymmetric_high_edge() {
     );
 
     let mut sim = Simulation::new();
-    let owner = insert_reservation_building(&mut sim, 107, "Americans", 10, 20, "4x4", 1);
-    sim.session.house_order.push(owner);
-    insert_reservation_building(&mut sim, 108, "Americans", 16, 20, "1x1", 2);
+    insert_reservation_building(&mut sim, 107, "Americans", 10, 20, &"4x4".into(), 1);
+    insert_reservation_building(&mut sim, 108, "Americans", 16, 20, &"1x1".into(), 2);
     let _ = sim.try_reveal_entity(107, request(10, 20, PlacementEvidence::MarkSucceeded));
     let _ = sim.try_reveal_entity(108, request(16, 20, PlacementEvidence::MarkSucceeded));
     assert_eq!(sim.substrate.base_reservations.raw_mask(None, 14, 20), 1);
@@ -4906,7 +5135,7 @@ fn gsi_04_05_reservation_repair_scan_reaches_asymmetric_high_edge() {
 #[test]
 fn gsi_04_05_reservation_origins_truncate_after_first_spacing_subtraction() {
     assert_eq!(
-        super::lifecycle::building_base_reservation_rect(0, 0, "1x1", 32_769),
+        super::lifecycle::building_base_reservation_rect(0, 0, &"1x1".into(), 32_769),
         crate::sim::cell_rect::CellRect::new(32_767, 32_767, 65_539, 65_539)
     );
     assert_eq!(
@@ -4919,9 +5148,8 @@ fn gsi_04_05_reservation_origins_truncate_after_first_spacing_subtraction() {
 #[test]
 fn gsi_04_05_reservation_repair_replays_multicell_neighbor_for_every_hit() {
     let mut sim = Simulation::new();
-    let owner = insert_reservation_building(&mut sim, 109, "Americans", 10, 10, "1x1", 1);
-    sim.session.house_order.push(owner);
-    insert_reservation_building(&mut sim, 110, "Americans", 12, 10, "2x2", 1);
+    insert_reservation_building(&mut sim, 109, "Americans", 10, 10, &"1x1".into(), 1);
+    insert_reservation_building(&mut sim, 110, "Americans", 12, 10, &"2x2".into(), 1);
     let _ = sim.try_reveal_entity(109, request(10, 10, PlacementEvidence::MarkSucceeded));
     let _ = sim.try_reveal_entity(110, request(12, 10, PlacementEvidence::MarkSucceeded));
 
@@ -4979,9 +5207,7 @@ fn gsi_04_05_reservation_processed_foundation_precedes_metadata_and_lifecycle_ma
     let spacing = gacnst.base_reservation_spacing.unwrap();
 
     let mut sim = Simulation::new();
-    let owner =
-        insert_reservation_building(&mut sim, 106, "Americans", 30, 40, &foundation, spacing);
-    sim.session.house_order.push(owner);
+    insert_reservation_building(&mut sim, 106, "Americans", 30, 40, &foundation, spacing);
     assert!(matches!(
         sim.try_reveal_entity(106, request(30, 40, PlacementEvidence::MarkSucceeded)),
         RevealOutcome::Revealed { .. }
@@ -5000,14 +5226,10 @@ fn score_stats_credit_the_killer_and_charge_the_victim_once() {
     let mut sim = Simulation::new();
     let victim_owner = sim.interner.intern("Americans");
     let killer_owner = sim.interner.intern("Russians");
-    sim.houses.insert(
-        victim_owner,
-        HouseState::new(victim_owner, 0, None, true, 0, 10),
-    );
-    sim.houses.insert(
-        killer_owner,
-        HouseState::new(killer_owner, 1, None, false, 0, 10),
-    );
+    sim.houses
+        .register(HouseState::new(victim_owner, 0, None, true, 0, 10));
+    sim.houses
+        .register(HouseState::new(killer_owner, 1, None, false, 0, 10));
     insert_entity(&mut sim, 1, EntityCategory::Unit);
     let victim = sim.substrate.entities.get_mut(1).unwrap();
     victim.health.set_for_test(0);
@@ -5017,24 +5239,24 @@ fn score_stats_credit_the_killer_and_charge_the_victim_once() {
         crate::sim::combat::KillCallback::Terminal,
         crate::sim::world::UninitContext::with_rules(&rules),
     );
-    assert_eq!(sim.houses[&victim_owner].stats.losses(), 1);
-    assert_eq!(sim.houses[&killer_owner].stats.kills(), 1);
+    assert_eq!(sim.houses[&victim_owner].stats().losses(), 1);
+    assert_eq!(sim.houses[&killer_owner].stats().kills(), 1);
 
     // A repeated uninit must not double-count: the destruction is recorded
     // exactly once.
     sim.uninit(1);
     sim.uninit(1);
 
-    assert_eq!(sim.houses.get(&victim_owner).unwrap().stats.losses(), 1);
-    assert_eq!(sim.houses.get(&victim_owner).unwrap().stats.kills(), 0);
+    assert_eq!(sim.houses.get(&victim_owner).unwrap().stats().losses(), 1);
+    assert_eq!(sim.houses.get(&victim_owner).unwrap().stats().kills(), 0);
     let killer = sim.houses.get(&killer_owner).unwrap();
-    assert_eq!(killer.stats.kills(), 1);
+    assert_eq!(killer.stats().kills(), 1);
     assert_eq!(
-        killer.stats.units_killed(),
+        killer.stats().units_killed(),
         1,
         "a unit victim must land in the unit bucket, not the building one"
     );
-    assert_eq!(killer.economy.score(), 900);
+    assert_eq!(killer.economy().score(), 900);
 }
 
 #[test]
@@ -5048,14 +5270,10 @@ fn score_stats_come_from_the_kill_record_captured_at_destruction() {
     let mut sim = Simulation::new();
     let victim_owner = sim.interner.intern("Americans");
     let killer_owner = sim.interner.intern("Russians");
-    sim.houses.insert(
-        victim_owner,
-        HouseState::new(victim_owner, 0, None, true, 0, 10),
-    );
-    sim.houses.insert(
-        killer_owner,
-        HouseState::new(killer_owner, 1, None, false, 0, 10),
-    );
+    sim.houses
+        .register(HouseState::new(victim_owner, 0, None, true, 0, 10));
+    sim.houses
+        .register(HouseState::new(killer_owner, 1, None, false, 0, 10));
     insert_entity(&mut sim, 1, EntityCategory::Infantry);
     let victim = sim.substrate.entities.get_mut(1).unwrap();
     victim.health.set_for_test(0);
@@ -5065,12 +5283,15 @@ fn score_stats_come_from_the_kill_record_captured_at_destruction() {
         crate::sim::combat::KillCallback::Terminal,
         crate::sim::world::UninitContext::with_rules(&rules),
     );
-    assert_eq!(sim.houses[&killer_owner].economy.score(), 200);
+    assert_eq!(sim.houses[&killer_owner].economy().score(), 200);
 
     sim.uninit(1);
 
-    assert_eq!(sim.houses.get(&killer_owner).unwrap().stats.kills(), 1);
-    assert_eq!(sim.houses.get(&killer_owner).unwrap().economy.score(), 200);
+    assert_eq!(sim.houses.get(&killer_owner).unwrap().stats().kills(), 1);
+    assert_eq!(
+        sim.houses.get(&killer_owner).unwrap().economy().score(),
+        200
+    );
 }
 
 #[test]
@@ -5079,7 +5300,7 @@ fn score_stats_ignore_a_removal_that_was_not_a_destruction() {
     let mut sim = Simulation::new();
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+        .register(HouseState::new(owner, 0, None, true, 0, 10));
     insert_entity(&mut sim, 1, EntityCategory::Structure);
     sim.substrate
         .entities
@@ -5090,7 +5311,7 @@ fn score_stats_ignore_a_removal_that_was_not_a_destruction() {
 
     sim.uninit(1);
 
-    assert_eq!(sim.houses.get(&owner).unwrap().stats.losses(), 0);
+    assert_eq!(sim.houses.get(&owner).unwrap().stats().losses(), 0);
 }
 
 #[test]
@@ -5105,7 +5326,7 @@ fn score_stats_count_a_self_inflicted_kill_but_award_no_points() {
     let mut sim = Simulation::new();
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+        .register(HouseState::new(owner, 0, None, true, 0, 10));
     insert_entity(&mut sim, 1, EntityCategory::Structure);
     sim.substrate
         .entities
@@ -5123,10 +5344,10 @@ fn score_stats_count_a_self_inflicted_kill_but_award_no_points() {
     sim.uninit(1);
 
     let house = sim.houses.get(&owner).unwrap();
-    assert_eq!(house.stats.buildings_lost(), 1);
-    assert_eq!(house.stats.buildings_killed(), 1);
+    assert_eq!(house.stats().buildings_lost(), 1);
+    assert_eq!(house.stats().buildings_killed(), 1);
     assert_eq!(
-        house.economy.score(),
+        house.economy().score(),
         0,
         "an allied or self-inflicted victim is worth no score"
     );
@@ -5141,14 +5362,10 @@ fn dont_score_victims_book_no_kill_no_loss_and_no_points() {
     let mut sim = Simulation::new();
     let victim_owner = sim.interner.intern("Americans");
     let killer_owner = sim.interner.intern("Russians");
-    sim.houses.insert(
-        victim_owner,
-        HouseState::new(victim_owner, 0, None, true, 0, 10),
-    );
-    sim.houses.insert(
-        killer_owner,
-        HouseState::new(killer_owner, 1, None, false, 0, 10),
-    );
+    sim.houses
+        .register(HouseState::new(victim_owner, 0, None, true, 0, 10));
+    sim.houses
+        .register(HouseState::new(killer_owner, 1, None, false, 0, 10));
     insert_entity(&mut sim, 1, EntityCategory::Infantry);
     let victim = sim.substrate.entities.get_mut(1).unwrap();
     victim.health.set_for_test(0);
@@ -5161,10 +5378,10 @@ fn dont_score_victims_book_no_kill_no_loss_and_no_points() {
     sim.uninit(1);
 
     let victim_house = sim.houses.get(&victim_owner).unwrap();
-    assert_eq!(victim_house.stats.losses(), 0, "no phantom loss");
+    assert_eq!(victim_house.stats().losses(), 0, "no phantom loss");
     let killer = sim.houses.get(&killer_owner).unwrap();
-    assert_eq!(killer.stats.kills(), 0, "no phantom kill");
-    assert_eq!(killer.economy.score(), 0, "no phantom points");
+    assert_eq!(killer.stats().kills(), 0, "no phantom kill");
+    assert_eq!(killer.economy().score(), 0, "no phantom points");
 }
 
 #[test]
@@ -5174,9 +5391,9 @@ fn deposits_and_kills_feed_the_one_score() {
     // (Cost=900) plus one veteran GI (Cost=200, doubled).
     use crate::rules::ini_parser::IniFile;
     use crate::rules::object_type::{ObjectCategory, ObjectType};
-    use crate::rules::ruleset::INCOME_PPM_SCALE;
     use crate::sim::combat::veterancy::{VeterancyRank, kill_award_points};
     use crate::sim::economy::Economy;
+    use crate::util::native_x87::NativeF32Bits;
 
     let of = |body: &str, category| {
         let ini = IniFile::from_str(&format!(
@@ -5202,7 +5419,11 @@ fn deposits_and_kills_feed_the_one_score() {
 
     let mut economy = Economy::new(0);
     // 240 bales of ore deposited at the x5.0 score rate.
-    economy.add_tiberium_credits(240 * 25, 240, INCOME_PPM_SCALE, INCOME_PPM_SCALE);
+    economy.add_tiberium_credits(
+        25,
+        NativeF32Bits::from_bits(240_f32.to_bits()),
+        NativeF32Bits::ONE,
+    );
     economy.add_score(kill_points);
     assert_eq!(economy.score(), 2_500);
 }
@@ -5212,15 +5433,20 @@ fn lifecycle_authority_animated_death_stays_represented_until_uninit() {
     let mut sim = Simulation::new();
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+        .register(HouseState::new(owner, 0, None, true, 0, 10));
     insert_entity(&mut sim, 1, EntityCategory::Unit);
-    sim.update_house_tracking(1, crate::sim::house_tracking::HouseTracking::add_tracking);
+    Simulation::update_house_tracking(
+        &mut sim.substrate,
+        &mut sim.houses,
+        1,
+        crate::sim::house_tracking::HouseTracking::add_tracking,
+    );
     let _ = sim.reveal(1);
 
     let entity = sim.substrate.entities.get_mut(1).unwrap();
     entity.health.set_for_test(0);
     entity.death.set_dying_for_test(true);
-    let tracking = &sim.houses.get(&owner).unwrap().tracking;
+    let tracking = sim.houses.get(&owner).unwrap().tracking();
     assert_eq!(
         (tracking.units_for_test(), tracking.active_for_test().0),
         (1, 1)
@@ -5233,7 +5459,7 @@ fn lifecycle_authority_animated_death_stays_represented_until_uninit() {
     assert!(entity.in_logic_vector.is_member());
 
     sim.uninit(1);
-    let tracking = &sim.houses.get(&owner).unwrap().tracking;
+    let tracking = sim.houses.get(&owner).unwrap().tracking();
     assert_eq!(
         (tracking.units_for_test(), tracking.active_for_test().0),
         (1, 0)
@@ -5257,36 +5483,6 @@ fn lifecycle_authority_animated_death_stays_represented_until_uninit() {
 }
 
 #[test]
-fn lifecycle_authority_duplicate_queue_finalizes_once() {
-    let mut sim = Simulation::new();
-    insert_entity(&mut sim, 1, EntityCategory::Unit);
-    sim.uninit(1);
-    sim.uninit(1);
-    assert_eq!(sim.substrate.pending_delete.object_ids(), vec![1, 1]);
-    sim.lifecycle_test_events.clear();
-
-    sim.process_pending_delete();
-    assert_eq!(
-        sim.lifecycle_test_events,
-        vec![
-            LifecycleTestEvent::PendingDeleteDrainStarted,
-            LifecycleTestEvent::DeferredDeleteSelected {
-                ticket: super::DeferredDeleteTicket::Object(1),
-            },
-            LifecycleTestEvent::UninitRemovalListenerVisited {
-                expired_id: 1,
-                listener_id: 1,
-                target_alive: false,
-                target_in_limbo: true,
-            },
-            LifecycleTestEvent::FinalizedCommon { stable_id: 1 },
-        ]
-    );
-    assert!(!sim.substrate.entities.contains(1));
-    assert!(sim.substrate.pending_delete.is_empty());
-}
-
-#[test]
 fn lifecycle_authority_entity_and_anim_share_ordered_drain() {
     let mut sim = Simulation::new();
     insert_anim(&mut sim, 2, true);
@@ -5307,6 +5503,12 @@ fn lifecycle_authority_entity_and_anim_share_ordered_drain() {
             LifecycleTestEvent::FinalizedCommon { stable_id: 2 },
             LifecycleTestEvent::DeferredDeleteSelected {
                 ticket: super::DeferredDeleteTicket::Object(1),
+            },
+            // The Unit destructor's own Limbo (`0x0073584F`), already in limbo.
+            LifecycleTestEvent::ConcealAlreadyLimboReturn {
+                stable_id: 1,
+                object_alive: false,
+                resolvable: true,
             },
             LifecycleTestEvent::UninitRemovalListenerVisited {
                 expired_id: 1,
@@ -5338,6 +5540,12 @@ fn lifecycle_authority_late_tail_commits_frame_before_drain() {
             LifecycleTestEvent::DeferredDeleteSelected {
                 ticket: super::DeferredDeleteTicket::Object(1),
             },
+            // The Unit destructor's own Limbo (`0x0073584F`), already in limbo.
+            LifecycleTestEvent::ConcealAlreadyLimboReturn {
+                stable_id: 1,
+                object_alive: false,
+                resolvable: true,
+            },
             LifecycleTestEvent::UninitRemovalListenerVisited {
                 expired_id: 1,
                 listener_id: 1,
@@ -5347,7 +5555,7 @@ fn lifecycle_authority_late_tail_commits_frame_before_drain() {
             LifecycleTestEvent::FinalizedCommon { stable_id: 1 },
         ]
     );
-    assert_eq!(sim.session.binary_frame, 1);
+    assert_eq!(sim.session.binary_frame(), 1);
     assert!(!sim.substrate.entities.contains(1));
 }
 
@@ -5361,13 +5569,13 @@ fn lifecycle_authority_set_logic_order_for_test_synchronizes_all_membership_flag
 
     sim.set_logic_order_for_test(vec![3, 4, 1]);
     assert_eq!(sim.live_object_order_snapshot(), vec![3, 4, 1]);
-    assert!(sim.substrate.anims.get(3).unwrap().in_logic_vector);
+    assert!(sim.substrate.anims.get(3).unwrap().in_logic_vector());
     assert!(
         sim.substrate
             .particle_systems
             .get(4)
             .unwrap()
-            .in_logic_vector
+            .in_logic_vector()
     );
     assert!(
         sim.substrate
@@ -5389,13 +5597,13 @@ fn lifecycle_authority_set_logic_order_for_test_synchronizes_all_membership_flag
 
     sim.set_logic_order_for_test(vec![2]);
     assert_eq!(sim.live_object_order_snapshot(), vec![2]);
-    assert!(!sim.substrate.anims.get(3).unwrap().in_logic_vector);
+    assert!(!sim.substrate.anims.get(3).unwrap().in_logic_vector());
     assert!(
         !sim.substrate
             .particle_systems
             .get(4)
             .unwrap()
-            .in_logic_vector
+            .in_logic_vector()
     );
     assert!(
         !sim.substrate
@@ -5470,7 +5678,7 @@ fn persistent_bullet_logic_slot_publishes_native_wall_dirty_visits() {
         sim.overlay_grid = Some(grid);
         sim.resolved_terrain = Some(crate::sim::tiberium::test_support::flat_terrain(12, 12));
 
-        let projectile_id = sim.allocate_stable_id();
+        let projectile_id = sim.substrate.allocate_stable_id();
         let impact = ProjectileCoord::new(5 * 256 + 128, 5 * 256 + 128, 0);
         let mut spawn = gsi_05_02_projectile(crate::sim::combat::RAD_NO_ATTACKER, Some(0));
         spawn.origin = impact;
@@ -5487,7 +5695,12 @@ fn persistent_bullet_logic_slot_publishes_native_wall_dirty_visits() {
                 ..ObjectAiCtx::default()
             },
         ));
-        assert!(!sim.projectiles.get(projectile_id).unwrap().in_logic_vector);
+        assert!(
+            !sim.projectiles
+                .get(projectile_id)
+                .unwrap()
+                .in_logic_vector()
+        );
         sim
     };
 
@@ -5501,9 +5714,9 @@ fn persistent_bullet_logic_slot_publishes_native_wall_dirty_visits() {
             .overlay_data,
         0x10,
     );
-    assert!(partial.radar_terrain_dirty_cells.is_empty());
-    assert_eq!(partial.radar_terrain_dirty_generation, 0);
-    assert_eq!(partial.tactical_dirty_cells, vec![(5, 5)]);
+    assert!(partial.dirty_cells.radar().is_empty());
+    assert_eq!(partial.dirty_cells.radar_generation(), 0);
+    assert_eq!(partial.dirty_cells.tactical_for_test(), vec![(5, 5)]);
 
     let terminal = run(0x30);
     assert_eq!(
@@ -5516,7 +5729,7 @@ fn persistent_bullet_logic_slot_publishes_native_wall_dirty_visits() {
         None
     );
     assert_eq!(
-        terminal.radar_terrain_dirty_cells,
+        terminal.dirty_cells.radar(),
         vec![
             (5, 5),
             (5, 3),
@@ -5533,9 +5746,9 @@ fn persistent_bullet_logic_slot_publishes_native_wall_dirty_visits() {
             (6, 5),
         ],
     );
-    assert_eq!(terminal.radar_terrain_dirty_generation, 13);
+    assert_eq!(terminal.dirty_cells.radar_generation(), 13);
     assert_eq!(
-        terminal.tactical_dirty_cells,
+        terminal.dirty_cells.tactical_for_test(),
         vec![
             (5, 5),
             (5, 3),
@@ -5646,7 +5859,7 @@ fn homing_ground_impact_reaches_damage_and_cleanup_through_runtime_frame() {
         guidance.max_speed = 4;
         guidance.acceleration = 0;
         let source_id = if with_source {
-            let source_id = sim.allocate_stable_id();
+            let source_id = sim.substrate.allocate_stable_id();
             insert_entity(&mut sim, source_id, EntityCategory::Unit);
             let type_ref = sim.interner.intern("MTNK");
             sim.substrate
@@ -5661,27 +5874,33 @@ fn homing_ground_impact_reaches_damage_and_cleanup_through_runtime_frame() {
             None
         };
         shot.payload = ProjectilePayload::new(1, sim.interner.intern("WALLWH"), None, false);
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         sim.admit_projectile(id, shot);
         // The native control supplies an in-flight OLD-height boundary.
         // Restore it after admission's independent 46C4F0 launch-floor fixup.
-        sim.projectiles.get_mut(id).unwrap().position = origin;
+        sim.projectiles
+            .get_mut(id)
+            .unwrap()
+            .set_position_for_test(origin);
         if with_source {
             let bullet = sim.projectiles.get_mut(id).unwrap();
-            bullet.proximity_reference =
-                ProjectileCoord::new(origin.x + 104, origin.y, origin.z - 2);
-            bullet.last_distance_half = 0;
+            bullet.set_proximity_reference_for_test(ProjectileCoord::new(
+                origin.x + 104,
+                origin.y,
+                origin.z - 2,
+            ));
+            bullet.set_last_distance_half_for_test(0);
         }
         if expire_source {
             sim.uninit(source_id.unwrap());
             assert_eq!(
-                sim.projectiles.get(id).unwrap().source_id,
+                sim.projectiles.get(id).unwrap().source_id(),
                 crate::sim::combat::RAD_NO_ATTACKER
             );
         }
         let mut runtime = SimRuntime::from_simulation(sim);
-        runtime.resources.rules = RuleSet::from_ini(&ini).unwrap();
-        runtime.resources.overlay_registry =
+        runtime.resources_mut().rules = RuleSet::from_ini(&ini).unwrap();
+        runtime.resources_mut().overlay_registry =
             crate::rules::overlay_types::OverlayTypeRegistry::from_ini(&ini, Some(&art));
 
         let _ = runtime
@@ -5696,13 +5915,13 @@ fn homing_ground_impact_reaches_damage_and_cleanup_through_runtime_frame() {
             let bullet = runtime.simulation.projectiles.get(id).expect(
                 "crossing below ground does not trigger the OLD-height predicate until next visit",
             );
-            assert!(bullet.in_logic_vector);
+            assert!(bullet.in_logic_vector());
             // Native ground_old1 uses level6; this fixture uses level2.
             let row = &native["rows"][0];
             assert_eq!(row["input"]["name"], "ground_old1_level_no_acceleration");
             let native_relative_z = row["candidate"][2].as_i64().unwrap()
                 - row["prepared"]["level"].as_i64().unwrap() * 104;
-            assert_eq!(i64::from(bullet.position.z), 208 + native_relative_z);
+            assert_eq!(i64::from(bullet.position().z), 208 + native_relative_z);
             assert_eq!(
                 runtime
                     .simulation
@@ -5754,9 +5973,12 @@ fn homing_mode_one_fuse_snaps_to_cell_location_below_bridge_aim_point() {
     shot.ranged_fuse = true;
     shot.guidance.as_mut().unwrap().max_speed = 4;
     let origin = shot.origin;
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     sim.admit_projectile(id, shot);
-    sim.projectiles.get_mut(id).unwrap().proximity_reference = origin;
+    sim.projectiles
+        .get_mut(id)
+        .unwrap()
+        .set_proximity_reference_for_test(origin);
     let result = sim.projectiles.advance(
         0,
         &BTreeMap::new(),
@@ -5775,10 +5997,29 @@ fn homing_mode_one_fuse_snaps_to_cell_location_below_bridge_aim_point() {
     );
 }
 
+/// The Wave owner's type (`insert_entity`'s TEST), whose fire coordinate
+/// keeps a Wave tracking; the warhead a detonating fixture projectile names;
+/// the particle system type `insert_particle_system` places; and the ART of
+/// `insert_anim`'s TESTANIM.
+fn gsi_05_02_rules() -> crate::rules::ruleset::RuleSet {
+    use crate::rules::ini_parser::IniFile;
+    let mut rules = crate::rules::ruleset::RuleSet::from_ini(&IniFile::from_str(
+        "[VehicleTypes]\n0=TEST\n[TEST]\nStrength=100\n\
+         [Warheads]\n0=GSIWH\n[GSIWH]\nCellSpread=0\n\
+         [ParticleSystems]\n0=GSISYS\n[GSISYS]\nBehavesLike=Smoke\n",
+    ))
+    .expect("GSI fixture rules");
+    let mut art =
+        crate::rules::art_data::ArtRegistry::from_ini(&IniFile::from_str("[TESTANIM]\nEnd=10\n"));
+    art.bind_anim_frame_count_for_test("TESTANIM", 10);
+    rules.replace_art_registry_for_test(art);
+    rules
+}
+
 fn gsi_05_02_mixed_fixture() -> (Simulation, [u64; 6]) {
     let mut sim = Simulation::new();
 
-    let entity_id = sim.allocate_stable_id();
+    let entity_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, entity_id, EntityCategory::Unit);
     sim.substrate
         .entities
@@ -5788,28 +6029,34 @@ fn gsi_05_02_mixed_fixture() -> (Simulation, [u64; 6]) {
         .set_for_test(Some(TargetKind::Cell(1, 0)));
     sim.register_live_object(entity_id);
 
-    let anim_id = sim.allocate_stable_id();
-    insert_anim(&mut sim, anim_id, true);
+    let anim_id = sim.substrate.allocate_stable_id();
+    insert_anim(&mut sim, anim_id, false);
     sim.register_live_object(anim_id);
 
-    let particle_id = sim.allocate_stable_id();
+    let particle_id = sim.substrate.allocate_stable_id();
     insert_particle_system(&mut sim, particle_id);
     sim.register_live_object(particle_id);
 
-    let terrain_id = sim.allocate_stable_id();
-    sim.production.terrain_objects.insert(terrain_id, {
-        let mut terrain =
-            TerrainObjectState::for_test(terrain_id, sim.interner.intern("TREE01"), 8, 9);
-        terrain.health = 10;
-        terrain.max_health = 10;
-        terrain
-    });
-    assert!(sim.register_terrain_object(terrain_id, None));
+    let terrain_id = sim.substrate.allocate_stable_id();
+    sim.terrain_objects.insert_constructed(
+        {
+            let mut terrain =
+                TerrainObjectState::for_test(terrain_id, sim.interner.intern("TREE01"), 8, 9);
+            terrain.set_health_for_test(10);
+            terrain.set_max_health_for_test(10);
+            terrain
+        },
+        false,
+    );
+    sim.terrain_objects.add_to_cell(terrain_id, (8, 9));
+    assert!(
+        sim.register_terrain_object(terrain_id, crate::rules::ruleset::RuleSet::empty_for_test())
+    );
 
-    let projectile_id = sim.allocate_stable_id();
+    let projectile_id = sim.substrate.allocate_stable_id();
     sim.admit_projectile(projectile_id, gsi_05_02_projectile(entity_id, None));
 
-    let wave_id = sim.allocate_stable_id();
+    let wave_id = sim.substrate.allocate_stable_id();
     sim.admit_wave(
         wave_id,
         Wave::new_owned(
@@ -5821,10 +6068,16 @@ fn gsi_05_02_mixed_fixture() -> (Simulation, [u64; 6]) {
         ),
     );
 
+    // Each visit before the last keeps its object, since an object leaving
+    // the vector during its own visit makes the walk skip its successor (see
+    // the terminal-current test below). So the Wave precedes its owner, whose
+    // visit drops the cell target (TEST has no weapon) that keeps the Wave
+    // tracking, and the particle system, which has nothing to spawn and
+    // retires at once, comes last.
     let mixed = [
         terrain_id,
-        entity_id,
         wave_id,
+        entity_id,
         anim_id,
         projectile_id,
         particle_id,
@@ -5836,6 +6089,14 @@ fn gsi_05_02_mixed_fixture() -> (Simulation, [u64; 6]) {
 #[test]
 fn gsi_05_02_mixed_six_family_order_roundtrips_and_dispatches_every_slot() {
     let (sim, mixed) = gsi_05_02_mixed_fixture();
+    let [
+        terrain_id,
+        wave_id,
+        entity_id,
+        anim_id,
+        projectile_id,
+        particle_id,
+    ] = mixed;
     let bytes = GameSnapshot::save(&sim, 0, 0, "logic-membership", 0);
     let mut restored = GameSnapshot::load(&bytes)
         .expect("mixed Logic snapshot")
@@ -5847,43 +6108,50 @@ fn gsi_05_02_mixed_six_family_order_roundtrips_and_dispatches_every_slot() {
     assert_eq!(restored.live_object_order_snapshot(), mixed);
     assert!(
         restored
-            .production
             .terrain_objects
-            .get(&mixed[0])
+            .objects()
+            .get(&terrain_id)
             .unwrap()
-            .in_logic_vector
+            .in_logic_vector()
     );
     assert!(
         restored
             .substrate
             .entities
-            .get(mixed[1])
+            .get(entity_id)
             .unwrap()
             .in_logic_vector
             .is_member()
     );
-    assert!(restored.waves.get(mixed[2]).unwrap().in_logic_vector);
+    assert!(restored.waves.get(wave_id).unwrap().in_logic_vector());
     assert!(
         restored
             .substrate
             .anims
-            .get(mixed[3])
+            .get(anim_id)
             .unwrap()
-            .in_logic_vector
+            .in_logic_vector()
     );
-    assert!(restored.projectiles.get(mixed[4]).unwrap().in_logic_vector);
+    assert!(
+        restored
+            .projectiles
+            .get(projectile_id)
+            .unwrap()
+            .in_logic_vector()
+    );
     assert!(
         restored
             .substrate
             .particle_systems
-            .get(mixed[5])
+            .get(particle_id)
             .unwrap()
-            .in_logic_vector
+            .in_logic_vector()
     );
 
+    let rules = gsi_05_02_rules();
     let mut visited = Vec::new();
     restored.for_each_live_object(|sim, id| {
-        if sim.object_ai_visit_one(id, None, ObjectAiCtx::default()) {
+        if sim.object_ai_visit_one(id, Some(&rules), ObjectAiCtx::default()) {
             visited.push(id);
         }
     });
@@ -5901,8 +6169,8 @@ fn substrate_registration_and_removal_dispatch_is_order_identical() {
     let (mut sim, mixed) = gsi_05_02_mixed_fixture();
     let [
         terrain_id,
-        entity_id,
         wave_id,
+        entity_id,
         anim_id,
         projectile_id,
         particle_id,
@@ -5917,7 +6185,7 @@ fn substrate_registration_and_removal_dispatch_is_order_identical() {
 
     // An id represented nowhere is rejected by both directions and leaves the
     // order untouched.
-    let ghost = sim.allocate_stable_id();
+    let ghost = sim.substrate.allocate_stable_id();
     assert!(!sim.register_live_object(ghost));
     assert!(!sim.unregister_live_object(ghost));
     assert_eq!(sim.live_object_order_snapshot(), mixed);
@@ -5929,13 +6197,13 @@ fn substrate_registration_and_removal_dispatch_is_order_identical() {
         sim.live_object_order_snapshot(),
         vec![terrain_id, entity_id, anim_id, projectile_id, particle_id]
     );
-    assert!(!sim.waves.get(wave_id).unwrap().in_logic_vector);
+    assert!(!sim.waves.get(wave_id).unwrap().in_logic_vector());
     assert!(
-        sim.production
-            .terrain_objects
+        sim.terrain_objects
+            .objects()
             .get(&terrain_id)
             .unwrap()
-            .in_logic_vector
+            .in_logic_vector()
     );
     assert!(
         sim.substrate
@@ -5945,14 +6213,19 @@ fn substrate_registration_and_removal_dispatch_is_order_identical() {
             .in_logic_vector
             .is_member()
     );
-    assert!(sim.substrate.anims.get(anim_id).unwrap().in_logic_vector);
-    assert!(sim.projectiles.get(projectile_id).unwrap().in_logic_vector);
+    assert!(sim.substrate.anims.get(anim_id).unwrap().in_logic_vector());
+    assert!(
+        sim.projectiles
+            .get(projectile_id)
+            .unwrap()
+            .in_logic_vector()
+    );
     assert!(
         sim.substrate
             .particle_systems
             .get(particle_id)
             .unwrap()
-            .in_logic_vector
+            .in_logic_vector()
     );
 
     // The flag gates a second removal; re-registration tail-appends rather
@@ -5970,7 +6243,7 @@ fn substrate_registration_and_removal_dispatch_is_order_identical() {
             wave_id
         ]
     );
-    assert!(sim.waves.get(wave_id).unwrap().in_logic_vector);
+    assert!(sim.waves.get(wave_id).unwrap().in_logic_vector());
 
     // The retire subset dispatches through the same classifier: Terrain /
     // Bullet / Wave retire; Entity and Anim do not.
@@ -5986,7 +6259,7 @@ fn substrate_registration_and_removal_dispatch_is_order_identical() {
 #[test]
 fn gsi_05_02_tail_appends_run_same_pass_and_terminal_current_skips_successor() {
     let mut sim = Simulation::new();
-    let entity_id = sim.allocate_stable_id();
+    let entity_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, entity_id, EntityCategory::Unit);
     sim.register_live_object(entity_id);
 
@@ -5996,9 +6269,9 @@ fn gsi_05_02_tail_appends_run_same_pass_and_terminal_current_skips_successor() {
         visited.push(id);
         let _ = sim.object_ai_visit_one(id, None, ObjectAiCtx::default());
         if id == entity_id {
-            let projectile_id = sim.allocate_stable_id();
+            let projectile_id = sim.substrate.allocate_stable_id();
             sim.admit_projectile(projectile_id, gsi_05_02_projectile(entity_id, None));
-            let wave_id = sim.allocate_stable_id();
+            let wave_id = sim.substrate.allocate_stable_id();
             sim.admit_wave(
                 wave_id,
                 Wave::new(
@@ -6013,18 +6286,21 @@ fn gsi_05_02_tail_appends_run_same_pass_and_terminal_current_skips_successor() {
     let (projectile_id, wave_id) = appended.expect("tail objects appended");
     assert_eq!(visited, vec![entity_id, projectile_id, wave_id]);
     assert_eq!(
-        sim.projectiles.get(projectile_id).unwrap().position,
+        sim.projectiles.get(projectile_id).unwrap().position(),
         // CellClass target coordinates resolve from the live cell center on
         // every visit, so Cell(16, 0) contributes a small positive Y step.
         // BulletType 46C4F0 places this ground-level launch at floor + 1.
         ProjectileCoord::new(64, 1, 1)
     );
-    assert_eq!(sim.waves.get(wave_id).unwrap().lifetime, 99);
+    assert_eq!(sim.waves.get(wave_id).unwrap().lifetime(), 99);
 
+    let rules = gsi_05_02_rules();
     let mut removal = Simulation::new();
-    let terminal_id = removal.allocate_stable_id();
-    removal.admit_projectile(terminal_id, gsi_05_02_projectile(0, Some(0)));
-    let successor_id = removal.allocate_stable_id();
+    let terminal_id = removal.substrate.allocate_stable_id();
+    let mut terminal = gsi_05_02_projectile(0, Some(0));
+    terminal.payload = ProjectilePayload::new(1, removal.interner.intern("GSIWH"), None, false);
+    removal.admit_projectile(terminal_id, terminal);
+    let successor_id = removal.substrate.allocate_stable_id();
     removal.admit_wave(
         successor_id,
         Wave::new(
@@ -6036,7 +6312,7 @@ fn gsi_05_02_tail_appends_run_same_pass_and_terminal_current_skips_successor() {
     let mut removal_visited = Vec::new();
     removal.for_each_live_object(|sim, id| {
         removal_visited.push(id);
-        let _ = sim.object_ai_visit_one(id, None, ObjectAiCtx::default());
+        let _ = sim.object_ai_visit_one(id, Some(&rules), ObjectAiCtx::default());
     });
     assert_eq!(removal_visited, vec![terminal_id]);
     assert_eq!(removal.live_object_order_snapshot(), vec![successor_id]);
@@ -6045,16 +6321,16 @@ fn gsi_05_02_tail_appends_run_same_pass_and_terminal_current_skips_successor() {
         removal.substrate.pending_delete.object_ids(),
         vec![terminal_id]
     );
-    assert_eq!(removal.waves.get(successor_id).unwrap().lifetime, 100);
+    assert_eq!(removal.waves.get(successor_id).unwrap().lifetime(), 100);
     removal.debug_assert_logic_membership_consistent();
 }
 
 #[test]
-fn gsi_05_02_terrain_map_construction_registers_before_later_techno() {
+fn gsi_05_02_terrain_spawner_registers_before_later_techno() {
     let rules =
         crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
             "[InfantryTypes]\n[VehicleTypes]\n[AircraftTypes]\n[BuildingTypes]\n\
-             [TerrainTypes]\n0=TREE01\n[TREE01]\nStrength=10\n",
+             [TerrainTypes]\n0=TREE01\n[TREE01]\nStrength=10\nSpawnsTiberium=yes\n",
         ))
         .expect("terrain fixture rules");
     let mut sim = Simulation::new();
@@ -6071,9 +6347,9 @@ fn gsi_05_02_terrain_map_construction_registers_before_later_techno() {
         ),
         1
     );
-    let terrain_id = *sim.production.terrain_objects.keys().next().unwrap();
+    let terrain_id = *sim.terrain_objects.objects().keys().next().unwrap();
 
-    let entity_id = sim.allocate_stable_id();
+    let entity_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, entity_id, EntityCategory::Unit);
     sim.register_live_object(entity_id);
     assert_eq!(
@@ -6094,25 +6370,30 @@ fn gsi_05_02_lethal_terrain_unregisters_and_inactive_slot_cannot_roundtrip() {
         ))
         .expect("lethal terrain rules");
     let mut sim = Simulation::new();
-    let terrain_id = sim.allocate_stable_id();
+    let terrain_id = sim.substrate.allocate_stable_id();
     let type_ref = sim.interner.intern("TREE01");
     let warhead_ref = sim.interner.intern("WOODWH");
-    sim.production.terrain_objects.insert(terrain_id, {
-        let mut terrain = TerrainObjectState::for_test(terrain_id, type_ref, 5, 6);
-        terrain.health = 10;
-        terrain.max_health = 10;
-        terrain
-    });
-    sim.production
-        .terrain_object_cells
+    sim.terrain_objects
+        .objects_mut_for_test()
+        .insert(terrain_id, {
+            let mut terrain = TerrainObjectState::for_test(terrain_id, type_ref, 5, 6);
+            terrain.set_health_for_test(10);
+            terrain.set_max_health_for_test(10);
+            terrain
+        });
+    sim.terrain_objects
+        .cell_index_mut_for_test()
         .insert((5, 6), terrain_id);
-    assert!(sim.register_terrain_object(terrain_id, None));
+    assert!(
+        sim.register_terrain_object(terrain_id, crate::rules::ruleset::RuleSet::empty_for_test())
+    );
 
     sim.commit_noncombat_aoe_receivers(
         &rules,
         None,
         &[crate::sim::combat::combat_aoe::AreaDamageReceiver::Terrain(
             crate::sim::combat::TerrainDamageEvent {
+                damage_writeback: None,
                 stable_id: terrain_id,
                 rx: 5,
                 ry: 6,
@@ -6124,9 +6405,9 @@ fn gsi_05_02_lethal_terrain_unregisters_and_inactive_slot_cannot_roundtrip() {
         )],
         crate::sim::world::FrameEffects::default(),
     );
-    let terrain = &sim.production.terrain_objects[&terrain_id];
-    assert_eq!(terrain.lifecycle, TerrainObjectLifecycle::Destroyed);
-    assert!(!terrain.in_logic_vector);
+    let terrain = &sim.terrain_objects.objects()[&terrain_id];
+    assert_eq!(terrain.lifecycle(), TerrainObjectLifecycle::Destroyed);
+    assert!(!terrain.in_logic_vector());
     assert!(sim.live_object_order_snapshot().is_empty());
     assert_eq!(sim.substrate.pending_delete.object_ids(), vec![terrain_id]);
 
@@ -6162,24 +6443,29 @@ fn gsi_05_03_terminal_non_entities_remain_resolvable_until_common_drain() {
         .expect("terminal non-entity rules");
     let mut sim = Simulation::new();
 
-    let terrain_id = sim.allocate_stable_id();
+    let terrain_id = sim.substrate.allocate_stable_id();
     let terrain_type = sim.interner.intern("TREE01");
     let warhead_ref = sim.interner.intern("WOODWH");
-    sim.production.terrain_objects.insert(terrain_id, {
-        let mut terrain = TerrainObjectState::for_test(terrain_id, terrain_type, 5, 6);
-        terrain.health = 10;
-        terrain.max_health = 10;
-        terrain
-    });
-    sim.production
-        .terrain_object_cells
+    sim.terrain_objects
+        .objects_mut_for_test()
+        .insert(terrain_id, {
+            let mut terrain = TerrainObjectState::for_test(terrain_id, terrain_type, 5, 6);
+            terrain.set_health_for_test(10);
+            terrain.set_max_health_for_test(10);
+            terrain
+        });
+    sim.terrain_objects
+        .cell_index_mut_for_test()
         .insert((5, 6), terrain_id);
-    assert!(sim.register_terrain_object(terrain_id, None));
+    assert!(
+        sim.register_terrain_object(terrain_id, crate::rules::ruleset::RuleSet::empty_for_test())
+    );
     sim.commit_noncombat_aoe_receivers(
         &rules,
         None,
         &[crate::sim::combat::combat_aoe::AreaDamageReceiver::Terrain(
             crate::sim::combat::TerrainDamageEvent {
+                damage_writeback: None,
                 stable_id: terrain_id,
                 rx: 5,
                 ry: 6,
@@ -6192,30 +6478,35 @@ fn gsi_05_03_terminal_non_entities_remain_resolvable_until_common_drain() {
         crate::sim::world::FrameEffects::default(),
     );
 
-    let projectile_id = sim.allocate_stable_id();
+    let projectile_id = sim.substrate.allocate_stable_id();
     sim.admit_projectile(projectile_id, gsi_05_02_projectile(0, Some(0)));
     assert!(sim.object_ai_visit_one(projectile_id, None, ObjectAiCtx::default()));
 
-    let wave_id = sim.allocate_stable_id();
+    let wave_id = sim.substrate.allocate_stable_id();
     let mut terminal_wave = Wave::new(
         3,
         ProjectileCoord::new(0, 0, 0),
         ProjectileCoord::new(256, 0, 0),
     );
-    terminal_wave.lifetime = 0;
+    terminal_wave.set_lifetime_for_test(0);
     sim.admit_wave(wave_id, terminal_wave);
     assert!(sim.object_ai_visit_one(wave_id, None, ObjectAiCtx::default()));
 
     assert_eq!(
-        sim.production.terrain_objects[&terrain_id].lifecycle,
+        sim.terrain_objects.objects()[&terrain_id].lifecycle(),
         TerrainObjectLifecycle::Destroyed
     );
-    assert!(sim.production.terrain_objects.contains_key(&terrain_id));
+    assert!(sim.terrain_objects.objects().contains_key(&terrain_id));
     assert!(sim.projectiles.get(projectile_id).is_some());
     assert!(sim.waves.get(wave_id).is_some());
-    assert!(!sim.production.terrain_objects[&terrain_id].in_logic_vector);
-    assert!(!sim.projectiles.get(projectile_id).unwrap().in_logic_vector);
-    assert!(!sim.waves.get(wave_id).unwrap().in_logic_vector);
+    assert!(!sim.terrain_objects.objects()[&terrain_id].in_logic_vector());
+    assert!(
+        !sim.projectiles
+            .get(projectile_id)
+            .unwrap()
+            .in_logic_vector()
+    );
+    assert!(!sim.waves.get(wave_id).unwrap().in_logic_vector());
     assert_eq!(
         sim.substrate.pending_delete.object_ids(),
         vec![terrain_id, projectile_id, wave_id]
@@ -6233,22 +6524,12 @@ fn gsi_05_03_terminal_non_entities_remain_resolvable_until_common_drain() {
         restored.substrate.pending_delete.object_ids(),
         vec![terrain_id, projectile_id, wave_id]
     );
-    assert!(
-        restored
-            .production
-            .terrain_objects
-            .contains_key(&terrain_id)
-    );
+    assert!(restored.terrain_objects.objects().contains_key(&terrain_id));
     assert!(restored.projectiles.get(projectile_id).is_some());
     assert!(restored.waves.get(wave_id).is_some());
 
     restored.process_pending_delete();
-    assert!(
-        !restored
-            .production
-            .terrain_objects
-            .contains_key(&terrain_id)
-    );
+    assert!(!restored.terrain_objects.objects().contains_key(&terrain_id));
     assert!(restored.projectiles.get(projectile_id).is_none());
     assert!(restored.waves.get(wave_id).is_none());
     assert!(restored.substrate.pending_delete.is_empty());
@@ -6257,11 +6538,11 @@ fn gsi_05_03_terminal_non_entities_remain_resolvable_until_common_drain() {
 #[test]
 fn gsi_05_04_ground_source_and_target_retarget_before_removal_without_expiry() {
     let mut sim = Simulation::new();
-    sim.session.map_width = 16;
-    sim.session.map_height = 16;
+    sim.session.set_map_width_for_test(16);
+    sim.session.set_map_height_for_test(16);
     install_common_raw_terrain(&mut sim, 16, 16, 2, None);
 
-    let target_id = sim.allocate_stable_id();
+    let target_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, target_id, EntityCategory::Unit);
     assert!(matches!(
         sim.try_reveal_entity(target_id, request(9, 11, PlacementEvidence::MarkSucceeded)),
@@ -6272,7 +6553,7 @@ fn gsi_05_04_ground_source_and_target_retarget_before_removal_without_expiry() {
         11 * 256 + 64,
         2 * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS,
     );
-    let projectile_id = sim.allocate_stable_id();
+    let projectile_id = sim.substrate.allocate_stable_id();
     sim.admit_projectile(
         projectile_id,
         gsi_05_04_guided_projectile(
@@ -6290,9 +6571,9 @@ fn gsi_05_04_ground_source_and_target_retarget_before_removal_without_expiry() {
         .projectiles
         .get(projectile_id)
         .expect("Bullet remains stored throughout pointer cleanup");
-    assert_eq!(projectile.source_id, crate::sim::combat::RAD_NO_ATTACKER);
-    assert_eq!(projectile.target, cell_target);
-    assert!(projectile.in_logic_vector);
+    assert_eq!(projectile.source_id(), crate::sim::combat::RAD_NO_ATTACKER);
+    assert_eq!(projectile.target(), cell_target);
+    assert!(projectile.in_logic_vector());
     assert!(sim.substrate.entities.contains(target_id));
     assert!(sim.lifecycle_test_events.iter().any(|event| {
         *event
@@ -6310,7 +6591,7 @@ fn gsi_05_04_ground_source_and_target_retarget_before_removal_without_expiry() {
     assert!(sim.object_ai_visit_one(projectile_id, None, ObjectAiCtx::default()));
     assert!(sim.projectiles.get(projectile_id).is_some());
     assert_eq!(
-        sim.projectiles.get(projectile_id).unwrap().target,
+        sim.projectiles.get(projectile_id).unwrap().target(),
         cell_target
     );
     assert!(
@@ -6318,7 +6599,7 @@ fn gsi_05_04_ground_source_and_target_retarget_before_removal_without_expiry() {
             sim.projectiles
                 .get(projectile_id)
                 .unwrap()
-                .velocity
+                .velocity()
                 .y
                 .bits()
         ) > 0.0,
@@ -6329,23 +6610,25 @@ fn gsi_05_04_ground_source_and_target_retarget_before_removal_without_expiry() {
 #[test]
 fn gsi_05_04_building_get_coords_uses_foundation_center_cell() {
     let mut sim = Simulation::new();
-    sim.session.map_width = 20;
-    sim.session.map_height = 20;
+    sim.session.set_map_width_for_test(20);
+    sim.session.set_map_height_for_test(20);
     install_common_raw_terrain(&mut sim, 20, 20, 0, None);
 
-    let target_id = sim.allocate_stable_id();
+    let target_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, target_id, EntityCategory::Structure);
     let gapowr = sim.interner.intern("GAPOWR");
     {
         let target = sim.substrate.entities.get_mut(target_id).unwrap();
         target.set_type_ref_for_test(gapowr);
-        target.type_facts.set_foundation_for_test("2x2".to_string());
+        target
+            .type_facts
+            .set_foundation_for_test("2x2".to_string().into());
     }
     assert!(matches!(
         sim.try_reveal_entity(target_id, common_raw_request(9, 11, 0, 128, 128)),
         RevealOutcome::Revealed { .. }
     ));
-    let projectile_id = sim.allocate_stable_id();
+    let projectile_id = sim.substrate.allocate_stable_id();
     sim.admit_projectile(
         projectile_id,
         gsi_05_04_guided_projectile(
@@ -6358,7 +6641,7 @@ fn gsi_05_04_building_get_coords_uses_foundation_center_cell() {
     sim.uninit(target_id);
 
     assert_eq!(
-        sim.projectiles.get(projectile_id).unwrap().target,
+        sim.projectiles.get(projectile_id).unwrap().target(),
         ProjectileTarget::Cell { rx: 10, ry: 12 },
         "BuildingClass GetCoords shifts GAPOWR's NW anchor by 128 leptons per 2x2 axis before truncation"
     );
@@ -6367,27 +6650,27 @@ fn gsi_05_04_building_get_coords_uses_foundation_center_cell() {
 #[test]
 fn gsi_04_01_cell_target_uses_live_structural_bit() {
     let mut sim = Simulation::new();
-    sim.session.map_width = 16;
-    sim.session.map_height = 16;
+    sim.session.set_map_width_for_test(16);
+    sim.session.set_map_height_for_test(16);
     install_common_raw_terrain(&mut sim, 16, 16, 0, Some((6, 7)));
     {
         let cell = sim
             .resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(6, 7)
+            .cell_mut_for_test(6, 7)
             .unwrap();
         cell.level = 2;
         cell.slope_type = 1;
     }
 
-    let target_id = sim.allocate_stable_id();
+    let target_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, target_id, EntityCategory::Unit);
     assert!(matches!(
         sim.try_reveal_entity(target_id, common_raw_request(6, 7, 0, 128, 128)),
         RevealOutcome::Revealed { .. }
     ));
-    let projectile_id = sim.allocate_stable_id();
+    let projectile_id = sim.substrate.allocate_stable_id();
     let center_x = 6 * 256 + 128;
     let center_y = 7 * 256 + 128;
     let bridge_z = crate::util::lepton::ground_height_leptons(2, 1, center_x, center_y)
@@ -6406,7 +6689,7 @@ fn gsi_04_01_cell_target_uses_live_structural_bit() {
 
     sim.uninit(target_id);
     assert_eq!(
-        sim.projectiles.get(projectile_id).unwrap().target,
+        sim.projectiles.get(projectile_id).unwrap().target(),
         ProjectileTarget::Cell { rx: 6, ry: 7 }
     );
     assert_eq!(
@@ -6418,7 +6701,10 @@ fn gsi_04_01_cell_target_uses_live_structural_bit() {
     // The actual Bullet visit consumes the live Cell target coordinate. Being
     // stationary at that target is not an admission: old height is 416, above
     // both native tail gates (4677D3: <208; 467B68: <10).
-    assert_eq!(sim.projectiles.get(projectile_id).unwrap().position, center);
+    assert_eq!(
+        sim.projectiles.get(projectile_id).unwrap().position(),
+        center
+    );
 }
 
 #[test]
@@ -6436,11 +6722,11 @@ fn gsi_05_04_combat_fatal_expiry_keeps_authoritative_cell_target() {
         ))
         .expect("combat-fatal expiry rules");
     let mut sim = Simulation::new();
-    sim.session.map_width = 16;
-    sim.session.map_height = 16;
+    sim.session.set_map_width_for_test(16);
+    sim.session.set_map_height_for_test(16);
     install_common_raw_terrain(&mut sim, 16, 16, 0, None);
 
-    let victim_id = sim.allocate_stable_id();
+    let victim_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, victim_id, EntityCategory::Unit);
     let victim_type = sim.interner.intern("VICTIM");
     {
@@ -6453,7 +6739,7 @@ fn gsi_05_04_combat_fatal_expiry_keeps_authoritative_cell_target() {
         RevealOutcome::Revealed { .. }
     ));
 
-    let listener_id = sim.allocate_stable_id();
+    let listener_id = sim.substrate.allocate_stable_id();
     sim.admit_projectile(
         listener_id,
         gsi_05_04_guided_projectile(
@@ -6491,7 +6777,7 @@ fn gsi_05_04_combat_fatal_expiry_keeps_authoritative_cell_target() {
     assert!(victim.lifecycle.in_limbo());
     assert!(sim.substrate.pending_delete.contains_object(&victim_id));
     assert_eq!(
-        sim.projectiles.get(listener_id).unwrap().target,
+        sim.projectiles.get(listener_id).unwrap().target(),
         ProjectileTarget::Cell { rx: 5, ry: 6 },
         "the synchronous fatal UnInit must read the same allocated CellClass terrain authority as combat before late deletion"
     );
@@ -6516,13 +6802,13 @@ fn gsi_05_04_combat_fatal_garrison_recursion_keeps_cell_target() {
     )
     .expect("fatal garrison recursion rules");
     let mut sim = Simulation::new();
-    sim.session.map_width = 16;
-    sim.session.map_height = 16;
+    sim.session.set_map_width_for_test(16);
+    sim.session.set_map_height_for_test(16);
     install_common_raw_terrain(&mut sim, 16, 16, 0, None);
 
-    let building_id = sim.allocate_stable_id();
+    let building_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, building_id, EntityCategory::Structure);
-    let passenger_id = sim.allocate_stable_id();
+    let passenger_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, passenger_id, EntityCategory::Infantry);
     let building_type = sim.interner.intern("GARRISON");
     let passenger_type = sim.interner.intern("OCCUPANT");
@@ -6536,11 +6822,9 @@ fn gsi_05_04_combat_fatal_garrison_recursion_keeps_cell_target() {
         building.set_type_ref_for_test(building_type);
         building
             .type_facts
-            .set_foundation_for_test("2x2".to_string());
+            .set_foundation_for_test("2x2".to_string().into());
         building.health.set_for_test(10);
-        let mut cargo = PassengerCargo::new(5, 1.0);
-        cargo.board_forced_chain(&[(passenger_id, 1.0)]);
-        building.passenger_role = PassengerRole::transport(cargo);
+        building.passenger_role.occupants_mut().add(passenger_id);
     }
     assert!(matches!(
         sim.try_reveal_entity_with_context(
@@ -6575,7 +6859,7 @@ fn gsi_05_04_combat_fatal_garrison_recursion_keeps_cell_target() {
         (7, 8),
         (7, 9),
     ] {
-        let blocker_id = sim.allocate_stable_id();
+        let blocker_id = sim.substrate.allocate_stable_id();
         insert_entity(&mut sim, blocker_id, EntityCategory::Unit);
         sim.substrate
             .entities
@@ -6588,7 +6872,7 @@ fn gsi_05_04_combat_fatal_garrison_recursion_keeps_cell_target() {
         ));
     }
 
-    let listener_id = sim.allocate_stable_id();
+    let listener_id = sim.substrate.allocate_stable_id();
     sim.admit_projectile(
         listener_id,
         gsi_05_04_guided_projectile(
@@ -6626,7 +6910,7 @@ fn gsi_05_04_combat_fatal_garrison_recursion_keeps_cell_target() {
     assert!(passenger.lifecycle.in_limbo());
     assert!(sim.substrate.pending_delete.contains_object(&passenger_id));
     assert_eq!(
-        sim.projectiles.get(listener_id).unwrap().target,
+        sim.projectiles.get(listener_id).unwrap().target(),
         ProjectileTarget::Cell { rx: 2, ry: 3 },
         "recursive no-exit passenger UnInit inherits combat's allocated CellClass authority"
     );
@@ -6644,11 +6928,11 @@ fn receiver_fatal_expiry_retains_live_dummy_identity_for_bullet_ai() {
 
 fn assert_unallocated_expiry_retains_live_dummy_identity(through_receiver: bool) {
     let mut sim = Simulation::new();
-    sim.session.map_width = 16;
-    sim.session.map_height = 16;
+    sim.session.set_map_width_for_test(16);
+    sim.session.set_map_height_for_test(16);
     install_common_raw_terrain(&mut sim, 16, 16, 0, None);
 
-    let target_id = sim.allocate_stable_id();
+    let target_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, target_id, EntityCategory::Unit);
     assert!(matches!(
         sim.try_reveal_entity(target_id, common_raw_request(8, 8, 0, 128, 64)),
@@ -6664,7 +6948,7 @@ fn assert_unallocated_expiry_retains_live_dummy_identity(through_receiver: bool)
         .expect("terrain")
         .test_set_native_allocated_cells(&allocated);
 
-    let projectile_id = sim.allocate_stable_id();
+    let projectile_id = sim.substrate.allocate_stable_id();
     sim.admit_projectile(
         projectile_id,
         gsi_05_04_guided_projectile(
@@ -6681,12 +6965,17 @@ fn assert_unallocated_expiry_retains_live_dummy_identity(through_receiver: bool)
     }
 
     assert_eq!(
-        sim.projectiles.get(projectile_id).unwrap().target,
+        sim.projectiles.get(projectile_id).unwrap().target(),
         ProjectileTarget::DummyCell,
         "MapClass::Get_CellClass @ 0x005657A0 answers an unallocated slot with \
          the shared dummy CellClass carrying the requested coord, never NULL"
     );
-    assert!(sim.projectiles.get(projectile_id).unwrap().in_logic_vector);
+    assert!(
+        sim.projectiles
+            .get(projectile_id)
+            .unwrap()
+            .in_logic_vector()
+    );
     let dummy = sim.effective_shared_cell_dummy();
     assert_eq!(dummy.snapshot().coord, (8, 8));
 
@@ -6704,7 +6993,7 @@ fn assert_unallocated_expiry_retains_live_dummy_identity(through_receiver: bool)
             sim.projectiles
                 .get(projectile_id)
                 .unwrap()
-                .velocity
+                .velocity()
                 .y
                 .bits()
         ) < 0.0,
@@ -6725,18 +7014,18 @@ fn assert_unallocated_expiry_retains_live_dummy_identity(through_receiver: bool)
 #[test]
 fn gsi_05_04_sentinel_origin_cell_target_becomes_explicit_null() {
     let mut sim = Simulation::new();
-    sim.session.map_width = 16;
-    sim.session.map_height = 16;
+    sim.session.set_map_width_for_test(16);
+    sim.session.set_map_height_for_test(16);
     install_common_raw_terrain(&mut sim, 16, 16, 0, None);
 
-    let target_id = sim.allocate_stable_id();
+    let target_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, target_id, EntityCategory::Unit);
     assert!(matches!(
         sim.try_reveal_entity(target_id, request(0, 0, PlacementEvidence::MarkSucceeded)),
         RevealOutcome::Revealed { .. }
     ));
 
-    let projectile_id = sim.allocate_stable_id();
+    let projectile_id = sim.substrate.allocate_stable_id();
     sim.admit_projectile(
         projectile_id,
         gsi_05_04_guided_projectile(
@@ -6749,12 +7038,17 @@ fn gsi_05_04_sentinel_origin_cell_target_becomes_explicit_null() {
     sim.uninit(target_id);
 
     assert_eq!(
-        sim.projectiles.get(projectile_id).unwrap().target,
+        sim.projectiles.get(projectile_id).unwrap().target(),
         ProjectileTarget::None,
         "cell (0, 0) is the native sentinel, so the target is cleared rather \
          than retained as a Cell"
     );
-    assert!(sim.projectiles.get(projectile_id).unwrap().in_logic_vector);
+    assert!(
+        sim.projectiles
+            .get(projectile_id)
+            .unwrap()
+            .in_logic_vector()
+    );
 }
 
 #[test]
@@ -6766,8 +7060,8 @@ fn gsi_05_04_high_flying_source_and_target_become_explicit_null() {
     let control = &native["rows"][2];
     assert_eq!(control["input"]["name"], "expired_null_below_safety");
     let mut sim = Simulation::new();
-    sim.session.map_width = 32;
-    sim.session.map_height = 32;
+    sim.session.set_map_width_for_test(32);
+    sim.session.set_map_height_for_test(32);
     // Installed so the case is production-shaped rather than a bare store; the
     // replacement no longer reads terrain either way.
     // `ObjectClass::IsHighFlying @ 0x005F6B90` is the only thing keeping this
@@ -6778,7 +7072,7 @@ fn gsi_05_04_high_flying_source_and_target_become_explicit_null() {
     // (`0x004684FF`), never on the high-flying predicate.
     install_common_raw_terrain(&mut sim, 32, 32, 0, None);
 
-    let target_id = sim.allocate_stable_id();
+    let target_id = sim.substrate.allocate_stable_id();
     install_fly_aircraft(&mut sim, target_id, SimFixed::from_num(208));
     assert!(matches!(
         sim.try_reveal_entity(target_id, request(13, 15, PlacementEvidence::MarkSucceeded)),
@@ -6789,11 +7083,11 @@ fn gsi_05_04_high_flying_source_and_target_become_explicit_null() {
     sim.set_object_height(
         target_id,
         208,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default(),
     );
-    let projectile_id = sim.allocate_stable_id();
+    let projectile_id = sim.substrate.allocate_stable_id();
     let mut spawn = gsi_05_04_guided_projectile(
         target_id,
         ProjectileTarget::Entity(target_id),
@@ -6805,16 +7099,17 @@ fn gsi_05_04_high_flying_source_and_target_become_explicit_null() {
     // translating native floor624 to0 keeps the same400-lepton height.
     spawn.origin = ProjectileCoord::new(1024, 1024, 400);
     spawn.native_unique_id = control["prepared"]["unique_id"].as_i64().unwrap() as i32;
-    sim.session.binary_frame = control["prepared"]["binary_frame"].as_u64().unwrap() as u32;
+    sim.session
+        .set_binary_frame_for_test(control["prepared"]["binary_frame"].as_u64().unwrap() as u32);
     sim.admit_projectile(projectile_id, spawn);
     sim.lifecycle_test_events.clear();
 
     sim.uninit(target_id);
 
     let projectile = sim.projectiles.get(projectile_id).unwrap();
-    assert_eq!(projectile.source_id, crate::sim::combat::RAD_NO_ATTACKER);
-    assert_eq!(projectile.target, ProjectileTarget::None);
-    assert!(projectile.in_logic_vector);
+    assert_eq!(projectile.source_id(), crate::sim::combat::RAD_NO_ATTACKER);
+    assert_eq!(projectile.target(), ProjectileTarget::None);
+    assert!(projectile.in_logic_vector());
     assert!(sim.lifecycle_test_events.iter().any(|event| {
         *event
             == LifecycleTestEvent::ProjectilePointerExpiredVisited {
@@ -6835,20 +7130,20 @@ fn gsi_05_04_high_flying_source_and_target_become_explicit_null() {
         .restore_after_snapshot_load()
         .expect("null Bullet target remains valid on restore");
     assert_eq!(
-        restored.projectiles.get(projectile_id).unwrap().target,
+        restored.projectiles.get(projectile_id).unwrap().target(),
         ProjectileTarget::None
     );
     assert!(restored.object_ai_visit_one(projectile_id, None, ObjectAiCtx::default()));
     let advanced = restored.projectiles.get(projectile_id).unwrap();
-    assert_eq!(advanced.target, ProjectileTarget::None);
+    assert_eq!(advanced.target(), ProjectileTarget::None);
     let expected_velocity: [u64; 3] = std::array::from_fn(|i| {
         u64::from_str_radix(control["velocity"]["bits"][i].as_str().unwrap(), 16).unwrap()
     });
     assert_eq!(
         [
-            advanced.velocity.x.bits(),
-            advanced.velocity.y.bits(),
-            advanced.velocity.z.bits()
+            advanced.velocity().x.bits(),
+            advanced.velocity().y.bits(),
+            advanced.velocity().z.bits()
         ],
         expected_velocity,
         "native null-target tracking preserves yaw and pitches upward, rather than tracking the cached target"
@@ -6860,16 +7155,16 @@ fn gsi_05_04_high_flying_source_and_target_become_explicit_null() {
 #[test]
 fn gsi_05_04_cell_target_cleanup_is_idempotent_across_duplicate_uninit() {
     let mut sim = Simulation::new();
-    sim.session.map_width = 8;
-    sim.session.map_height = 8;
+    sim.session.set_map_width_for_test(8);
+    sim.session.set_map_height_for_test(8);
 
-    let target_id = sim.allocate_stable_id();
+    let target_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, target_id, EntityCategory::Unit);
     assert!(matches!(
         sim.try_reveal_entity(target_id, request(9, 9, PlacementEvidence::MarkSucceeded)),
         RevealOutcome::Revealed { .. }
     ));
-    let projectile_id = sim.allocate_stable_id();
+    let projectile_id = sim.substrate.allocate_stable_id();
     sim.admit_projectile(
         projectile_id,
         gsi_05_04_guided_projectile(
@@ -6881,7 +7176,10 @@ fn gsi_05_04_cell_target_cleanup_is_idempotent_across_duplicate_uninit() {
 
     sim.uninit(target_id);
     let after_first = sim.projectiles.get(projectile_id).unwrap().clone();
-    assert_eq!(after_first.target, ProjectileTarget::Cell { rx: 9, ry: 9 });
+    assert_eq!(
+        after_first.target(),
+        ProjectileTarget::Cell { rx: 9, ry: 9 }
+    );
     sim.lifecycle_test_events.clear();
 
     sim.uninit(target_id);
@@ -6913,13 +7211,13 @@ fn gsi_05_04_cell_target_cleanup_is_idempotent_across_duplicate_uninit() {
 #[test]
 fn gsi_05_04_projectile_listener_keeps_mixed_object_construction_order() {
     let mut sim = Simulation::new();
-    sim.session.map_width = 16;
-    sim.session.map_height = 16;
+    sim.session.set_map_width_for_test(16);
+    sim.session.set_map_height_for_test(16);
 
-    let entity_id = sim.allocate_stable_id();
+    let entity_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, entity_id, EntityCategory::Unit);
 
-    let projectile_id = sim.allocate_stable_id();
+    let projectile_id = sim.substrate.allocate_stable_id();
     let target_id = 5;
     sim.admit_projectile(
         projectile_id,
@@ -6930,11 +7228,11 @@ fn gsi_05_04_projectile_listener_keeps_mixed_object_construction_order() {
         ),
     );
 
-    let anim_id = sim.allocate_stable_id();
+    let anim_id = sim.substrate.allocate_stable_id();
     insert_anim(&mut sim, anim_id, false);
-    let particle_id = sim.allocate_stable_id();
+    let particle_id = sim.substrate.allocate_stable_id();
     insert_particle_system(&mut sim, particle_id);
-    assert_eq!(sim.allocate_stable_id(), target_id);
+    assert_eq!(sim.substrate.allocate_stable_id(), target_id);
     insert_entity(&mut sim, target_id, EntityCategory::Unit);
     let _ = sim.reveal(target_id);
     sim.lifecycle_test_events.clear();
@@ -6979,7 +7277,12 @@ fn gsi_05_04_projectile_listener_keeps_mixed_object_construction_order() {
         } if *expired_id == target_id && *visited_id == projectile_id
     )));
     assert!(sim.projectiles.get(projectile_id).is_some());
-    assert!(sim.projectiles.get(projectile_id).unwrap().in_logic_vector);
+    assert!(
+        sim.projectiles
+            .get(projectile_id)
+            .unwrap()
+            .in_logic_vector()
+    );
 }
 
 fn gsi_01_05_damage_rules() -> crate::rules::ruleset::RuleSet {
@@ -7006,9 +7309,10 @@ fn gsi_01_05_damage_rules() -> crate::rules::ruleset::RuleSet {
 
 #[test]
 fn wave_pointer_expiry_target_survives_dying_then_uninit_starts_decay_tail() {
+    let rules = receiver_authority_rules();
     let mut sim = Simulation::new();
-    let owner_id = sim.allocate_stable_id();
-    let target_id = sim.allocate_stable_id();
+    let owner_id = sim.substrate.allocate_stable_id();
+    let target_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, owner_id, EntityCategory::Unit);
     insert_entity(&mut sim, target_id, EntityCategory::Unit);
     {
@@ -7027,7 +7331,7 @@ fn wave_pointer_expiry_target_survives_dying_then_uninit_starts_decay_tail() {
         target.death.set_dying_for_test(true);
     }
 
-    let wave_id = sim.allocate_stable_id();
+    let wave_id = sim.substrate.allocate_stable_id();
     let wave = Wave::new_owned(
         0,
         owner_id,
@@ -7038,7 +7342,7 @@ fn wave_pointer_expiry_target_survives_dying_then_uninit_starts_decay_tail() {
     sim.admit_wave(wave_id, wave);
     sim.active_wave_links.insert(owner_id, wave_id);
 
-    let represented = sim.wave_update_context(sim.waves.get(wave_id).unwrap(), None);
+    let represented = sim.wave_update_context(sim.waves.get(wave_id).unwrap(), &rules, None);
     assert_eq!(
         represented.target_position,
         Some(ProjectileCoord::new(4 * 256 + 128, 128, 0)),
@@ -7048,31 +7352,35 @@ fn wave_pointer_expiry_target_survives_dying_then_uninit_starts_decay_tail() {
         .waves
         .advance_one(wave_id, represented, sim.resolved_terrain.as_ref())
         .expect("represented Wave AI");
-    assert!(sim.waves.get(wave_id).unwrap().active_geometry);
-    assert!(!sim.waves.get(wave_id).unwrap().decaying);
+    assert!(sim.waves.get(wave_id).unwrap().active_geometry());
+    assert!(!sim.waves.get(wave_id).unwrap().decaying());
 
-    sim.uninit(target_id);
+    sim.uninit_with_rules(target_id, &rules);
 
     let wave = sim.waves.get(wave_id).expect("Wave remains represented");
-    assert_eq!(wave.owner_id, Some(owner_id));
-    assert_eq!(wave.target_ref, None, "UnInit synchronously expires +0xAC");
+    assert_eq!(wave.owner_id(), Some(owner_id));
+    assert_eq!(
+        wave.target_ref(),
+        None,
+        "UnInit synchronously expires +0xAC"
+    );
     assert_eq!(sim.active_wave_links.get(&owner_id), Some(&wave_id));
-    let expired = sim.wave_update_context(sim.waves.get(wave_id).unwrap(), None);
+    let expired = sim.wave_update_context(sim.waves.get(wave_id).unwrap(), &rules, None);
     assert_eq!(expired.target_position, None);
     let _ = sim
         .waves
         .advance_one(wave_id, expired, sim.resolved_terrain.as_ref())
         .expect("post-expiry Wave AI");
     let wave = sim.waves.get(wave_id).unwrap();
-    assert!(!wave.active_geometry);
-    assert!(wave.decaying, "null target activates the decay/fade tail");
+    assert!(!wave.active_geometry());
+    assert!(wave.decaying(), "null target activates the decay/fade tail");
 }
 
 #[test]
 fn wave_pointer_expiry_owner_allows_dying_damage_then_uninit_nulls_later_calls() {
     let rules = gsi_01_05_damage_rules();
     let mut sim = Simulation::new();
-    let owner_id = sim.allocate_stable_id();
+    let owner_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, owner_id, EntityCategory::Unit);
     {
         let owner = sim.substrate.entities.get_mut(owner_id).unwrap();
@@ -7083,7 +7391,7 @@ fn wave_pointer_expiry_owner_allows_dying_damage_then_uninit_nulls_later_calls()
             .attack_target
             .set_for_test(Some(TargetKind::Cell(4, 5)));
     }
-    let receiver_id = sim.allocate_stable_id();
+    let receiver_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, receiver_id, EntityCategory::Unit);
     {
         let receiver = sim.substrate.entities.get_mut(receiver_id).unwrap();
@@ -7095,7 +7403,7 @@ fn wave_pointer_expiry_owner_allows_dying_damage_then_uninit_nulls_later_calls()
         RevealOutcome::Revealed { .. }
     ));
 
-    let wave_id = sim.allocate_stable_id();
+    let wave_id = sim.substrate.allocate_stable_id();
     let mut wave = Wave::new_owned(
         0,
         owner_id,
@@ -7111,11 +7419,16 @@ fn wave_pointer_expiry_owner_allows_dying_damage_then_uninit_nulls_later_calls()
         firer_id: owner_id,
         recorded_cells: vec![WaveRecordedCell::real(4, 5)],
         wave_z: 0,
+        ares_weapon: None,
     };
     assert!(
-        sim.wave_update_context(sim.waves.get(wave_id).unwrap(), None)
-            .owner_position
-            .is_some(),
+        sim.wave_update_context(
+            sim.waves.get(wave_id).unwrap(),
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            None
+        )
+        .owner_position
+        .is_some(),
         "the dying-but-represented owner still supplies live Wave coordinates",
     );
     assert_eq!(sim.active_wave_links.get(&owner_id), Some(&wave_id));
@@ -7138,9 +7451,9 @@ fn wave_pointer_expiry_owner_allows_dying_damage_then_uninit_nulls_later_calls()
     );
 
     sim.uninit(owner_id);
-    assert_eq!(sim.waves.get(wave_id).unwrap().owner_id, None);
+    assert_eq!(sim.waves.get(wave_id).unwrap().owner_id(), None);
     assert_eq!(
-        sim.waves.get(wave_id).unwrap().target_ref,
+        sim.waves.get(wave_id).unwrap().target_ref(),
         Some(TargetKind::Cell(4, 5)),
         "owner expiry does not clear an unrelated CellClass target",
     );
@@ -7167,9 +7480,9 @@ fn wave_pointer_expiry_owner_allows_dying_damage_then_uninit_nulls_later_calls()
 #[test]
 fn wave_pointer_expiry_ignores_unrelated_object_and_preserves_owner_link() {
     let mut sim = Simulation::new();
-    let owner_id = sim.allocate_stable_id();
-    let target_id = sim.allocate_stable_id();
-    let unrelated_id = sim.allocate_stable_id();
+    let owner_id = sim.substrate.allocate_stable_id();
+    let target_id = sim.substrate.allocate_stable_id();
+    let unrelated_id = sim.substrate.allocate_stable_id();
     for id in [owner_id, target_id, unrelated_id] {
         insert_entity(&mut sim, id, EntityCategory::Unit);
     }
@@ -7179,7 +7492,7 @@ fn wave_pointer_expiry_ignores_unrelated_object_and_preserves_owner_link() {
         .unwrap()
         .attack_target
         .set_for_test(Some(TargetKind::Entity(target_id)));
-    let wave_id = sim.allocate_stable_id();
+    let wave_id = sim.substrate.allocate_stable_id();
     sim.admit_wave(
         wave_id,
         Wave::new_owned(
@@ -7195,8 +7508,8 @@ fn wave_pointer_expiry_ignores_unrelated_object_and_preserves_owner_link() {
     sim.uninit(unrelated_id);
 
     let wave = sim.waves.get(wave_id).expect("unrelated expiry keeps Wave");
-    assert_eq!(wave.owner_id, Some(owner_id));
-    assert_eq!(wave.target_ref, Some(TargetKind::Entity(target_id)));
+    assert_eq!(wave.owner_id(), Some(owner_id));
+    assert_eq!(wave.target_ref(), Some(TargetKind::Entity(target_id)));
     assert_eq!(sim.active_wave_links.get(&owner_id), Some(&wave_id));
 }
 
@@ -7204,7 +7517,7 @@ fn wave_pointer_expiry_ignores_unrelated_object_and_preserves_owner_link() {
 fn gsi_01_05_lethal_bullet_commits_receiver_before_retirement_and_double_compaction() {
     let rules = gsi_01_05_damage_rules();
     let mut sim = Simulation::new();
-    let victim_id = sim.allocate_stable_id();
+    let victim_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, victim_id, EntityCategory::Unit);
     let victim_type = sim.interner.intern("VICTIM");
     {
@@ -7217,7 +7530,7 @@ fn gsi_01_05_lethal_bullet_commits_receiver_before_retirement_and_double_compact
         RevealOutcome::Revealed { .. }
     ));
 
-    let successor_id = sim.allocate_stable_id();
+    let successor_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, successor_id, EntityCategory::Unit);
     let successor_type = sim.interner.intern("SUCCESSOR");
     sim.substrate
@@ -7230,7 +7543,7 @@ fn gsi_01_05_lethal_bullet_commits_receiver_before_retirement_and_double_compact
         RevealOutcome::Revealed { .. }
     ));
 
-    let projectile_id = sim.allocate_stable_id();
+    let projectile_id = sim.substrate.allocate_stable_id();
     let impact = ProjectileCoord::new(5 * 256 + 128, 6 * 256 + 128, 0);
     let mut spawn = gsi_05_02_projectile(crate::sim::combat::RAD_NO_ATTACKER, Some(0));
     spawn.origin = impact;
@@ -7240,7 +7553,10 @@ fn gsi_01_05_lethal_bullet_commits_receiver_before_retirement_and_double_compact
     sim.admit_projectile(projectile_id, spawn);
     // Supply an already-arrived impact boundary for the lethal transaction;
     // native launch-floor placement is covered by projectile_trailer tests.
-    sim.projectiles.get_mut(projectile_id).unwrap().position = impact;
+    sim.projectiles
+        .get_mut(projectile_id)
+        .unwrap()
+        .set_position_for_test(impact);
     sim.set_logic_order_for_test(vec![projectile_id, victim_id, successor_id]);
     sim.lifecycle_test_events.clear();
 
@@ -7275,7 +7591,12 @@ fn gsi_01_05_lethal_bullet_commits_receiver_before_retirement_and_double_compact
         vec![victim_id, projectile_id]
     );
     assert!(sim.projectiles.get(projectile_id).is_some());
-    assert!(!sim.projectiles.get(projectile_id).unwrap().in_logic_vector);
+    assert!(
+        !sim.projectiles
+            .get(projectile_id)
+            .unwrap()
+            .in_logic_vector()
+    );
 
     let queued = sim
         .lifecycle_test_events
@@ -7296,7 +7617,7 @@ fn gsi_01_05_lethal_bullet_commits_receiver_before_retirement_and_double_compact
 fn gsi_01_05_terminal_wave_damages_once_before_single_current_removal() {
     let rules = gsi_01_05_damage_rules();
     let mut sim = Simulation::new();
-    let victim_id = sim.allocate_stable_id();
+    let victim_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, victim_id, EntityCategory::Unit);
     let victim_type = sim.interner.intern("VICTIM");
     sim.substrate
@@ -7310,7 +7631,7 @@ fn gsi_01_05_terminal_wave_damages_once_before_single_current_removal() {
         RevealOutcome::Revealed { .. }
     ));
 
-    let successor_id = sim.allocate_stable_id();
+    let successor_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, successor_id, EntityCategory::Unit);
     let successor_type = sim.interner.intern("SUCCESSOR");
     sim.substrate
@@ -7323,8 +7644,8 @@ fn gsi_01_05_terminal_wave_damages_once_before_single_current_removal() {
         RevealOutcome::Revealed { .. }
     ));
 
-    let wave_id = sim.allocate_stable_id();
-    let firer_id = sim.allocate_stable_id();
+    let wave_id = sim.substrate.allocate_stable_id();
+    let firer_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, firer_id, EntityCategory::Unit);
     sim.substrate
         .entities
@@ -7344,10 +7665,10 @@ fn gsi_01_05_terminal_wave_damages_once_before_single_current_removal() {
         ProjectileCoord::new(4 * 256, 5 * 256, 0),
         ProjectileCoord::new(5 * 256, 5 * 256, 0),
     );
-    wave.active_geometry = false;
-    wave.decaying = true;
-    wave.fade_in = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
-    wave.fade_out = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
+    wave.set_active_geometry_for_test(false);
+    wave.set_decaying_for_test(true);
+    wave.set_fade_in_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
+    wave.set_fade_out_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
     wave.replace_recorded_cells(vec![WaveRecordedCell::real(4, 5)]);
     sim.admit_wave(wave_id, wave);
     sim.set_logic_order_for_test(vec![wave_id, victim_id, successor_id]);
@@ -7395,7 +7716,7 @@ fn gsi_01_05_terminal_wave_damages_once_before_single_current_removal() {
         vec![victim_id, successor_id]
     );
     assert!(sim.waves.get(wave_id).is_some());
-    assert!(!sim.waves.get(wave_id).unwrap().in_logic_vector);
+    assert!(!sim.waves.get(wave_id).unwrap().in_logic_vector());
     assert_eq!(
         sim.lifecycle_test_events
             .iter()
@@ -7411,7 +7732,7 @@ fn gsi_01_05_terminal_wave_damages_once_before_single_current_removal() {
 fn terminal_type_zero_wave_with_empty_recorded_vector_has_no_damage_area_tail() {
     let rules = gsi_01_05_damage_rules();
     let mut sim = Simulation::new();
-    let firer_id = sim.allocate_stable_id();
+    let firer_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, firer_id, EntityCategory::Unit);
     {
         let firer = sim.substrate.entities.get_mut(firer_id).unwrap();
@@ -7420,7 +7741,7 @@ fn terminal_type_zero_wave_with_empty_recorded_vector_has_no_damage_area_tail() 
             .attack_target
             .set_for_test(Some(TargetKind::Cell(4, 5)));
     }
-    let wave_id = sim.allocate_stable_id();
+    let wave_id = sim.substrate.allocate_stable_id();
     let mut wave = Wave::new_owned(
         0,
         firer_id,
@@ -7428,10 +7749,10 @@ fn terminal_type_zero_wave_with_empty_recorded_vector_has_no_damage_area_tail() 
         ProjectileCoord::new(4 * 256, 5 * 256, 0),
         ProjectileCoord::new(5 * 256, 5 * 256, 0),
     );
-    wave.active_geometry = false;
-    wave.decaying = true;
-    wave.fade_in = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
-    wave.fade_out = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
+    wave.set_active_geometry_for_test(false);
+    wave.set_decaying_for_test(true);
+    wave.set_fade_in_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
+    wave.set_fade_out_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
     sim.admit_wave(wave_id, wave);
     sim.active_wave_links.insert(firer_id, wave_id);
     sim.scenario_rng = crate::sim::rng::SimRng::new(0x45_4d_50_54_59);
@@ -7442,8 +7763,8 @@ fn terminal_type_zero_wave_with_empty_recorded_vector_has_no_damage_area_tail() 
     assert_eq!(sim.scenario_rng.logical_state(), expected_rng);
     assert!(!sim.active_wave_links.contains_key(&firer_id));
     assert!(sim.dynamic_terrain_cells.is_empty());
-    assert!(sim.radar_terrain_dirty_cells.is_empty());
-    assert!(sim.tactical_dirty_cells.is_empty());
+    assert!(sim.dirty_cells.radar().is_empty());
+    assert!(sim.dirty_cells.tactical_for_test().is_empty());
     assert_eq!(sim.substrate.pending_delete.object_ids(), vec![wave_id]);
 }
 
@@ -7465,7 +7786,7 @@ fn wave_elite_ambient_damage_carries_within_cell_and_resets_on_next_cell() {
         ))
         .expect("Wave shared-damage fixture");
     let mut sim = Simulation::new();
-    let second_id = sim.allocate_stable_id();
+    let second_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, second_id, EntityCategory::Unit);
     sim.substrate
         .entities
@@ -7477,7 +7798,7 @@ fn wave_elite_ambient_damage_carries_within_cell_and_resets_on_next_cell() {
         RevealOutcome::Revealed { .. }
     ));
 
-    let first_id = sim.allocate_stable_id();
+    let first_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, first_id, EntityCategory::Unit);
     sim.substrate
         .entities
@@ -7489,7 +7810,7 @@ fn wave_elite_ambient_damage_carries_within_cell_and_resets_on_next_cell() {
         RevealOutcome::Revealed { .. }
     ));
 
-    let next_id = sim.allocate_stable_id();
+    let next_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, next_id, EntityCategory::Unit);
     sim.substrate
         .entities
@@ -7501,7 +7822,7 @@ fn wave_elite_ambient_damage_carries_within_cell_and_resets_on_next_cell() {
         RevealOutcome::Revealed { .. }
     ));
 
-    let firer_id = sim.allocate_stable_id();
+    let firer_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, firer_id, EntityCategory::Unit);
     {
         let firer = sim.substrate.entities.get_mut(firer_id).unwrap();
@@ -7512,7 +7833,7 @@ fn wave_elite_ambient_damage_carries_within_cell_and_resets_on_next_cell() {
             .set_for_test(Some(TargetKind::Entity(next_id)));
     }
 
-    let wave_id = sim.allocate_stable_id();
+    let wave_id = sim.substrate.allocate_stable_id();
     let mut wave = Wave::new_owned(
         0,
         firer_id,
@@ -7520,10 +7841,10 @@ fn wave_elite_ambient_damage_carries_within_cell_and_resets_on_next_cell() {
         ProjectileCoord::new(4 * 256, 5 * 256, 0),
         ProjectileCoord::new(6 * 256, 5 * 256, 0),
     );
-    wave.active_geometry = false;
-    wave.decaying = true;
-    wave.fade_in = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
-    wave.fade_out = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
+    wave.set_active_geometry_for_test(false);
+    wave.set_decaying_for_test(true);
+    wave.set_fade_in_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
+    wave.set_fade_out_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
     wave.replace_recorded_cells(vec![
         WaveRecordedCell::real(4, 5),
         WaveRecordedCell::real(5, 5),
@@ -7601,7 +7922,7 @@ fn wave_shared_damage_passes_a_unit_inside_its_war_factory() {
         .expect("Wave war-factory fixture");
     let mut sim = Simulation::new();
     let unit = |sim: &mut Simulation, kind: &str| {
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         insert_entity(sim, id, EntityCategory::Unit);
         sim.substrate
             .entities
@@ -7616,14 +7937,14 @@ fn wave_shared_damage_passes_a_unit_inside_its_war_factory() {
     };
     let second_id = unit(&mut sim, "SECOND");
     let first_id = unit(&mut sim, "FIRST");
-    let factory_id = sim.allocate_stable_id();
+    let factory_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, factory_id, EntityCategory::Structure);
     {
         let factory = sim.substrate.entities.get_mut(factory_id).unwrap();
         factory.set_type_ref_for_test(sim.interner.intern("WEAP"));
         factory
             .type_facts
-            .set_foundation_for_test("1x1".to_string());
+            .set_foundation_for_test("1x1".to_string().into());
     }
     assert!(matches!(
         sim.try_reveal_entity(factory_id, common_raw_request(4, 5, 0, 128, 128)),
@@ -7637,7 +7958,7 @@ fn wave_shared_damage_passes_a_unit_inside_its_war_factory() {
         .insert(factory_id)
         .unwrap();
 
-    let firer_id = sim.allocate_stable_id();
+    let firer_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, firer_id, EntityCategory::Unit);
     {
         let firer = sim.substrate.entities.get_mut(firer_id).unwrap();
@@ -7646,7 +7967,7 @@ fn wave_shared_damage_passes_a_unit_inside_its_war_factory() {
             .attack_target
             .set_for_test(Some(TargetKind::Entity(second_id)));
     }
-    let wave_id = sim.allocate_stable_id();
+    let wave_id = sim.substrate.allocate_stable_id();
     let mut wave = Wave::new_owned(
         0,
         firer_id,
@@ -7654,10 +7975,10 @@ fn wave_shared_damage_passes_a_unit_inside_its_war_factory() {
         ProjectileCoord::new(4 * 256, 5 * 256, 0),
         ProjectileCoord::new(6 * 256, 5 * 256, 0),
     );
-    wave.active_geometry = false;
-    wave.decaying = true;
-    wave.fade_in = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
-    wave.fade_out = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
+    wave.set_active_geometry_for_test(false);
+    wave.set_decaying_for_test(true);
+    wave.set_fade_in_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
+    wave.set_fade_out_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
     wave.replace_recorded_cells(vec![WaveRecordedCell::real(4, 5)]);
     sim.admit_wave(wave_id, wave);
 
@@ -7690,7 +8011,7 @@ fn wave_walks_nonbuilding_terrain_building_order_and_terrain_owns_wood_gate() {
         .expect("Wave Terrain fixture");
         let mut sim = Simulation::new();
 
-        let unit_id = sim.allocate_stable_id();
+        let unit_id = sim.substrate.allocate_stable_id();
         insert_entity(&mut sim, unit_id, EntityCategory::Unit);
         sim.substrate
             .entities
@@ -7702,30 +8023,30 @@ fn wave_walks_nonbuilding_terrain_building_order_and_terrain_owns_wood_gate() {
             RevealOutcome::Revealed { .. }
         ));
 
-        let building_id = sim.allocate_stable_id();
+        let building_id = sim.substrate.allocate_stable_id();
         insert_entity(&mut sim, building_id, EntityCategory::Structure);
         {
             let building = sim.substrate.entities.get_mut(building_id).unwrap();
             building.set_type_ref_for_test(sim.interner.intern("BLDG"));
             building
                 .type_facts
-                .set_foundation_for_test("1x1".to_string());
+                .set_foundation_for_test("1x1".to_string().into());
         }
         assert!(matches!(
             sim.try_reveal_entity(building_id, common_raw_request(4, 5, 0, 128, 128)),
             RevealOutcome::Revealed { .. }
         ));
 
-        let terrain_id = sim.allocate_stable_id();
-        sim.production.terrain_objects.insert(
+        let terrain_id = sim.substrate.allocate_stable_id();
+        sim.terrain_objects.objects_mut_for_test().insert(
             terrain_id,
             TerrainObjectState::for_test(terrain_id, sim.interner.intern("TREE01"), 4, 5),
         );
-        sim.production
-            .terrain_object_cells
+        sim.terrain_objects
+            .cell_index_mut_for_test()
             .insert((4, 5), terrain_id);
 
-        let firer_id = sim.allocate_stable_id();
+        let firer_id = sim.substrate.allocate_stable_id();
         insert_entity(&mut sim, firer_id, EntityCategory::Unit);
         {
             let firer = sim.substrate.entities.get_mut(firer_id).unwrap();
@@ -7734,7 +8055,7 @@ fn wave_walks_nonbuilding_terrain_building_order_and_terrain_owns_wood_gate() {
                 .attack_target
                 .set_for_test(Some(TargetKind::Entity(building_id)));
         }
-        let wave_id = sim.allocate_stable_id();
+        let wave_id = sim.substrate.allocate_stable_id();
         let mut wave = Wave::new_owned(
             0,
             firer_id,
@@ -7742,10 +8063,10 @@ fn wave_walks_nonbuilding_terrain_building_order_and_terrain_owns_wood_gate() {
             ProjectileCoord::new(4 * 256, 5 * 256, 0),
             ProjectileCoord::new(6 * 256, 5 * 256, 0),
         );
-        wave.active_geometry = false;
-        wave.decaying = true;
-        wave.fade_in = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
-        wave.fade_out = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
+        wave.set_active_geometry_for_test(false);
+        wave.set_decaying_for_test(true);
+        wave.set_fade_in_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
+        wave.set_fade_out_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
         wave.replace_recorded_cells(vec![WaveRecordedCell::real(4, 5)]);
         sim.admit_wave(wave_id, wave);
         sim.lifecycle_test_events.clear();
@@ -7771,7 +8092,7 @@ fn wave_walks_nonbuilding_terrain_building_order_and_terrain_owns_wood_gate() {
                 .unwrap()
                 .health
                 .current(),
-            sim.production.terrain_objects[&terrain_id].health,
+            sim.terrain_objects.objects()[&terrain_id].health(),
             sim.substrate
                 .entities
                 .get(building_id)
@@ -7813,7 +8134,7 @@ fn wave_tail_consumes_wall_roll_before_mandatory_cliff_chance_roll() {
     let rules = crate::rules::ruleset::RuleSet::from_ini(&ini).expect("wall+cliff rules");
     let registry = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(&ini, None);
     let mut sim = Simulation::new();
-    let firer_id = sim.allocate_stable_id();
+    let firer_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, firer_id, EntityCategory::Unit);
     {
         let firer = sim.substrate.entities.get_mut(firer_id).unwrap();
@@ -7847,7 +8168,7 @@ fn wave_tail_consumes_wall_roll_before_mandatory_cliff_chance_roll() {
     );
     sim.overlay_grid = Some(overlay);
 
-    let wave_id = sim.allocate_stable_id();
+    let wave_id = sim.substrate.allocate_stable_id();
     let mut wave = Wave::new_owned(
         0,
         firer_id,
@@ -7855,16 +8176,20 @@ fn wave_tail_consumes_wall_roll_before_mandatory_cliff_chance_roll() {
         ProjectileCoord::new(0, 0, 0),
         ProjectileCoord::new(4 * 256, 256, 50),
     );
-    wave.active_geometry = false;
-    wave.decaying = true;
-    wave.fade_in = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
-    wave.fade_out = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
+    wave.set_active_geometry_for_test(false);
+    wave.set_decaying_for_test(true);
+    wave.set_fade_in_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
+    wave.set_fade_out_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
     wave.replace_recorded_cells(vec![WaveRecordedCell::real(4, 1)]);
     sim.admit_wave(wave_id, wave);
 
     sim.scenario_rng = crate::sim::rng::SimRng::new(0x57_41_4c_4c);
     let mut expected = sim.scenario_rng.clone();
-    let _wall_roll = expected.next_range_u32_inclusive(0, 100);
+    // Ares WaveClass_DamageCell_Wall (1005D7A0, hook 0x75F46E) leaves the
+    // wall to a `Wall=yes` warhead; WH is not one, so no wall roll.
+    if !rules.ares() {
+        let _wall_roll = expected.next_range_u32_inclusive(0, 100);
+    }
     let _cliff_chance_roll = expected.next_range_u32_inclusive(0, 99);
 
     assert!(sim.object_ai_visit_one(
@@ -7902,7 +8227,7 @@ fn assert_direct_fatal_death_weapon_starts_crater(bridge: bool) {
     let ini = IniFile::from_str(
         "[CombatDamage]\nC4Warhead=KILLWH\n[InfantryTypes]\n[VehicleTypes]\n0=VICTIM\n1=FIRER\n\
          [AircraftTypes]\n[BuildingTypes]\n[OverlayTypes]\n\
-         [Warheads]\n0=KILLWH\n1=CRATERWH\n[SmudgeTypes]\n0=CR1\n\
+         [Warheads]\n0=KILLWH\n1=CRATERWH\n[SmudgeTypes]\n0=CR1\n[Animations]\n0=CRATERANIM\n\
          [VICTIM]\nStrength=1\nArmor=light\nExplodes=yes\nDeathWeapon=DeathBoom\n\
          [FIRER]\nStrength=100\nArmor=light\nPrimary=SONIC\n\
          [SONIC]\nDamage=1\nAmbientDamage=10\nWarhead=KILLWH\nIsSonic=yes\n\
@@ -7934,8 +8259,8 @@ fn assert_direct_fatal_death_weapon_starts_crater(bridge: bool) {
     sim.resolved_terrain = Some(ResolvedTerrainGrid::from_cells(10, 10, cells));
     sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(10, 10));
     sim.smudge_grid = Some(crate::sim::smudge_grid::SmudgeGrid::new(10, 10));
-    sim.production.ore_growth_state = crate::sim::ore_growth::OreGrowthState::new(10, 10);
-    let victim_id = sim.allocate_stable_id();
+    sim.ore_growth_state = crate::sim::ore_growth::OreGrowthState::new(10, 10);
+    let victim_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, victim_id, EntityCategory::Unit);
     let victim = sim.substrate.entities.get_mut(victim_id).unwrap();
     victim.set_type_ref_for_test(sim.interner.intern("VICTIM"));
@@ -7954,14 +8279,14 @@ fn assert_direct_fatal_death_weapon_starts_crater(bridge: bool) {
             crate::sim::world::FrameEffects::default(),
         );
     } else {
-        let firer_id = sim.allocate_stable_id();
+        let firer_id = sim.substrate.allocate_stable_id();
         insert_entity(&mut sim, firer_id, EntityCategory::Unit);
         let firer = sim.substrate.entities.get_mut(firer_id).unwrap();
         firer.set_type_ref_for_test(sim.interner.intern("FIRER"));
         firer
             .attack_target
             .set_for_test(Some(TargetKind::Entity(victim_id)));
-        let wave_id = sim.allocate_stable_id();
+        let wave_id = sim.substrate.allocate_stable_id();
         let mut wave = Wave::new_owned(
             0,
             firer_id,
@@ -7969,10 +8294,10 @@ fn assert_direct_fatal_death_weapon_starts_crater(bridge: bool) {
             ProjectileCoord::new(4 * 256, 5 * 256, 0),
             ProjectileCoord::new(5 * 256, 5 * 256, 0),
         );
-        wave.active_geometry = false;
-        wave.decaying = true;
-        wave.fade_in = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
-        wave.fade_out = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
+        wave.set_active_geometry_for_test(false);
+        wave.set_decaying_for_test(true);
+        wave.set_fade_in_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
+        wave.set_fade_out_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
         wave.replace_recorded_cells(vec![WaveRecordedCell::real(4, 5)]);
         sim.admit_wave(wave_id, wave);
 
@@ -8032,7 +8357,7 @@ fn wave_cliff_collapse_consumes_exact_body_rng_and_spawns_row_major_anims() {
     }
     rules.install_art_data(art);
     let mut sim = Simulation::new();
-    let firer_id = sim.allocate_stable_id();
+    let firer_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, firer_id, EntityCategory::Unit);
     {
         let firer = sim.substrate.entities.get_mut(firer_id).unwrap();
@@ -8137,14 +8462,13 @@ fn wave_cliff_collapse_consumes_exact_body_rng_and_spawns_row_major_anims() {
             0,
             crate::sim::smudge_grid::SmudgeCell {
                 type_id: Some(9),
-                footprint_origin: Some((0, 0)),
                 frame_offset,
             },
         );
     }
     sim.smudge_grid = Some(smudge);
 
-    let wave_id = sim.allocate_stable_id();
+    let wave_id = sim.substrate.allocate_stable_id();
     let mut wave = Wave::new_owned(
         0,
         firer_id,
@@ -8152,10 +8476,10 @@ fn wave_cliff_collapse_consumes_exact_body_rng_and_spawns_row_major_anims() {
         ProjectileCoord::new(0, 0, 0),
         ProjectileCoord::new(4 * 256, 256, 50),
     );
-    wave.active_geometry = false;
-    wave.decaying = true;
-    wave.fade_in = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
-    wave.fade_out = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
+    wave.set_active_geometry_for_test(false);
+    wave.set_decaying_for_test(true);
+    wave.set_fade_in_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
+    wave.set_fade_out_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
     wave.replace_recorded_cells(vec![WaveRecordedCell::real(4, 1)]);
     sim.admit_wave(wave_id, wave);
 
@@ -8168,9 +8492,9 @@ fn wave_cliff_collapse_consumes_exact_body_rng_and_spawns_row_major_anims() {
         for rx in 0..5i32 {
             for _ in 0..2 {
                 let type_index = expected_rng.next_range_u32_inclusive(0, 2) as usize;
-                let jitter_x = expected_rng.next_range_u32_inclusive(0, 16) as i32 - 8;
-                let jitter_y = expected_rng.next_range_u32_inclusive(0, 24) as i32 - 12;
-                let delay = expected_rng.next_range_u32_inclusive(0, 2) as u16;
+                let jitter_y = expected_rng.next_range_u32_inclusive(0, 16) as i32 - 8;
+                let jitter_x = expected_rng.next_range_u32_inclusive(0, 24) as i32 - 12;
+                let delay = expected_rng.next_range_u32_inclusive(0, 2) as i32;
                 let rate = expected_rng.next_range_u32_inclusive(1, 3) as u16;
                 expected_spawns.push((
                     type_index,
@@ -8200,6 +8524,27 @@ fn wave_cliff_collapse_consumes_exact_body_rng_and_spawns_row_major_anims() {
         expected_rng.logical_state()
     );
     assert_eq!(sim.dynamic_terrain_cells.len(), 20);
+    let published = sim
+        .lighting_sources
+        .pending()
+        .iter()
+        .find_map(|event| match event {
+            crate::sim::light_sources::LightingEvent::CellLevels { cells } => Some(cells),
+            _ => None,
+        })
+        .expect("the actual cliff stamp publishes Cell+11B before later callbacks");
+    assert!(!published.is_empty());
+    for &(coord, level) in published {
+        assert_eq!(
+            sim.resolved_terrain
+                .as_ref()
+                .unwrap()
+                .cell(coord.0, coord.1)
+                .unwrap()
+                .level,
+            level
+        );
+    }
     // Check before any later frame repair: native cliff collapse rebuilds
     // connectivity synchronously with the retained global bridge vector.
     assert_eq!(
@@ -8212,6 +8557,7 @@ fn wave_cliff_collapse_consumes_exact_body_rng_and_spawns_row_major_anims() {
     );
     let canonical_path = crate::sim::pathfinding::PathGrid::from_resolved_terrain_with_bridges(
         sim.resolved_terrain.as_ref().unwrap(),
+        sim.overlay_grid.as_ref(),
     );
     for rx in 9..=12 {
         assert_eq!(
@@ -8219,8 +8565,8 @@ fn wave_cliff_collapse_consumes_exact_body_rng_and_spawns_row_major_anims() {
             canonical_path.cell(rx, 10)
         );
     }
-    assert_eq!(sim.radar_terrain_dirty_cells.len(), 20);
-    assert_eq!(sim.tactical_dirty_cells.len(), 20);
+    assert_eq!(sim.dirty_cells.radar().len(), 20);
+    assert_eq!(sim.dirty_cells.tactical_for_test().len(), 20);
     let overlay = sim.overlay_grid.as_ref().unwrap();
     assert_eq!(overlay.cell(1, 0).overlay_id, None);
     assert_eq!(
@@ -8248,14 +8594,14 @@ fn wave_cliff_collapse_consumes_exact_body_rng_and_spawns_row_major_anims() {
             (
                 names
                     .iter()
-                    .position(|name| *name == sim.interner.resolve(anim.type_id))
+                    .position(|name| *name == sim.interner.resolve(anim.type_id()))
                     .expect("one of the three cliff anim types"),
-                anim.world_coord,
-                anim.runtime.delay_remaining,
-                anim.runtime.rate_reload,
-                anim.draw_flags,
-                anim.runtime.loop_remaining,
-                anim.runtime.constructor_reverse,
+                anim.world_coord(),
+                anim.runtime().delay_remaining,
+                anim.runtime().rate_reload,
+                anim.draw_flags(),
+                anim.runtime().loop_remaining,
+                anim.runtime().constructor_reverse,
             )
         })
         .collect::<Vec<_>>();
@@ -8338,7 +8684,7 @@ fn wave_cliff_collapse_consumes_exact_body_rng_and_spawns_row_major_anims() {
         (true, true)
     );
     let restored_terrain = restored.resolved_terrain.as_ref().unwrap();
-    for (&(rx, ry), expected) in &expected_dynamic_terrain {
+    for (&(rx, ry), expected) in expected_dynamic_terrain.iter() {
         assert_eq!(
             crate::map::resolved_terrain::DynamicTerrainCellState::capture(
                 restored_terrain.cell(rx, ry).unwrap(),
@@ -8352,10 +8698,10 @@ fn wave_cliff_collapse_consumes_exact_body_rng_and_spawns_row_major_anims() {
 fn gsi_01_05_wave_reselects_live_cell_list_after_fatal_receiver_unmark() {
     let rules = gsi_01_05_damage_rules();
     let mut sim = Simulation::new();
-    sim.session.map_width = 16;
-    sim.session.map_height = 16;
+    sim.session.set_map_width_for_test(16);
+    sim.session.set_map_height_for_test(16);
 
-    let building_id = sim.allocate_stable_id();
+    let building_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, building_id, EntityCategory::Structure);
     let building_type = sim.interner.intern("DUPBLDG");
     {
@@ -8363,7 +8709,7 @@ fn gsi_01_05_wave_reselects_live_cell_list_after_fatal_receiver_unmark() {
         building.set_type_ref_for_test(building_type);
         building
             .type_facts
-            .set_foundation_for_test("2x1".to_string());
+            .set_foundation_for_test("2x1".to_string().into());
         building.health.set_for_test(10);
     }
     assert!(matches!(
@@ -8373,8 +8719,8 @@ fn gsi_01_05_wave_reselects_live_cell_list_after_fatal_receiver_unmark() {
     assert!(sim.substrate.occupancy.contains_entity(4, 5, building_id));
     assert!(sim.substrate.occupancy.contains_entity(5, 5, building_id));
 
-    let wave_id = sim.allocate_stable_id();
-    let firer_id = sim.allocate_stable_id();
+    let wave_id = sim.substrate.allocate_stable_id();
+    let firer_id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, firer_id, EntityCategory::Unit);
     sim.substrate
         .entities
@@ -8394,10 +8740,10 @@ fn gsi_01_05_wave_reselects_live_cell_list_after_fatal_receiver_unmark() {
         ProjectileCoord::new(4 * 256, 5 * 256, 0),
         ProjectileCoord::new(6 * 256, 5 * 256, 0),
     );
-    wave.active_geometry = false;
-    wave.decaying = true;
-    wave.fade_in = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
-    wave.fade_out = NativeF64Bits::from_bits(0x3fa9_9999_a000_0000);
+    wave.set_active_geometry_for_test(false);
+    wave.set_decaying_for_test(true);
+    wave.set_fade_in_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
+    wave.set_fade_out_for_test(NativeF64Bits::from_bits(0x3fa9_9999_a000_0000));
     wave.replace_recorded_cells(vec![
         WaveRecordedCell::real(4, 5),
         WaveRecordedCell::real(5, 5),
@@ -8437,26 +8783,26 @@ fn gsi_01_05_wave_reselects_live_cell_list_after_fatal_receiver_unmark() {
 }
 
 #[test]
-fn gsi_05_02_restore_rejects_each_live_modeled_family_missing_from_logic() {
+fn gsi_05_02_graph_restore_allows_static_terrain_and_requires_fired_objects() {
     let mut terrain = Simulation::new();
-    let terrain_id = terrain.allocate_stable_id();
-    terrain.production.terrain_objects.insert(terrain_id, {
-        let mut terrain =
-            TerrainObjectState::for_test(terrain_id, terrain.interner.intern("TREE01"), 1, 1);
-        terrain.health = 1;
-        terrain.max_health = 1;
-        terrain
-    });
-    assert_eq!(
-        terrain.restore_after_snapshot_load(),
-        Err(SnapshotRestoreError::MissingRequiredLogicIdentity {
-            registry: "TerrainObjectStore",
-            object_id: terrain_id,
-        })
+    let terrain_id = terrain.substrate.allocate_stable_id();
+    terrain.terrain_objects.insert_constructed(
+        {
+            let mut terrain =
+                TerrainObjectState::for_test(terrain_id, terrain.interner.intern("TREE01"), 1, 1);
+            terrain.set_health_for_test(1);
+            terrain.set_max_health_for_test(1);
+            terrain
+        },
+        false,
     );
+    terrain.terrain_objects.add_to_cell(terrain_id, (1, 1));
+    terrain
+        .restore_after_snapshot_load()
+        .expect("static Terrain has no required Logic slot");
 
     let mut projectile = Simulation::new();
-    let projectile_id = projectile.allocate_stable_id();
+    let projectile_id = projectile.substrate.allocate_stable_id();
     projectile
         .projectiles
         .spawn(projectile_id, gsi_05_02_projectile(0, None));
@@ -8469,7 +8815,7 @@ fn gsi_05_02_restore_rejects_each_live_modeled_family_missing_from_logic() {
     );
 
     let mut wave = Simulation::new();
-    let wave_id = wave.allocate_stable_id();
+    let wave_id = wave.substrate.allocate_stable_id();
     wave.waves.spawn(
         wave_id,
         Wave::new(
@@ -8520,6 +8866,7 @@ fn attack_fixture(current: MissionType, suspended: MissionId) -> MissionTestFixt
 /// Restore replaced the target, and the walk is descending.
 #[test]
 fn detach_sweep_restores_before_clearing_target_in_descending_id_order() {
+    let rules = receiver_authority_rules();
     let mut sim = Simulation::new();
     insert_entity(&mut sim, 1, EntityCategory::Infantry);
     insert_entity(&mut sim, 2, EntityCategory::Infantry);
@@ -8545,7 +8892,7 @@ fn detach_sweep_restores_before_clearing_target_in_descending_id_order() {
     }
     sim.lifecycle_test_events.clear();
 
-    sim.stop_all_targeting_on_detach(3, None, None, crate::sim::world::FrameEffects::default());
+    sim.stop_all_targeting_on_detach(3, &rules, None, crate::sim::world::FrameEffects::default());
 
     // The detaching object is untouched and still present: this is not removal.
     assert!(sim.substrate.entities.contains(3));
@@ -8614,7 +8961,12 @@ fn detach_sweep_clears_target_when_no_mission_was_suspended() {
         .apply_test_fixture(attack_fixture(MissionType::Attack, MissionId::NONE));
     sim.lifecycle_test_events.clear();
 
-    sim.stop_all_targeting_on_detach(2, None, None, crate::sim::world::FrameEffects::default());
+    sim.stop_all_targeting_on_detach(
+        2,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        None,
+        crate::sim::world::FrameEffects::default(),
+    );
 
     let attacker = sim.substrate.entities.get(1).unwrap();
     assert!(attacker.attack_target.target().is_none());
@@ -8637,8 +8989,8 @@ fn detach_sweep_clears_target_when_no_mission_was_suspended() {
 }
 
 /// A cell target is not the departing Techno pointer, so the live-object detach
-/// sweep does not match it. CellClass pointer expiry has its own forward,
-/// clear-before-Restore transaction and is tested with wall removal.
+/// sweep does not match it. AreaDamage and cliff callers explicitly invoke
+/// the same restore-first sweep with their retained Cell identity.
 #[test]
 fn detach_sweep_never_matches_a_cell_target() {
     let mut sim = Simulation::new();
@@ -8654,7 +9006,12 @@ fn detach_sweep_never_matches_a_cell_target() {
         MissionId::from_known(MissionType::Move),
     ));
 
-    sim.stop_all_targeting_on_detach(2, None, None, crate::sim::world::FrameEffects::default());
+    sim.stop_all_targeting_on_detach(
+        2,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        None,
+        crate::sim::world::FrameEffects::default(),
+    );
 
     let attacker = sim.substrate.entities.get(1).unwrap();
     assert_eq!(
@@ -8670,6 +9027,7 @@ fn detach_sweep_never_matches_a_cell_target() {
 
 #[test]
 fn bridge_cell_success_restores_before_conditional_target_clear() {
+    let rules = receiver_authority_rules();
     let mut sim = Simulation::new();
     insert_entity(&mut sim, 1, EntityCategory::Infantry);
     insert_entity(&mut sim, 2, EntityCategory::Unit);
@@ -8690,7 +9048,7 @@ fn bridge_cell_success_restores_before_conditional_target_clear() {
     sim.stop_all_targeting_cell(
         9,
         11,
-        None,
+        &rules,
         None,
         crate::sim::world::FrameEffects::default(),
     );
@@ -8730,7 +9088,7 @@ fn insert_naval_build_const_fixture(
     );
     building
         .type_facts
-        .set_foundation_for_test("1x1".to_string());
+        .set_foundation_for_test("1x1".to_string().into());
     building.type_facts.set_build_const_eligible_for_test(true);
     sim.substrate.entities.insert(building);
 }
@@ -8740,7 +9098,7 @@ fn naval_build_const_reveal_conceal_and_reentry_preserve_acquisition_order() {
     let mut sim = Simulation::new();
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+        .register(HouseState::new(owner, 0, None, true, 0, 10));
     insert_naval_build_const_fixture(&mut sim, 20, owner, 2, 2);
     insert_naval_build_const_fixture(&mut sim, 10, owner, 4, 2);
     insert_naval_build_const_fixture(&mut sim, 30, owner, 6, 2);
@@ -8754,7 +9112,7 @@ fn naval_build_const_reveal_conceal_and_reentry_preserve_acquisition_order() {
         RevealOutcome::Revealed { .. }
     ));
     assert_eq!(
-        sim.houses[&owner].build_const_order,
+        sim.houses[&owner].build_const_order(),
         vec![20, 10],
         "acquisition order differs from stable-ID order"
     );
@@ -8766,22 +9124,28 @@ fn naval_build_const_reveal_conceal_and_reentry_preserve_acquisition_order() {
         sim.try_reveal_entity(20, request(2, 2, PlacementEvidence::MarkSucceeded)),
         RevealOutcome::AlreadyRevealed
     );
-    assert_eq!(sim.houses[&owner].build_const_order, vec![20, 10]);
+    assert_eq!(sim.houses[&owner].build_const_order(), vec![20, 10]);
     assert_eq!(
         sim.try_reveal_entity(30, request(6, 2, PlacementEvidence::MarkFailed)),
         RevealOutcome::Failed(RevealFailure::MarkFailed)
     );
-    assert_eq!(sim.houses[&owner].build_const_order, vec![20, 10]);
+    assert_eq!(sim.houses[&owner].build_const_order(), vec![20, 10]);
 
     // A native DynamicVector stable-removes one matching pointer and shifts
     // one tail; this intentionally corrupt duplicate proves it is not retain.
-    sim.houses.get_mut(&owner).unwrap().build_const_order = vec![20, 10, 20];
-    sim.remove_build_const_from_owner(20);
-    assert_eq!(sim.houses[&owner].build_const_order, vec![10, 20]);
-    sim.houses.get_mut(&owner).unwrap().build_const_order = vec![20, 10];
+    sim.houses
+        .get_mut(&owner)
+        .unwrap()
+        .set_build_const_order_for_test(vec![20, 10, 20]);
+    Simulation::remove_build_const_from_owner(&sim.substrate, &mut sim.houses, 20);
+    assert_eq!(sim.houses[&owner].build_const_order(), vec![10, 20]);
+    sim.houses
+        .get_mut(&owner)
+        .unwrap()
+        .set_build_const_order_for_test(vec![20, 10]);
 
     assert_eq!(sim.conceal(20), super::ConcealOutcome::Concealed);
-    assert_eq!(sim.houses[&owner].build_const_order, vec![10]);
+    assert_eq!(sim.houses[&owner].build_const_order(), vec![10]);
     // The pointer expiry stable-removes it from House+68 too (`0x004FBC1C`).
     assert_eq!(house_buildings(&sim, owner), vec![10]);
 
@@ -8790,18 +9154,22 @@ fn naval_build_const_reveal_conceal_and_reentry_preserve_acquisition_order() {
     sim.houses
         .get_mut(&owner)
         .unwrap()
-        .build_const_order
+        .build_const_order_mut_for_test()
         .push(20);
     assert_eq!(sim.conceal(20), super::ConcealOutcome::AlreadyConcealed);
-    assert_eq!(sim.houses[&owner].build_const_order, vec![10, 20]);
-    sim.houses.get_mut(&owner).unwrap().build_const_order.pop();
+    assert_eq!(sim.houses[&owner].build_const_order(), vec![10, 20]);
+    sim.houses
+        .get_mut(&owner)
+        .unwrap()
+        .build_const_order_mut_for_test()
+        .pop();
 
     assert!(matches!(
         sim.try_reveal_entity(20, request(8, 2, PlacementEvidence::MarkSucceeded)),
         RevealOutcome::Revealed { .. }
     ));
     assert_eq!(
-        sim.houses[&owner].build_const_order,
+        sim.houses[&owner].build_const_order(),
         vec![10, 20],
         "successful re-entry appends at the live tail"
     );
@@ -8810,37 +9178,45 @@ fn naval_build_const_reveal_conceal_and_reentry_preserve_acquisition_order() {
 
 /// House+68 in vector order.
 fn house_buildings(sim: &Simulation, house: crate::sim::intern::InternedId) -> Vec<u64> {
-    sim.houses[&house].base_projection.buildings().to_vec()
+    sim.houses[&house].base_projection().buildings().to_vec()
 }
 
 #[test]
 fn naval_build_const_capture_moves_old_entry_to_new_owner_tail() {
+    let rules = crate::rules::ruleset::RuleSet::from_ini(
+        &crate::rules::ini_parser::IniFile::from_str("[BuildingTypes]\n0=GACNST\n"),
+    )
+    .expect("GACNST rules");
     let mut sim = Simulation::new();
     let old_owner = sim.interner.intern("Americans");
     let new_owner = sim.interner.intern("Russians");
     sim.houses
-        .insert(old_owner, HouseState::new(old_owner, 0, None, true, 0, 10));
+        .register(HouseState::new(old_owner, 0, None, true, 0, 10));
     sim.houses
-        .insert(new_owner, HouseState::new(new_owner, 1, None, false, 0, 10));
+        .register(HouseState::new(new_owner, 1, None, false, 0, 10));
     insert_naval_build_const_fixture(&mut sim, 50, new_owner, 8, 8);
     insert_naval_build_const_fixture(&mut sim, 40, old_owner, 2, 2);
     insert_naval_build_const_fixture(&mut sim, 12, old_owner, 4, 2);
     for (stable_id, rx, ry) in [(50, 8, 8), (40, 2, 2), (12, 4, 2)] {
         assert!(matches!(
-            sim.try_reveal_entity(stable_id, request(rx, ry, PlacementEvidence::MarkSucceeded)),
+            sim.try_reveal_entity_with_context(
+                stable_id,
+                request(rx, ry, PlacementEvidence::MarkSucceeded),
+                super::UninitContext::with_rules(&rules),
+            ),
             RevealOutcome::Revealed { .. }
         ));
     }
-    assert_eq!(sim.houses[&old_owner].build_const_order, vec![40, 12]);
-    assert_eq!(sim.houses[&new_owner].build_const_order, vec![50]);
+    assert_eq!(sim.houses[&old_owner].build_const_order(), vec![40, 12]);
+    assert_eq!(sim.houses[&new_owner].build_const_order(), vec![50]);
 
     assert_eq!(house_buildings(&sim, old_owner), vec![40, 12]);
     assert_eq!(house_buildings(&sim, new_owner), vec![50]);
 
     sim.change_owner(40, new_owner);
 
-    assert_eq!(sim.houses[&old_owner].build_const_order, vec![12]);
-    assert_eq!(sim.houses[&new_owner].build_const_order, vec![50, 40]);
+    assert_eq!(sim.houses[&old_owner].build_const_order(), vec![12]);
+    assert_eq!(sim.houses[&new_owner].build_const_order(), vec![50, 40]);
     // ChangeOwner moves House+68 the same way: stable-removed from the old
     // House (`0x00448A78..0x00448AB0`), appended at the new one's tail
     // (`0x00449197..0x004491D2`).
@@ -8966,7 +9342,7 @@ fn production_air_wrapper_keeps_fly_exact_producer_and_reads_live_dummy() {
         .set_fly_target_height(731 - ground - 416);
     sim.tick_air_movement_with_cell_lists_one(
         1,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -9005,7 +9381,12 @@ fn production_air_wrapper_retains_native_jumpjet_result_below_the_ground() {
     let mut direct = fixture();
     assert!(
         direct
-            .tick_jumpjet_cruise_one(1, None, None, crate::sim::world::FrameEffects::default())
+            .tick_jumpjet_cruise_one(
+                1,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
+                None,
+                crate::sim::world::FrameEffects::default()
+            )
             .unwrap()
             .is_some()
     );
@@ -9025,7 +9406,7 @@ fn production_air_wrapper_retains_native_jumpjet_result_below_the_ground() {
     wrapped
         .tick_air_movement_with_cell_lists_one(
             1,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -9057,12 +9438,12 @@ fn fly_cross_level_move_lands_on_destination_surface_after_restore() {
         .unwrap();
     for (origin_level, destination_level) in [(0, 2), (2, 0)] {
         let mut sim = Simulation::with_seed(0);
-        assert_eq!(sim.allocate_stable_id(), 1);
+        assert_eq!(sim.substrate.allocate_stable_id(), 1);
         install_common_raw_terrain(&mut sim, 8, 8, origin_level, None);
         sim.resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(2, 2)
+            .cell_mut_for_test(2, 2)
             .unwrap()
             .level = destination_level;
         install_fly_aircraft(&mut sim, 1, SimFixed::from_num(600));
@@ -9079,17 +9460,27 @@ fn fly_cross_level_move_lands_on_destination_surface_after_restore() {
         loco.set_fly_target_height(600);
 
         let fly = loco.fly_runtime_mut().unwrap();
-        fly.set_current_speed(SIM_ONE);
-        fly.set_target_speed(SIM_ONE);
+        fly.set_current_speed_for_test(SIM_ONE);
+        fly.set_target_speed_for_test(SIM_ONE);
         let cells = sim
             .resolved_terrain
             .as_ref()
             .map(crate::map::resolved_terrain::NativeCellQuery::canonical);
         let coordinate = crate::sim::movement::target_cell_coord(2, 2, cells.as_ref());
-        assert!(sim.move_air_coordinate(1, coordinate, None, Some(&rules)));
+        assert!(Simulation::move_air_coordinate(
+            &mut sim.interner,
+            &sim.session,
+            &mut sim.substrate,
+            &mut sim.sound_events,
+            &sim.resolved_terrain,
+            1,
+            coordinate,
+            None,
+            &rules
+        ));
         sim.tick_air_movement_with_cell_lists_one(
             1,
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -9112,8 +9503,8 @@ fn fly_cross_level_move_lands_on_destination_surface_after_restore() {
         // Fly lands there (`0x004CE3C0`'s Begin_Landing).
         let loco = entity.locomotor.as_mut().unwrap();
         let fly = loco.fly_runtime_mut().unwrap();
-        fly.set_current_speed(SIM_ZERO);
-        fly.set_target_speed(SIM_ZERO);
+        fly.set_current_speed_for_test(SIM_ZERO);
+        fly.set_target_speed_for_test(SIM_ZERO);
         loco.begin_fly_landing();
         loco.set_fly_target_height(0);
 
@@ -9129,12 +9520,12 @@ fn fly_cross_level_move_lands_on_destination_surface_after_restore() {
         let mut landed = false;
         for frame in 1..80 {
             for instance in [&mut sim, &mut restored] {
-                instance.session.tick = frame;
-                instance.session.binary_frame = frame as u32;
+                instance.session.set_tick_for_test(frame);
+                instance.session.set_binary_frame_for_test(frame as u32);
                 instance
                     .tick_air_movement_with_cell_lists_one(
                         1,
-                        Some(&rules),
+                        &rules,
                         None,
                         crate::sim::world::FrameEffects::default(),
                     )
@@ -9161,11 +9552,68 @@ fn fly_cross_level_move_lands_on_destination_surface_after_restore() {
 }
 
 #[test]
+fn pre_logic_save_observes_input_and_ground_order_before_first_tick() {
+    use super::{FrameEffects, TickLane, display_layers::DisplayLayer};
+    use crate::sim::command::{Command, CommandEnvelope};
+
+    let mut sim = Simulation::new();
+    let owner = sim.interner.intern("Player");
+    sim.houses
+        .register(HouseState::new(owner, 0, None, true, 0, 10));
+    for id in 1..=4 {
+        insert_entity(&mut sim, id, EntityCategory::Unit);
+        assert!(matches!(
+            sim.try_reveal_entity(id, common_raw_request(2 + id as u16, 3, 0, 128, 128)),
+            RevealOutcome::Revealed { .. }
+        ));
+    }
+    assert_eq!(
+        sim.substrate.display.members(DisplayLayer::GROUND),
+        [1, 2, 3, 4]
+    );
+    for id in 1..=4 {
+        sim.remove_entity_occupancy(id);
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .position
+            .set_rx_for_test(7 - id as u16);
+        sim.add_entity_occupancy(id);
+    }
+    let mut runtime = crate::sim::runtime::SimRuntime::from_simulation(sim);
+    let saved = std::cell::RefCell::new(None);
+    let save = |sim: &Simulation| {
+        *saved.borrow_mut() = Some(GameSnapshot::save_validated(sim, 0, 0, "initial", 0));
+    };
+    runtime
+        .advance_frame(
+            &[CommandEnvelope::new(
+                owner,
+                1,
+                Command::SetGameSpeed { speed: 2 },
+            )],
+            67,
+            TickLane::Ordinary,
+            FrameEffects::default().with_before_logic(&save),
+        )
+        .unwrap();
+    let loaded = GameSnapshot::load(&saved.into_inner().expect("reached pre-Logic save")).unwrap();
+    assert_eq!(loaded.sim.session().tick(), 0);
+    assert_eq!(loaded.sim.session().game_options().game_speed, 2);
+    assert_eq!(
+        loaded.sim.substrate.display.members(DisplayLayer::GROUND),
+        [2, 3, 4, 1]
+    );
+    assert_eq!(runtime.simulation.session().tick(), 1);
+}
+
+#[test]
 fn display_lifecycle_is_independent_of_logic_and_survives_production_save() {
     use super::display_layers::DisplayLayer;
     let mut sim = Simulation::new();
     for _ in 0..4 {
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         insert_entity(&mut sim, id, EntityCategory::Unit);
         let mut req = common_raw_request(2 + id as u16, 3, 0, 128, 128);
         req.logic_eligible = id != 2;
@@ -9190,7 +9638,12 @@ fn display_lifecycle_is_independent_of_logic_and_survives_production_save() {
             .set_rx_for_test(7 - id as u16);
     }
     let before_sort = sim.state_hash();
-    sim.sort_display_ground(None);
+    Simulation::sort_display_ground(
+        &sim.interner,
+        &sim.terrain_objects,
+        &mut sim.substrate,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+    );
     assert_ne!(sim.state_hash(), before_sort);
     assert_eq!(
         sim.substrate.display.members(DisplayLayer::GROUND),
@@ -9203,7 +9656,12 @@ fn display_lifecycle_is_independent_of_logic_and_survives_production_save() {
         restored.substrate.display.members(DisplayLayer::GROUND),
         [2, 3, 4, 1]
     );
-    restored.sort_display_ground(None);
+    Simulation::sort_display_ground(
+        &restored.interner,
+        &restored.terrain_objects,
+        &mut restored.substrate,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+    );
     assert_eq!(
         restored.substrate.display.members(DisplayLayer::GROUND),
         [3, 4, 2, 1]
@@ -9256,7 +9714,7 @@ fn mixed_display_lifecycle_matches_original_sequences_and_save_restore() {
         // consume no Scenario draws, so the complete saved hash can match.
         sim.scenario_rng = crate::sim::rng::SimRng::new(0);
         for (index, actor) in actors.iter().enumerate() {
-            let id = sim.allocate_stable_id();
+            let id = sim.substrate.allocate_stable_id();
             assert_eq!(id, index as u64 + 1);
             let xyz: [i32; 3] = std::array::from_fn(|i| actor["xyz"][i].as_i64().unwrap() as i32);
             match actor["kind"].as_str().unwrap() {
@@ -9280,8 +9738,11 @@ fn mixed_display_lifecycle_matches_original_sequences_and_save_restore() {
                 }
                 "particle" => {
                     insert_particle_system(&mut sim, id);
-                    sim.substrate.particle_systems.get_mut(id).unwrap().coords =
-                        IVec3::from_array(xyz);
+                    sim.substrate
+                        .particle_systems
+                        .get_mut(id)
+                        .unwrap()
+                        .set_coords_for_test(IVec3::from_array(xyz));
                 }
                 "terrain" => {
                     let terrain = {
@@ -9291,14 +9752,16 @@ fn mixed_display_lifecycle_matches_original_sequences_and_save_restore() {
                             (xyz[0] / 256) as u16,
                             (xyz[1] / 256) as u16,
                         );
-                        terrain.health = 10;
-                        terrain.max_health = 10;
+                        terrain.set_health_for_test(10);
+                        terrain.set_max_health_for_test(10);
                         terrain
                     };
-                    sim.production
-                        .terrain_object_cells
+                    sim.terrain_objects
+                        .cell_index_mut_for_test()
                         .insert(terrain.cell(), id);
-                    sim.production.terrain_objects.insert(id, terrain);
+                    sim.terrain_objects
+                        .objects_mut_for_test()
+                        .insert(id, terrain);
                 }
                 "bullet" => {
                     let mut shot = gsi_05_02_projectile(0, None);
@@ -9341,12 +9804,20 @@ fn mixed_display_lifecycle_matches_original_sequences_and_save_restore() {
             let id = step["actor"].as_u64().map_or(0, |i| i + 1);
             match step["op"].as_str().unwrap() {
                 "submit" => match actors[id as usize - 1]["kind"].as_str().unwrap() {
-                    "unit" | "building" => sim.submit_entity_display(id, Some(&rules), None),
+                    "unit" | "building" => Simulation::submit_entity_display(
+                        &sim.interner,
+                        &sim.terrain_objects,
+                        &mut sim.substrate,
+                        &sim.resolved_terrain,
+                        id,
+                        &rules,
+                        None,
+                    ),
                     "particle" => {
-                        sim.reveal_particle_system(id, Some(&rules));
+                        sim.reveal_particle_system(id, &rules);
                     }
                     "terrain" => {
-                        sim.register_terrain_object(id, Some(&rules));
+                        sim.register_terrain_object(id, &rules);
                     }
                     "bullet" => {
                         sim.register_projectile(
@@ -9365,7 +9836,12 @@ fn mixed_display_lifecycle_matches_original_sequences_and_save_restore() {
                 "remove" => {
                     sim.substrate.display.remove(id);
                 }
-                "sort" => sim.sort_display_ground(Some(&rules)),
+                "sort" => Simulation::sort_display_ground(
+                    &sim.interner,
+                    &sim.terrain_objects,
+                    &mut sim.substrate,
+                    &rules,
+                ),
                 "coordinates" => {
                     let xyz: [i32; 3] =
                         std::array::from_fn(|i| step["xyz"][i].as_i64().unwrap() as i32);
@@ -9379,8 +9855,11 @@ fn mixed_display_lifecycle_matches_original_sequences_and_save_restore() {
                             .position
                             .set_sub_y_for_test(SimFixed::from_num(xyz[1] % 256));
                     } else {
-                        sim.substrate.particle_systems.get_mut(id).unwrap().coords =
-                            IVec3::from_array(xyz);
+                        sim.substrate
+                            .particle_systems
+                            .get_mut(id)
+                            .unwrap()
+                            .set_coords_for_test(IVec3::from_array(xyz));
                     }
                 }
                 _ => unreachable!(),
@@ -9405,8 +9884,18 @@ fn mixed_display_lifecycle_matches_original_sequences_and_save_restore() {
         let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
         restored.restore_after_snapshot_load().unwrap();
         assert_eq!(restored.state_hash(), sim.state_hash(), "{name}");
-        sim.sort_display_ground(Some(&rules));
-        restored.sort_display_ground(Some(&rules));
+        Simulation::sort_display_ground(
+            &sim.interner,
+            &sim.terrain_objects,
+            &mut sim.substrate,
+            &rules,
+        );
+        Simulation::sort_display_ground(
+            &restored.interner,
+            &restored.terrain_objects,
+            &mut restored.substrate,
+            &rules,
+        );
         assert_eq!(restored.state_hash(), sim.state_hash(), "{name}: next sort");
         for id in 1..=actors.len() as u64 {
             if restored.substrate.entities.contains(id) {
@@ -9425,7 +9914,7 @@ fn mixed_display_lifecycle_matches_original_sequences_and_save_restore() {
 fn jumpjet_process_compares_live_layer_queries_not_cached_registration() {
     use super::display_layers::DisplayLayer;
     let mut sim = Simulation::new();
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, id, EntityCategory::Unit);
     sim.substrate.entities.get_mut(id).unwrap().locomotor =
         Some(LocomotorState::for_test_kind(LocomotorKind::Jumpjet));
@@ -9437,7 +9926,7 @@ fn jumpjet_process_compares_live_layer_queries_not_cached_registration() {
         .submit(id, Some(DisplayLayer::TOP), &|_| 0);
     sim.tick_air_movement_with_cell_lists_one(
         id,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -9446,7 +9935,9 @@ fn jumpjet_process_compares_live_layer_queries_not_cached_registration() {
 
     // A real changed query re-submits even if cached membership is absent.
     sim.substrate.display.remove(id);
-    let before = sim.entity_display_layer(id, None).unwrap();
+    let before = sim
+        .entity_display_layer(id, crate::rules::ruleset::RuleSet::empty_for_test())
+        .unwrap();
     // GetHeight reads the coordinate Z Jumpjet flight writes.
     sim.substrate
         .entities
@@ -9454,14 +9945,32 @@ fn jumpjet_process_compares_live_layer_queries_not_cached_registration() {
         .unwrap()
         .position
         .set_exact_z_leptons_for_test(Some(600));
-    sim.complete_jumpjet_display_process(id, before, None);
+    Simulation::complete_jumpjet_display_process(
+        &sim.interner,
+        &sim.terrain_objects,
+        &mut sim.substrate,
+        &sim.resolved_terrain,
+        id,
+        before,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+    );
     assert_eq!(sim.substrate.display.layer_of(id), Some(DisplayLayer::TOP));
     // The native tail's alive gate prevents another submission after death.
-    let before = sim.entity_display_layer(id, None).unwrap();
+    let before = sim
+        .entity_display_layer(id, crate::rules::ruleset::RuleSet::empty_for_test())
+        .unwrap();
     let entity = sim.substrate.entities.get_mut(id).unwrap();
     entity.lifecycle.set_object_alive_for_test(false);
     entity.position.set_exact_z_leptons_for_test(Some(0));
-    sim.complete_jumpjet_display_process(id, before, None);
+    Simulation::complete_jumpjet_display_process(
+        &sim.interner,
+        &sim.terrain_objects,
+        &mut sim.substrate,
+        &sim.resolved_terrain,
+        id,
+        before,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+    );
     assert_eq!(sim.substrate.display.layer_of(id), Some(DisplayLayer::TOP));
 }
 
@@ -9473,12 +9982,20 @@ fn jumpjet_process_compares_live_layer_queries_not_cached_registration() {
 fn display_registration_expires_with_a_resubmitted_uninit_owner() {
     use super::display_layers::DisplayLayer;
     let mut sim = Simulation::new();
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     insert_entity(&mut sim, id, EntityCategory::Unit);
     sim.try_reveal_entity(id, common_raw_request(3, 3, 0, 128, 128));
     sim.uninit(id);
     assert!(sim.substrate.entities.get(id).unwrap().lifecycle.in_limbo());
-    sim.submit_entity_display(id, None, None);
+    Simulation::submit_entity_display(
+        &sim.interner,
+        &sim.terrain_objects,
+        &mut sim.substrate,
+        &sim.resolved_terrain,
+        id,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        None,
+    );
     assert_eq!(
         sim.substrate.display.layer_of(id),
         Some(DisplayLayer::GROUND)
@@ -9486,7 +10003,12 @@ fn display_registration_expires_with_a_resubmitted_uninit_owner() {
     sim.process_pending_delete();
     assert!(!sim.substrate.entities.contains(id));
     assert_eq!(sim.substrate.display.layer_of(id), None);
-    sim.sort_display_ground(None);
+    Simulation::sort_display_ground(
+        &sim.interner,
+        &sim.terrain_objects,
+        &mut sim.substrate,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+    );
 }
 
 /// `TechnoClass::Unlimbo` snaps the barrel elevation level (`0x006F6DC3`) and
@@ -9510,7 +10032,7 @@ fn unlimbo_levels_then_aims_the_barrel_elevation() {
         ("RAISED", [(40, 0x3FFE), (45, 0x2FFF), (50, 0x2000)]),
     ] {
         let mut sim = Simulation::with_seed(7);
-        sim.session.binary_frame = 40;
+        sim.session.set_binary_frame_for_test(40);
         sim.playfield_bounds = Some(crate::sim::cell_rect::PlayfieldBounds {
             base: 0,
             off_fc: -100,
@@ -9523,10 +10045,10 @@ fn unlimbo_levels_then_aims_the_barrel_elevation() {
             .resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(4, 4)
+            .cell_mut_for_test(4, 4)
             .unwrap();
-        cell.speed_costs.track = Some(100);
-        cell.speed_costs.wheel = Some(100);
+        cell.speed_costs.track = Some(crate::util::native_x87::NativeF32Bits::ONE);
+        cell.speed_costs.wheel = Some(crate::util::native_x87::NativeF32Bits::ONE);
         cell.base_speed_costs = cell.speed_costs;
         let id = sim
             .spawn_object(type_id, "Americans", 4, 4, 0, &rules)
@@ -9588,7 +10110,10 @@ fn a_missile_is_tracked_in_the_cell_its_flight_step_reached() {
         .unwrap()
         .position
         .set_exact_z_leptons_for_test(Some(512));
-    sim.rocket_move_to(
+    Simulation::rocket_move_to(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
         1,
         crate::sim::components::DriveCoord::cell(25, 12, 0),
         &rules,
@@ -9604,13 +10129,13 @@ fn a_missile_is_tracked_in_the_cell_its_flight_step_reached() {
         .unwrap()
         .set_mission_state_for_test(4);
     // The tilt's end added the climbing missile to the AircraftTracker.
-    sim.aircraft_tracker_add(1);
+    Simulation::aircraft_tracker_add(&sim.session, &mut sim.substrate, 1);
     let bucket = |sim: &Simulation, cell: (u16, u16)| {
         crate::sim::occupancy::air_spatial_bucket_index(
             cell.0,
             cell.1,
-            sim.session.map_width,
-            sim.session.map_height,
+            sim.session.map_width(),
+            sim.session.map_height(),
         )
     };
     assert_eq!(
@@ -9618,11 +10143,115 @@ fn a_missile_is_tracked_in_the_cell_its_flight_step_reached() {
         Some(bucket(&sim, (12, 12)))
     );
 
-    sim.advance_live_object_turn(1, Some(&rules), super::techno_ai::ObjectAiCtx::default())
+    sim.advance_live_object_turn(1, &rules, super::techno_ai::ObjectAiCtx::default())
         .unwrap();
 
     let missile = sim.substrate.entities.get(1).unwrap();
     let cell = (missile.position.rx(), missile.position.ry());
     assert_eq!(cell, (13, 12), "the flight step left the launch cell");
     assert_eq!(missile.air_spatial_bucket(), Some(bucket(&sim, cell)));
+}
+
+/// `UnitClass::~UnitClass @ 0x00735780` Limbos the Unit itself
+/// (`FootClass::Limbo`, `0x0073584F`), so one destroyed while placed leaves
+/// its cell.
+#[test]
+fn unit_destructor_limbos_a_unit_still_on_the_map() {
+    let mut sim = Simulation::new();
+    insert_entity(&mut sim, 1, EntityCategory::Unit);
+    let _ = sim.try_reveal_entity(1, common_raw_request(3, 4, 0, 128, 128));
+    assert!(sim.substrate.occupancy.contains_entity(3, 4, 1));
+
+    sim.finalize_and_remove_common(1, super::UninitContext::default(), 1);
+
+    assert!(!sim.substrate.entities.contains(1));
+    assert!(!sim.substrate.occupancy.contains_entity(3, 4, 1));
+    assert_eq!(sim.substrate.raw_cell_occupation.ground_bits(3, 4), 0);
+}
+
+/// `AircraftClass::~AircraftClass @ 0x00414080` kills its passengers
+/// (`KillPassengers(NULL)`, `0x004140E6`): none outlives a carrier destroyed
+/// without UnInit.
+#[test]
+fn aircraft_destructor_kills_its_passengers() {
+    let mut sim = Simulation::new();
+    insert_entity(&mut sim, 1, EntityCategory::Aircraft);
+    insert_entity(&mut sim, 2, EntityCategory::Infantry);
+    let mut cargo = PassengerCargo::new(5, 1.0);
+    cargo.board_forced_chain(&[(2, 1.0)]);
+    sim.substrate.entities.get_mut(1).unwrap().passenger_role = PassengerRole::transport(cargo);
+    sim.substrate.entities.get_mut(2).unwrap().passenger_role =
+        PassengerRole::inside_for_test(1, false);
+
+    sim.finalize_and_remove_common(1, super::UninitContext::default(), 1);
+
+    assert!(!sim.substrate.entities.contains(1));
+    assert!(
+        !sim.substrate
+            .entities
+            .get(2)
+            .unwrap()
+            .lifecycle
+            .object_alive()
+    );
+    assert_eq!(sim.substrate.pending_delete.object_ids(), vec![2]);
+}
+
+/// `TechnoClass::PointerExpired @ 0x007077C0` removes the expiring object from
+/// the listener's cargo only when its `removed` argument is set
+/// (`0x007077D8..0x007077E9`). A rider that cloaks sends Detach_All(false) and
+/// stays aboard.
+#[test]
+fn detach_all_false_keeps_a_rider_in_its_transports_cargo() {
+    let mut sim = Simulation::new();
+    insert_entity(&mut sim, 1, EntityCategory::Unit);
+    insert_entity(&mut sim, 2, EntityCategory::Infantry);
+    let _ = sim.reveal(1);
+    let mut cargo = PassengerCargo::new(5, 1.0);
+    cargo.board_forced_chain(&[(2, 1.0)]);
+    sim.substrate.entities.get_mut(1).unwrap().passenger_role = PassengerRole::transport(cargo);
+    sim.substrate.entities.get_mut(2).unwrap().passenger_role =
+        PassengerRole::inside_for_test(1, true);
+
+    sim.detach_all(2, false, super::UninitContext::default());
+
+    let transport = sim.substrate.entities.get(1).unwrap();
+    assert_eq!(transport.passenger_role.cargo().unwrap().passengers(), &[2]);
+}
+
+/// The Restore inside the expiry broadcast (`TechnoClass::PointerExpired`
+/// `0x00707A51`) cannot fail natively. VERA's preflight can refuse it, here
+/// for an archived NavCom that names no object; the broadcast must carry on
+/// and still clear the expiring target.
+#[test]
+fn target_expiry_carries_on_when_the_suspended_mission_cannot_be_restored() {
+    let rules = receiver_authority_rules();
+    let mut sim = Simulation::with_seed(0x1234);
+    insert_entity(&mut sim, 1, EntityCategory::Unit);
+    insert_entity(&mut sim, 2, EntityCategory::Unit);
+    let _ = sim.try_reveal_entity(2, request(9, 11, PlacementEvidence::MarkSucceeded));
+
+    let listener = sim.substrate.entities.get_mut(1).unwrap();
+    listener
+        .attack_target
+        .set_for_test(Some(TargetKind::Entity(2)));
+    listener
+        .navigation
+        .set_suspended_nav_com_for_test(Some(NavTargetRef::Object { id: 99 }));
+    listener.mission.apply_test_fixture(MissionTestFixture {
+        current: MissionId::from_known(MissionType::Attack),
+        suspended: MissionId::from_known(MissionType::Guard),
+        queued: MissionId::NONE,
+        movement_bypass_latch: 0,
+        handler_state: 0,
+        mission_start_frame: 100,
+        ai_counter: 0,
+        dispatch_timer: MissionDispatchTimer::at_frame(100),
+    });
+
+    sim.uninit_with_rules(2, &rules);
+
+    let listener = sim.substrate.entities.get(1).unwrap();
+    assert_eq!(listener.attack_target.target(), None);
+    assert!(!sim.substrate.entities.get(2).unwrap().is_object_alive());
 }

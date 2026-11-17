@@ -41,24 +41,28 @@ impl MindScene {
         assert_eq!(rules.bridge_warheads.c4_name, "Super");
         let super_wh = rules.warhead(&rules.bridge_warheads.c4_name).unwrap();
         assert_eq!(
-            super_wh.verses_f64[crate::sim::combat::armor_index(&object.armor)],
+            f64::from_bits(super_wh.interaction(object.armor_id()).multiplier().bits()),
             1.0
         );
         let spark = rules.combat_damage.default_spark_system.as_deref().unwrap();
         assert!(rules.ps_type_id_by_name(spark).is_some());
 
         let mut sim = crate::sim::arena_fixture::rival_arena_with_size(&rules, 0x471a50, 64);
+        // A loaded match always has an overlay grid, and a Spark particle's
+        // collision query reads it: without one the overload's sparks are
+        // refused and retired before they can be counted.
+        sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(64, 64));
         // The arena's open LocalSize retains native Size width20 independently
         // of its rectangular terrain. Supply Size height64 for this larger
         // scene: Bullet In_Bounds568300 must admit the cardinal encounter and
         // its ordinary tank pursuit (the arena's default20 ends at x+y=60).
         // Allocated terrain/fog64x64 and native MapSize20x64 are independent.
-        sim.playfield_size_height = Some(64);
-        let native_width = sim.playfield_bounds.unwrap().base;
+        sim.set_playfield_size_height_for_test(Some(64));
+        let native_width = sim.playfield_bounds().unwrap().base;
         for cell in [(32, 32), (32, 26), (38, 32), (32, 38), (26, 32)] {
             assert!(crate::map::playfield::size_diamond_contains(
                 native_width,
-                sim.playfield_size_height.unwrap(),
+                sim.playfield_size_height().unwrap(),
                 cell,
             ));
         }
@@ -90,8 +94,8 @@ impl MindScene {
         let owner = sim.entities().get(mind).unwrap().owner();
         let enemy = sim.entities().get(targets[0]).unwrap().owner();
         assert_ne!(owner, enemy);
-        assert!(sim.houses.get(&owner).unwrap().is_human);
-        sim.session.current_house = Some(owner);
+        assert!(sim.houses.get(&owner).unwrap().is_human());
+        sim.session.set_current_house_for_test(Some(owner));
         // Supplied map knowledge admits the real commands/scanner for both
         // houses; counterfire is not avoided by hiding the controller.
         sim.fog.mark_visible_for_owner(enemy, 32, 32);
@@ -99,8 +103,11 @@ impl MindScene {
             let actor = sim.entities().get(id).unwrap();
             sim.fog
                 .mark_visible_for_owner(owner, actor.position.rx(), actor.position.ry());
+            // The human owner sends the computer tanks' Guard too: the DoList skips computer
+            // Houses' events (0x0064C4FB..0x0064C50D), and MegaMission never compares sender and
+            // actor (0x004C71F6..0x004C721F).
             sim.queue_command(CommandEnvelope::new(
-                enemy,
+                owner,
                 1,
                 Command::Guard {
                     entity_id: id,
@@ -126,7 +133,8 @@ impl MindScene {
         ));
         eprintln!(
             "MIND ordinary initial Attack issue_tick={} due_tick=1 target={}",
-            sim.session.tick, targets[0]
+            sim.session.tick(),
+            targets[0]
         );
         Some(Self {
             rules: rules.into(),
@@ -152,7 +160,7 @@ impl MindScene {
             .sim
             .advance_app_frame(
                 &commands,
-                Some(&self.rules),
+                &self.rules,
                 None,
                 33,
                 TickLane::Ordinary,
@@ -169,11 +177,11 @@ impl MindScene {
         {
             eprintln!(
                 "MIND actual terminal visited_frame={} before={before:?} houses={:?} shots={:?} lifecycle={:?}",
-                self.sim.session.binary_frame - 1,
+                self.sim.session.binary_frame() - 1,
                 self.sim
                     .houses
                     .iter()
-                    .map(|(id, house)| (self.sim.interner.resolve(*id), house.is_defeated))
+                    .map(|(id, house)| (self.sim.interner.resolve(*id), house.is_defeated()))
                     .collect::<Vec<_>>(),
                 output
                     .fire_events
@@ -234,8 +242,8 @@ impl MindScene {
                 fired_at.insert(target);
                 eprintln!(
                     "MIND ordinary Fire visited_frame={} tick={} target={} fire={:?}",
-                    self.sim.session.binary_frame - 1,
-                    self.sim.session.tick,
+                    self.sim.session.binary_frame() - 1,
+                    self.sim.session.tick(),
                     target,
                     shot.fire_coord
                 );
@@ -263,8 +271,8 @@ impl MindScene {
             if victims.contains(&requested) {
                 eprintln!(
                     "MIND ordinary capture visited_frame={} tick={} requested={} nodes={victims:?}",
-                    self.sim.session.binary_frame - 1,
-                    self.sim.session.tick,
+                    self.sim.session.binary_frame() - 1,
+                    self.sim.session.tick(),
                     requested
                 );
             }
@@ -273,7 +281,7 @@ impl MindScene {
                 assert!(self.targets.iter().all(|id| victims.contains(id)));
                 self.sim.queue_command(CommandEnvelope::new(
                     owner,
-                    self.sim.session.tick + 1,
+                    self.sim.session.tick() + 1,
                     Command::Stop {
                         entity_id: self.mind,
                     },
@@ -288,12 +296,12 @@ impl MindScene {
                     .unwrap();
                 eprintln!(
                     "MIND ordinary next Attack issue_tick={} due_tick={} target={requested}",
-                    self.sim.session.tick,
-                    self.sim.session.tick + 1
+                    self.sim.session.tick(),
+                    self.sim.session.tick() + 1
                 );
                 self.sim.queue_command(CommandEnvelope::new(
                     owner,
-                    self.sim.session.tick + 1,
+                    self.sim.session.tick() + 1,
                     Command::Attack {
                         attacker_id: self.mind,
                         target_id: requested,
@@ -311,7 +319,7 @@ impl MindScene {
         let owner = self.sim.entities().get(self.mind).unwrap().owner();
         self.sim.queue_command(CommandEnvelope::new(
             owner,
-            self.sim.session.tick + 1,
+            self.sim.session.tick() + 1,
             Command::Select {
                 entity_ids: vec![self.mind],
                 additive: false,
@@ -358,7 +366,7 @@ impl MindScene {
         loaded.restore_after_snapshot_load().unwrap();
         loaded.rebuild_caches_after_load(
             self.sim.resolved_terrain.clone().unwrap(),
-            self.sim.terrain_speed_config.clone(),
+            self.sim.terrain_speed_config().clone(),
             &self.rules,
         );
         loaded.resolve_type_handles(&self.rules);
@@ -405,7 +413,7 @@ impl MindScene {
                     .sim
                     .particle_systems()
                     .iter()
-                    .filter(|(id, system)| !before.contains(id) && system.type_id == spark)
+                    .filter(|(id, system)| !before.contains(id) && system.type_id() == spark)
                     .collect();
                 assert_eq!(
                     born.len(),
@@ -414,11 +422,11 @@ impl MindScene {
                 );
                 assert!(born.iter().all(|(_, system)| system.alive()
                     && !system.in_limbo()
-                    && system.in_logic_vector));
-                let pulse_frame = self.sim.session.binary_frame - 1;
+                    && system.in_logic_vector()));
+                let pulse_frame = self.sim.session.binary_frame() - 1;
                 eprintln!(
                     "MIND ordinary overload visited_frame={pulse_frame} tick={} health={} new_sparks={}",
-                    self.sim.session.tick,
+                    self.sim.session.tick(),
                     controller.health.current(),
                     born.len()
                 );
@@ -427,7 +435,7 @@ impl MindScene {
                     words[2] & 0x7fff_ffff,
                     0x3c75_c28f,
                     "native471C78 must assign row1's signed sideways RATE after the real pulse; visited_frame={}",
-                    self.sim.session.binary_frame - 1
+                    self.sim.session.binary_frame() - 1
                 );
                 assert_eq!(
                     [words[0], words[1], words[3]],
@@ -465,7 +473,7 @@ pub fn spark_ids(scene: &MindScene) -> BTreeSet<u64> {
         .sim
         .particle_systems()
         .iter()
-        .filter(|(_, system)| system.type_id == ty)
+        .filter(|(_, system)| system.type_id() == ty)
         .map(|(&id, _)| id)
         .collect()
 }
@@ -476,9 +484,9 @@ pub fn captive_ring_ids(scene: &MindScene) -> BTreeSet<crate::sim::anim_class::A
         .sim
         .anims()
         .filter(|(_, anim)| {
-            scene.sim.interner.resolve(anim.type_id) == name
+            scene.sim.interner.resolve(anim.type_id()) == name
                 && anim
-                    .owner_entity
+                    .owner_entity()
                     .is_some_and(|id| scene.targets.contains(&id))
         })
         .map(|(&id, _)| id)

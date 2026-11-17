@@ -5,11 +5,8 @@ for all 56 `[General]` integer reads inside `Read_Theater_TileSets_INI`
 (`545150`), preserving the caller's defaults, read order and result stores.
 [Native outputs](theater_general_reader.json) contain 34 synthetic input cases,
 six physical theater files and seven ordinal-publication controls.
-[Provenance](theater_general_reader.meta.json) records the executable identity,
-Unicorn version, execution boundaries and fixture substitutions.
+[Provenance](theater_general_reader.meta.json) records the Unicorn version, execution boundaries and fixture substitutions.
 
-Original executable SHA256:
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
 Explicit generation followed by an independent check passed on 2026-09-27.
 This is bounded native evidence; Rust replay and production theater loading are
 separate validation obligations.
@@ -127,10 +124,11 @@ are −1/−2, while a *present* malformed ordinary value can deliberately parse
 Keep consumer projections explicit. Checked `u16` conversion remains suitable
 for the existing presentation-facing optional fields; negative and oversized
 values become absent there. Signed ordinal resolution must reject negative
-values before indexing and avoid wrapping oversized values. The existing
-`HighBridgeRimTiles::from_ini` already uses signed `read_int(key, -1)` for all
-ten pieces and must retain that behavior. This corpus does not justify
-replacing its signed identities with the narrower presentation fields.
+values before indexing and avoid wrapping oversized values. `load_theater`
+reads the ten pieces once, signed, through `HighBridgeRimTiles::read`
+(`read_int(key, -1)`); the bounded `BridgeMiddle1/2` view is projected from
+those values. This corpus does not justify replacing the signed identities
+with the narrower presentation fields.
 
 The native `DestroyableCliffs=-2` default is distinct even though the current
 optional resolved cliff-range projection maps either negative sentinel to

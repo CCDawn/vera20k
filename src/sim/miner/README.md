@@ -18,6 +18,7 @@ movement, placement, capture and refinery/depot exits.
 | Shared refinery/depot Enter | `mission::enter` with `MissionCom` cadence | Foot `4D9290`, current control `5B3A00` |
 | Unit destination and per-cell docking | `movement::track_path` / `movement::per_cell` | Unit `741970` / `73A31F` |
 | Unload, cargo payment and departure | `miner::refinery_dock` with shared House economy | Unit `73D630` → House `4F9610` |
+| Computer miner stuck on its pad | `miner_system::unit_ai_nudge_off_refinery_pad`, after the Unit's second Commence | Unit AI `73681D..73697B` |
 
 The committed selector chooses one handler. A Miner component never admits
 Harvest while Attack, Move or another mission is current. Harvest returns its
@@ -102,6 +103,16 @@ controls, replayed through the shared owners and both construction routes. The
 observes cargo, House payment, radio release and resumed harvesting through
 the normal loader and synchronized commands. The packet records the exact
 boundaries of its repair, movement, scheduling and rendering evidence.
+
+Payment reads the selected Tiberium type's current signed `Value` and the
+recipient country's stored `IncomeMult` float. The shared House owner follows
+the original x87 operation order for both credits and harvested score; the
+purifier bonus is stored as a float before its separate positive payment.
+The [income controls](../../../tools/spatial_oracle/refinery_income.md) compare
+191 original House calls, 258 Unit numeric interiors and twelve field reads.
+Rust replays the Unit and shared slave payment paths, including the existing
+native slave `dep_income_mult` control. Fractional cargo representation remains
+outside these whole-cargo callers.
 
 The docking validation receipt (`tools/spatial_oracle/refinery_dock.validation.json`, in git at 1b1a8b43e)
 binds the final Rust hashes, native comparisons and release run. That ordinary

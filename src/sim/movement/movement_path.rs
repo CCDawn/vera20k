@@ -11,26 +11,9 @@ use crate::sim::movement::locomotor::MovementLayer;
 #[path = "path_finishing.rs"]
 mod path_finishing;
 use crate::sim::pathfinding::zone_search;
-use crate::sim::pathfinding::{
-    LayeredPath, MAX_PATH_SEGMENT_STEPS, SearchMarkerOverlay, truncate_layered_path,
-};
+use crate::sim::pathfinding::{LayeredPath, SearchMarkerOverlay};
 
 use super::PathfindingContext;
-
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn reset_path_search_used_zone_grid_marker() {
-    PATH_SEARCH_USED_ZONE_GRID.with(|used| used.set(false));
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn path_search_used_zone_grid_marker() -> bool {
-    PATH_SEARCH_USED_ZONE_GRID.with(|used| used.get())
-}
-
-#[cfg(any(test, feature = "test-support"))]
-thread_local! {
-    static PATH_SEARCH_USED_ZONE_GRID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
 
 /// Internal request failures retain the layer where the return originated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,16 +43,13 @@ pub(super) fn find_move_path(
     allow_zone_hierarchy: bool,
     foot_entry: &dyn crate::sim::pathfinding::SearchFootEntry,
 ) -> Result<LayeredPath, MovePathFailure> {
+    let _area = crate::sim::frame_profile::area(crate::sim::frame_profile::phase::PATHFINDING);
     let facts = crate::sim::pathfinding::MoverSearchFacts {
         urgency,
         foot_entry,
     };
     let grid = ctx.path_grid.ok_or(MovePathFailure::MissingGrid)?;
     let zone_grid = ctx.zone_grid;
-    #[cfg(any(test, feature = "test-support"))]
-    if zone_grid.is_some() {
-        PATH_SEARCH_USED_ZONE_GRID.with(|used| used.set(true));
-    }
     let path = zone_search::find_layered_path_zoned_marker_detailed(
         grid,
         start,
@@ -92,18 +72,14 @@ pub(super) fn find_move_path(
         goal,
         path.len(),
     );
-    let (coords, layers) = path_finishing::finish(path, ctx, grid, foot_entry, marker_overlay)
-        .map_err(|cause| {
-            MovePathFailure::Search(zone_search::PathSearchFailure::CellEntryUnavailable(cause))
-        })?;
-    Ok(truncate_layered_path(
-        coords,
-        layers,
-        MAX_PATH_SEGMENT_STEPS,
-    ))
+    // The whole route: Find_Path's copy (`FootPathQueue::install`) owns the
+    // window.
+    path_finishing::finish(path, ctx, grid, foot_entry, marker_overlay).map_err(|cause| {
+        MovePathFailure::Search(zone_search::PathSearchFailure::CellEntryUnavailable(cause))
+    })
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::*;
 
@@ -245,6 +221,7 @@ mod tests {
                 blocker_neighbor_counts: Some(&counts),
             },
             &witness,
+            true,
         );
 
         assert_eq!(

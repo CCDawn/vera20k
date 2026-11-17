@@ -7,9 +7,9 @@ use crate::rules::ini_parser::IniFile;
 use crate::sim::terrain_spawn::{
     TerrainAnimationState, construct_terrain_objects, seed_terrain_spawner_animation,
 };
-use crate::sim::tiberium::{
-    NewTiberiumAdmission, PlaceTiberiumContext, TiberiumPlacementObjectContext, spread_tiberium,
-};
+// Direct stock-context spreads remain stock in a Phobos build; only an
+// active terrain-spawner context selects the replacement scan.
+use crate::sim::tiberium::spread_tiberium;
 use crate::util::native_x87::NativeF32Bits;
 use serde_json::{Value, json};
 
@@ -58,7 +58,7 @@ fn fixture(input: &Value, stock: &Value) -> (Scene, Vec<(u16, u16)>) {
                 .resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(rx, ry)
+                .cell_mut_for_test(rx, ry)
                 .unwrap()
                 .allows_tiberium = input["tile_allows_tiberium"] != false;
         }
@@ -91,7 +91,27 @@ fn fixture(input: &Value, stock: &Value) -> (Scene, Vec<(u16, u16)>) {
         }
     }
     construct_terrain_objects(&mut s.sim, &trees, &s.rules, false);
-    seed_terrain_spawner_animation(&mut s.sim, &s.rules);
+    // tools/spatial_oracle/tibtre.py supplies these Cell+E4 heads directly;
+    // full Terrain construction/placement is outside that native fixture.
+    let prepared_heads: Vec<_> = s
+        .sim
+        .terrain_objects
+        .objects()
+        .values()
+        .filter(|object| object.is_live())
+        .map(|object| (object.cell(), object.stable_id()))
+        .collect();
+    for (at, id) in prepared_heads {
+        if s.sim.terrain_objects.id_at(at).is_none() {
+            s.sim.terrain_objects.add_to_cell(id, at);
+        }
+    }
+    seed_terrain_spawner_animation(
+        &s.sim.interner,
+        &mut s.sim.terrain_objects,
+        &s.sim.session,
+        &s.rules,
+    );
     let type_ref = s.sim.interner.get("TIBTRE01").unwrap();
     for &at in &coords {
         let mut animation = TerrainAnimationState::new(
@@ -99,7 +119,7 @@ fn fixture(input: &Value, stock: &Value) -> (Scene, Vec<(u16, u16)>) {
             NativeF32Bits::from_bits(typ["probability_bits"].as_u64().unwrap() as u32),
             typ["rate"].as_i64().unwrap() as i32,
             22,
-            s.sim.session.binary_frame,
+            s.sim.session.binary_frame(),
         );
         if let Some(stage) = input.get("stage") {
             let mut retained = serde_json::to_value(&animation).unwrap();
@@ -109,7 +129,11 @@ fn fixture(input: &Value, stock: &Value) -> (Scene, Vec<(u16, u16)>) {
             animation = serde_json::from_value(retained).unwrap();
         }
         // Retained controls deliberately include a non-animated active Stage.
-        s.sim.production.terrain_animations.insert(at, animation);
+        let terrain_id = s.sim.terrain_objects.cell_index()[&at];
+        s.sim
+            .terrain_objects
+            .animations_mut_for_test()
+            .insert(terrain_id, animation);
     }
     for blocked in input["blocked"].as_array().into_iter().flatten() {
         let at = cell(blocked);
@@ -126,7 +150,7 @@ fn fixture(input: &Value, stock: &Value) -> (Scene, Vec<(u16, u16)>) {
                     .resolved_terrain
                     .as_mut()
                     .unwrap()
-                    .cell_mut(at.0, at.1)
+                    .cell_mut_for_test(at.0, at.1)
                     .unwrap();
                 c.land_type = 1;
                 c.allows_tiberium = false;
@@ -136,7 +160,7 @@ fn fixture(input: &Value, stock: &Value) -> (Scene, Vec<(u16, u16)>) {
                     .resolved_terrain
                     .as_mut()
                     .unwrap()
-                    .cell_mut(at.0, at.1)
+                    .cell_mut_for_test(at.0, at.1)
                     .unwrap()
                     .slope_type = 1
             }
@@ -145,13 +169,16 @@ fn fixture(input: &Value, stock: &Value) -> (Scene, Vec<(u16, u16)>) {
                     .resolved_terrain
                     .as_mut()
                     .unwrap()
-                    .cell_mut(at.0, at.1)
+                    .cell_mut_for_test(at.0, at.1)
                     .unwrap()
                     .bridge_facts
                     .raw_flags = 0x100
             }
             "tree" => {
-                s.sim.production.tiberium_spawning_terrain_cells.insert(at);
+                s.sim
+                    .terrain_objects
+                    .spawning_cells_mut_for_test()
+                    .insert(at);
             }
             "ordinary_tree" => {}
             "building" => {
@@ -185,12 +212,19 @@ fn fixture(input: &Value, stock: &Value) -> (Scene, Vec<(u16, u16)>) {
     // Native controls supply already-constructed adjacent objects and seed
     // Scenario at the measured boundary; exclude Rust fixture constructors.
     s.sim.scenario_rng = crate::sim::rng::SimRng::new(input["seed"].as_u64().unwrap_or(1));
+    s.sim.native_unique_ids =
+        Some(crate::sim::native_identity::NativeUniqueIdCursor::test_at_current_value(0));
     (s, coords)
 }
 
+/// The per-visit state the two stock-spread replays compare: stage, timer,
+/// overlay bytes and the ore queues a forced spread fed.
 fn compare(s: &Scene, coords: &[(u16, u16)], native: &Value, context: &str) {
     for (at, expected) in coords.iter().zip(native["actors"].as_array().unwrap()) {
-        let state = serde_json::to_value(&s.sim.production.terrain_animations[at]).unwrap();
+        let state = serde_json::to_value(
+            &s.sim.terrain_objects.animations()[&s.sim.terrain_objects.cell_index()[at]],
+        )
+        .unwrap();
         assert_eq!(
             state["current_frame"], expected["stage"],
             "{context}: Stage"
@@ -219,12 +253,7 @@ fn compare(s: &Scene, coords: &[(u16, u16)], native: &Value, context: &str) {
             "{context}: density {at:?}"
         );
     }
-    let classes = &s
-        .sim
-        .production
-        .ore_growth_state
-        .native_tiberium_state()
-        .classes;
+    let classes = &s.sim.ore_growth_state.native_tiberium_state().classes;
     for queue in native["growth"].as_array().unwrap() {
         let growth = &classes[queue["kind"].as_u64().unwrap() as usize].growth;
         let actual: Vec<_> = (0..growth.len())
@@ -256,23 +285,29 @@ fn compare(s: &Scene, coords: &[(u16, u16)], native: &Value, context: &str) {
     );
 }
 
+/// The stock Terrain AI timelines end in the stock forced spread, which a
+/// Phobos build replaces with its own `SpawnsTiberium.*` scan.
 #[test]
+#[cfg(not(feature = "phobos"))]
 fn terrain_ai_timelines_match_native_stage_timers_ore_queues_and_rng() {
     let corpus = corpus();
     let stock = &corpus["retail_inputs"]["rows"][0];
     for case in corpus["timelines"].as_array().unwrap() {
         let (mut s, coords) = fixture(&case["input"], stock);
         for row in case["rows"].as_array().unwrap() {
-            s.sim.session.binary_frame = row["frame"].as_u64().unwrap() as u32;
+            s.sim
+                .session
+                .set_binary_frame_for_test(row["frame"].as_u64().unwrap() as u32);
             let at = coords[row["actor"].as_u64().unwrap() as usize];
-            let id = s.sim.production.terrain_object_cells[&at];
+            let id = s.sim.terrain_objects.cell_index()[&at];
             crate::sim::terrain_spawn::tick_terrain_object_ai(
                 &mut s.sim,
                 id,
-                Some(&s.rules),
+                &s.rules,
                 Some(registry()),
-                None,
-            );
+                crate::sim::world::FrameEffects::default(),
+            )
+            .unwrap();
             compare(
                 &s,
                 &coords,
@@ -299,40 +334,25 @@ fn forced_spread_matches_original_admission_placement_queues_and_rng() {
     let stock = &corpus["retail_inputs"]["rows"][0];
     for case in corpus["spread_cases"].as_array().unwrap() {
         let (mut s, coords) = fixture(&case["input"], stock);
-        let objects = TiberiumPlacementObjectContext::new(
-            &s.sim.substrate.entities,
-            &s.sim.substrate.occupancy,
-            &s.sim.substrate.raw_cell_occupation,
-            &s.rules,
-            &s.sim.interner,
-            &s.sim.production.terrain_object_cells,
+        s.sim
+            .session
+            .set_binary_frame_for_test(case["input"]["frame"].as_u64().unwrap_or(200) as u32);
+        s.sim.ore_growth_config = crate::sim::ore_growth::OreGrowthConfig::for_test(
+            true,
+            case["input"]["spreads"] != false,
+            s.sim.ore_growth_config.tiberium_grows_flag(),
         );
-        let terrain = s.sim.resolved_terrain.as_ref().unwrap();
         let result = spread_tiberium(
-            &mut PlaceTiberiumContext {
-                overlay_grid: s.sim.overlay_grid.as_mut().unwrap(),
-                ore_growth_state: &mut s.sim.production.ore_growth_state,
-                overlay_registry: registry(),
-                tiberium_types: &s.rules.tiberium_types,
-                resolved_terrain: Some(terrain),
-                source_object_cells: &s.sim.production.tiberium_spawning_terrain_cells,
-                new_cell_admission: Some(NewTiberiumAdmission::runtime(terrain, objects)),
-                live_objects: Some(objects.object_view()),
-                rng: &mut s.sim.scenario_rng,
-                binary_frame: case["input"]["frame"].as_u64().unwrap_or(200) as u32,
-                growth_enabled: true,
-                spread_enabled: case["input"]["spreads"] != false,
-                radar_dirty_cells: None,
-                radar_dirty_generation: None,
-                tactical_dirty_cells: None,
-            },
+            &mut s.sim,
+            &s.rules,
+            registry(),
             coords[0],
             true,
-        );
+            None,
+            crate::sim::world::FrameEffects::default(),
+        )
+        .unwrap();
         let succeeded = result.is_some();
-        s.sim.publish_overlay_constructions(
-            result.and_then(crate::sim::tiberium::TiberiumPlacement::into_overlay_construction),
-        );
         assert_eq!(
             json!(u8::from(succeeded)),
             case["result"],
@@ -403,8 +423,8 @@ fn same_frame_ore_terrain_ai_publishes_the_path_view_before_return() {
     let registry = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(&ini, None);
     let tree = s
         .sim
-        .production
         .terrain_objects
+        .objects()
         .iter()
         .find(|(_, object)| object.cell() == (16, 16))
         .map(|(&id, _)| id)
@@ -412,10 +432,11 @@ fn same_frame_ore_terrain_ai_publishes_the_path_view_before_return() {
     crate::sim::terrain_spawn::tick_terrain_object_ai(
         &mut s.sim,
         tree,
-        Some(&s.rules),
+        &s.rules,
         Some(&registry),
-        None,
-    );
+        crate::sim::world::FrameEffects::default(),
+    )
+    .unwrap();
     let (x, y, _) = s
         .sim
         .overlay_grid
@@ -426,13 +447,11 @@ fn same_frame_ore_terrain_ai_publishes_the_path_view_before_return() {
         .expect("force1 Terrain turn creates actual ore");
     let cell = s.sim.resolved_terrain.as_ref().unwrap().cell(x, y).unwrap();
     assert_eq!(cell.land_type, 5, "native Mark published ore attributes");
-    assert!(
-        s.sim
-            .path_grid
-            .as_ref()
-            .unwrap()
-            .resolved_cell_is_current(cell, false)
-    );
+    assert!(s.sim.path_grid.as_ref().unwrap().resolved_cell_is_current(
+        cell,
+        s.sim.overlay_grid.as_ref(),
+        false
+    ));
     assert!(
         !s.sim
             .overlay_grid
@@ -453,7 +472,7 @@ fn tibtre_spawned_ore_grows_is_harvested_and_reaches_refinery_credits() {
     let corpus = corpus();
     let stock = &corpus["retail_inputs"]["rows"][0];
     let (mut s, _) = fixture(&json!({"seed":4}), stock);
-    s.sim.production.ore_growth_config = OreGrowthConfig::disabled();
+    s.sim.ore_growth_config = OreGrowthConfig::disabled();
     let frame = |s: &mut Scene| {
         let path = s.sim.path_grid_snapshot();
         assert!(
@@ -488,21 +507,13 @@ fn tibtre_spawned_ore_grows_is_harvested_and_reaches_refinery_credits() {
         5
     );
     assert!(
-        s.sim
-            .production
-            .ore_growth_state
-            .native_tiberium_state()
-            .classes[0]
+        s.sim.ore_growth_state.native_tiberium_state().classes[0]
             .growth_bitmap
             .contains(&at)
     );
     // A queued cell reaches the existing global growth driver; the stock
     // Growth=2200 timer must expire without seeding replacement ore.
-    s.sim.production.ore_growth_config = OreGrowthConfig {
-        grows: true,
-        spreads: false,
-        tiberium_grows_flag: true,
-    };
+    s.sim.ore_growth_config = OreGrowthConfig::for_test(true, false, true);
     for _ in 0..1600 {
         frame(&mut s);
         if s.sim
@@ -526,7 +537,7 @@ fn tibtre_spawned_ore_grows_is_harvested_and_reaches_refinery_credits() {
             > 3,
         "spawned ore grows from its actual retained queue"
     );
-    s.sim.production.ore_growth_config = OreGrowthConfig::disabled();
+    s.sim.ore_growth_config = OreGrowthConfig::disabled();
     let before = s
         .sim
         .overlay_grid
@@ -536,12 +547,12 @@ fn tibtre_spawned_ore_grows_is_harvested_and_reaches_refinery_credits() {
         .overlay_data;
     assert!(s.sim.apply_command_with_overlays(
         "Americans",
-        &Command::HarvestCell {
-            entity_id: s.miner,
-            target_rx: at.0,
-            target_ry: at.1
-        },
-        Some(&s.rules),
+        &Command::clicked_mission(
+            s.miner,
+            crate::sim::mission::MissionType::Harvest,
+            crate::sim::combat::TargetKind::Cell(at.0, at.1)
+        ),
+        &s.rules,
         Some(registry()),
         crate::sim::world::FrameEffects::default()
     ));
@@ -585,25 +596,26 @@ fn tibtre_spawned_ore_grows_is_harvested_and_reaches_refinery_credits() {
             < before
     );
     let owner = s.sim.interner.get("Americans").unwrap();
-    let balance = s.sim.houses[&owner].economy.credits();
+    let balance = s.sim.houses[&owner].economy().credits();
     assert!(s.sim.apply_command_with_overlays(
         "Americans",
-        &Command::MinerReturn {
-            entity_id: s.miner,
-            target_refinery_id: Some(s.refinery)
-        },
-        Some(&s.rules),
+        &Command::clicked_mission(
+            s.miner,
+            crate::sim::mission::MissionType::Enter,
+            crate::sim::combat::TargetKind::Entity(s.refinery)
+        ),
+        &s.rules,
         Some(registry()),
         crate::sim::world::FrameEffects::default()
     ));
     for _ in 0..1800 {
         frame(&mut s);
-        if s.sim.houses[&owner].economy.credits() > balance {
+        if s.sim.houses[&owner].economy().credits() > balance {
             break;
         }
     }
     assert!(
-        s.sim.houses[&owner].economy.credits() > balance,
+        s.sim.houses[&owner].economy().credits() > balance,
         "real refinery unload credits the harvested resource"
     );
 }
@@ -615,18 +627,20 @@ fn tibtre_active_stage_survives_snapshot_and_removal_clears_its_owner() {
     use crate::sim::snapshot::GameSnapshot;
     let corpus = corpus();
     let (mut s, coords) = fixture(&json!({"seed":4}), &corpus["retail_inputs"]["rows"][0]);
-    s.sim.production.ore_growth_config = OreGrowthConfig::disabled();
+    s.sim.ore_growth_config = OreGrowthConfig::disabled();
     let at = coords[0];
     for _ in 0..2000 {
         let path = s.sim.path_grid_snapshot();
         s.sim
             .advance_tick(&[], Some(&s.rules), path.as_deref(), Some(registry()), 67);
-        let a = &s.sim.production.terrain_animations[&at];
+        let a = &s.sim.terrain_objects.animations()[&s.sim.terrain_objects.cell_index()[&at]];
         if a.is_active() && a.current_frame() >= 3 {
             break;
         }
     }
-    assert!(s.sim.production.terrain_animations[&at].is_active());
+    assert!(
+        s.sim.terrain_objects.animations()[&s.sim.terrain_objects.cell_index()[&at]].is_active()
+    );
     // Save loading intentionally reseeds Scenario RNG; compare both
     // continuations under that existing owner policy.
     s.sim.scenario_rng = SimRng::new(0);
@@ -646,8 +660,8 @@ fn tibtre_active_stage_survives_snapshot_and_removal_clears_its_owner() {
         let path = restored.path_grid_snapshot();
         restored.advance_tick(&[], Some(&s.rules), path.as_deref(), Some(registry()), 67);
         assert_eq!(
-            s.sim.production.terrain_animations,
-            restored.production.terrain_animations
+            s.sim.terrain_objects.animations(),
+            restored.terrain_objects.animations()
         );
         assert_eq!(
             s.sim.scenario_rng.logical_state(),
@@ -663,21 +677,11 @@ fn tibtre_active_stage_survives_snapshot_and_removal_clears_its_owner() {
         };
         assert_eq!(ore(&s.sim), ore(&restored));
     }
-    let id = s.sim.production.terrain_object_cells[&at];
-    assert!(crate::sim::terrain_object::limbo_terrain_object_at_cell(
-        &mut s.sim.production,
-        at,
-        &mut s.sim.substrate.raw_cell_occupation,
-        s.sim.resolved_terrain.as_mut()
-    ));
-    s.sim.unregister_non_entity_object(id);
-    assert!(!s.sim.production.terrain_animations.contains_key(&at));
-    assert!(
-        !s.sim
-            .production
-            .tiberium_spawning_terrain_cells
-            .contains(&at)
-    );
+    let id = s.sim.terrain_objects.cell_index()[&at];
+    s.sim
+        .uninit_with_context(id, super::UninitContext::new(&s.rules, Some(registry())));
+    assert!(!s.sim.terrain_objects.animations().contains_key(&id));
+    assert!(!s.sim.terrain_objects.spawning_cells().contains(&at));
 }
 
 #[test]
@@ -689,25 +693,25 @@ fn forced_terrain_enqueue_rebuild_uses_live_scenario_flags_through_advance_tick(
         &json!({"seed":1, "stage":[10,0,0,0,1]}),
         &corpus["retail_inputs"]["rows"][0],
     );
-    s.sim.production.ore_growth_config = OreGrowthConfig::disabled();
+    s.sim.ore_growth_config = OreGrowthConfig::disabled();
     let grid = s.sim.overlay_grid.as_mut().unwrap();
     grid.place_overlay(10, 10, registry().id_for_name("TIB01").unwrap(), 2);
     // Prepared drained-heap prestate models a valid long-running append array.
     // Native admission/rebuild ordering and growth-off controls: ore_queue.json.
     let capacity = crate::sim::ore_growth::native_tiberium_queue_capacity((16, 16));
-    let mut saved = serde_json::to_value(&s.sim.production.ore_growth_state).unwrap();
+    let mut saved = serde_json::to_value(&s.sim.ore_growth_state).unwrap();
     saved["native_tiberium"]["classes"][0]["growth"]["entries"] = json!(vec![
         json!({"rx":10,"ry":10,"priority_bits":0});
         (capacity - 9)
             as usize
     ]);
-    saved["native_tiberium"]["classes"][0]["growth"]["heap"] = json!([0]);
+    saved["native_tiberium"]["classes"][0]["growth"]["heap"]["slots"] = json!([]);
     saved["native_tiberium"]["classes"][0]["growth_bitmap"] = json!([[10, 10]]);
-    s.sim.production.ore_growth_state = serde_json::from_value(saved).unwrap();
+    s.sim.ore_growth_state = serde_json::from_value(saved).unwrap();
     let path = s.sim.path_grid_snapshot();
     s.sim
         .advance_tick(&[], Some(&s.rules), path.as_deref(), Some(registry()), 67);
-    let saved = serde_json::to_value(&s.sim.production.ore_growth_state).unwrap();
+    let saved = serde_json::to_value(&s.sim.ore_growth_state).unwrap();
     let class = &saved["native_tiberium"]["classes"][0];
     let entries = class["growth"]["entries"].as_array().unwrap();
     assert_eq!(

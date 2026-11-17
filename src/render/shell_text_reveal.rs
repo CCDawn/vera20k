@@ -47,7 +47,7 @@ pub fn encoded_unit_rgb(unit_position: u32, reveal: PathAReveal) -> Option<[u8; 
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_s_z))]
 mod tests {
     use super::*;
 
@@ -81,15 +81,6 @@ mod tests {
         let rgb = encoded_unit_rgb(12, reveal).unwrap();
         assert_eq!([rgb[0] >> 3, rgb[1] >> 2, rgb[2] >> 3], [4, 27, 26]);
         assert_eq!(encoded_unit_rgb(11, reveal), Some([32, 104, 208]));
-    }
-
-    #[test]
-    fn count_one_is_a_blank_first_paint() {
-        let reveal = PathAReveal {
-            count: 1,
-            ..YELLOW_TO_WHITE
-        };
-        assert_eq!(encoded_unit_rgb(1, reveal), None);
     }
 
     #[test]

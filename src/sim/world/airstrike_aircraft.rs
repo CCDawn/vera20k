@@ -9,6 +9,8 @@
 //! A failed Unlimbo deletes that plane and returns the prior count minus one.
 
 use super::{FrameEffects, PlacementEvidence, Simulation};
+#[cfg(feature = "phobos")]
+use crate::map::entities::EntityCategory;
 use crate::rules::locomotor_type::{MovementZone, SpeedType};
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat::TargetKind;
@@ -40,18 +42,30 @@ impl Simulation {
         };
         let house_id = boris.owner();
         let owner_name = self.interner.resolve(house_id).to_owned();
-        let Some(target) = self.substrate.entities.get(target) else {
+        let Some(target_entity) = self.substrate.entities.get(target) else {
             return result;
         };
         //41D8C9 calls GetCoords (+48), not TargetCoords (+A4), and divides
-        //towards zero before narrowing to the CellStruct words.
-        let coord = ground_pose::object_get_coords(target, self.resolved_terrain.as_ref());
-        let target = TargetKind::Cell(
-            crate::util::lepton::lepton_to_cell_packed(coord.x) as u16,
-            crate::util::lepton::lepton_to_cell_packed(coord.y) as u16,
-        );
+        //towards zero before narrowing to the CellStruct words. Phobos
+        //`AirstrikeClass_Fire_SetAirstrike` (`0x41D97B`) keeps that path for a
+        //building only; every other target stays the object itself, so the
+        //aircraft follow a moving unit instead of the cell it stood on.
+        #[cfg(feature = "phobos")]
+        let keep_object = target_entity.category() != EntityCategory::Structure;
+        #[cfg(not(feature = "phobos"))]
+        let keep_object = false;
+        let target = if keep_object {
+            TargetKind::Entity(target)
+        } else {
+            let coord =
+                ground_pose::object_get_coords(target_entity, self.resolved_terrain.as_ref());
+            TargetKind::Cell(
+                crate::util::lepton::lepton_to_cell_packed(coord.x) as u16,
+                crate::util::lepton::lepton_to_cell_packed(coord.y) as u16,
+            )
+        };
         let (authored, waypoint) = self.houses.get(&house_id).map_or((-1, 0), |house| {
-            (house.authored_edge(), house.waypoint_edge)
+            (house.authored_edge(), house.waypoint_edge())
         });
         let edge = super::edge_cell::Edge::authored_or_waypoint(authored, waypoint);
         let Some(seed) = self.aircraft_edge_cell(edge) else {
@@ -73,7 +87,7 @@ impl Simulation {
             let Some(plane) = plane else {
                 break;
             };
-            self.link_airstrike_aircraft(owner, plane);
+            self.substrate.link_airstrike_aircraft(owner, plane);
             self.substrate
                 .entities
                 .get_mut(plane)
@@ -100,7 +114,7 @@ impl Simulation {
                 self.substrate.entities.get_mut(plane).unwrap(),
                 MissionId::from_known(MissionType::Attack),
             );
-            self.assign_target_represented(plane, Some(target), Some(rules), None, effects)
+            self.assign_target_represented(plane, Some(target), rules, None, effects)
                 .expect("constructed aircraft target setter");
             let placed = self.with_object_placement_scope(|sim| {
                 sim.reveal_constructed_object_at_height(
@@ -115,13 +129,13 @@ impl Simulation {
                 )
             });
             if placed.is_none() {
-                let _ = self.discard_constructed_limbo(plane, Some(rules), effects);
+                let _ = self.discard_constructed_limbo(plane, rules, effects);
                 result.count -= 1;
                 break;
             }
             crate::sim::mission::authority::commence_entity_mission(
                 self.substrate.entities.get_mut(plane).unwrap(),
-                self.session.binary_frame,
+                self.session.binary_frame(),
             );
             result.aircraft.push(plane);
             result.count += 1;
@@ -131,7 +145,7 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 mod tests {
     use super::*;
     use crate::map::playfield::PlayfieldBounds;
@@ -195,6 +209,36 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "phobos")]
+    #[test]
+    fn a_non_building_target_keeps_the_object_instead_of_its_cell() {
+        let Some((rules, mut sim, boris, _)) = world() else {
+            return;
+        };
+        let target = sim
+            .spawn_object("MTNK", "Americans", 40, 40, 0, &rules)
+            .unwrap();
+        assert_eq!(
+            sim.substrate.entities.get(target).unwrap().category(),
+            EntityCategory::Unit
+        );
+        let sortie = sim.create_airstrike_aircraft(
+            boris,
+            target,
+            "BPLN",
+            1,
+            &rules,
+            FrameEffects::default(),
+        );
+        assert_eq!(sortie.count, 1);
+        let plane = sim.substrate.entities.get(sortie.aircraft[0]).unwrap();
+        assert_eq!(
+            plane.attack_target.target(),
+            Some(TargetKind::Entity(target)),
+            "Phobos keeps a non-building target as the object"
+        );
+    }
+
     #[test]
     fn zero_count_still_spends_the_single_edge_pick_before_the_count_gate() {
         let Some((rules, mut sim, boris, target)) = world() else {
@@ -202,7 +246,7 @@ mod tests {
         };
         let owner = sim.substrate.entities.get(boris).unwrap().owner();
         let house = sim.houses.get(&owner).unwrap();
-        let edge = Edge::authored_or_waypoint(house.authored_edge(), house.waypoint_edge);
+        let edge = Edge::authored_or_waypoint(house.authored_edge(), house.waypoint_edge());
         let mut expected = sim.scenario_rng.clone();
         super::super::edge_cell::find_paradrop_edge_cell(
             sim.playfield_bounds,
@@ -242,14 +286,8 @@ mod tests {
                     .mission
                     .set_current_for_test(MissionId::from_known(MissionType::Attack), 5);
                 plane.ammo_mut().unwrap().set_current_for_test(2);
-                sim.assign_target_represented(
-                    id,
-                    target,
-                    Some(&rules),
-                    None,
-                    FrameEffects::default(),
-                )
-                .unwrap();
+                sim.assign_target_represented(id, target, &rules, None, FrameEffects::default())
+                    .unwrap();
                 let plane = sim.substrate.entities.get(id).unwrap();
                 // A NULL request jumps to the store (0x006FCDF3), keeping
                 // the ammo; only a new target leaves the run.

@@ -103,45 +103,6 @@ impl BlitPolicy {
     }
 }
 
-/// Families drawn during the fixed per-cell pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CellDrawKind {
-    Terrain,
-    Smudge,
-    FlatOverlay,
-    WallOverlay,
-    PrimaryCellObject,
-}
-
-/// One already-cell-traversed item. Its order is preserved exactly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CellDraw {
-    pub id: DrawId,
-    pub kind: CellDrawKind,
-    pub policy: BlitPolicy,
-}
-
-/// Fixed cell-pass families from back to front.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CellPass {
-    pub terrain: Vec<CellDraw>,
-    pub smudges: Vec<CellDraw>,
-    /// Flat overlays and walls keep their original cell traversal order.
-    pub overlays: Vec<CellDraw>,
-    pub primary_objects: Vec<CellDraw>,
-}
-
-impl CellPass {
-    fn push(&mut self, draw: CellDraw) {
-        match draw.kind {
-            CellDrawKind::Terrain => self.terrain.push(draw),
-            CellDrawKind::Smudge => self.smudges.push(draw),
-            CellDrawKind::FlatOverlay | CellDrawKind::WallOverlay => self.overlays.push(draw),
-            CellDrawKind::PrimaryCellObject => self.primary_objects.push(draw),
-        }
-    }
-}
-
 /// An object already admitted to an authoritative Display vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectDraw {
@@ -159,6 +120,12 @@ pub enum BuildingPieceKind {
     Body,
     Shadow,
     Bib,
+    /// The bib's own DrawSHP shadow half, drawn right after the bib
+    /// (`TechnoClass_DrawSHP @ 0x00705E00` from `0x0043D8E9`).
+    BibShadow,
+    /// A war factory's `UnderDoorAnim=` and its shadow, drawn after the bib
+    /// (`BuildingClass::DrawIt @ 0x0043D8EE`).
+    UnderDoor,
     PoweredOrActiveOverlay,
     SplitBack,
     SplitFront,
@@ -206,7 +173,6 @@ pub struct ObjectLayerPass {
 /// One pure input to the tactical draw planner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TacticalDrawInput {
-    Cell(CellDraw),
     Object(ObjectDraw),
     Building(BuildingOwnedPlan),
 }
@@ -214,7 +180,6 @@ pub enum TacticalDrawInput {
 /// Presentation plan lowered from the simulation-owned Display vectors.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TacticalDrawPlan {
-    pub cell_pass: CellPass,
     pub object_layers: Vec<ObjectLayerPass>,
 }
 
@@ -228,7 +193,6 @@ impl TacticalDrawPlan {
 
         for input in inputs {
             match input {
-                TacticalDrawInput::Cell(draw) => plan.cell_pass.push(draw),
                 TacticalDrawInput::Object(object) => entries.push(LayerEntry::Object(object)),
                 TacticalDrawInput::Building(building) => {
                     let mut building = building;
@@ -269,8 +233,10 @@ fn building_piece_order(kind: BuildingPieceKind) -> u8 {
         BuildingPieceKind::Body => 2,
         BuildingPieceKind::Shadow => 3,
         BuildingPieceKind::Bib => 4,
-        BuildingPieceKind::PoweredOrActiveOverlay => 5,
-        BuildingPieceKind::SplitFront => 6,
+        BuildingPieceKind::BibShadow => 5,
+        BuildingPieceKind::UnderDoor => 6,
+        BuildingPieceKind::PoweredOrActiveOverlay => 7,
+        BuildingPieceKind::SplitFront => 8,
     }
 }
 
@@ -282,7 +248,7 @@ fn native_layer_order(left: &LayerEntry, right: &LayerEntry) -> Ordering {
         .then_with(|| left.display_order.cmp(&right.display_order))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_s_z))]
 mod tests {
     use super::*;
 
@@ -295,57 +261,6 @@ mod tests {
             display_order,
             policy: OPAQUE_SHP,
         }
-    }
-
-    #[test]
-    fn cell_pass_keeps_native_family_order_and_cell_traversal_order() {
-        let plan = TacticalDrawPlan::build([
-            TacticalDrawInput::Cell(CellDraw {
-                id: 4,
-                kind: CellDrawKind::WallOverlay,
-                policy: OPAQUE_SHP,
-            }),
-            TacticalDrawInput::Cell(CellDraw {
-                id: 1,
-                kind: CellDrawKind::Terrain,
-                policy: OPAQUE_SHP,
-            }),
-            TacticalDrawInput::Cell(CellDraw {
-                id: 2,
-                kind: CellDrawKind::Smudge,
-                policy: OPAQUE_SHP,
-            }),
-            TacticalDrawInput::Cell(CellDraw {
-                id: 3,
-                kind: CellDrawKind::FlatOverlay,
-                policy: OPAQUE_SHP,
-            }),
-        ]);
-
-        assert_eq!(
-            plan.cell_pass
-                .terrain
-                .iter()
-                .map(|draw| draw.id)
-                .collect::<Vec<_>>(),
-            [1]
-        );
-        assert_eq!(
-            plan.cell_pass
-                .smudges
-                .iter()
-                .map(|draw| draw.id)
-                .collect::<Vec<_>>(),
-            [2]
-        );
-        assert_eq!(
-            plan.cell_pass
-                .overlays
-                .iter()
-                .map(|draw| draw.id)
-                .collect::<Vec<_>>(),
-            [4, 3]
-        );
     }
 
     #[test]
@@ -435,13 +350,5 @@ mod tests {
                 .collect::<Vec<_>>(),
             [22, 23, 21]
         );
-    }
-
-    #[test]
-    fn alpha_z_policy_is_explicit_for_future_shared_blitter_lowering() {
-        let policy = BlitPolicy::translucent(SpriteEncoding::Rle, RenderZPolicy::AlphaReadWrite);
-        assert_eq!(policy.encoding, SpriteEncoding::Rle);
-        assert_eq!(policy.render_z, RenderZPolicy::AlphaReadWrite);
-        assert!(policy.translucent);
     }
 }

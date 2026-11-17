@@ -9,7 +9,7 @@
 //! charge delay+2F8 and unmodeled manager helper fields are outside this state
 //! projection; their native writes remain in the corpus.
 
-use super::super::{receive_gunner, remove_gunner};
+use super::super::receive_gunner;
 use super::{arena, entity};
 use crate::rules::object_type::Ability;
 use crate::rules::ruleset::RuleSet;
@@ -404,7 +404,7 @@ fn prepare_case(rules: &RuleSet, row: &Value) -> (Simulation, Actors) {
             signed(&row["initial"]["transport"]["turret_index"]),
         );
     install_temporal_boundary(&mut sim, &actors, &row["initial"]);
-    sim.session.binary_frame = frame as u32;
+    sim.session.set_binary_frame_for_test(frame as u32);
     sim.scenario_rng = SimRng::new(input["seed"].as_u64().unwrap());
     assert_eq!(
         sim.scenario_rng.native_state_hex(),
@@ -481,13 +481,20 @@ fn native_temporal_gunner_callbacks_match_retained_histories() {
                 }
                 callback => {
                     let (_, draws) = trace_draws(|| match callback {
-                        "receive" | "retry" => {
-                            receive_gunner(&mut sim, rules, actors.transport, actors.passenger)
-                        }
+                        "receive" | "retry" => receive_gunner(
+                            &sim.interner,
+                            &sim.session,
+                            &mut sim.scenario_rng,
+                            &mut sim.substrate,
+                            &sim.houses,
+                            rules,
+                            actors.transport,
+                            actors.passenger,
+                        ),
                         "remove" => {
-                            remove_gunner(&mut sim, rules, actors.transport, Some(actors.passenger))
+                            sim.remove_gunner(rules, actors.transport, Some(actors.passenger))
                         }
-                        "remove_null" => remove_gunner(&mut sim, rules, actors.transport, None),
+                        "remove_null" => sim.remove_gunner(rules, actors.transport, None),
                         other => panic!("unknown native operation {other}"),
                     });
                     let native_draws = operation["raw_draws"].as_array().unwrap();

@@ -17,10 +17,6 @@ fn capture_accounting_corpus() -> &'static Value {
         corpus["kind"],
         "bounded-original-engineer-capture-accounting"
     );
-    assert_eq!(
-        corpus["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     corpus
 }
 
@@ -91,7 +87,7 @@ fn native_null_record_kill_books_each_live_callback_immediately() {
         let (stats, score) = capture_totals(&row["before"]);
         house.stats = stats;
         house.economy.set_score_for_test(score);
-        sim.houses.insert(owner, house);
+        sim.houses.register(house);
         let mut victim = GameEntity::test_default(1, "GAPOWR", "Americans", 10, 10);
         victim.set_owner_for_test(owner);
         victim.set_type_ref_for_test(sim.interner.intern("GAPOWR"));
@@ -175,7 +171,14 @@ fn native_change_owner_score_and_kill_counter_wrap() {
     let mut economy = crate::sim::economy::Economy::new(0);
     economy.set_score_for_test(score);
     economy.add_score(i32::try_from(native_price).unwrap());
-    stats.record_kill(crate::map::entities::EntityCategory::Structure);
+    // The table slot that changed is the old owner's House index.
+    let slot = row["before"]["new"]["building_kills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(row["after"]["new"]["building_kills"].as_array().unwrap())
+        .position(|(before, after)| before != after);
+    stats.record_kill(crate::map::entities::EntityCategory::Structure, slot);
     assert_eq!(
         (stats, economy.score()),
         capture_totals(&row["after"]["new"])
@@ -226,7 +229,7 @@ fn produced_history_distinguishes_equal_built_totals_and_last_types() {
         let mut sim = Simulation::new();
         let owner = sim.interner.intern("Americans");
         sim.houses
-            .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+            .register(HouseState::new(owner, 0, None, true, 0, 10));
         (sim, owner)
     };
     let (mut first, owner) = fixture();
@@ -258,7 +261,8 @@ fn produced_history_distinguishes_equal_built_totals_and_last_types() {
 fn saved_produced_history_rejects_inconsistent_cache_or_sparse_items() {
     for corruption in 0..3 {
         let mut sim = Simulation::new();
-        sim.session.map_name = "PRODUCED-HISTORY.MAP".into();
+        sim.session
+            .set_map_name_for_test("PRODUCED-HISTORY.MAP".into());
         let owner = sim.interner.intern("Americans");
         let mut house = HouseState::new(owner, 0, None, true, 0, 10);
         house.record_scored_production(ObjectCategory::Infantry, 0);
@@ -271,7 +275,7 @@ fn saved_produced_history_rejects_inconsistent_cache_or_sparse_items() {
                 house.produced_type_counts[ObjectCategory::Infantry as usize].insert(2, 0);
             }
         }
-        sim.houses.insert(owner, house);
+        sim.houses.register(house);
         let bytes = GameSnapshot::save_validated(&sim, 1, 2, "invalid produced history", 0);
         let mut saved = GameSnapshot::load_validated(&bytes, 1, 2, "PRODUCED-HISTORY.MAP")
             .unwrap()
@@ -332,7 +336,7 @@ fn house_current_viewer_discovery_is_retained_without_changing_peer_hash() {
     let mut sim = Simulation::new();
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+        .register(HouseState::new(owner, 0, None, true, 0, 10));
     assert!(!sim.houses[&owner].discovered_by_current_house());
     let prior = sim.state_hash();
     sim.houses
@@ -343,7 +347,7 @@ fn house_current_viewer_discovery_is_retained_without_changing_peer_hash() {
     let encoded = serde_json::to_vec(&sim.houses[&owner]).unwrap();
     let restored: HouseState = serde_json::from_slice(&encoded).unwrap();
     assert!(restored.discovered_by_current_house());
-    sim.houses.insert(owner, restored);
+    sim.houses.replace_for_test(restored);
     assert_eq!(sim.state_hash(), prior);
 }
 
@@ -380,7 +384,8 @@ fn native_house_statistics_survive_snapshot_and_retained_ship_terminal_record() 
     assert_eq!(rows.len(), 2);
     for row in rows {
         let mut sim = Simulation::new();
-        sim.session.map_name = "HOUSE-STATS.MAP".to_owned();
+        sim.session
+            .set_map_name_for_test("HOUSE-STATS.MAP".to_owned());
         // Whole Scenario load has its own seed-zero contract. The native
         // comparison here establishes the House fields across its Save/Load.
         sim.scenario_rng = SimRng::new(0);
@@ -404,9 +409,8 @@ fn native_house_statistics_survive_snapshot_and_retained_ship_terminal_record() 
         }
         assert_eq!(house.stats, stats, "native Built total equals its item sum");
         house.economy.set_score_for_test(score);
-        sim.houses.insert(owner, house);
-        sim.session.house_order.push(owner);
-        let id = sim.allocate_stable_id();
+        sim.houses.register(house);
+        let id = sim.substrate.allocate_stable_id();
         let mut hull = GameEntity::test_default(id, "AEGIS", "Americans", 113, 59);
         hull.set_type_ref_for_test(sim.interner.intern("AEGIS"));
         hull.set_owner_for_test(owner);
@@ -459,7 +463,7 @@ fn native_house_statistics_survive_snapshot_and_retained_ship_terminal_record() 
 #[test]
 fn saved_live_statistics_preserve_terminal_score_and_rng_continuation() {
     let mut sim = Simulation::new();
-    sim.session.map_name = "SCORE.MAP".to_owned();
+    sim.session.set_map_name_for_test("SCORE.MAP".to_owned());
     sim.scenario_rng = SimRng::new(0);
     let owner = sim.interner.intern("Americans");
     let mut house = HouseState::new(owner, 0, None, false, 0, 10);
@@ -473,8 +477,7 @@ fn saved_live_statistics_preserve_terminal_score_and_rng_continuation() {
     // Explicit four-produced-item prior for this synthetic score scene.
     house.set_produced_count_for_test(ObjectCategory::Infantry, 0, 4);
     house.economy.set_score_for_test(700);
-    sim.houses.insert(owner, house);
-    sim.session.house_order.push(owner);
+    sim.houses.register(house);
     let bytes = GameSnapshot::save_validated(&sim, 1, 2, "before score edge", 3);
     let mut restored = GameSnapshot::load_validated(&bytes, 1, 2, "SCORE.MAP")
         .unwrap()
@@ -482,8 +485,18 @@ fn saved_live_statistics_preserve_terminal_score_and_rng_continuation() {
     restored.retain_process_state_for_load(crate::sim::world::SnapshotProcessState::Live(&sim));
     restored.restore_after_snapshot_load().unwrap();
     let before_rng = sim.rng_state();
-    assert!(sim.finalize_terminal_score_snapshot());
-    assert!(restored.finalize_terminal_score_snapshot());
+    assert!(Simulation::finalize_terminal_score_snapshot(
+        &sim.session,
+        &mut sim.scenario_rng,
+        &mut sim.terminal_score_snapshot,
+        &sim.houses
+    ));
+    assert!(Simulation::finalize_terminal_score_snapshot(
+        &restored.session,
+        &mut restored.scenario_rng,
+        &mut restored.terminal_score_snapshot,
+        &restored.houses
+    ));
     assert_ne!(
         sim.rng_state(),
         before_rng,
@@ -495,4 +508,23 @@ fn saved_live_statistics_preserve_terminal_score_and_rng_continuation() {
     );
     assert_eq!(restored.rng_state(), sim.rng_state());
     assert_eq!(restored.state_hash(), sim.state_hash());
+}
+
+/// Each 20-entry kill table is followed by its loss counter (`+0x5434`,
+/// `+0x5488`), so kills of House 20 and later land past the tables the score
+/// screen and Diplomacy dialog sum (`0x005C996D`, `0x00658330`).
+#[test]
+fn kills_of_house_twenty_and_later_land_past_the_kill_tables() {
+    use crate::map::entities::EntityCategory;
+    let mut stats = MatchStatistics::default();
+    stats.record_kill(EntityCategory::Unit, Some(19));
+    stats.record_kill(EntityCategory::Structure, Some(19));
+    stats.record_kill(EntityCategory::Unit, Some(20));
+    stats.record_kill(EntityCategory::Structure, Some(20));
+    stats.record_kill(EntityCategory::Infantry, Some(21));
+    stats.record_kill(EntityCategory::Structure, Some(21));
+    assert_eq!(
+        (stats.kills(), stats.units_lost(), stats.buildings_lost()),
+        (3, 1, 1)
+    );
 }

@@ -31,11 +31,12 @@
 //! empty handle is omitted. Current facing cannot reconstruct this control
 //! history, so the bit is retained rather than recomputed.
 //!
-//! Instruction reading indicates that non-buildings leave `+0x4A0` zero:
-//! `Turret=` vehicles use the separate `+0x3A0` barrel facing, and a whole-image
-//! operand scan finds no other nonzero writer. On that basis, VERA omits their
-//! empty-handle operations and runs this state machine for structures only.
-//! Non-building execution has not been compared against native.
+//! VERA runs this state machine for structures only. A `Turret=` Unit also
+//! writes `+0x4A0`: `UnitClass::Facing_Update` stores its `+0x3A0` facing's
+//! `Is_Rotating` there (`0x00736BE9..0x00736C03`). RESIDUAL, dormant: no stock
+//! Unit sets `TurretRotateSound=` (only GTGCAN and CAEAST02 do), so no Unit
+//! plays the sound. Non-building execution has not been compared against
+//! native.
 //!
 //! Evidence: instruction-level reading of `gamemd.exe` (`BuildingClass::Update`,
 //! `TechnoClass::AI_Update`, `FacingClass::Is_Rotating`, `TechnoClass::Limbo`'s
@@ -51,10 +52,10 @@
 //! the selected supported executable, with identity and limits in its sidecar.
 //!
 //! The handle itself is the app/audio owner's, keyed by
-//! [`turret_rotate_sound_owner`] and re-driven by `app`, exactly as the
-//! Gattling report loop and `FootClass`'s `MoveSound` are. VERA publishes the
-//! stop and the start on the ordered `sound_events` channel and leaves the
-//! native `0x00750D40` coordinate update to the app's per-frame owner pass.
+//! [`turret_rotate_sound_owner`]. VERA publishes the stop and the start on the
+//! ordered `sound_events` channel. The calling `techno_common_steps` then
+//! delivers the native `0x006FA04F` position update through the synchronous
+//! client boundary, before promotion, mission work or a later fatal receiver.
 //! Each published Stop/Play/Release reaches `FrameEffects::flush_sound` before
 //! the latch write and later object work. This preserves request ordering;
 //! it does not establish native parity for accepted sources or their RNG draws.
@@ -64,6 +65,7 @@
 use super::{FrameEffects, SimSoundEvent, Simulation};
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
+use crate::sim::world::ObjectSubstrate;
 
 /// The loop-handle owner of a techno's turret rotation sound
 /// (`TechnoClass+0x488`). A tag bit keeps it apart from the object's own sound
@@ -78,7 +80,9 @@ pub(crate) const fn turret_rotate_sound_owner(techno: u64) -> u64 {
     techno | TURRET_ROTATE_SOUND_TAG
 }
 
-pub(crate) const fn turret_rotate_sound_techno(owner: u64) -> Option<u64> {
+/// The techno whose +488 loop this owner names. Its reached AI visit owns
+/// position updates, so the client must omit its frame-tail poll.
+pub const fn turret_rotate_sound_techno(owner: u64) -> Option<u64> {
     if owner & TURRET_ROTATE_SOUND_TAG != 0 {
         Some(owner & !TURRET_ROTATE_SOUND_TAG)
     } else {
@@ -152,7 +156,7 @@ impl Simulation {
         let Some(object) = self.object_type(entity.type_ref(), rules) else {
             return false;
         };
-        object.has_turret && entity.body_facing.is_rotating(self.session.binary_frame)
+        object.has_turret && entity.body_facing.is_rotating(self.session.binary_frame())
     }
 
     /// `TechnoClass::AI_Update`'s turret block (`0x006F9FA9..0x006FA04F`) for
@@ -186,10 +190,10 @@ impl Simulation {
             if !armed {
                 // The prior rotating visit cleared the latch, even without playback.
                 // Release any source and re-arm for the next rotating visit.
-                self.sound_events.push(SimSoundEvent::ObjectSoundReleased {
+                self.sound_events.emit(SimSoundEvent::ObjectSoundReleased {
                     owner: turret_rotate_sound_owner(id),
                 });
-                effects.flush_sound(self, Some(rules));
+                effects.flush_sound(self, rules);
                 if let Some(entity) = self.substrate.entities.get_mut(id) {
                     entity.turret_rotate_latch.arm();
                 }
@@ -214,19 +218,19 @@ impl Simulation {
             .object_type(entity.type_ref(), rules)
             .and_then(|object| object.turret_rotate_sound.clone());
         let world = Self::movement_sound_world(entity);
-        self.sound_events.push(SimSoundEvent::AnimationStopped {
+        self.sound_events.emit(SimSoundEvent::AnimationStopped {
             anim_id: owner,
             stop_sound_id: None,
             world,
         });
-        effects.flush_sound(self, Some(rules));
+        effects.flush_sound(self, rules);
         if let Some(sound_id) = sound_id {
-            self.sound_events.push(SimSoundEvent::AnimationStarted {
+            self.sound_events.emit(SimSoundEvent::AnimationStarted {
                 anim_id: owner,
                 sound_id,
                 world,
             });
-            effects.flush_sound(self, Some(rules));
+            effects.flush_sound(self, rules);
         }
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             entity.turret_rotate_latch.disarm();
@@ -242,12 +246,12 @@ impl Simulation {
         &mut self,
         id: u64,
         effects: FrameEffects<'_>,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
     ) {
-        if !self.turret_rotate_loop_live(id) {
+        if !Self::turret_rotate_loop_live(&self.substrate, id) {
             return;
         }
-        self.sound_events.push(SimSoundEvent::ObjectSoundReleased {
+        self.sound_events.emit(SimSoundEvent::ObjectSoundReleased {
             owner: turret_rotate_sound_owner(id),
         });
         effects.flush_sound(self, rules);
@@ -257,14 +261,14 @@ impl Simulation {
     }
 
     // This queries the control latch, not whether the audio owner has a source.
-    fn turret_rotate_loop_live(&self, id: u64) -> bool {
-        self.substrate
+    fn turret_rotate_loop_live(substrate: &ObjectSubstrate, id: u64) -> bool {
+        substrate
             .entities
             .get(id)
             .is_some_and(|entity| !entity.turret_rotate_latch.is_armed())
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_t_z))]
 #[path = "turret_rotate_sound_tests.rs"]
 mod tests;

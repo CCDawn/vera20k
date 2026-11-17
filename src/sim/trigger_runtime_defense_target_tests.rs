@@ -1,5 +1,5 @@
 //! TAction140/141: Execute6E4460/6E44C0 -> House50DA20/50DA50.
-//! Original gamemd.exe3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600.
+//! Original gamemd.exe.
 //! Writes/admission are instruction-established; timing goldens below reuse
 //! original AI_TryFireSW execution, not a second implementation of its timer.
 use super::*;
@@ -16,10 +16,10 @@ fn fixture() -> (Simulation, InternedId, InternedId) {
     let other = sim.interner.intern("UnrelatedHouse");
     for id in [owner, other] {
         sim.houses
-            .insert(id, HouseState::new(id, 0, None, false, 0, 10));
-        sim.session.house_order.push(id);
+            .register(HouseState::new(id, 0, None, false, 0, 10));
     }
-    sim.session.game_mode_nonzero = true;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     (sim, owner, other)
 }
 
@@ -46,7 +46,7 @@ fn apply(sim: &mut Simulation, owner: Option<InternedId>, kind: i32, tail: &str)
         .unwrap()
         .entries()[0]
         .clone();
-    let action = RuntimeDefinitions::default().resolve_action(entry, None, None);
+    let action = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
     sim.apply_live_trigger_action(
         &action,
         TriggerActionContext {
@@ -55,7 +55,7 @@ fn apply(sim: &mut Simulation, owner: Option<InternedId>, kind: i32, tail: &str)
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         FrameEffects::default(),
     )
@@ -74,7 +74,7 @@ fn defense_actions_store_raw_cell_and_frame_without_changing_other_targets_or_rn
     for frame in [17, i32::MAX as u32, i32::MIN as u32, u32::MAX] {
         for cell in [(0, 22), (11, 0), (u16::MAX, 32768)] {
             let (mut sim, owner, other) = fixture();
-            sim.session.binary_frame = frame;
+            sim.session.set_binary_frame_for_test(frame);
             waypoint(&mut sim, cell);
             let house = sim.houses.get_mut(&owner).unwrap();
             house.set_preferred_super_weapon_target((7, 8));
@@ -181,20 +181,23 @@ fn scripted_alerts_drive_the_original_force_shield_timing_controls() {
         // Original controls supply ready, ungranted Supers: observe the actual
         // AI -> Fire_SW call; ClickFire then refuses, so nothing launches.
         sim.super_weapons
+            .map_mut_for_test()
             .get_mut(&owner)
             .unwrap()
             .get_mut(&shield)
             .unwrap()
-            .is_ready = true;
+            .set_is_ready_for_test(true);
         let cell = (
             row["defense"][0].as_i64().unwrap() as u16,
             row["defense"][1].as_i64().unwrap() as u16,
         );
         waypoint(&mut sim, cell);
-        sim.session.binary_frame = row["defense_frame"].as_i64().unwrap() as u32;
+        sim.session
+            .set_binary_frame_for_test(row["defense_frame"].as_i64().unwrap() as u32);
         assert_eq!(apply(&mut sim, Some(owner), 140, "A"), cell != (0, 0));
         rules.general.ai_super_defense_frames = row["defense_frames"].as_i64().unwrap() as i32;
-        sim.session.binary_frame = row["frame"].as_i64().unwrap() as u32;
+        sim.session
+            .set_binary_frame_for_test(row["frame"].as_i64().unwrap() as u32);
         let expected: Vec<_> = row["events"]
             .as_array()
             .unwrap()
@@ -219,7 +222,7 @@ fn scripted_alerts_drive_the_original_force_shield_timing_controls() {
 #[test]
 fn scripted_defense_state_survives_snapshot_then_clears_through_the_same_owner() {
     let (mut original, owner, _) = fixture();
-    original.session.binary_frame = i32::MIN as u32;
+    original.session.set_binary_frame_for_test(i32::MIN as u32);
     waypoint(&mut original, (u16::MAX, 32768));
     assert!(apply(&mut original, Some(owner), 140, "A"));
     let hash = original.state_hash();

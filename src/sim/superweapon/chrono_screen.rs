@@ -4,7 +4,6 @@
 //! scheduler. Original executed controls: tools/chrono_screen_effect.json.
 
 use crate::sim::trigger_runtime::TriggerEffect;
-use crate::sim::world::Simulation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChronoScreenCommand {
@@ -92,33 +91,14 @@ impl ChronoScreenState {
     }
 }
 
-impl Simulation {
-    ///53B460 owns admission; Execute127 itself succeeds even for a no-op.
-    pub(crate) fn start_chrono_screen_effect(
-        &mut self,
-        duration: i32,
-        effects: &mut Vec<TriggerEffect>,
-    ) {
-        let was_locked = self.session.input_locked();
-        if !self.session.start_chrono_screen_state(duration) {
-            return;
-        }
-        effects.push(TriggerEffect::ChronoScreen {
-            command: ChronoScreenCommand::Start,
-        });
-        effects.push(TriggerEffect::InputLockChanged {
-            locked: true,
-            was_locked,
-        });
-    }
-
+impl crate::sim::scenario_session::ScenarioSession {
     /// LightningStorm::Process53A747, after Dominator and before storm work.
     /// Original53B560 also runs from Main_Tick55D83A while ordinary Logic
     /// is paused. Return ordered effects to the calling frame/service owner.
-    pub fn process_chrono_screen_effect(&mut self) -> Vec<TriggerEffect> {
+    pub(crate) fn process_chrono_screen_effect(&mut self) -> Vec<TriggerEffect> {
         let mut effects = Vec::new();
-        let was_locked = self.session.input_locked();
-        let commands = self.session.step_chrono_screen_state();
+        let was_locked = self.input_locked();
+        let commands = self.step_chrono_screen_state();
         for command in commands {
             match command {
                 ChronoScreenCommand::Pause => effects.extend(self.pause_scenario(0)),
@@ -126,8 +106,7 @@ impl Simulation {
                 _ => {}
             }
             effects.push(TriggerEffect::ChronoScreen { command });
-            if command == ChronoScreenCommand::Finish
-                && !self.session.chrono_screen().prior_input_locked()
+            if command == ChronoScreenCommand::Finish && !self.chrono_screen().prior_input_locked()
             {
                 effects.push(TriggerEffect::InputLockChanged {
                     locked: false,
@@ -139,7 +118,28 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+impl crate::sim::scenario_session::ScenarioSession {
+    ///53B460 owns admission; Execute127 itself succeeds even for a no-op.
+    pub(crate) fn start_chrono_screen_effect(
+        &mut self,
+        duration: i32,
+        effects: &mut Vec<TriggerEffect>,
+    ) {
+        let was_locked = self.input_locked();
+        if !self.start_chrono_screen_state(duration) {
+            return;
+        }
+        effects.push(TriggerEffect::ChronoScreen {
+            command: ChronoScreenCommand::Start,
+        });
+        effects.push(TriggerEffect::InputLockChanged {
+            locked: true,
+            was_locked,
+        });
+    }
+}
+
+#[cfg(all(test, tests_sim_superweapon))]
 mod tests {
     use super::*;
     use serde_json::Value;

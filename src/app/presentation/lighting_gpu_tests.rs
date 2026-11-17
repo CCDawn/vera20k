@@ -38,7 +38,7 @@ fn stock_lamp_loaded_by_scenario_changes_actual_terrain_pixels() {
         .find(|entity| {
             scenario
                 .sim()
-                .interner
+                .interner()
                 .resolve(entity.type_ref())
                 .eq_ignore_ascii_case("GALITE")
                 && (entity.position.rx(), entity.position.ry()) == (53, 113)
@@ -50,11 +50,11 @@ fn stock_lamp_loaded_by_scenario_changes_actual_terrain_pixels() {
     );
     let rules = &scenario.runtime.resources.rules;
     let stock = rules.object("GALITE").expect("stock GALITE rules");
-    assert_eq!(stock.light_visibility, 5000);
-    assert!((stock.light_intensity - 0.2).abs() < 0.00001);
+    assert_eq!(stock.building_light().visibility_leptons(), 5000);
+    assert_eq!(stock.building_light().intensity_units(), 200);
     // Headless construction retains the actual resolved world but omits the
     // app-only immutable template. Snapshot that same terrain for this view.
-    let terrain_snapshot = scenario.sim().resolved_terrain.as_ref().unwrap().clone();
+    let terrain_snapshot = scenario.sim().resolved_terrain().unwrap().clone();
     let terrain = &terrain_snapshot;
     let cell = terrain.cell(rx, ry).expect("lamp has real terrain");
     let (tile_id, sub_tile) = terrain.presentation_tile(cell);
@@ -98,6 +98,7 @@ fn stock_lamp_loaded_by_scenario_changes_actual_terrain_pixels() {
         origin_x: 0.0,
         origin_y: 0.0,
         bridge_middle_tiles: None,
+        deformation_tiles: Vec::new(),
     };
     let mut lighting = MatchLighting::default();
     lighting.install(
@@ -105,6 +106,7 @@ fn stock_lamp_loaded_by_scenario_changes_actual_terrain_pixels() {
         parse_lighting(&scenario.map.ini),
         2,
         Some((terrain, &scenario.runtime.simulation)),
+        None,
     );
     let lit_scalar = lighting
         .grid()
@@ -130,20 +132,29 @@ fn stock_lamp_loaded_by_scenario_changes_actual_terrain_pixels() {
         tile.height as f32,
         Some(&lookup),
         None,
+        Vec::new(),
     )
     .normal
     .remove(0);
     let lit_pixels = crate::render::depth_gpu_tests::render_terrain_lighting_probe(&tile, instance);
 
-    scenario.runtime.simulation.discard_lighting_events();
+    scenario
+        .runtime
+        .simulation
+        .lighting_sources_mut_for_test()
+        .discard_pending();
     scenario.runtime.simulation.apply_fatal_lifecycle_stage(
         rules,
-        crate::sim::combat::FatalLifecycleStage::BeforeDeathEffects { attacker: None },
+        crate::sim::combat::FatalLifecycleStage::BeforeBuildingDestruction,
         id,
         crate::map::entities::EntityCategory::Structure,
         crate::sim::world::UninitContext::with_rules(rules),
     );
-    let events = std::mem::take(&mut scenario.runtime.simulation.lighting_sources.pending);
+    let events = scenario
+        .runtime
+        .simulation
+        .lighting_sources_mut_for_test()
+        .take_pending();
     lighting.apply_events(terrain, &events);
     lighting.refresh(terrain, &scenario.runtime.simulation, 2);
     let dark_scalar = lighting
@@ -168,6 +179,7 @@ fn stock_lamp_loaded_by_scenario_changes_actual_terrain_pixels() {
         tile.height as f32,
         Some(&lookup),
         None,
+        Vec::new(),
     )
     .normal
     .remove(0);

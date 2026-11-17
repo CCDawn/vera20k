@@ -3,6 +3,9 @@
 //! deliberately asymmetric native writes. The live byte plane stays on OverlayGrid.
 
 use crate::map::entities::EntityCategory;
+use crate::map::resolved_terrain::ResolvedTerrainGrid;
+use crate::sim::overlay_grid::OverlayGrid;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
 use std::collections::VecDeque;
 
@@ -63,28 +66,29 @@ impl NeighborCountChanges {
 }
 
 impl Simulation {
-    fn foot_neighbor_position(&self, id: u64) -> Option<(i16, i16)> {
-        let entity = self.substrate.entities.get(id)?;
+    fn foot_neighbor_position(substrate: &ObjectSubstrate, id: u64) -> Option<(i16, i16)> {
+        let entity = substrate.entities.get(id)?;
         (entity.category() != EntityCategory::Structure)
             .then_some((entity.position.rx() as i16, entity.position.ry() as i16))
     }
 
-    fn adjust_foot_neighbors(&mut self, cell: (i16, i16), add: bool) {
-        if let Some(grid) = self.overlay_grid.as_mut() {
-            grid.adjust_foot_neighbor_source(self.resolved_terrain.as_ref(), cell, add);
+    fn adjust_foot_neighbors(
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        overlay_grid: &mut Option<OverlayGrid>,
+        cell: (i16, i16),
+        add: bool,
+    ) {
+        if let Some(grid) = overlay_grid.as_mut() {
+            grid.adjust_foot_neighbor_source(resolved_terrain.as_ref(), cell, add);
         }
     }
 
-    fn foot_neighbor_high_flight(
-        &self,
-        id: u64,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
-    ) -> bool {
+    fn foot_neighbor_high_flight(&self, id: u64, rules: &crate::rules::ruleset::RuleSet) -> bool {
         self.substrate.entities.get(id).is_some_and(|entity| {
             crate::sim::movement::air_movement::is_high_flying(
                 entity,
                 self.resolved_terrain.as_ref(),
-                rules.map(|rules| (rules, &self.interner)),
+                Some((rules, &self.interner)),
             )
         })
     }
@@ -95,12 +99,12 @@ impl Simulation {
     pub(crate) fn foot_neighbors_after_unlimbo(
         &mut self,
         id: u64,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
     ) -> bool {
-        let Some(cell) = self.foot_neighbor_position(id) else {
+        let Some(cell) = Self::foot_neighbor_position(&self.substrate, id) else {
             return false;
         };
-        self.adjust_foot_neighbors(cell, true);
+        Self::adjust_foot_neighbors(&self.resolved_terrain, &mut self.overlay_grid, cell, true);
         let high_flight = self.foot_neighbor_high_flight(id, rules);
         if !high_flight {
             self.substrate
@@ -108,7 +112,7 @@ impl Simulation {
                 .get_mut(id)
                 .unwrap()
                 .navigation
-                .neighbor_state
+                .neighbor_state_mut()
                 .cell = cell;
         }
         high_flight
@@ -116,42 +120,56 @@ impl Simulation {
 
     /// Foot PerCell(reason2)4D8627..4D8757 skips the WHOLE migration on zero.
     /// Call only at native PerCell boundaries, never on every coordinate change.
-    pub(crate) fn foot_neighbors_at_per_cell(&mut self, id: u64) {
-        if self.foot_neighbor_position(id).is_none() {
+    pub(crate) fn foot_neighbors_at_per_cell(
+        substrate: &mut ObjectSubstrate,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        overlay_grid: &mut Option<OverlayGrid>,
+        id: u64,
+    ) {
+        if Self::foot_neighbor_position(substrate, id).is_none() {
             return;
         }
-        let old = self
-            .substrate
+        let old = substrate
             .entities
             .get(id)
             .unwrap()
             .navigation
-            .neighbor_state
+            .neighbor_state()
             .cell;
         if old == (0, 0) {
             return;
         }
-        self.adjust_foot_neighbors(old, false);
-        let cell = self.foot_neighbor_position(id).unwrap();
-        self.substrate
+        Self::adjust_foot_neighbors(resolved_terrain, overlay_grid, old, false);
+        let cell = Self::foot_neighbor_position(substrate, id).unwrap();
+        substrate
             .entities
             .get_mut(id)
             .unwrap()
             .navigation
-            .neighbor_state
+            .neighbor_state_mut()
             .cell = cell;
-        self.adjust_foot_neighbors(cell, true);
+        Self::adjust_foot_neighbors(resolved_terrain, overlay_grid, cell, true);
     }
 
     /// Foot Limbo4DB298..4DB2E9 decrements even a zero source; the saved cell
     /// survives Limbo. The caller's InLimbo check suppresses repeat removal.
-    pub(crate) fn foot_neighbors_before_limbo(&mut self, id: u64) {
-        if self.foot_neighbor_position(id).is_none() {
+    pub(crate) fn foot_neighbors_before_limbo(
+        substrate: &ObjectSubstrate,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        overlay_grid: &mut Option<OverlayGrid>,
+        id: u64,
+    ) {
+        if Self::foot_neighbor_position(substrate, id).is_none() {
             return;
         }
-        let entity = self.substrate.entities.get(id).unwrap();
+        let entity = substrate.entities.get(id).unwrap();
         if !entity.lifecycle.in_limbo() {
-            self.adjust_foot_neighbors(entity.navigation.neighbor_state.cell, false);
+            Self::adjust_foot_neighbors(
+                resolved_terrain,
+                overlay_grid,
+                entity.navigation.neighbor_state().cell,
+                false,
+            );
         }
     }
 
@@ -159,9 +177,9 @@ impl Simulation {
     pub(crate) fn foot_neighbors_after_owner_change(
         &mut self,
         id: u64,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
     ) {
-        if let Some(cell) = self.foot_neighbor_position(id)
+        if let Some(cell) = Self::foot_neighbor_position(&self.substrate, id)
             && !self.foot_neighbor_high_flight(id, rules)
         {
             self.substrate
@@ -169,52 +187,74 @@ impl Simulation {
                 .get_mut(id)
                 .unwrap()
                 .navigation
-                .neighbor_state
+                .neighbor_state_mut()
                 .cell = cell;
+        }
+    }
+
+    /// Ares survivor placement10044762/100447F3 stores retained Cell+24
+    /// directly, without a neighbor-count increment/decrement.
+    pub(crate) fn foot_neighbors_store_retained_cell(
+        substrate: &mut ObjectSubstrate,
+        id: u64,
+        cell: (i16, i16),
+    ) {
+        if let Some(entity) = substrate.entities.get_mut(id) {
+            entity.navigation.neighbor_state_mut().cell = cell;
         }
     }
 
     /// Aircraft DropPayload415E26..415E6E samples the selected Cell's center,
     /// then truncates /256; it does not change Cell+122 in this suffix.
-    pub(crate) fn foot_neighbors_after_payload_drop(&mut self, id: u64, cell: (i16, i16)) {
-        let cell = self.resolved_terrain.as_ref().map_or(cell, |terrain| {
+    pub(crate) fn foot_neighbors_after_payload_drop(
+        substrate: &mut ObjectSubstrate,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        id: u64,
+        cell: (i16, i16),
+    ) {
+        let cell = resolved_terrain.as_ref().map_or(cell, |terrain| {
             terrain.native_cell_coord(terrain.native_cell_identity(cell))
         });
-        if let Some(entity) = self.substrate.entities.get_mut(id) {
+        if let Some(entity) = substrate.entities.get_mut(id) {
             let centre_cell = |n: i16| ((i32::from(n) * 256 + 128) / 256) as i16;
-            entity.navigation.neighbor_state.cell = (centre_cell(cell.0), centre_cell(cell.1));
+            entity.navigation.neighbor_state_mut().cell =
+                (centre_cell(cell.0), centre_cell(cell.1));
         }
     }
 
     /// Fly landing4CED49..4CEE97 skips only the zero-source decrement, then
     /// always stores/adds the current cell. Landing owns when this is reached.
-    pub(crate) fn foot_neighbors_after_fly_landing(&mut self, id: u64) {
-        let Some(cell) = self.foot_neighbor_position(id) else {
+    pub(crate) fn foot_neighbors_after_fly_landing(
+        substrate: &mut ObjectSubstrate,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        overlay_grid: &mut Option<OverlayGrid>,
+        id: u64,
+    ) {
+        let Some(cell) = Self::foot_neighbor_position(substrate, id) else {
             return;
         };
-        let old = self
-            .substrate
+        let old = substrate
             .entities
             .get(id)
             .unwrap()
             .navigation
-            .neighbor_state
+            .neighbor_state()
             .cell;
         if old != (0, 0) {
-            self.adjust_foot_neighbors(old, false);
+            Self::adjust_foot_neighbors(resolved_terrain, overlay_grid, old, false);
         }
-        self.substrate
+        substrate
             .entities
             .get_mut(id)
             .unwrap()
             .navigation
-            .neighbor_state
+            .neighbor_state_mut()
             .cell = cell;
-        self.adjust_foot_neighbors(cell, true);
+        Self::adjust_foot_neighbors(resolved_terrain, overlay_grid, cell, true);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
     use crate::map::resolved_terrain::{ResolvedTerrainGrid, test_flat_cell};
@@ -268,11 +308,11 @@ mod tests {
             entity.lifecycle.set_in_limbo_for_test(false);
             entity
                 .lifecycle
-                .set_cell_marked(input["marked"].as_bool().unwrap_or(true));
+                .set_cell_marked_for_test(input["marked"].as_bool().unwrap_or(true));
             entity
                 .position
                 .set_exact_z_leptons_for_test(Some(input["z"].as_i64().unwrap_or(0) as i32));
-            entity.navigation.neighbor_state.cell = (
+            entity.navigation.neighbor_state_mut().cell = (
                 input["old"][0].as_i64().unwrap() as i16,
                 input["old"][1].as_i64().unwrap() as i16,
             );
@@ -305,11 +345,31 @@ mod tests {
             });
             match input["operation"].as_str().unwrap() {
                 "unlimbo" => {
-                    sim.foot_neighbors_after_unlimbo(1, rules.as_ref());
+                    sim.foot_neighbors_after_unlimbo(
+                        1,
+                        rules
+                            .as_ref()
+                            .unwrap_or(crate::rules::ruleset::RuleSet::empty_for_test()),
+                    );
                 }
-                "per_cell" => sim.foot_neighbors_at_per_cell(1),
-                "limbo" => sim.foot_neighbors_before_limbo(1),
-                "owner_change" => sim.foot_neighbors_after_owner_change(1, rules.as_ref()),
+                "per_cell" => Simulation::foot_neighbors_at_per_cell(
+                    &mut sim.substrate,
+                    &sim.resolved_terrain,
+                    &mut sim.overlay_grid,
+                    1,
+                ),
+                "limbo" => Simulation::foot_neighbors_before_limbo(
+                    &sim.substrate,
+                    &sim.resolved_terrain,
+                    &mut sim.overlay_grid,
+                    1,
+                ),
+                "owner_change" => sim.foot_neighbors_after_owner_change(
+                    1,
+                    rules
+                        .as_ref()
+                        .unwrap_or(crate::rules::ruleset::RuleSet::empty_for_test()),
+                ),
                 _ => unreachable!(),
             }
             let cell = sim
@@ -318,7 +378,7 @@ mod tests {
                 .get(1)
                 .unwrap()
                 .navigation
-                .neighbor_state
+                .neighbor_state()
                 .cell;
             assert_eq!(
                 serde_json::json!([cell.0, cell.1]),
@@ -357,7 +417,7 @@ mod tests {
         entity.set_type_ref_for_test(sim.intern("MTNK"));
         entity.set_owner_for_test(sim.intern("Americans"));
         sim.substrate.entities.insert(entity);
-        sim.substrate.next_stable_object_id = 2;
+        sim.set_next_stable_object_id_for_test(2);
         sim.reveal(1);
         assert_eq!(
             sim.substrate
@@ -365,7 +425,7 @@ mod tests {
                 .get(1)
                 .unwrap()
                 .navigation
-                .neighbor_state
+                .neighbor_state()
                 .cell,
             (3, 3)
         );
@@ -401,7 +461,7 @@ mod tests {
                 .get(1)
                 .unwrap()
                 .navigation
-                .neighbor_state
+                .neighbor_state()
                 .cell,
             (3, 3)
         );
@@ -432,7 +492,7 @@ mod tests {
             .get_mut(1)
             .unwrap()
             .navigation
-            .neighbor_state
+            .neighbor_state_mut()
             .cell = (5, 3);
         assert_ne!(restored.state_hash(), hash);
         restored
@@ -441,7 +501,7 @@ mod tests {
             .get_mut(1)
             .unwrap()
             .navigation
-            .neighbor_state
+            .neighbor_state_mut()
             .cell = (3, 3);
         restored.resolved_terrain = sim.resolved_terrain.clone();
         restored.techno_limbo(1);
@@ -471,7 +531,7 @@ mod tests {
                 .get(1)
                 .unwrap()
                 .navigation
-                .neighbor_state
+                .neighbor_state()
                 .cell,
             (3, 3)
         );
@@ -496,7 +556,7 @@ mod tests {
             let mut sim = fixture(128, 0);
             let mut entity = GameEntity::test_default(1, "ORCA", "Americans", 64, 64);
             let old = &row["before"]["neighbor_cell"];
-            entity.navigation.neighbor_state.cell = (
+            entity.navigation.neighbor_state_mut().cell = (
                 old[0].as_i64().unwrap() as i16,
                 old[1].as_i64().unwrap() as i16,
             );
@@ -506,7 +566,12 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .seed_neighbor_counts_for_tests(seed);
-            sim.foot_neighbors_after_fly_landing(1);
+            Simulation::foot_neighbors_after_fly_landing(
+                &mut sim.substrate,
+                &sim.resolved_terrain,
+                &mut sim.overlay_grid,
+                1,
+            );
             let plane = sim
                 .overlay_grid
                 .as_ref()

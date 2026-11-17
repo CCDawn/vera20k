@@ -49,7 +49,9 @@ fn native_tube_hierarchy_pairs_match_original_executable() {
             .collect();
         let tw = allocated.iter().map(|(_, x, _)| x + 1).max().unwrap_or(1);
         let th = allocated.iter().map(|(_, _, y)| y + 1).max().unwrap_or(1);
-        let mut cells = redirect_terrain(tw, th, None, None, |_| {}).cells;
+        let mut cells = redirect_terrain(tw, th, None, None, |_| {})
+            .cells()
+            .to_vec();
         for &(i, x, y) in &allocated {
             let cell = &mut cells[usize::from(y) * usize::from(tw) + usize::from(x)];
             cell.tube_index = Some(TubeId(i as u16));
@@ -74,7 +76,7 @@ fn native_tube_hierarchy_pairs_match_original_executable() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v.as_u64().unwrap() as u16)
+            .map(|v| v.as_u64().unwrap() as ZoneId)
             .collect();
         let record = BridgeEndpointRecord {
             endpoint_a: coord(&case["a"]),
@@ -86,9 +88,10 @@ fn native_tube_hierarchy_pairs_match_original_executable() {
         for seed in case["seed_pairs"].as_array().unwrap() {
             register_native_hierarchy_pair(
                 &mut buckets,
-                seed[0].as_u64().unwrap() as u16,
-                seed[1].as_u64().unwrap() as u16,
+                seed[0].as_u64().unwrap() as ZoneId,
+                seed[1].as_u64().unwrap() as ZoneId,
                 seed[2].as_u64().unwrap() as u8,
+                crate::map::cell_index::CellGrid::Retail,
             );
         }
         let width = case["width"].as_u64().unwrap() as u16;
@@ -141,7 +144,8 @@ fn tube_hierarchy_generated_records_connect_full_and_local_precheck() {
             cell.zone_type = zone_class::OUTSIDE;
         }
     })
-    .cells;
+    .cells()
+    .to_vec();
     let tubes: Vec<_> = [15u16, 16, 17]
         .into_iter()
         .enumerate()
@@ -333,9 +337,27 @@ fn tube_hierarchy_constant_walk_endpoints_match_original_executable() {
 #[test]
 fn a_sign_extended_pair_is_kept_once_per_bucket() {
     let mut buckets = HierarchyEdgeBuckets::new();
-    register_native_hierarchy_pair(&mut buckets, 1, 0x8001, 0);
-    register_native_hierarchy_pair(&mut buckets, 2, 0x8001, 0);
-    register_native_hierarchy_pair(&mut buckets, 1, 0x8001, 1);
+    register_native_hierarchy_pair(
+        &mut buckets,
+        1,
+        0x8001,
+        0,
+        crate::map::cell_index::CellGrid::Retail,
+    );
+    register_native_hierarchy_pair(
+        &mut buckets,
+        2,
+        0x8001,
+        0,
+        crate::map::cell_index::CellGrid::Retail,
+    );
+    register_native_hierarchy_pair(
+        &mut buckets,
+        1,
+        0x8001,
+        1,
+        crate::map::cell_index::CellGrid::Retail,
+    );
     let stored: Vec<_> = buckets
         .buckets
         .iter()

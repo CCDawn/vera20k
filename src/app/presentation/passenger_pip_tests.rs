@@ -8,11 +8,12 @@ const OWNER: &str = "Americans";
 
 fn frames(sim: &Simulation, rules: &RuleSet, transport: u64, hover: Option<u64>) -> Vec<usize> {
     let hash = sim.state_hash();
+    let frame = crate::app::presentation::frame::PresentationFrame::of_test(sim, rules);
     let result = super::ui_overlays::scale_pip_draws(
         sim,
-        sim.entities().get(transport).unwrap(),
+        frame.object(transport).unwrap(),
         hover,
-        Some(OWNER),
+        sim.interner().get(OWNER),
         rules,
     )
     .into_iter()
@@ -66,16 +67,15 @@ fn stock_passenger_pips_follow_real_boarding_departure_and_selection() {
         //actual native executions, including the Size>1 own/filler ordering.
         let empty = vec![0; rules.object(transport_type).unwrap().pip_max(rules) as usize];
         let mut sim = Simulation::new();
-        let owner = sim.interner.intern(OWNER);
-        sim.houses.insert(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10),
-        );
-        sim.session.house_order.push(owner);
+        let owner = sim.intern(OWNER);
+        sim.houses_mut_for_test()
+            .register(crate::sim::house_state::HouseState::new(
+                owner, 0, None, true, 0, 10,
+            ));
         crate::sim::arena_fixture::flat_arena(&mut sim, rules);
         sim.intern_rule_type_ids(rules);
         sim.resolve_type_handles(rules);
-        sim.fog.reveal_all_for_owner(owner);
+        sim.fog_mut_for_test().reveal_all_for_owner(owner);
         let transport = sim
             .spawn_object(transport_type, OWNER, 16, 16, 64, rules)
             .unwrap();
@@ -93,10 +93,11 @@ fn stock_passenger_pips_follow_real_boarding_departure_and_selection() {
         assert_eq!(frames(&sim, rules, transport, None), empty);
         assert!(sim.apply_command(
             OWNER,
-            &Command::EnterTransport {
-                passenger_id: passenger,
-                transport_id: transport,
-            },
+            &Command::clicked_mission(
+                passenger,
+                crate::sim::mission::MissionType::Enter,
+                crate::sim::combat::TargetKind::Entity(transport)
+            ),
             Some(rules)
         ));
         let grid = sim.path_grid_snapshot().unwrap();
@@ -229,8 +230,10 @@ fn fractional_passenger_pips_match_original_cargo_and_draw_controls() {
             "{}",
             control
         );
-        sim.entities_mut().get_mut(carrier).unwrap().passenger_role =
-            PassengerRole::transport(cargo);
+        sim.entities_mut_for_test()
+            .get_mut(carrier)
+            .unwrap()
+            .passenger_role = PassengerRole::transport(cargo);
         assert!(sim.apply_command(
             OWNER,
             &Command::Select {
@@ -248,6 +251,66 @@ fn fractional_passenger_pips_match_original_cargo_and_draw_controls() {
             .map(|draw| draw["frame"].as_u64().unwrap() as usize)
             .collect();
         assert_eq!(frames(&sim, &rules, carrier, None), expected, "{control}");
+    }
+}
+
+/// A Yuri Slave has no Miner; its Storage is its SlaveLink's hold. The
+/// storage arm (`0x0070A1E9..0x0070A340`) reads it as it reads a War
+/// Miner's: retail SLAV is `PipScale=Tiberium` with `Storage=4`, three pips
+/// for an infantryman (`0x007162BD`). Expected frames come from the shared
+/// rounding kernel the HARV rows above pin, not from a native SLAV run.
+#[test]
+fn a_slave_shows_the_load_it_carries() {
+    use crate::sim::miner::{CargoBale, ResourceType};
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules_for_map("XMP03T4.MAP")
+    else {
+        return;
+    };
+    let rules = &retail.rules;
+    let slave_type = rules.object("SLAV").unwrap();
+    assert_eq!(
+        (slave_type.pip_scale, slave_type.storage),
+        (crate::rules::object_type::PipScale::Tiberium, 4)
+    );
+    let mut sim = Simulation::new();
+    crate::sim::arena_fixture::flat_arena(&mut sim, rules);
+    sim.intern_rule_type_ids(rules);
+    sim.resolve_type_handles(rules);
+    let slave = sim.spawn_object("SLAV", OWNER, 16, 16, 64, rules).unwrap();
+    assert!(sim.entities().get(slave).unwrap().miner.is_none());
+    assert!(sim.apply_command(
+        OWNER,
+        &Command::Select {
+            entity_ids: vec![slave],
+            additive: false,
+        },
+        Some(rules)
+    ));
+    for (ore, gems, expected) in [
+        (0, 0, [0, 0, 0]),
+        (1, 0, [2, 0, 0]),
+        (3, 0, [2, 2, 0]),
+        (4, 0, [2, 2, 2]),
+        (2, 2, [5, 5, 2]),
+    ] {
+        let bale = |resource_type| CargoBale {
+            tiberium_type: crate::rules::tiberium_type::TiberiumTypeId(match resource_type {
+                ResourceType::Ore => 0,
+                ResourceType::Gem => 1,
+            }),
+            resource_type,
+            value: 0,
+        };
+        let cargo = std::iter::repeat_n(bale(ResourceType::Ore), ore)
+            .chain(std::iter::repeat_n(bale(ResourceType::Gem), gems))
+            .collect();
+        sim.entities_mut_for_test().get_mut(slave).unwrap().slave =
+            crate::sim::slave_manager::SlaveLink::for_test(None, cargo);
+        assert_eq!(
+            frames(&sim, rules, slave, None),
+            expected,
+            "{ore} ore, {gems} gems"
+        );
     }
 }
 
@@ -280,7 +343,7 @@ fn shared_harvester_scale_matches_native_independent_ore_and_gem_counts() {
             continue;
         }
         crate::sim::arena_fixture::install_status_miner_cargo(
-            sim.entities_mut().get_mut(miner).unwrap(),
+            sim.entities_mut_for_test().get_mut(miner).unwrap(),
             rules.object("HARV").unwrap(),
             rules,
             actor["ore_bales"].as_u64().unwrap() as usize,
@@ -300,4 +363,57 @@ fn shared_harvester_scale_matches_native_independent_ore_and_gem_counts() {
             row["name"]
         );
     }
+}
+
+/// Ares TechnoClass_DrawPipscale_Passengers (1004A280, hook 0x709D38) and
+/// GetPassengerPips (10044C90): a hold over GetPipMax clips its pips where
+/// the stock arm draws none, a `Gunner=` type leaves one empty step after
+/// its first pip, and `Passengers.BySize=no` gives a passenger one pip.
+#[test]
+fn ares_passenger_pips_clip_an_overfull_hold_and_step_once_after_the_gunner() {
+    use crate::rules::ini_parser::IniFile;
+    use crate::sim::passenger::{PassengerCargo, PassengerRole};
+
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+
+    let draws = |carrier_keys: &str| {
+        let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
+            "[VehicleTypes]\n0=CARRIER\n1=TANK\n\
+             [CARRIER]\nStrength=100\nArmor=heavy\nSpeed=4\nPassengers=3\n\
+             PipScale=Passengers\nSizeLimit=4\n{carrier_keys}\
+             [TANK]\nStrength=100\nArmor=heavy\nSpeed=4\nSize=4\n"
+        )))
+        .expect("carrier and passenger rules");
+        let mut sim = Simulation::new();
+        crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        let carrier = sim
+            .spawn_object("CARRIER", OWNER, 16, 16, 64, &rules)
+            .unwrap();
+        let tank = sim.spawn_object("TANK", OWNER, 16, 15, 64, &rules).unwrap();
+        let mut cargo = PassengerCargo::new(3, 4.0);
+        cargo.board_forced_chain(&[(tank, 4.0)]);
+        sim.entities_mut_for_test()
+            .get_mut(carrier)
+            .unwrap()
+            .passenger_role = PassengerRole::transport(cargo);
+        assert!(sim.apply_command(
+            OWNER,
+            &Command::Select {
+                entity_ids: vec![carrier],
+                additive: false,
+            },
+            Some(&rules)
+        ));
+        let record =
+            crate::app::presentation::frame::ObjectRecord::of_test_sim(&sim, &rules, carrier);
+        super::ui_overlays::scale_pip_draws(&sim, &record, None, sim.interner().get(OWNER), &rules)
+            .into_iter()
+            .map(|pip| (pip.frame, pip.offset_pixels[0]))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(draws(""), [(5, 0), (3, 4), (3, 8)]);
+    assert_eq!(draws("Gunner=yes\n"), [(5, 0), (3, 8), (3, 12)]);
+    assert_eq!(draws("Passengers.BySize=no\n"), [(5, 0), (0, 4), (0, 8)]);
 }

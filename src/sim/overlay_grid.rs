@@ -10,8 +10,6 @@
 use crate::map::authored_overlay::{FinalizedOverlayCell, FinalizedOverlayPayload};
 use crate::map::overlay::{OverlayDataPack, OverlayEntry};
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
-#[cfg(any(test, feature = "test-support"))]
-use crate::rules::overlay_types::is_bridge_overlay_index;
 use crate::rules::overlay_types::{OverlayTypeRegistry, clears_tiberium_on_slope};
 use crate::sim::intern::InternedId;
 use crate::sim::pathfinding::zone_incremental::ZoneRepairKind;
@@ -96,11 +94,12 @@ impl OverlayCell {
 pub struct OverlayGrid {
     width: u16,
     height: u16,
-    cells: Vec<OverlayCell>,
+    /// Synced in chunks into the presentation copy (docs/sim-thread.md).
+    cells: crate::util::synced::ChunkedVec<OverlayCell>,
     /// Retained wall and Foot contribution to CellClass+0x122, one byte per
     /// cell. It is the sole wall authority, even when all zero: final wall
     /// identities are never scanned as a substitute.
-    retained_neighbor_counts: Vec<u8>,
+    retained_neighbor_counts: crate::util::synced::ChunkedVec<u8>,
     #[serde(skip, default)]
     foot_neighbor_changes: crate::sim::cell_neighbors::NeighborCountChanges,
     /// Cells mutated this tick — drained by Simulation's end-of-frame finalizer
@@ -151,8 +150,8 @@ impl OverlayGrid {
         Self {
             width,
             height,
-            cells: vec![OverlayCell::default(); count],
-            retained_neighbor_counts: vec![0u8; count],
+            cells: crate::util::synced::ChunkedVec::filled(OverlayCell::default(), count),
+            retained_neighbor_counts: crate::util::synced::ChunkedVec::filled(0u8, count),
             foot_neighbor_changes: Default::default(),
             dirty_cells: Vec::new(),
             #[cfg(test)]
@@ -188,12 +187,12 @@ impl OverlayGrid {
                 wall_owner: None,
                 rubble_building_type: None,
             })
-            .collect();
+            .collect::<Vec<_>>();
         Self {
             width,
             height,
-            cells,
-            retained_neighbor_counts,
+            cells: cells.into(),
+            retained_neighbor_counts: retained_neighbor_counts.into(),
             foot_neighbor_changes: Default::default(),
             dirty_cells: Vec::new(),
             #[cfg(test)]
@@ -233,18 +232,11 @@ impl OverlayGrid {
         true
     }
 
-    /// Seed from parsed map overlay entries.
-    ///
-    /// Bridge overlays are intentionally excluded: bridge body/bridgehead
-    /// overlay bytes are owned by CellClass (`ResolvedTerrainGrid`), while this
-    /// grid owns mutable non-bridge overlay bytes such as ore and walls.
+    /// Seed from parsed map overlay entries, bridges included.
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_overlay_entries(entries: &[OverlayEntry], width: u16, height: u16) -> Self {
         let mut grid = Self::new(width, height);
         for entry in entries {
-            if is_bridge_overlay_index(entry.overlay_id) {
-                continue;
-            }
             if let Some(idx) = index_of(width, height, entry.rx, entry.ry) {
                 grid.cells[idx] = OverlayCell {
                     overlay_id: Some(entry.overlay_id),
@@ -328,7 +320,7 @@ impl OverlayGrid {
 
     /// Read cell at (rx, ry). Returns default (no overlay) for out-of-bounds.
     /// Every cell in row-major order (`ry * width + rx`).
-    pub(crate) fn cells(&self) -> &[OverlayCell] {
+    pub(crate) fn cells(&self) -> &crate::util::synced::ChunkedVec<OverlayCell> {
         &self.cells
     }
 
@@ -355,11 +347,23 @@ impl OverlayGrid {
     }
 
     /// Mutable access to cell. Panics if out-of-bounds.
-    pub fn cell_mut(&mut self, rx: u16, ry: u16) -> &mut OverlayCell {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cell_mut_for_test(&mut self, rx: u16, ry: u16) -> &mut OverlayCell {
         self.bump_mutation_epoch();
         let idx =
             index_of(self.width, self.height, rx, ry).expect("OverlayGrid::cell_mut out of bounds");
         &mut self.cells[idx]
+    }
+
+    /// Empty the whole cell without dirty-cell or neighbor bookkeeping: a
+    /// resource that cannot lie on its slope ([`recalc_overlay_passability`])
+    /// and the resource under an authored terrain object at map load.
+    /// Panics if out-of-bounds.
+    pub(crate) fn clear_cell_silently(&mut self, rx: u16, ry: u16) {
+        self.bump_mutation_epoch();
+        let idx = index_of(self.width, self.height, rx, ry)
+            .expect("OverlayGrid::clear_cell_silently out of bounds");
+        self.cells[idx] = OverlayCell::default();
     }
 
     /// Update only CellClass's bridge-overlay identity.
@@ -388,7 +392,7 @@ impl OverlayGrid {
 
     /// Read the retained wall and Foot contribution plane. All-zero is
     /// authoritative and must not fall back to a final-identity scan.
-    pub(crate) fn retained_neighbor_counts(&self) -> &[u8] {
+    pub(crate) fn retained_neighbor_counts(&self) -> &crate::util::synced::ChunkedVec<u8> {
         &self.retained_neighbor_counts
     }
 
@@ -585,9 +589,9 @@ impl OverlayGrid {
 
     /// `OverlayClass::Mark @ 0x005FC570`'s literal `CellClass+0x44` store,
     /// without the `RecalcAttributes` tail. Mark interleaves its data stores,
-    /// wall cleanup, germination and CellAnim before its own Recalc. The
-    /// terrain bridge cache follows when the caller holds the terrain mutably;
-    /// the batched ore placement holds it shared and leaves the cache (#722).
+    /// wall cleanup, germination and CellAnim before its own Recalc. A bridge
+    /// identity also projects the terrain's bridge layer and deck, so a caller
+    /// that can place one passes the terrain; ore placement passes none.
     /// False outside the grid or for an unregistered type.
     pub(crate) fn write_mark_identity(
         &mut self,
@@ -610,23 +614,14 @@ impl OverlayGrid {
     /// without a dirty entry or Recalc: `OverlayClass::Mark`'s data stores and
     /// the stores that follow an Overlay constructor
     /// (`CellClass::PlaceTiberium @ 0x004872A0`, `AnimClass::AI @
-    /// 0x00424155`). The terrain bridge cache follows as for
-    /// [`Self::write_mark_identity`]. False outside the grid.
-    pub(crate) fn write_cell_data(
-        &mut self,
-        resolved_terrain: Option<&mut ResolvedTerrainGrid>,
-        rx: u16,
-        ry: u16,
-        overlay_data: u8,
-    ) -> bool {
+    /// 0x00424155`), and map-load germination's densities. False outside the
+    /// grid.
+    pub(crate) fn write_cell_data(&mut self, rx: u16, ry: u16, overlay_data: u8) -> bool {
         let Some(idx) = index_of(self.width, self.height, rx, ry) else {
             return false;
         };
         self.bump_mutation_epoch();
         self.cells[idx].overlay_data = overlay_data;
-        if let Some(terrain) = resolved_terrain {
-            terrain.set_runtime_overlay_bridge_state_byte(rx, ry, overlay_data);
-        }
         true
     }
 
@@ -657,8 +652,8 @@ impl OverlayGrid {
     }
 
     /// The literal `CellClass+0x44` store, with `+0x11E` when `overlay_data`
-    /// is given, projected into the bridge cache when the terrain is given.
-    /// No Recalc tail. Returns the cell index, or `None` outside the grid or
+    /// is given; a bridge identity projects the terrain's bridge layer when
+    /// the terrain is given. No Recalc tail. Returns the cell index, or `None` outside the grid or
     /// for an unregistered type.
     fn write_identity_fields(
         &mut self,
@@ -670,16 +665,14 @@ impl OverlayGrid {
     ) -> Option<usize> {
         let idx = index_of(self.width, self.height, rx, ry)?;
         registry.flags(overlay_id)?;
-        let name = registry.name(overlay_id)?;
         let cell = &mut self.cells[idx];
         cell.overlay_id = Some(overlay_id);
         if let Some(overlay_data) = overlay_data {
             cell.overlay_data = overlay_data;
         }
-        let overlay_data = cell.overlay_data;
         self.dirty_cells.push((rx, ry));
         if let Some(terrain) = resolved_terrain {
-            terrain.set_runtime_overlay_bridge_identity(rx, ry, overlay_id, overlay_data, name);
+            terrain.set_runtime_overlay_bridge_identity(rx, ry, overlay_id);
         }
         Some(idx)
     }
@@ -703,24 +696,39 @@ impl OverlayGrid {
     /// Erase the two literal CellClass overlay fields a crate removal clears.
     ///
     /// `CrateSlot__RemoveCrateOverlayFromCell @ 0x004A1AA0` writes
-    /// `CellClass+0x44 = -1` and `CellClass+0x11E = 0` after its screen-dirty
-    /// request and changes no other field, so this deliberately keeps
-    /// `wall_owner` and runs no passability recalc of its own — unlike
-    /// [`OverlayGrid::clear_overlay`], which resets the whole cell.
-    pub(crate) fn clear_crate_mark_fields(
-        &mut self,
-        resolved_terrain: &mut ResolvedTerrainGrid,
-        rx: u16,
-        ry: u16,
-    ) -> bool {
+    /// `CellClass+0x44 = -1` (`0x004A1BE1`) and `CellClass+0x11E = 0`
+    /// (`0x004A1BE8`) after its screen-dirty request and changes no other
+    /// field, so this deliberately keeps `wall_owner`, the terrain's bridge
+    /// layer and every Recalc-derived attribute — unlike
+    /// [`OverlayGrid::clear_overlay`], which resets the whole cell. The random
+    /// placer admits only cells without an overlay, so in stock rules a
+    /// removal never undoes a bridge identity.
+    pub(crate) fn clear_crate_mark_fields(&mut self, rx: u16, ry: u16) -> bool {
         let Some(idx) = index_of(self.width, self.height, rx, ry) else {
             return false;
         };
         self.cells[idx].overlay_id = None;
         self.cells[idx].overlay_data = 0;
         self.removed_render_cells.push((rx, ry));
-        resolved_terrain.clear_runtime_overlay_identity(rx, ry);
         true
+    }
+
+    /// CellLoad483BE0 clears literal179/242, independently of Rules crate-image
+    /// pointers or lobby options. Loading emits no runtime dirty/recalc receipt.
+    pub(crate) fn reset_crate_fields_after_user_load(
+        &mut self,
+        cells: impl Iterator<Item = (u16, u16)>,
+    ) {
+        for (rx, ry) in cells {
+            let Some(index) = index_of(self.width, self.height, rx, ry) else {
+                continue;
+            };
+            let cell = &mut self.cells[index];
+            if matches!(cell.overlay_id, Some(179 | 242)) {
+                cell.overlay_id = None;
+                cell.overlay_data = 0;
+            }
+        }
     }
 
     /// Drain the coordinates whose overlay identity was erased without a
@@ -735,12 +743,11 @@ impl OverlayGrid {
     /// target cell has no overlay identity yet.
     pub(crate) fn write_crate_mark_data_field(
         &mut self,
-        resolved_terrain: &mut ResolvedTerrainGrid,
         rx: u16,
         ry: u16,
         overlay_data: u8,
     ) -> bool {
-        if !self.write_literal_bridge_state(resolved_terrain, rx, ry, overlay_data) {
+        if !self.write_literal_bridge_state(rx, ry, overlay_data) {
             return false;
         }
         self.dirty_cells.push((rx, ry));
@@ -751,7 +758,6 @@ impl OverlayGrid {
     /// caller owns the later fallout/radar sequence; no Recalc receipt here.
     pub(crate) fn write_literal_bridge_state(
         &mut self,
-        resolved_terrain: &mut ResolvedTerrainGrid,
         rx: u16,
         ry: u16,
         overlay_data: u8,
@@ -759,17 +765,14 @@ impl OverlayGrid {
         let Some(idx) = index_of(self.width, self.height, rx, ry) else {
             return false;
         };
-        if !resolved_terrain.set_runtime_overlay_bridge_state_byte(rx, ry, overlay_data) {
-            return false;
-        }
         self.cells[idx].overlay_data = overlay_data;
         true
     }
 
-    /// Literal576BA0 +44=-1 after the separately published +11E store. Keep
+    /// Literal576BA0 / AreaDamage48A2F0 +44=-1. Keep
     /// the state, wall owner and retained attributes; only presentation drops
     /// the removed identity. This must not enqueue a frame-tail Recalc.
-    pub(crate) fn clear_literal_bridge_identity(&mut self, rx: u16, ry: u16) -> bool {
+    pub(crate) fn clear_literal_overlay_identity(&mut self, rx: u16, ry: u16) -> bool {
         self.bump_mutation_epoch();
         let Some(idx) = index_of(self.width, self.height, rx, ry) else {
             return false;
@@ -785,7 +788,7 @@ impl OverlayGrid {
     /// callback here; subsequent Limbo/Unlimbo supplies its own cell callbacks.
     pub(crate) fn clear_building_placement_fields(
         &mut self,
-        terrain: &mut ResolvedTerrainGrid,
+        terrain: &ResolvedTerrainGrid,
         rx: u16,
         ry: u16,
     ) -> bool {
@@ -800,9 +803,12 @@ impl OverlayGrid {
         self.cells[idx].overlay_data = 0;
         self.cells[idx].rubble_building_type = None;
         self.removed_render_cells.push((rx, ry));
+        // A coordinate outside the native allocation resolves to the shared
+        // dummy, which clears its own identity and state.
         let cell = terrain.native_cell_identity((rx as i16, ry as i16));
-        terrain.clear_native_cell_overlay(cell);
-        terrain.write_native_cell_state(cell, 0);
+        if cell == crate::map::cell_index::NativeCellIdentity::Dummy {
+            terrain.shared_cell_dummy().set_overlay_fields(None, 0);
+        }
         true
     }
 
@@ -945,6 +951,22 @@ impl OverlayGrid {
             })
     }
 
+    /// Occupied cells as presentation entries carrying the full Cell+0x11E
+    /// byte (wall connectivity plus damage nibble). Fresh map loads and saved
+    /// worlds seed their overlay presentation from this one projection.
+    pub fn occupied_entries(&self) -> Vec<OverlayEntry> {
+        self.iter_occupied()
+            .filter_map(|(rx, ry, cell)| {
+                cell.overlay_id.map(|overlay_id| OverlayEntry {
+                    rx,
+                    ry,
+                    overlay_id,
+                    frame: cell.overlay_data,
+                })
+            })
+            .collect()
+    }
+
     pub fn width(&self) -> u16 {
         self.width
     }
@@ -968,7 +990,24 @@ impl OverlayGrid {
     /// @ 0x00480630 runs Recalc @ 0x00480969, compares old/new zone at
     /// 0x0048096E..0x00480977, then repairs the graph before its neighbor-count
     /// tail. The caller still owns those callbacks in their native slots.
+    ///
+    /// This is gamemd's own `CellClass::RecalcAttributes` call, so it makes
+    /// the call's CliffBack neighbour reads before projecting the cell.
     pub fn recalculate_runtime_cell(
+        &mut self,
+        terrain: &mut ResolvedTerrainGrid,
+        registry: &OverlayTypeRegistry,
+        cell: (u16, u16),
+    ) -> OverlayRecalcOutcome {
+        terrain.read_cliff_back_neighbours(cell, registry.cliff_back_impassability());
+        self.recalculate_deferred_cell(terrain, registry, cell)
+    }
+
+    /// [`Self::recalculate_runtime_cell`] for a Recalc whose neighbour reads
+    /// its owner already made in their gamemd place: an ordinary Overlay's
+    /// Mark that leaves the projection to its batch
+    /// (`OverlayRecalc::DeferOrdinary`).
+    pub(crate) fn recalculate_deferred_cell(
         &mut self,
         terrain: &mut ResolvedTerrainGrid,
         registry: &OverlayTypeRegistry,
@@ -988,6 +1027,11 @@ impl OverlayGrid {
             navigation_changed,
             zone_changed,
         }
+    }
+
+    /// Whether [`Self::take_synchronous_navigation_cells`] would return any cell.
+    pub(crate) fn has_synchronous_navigation_cells(&self) -> bool {
+        !self.synchronous_navigation_cells.is_empty()
     }
 
     /// Drain movement-authority changes after all inline overlay callbacks that
@@ -1021,6 +1065,14 @@ impl OverlayGrid {
 /// finalizer replay and bridge-owned immediate publication. Ordinary runtime
 /// overlay mutations use `OverlayGrid::recalculate_runtime_cell` to keep projection
 /// and downstream notification together.
+///
+/// None of those uses is a gamemd Recalc call. The frame-end pass replays
+/// cells whose Recalc ran inside the mutation. No load function calls
+/// `CellClass::RecalcAttributes`, and MapClass::Resize's whole-map pass
+/// (`0x00567110`, through `0x00568BB0`) comes before it reconstructs the
+/// Dummy (`0x005670E7..0x005670F2`). The generator's own passes
+/// (`0x0059937D`) cover the whole map, not its overlays. So this reads no
+/// cell through the Map lookup and leaves the shared Dummy where it was.
 pub fn recalc_overlay_passability(
     overlay_grid: &mut OverlayGrid,
     resolved_terrain: &mut ResolvedTerrainGrid,
@@ -1035,7 +1087,7 @@ pub fn recalc_overlay_passability(
     let source_flags = overlay_id.and_then(|id| registry.flags(id));
     let mut cleared_resource_for_slope = false;
     if source_flags.is_some_and(|flags| clears_tiberium_on_slope(flags, slope_type)) {
-        *overlay_grid.cell_mut(rx, ry) = OverlayCell::default();
+        overlay_grid.clear_cell_silently(rx, ry);
         overlay_id = None;
         cleared_resource_for_slope = true;
     }
@@ -1046,7 +1098,13 @@ pub fn recalc_overlay_passability(
         flags
     };
     // Do not short circuit the projection when literal storage was cleared.
-    let projection_changed = resolved_terrain.apply_overlay_attributes(rx, ry, flags, land_flags);
+    let projection_changed = resolved_terrain.apply_overlay_attributes(
+        rx,
+        ry,
+        flags,
+        land_flags,
+        registry.cliff_back_rock(),
+    );
     cleared_resource_for_slope || projection_changed
 }
 
@@ -1092,6 +1150,7 @@ pub(crate) trait WallDamageTransactionHost {
     fn navigation_step(
         &mut self,
         terrain: &ResolvedTerrainGrid,
+        overlays: &OverlayGrid,
         cell: (u16, u16),
         navigation_changed: bool,
         repair: ZoneRepairKind,
@@ -1363,8 +1422,10 @@ fn damage_wall_recursive(
     // — and apply damage only when roll < damage; otherwise no effect. The
     // engine uses `< damage` (so roll == damage is a no-op) and the inclusive
     // top, both of which differ from an exclusive `[0, Strength-1]` / `>` test.
-    if damage != -1 && damage < i32::from(flags.strength) {
-        let roll = rng.next_range_u32_inclusive(0, u32::from(flags.strength)) as i32;
+    // CellClass::DestroyOverlay480CE9..480D18 compares signed dwords and
+    // forwards the full bound to RandomRanged65C7E0, including negative ones.
+    if damage != -1 && damage < flags.strength {
+        let roll = rng.next_range_i32_inclusive(0, flags.strength);
         if roll >= damage {
             return;
         }
@@ -1394,7 +1455,7 @@ fn damage_wall_recursive(
     let damage_level = new_data >> 4;
 
     // At penultimate damage level: chain-damage cardinal neighbors.
-    if flags.damage_levels > 2 && u16::from(damage_level) == flags.damage_levels.saturating_sub(1) {
+    if flags.damage_levels > 2 && i32::from(damage_level) == flags.damage_levels.wrapping_sub(1) {
         const CARDINAL: [(i32, i32); 4] = [(0, -1), (1, 0), (0, 1), (-1, 0)];
         for (dx, dy) in CARDINAL {
             let Some((base_x, base_y)) =
@@ -1435,10 +1496,13 @@ fn damage_wall_recursive(
     let post_chain_data =
         native_runtime_overlay_target_state(grid, resolved_terrain.as_deref(), target).1;
     let post_chain_level = post_chain_data >> 4;
-    let penultimate = flags.damage_levels.saturating_sub(1);
     let connected = post_chain_data & 0x0F != 0;
-    let retain = u16::from(post_chain_level) < penultimate
-        || (u16::from(post_chain_level) == penultimate && connected);
+    // DestroyOverlay480EDD..480EEA tests signed stage<levels BEFORE DEC.
+    // In particular i32::MIN removes, rather than wrapping its penultimate
+    // into a positive value and retaining the wall.
+    let stage = i32::from(post_chain_level);
+    let retain =
+        stage < flags.damage_levels && (stage != flags.damage_levels.wrapping_sub(1) || connected);
     if damage != -1 && retain {
         // The native state write preceded the chain. Export a real-cell render
         // mutation only; the shared dummy's pair stays live through its handle.
@@ -1477,6 +1541,7 @@ fn damage_wall_recursive(
         if let Some(host) = host.as_deref_mut() {
             host.navigation_step(
                 terrain,
+                grid,
                 (rx, ry),
                 recalc.navigation_changed,
                 ZoneRepairKind::AssignOrphaned,
@@ -1677,8 +1742,7 @@ fn recompute_wall_connectivity_target(
         return RecomputeResult::NoChange;
     }
 
-    // Cardinal neighbor connectivity scan. Bit assignment matches existing
-    // compute_wall_connectivity: N=0, E=1, S=2, W=3.
+    // Cardinal neighbor connectivity scan, bits N=0, E=1, S=2, W=3.
     const CARDINAL: [(i32, i32); 4] = [(0, -1), (1, 0), (0, 1), (-1, 0)];
     let mut connectivity: u8 = 0;
     for (bit, (dx, dy)) in CARDINAL.iter().enumerate() {
@@ -1702,6 +1766,10 @@ fn recompute_wall_connectivity_target(
         let connects = match crate::sim::cell_kernel::wall_connection_step(
             neighbor_id.map_or(-1, i32::from),
             i32::from(overlay_id),
+            Some(registry),
+            // Never read here: the Ares answer decides only the
+            // `requested == -1` query, and this one names its own overlay.
+            false,
         ) {
             crate::sim::cell_kernel::WallConnectionStep::Return(connected) => connected,
             // Existing residual: this cleanup view does not implement native
@@ -1836,6 +1904,7 @@ pub(crate) fn refresh_wall_connectivity_after_placement_with_host(
             {
                 host.navigation_step(
                     terrain,
+                    grid,
                     (nx, ny),
                     recalc.navigation_changed,
                     if result == RecomputeResult::Destroyed {
@@ -1988,6 +2057,7 @@ fn cleanup_wall_neighbors_into(
                 {
                     host.navigation_step(
                         terrain,
+                        grid,
                         (nx, ny),
                         recalc.navigation_changed,
                         if recomputed == RecomputeResult::Destroyed {
@@ -2062,7 +2132,45 @@ pub(crate) fn test_wall_overlays(
     overlays
 }
 
-#[cfg(test)]
+impl OverlayGrid {
+    /// Bring `mirror`, the presentation copy of the world's grid, up to
+    /// this one (docs/sim-thread.md): the chunks written since the last
+    /// sync, and the small fields whole.
+    pub(crate) fn sync_into(&mut self, mirror: &mut Self) {
+        let Self {
+            width,
+            height,
+            cells,
+            retained_neighbor_counts,
+            foot_neighbor_changes,
+            dirty_cells,
+            #[cfg(test)]
+            mutation_epoch,
+            wall_plane_epoch,
+            removed_render_cells,
+            synchronous_navigation_cells,
+        } = self;
+        mirror.width = *width;
+        mirror.height = *height;
+        cells.sync_into(&mut mirror.cells);
+        retained_neighbor_counts.sync_into(&mut mirror.retained_neighbor_counts);
+        mirror
+            .foot_neighbor_changes
+            .clone_from(foot_neighbor_changes);
+        mirror.dirty_cells.clone_from(dirty_cells);
+        #[cfg(test)]
+        {
+            mirror.mutation_epoch = *mutation_epoch;
+        }
+        mirror.wall_plane_epoch = *wall_plane_epoch;
+        mirror.removed_render_cells.clone_from(removed_render_cells);
+        mirror
+            .synchronous_navigation_cells
+            .clone_from(synchronous_navigation_cells);
+    }
+}
+
+#[cfg(test)] // shared by test groups
 mod tests {
     use super::*;
 
@@ -2070,7 +2178,7 @@ mod tests {
         terrain: &ResolvedTerrainGrid,
         sources: &[(u16, u16)],
     ) -> Vec<u8> {
-        let mut counts = vec![0u8; terrain.cells.len()];
+        let mut counts = vec![0u8; terrain.cells().len()];
         for &(rx, ry) in sources {
             let anchor = (rx as i16, ry as i16);
             for (dx, dy) in ADJACENT_8 {
@@ -2105,31 +2213,7 @@ mod tests {
             (Some(0x18), 9)
         );
         assert!(grid.dirty_cells.is_empty());
-        assert_eq!(grid.retained_neighbor_counts(), &[5, 8][..]);
-    }
-
-    #[test]
-    fn retained_wall_neighbor_plane_roundtrips_with_overlay_authority() {
-        let grid =
-            OverlayGrid::from_finalized_map_payload(FinalizedOverlayPayload::from_cells_for_test(
-                2,
-                2,
-                vec![(-1, 0), (1, 2), (-1, 0), (-1, 0)],
-                vec![0, 7, 255, 3],
-            ));
-        let bytes = crate::util::save_codec::serialize(&grid).expect("serialize overlay authority");
-        let restored: OverlayGrid =
-            crate::util::save_codec::deserialize(&bytes).expect("deserialize overlay authority");
-
-        assert_eq!(restored.retained_neighbor_counts(), &[0, 7, 255, 3][..]);
-        assert_eq!(restored.cell(1, 0), grid.cell(1, 0));
-    }
-
-    #[test]
-    fn new_grid_is_empty() {
-        let grid = OverlayGrid::new(4, 4);
-        assert_eq!(grid.cell(0, 0).overlay_id, None);
-        assert_eq!(grid.cell(3, 3).overlay_id, None);
+        assert_eq!(grid.retained_neighbor_counts(), &[5u8, 8][..]);
     }
 
     #[test]
@@ -2148,56 +2232,6 @@ mod tests {
         assert_eq!(cell.overlay_id, Some(2));
         assert_eq!(cell.overlay_data, 0x18);
         assert_eq!(cell.wall_owner, None);
-    }
-
-    #[test]
-    fn from_overlay_entries_seeds_cells() {
-        let entries = vec![
-            OverlayEntry {
-                rx: 1,
-                ry: 2,
-                overlay_id: 5,
-                frame: 7,
-            },
-            OverlayEntry {
-                rx: 3,
-                ry: 0,
-                overlay_id: 10,
-                frame: 0,
-            },
-        ];
-        let grid = OverlayGrid::from_overlay_entries(&entries, 4, 4);
-        assert_eq!(grid.cell(1, 2).overlay_id, Some(5));
-        assert_eq!(grid.cell(1, 2).overlay_data, 7);
-        assert_eq!(grid.cell(3, 0).overlay_id, Some(10));
-        assert_eq!(grid.cell(0, 0).overlay_id, None);
-    }
-
-    #[test]
-    fn from_overlay_entries_skips_bridge_overlay_bytes() {
-        let entries = vec![
-            OverlayEntry {
-                rx: 1,
-                ry: 1,
-                overlay_id: 24,
-                frame: 3,
-            },
-            OverlayEntry {
-                rx: 2,
-                ry: 1,
-                overlay_id: 5,
-                frame: 7,
-            },
-        ];
-
-        let grid = OverlayGrid::from_overlay_entries(&entries, 4, 4);
-
-        assert_eq!(
-            grid.cell(1, 1).overlay_id,
-            None,
-            "bridge overlay byte is owned by CellClass"
-        );
-        assert_eq!(grid.cell(2, 1).overlay_id, Some(5));
     }
 
     #[test]
@@ -2231,47 +2265,16 @@ mod tests {
     }
 
     #[test]
-    fn place_and_clear_overlay() {
-        let mut grid = OverlayGrid::new(4, 4);
-        grid.place_overlay(2, 2, 42, 11);
-        assert_eq!(grid.cell(2, 2).overlay_id, Some(42));
-        assert_eq!(grid.cell(2, 2).overlay_data, 11);
-
-        let prev = grid.clear_overlay(2, 2);
-        assert_eq!(prev, Some(42));
-        assert_eq!(grid.cell(2, 2).overlay_id, None);
-    }
-
-    #[test]
-    fn set_overlay_data_updates_existing() {
-        let mut grid = OverlayGrid::new(4, 4);
-        grid.place_overlay(1, 1, 5, 3);
-        grid.set_overlay_data(1, 1, 9);
-        assert_eq!(grid.cell(1, 1).overlay_data, 9);
-        assert_eq!(grid.cell(1, 1).overlay_id, Some(5));
-    }
-
-    #[test]
-    fn set_overlay_data_noop_on_empty_cell() {
-        let mut grid = OverlayGrid::new(4, 4);
-        grid.set_overlay_data(1, 1, 9);
-        assert_eq!(grid.cell(1, 1).overlay_id, None);
-        assert_eq!(grid.cell(1, 1).overlay_data, 0);
-    }
-
-    #[test]
     fn bridge_publication_literal_fields_do_not_schedule_attribute_recalc() {
-        let mut terrain = single_cell_terrain(0, Default::default(), false);
         let mut grid = OverlayGrid::new(1, 1);
-        assert!(grid.write_literal_bridge_state(&mut terrain, 0, 0, 15));
+        assert!(grid.write_literal_bridge_state(0, 0, 15));
         assert_eq!(grid.cell(0, 0).overlay_id, None);
         assert_eq!(grid.cell(0, 0).overlay_data, 15);
-        assert_eq!(terrain.cell(0, 0).unwrap().bridge_facts.state_byte, 15);
         assert!(grid.pending_dirty_cells().is_empty());
         grid.cells[0].overlay_id = Some(24);
         grid.cells[0].wall_owner = Some(crate::sim::intern::test_intern("RetainedOwner"));
         let owner = grid.cells[0].wall_owner;
-        assert!(grid.clear_literal_bridge_identity(0, 0));
+        assert!(grid.clear_literal_overlay_identity(0, 0));
         assert_eq!(grid.cell(0, 0).overlay_id, None);
         assert_eq!(
             grid.cell(0, 0).overlay_data,
@@ -2281,33 +2284,6 @@ mod tests {
         assert_eq!(grid.cell(0, 0).wall_owner, owner);
         assert!(grid.pending_dirty_cells().is_empty());
         assert_eq!(grid.take_removed_render_cells(), vec![(0, 0)]);
-    }
-
-    #[test]
-    fn out_of_bounds_returns_default() {
-        let grid = OverlayGrid::new(2, 2);
-        assert_eq!(grid.cell(5, 5).overlay_id, None);
-    }
-
-    #[test]
-    fn iter_occupied_skips_empty() {
-        let mut grid = OverlayGrid::new(3, 3);
-        grid.place_overlay(0, 0, 1, 0);
-        grid.place_overlay(2, 2, 2, 5);
-        let occupied: Vec<_> = grid.iter_occupied().collect();
-        assert_eq!(occupied.len(), 2);
-        assert_eq!(occupied[0].0, 0); // rx
-        assert_eq!(occupied[0].1, 0); // ry
-        assert_eq!(occupied[1].0, 2);
-        assert_eq!(occupied[1].1, 2);
-    }
-
-    #[test]
-    fn place_overlay_pushes_dirty() {
-        let mut grid = OverlayGrid::new(10, 10);
-        assert!(grid.dirty_cells.is_empty());
-        grid.place_overlay(3, 4, 7, 0);
-        assert_eq!(grid.dirty_cells, vec![(3, 4)]);
     }
 
     #[test]
@@ -2321,14 +2297,6 @@ mod tests {
     }
 
     #[test]
-    fn clear_overlay_no_push_when_out_of_bounds() {
-        let mut grid = OverlayGrid::new(10, 10);
-        let prev = grid.clear_overlay(100, 100);
-        assert_eq!(prev, None);
-        assert!(grid.dirty_cells.is_empty());
-    }
-
-    #[test]
     fn set_overlay_data_pushes_only_when_cell_has_overlay() {
         let mut grid = OverlayGrid::new(10, 10);
         // No overlay → no push.
@@ -2339,18 +2307,6 @@ mod tests {
         grid.dirty_cells.clear();
         grid.set_overlay_data(1, 1, 42);
         assert_eq!(grid.dirty_cells, vec![(1, 1)]);
-    }
-
-    #[test]
-    fn take_dirty_cells_returns_and_clears() {
-        let mut grid = OverlayGrid::new(10, 10);
-        grid.place_overlay(0, 0, 1, 0);
-        grid.place_overlay(1, 1, 2, 0);
-        let drained = grid.take_dirty_cells();
-        assert_eq!(drained, vec![(0, 0), (1, 1)]);
-        assert!(grid.dirty_cells.is_empty());
-        // Second take returns empty.
-        assert!(grid.take_dirty_cells().is_empty());
     }
 
     #[test]
@@ -2441,8 +2397,14 @@ mod tests {
                 .flat_map(|y| (0..6).map(move |x| (x, y)))
                 .collect::<Vec<_>>(),
         );
-        terrain.cell_mut(0, 0).expect("rock cell").slope_type = 5;
-        terrain.cell_mut(3, 0).expect("sloped ore cell").slope_type = 1;
+        terrain
+            .cell_mut_for_test(0, 0)
+            .expect("rock cell")
+            .slope_type = 5;
+        terrain
+            .cell_mut_for_test(3, 0)
+            .expect("sloped ore cell")
+            .slope_type = 1;
         let placed = [
             ((0, 0), rock, 3),
             ((1, 0), crate_overlay, 41),
@@ -2527,7 +2489,9 @@ mod tests {
         );
 
         let mut unchanged_zone_terrain = clear_terrain_grid(5, 5);
-        let cleanup_cell = unchanged_zone_terrain.cell_mut(2, 1).expect("cleanup cell");
+        let cleanup_cell = unchanged_zone_terrain
+            .cell_mut_for_test(2, 1)
+            .expect("cleanup cell");
         cleanup_cell.outside_playfield = true;
         cleanup_cell.zone_type = crate::map::resolved_terrain::zone_class::OUTSIDE;
         let full_plane =
@@ -2866,6 +2830,118 @@ IsRubble=yes
         }
     }
 
+    /// RecalcAttributes' early overlay branch (`0x0047D31E..0x0047D53E`):
+    /// under `CliffBackImpassability=2`, rubble on a cell with a neighbour four
+    /// levels up is Rock, as at load. Rules without the key hold the
+    /// constructor's 0, which skips the test (`0x0047D386..0x0047D393`).
+    #[test]
+    fn rubble_behind_a_cliff_takes_rock_land_at_runtime() {
+        use crate::map::resolved_terrain::{ResolvedTerrainGrid, test_flat_cell};
+        use crate::rules::ini_parser::IniFile;
+        use crate::rules::terrain_rules::LandType;
+
+        let registry_with = |general: &str| {
+            let ini = IniFile::from_str(&format!(
+                "{general}[OverlayTypes]\n0=RUBBLE\n[Clear]\nTrack=100%\n[Rock]\nTrack=0%\n\
+                 [RUBBLE]\nIsRubble=yes\n",
+            ));
+            OverlayTypeRegistry::from_ini(&ini, None)
+        };
+        let mode_two = registry_with("[General]\nCliffBackImpassability=2\n");
+        let no_key = registry_with("");
+        let land_beside_level = |registry: &OverlayTypeRegistry, level: u8| {
+            let cells = (0..3)
+                .flat_map(|y| (0..3).map(move |x| (x, y)))
+                .map(|(x, y)| {
+                    let mut cell = test_flat_cell(x, y);
+                    if (x, y) == (1, 0) {
+                        cell.level = level;
+                    }
+                    cell
+                })
+                .collect();
+            let mut terrain = ResolvedTerrainGrid::from_cells(3, 3, cells);
+            let mut overlay_grid = OverlayGrid::new(3, 3);
+            overlay_grid.place_overlay(1, 1, 0, 0);
+            recalc_overlay_passability(&mut overlay_grid, &mut terrain, registry, 1, 1);
+            terrain.cell(1, 1).expect("cell").land_type
+        };
+        assert_eq!(land_beside_level(&mode_two, 3), LandType::Clear.as_index());
+        assert_eq!(land_beside_level(&mode_two, 4), LandType::Rock.as_index());
+        assert_eq!(land_beside_level(&no_key, 4), LandType::Clear.as_index());
+    }
+
+    /// A 3x3 array with RUBBLE as overlay 0 under `cliff_back`, the Dummy cell
+    /// left at (7, 7). Cell (0, 1) lacks three of its six CliffBack
+    /// neighbours: (-1, 1), (2, 3) and (-1, 2), read in that order.
+    fn cliff_back_edge_scene(
+        cliff_back: u8,
+    ) -> (
+        crate::map::resolved_terrain::ResolvedTerrainGrid,
+        OverlayTypeRegistry,
+    ) {
+        use crate::map::resolved_terrain::{ResolvedTerrainGrid, test_flat_cell};
+        let registry = OverlayTypeRegistry::from_ini(
+            &crate::rules::ini_parser::IniFile::from_str(&format!(
+                "[General]\nCliffBackImpassability={cliff_back}\n[OverlayTypes]\n0=RUBBLE\n\
+                 [Clear]\nTrack=100%\n[Rock]\nTrack=0%\n[RUBBLE]\nIsRubble=yes\n",
+            )),
+            None,
+        );
+        let cells = (0..3)
+            .flat_map(|y| (0..3).map(move |x| test_flat_cell(x, y)))
+            .collect();
+        let terrain = ResolvedTerrainGrid::from_cells(3, 3, cells);
+        terrain.shared_cell_dummy().stamp_coord(7, 7);
+        (terrain, registry)
+    }
+
+    /// `CellClass::RecalcAttributes` (`0x0047D2B0`) reads the six CliffBack
+    /// neighbours through the Map lookup on every Recalc of a real cell
+    /// unless the rules byte is 0: the early overlay branch at
+    /// `0x0047D386..0x0047D393`, a tile without a body at
+    /// `0x0047D5FF..0x0047D60D`, every other cell at `0x0047DB59..0x0047DB66`.
+    /// A missing neighbour answers with the shared Dummy, stamped with its
+    /// coordinate.
+    #[test]
+    fn a_runtime_recalc_reads_the_cliff_back_neighbours_unless_the_byte_is_zero() {
+        let dummy_after = |cliff_back: u8, overlay: bool| {
+            let (mut terrain, registry) = cliff_back_edge_scene(cliff_back);
+            let mut overlay_grid = OverlayGrid::new(3, 3);
+            if overlay {
+                overlay_grid.place_overlay(0, 1, 0, 0);
+            }
+            overlay_grid.recalculate_runtime_cell(&mut terrain, &registry, (0, 1));
+            terrain.shared_cell_dummy().snapshot().coord
+        };
+        for overlay in [true, false] {
+            assert_eq!(dummy_after(0, overlay), (7, 7));
+            assert_eq!(dummy_after(1, overlay), (-1, 2));
+            assert_eq!(dummy_after(2, overlay), (-1, 2));
+        }
+    }
+
+    /// A replay of an overlay cell's attributes (the frame-end pass, a
+    /// snapshot rebuild, generated-map admission) stands for no gamemd
+    /// Recalc. It gives the land the cell's Recalc gave, Rock here because
+    /// the sixth neighbour stands four levels up, and reads no cell through
+    /// the Map lookup.
+    #[test]
+    fn replaying_an_overlay_recalc_leaves_the_dummy_cell_alone() {
+        use crate::rules::terrain_rules::LandType;
+
+        let (mut terrain, registry) = cliff_back_edge_scene(2);
+        terrain.cell_mut_for_test(1, 0).expect("cell").level = 4;
+        let mut overlay_grid = OverlayGrid::new(3, 3);
+        overlay_grid.place_overlay(0, 1, 0, 0);
+        recalc_overlay_passability(&mut overlay_grid, &mut terrain, &registry, 0, 1);
+        assert_eq!(
+            terrain.cell(0, 1).expect("cell").land_type,
+            LandType::Rock.as_index()
+        );
+        assert_eq!(terrain.shared_cell_dummy().snapshot().coord, (7, 7));
+    }
+
     #[test]
     fn low_bridge_land_override_clears_the_water_tiles_ground_block() {
         use crate::rules::ini_parser::IniFile;
@@ -2893,7 +2969,8 @@ NoUseTileLandType=yes
         );
         let registry = OverlayTypeRegistry::from_ini(&ini, None);
         let water_costs = SpeedCostProfile {
-            wheel: Some(0),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
             ..Default::default()
         };
 
@@ -2916,7 +2993,7 @@ NoUseTileLandType=yes
         assert_eq!(deck.base_land_type, LandType::Water.as_index());
 
         // Removing the bridge hands the cell back to the water tile.
-        *overlay_grid.cell_mut(0, 0) = OverlayCell::default();
+        *overlay_grid.cell_mut_for_test(0, 0) = OverlayCell::default();
         recalc_overlay_passability(&mut overlay_grid, &mut terrain, &registry, 0, 0);
         let bare = terrain.cell(0, 0).expect("cleared cell");
         assert_eq!(bare.land_type, LandType::Water.as_index());
@@ -2932,7 +3009,8 @@ NoUseTileLandType=yes
         let registry = OverlayTypeRegistry::empty();
         let mut overlay_grid = OverlayGrid::new(1, 1);
         let zero_wheel = SpeedCostProfile {
-            wheel: Some(0),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
             ..Default::default()
         };
 
@@ -2957,7 +3035,8 @@ NoUseTileLandType=yes
         let registry = gsi_04_04_registry();
         let clear = LandType::Clear.as_index();
         let clear_speed = SpeedCostProfile {
-            wheel: Some(100),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
             ..Default::default()
         };
 
@@ -2971,8 +3050,14 @@ NoUseTileLandType=yes
             let mut overlay_grid = OverlayGrid::new(1, 1);
             overlay_grid.place_overlay(0, 0, overlay_id, 0);
             let mut terrain = single_cell_terrain(clear, clear_speed, false);
-            terrain.cell_mut(0, 0).unwrap().terrain_object_occupation = Some(7);
-            terrain.cell_mut(0, 0).unwrap().terrain_object_blocks = true;
+            terrain
+                .cell_mut_for_test(0, 0)
+                .unwrap()
+                .terrain_object_occupation = Some(7);
+            terrain
+                .cell_mut_for_test(0, 0)
+                .unwrap()
+                .terrain_object_blocks = true;
             recalc_overlay_passability(&mut overlay_grid, &mut terrain, &registry, 0, 0);
             let cell = terrain.cell(0, 0).expect("priority cell");
             assert_eq!(cell.zone_type, expected_zone, "overlay {overlay_id}");
@@ -2980,7 +3065,8 @@ NoUseTileLandType=yes
         }
 
         let zero_wheel = SpeedCostProfile {
-            wheel: Some(0),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
             ..Default::default()
         };
         let mut overlay_grid = OverlayGrid::new(1, 1);
@@ -3018,7 +3104,8 @@ NoUseTileLandType=yes
             (2, zone_class::GROUND),
         ] {
             let speed = SpeedCostProfile {
-                wheel: Some(wheel),
+                wheel: Some(crate::rules::terrain_rules::test_speed_percent(wheel)),
+                winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
                 ..Default::default()
             };
             let mut terrain = single_cell_terrain(clear, speed, false);
@@ -3036,7 +3123,7 @@ NoUseTileLandType=yes
             (0, zone_class::BUILDING, false),
         ] {
             let mut object = single_cell_terrain(clear, clear_speed, false);
-            let object_cell = object.cell_mut(0, 0).unwrap();
+            let object_cell = object.cell_mut_for_test(0, 0).unwrap();
             object_cell.terrain_object_occupation = Some(occupation);
             object_cell.terrain_object_blocks = expected_blocks;
             recalc_overlay_passability(&mut empty_grid, &mut object, &registry, 0, 0);
@@ -3058,7 +3145,8 @@ NoUseTileLandType=yes
 
         let registry = gsi_04_04_registry();
         let base_speed = SpeedCostProfile {
-            wheel: Some(100),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
             ..Default::default()
         };
 
@@ -3115,7 +3203,8 @@ NoUseTileLandType=yes
 
         let registry = gsi_04_04_registry();
         let base_speed = SpeedCostProfile {
-            wheel: Some(100),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
             ..Default::default()
         };
         let ordinary_ore_speed = registry
@@ -3128,7 +3217,7 @@ NoUseTileLandType=yes
             let mut overlay_grid = OverlayGrid::new(1, 1);
             overlay_grid.place_overlay(0, 0, 11, 7);
             let mut terrain = single_cell_terrain(LandType::Clear.as_index(), base_speed, false);
-            terrain.cell_mut(0, 0).unwrap().slope_type = slope;
+            terrain.cell_mut_for_test(0, 0).unwrap().slope_type = slope;
 
             assert!(recalc_overlay_passability(
                 &mut overlay_grid,
@@ -3168,7 +3257,7 @@ NoUseTileLandType=yes
                 overlay_grid.place_overlay(0, 0, overlay_id, 7);
                 let mut terrain =
                     single_cell_terrain(LandType::Clear.as_index(), base_speed, false);
-                terrain.cell_mut(0, 0).unwrap().slope_type = slope;
+                terrain.cell_mut_for_test(0, 0).unwrap().slope_type = slope;
 
                 assert!(recalc_overlay_passability(
                     &mut overlay_grid,
@@ -3232,13 +3321,14 @@ NoUseTileLandType=yes
         // Install a distinct Tiberium-mode speed profile so we can prove the
         // round-trip actually copies it (not the same default).
         let tib_speed = SpeedCostProfile {
-            foot: Some(90),
-            track: Some(70),
-            wheel: Some(100),
-            float: Some(100),
-            amphibious: Some(100),
-            float_beach: Some(100),
-            hover: Some(100),
+            foot: Some(crate::rules::terrain_rules::test_speed_percent(90)),
+            track: Some(crate::rules::terrain_rules::test_speed_percent(70)),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            float: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            amphibious: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            float_beach: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            hover: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
         };
         let mut overlay_grid = OverlayGrid::new(10, 10);
         let tib_lt = LandType::Tiberium.as_index();
@@ -3248,7 +3338,7 @@ NoUseTileLandType=yes
         let changed = recalc_overlay_passability(&mut overlay_grid, &mut terrain, &registry, 5, 5);
         assert!(changed, "tiberium placement must report a change");
         let idx = 5 * 10 + 5;
-        let cell = &terrain.cells[idx];
+        let cell = &terrain.cells()[idx];
         assert_eq!(cell.land_type, tib_lt, "land_type → Tiberium");
         assert_eq!(cell.land_type, tib_lt, "land_type → 5");
         assert_eq!(
@@ -3262,7 +3352,7 @@ NoUseTileLandType=yes
         overlay_grid.clear_overlay(5, 5);
         let changed = recalc_overlay_passability(&mut overlay_grid, &mut terrain, &registry, 5, 5);
         assert!(changed, "tiberium removal must report a change");
-        let cell = &terrain.cells[idx];
+        let cell = &terrain.cells()[idx];
         assert_eq!(cell.land_type, clear_lt, "land_type → underlying Clear");
         assert_eq!(cell.land_type, clear_lt);
         assert_eq!(

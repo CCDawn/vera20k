@@ -25,7 +25,7 @@ fn native_foot_archive_expiry_matches_all_22_original_class_rows() {
             other => panic!("family {other}"),
         };
         let mut sim = Simulation::new();
-        sim.session.binary_frame = 1000;
+        sim.session.set_binary_frame_for_test(1000);
         sim.fog = FogState::new(8, 8);
         let owner = sim.interner.intern("Receiver");
         let other_owner = sim.interner.intern("Enemy");
@@ -100,7 +100,7 @@ fn native_foot_archive_expiry_matches_all_22_original_class_rows() {
             } else {
                 PointerExpiryControl::Uninit
             },
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             None,
             crate::sim::world::FrameEffects::default(),
         );

@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 
 use crate::assets::asset_manager::AssetManager;
 use crate::rules::ini_parser::{IniFile, IniSection, is_native_none_type_name};
-use crate::rules::ini_value::{crt_atoi, parse_leading_f64, scan_decimal_i32};
+use crate::rules::ini_value::{
+    crt_atoi, parse_leading_f64, scan_decimal_i32, strtrim_ascii, truncate_native_bytes,
+};
 use crate::util::native_x87::NativeF64Bits;
 
 const SCRIPT_ACTION_CAPACITY: usize = 50;
@@ -100,8 +102,9 @@ pub enum AiTriggerOwnerIni {
 /// One AITriggerType after the fixed/map replacement pass.
 ///
 /// The typed fields are limited to storage proven in the active YR raw reader
-/// at `0x0041F580`. `tokens` remains authoritative for token 12 and for the
-/// still-untraced semantic names of tokens 11 through 14.
+/// at `0x0041F580`. Token 11 is read and discarded (the `strtok` at
+/// `0x0041F942`); 12 is [`Self::side`], 13 [`Self::storage_flag_d1`] and 14
+/// [`Self::secondary_team_type`]. `tokens` keeps every token's raw text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiTriggerTypeIni {
     pub id: String,
@@ -194,6 +197,12 @@ struct FixedTeamAiDefinitions {
     ai_triggers: Vec<AiTriggerTypeIni>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TeamTypeReadTransaction {
+    id: String,
+    definition: Option<TeamTypeIni>,
+}
+
 /// Ordered unresolved AI definitions from fixed AIMD and the scenario INI.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TeamAiIniRegistry {
@@ -204,7 +213,7 @@ pub struct TeamAiIniRegistry {
     pub diagnostics: Vec<TeamAiIniDiagnostic>,
     pub fixed_counts: TeamAiRegistryCounts,
     fixed_definitions: FixedTeamAiDefinitions,
-    team_type_read_transactions: Vec<TeamTypeIni>,
+    team_type_read_transactions: Vec<TeamTypeReadTransaction>,
     fixed_team_type_read_count: usize,
     game_mode_nonzero: bool,
 }
@@ -221,11 +230,23 @@ impl TeamAiIniRegistry {
         scenario: &IniFile,
         game_mode_nonzero: bool,
     ) -> Result<Self, String> {
-        let fixed = crate::rules::retail_sources::select_ini(assets, "aimd.ini")?.ini;
+        let name = assets.ini_roots().ai();
+        let mut fixed = crate::rules::retail_sources::select_ini(assets, name)?.ini;
+        // Load_Game_Rules52D378 reads AIMD through ReadCCFile4741F0 with
+        // checkDigest=1 before Full_Init68797F..6879DA consumes its registries.
+        // Raw source inspection and metadata keep their unchecked INI view.
+        fixed.remove_digest_for_checked_load();
         let registry = Self::from_sources(&fixed, scenario, game_mode_nonzero);
-        if !registry.fixed_source_is_complete() {
+        // Only a root that is not an AI INI at all is refused. A listed type
+        // with no section, or a TaskForce entry that does not scan, is a
+        // diagnostic: TeamTypeClass::LoadFromINIList (`0x006F19B0`) allocates
+        // each listed type and calls its ReadINI whatever it returns, and
+        // TaskForceClass::ReadINI (`0x006E8420`) counts only resolved members.
+        // Residual: VERA leaves such a type out where native keeps it with
+        // its constructor's values.
+        if !registry.fixed_source_has_every_registry() {
             return Err(format!(
-                "active YR aimd.ini failed structural validation: fixed_counts={:?}, diagnostics={:?}",
+                "selected AI root {name} failed structural validation: fixed_counts={:?}, diagnostics={:?}",
                 registry.fixed_counts, registry.diagnostics
             ));
         }
@@ -270,18 +291,42 @@ impl TeamAiIniRegistry {
         registry
     }
 
-    /// Whether the required fixed AIMD source produced all four non-empty
-    /// registries without a refused definition. Scenario diagnostics do not
-    /// invalidate the fixed source because map additions are optional overlays.
-    pub fn fixed_source_is_complete(&self) -> bool {
+    /// Whether the fixed AIMD source produced all four registries: what
+    /// [`Self::load_retail`] requires of the selected root.
+    pub fn fixed_source_has_every_registry(&self) -> bool {
         self.fixed_counts.team_types > 0
             && self.fixed_counts.scripts > 0
             && self.fixed_counts.task_forces > 0
             && self.fixed_counts.ai_triggers > 0
+    }
+
+    /// Whether the required fixed AIMD source produced all four non-empty
+    /// registries without a refused definition. Scenario diagnostics do not
+    /// invalidate the fixed source because map additions are optional overlays.
+    pub fn fixed_source_is_complete(&self) -> bool {
+        self.fixed_source_has_every_registry()
             && !self
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.source() == TeamAiDefinitionSource::FixedAimd)
+    }
+
+    /// Script action 51 (`0x006EF610`) constructs the AnimType its argument's
+    /// low 16 bits index. Loading binds these names tolerantly: native loads
+    /// each image in `AnimTypeClass::ReadINI` (`0x00427D00`) or on demand
+    /// (`0x00428C30`) and never fails the scenario, so art VERA cannot bind
+    /// must not fail the map.
+    /// Bound names join the scheduler closure that saved resources rebind.
+    pub fn script_anim_class_roots(&self, rules: &crate::rules::ruleset::RuleSet) -> Vec<String> {
+        self.scripts
+            .iter()
+            .flat_map(|script| &script.actions)
+            .filter(|action| action.action_id == 51)
+            .filter_map(|action| rules.anim_type_runtime_key_by_index(action.argument & 0xffff))
+            .map(std::borrow::Cow::into_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     pub(crate) fn fixed_resolution_view(&self) -> Self {
@@ -311,7 +356,33 @@ impl TeamAiIniRegistry {
     /// the merged identity vector cannot reconstruct a map pass that lists a
     /// new identity before an override of an existing one.
     pub(crate) fn team_type_read_sequence(&self) -> impl Iterator<Item = &TeamTypeIni> {
-        self.team_type_read_transactions.iter()
+        self.team_type_read_transactions
+            .iter()
+            .filter_map(|read| read.definition.as_ref())
+    }
+
+    /// LoadFromINIList6F19B0 constructs before ReadINI6F1A8B, including a
+    /// failed section read. Failed reads do not replay reference factories.
+    pub(crate) fn team_type_registration_sequence(
+        &self,
+    ) -> impl Iterator<Item = (&str, Option<&TeamTypeIni>)> {
+        self.team_type_read_transactions
+            .iter()
+            .map(|read| (read.id.as_str(), read.definition.as_ref()))
+    }
+
+    /// AbstractType ctor4108B8 copies the stored ID to Name. ReadINI410A91
+    /// then reads Name with capacity49/current default, unconditionally.
+    /// Physical INI values have no leading whitespace, so subsequent absent
+    /// reads are idempotent; the immutable projection needs no Name cache.
+    pub(crate) fn team_type_name(&self, stored_id: &str) -> String {
+        self.team_types
+            .iter()
+            .find(|team| team.id.eq_ignore_ascii_case(stored_id))
+            .map_or_else(
+                || stored_id.to_owned(),
+                |team| team.section().read_string("Name", stored_id, 49),
+            )
     }
 
     fn read_team_types(&mut self, ini: &IniFile, source: TeamAiDefinitionSource) {
@@ -328,7 +399,22 @@ impl TeamAiIniRegistry {
             else {
                 continue;
             };
-            let Some(section) = ini.section(id) else {
+            // LoadFromINIList6F1A30 compares against stored IDs and retains
+            // the first constructor spelling. AbstractType::ReadINI410A79
+            // then finds the section by that stored ID, not this list token.
+            let stored_id = self
+                .team_type_read_transactions
+                .iter()
+                .map(|read| truncate_native_bytes(&read.id, 24))
+                .find(|stored| stored.eq_ignore_ascii_case(id))
+                .unwrap_or_else(|| truncate_native_bytes(id, 24))
+                .to_owned();
+            let Some(section) = ini.section(&stored_id) else {
+                self.team_type_read_transactions
+                    .push(TeamTypeReadTransaction {
+                        id: id.to_string(),
+                        definition: None,
+                    });
                 self.diagnostics
                     .push(TeamAiIniDiagnostic::MissingDefinitionSection {
                         registry: "TeamTypes",
@@ -337,15 +423,15 @@ impl TeamAiIniRegistry {
                     });
                 continue;
             };
-            let identity = canonical_identity(id);
+            let identity = canonical_identity(&stored_id);
             let position = if let Some(position) = index.get(&identity).copied() {
                 self.team_types[position].overlay(section, source);
                 position
             } else {
                 let mut definition = TeamTypeIni {
-                    id: id.to_string(),
-                    fields: IniSection::new(id.to_string()),
-                    physical_read_fields: IniSection::new(id.to_string()),
+                    id: stored_id.clone(),
+                    fields: IniSection::new(stored_id.clone()),
+                    physical_read_fields: IniSection::new(stored_id),
                     source,
                 };
                 definition.overlay(section, source);
@@ -355,7 +441,10 @@ impl TeamAiIniRegistry {
                 position
             };
             self.team_type_read_transactions
-                .push(self.team_types[position].clone());
+                .push(TeamTypeReadTransaction {
+                    id: id.to_string(),
+                    definition: Some(self.team_types[position].clone()),
+                });
         }
     }
 
@@ -472,9 +561,15 @@ impl TeamAiIniRegistry {
                     member_type: member_type.to_string(),
                 });
             }
+            // gamemd.exe TaskForceClass::Read_INI6E8420 passes its current
+            // +98 Group as ReadInt's default at6E84CD..6E84E2. A reread that
+            // omits Group retains it; only the constructor starts at -1.
+            let group_default = index
+                .get(&canonical_identity(id))
+                .map_or(-1, |&position| self.task_forces[position].group);
             let definition = TaskForceIni {
                 id: id.to_string(),
-                group: section.read_int("Group", -1),
+                group: section.read_int("Group", group_default),
                 entries,
                 source,
             };
@@ -525,7 +620,7 @@ impl TeamAiIniRegistry {
             let definition = AiTriggerTypeIni {
                 id: id.to_string(),
                 display_name: tokens[0].clone(),
-                primary_team_type: optional_reference(&tokens[1]),
+                primary_team_type: ai_trigger_team_reference(&tokens[1]),
                 owner: if tokens[2].eq_ignore_ascii_case("<all>") {
                     AiTriggerOwnerIni::All
                 } else {
@@ -543,7 +638,7 @@ impl TeamAiIniRegistry {
                 multiplayer: crt_atoi(&tokens[10]) != 0,
                 side: crt_atoi(&tokens[12]),
                 storage_flag_d1: crt_atoi(&tokens[13]) != 0,
-                secondary_team_type: optional_reference(&tokens[14]),
+                secondary_team_type: ai_trigger_team_reference(&tokens[14]),
                 difficulty_enabled: [
                     crt_atoi(&tokens[15]) != 0,
                     crt_atoi(&tokens[16]) != 0,
@@ -590,6 +685,15 @@ fn valid_identity(id: &str) -> bool {
 
 fn optional_reference(raw: &str) -> Option<String> {
     valid_identity(raw).then(|| raw.trim().to_string())
+}
+
+/// AITriggerTypeClass::ReadINI @ 0x0041F580, original gamemd.exe:
+/// both Team buffers copy 24 bytes, overwrite byte 23 with NUL, then call
+/// strtrim (0x0041F626..0x0041F63E / 0x0041F9A0..0x0041F9B8).
+/// Only the case-insensitive `<none>` sentinel skips the Team lookup.
+fn ai_trigger_team_reference(raw: &str) -> Option<String> {
+    let name = strtrim_ascii(truncate_native_bytes(raw, 23));
+    (!name.eq_ignore_ascii_case("<none>")).then(|| name.to_string())
 }
 
 fn parse_ai_trigger_comparison(raw: &str) -> Option<[u8; 32]> {
@@ -668,7 +772,7 @@ fn scan_count_and_word(value: &str) -> Option<(i32, &str)> {
     Some((count, word))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_o_z))]
 mod tests {
     use super::*;
 
@@ -705,6 +809,43 @@ mod tests {
              [AITriggerTypes]\nTRIGGER={}\n",
             eighteen_tokens("Trigger", "TEAM")
         ))
+    }
+
+    #[test]
+    fn ai_team_buffers_cut_before_native_strtrim() {
+        let row = eighteen_tokens("Team buffers", "  ABCDEFGHIJKLMNOPQRSTUsuffix")
+            .replace(",<none>,1,1,1", ",  x  ,1,1,1");
+        let fixed = IniFile::from_str(&format!("[AITriggerTypes]\nA={row}\n"));
+        let loaded = TeamAiIniRegistry::from_sources(&fixed, &IniFile::from_str(""), true);
+        let trigger = &loaded.ai_triggers[0];
+
+        assert_eq!(
+            trigger.primary_team_type.as_deref(),
+            Some("ABCDEFGHIJKLMNOPQRSTU"),
+            "the 23-byte buffer includes leading spaces before strtrim"
+        );
+        assert_eq!(
+            trigger.secondary_team_type.as_deref(),
+            Some("x "),
+            "native strtrim retains this trailing space after shifting"
+        );
+        assert_eq!(trigger.tokens[1], "  ABCDEFGHIJKLMNOPQRSTUsuffix");
+        assert_eq!(trigger.tokens[14], "  x  ");
+    }
+
+    #[test]
+    fn ai_team_buffers_preserve_non_ascii_spaces_and_other_angle_names() {
+        let row = eighteen_tokens("Team names", "<team>")
+            .replace(",<none>,1,1,1", ",\u{a0}TEAM\u{a0},1,1,1");
+        let fixed = IniFile::from_str(&format!("[AITriggerTypes]\nA={row}\n"));
+        let loaded = TeamAiIniRegistry::from_sources(&fixed, &IniFile::from_str(""), true);
+        let trigger = &loaded.ai_triggers[0];
+
+        assert_eq!(trigger.primary_team_type.as_deref(), Some("<team>"));
+        assert_eq!(
+            trigger.secondary_team_type.as_deref(),
+            Some("\u{a0}TEAM\u{a0}")
+        );
     }
 
     #[test]
@@ -753,6 +894,10 @@ mod tests {
         assert_eq!(loaded.task_forces.len(), 2);
         assert_eq!(loaded.ai_triggers.len(), 2);
         assert!(!loaded.fixed_source_is_complete());
+        assert!(
+            loaded.fixed_source_has_every_registry(),
+            "a diagnosed fixed definition does not refuse the AI root"
+        );
         assert_eq!(
             loaded
                 .diagnostics
@@ -793,7 +938,7 @@ mod tests {
         let map = IniFile::from_str(&format!(
             "[TeamTypes]\n0=THIRD\n1=first\n\
              [THIRD]\nPriority=9\nScript=S1\nTaskForce=T1\n\
-             [first]\nPriority=20\n\
+             [FIRST]\nPriority=20\n\
              [ScriptTypes]\n0=S1\n1=S2\n[S1]\n4=49,0\n[S2]\n0=2,0\n\
              [TaskForces]\n0=T1\n1=T2\n[T1]\n0=2,E1\n6=9,IGNORED\n[T2]\n0=1,E2\n\
              [AITriggerTypes]\nA={}\nB={}\n[AITriggerTypesEnable]\nA=no\nB=yes\n",
@@ -842,6 +987,14 @@ mod tests {
         );
         assert_eq!(loaded.task_forces[0].entries.len(), 1);
         assert_eq!(loaded.task_forces[0].entries[0].count, 2);
+        assert_eq!(
+            loaded.task_forces[0].group, 3,
+            "omitted map Group retains the fixed value"
+        );
+        assert_eq!(
+            loaded.task_forces[1].group, -1,
+            "a new TaskForce starts ungrouped"
+        );
         assert_eq!(loaded.ai_triggers.len(), 2);
         assert!(!loaded.ai_triggers[0].enabled);
         assert!(loaded.ai_triggers[1].enabled);

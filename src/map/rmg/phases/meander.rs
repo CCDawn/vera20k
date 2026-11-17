@@ -23,19 +23,17 @@
 //! records linearly, so it yields cells in row-major order — ascending `y`, then
 //! ascending `x`. That difference is invisible everywhere else it is used,
 //! because those callers draw no randomness. Here it decides which border cell
-//! gets which random draw, so [`region_border_row_major`] exists to reproduce it
-//! rather than reusing the lake's collector.
+//! gets which random draw, and [`border_cells_of`] keeps that order.
 
 use crate::map::rmg::grid::RmgGrid;
 use crate::map::rmg::rng::{RANGE_K_BITS, RmgRng};
-use crate::map::rmg::scratch::RmgScratch;
 use crate::map::rmg::x87::{self, TruncF64};
+use crate::util::direction_tables::native_atan_from_table;
+use crate::util::native_heap::NativeHeap;
 use crate::util::native_x87::X87Chop53;
 
+use super::adjacency::border_cells_of;
 use super::blob::BlobCtx;
-
-/// The rect edge length that counts as "unclipped" when the heading is derived.
-const FULL_EXTENT: i32 = 0x200;
 
 /// Cost weights: a uniform random term, and how far off-heading the cell lies.
 const COST_RANDOM: f64 = 2.0;
@@ -85,107 +83,10 @@ struct Node {
     cost: f32,
 }
 
-/// The original's binary min-heap, reproduced including its tie-breaks.
-///
-/// Slots are 1-based and hold indices into the node pool. Ties matter: sift-up
-/// stops when the parent is *less than or equal*, and the right child only wins
-/// on a strict improvement, so equal costs keep the earlier-inserted node above.
-struct MinHeap {
-    count: usize,
-    capacity: usize,
-    slots: Vec<usize>,
-}
-
-impl MinHeap {
-    fn new(capacity: usize) -> Self {
-        Self {
-            count: 0,
-            capacity,
-            slots: vec![0; capacity + 2],
-        }
-    }
-
-    fn push(&mut self, nodes: &[Node], index: usize) {
-        let mut slot = self.count + 1;
-        // The original drops the insert when the pool is full rather than
-        // growing. Verified unreachable for the sizes this generator uses, but
-        // dropping silently is what it does, so it is kept.
-        if slot >= self.capacity {
-            return;
-        }
-        let cost = nodes[index].cost;
-        while slot > 1 {
-            let parent = self.slots[slot >> 1];
-            if nodes[parent].cost <= cost {
-                break;
-            }
-            self.slots[slot] = parent;
-            slot >>= 1;
-        }
-        self.slots[slot] = index;
-        self.count += 1;
-    }
-
-    fn pop(&mut self, nodes: &[Node]) -> Option<usize> {
-        if self.count == 0 {
-            return None;
-        }
-        let top = self.slots[1];
-        self.slots[1] = self.slots[self.count];
-        self.slots[self.count] = 0;
-        self.count -= 1;
-        self.sift_down(nodes, 1);
-        Some(top)
-    }
-
-    fn sift_down(&mut self, nodes: &[Node], start: usize) {
-        let mut parent = start;
-        let mut best = self.pick(nodes, parent);
-        while best != parent {
-            self.slots.swap(parent, best);
-            parent = best;
-            best = self.pick(nodes, parent);
-        }
-    }
-
-    /// The smaller of a node and its two children, preferring the parent and
-    /// then the left child when costs tie.
-    fn pick(&self, nodes: &[Node], parent: usize) -> usize {
-        let (left, right) = (parent * 2, parent * 2 + 1);
-        let mut best = parent;
-        if left <= self.count && nodes[self.slots[left]].cost < nodes[self.slots[parent]].cost {
-            best = left;
-        }
-        if right <= self.count && nodes[self.slots[right]].cost < nodes[self.slots[best]].cost {
-            best = right;
-        }
-        best
-    }
-}
-
-/// Cells of `region` that touch a differently-owned cell, in row-major order.
-///
-/// The original sweeps working-grid records by raw offset, and a record's index
-/// is `y * width + x`, so this is ascending `y` then ascending `x` — *not* the
-/// isometric order the rest of the generator draws in. See the module header.
-fn region_border_row_major(scratch: &RmgScratch, region: i32) -> Vec<(i32, i32)> {
-    let width = scratch.width() as i32;
-    let mut border = Vec::new();
-    for y in 0..width {
-        for x in 0..width {
-            if !scratch.in_diamond(x, y) || scratch.get(x, y).region != region {
-                continue;
-            }
-            for dir in 0..8usize {
-                let (nx, ny) = RmgGrid::step(x, y, dir);
-                if scratch.in_diamond(nx, ny) && scratch.get(nx, ny).region != region {
-                    border.push((x, y));
-                    break;
-                }
-            }
-        }
-    }
-    border
+/// The frontier's order: the nodes' costs, compared as native's `FCOMP` does
+/// for finite floats.
+fn by_cost(nodes: &[Node]) -> impl Fn(&usize, &usize) -> bool + '_ {
+    move |&a, &b| nodes[a].cost < nodes[b].cost
 }
 
 /// Where the growth points before the first Gaussian nudges it.
@@ -194,17 +95,18 @@ fn region_border_row_major(scratch: &RmgScratch, region: i32) -> Vec<(i32, i32)>
 /// second and overwrites the `x` test's answer, so a rect clipped on both axes
 /// takes its heading from `y`. A rect covering the whole map leaves the heading
 /// at zero — which is the case the canyon uses.
-fn heading_from_rect(rect: [i32; 4]) -> f64 {
+/// `full` is the unclipped rect edge, [`RmgGrid::whole_extent`].
+fn heading_from_rect(rect: [i32; 4], full: i32) -> f64 {
     let mut heading = 0.0;
     if rect[0] == 0 {
-        if rect[2] != FULL_EXTENT {
+        if rect[2] != full {
             heading = PI;
         }
     } else {
         heading = 0.0;
     }
     if rect[1] == 0 {
-        if rect[3] != FULL_EXTENT {
+        if rect[3] != full {
             heading = HALF_PI;
         }
     } else {
@@ -214,33 +116,45 @@ fn heading_from_rect(rect: [i32; 4]) -> f64 {
 }
 
 /// How far `cell` sits off `heading`, seen from `reference`, folded to `[0, π]`.
+///
+/// `GrowMeanderArm` computes this inline twice, for the seeds
+/// (0x005A0ACA..0x005A0B4F) and the frontier (0x005A0E81..0x005A0F0B), in
+/// x87 under chop: `FILD dy; FIDIV dx; FCHS` into `Math::AtanFromTable @
+/// 0x004CADE0`, the table lookup every RMG angle shares, then `+π` for a
+/// negative `dx` (`π/2` when `dx` is zero), `|· − heading|`, folded by `2π`
+/// while not below it and mirrored above `π`. The same angle and cost also
+/// sit out of line, unreferenced, at 0x005A1190.
 fn angle_off_heading(cell: (i32, i32), reference: (i32, i32), heading: f64) -> f64 {
+    let tf = TruncF64::from_f64;
     let dx = cell.0 - reference.0;
-    let mut angle = if dx == 0 {
-        HALF_PI
+    let angle = if dx == 0 {
+        tf(HALF_PI)
     } else {
-        let ratio = -(f64::from(cell.1 - reference.1) / f64::from(dx));
-        let angle = ratio.atan();
-        if dx < 0 { angle + PI } else { angle }
+        let ratio = tf(f64::from(cell.1 - reference.1))
+            .div(tf(f64::from(dx)))
+            .neg();
+        let angle = TruncF64::from(native_atan_from_table(ratio.into()));
+        if dx < 0 { angle.add(tf(PI)) } else { angle }
     };
-    angle = (angle - heading).abs();
-    while angle >= TAU {
-        angle -= TAU;
+    let mut off = angle.sub(tf(heading)).abs();
+    while !off.lt(tf(TAU)) {
+        off = off.sub(tf(TAU));
     }
-    if angle > PI {
-        angle = TAU - angle;
+    if tf(PI).lt(off) {
+        off = tf(TAU).sub(off);
     }
-    angle
+    off.to_f64()
 }
 
-/// The frontier priority: a random term plus the off-heading penalty.
+/// The frontier priority: a random term plus the off-heading penalty, stored
+/// with `FSTP m32` (`GrowMeanderArm` 0x005A0B9F seeds, 0x005A0F4F frontier).
 fn frontier_cost(angle: f64, draw: u32) -> f32 {
     let scale = TruncF64::from_f64(f64::from_bits(RANGE_K_BITS));
     let random_term = TruncF64::from_f64(f64::from(draw))
         .mul(scale)
         .mul(TruncF64::from_f64(COST_RANDOM));
     let angle_term = TruncF64::from_f64(angle).mul(TruncF64::from_f64(COST_ANGLE));
-    random_term.add(angle_term).to_f64() as f32
+    x87::store_f32(random_term.add(angle_term))
 }
 
 /// How many cells the arm may claim.
@@ -248,6 +162,11 @@ fn frontier_cost(angle: f64, draw: u32) -> f32 {
 /// Transcribed in the original's operation order, which is not the tidy
 /// division it is algebraically equal to: the reciprocal is taken, scaled, and
 /// then inverted again. Reordering it changes the last bits and so the budget.
+///
+/// Residual: the native log is `FLDLN2; FILD; FYL2X` under chop (0x005A0C40);
+/// [`x87::ln`] is libm's, rounded to nearest. Nothing narrows it here, so a
+/// last-bit difference changes the budget only when the result lands within
+/// an ulp of an integer.
 fn step_budget(border_total: usize, step_density: f32, rng: &mut RmgRng) -> i32 {
     let log = x87::ln(TruncF64::from_f64(border_total as f64)).to_f64();
     let floored = if STEP_LOG_FLOOR > log {
@@ -279,18 +198,20 @@ fn step_budget(border_total: usize, step_density: f32, rng: &mut RmgRng) -> i32 
     base + extra
 }
 
-/// Grow `args.tag`'s region along a wandering heading.
+/// `RandomMapGenerator::GrowMeanderArm @ 0x005A08D0`: grow `args.tag`'s
+/// region along a wandering heading. Callers: the canyon in `CarveRiver`
+/// (0x0059E3C2) and the bridge plateau in `BuildRiverBridge` (0x0059EC65).
 ///
 /// Returns false when the growth ran into a cell owned by a *different* region —
 /// that is the original's only failure, and its callers treat it as fatal.
 /// Running out of budget, of frontier, or of map is success.
 pub(crate) fn grow_meander_arm(ctx: &mut BlobCtx<'_>, args: &MeanderArgs) -> bool {
-    let mut heading = heading_from_rect(args.rect);
+    let mut heading = heading_from_rect(args.rect, ctx.grid.whole_extent());
     let mut alive = true;
 
     let pool = (args.pool_dims.0 * args.pool_dims.1 * 2).max(MIN_POOL) as usize;
     let mut nodes: Vec<Node> = Vec::new();
-    let mut heap = MinHeap::new(pool);
+    let mut heap = NativeHeap::new(pool);
 
     // The per-pass stamp is cleared across the whole map first; it is this
     // function's private "already queued" marker.
@@ -299,7 +220,7 @@ pub(crate) fn grow_meander_arm(ctx: &mut BlobCtx<'_>, args: &MeanderArgs) -> boo
         ctx.scratch.get_mut(x, y).stamp = 0;
     }
 
-    let border = region_border_row_major(ctx.scratch, args.tag);
+    let border = border_cells_of(ctx.scratch, args.tag);
     for &(x, y) in &border {
         if !in_rect(args.rect, x, y) {
             // Cells outside the rect consume nothing at all.
@@ -311,13 +232,13 @@ pub(crate) fn grow_meander_arm(ctx: &mut BlobCtx<'_>, args: &MeanderArgs) -> boo
             coord: (x, y),
             cost,
         });
-        heap.push(&nodes, nodes.len() - 1);
+        heap.push(nodes.len() - 1, by_cost(&nodes));
     }
 
     // The budget scales with the *whole* border, not the part inside the rect.
     let steps = step_budget(border.len(), args.step_density, ctx.rng);
 
-    let mut current = heap.pop(&nodes);
+    let mut current = heap.pop(by_cost(&nodes));
     if steps > 0 {
         let mut executed = 0;
         while let Some(index) = current {
@@ -353,7 +274,7 @@ pub(crate) fn grow_meander_arm(ctx: &mut BlobCtx<'_>, args: &MeanderArgs) -> boo
                         coord: (nx, ny),
                         cost,
                     });
-                    heap.push(&nodes, nodes.len() - 1);
+                    heap.push(nodes.len() - 1, by_cost(&nodes));
                     continue;
                 }
                 // Not enqueued: an unowned neighbour is simply skipped, but one
@@ -367,8 +288,12 @@ pub(crate) fn grow_meander_arm(ctx: &mut BlobCtx<'_>, args: &MeanderArgs) -> boo
             executed += 1;
             // Drawn every step, including the step that failed and the step
             // that emptied the queue — both are only noticed at the loop head.
-            heading += ctx.gauss.next(ctx.rng) * HEADING_DRIFT;
-            current = heap.pop(&nodes);
+            // 0x005A1051..0x005A105F: `FMUL π/4; FADD heading` under chop.
+            heading = TruncF64::from_f64(ctx.gauss.next(ctx.rng))
+                .mul(TruncF64::from_f64(HEADING_DRIFT))
+                .add(TruncF64::from_f64(heading))
+                .to_f64();
+            current = heap.pop(by_cost(&nodes));
             if executed >= steps {
                 break;
             }
@@ -378,7 +303,7 @@ pub(crate) fn grow_meander_arm(ctx: &mut BlobCtx<'_>, args: &MeanderArgs) -> boo
     if args.claim_frontier {
         // Whatever is still queued is claimed outright — no clear-ground test
         // and no randomness, but a foreign owner still fails the growth.
-        let mut node = heap.pop(&nodes);
+        let mut node = heap.pop(by_cost(&nodes));
         while let Some(index) = node {
             if !alive {
                 break;
@@ -392,10 +317,10 @@ pub(crate) fn grow_meander_arm(ctx: &mut BlobCtx<'_>, args: &MeanderArgs) -> boo
             } else {
                 ctx.scratch.get_mut(x, y).region = args.tag;
             }
-            if heap.count == 0 {
+            if heap.is_empty() {
                 break;
             }
-            node = heap.pop(&nodes);
+            node = heap.pop(by_cost(&nodes));
         }
     }
 
@@ -435,7 +360,7 @@ pub(crate) fn dilate_chained(
     level: Option<u8>,
     rect: [i32; 4],
 ) -> bool {
-    let mut frontier = region_border_row_major(ctx.scratch, region);
+    let mut frontier = border_cells_of(ctx.scratch, region);
     for _ in 0..rings {
         let mut claimed = Vec::new();
         for &(x, y) in &frontier {
@@ -472,25 +397,140 @@ pub(crate) fn dilate_chained(
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
 
+    /// Whole original `RandomMapGenerator::GrowMeanderArm @ 0x005A08D0`
+    /// calls from `tools/rmg_oracle/meander_arm.py`: a declared flat scene
+    /// around a river row (not a full Generate prefix), seeded streams, and
+    /// every claimed cell, +4B flag, result and draw the original produced.
+    #[test]
+    fn native_meander_arm_controls() {
+        use crate::map::rmg::scratch::RmgScratch;
+        use crate::map::rmg::x87::Gaussian;
+        let doc = crate::test_fixture::json("tools/rmg_oracle/meander_arm.json");
+        let (identity, blocks) = super::super::cliff_native_tests::physical_tiles();
+        let cliff = doc["scene"]["cliff_base"].as_i64().unwrap() as i32;
+        let pair =
+            |c: &serde_json::Value| (c[0].as_i64().unwrap() as i32, c[1].as_i64().unwrap() as i32);
+        let pairs = |value: &serde_json::Value| -> Vec<(i32, i32)> {
+            value.as_array().unwrap().iter().map(pair).collect()
+        };
+        let rows = doc["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 7);
+        for row in rows {
+            let input = &row["input"];
+            let context = input["id"].as_str().unwrap();
+            let tag = input["tag"].as_i64().unwrap() as i32;
+            let mut grid = RmgGrid::new(33, 16, 48);
+            let mut scratch = RmgScratch::new(33, 16, 48);
+            for (x, y) in grid.native_cells().collect::<Vec<_>>() {
+                let cell = grid.get_mut(x, y).unwrap();
+                (cell.tile, cell.sub_tile, cell.level) = (0, 0, 0);
+            }
+            for (x, y) in pairs(&input["river"]) {
+                scratch.get_mut(x, y).region = tag;
+            }
+            for (x, y) in pairs(&input["foreign"]) {
+                scratch.get_mut(x, y).region = 3;
+            }
+            for (x, y) in pairs(&input["rough"]) {
+                if scratch.in_diamond(x, y) {
+                    grid.get_mut(x, y).unwrap().tile = cliff;
+                }
+            }
+            let fields = |scratch: &RmgScratch| {
+                let mut out = Vec::new();
+                for y in 0..33 {
+                    for x in 0..33 {
+                        if scratch.in_diamond(x, y) {
+                            let cell = scratch.get(x, y);
+                            out.push([x, y, cell.region, i32::from(cell.water_region)]);
+                        }
+                    }
+                }
+                out
+            };
+            let prior = fields(&scratch);
+            let mut rng = RmgRng::new(input["seed"].as_u64().unwrap() as u16);
+            let mut gauss = Gaussian::default();
+            let rect = &input["rect"];
+            let size = pair(&input["gen"]);
+            let args = MeanderArgs {
+                tag,
+                step_density: f32::from_bits(input["density"].as_u64().unwrap() as u32),
+                rect: std::array::from_fn(|i| rect[i].as_i64().unwrap() as i32),
+                reference: pair(&input["ref"]),
+                claim_frontier: input["claim"].as_i64().unwrap() != 0,
+                pool_dims: size,
+            };
+            let ok = {
+                let mut ctx = BlobCtx {
+                    grid: &mut grid,
+                    scratch: &mut scratch,
+                    ids: &identity,
+                    blocks: &blocks,
+                    rng: &mut rng,
+                    gauss: &mut gauss,
+                    trig: None,
+                    map_w: size.0,
+                    map_h: size.1,
+                    rollback_level: 0,
+                };
+                grow_meander_arm(&mut ctx, &args)
+            };
+            assert_eq!(
+                ok,
+                row["result"].as_u64().unwrap() != 0,
+                "{context}: result"
+            );
+            assert_eq!(
+                rng.into_continuation().into_native_parts(),
+                super::super::cliff_native_tests::native_state(doc, &row["rng_after"])
+                    .into_native_parts(),
+                "{context}: exit RNG"
+            );
+            let cells: Vec<[i32; 4]> = fields(&scratch)
+                .into_iter()
+                .zip(prior)
+                .filter(|(now, before)| now != before)
+                .map(|(now, _)| now)
+                .collect();
+            let native: Vec<[i32; 4]> = row["cells"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| std::array::from_fn(|i| c[i].as_i64().unwrap() as i32))
+                .collect();
+            assert_eq!(cells, native, "{context}: cells");
+        }
+    }
+
+    /// `GrowMeanderArm` stores the cost with `FSTP m32` under chop
+    /// (0x005A0F4F): `u32::MAX * K * 2` stays just below 2.0.
+    #[test]
+    fn frontier_cost_store_truncates() {
+        assert_eq!(
+            frontier_cost(0.0, u32::MAX),
+            f32::from_bits(2.0f32.to_bits() - 1)
+        );
+    }
     #[test]
     fn a_whole_map_rect_points_east() {
         // The canyon's rect is unclipped on both axes, so neither test fires
         // and the heading stays at zero. Getting this wrong aims every canyon
         // in the wrong direction.
-        assert_eq!(heading_from_rect([0, 0, 0x200, 0x200]), 0.0);
+        assert_eq!(heading_from_rect([0, 0, 0x200, 0x200], 0x200), 0.0);
     }
 
     #[test]
     fn the_y_test_overwrites_the_x_test() {
         // Clipped on both axes: x alone would say pi, but y runs second.
-        assert_eq!(heading_from_rect([0, 0, 100, 100]), HALF_PI);
-        assert_eq!(heading_from_rect([5, 3, 100, 100]), THREE_HALF_PI);
+        assert_eq!(heading_from_rect([0, 0, 100, 100], 0x200), HALF_PI);
+        assert_eq!(heading_from_rect([5, 3, 100, 100], 0x200), THREE_HALF_PI);
         // Clipped on x only.
-        assert_eq!(heading_from_rect([0, 0, 100, 0x200]), PI);
+        assert_eq!(heading_from_rect([0, 0, 100, 0x200], 0x200), PI);
     }
 
     #[test]
@@ -536,53 +576,5 @@ mod tests {
         let unit = step_budget(1, 0.01, &mut rng);
         // ln(2) = 0.693 < 1, so both floor to 1 and give the same base of 50.
         assert_eq!(tiny, unit);
-    }
-
-    #[test]
-    fn the_heap_pops_in_cost_order() {
-        let nodes = vec![
-            Node {
-                coord: (0, 0),
-                cost: 3.0,
-            },
-            Node {
-                coord: (1, 0),
-                cost: 1.0,
-            },
-            Node {
-                coord: (2, 0),
-                cost: 2.0,
-            },
-            Node {
-                coord: (3, 0),
-                cost: 0.5,
-            },
-        ];
-        let mut heap = MinHeap::new(64);
-        for i in 0..nodes.len() {
-            heap.push(&nodes, i);
-        }
-        let mut order = Vec::new();
-        while let Some(i) = heap.pop(&nodes) {
-            order.push(nodes[i].coord.0);
-        }
-        assert_eq!(order, vec![3, 1, 2, 0]);
-    }
-
-    #[test]
-    fn equal_costs_keep_their_insertion_order() {
-        // The original's sift-up stops on parent <= child, so a later insert
-        // never overtakes an equal-cost earlier one.
-        let nodes: Vec<Node> = (0..6)
-            .map(|i| Node {
-                coord: (i, 0),
-                cost: 1.0,
-            })
-            .collect();
-        let mut heap = MinHeap::new(64);
-        for i in 0..nodes.len() {
-            heap.push(&nodes, i);
-        }
-        assert_eq!(heap.pop(&nodes).map(|i| nodes[i].coord.0), Some(0));
     }
 }

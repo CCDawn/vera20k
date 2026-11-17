@@ -4,8 +4,8 @@
 //! The existing CMIN scene supplies the same production setter and pad route.
 //! Only represented fields are compared: constructor padding, opaque words,
 //! COM counts and no-free allocation bytes remain native evidence. Fractions
-//! are compared after the existing SimFixed conversion, including Stop's 0.3
-//! precision difference. These are not native save/load or Ship witnesses.
+//! retain their native binary64 bits, including Stop's promoted-float 0.3.
+//! These are not native save/load or Ship witnesses.
 
 use super::{Scene, cmin_scene, coord, corpus};
 use crate::rules::ini_parser::IniFile;
@@ -20,7 +20,7 @@ use crate::sim::movement::slope_transition::SlopeTransitionState;
 use crate::sim::movement::track_process::TrackFamily;
 use crate::sim::movement::{self, DriveLocomotionRuntime, ground_pose, locomotor_owner};
 use crate::sim::timer::CdTimer;
-use crate::util::fixed_math::SimFixed;
+use crate::util::native_x87::NativeF64Bits;
 use serde_json::Value;
 
 fn integer(value: &Value) -> i32 {
@@ -35,11 +35,11 @@ fn pointer(value: &Value) -> u32 {
     u32::from_str_radix(value.as_str().unwrap().strip_prefix("0x").unwrap(), 16).unwrap()
 }
 
-fn fraction(bits: &Value) -> SimFixed {
+fn fraction(bits: &Value) -> NativeF64Bits {
     let bits = u64::from_str_radix(bits.as_str().unwrap(), 16).unwrap();
     let native = f64::from_bits(bits);
     assert!(native.is_finite());
-    SimFixed::from_num(native)
+    NativeF64Bits::from_bits(bits)
 }
 
 fn nonnull_coord(value: &Value) -> Option<DriveCoord> {
@@ -130,7 +130,7 @@ fn retained(native: &Value) -> DriveLocomotionRuntime {
         .with_track_valid_for_test(byte(&native["flags_60_67"][3]) != 0)
         .with_turn_latched_for_test(byte(&native["flags_60_67"][2]) != 0)
         .with_end_permitted_for_test(byte(&native["flags_60_67"][5]) != 0)
-        .with_target_speed_fraction_for_test(fraction(&native["target_speed_bits"]))
+        .with_target_speed_fraction_native_for_test(fraction(&native["target_speed_bits"]))
 }
 
 fn supply_retained(entity: &mut GameEntity, native: &Value) {
@@ -172,23 +172,28 @@ fn prepare(row: &Value) -> Scene {
         RuleSet::from_ini(&IniFile::from_str("[AI]\nBlockagePathDelay=22\n")).unwrap();
     scene.rules.general.blockage_path_delay_ticks =
         supplied_rules.general.blockage_path_delay_ticks;
-    scene.sim.session.binary_frame = u32::try_from(first["frame"].as_u64().unwrap()).unwrap();
+    scene
+        .sim
+        .session
+        .set_binary_frame_for_test(u32::try_from(first["frame"].as_u64().unwrap()).unwrap());
     let entity = scene.sim.substrate.entities.get_mut(scene.miner).unwrap();
     // dress_cmin already owns list placement and XY. Publish the measured Z too.
     entity.position.put_location(coord(&native["physical"]));
     entity.set_on_bridge(byte(&native["on_bridge"]) != 0);
     entity
         .foot_speed
-        .set_speed_fraction(fraction(&native["applied_speed_bits"]));
-    entity.navigation.path_replay = FootPathQueue::for_test(
-        path(&native["path"]),
-        0,
-        Some((
-            i16::try_from(integer(&native["reference_cell"][0])).unwrap(),
-            i16::try_from(integer(&native["reference_cell"][1])).unwrap(),
-        )),
-    );
-    let runtime = &mut entity.navigation.path_runtime;
+        .set_speed_fraction_native_bits(fraction(&native["applied_speed_bits"]).bits());
+    entity
+        .navigation
+        .set_path_replay_for_test(FootPathQueue::for_test(
+            path(&native["path"]),
+            0,
+            Some((
+                i16::try_from(integer(&native["reference_cell"][0])).unwrap(),
+                i16::try_from(integer(&native["reference_cell"][1])).unwrap(),
+            )),
+        ));
+    let runtime = entity.navigation.path_runtime_mut();
     runtime.set_movement_timer_for_test(CdTimer::from_raw(
         integer(&native["movement_timer"][0]),
         integer(&native["movement_timer"][2]),
@@ -197,10 +202,10 @@ fn prepare(row: &Value) -> Scene {
         integer(&native["blocked_timer"][0]),
         integer(&native["blocked_timer"][2]),
     ));
-    runtime.set_path_blocked(byte(&native["path_blocked"]) != 0);
+    runtime.set_path_blocked_for_test(byte(&native["path_blocked"]) != 0);
     // Foot+64C is supplied independently as 7 by the same fixture. The
     // accepted setter4D96C2..4D9707 preserves it; FindPath owns its reset.
-    runtime.set_retries_left(u32::try_from(integer(&native["retries"])).unwrap());
+    runtime.set_retries_left_for_test(u32::try_from(integer(&native["retries"])).unwrap());
     entity
         .navigation
         .set_nav_com_for_test(native_nav(row, &native["nav"]));
@@ -244,7 +249,7 @@ fn assert_boundary(scene: &Scene, row: &Value, expected: &Value, context: &str) 
         "{context}: exact Foot XYZ"
     );
     assert_eq!(
-        entity.foot_speed.applied_fraction(),
+        entity.foot_speed.native_applied_fraction(),
         fraction(&foot["applied_speed_bits"]),
         "{context}: independent Foot applied speed"
     );
@@ -264,19 +269,19 @@ fn assert_boundary(scene: &Scene, row: &Value, expected: &Value, context: &str) 
         "{context}: aux"
     );
     assert_eq!(
-        entity.navigation.path_replay.remaining_directions(),
+        entity.navigation.path_replay().remaining_directions(),
         path(&foot["path"]),
         "{context}: Foot queue"
     );
     assert_eq!(
-        entity.navigation.path_replay.reference_cell(),
+        entity.navigation.path_replay().reference_cell(),
         Some((
             i16::try_from(integer(&foot["reference_cell"][0])).unwrap(),
             i16::try_from(integer(&foot["reference_cell"][1])).unwrap(),
         )),
         "{context}: Foot reference cell"
     );
-    let runtime = entity.navigation.path_runtime;
+    let runtime = entity.navigation.path_runtime();
     assert_eq!(
         runtime.movement_timer(),
         CdTimer::from_raw(
@@ -427,7 +432,10 @@ fn replay(row: &Value) {
         let label = step["label"].as_str().unwrap();
         let before = boundary(row, step, "before");
         let after = boundary(row, step, "after");
-        scene.sim.session.binary_frame = u32::try_from(before["frame"].as_u64().unwrap()).unwrap();
+        scene
+            .sim
+            .session
+            .set_binary_frame_for_test(u32::try_from(before["frame"].as_u64().unwrap()).unwrap());
         let entity = scene.sim.substrate.entities.get_mut(scene.miner).unwrap();
         // Only the recipe's declared inputs are supplied between operations.
         // No after-state is fed back into the production controller.
@@ -510,7 +518,10 @@ fn replay(row: &Value) {
                     .unwrap();
                 let admitted = gate["return_eax"].as_u64().unwrap() & 0xFF != 0;
                 assert_eq!(
-                    scene.sim.try_end_piggyback(scene.miner, None),
+                    scene.sim.try_end_piggyback(
+                        scene.miner,
+                        crate::rules::ruleset::RuleSet::empty_for_test()
+                    ),
                     admitted,
                     "{label}: native END gate"
                 );
@@ -573,20 +584,17 @@ fn fresh_begin_owns_native_slope_frame_without_eager_retained_allocation() {
     }
 }
 
+/// Far-move reuse, refusals, end and repeat; a stopped pad setter releasing
+/// the complete Drive before the teleport move; a moving pad setter stopping,
+/// then Foot's end releasing the same complete Drive.
 #[test]
-fn far_move_reuse_refusals_end_and_repeat_match_complete_native_instances() {
+fn drive_instance_controls_match_complete_native_instances() {
     let data = corpus();
-    replay(control(&data, "far_fresh_reuse_end_repeat"));
-}
-
-#[test]
-fn stopped_pad_setter_releases_complete_drive_before_teleport_move() {
-    let data = corpus();
-    replay(control(&data, "pad_stopped_end"));
-}
-
-#[test]
-fn moving_pad_setter_stops_then_foot_end_releases_same_complete_drive() {
-    let data = corpus();
-    replay(control(&data, "pad_moving_refused_stop_end"));
+    for name in [
+        "far_fresh_reuse_end_repeat",
+        "pad_stopped_end",
+        "pad_moving_refused_stop_end",
+    ] {
+        replay(control(&data, name));
+    }
 }

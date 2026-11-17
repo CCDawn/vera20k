@@ -14,12 +14,19 @@
 //! | 1 | the in-game menu | the sidebar menu control | its buttons |
 //! | 3 | abort-mission confirm | the menu's Abort Mission button | see below |
 //! | 5 | Game Controls / Options | the menu's Options button | back to 1 |
+//! | 8 | Diplomacy (dialog 0x73) | the sidebar Diplomacy button, Tab | Return: 0 |
+//! | 9 | mission restate briefing (dialog 0x10C) | the sidebar Diplomacy button in campaign and Cooperative | Return: 0 |
+//!
+//! VERA has no state 5: gamemd's Game Controls (dialog BBB) is the first page
+//! of the in-game menu here, with its Sound (state 6) and Keyboard (state 4)
+//! dialogs opened from the menu and returning to it.
 //!
 //! Two re-entry rules matter to the player and are reproduced here:
 //!
 //! * **Options is a child of the menu.** When the Options dialog returns, the
 //!   state machine re-enters state 1 — closing Options puts you back on the
-//!   menu, it does not resume the mission.
+//!   menu, it does not resume the mission. VERA's Sound and Keyboard keep
+//!   that rule.
 //! * **Cancelling the abort confirmation resumes the mission**, it does not
 //!   return to the menu: the confirm dialog's cancel result matches no case in
 //!   the state machine's switch, so it falls through to state 0.
@@ -32,8 +39,9 @@
 //!
 //! The full-screen B6 abort shell has a secondary action that is mode
 //! dependent: campaign labels it `GUI:Restart` (restart the scenario),
-//! multiplayer with two or more live human players labels it `GUI:Observe`, and
-//! **offline skirmish hides it outright**. What is left in skirmish is one
+//! multiplayer with two or more live human players labels it `GUI:Observe`
+//! (EVENT_DESTRUCT for the local House, then keep watching; Leave there also
+//! destructs before EXIT), and **offline skirmish hides it outright**. What is left in skirmish is one
 //! action button captioned `GUI:Leave` and Resume Mission. Callback4F18B0
 //! accepts Resume686 and IDOK1; IDCANCEL2 is ignored, so Escape stays in B6.
 //! Confirming Leave queues an
@@ -55,8 +63,7 @@
 /// restricted to the values a stock offline skirmish can reach.
 ///
 /// States deliberately absent: the surrender-and-be-scored state (gated on a
-/// WOL-only mode), the replay state, the campaign mission-restate state, the
-/// multiplayer objectives state.
+/// WOL-only mode), the replay state, the multiplayer objectives state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InGameMenuState {
     /// No modal is open — the mission runs. (gamemd: 0)
@@ -64,14 +71,24 @@ pub enum InGameMenuState {
     Closed,
     /// The in-game menu. (gamemd: 1)
     Menu,
+    /// The WOL tournament Surrender box, ShellMessageBox `0x120` over the
+    /// battlefield. (gamemd: 2)
+    Surrender,
     /// The abort-mission confirmation. (gamemd: 3)
     AbortConfirm,
-    /// Game Controls / Options — a child of [`InGameMenuState::Menu`]. (gamemd: 5)
-    Options,
-    /// Sound options, active B8 (native state6).
+    /// Sound options, active B8 (native state6). gamemd reaches it and
+    /// Keyboard from Game Controls (BBB, its state 5), which VERA shows as
+    /// the first page of [`InGameMenuState::Menu`] rather than as a state.
     Sound,
-    /// Shared Keyboard A3, child of Game Controls (native state4).
+    /// Shared Keyboard A3 (native state4).
     Keyboard,
+    /// The WOL page dialog 0xCF, opened by PageUser. (gamemd: 7) It is a
+    /// compact popup over the live battlefield, not a full-screen shell.
+    Page,
+    /// The Diplomacy dialog 0x73. (gamemd: 8)
+    Diplomacy,
+    /// The mission restate briefing, dialog 0x10C. (gamemd: 9)
+    MissionBriefing,
     /// Native558DD0 browser nested beneath B5. Its mode has no independent
     /// scenario-state number: native keeps the parent hidden during this call.
     SavedGame(crate::ui::skirmish_shell::SavedSeedMode),
@@ -82,6 +99,14 @@ impl InGameMenuState {
     /// the simulation for exactly this condition.
     pub fn is_open(self) -> bool {
         !matches!(self, Self::Closed)
+    }
+
+    /// The battlefield keeps drawing under this modal: the modal pump's
+    /// Main_Tick still blits the tactical surface (`0x004F4780` only changes
+    /// its copy flag while `g_WSDialogCount` is nonzero), and the popup
+    /// window sits over it.
+    pub fn draws_over_battlefield(self) -> bool {
+        matches!(self, Self::Page | Self::Surrender)
     }
 
     /// Where Escape goes from here.
@@ -100,10 +125,21 @@ impl InGameMenuState {
             // B6 callback4F1A37..4F1A97 ignores IDCANCEL2. Its explicit
             // Resume686 and default IDOK1 resume instead.
             Self::AbortConfirm => Self::AbortConfirm,
-            // Options is a child of the menu.
-            Self::Options => Self::Menu,
-            Self::SavedGame(_) | Self::Sound => self,
-            Self::Keyboard => Self::Options,
+            // The 0x73 proc resolves its command by GetDlgCtrlID(lParam)
+            // (0x006581A7). IDCANCEL names no child window, so the id is 0:
+            // neither Return 0x423 nor in its box tables. Escape is ignored.
+            // The 0x10C proc keys Return the same way (0x0065F710).
+            // The 0xCF loop (0x007759E0 with 0x00623120) runs no
+            // IsDialogMessage, so Escape never reaches the proc.
+            Self::SavedGame(_)
+            | Self::Sound
+            | Self::Diplomacy
+            | Self::MissionBriefing
+            | Self::Page => self,
+            Self::Keyboard => Self::Menu,
+            // ShellMessageBox's callback 0x005D36A0 answers IDCANCEL with
+            // result 1: no surrender, state 0.
+            Self::Surrender => Self::Closed,
         }
     }
 }
@@ -125,6 +161,12 @@ pub enum AbortConfirmAction {
     Cancel,
     /// Leave — end the session through the graceful-exit route.
     Leave,
+    /// Campaign Restart — B6 result 5 (`0x004F196B`).
+    Restart,
+    /// LAN/WOL Leave while Observe is offered — B6 result 3.
+    LeaveDestruct,
+    /// LAN/WOL Observe — B6 result 4.
+    Observe,
 }
 
 /// What the app layer must do once a modal reports the player's choice.
@@ -134,8 +176,17 @@ pub enum ModalOutcome {
     Stay,
     /// Move the in-scenario state variable to this value.
     Enter(InGameMenuState),
-    /// End the running match by the graceful-exit route.
-    LeaveMatch,
+    /// End the running match by the graceful-exit route. `destruct` first
+    /// queues EVENT_DESTRUCT for the local House: the state machine's
+    /// result-3 arm (`0x0048CA34..0x0048CAA8`) queues it and falls into the
+    /// result-2 EXIT (`0x6471A0`).
+    LeaveMatch { destruct: bool },
+    /// Queue EVENT_DESTRUCT for the local House and keep watching: the
+    /// result-4 arm (`0x0048CAB2`) clears the admission latch without EXIT.
+    Observe,
+    /// Raise the scenario restart request: the state machine's result-5 arm
+    /// (`0x0048CB2E`) sets `0x008B41C0` and the modal state returns to 0.
+    RestartScenario,
 }
 
 /// The abort confirmation's button routes.
@@ -147,11 +198,14 @@ pub fn resolve_abort_action(action: AbortConfirmAction) -> ModalOutcome {
     match action {
         AbortConfirmAction::None => ModalOutcome::Stay,
         AbortConfirmAction::Cancel => ModalOutcome::Enter(InGameMenuState::Closed),
-        AbortConfirmAction::Leave => ModalOutcome::LeaveMatch,
+        AbortConfirmAction::Leave => ModalOutcome::LeaveMatch { destruct: false },
+        AbortConfirmAction::LeaveDestruct => ModalOutcome::LeaveMatch { destruct: true },
+        AbortConfirmAction::Restart => ModalOutcome::RestartScenario,
+        AbortConfirmAction::Observe => ModalOutcome::Observe,
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
 
@@ -161,7 +215,18 @@ mod tests {
         assert!(!InGameMenuState::Closed.is_open());
         assert!(InGameMenuState::Menu.is_open());
         assert!(InGameMenuState::AbortConfirm.is_open());
-        assert!(InGameMenuState::Options.is_open());
+        assert!(InGameMenuState::Keyboard.is_open());
+        assert!(InGameMenuState::Diplomacy.is_open());
+        assert!(InGameMenuState::MissionBriefing.is_open());
+    }
+
+    /// Dialogs 0x73 and 0x10C have no cancel path: only Return closes them.
+    #[test]
+    fn escape_keeps_diplomacy_and_the_briefing_open() {
+        for state in [InGameMenuState::Diplomacy, InGameMenuState::MissionBriefing] {
+            assert_eq!(state.on_escape(), state);
+            assert!(escape_belongs_to_modal_machine(state));
+        }
     }
 
     /// Doing nothing in the abort dialog leaves the modal where it was.
@@ -173,12 +238,11 @@ mod tests {
         );
     }
 
-    /// Options is a child of the menu: Game Controls enters it, and both ways
-    /// out of it — its own Back control and Escape — return to the menu (5 → 1)
-    /// rather than resuming the mission.
+    /// Keyboard is a child of the menu: Escape returns to the menu rather
+    /// than resuming the mission.
     #[test]
-    fn options_returns_to_the_menu_not_to_the_mission() {
-        assert_eq!(InGameMenuState::Options.on_escape(), InGameMenuState::Menu);
+    fn keyboard_returns_to_the_menu_not_to_the_mission() {
+        assert_eq!(InGameMenuState::Keyboard.on_escape(), InGameMenuState::Menu);
     }
 
     /// Explicit Resume ends at state 0, while native IDCANCEL is ignored.
@@ -199,7 +263,30 @@ mod tests {
     fn confirm_abort_leaves_the_match() {
         assert_eq!(
             resolve_abort_action(AbortConfirmAction::Leave),
-            ModalOutcome::LeaveMatch
+            ModalOutcome::LeaveMatch { destruct: false }
+        );
+    }
+
+    /// Network Leave with Observe offered destructs before EXIT; Observe
+    /// only destructs.
+    #[test]
+    fn network_leave_and_observe_destruct_the_local_house() {
+        assert_eq!(
+            resolve_abort_action(AbortConfirmAction::LeaveDestruct),
+            ModalOutcome::LeaveMatch { destruct: true }
+        );
+        assert_eq!(
+            resolve_abort_action(AbortConfirmAction::Observe),
+            ModalOutcome::Observe
+        );
+    }
+
+    /// Campaign Restart raises the restart request instead of leaving.
+    #[test]
+    fn campaign_restart_requests_a_scenario_restart() {
+        assert_eq!(
+            resolve_abort_action(AbortConfirmAction::Restart),
+            ModalOutcome::RestartScenario
         );
     }
 
@@ -217,7 +304,7 @@ mod tests {
         for open in [
             InGameMenuState::Menu,
             InGameMenuState::AbortConfirm,
-            InGameMenuState::Options,
+            InGameMenuState::Keyboard,
         ] {
             assert!(escape_belongs_to_modal_machine(open));
         }

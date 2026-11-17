@@ -37,7 +37,7 @@ impl Simulation {
     pub(crate) fn walk_stop_moving(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         frame_effects: FrameEffects<'_>,
     ) -> Result<(), String> {
         let actor = self
@@ -62,20 +62,19 @@ impl Simulation {
     pub(crate) fn run_walk_path_request(
         &mut self,
         request: &FootPathRequest,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> Result<bool, String> {
-        let rules = rules.ok_or("Walk path request requires rules")?;
         let id = request.entity_id;
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         //75AF69..8F arms the caller timer before Foot4D3920.
         self.substrate
             .entities
             .get_mut(id)
             .ok_or("retired Walk path requester")?
             .navigation
-            .path_runtime
+            .path_runtime_mut()
             .start_movement(frame, rules.general.path_delay_ticks());
         match self.foot_find_path(request, rules, registry, frame_effects)? {
             FindPathResult::Route => {
@@ -86,8 +85,8 @@ impl Simulation {
                     .get_mut(id)
                     .ok_or("retired Walk path requester")?
                     .navigation
-                    .path_runtime
-                    .set_retries_left(crate::sim::components::FootPathRuntime::RETRY_RELOAD);
+                    .path_runtime_mut()
+                    .reload_retries();
                 self.walk_short_path_receiver(id, rules)?;
                 Ok(true)
             }
@@ -136,14 +135,9 @@ impl Simulation {
             .entities
             .get(id)
             .ok_or("retired failed-path receiver")?;
-        let object = self
-            .object_type(actor.type_ref(), rules)
-            .ok_or("failed-path receiver requires the Infantry type")?;
-        let facts = super::infantry_action::DoActionType {
-            type_id: &object.id,
-            movement_zone: object.movement_zone,
-            crawls: object.crawls,
-        };
+        let facts =
+            super::infantry_action::DoActionType::of(&self.interner, actor.type_ref(), rules)
+                .ok_or("failed-path receiver requires the Infantry type")?;
         let doing = actor
             .mission_leaf
             .as_infantry()
@@ -158,7 +152,7 @@ impl Simulation {
         //0x51DB68..0x51DB7A: the 16-bit facing (+388) becomes an octant through
         //`((facing >> 12) + 1) >> 1 & 7`.
         let direction = i32::from(crate::util::direction_tables::dir_from_facing16(
-            actor.body_facing_current(self.session.binary_frame),
+            actor.body_facing_current(self.session.binary_frame()),
         ));
         let requested = failed_path_requested_action(doing, prone);
         self.apply_infantry_do_action(id, requested, false, &facts, rules, frame_effects)?;
@@ -206,7 +200,7 @@ impl Simulation {
             return Err("Stop_Driver requires a locomotor".into());
         }
         //0x4D55C0 -> ILocomotion +0x48.
-        self.locomotor_stop_moving(id, Some(rules), registry, frame_effects)
+        self.locomotor_stop_moving(id, rules, registry, frame_effects)
     }
 
     fn finish_failed_walk_process(
@@ -226,7 +220,7 @@ impl Simulation {
             .and_then(|l| l.walk_destination())
             .unwrap_or(DriveCoord { x: 0, y: 0, z: 0 });
         if !self.foot_path_zone_precheck(id, destination, rules)? {
-            self.assign_null_destination(id, Some(rules), None, frame_effects);
+            self.assign_null_destination(id, rules, None, frame_effects);
         } else {
             //75AFEE..75B083: +4F4 precedes a fresh read of physical+48 and
             //the live destination. CloseEnough is independent from code6's
@@ -249,8 +243,8 @@ impl Simulation {
                 current.z.wrapping_sub(destination.z),
             ) < rules.general.close_enough;
             if close && actor.tether.partner().is_none() {
-                self.assign_null_destination(id, Some(rules), None, frame_effects);
-            } else if actor.navigation.path_runtime.retries_left() != 0 {
+                self.assign_null_destination(id, rules, None, frame_effects);
+            } else if actor.navigation.path_runtime().retries_left() != 0 {
                 //The test is before the decrement: 1->0 does not run the
                 //exhaustion tail until a later failed Process invocation.
                 self.substrate
@@ -258,7 +252,7 @@ impl Simulation {
                     .get_mut(id)
                     .unwrap()
                     .navigation
-                    .path_runtime
+                    .path_runtime_mut()
                     .decrement_retries_left();
             } else {
                 self.finish_exhausted_walk_retry(id, rules, frame_effects)?;
@@ -271,10 +265,14 @@ impl Simulation {
             .ok_or("retired failed Walk actor")?;
         //75B2BC..75B2DC: all failed-queue exits set speed0 then Stop;
         //Stop does not itself clear NavCom or retire the paid head.
+        // Residual: the 75AFE3 arm above reaches 75B580 and calls only
+        // vt+480(0, 1) there, so speed and Stop run once more here. Trigger:
+        // a failed Find_Path whose zone precheck fails. Both writes repeat
+        // what the null destination did, with no visible effect.
         actor
             .foot_speed
             .set_speed_fraction(crate::util::fixed_math::SIM_ZERO);
-        self.walk_stop_moving(id, Some(rules), frame_effects)
+        self.walk_stop_moving(id, rules, frame_effects)
     }
 
     ///75B085..75B2BA, reached only with a preexisting zero retry count.
@@ -287,13 +285,13 @@ impl Simulation {
         rules: &RuleSet,
         frame_effects: FrameEffects<'_>,
     ) -> Result<(), String> {
-        self.play_foot_path_scold(id, rules);
+        Self::play_foot_path_scold(&self.substrate, &mut self.sound_events, id, rules);
         self.substrate
             .entities
             .get_mut(id)
             .ok_or("retired exhausted Walk actor")?
             .navigation
-            .path_runtime
+            .path_runtime_mut()
             .clear_scold_latch(); //75B0A9, even when the guard was zero.
         let actor = self
             .substrate
@@ -306,7 +304,7 @@ impl Simulation {
             .and_then(|loco| loco.walk_destination())
             .unwrap_or(DriveCoord { x: 0, y: 0, z: 0 });
         if actor.in_playfield() && !self.foot_can_reach_navigation_cell(id, destination, rules)? {
-            self.assign_null_destination(id, Some(rules), None, frame_effects);
+            self.assign_null_destination(id, rules, None, frame_effects);
         }
         //75B18A asks a nonnull target's+4C even when3D5 will then be false.
         let target = self
@@ -331,7 +329,7 @@ impl Simulation {
                 && actor.attack_target.target().is_some()
                 && !self.foot_can_reach_navigation_cell(id, coordinate, rules)?
             {
-                self.assign_target_represented(id, None, Some(rules), None, frame_effects)
+                self.assign_target_represented(id, None, rules, None, frame_effects)
                     .map_err(|error| format!("{error:?}"))?;
             }
         }
@@ -339,7 +337,7 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::*;
 

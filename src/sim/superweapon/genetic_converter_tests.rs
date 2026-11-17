@@ -15,7 +15,7 @@ use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::occupancy::CellListInsertion;
 use crate::sim::superweapon::chronosphere_tests::{
-    charge_super, click, place, retail_rules_with_sequences, step, world_with,
+    charge_super, click, place, retail_rules_binding, step, world_with,
 };
 use crate::sim::world::{SimSoundEvent, Simulation};
 use serde_json::Value;
@@ -94,7 +94,7 @@ fn anims_of<'a>(sim: &'a Simulation, name: &str) -> Vec<&'a crate::sim::anim_cla
         .anims
         .iter()
         .map(|(_, anim)| anim)
-        .filter(|anim| anim.type_id == type_id)
+        .filter(|anim| anim.type_id() == type_id)
         .collect()
 }
 
@@ -167,7 +167,7 @@ fn the_launch_matches_native() {
             let (x, y) = at(bridge);
             let terrain = sim.resolved_terrain.as_mut().unwrap();
             let index = terrain.index(x as u16, y as u16).unwrap();
-            terrain.cells[index].bridge_facts.raw_flags = BRIDGE_FLAG_STRUCTURAL;
+            terrain.cells_mut_for_test()[index].bridge_facts.raw_flags = BRIDGE_FLAG_STRUCTURAL;
         }
         // Prepended in reverse, each list ends in the row's order.
         let mut ids = vec![None; objects.len()];
@@ -190,13 +190,14 @@ fn the_launch_matches_native() {
         let charged = row["charged"] == true;
         if !charged {
             sim.super_weapons
+                .map_mut_for_test()
                 .get_mut(&owner)
                 .unwrap()
                 .get_mut(&sw_type)
                 .unwrap()
                 .is_ready = false;
         }
-        sim.sound_events.clear();
+        sim.sound_events.clear_for_test();
         let cell = (target.0 as u16, target.1 as u16);
         OBSERVED.set(Some(Vec::new()));
         let launched = launch(
@@ -216,11 +217,11 @@ fn the_launch_matches_native() {
         let native_anims: Vec<&Value> = events(row, "anim").collect();
         assert_eq!(rings.len(), native_anims.len(), "{row}");
         if let (Some(anim), Some(native)) = (rings.first(), native_anims.first()) {
-            let world = anim.world_coord;
+            let world = anim.world_coord();
             assert_eq!([world.x, world.y, world.z], coord(&native[2]), "{row}");
             // (delay, loopCount, drawFlags, zAdjust, reverse).
             assert_eq!(native[3], serde_json::json!([0, 1, 0x600, 0, 0]));
-            assert_eq!((anim.draw_flags, anim.z_adjust), (0x600, 0), "{row}");
+            assert_eq!((anim.draw_flags(), anim.z_adjust()), (0x600, 0), "{row}");
         }
 
         // PlayEVA and PlayAtCoord (one launch event), then
@@ -245,9 +246,11 @@ fn the_launch_matches_native() {
                 SimSoundEvent::SuperWeaponLaunched {
                     owner: by,
                     sw_type: kind,
-                    rx,
-                    ry,
-                } if *by == owner && *kind == sw_type && (*rx, *ry) == cell => {
+                    world,
+                } if *by == owner
+                    && *kind == sw_type
+                    && (world.to_cell_sub_z().0, world.to_cell_sub_z().1) == cell =>
+                {
                     Some("launched".to_string())
                 }
                 SimSoundEvent::RadarEvent { radar } => Some(format!(
@@ -258,6 +261,25 @@ fn the_launch_matches_native() {
             })
             .collect();
         assert_eq!(pushed, lines, "{row}");
+        // PlayAtCoord's full coordinate, deck height included.
+        let sound: Vec<[i32; 3]> = row["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event[0] == "play_at")
+            .map(|event| [int(&event[2][0]), int(&event[2][1]), int(&event[2][2])])
+            .collect();
+        let played: Vec<[i32; 3]> = sim
+            .sound_events
+            .iter()
+            .filter_map(|event| match *event {
+                SimSoundEvent::SuperWeaponLaunched {
+                    owner: by, world, ..
+                } if by == owner => Some([world.x, world.y, world.z]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(played, sound, "{row}");
 
         let warhead = sim.interner.intern("Mutate");
         let explosion = sim.interner.intern("MutateExplosion");
@@ -267,8 +289,8 @@ fn the_launch_matches_native() {
             match event[0].as_str().unwrap() {
                 "cell" => looked = (int(&event[1][0]) as i16, int(&event[1][1]) as i16),
                 "area_damage" => {
-                    // No source, MutateExplosionWarhead=, affectsTiberium 0
-                    // (module RESIDUAL), the Super's house.
+                    // No source, MutateExplosionWarhead=, affectsTiberium 0,
+                    // the Super's house.
                     assert_eq!(int(&event[3]), 0);
                     assert_eq!(event[4], true);
                     assert_eq!(int(&event[5]), 0);
@@ -386,7 +408,9 @@ fn the_mutation_arm_matches_native() {
             let terrain = sim.resolved_terrain.as_mut().unwrap();
             let index = terrain.index(cell.0, cell.1).unwrap();
             let foot = row["foot_cost"].as_f64().unwrap();
-            terrain.cells[index].speed_costs.foot = Some((foot * 100.0) as u8);
+            terrain.cells_mut_for_test()[index].speed_costs.foot = Some(
+                crate::util::native_x87::NativeF32Bits::from_bits((foot as f32).to_bits()),
+            );
         }
         let victim = sim
             .construct_object_limbo_at_height(
@@ -481,8 +505,8 @@ fn the_mutation_arm_matches_native() {
             let [anim] = mutants[..] else {
                 panic!("one InfantryMutate anim: {row}");
             };
-            assert_eq!(anim.world_coord, AnimWorldCoord { x, y, z }, "{row}");
-            assert_eq!((anim.draw_flags, anim.z_adjust), (0x600, 0), "{row}");
+            assert_eq!(anim.world_coord(), AnimWorldCoord { x, y, z }, "{row}");
+            assert_eq!((anim.draw_flags(), anim.z_adjust()), (0x600, 0), "{row}");
             let owner = match row["anim_owner"].as_str() {
                 Some("source") => Some(russians),
                 Some("house") => Some(americans),
@@ -572,6 +596,12 @@ fn the_make_infantry_end_matches_native() {
                 .collect::<String>(),
         );
         let mut rules = RuleSet::from_ini(&IniFile::from_str(&ini)).unwrap();
+        // Ares AnimClass_Update (1005C3E0, hook 0x424B23) ends the anim on a
+        // refused Unlimbo; `anim_class` tests that arm. The row still counts.
+        if rules.ares() && row["unlimbo"] == false && row["end"] != "uninit" {
+            compared += 1;
+            continue;
+        }
         let mut art = crate::rules::art_data::ArtRegistry::from_ini(&IniFile::from_str(
             "[GENDEATH]\nRate=900\nMakeInfantry=0\n",
         ));
@@ -584,8 +614,7 @@ fn the_make_infantry_end_matches_native() {
 
         let cell = ((x.max(0) / 256) as u16, (y / 256) as u16);
         let (rules, mut sim, _) = world_with(rules, 64, &[(cell, 2)]);
-        sim.houses.clear();
-        sim.session.house_order.clear();
+        sim.houses.clear_for_test();
         let houses: Vec<InternedId> = rows(row, "houses")
             .iter()
             .enumerate()
@@ -596,16 +625,15 @@ fn the_make_infantry_end_matches_native() {
                     ["Americans", "Russians", "YuriCountry", "Neutral"][usize::from(side)];
                 let country = sim.interner.intern(country);
                 let mut state = HouseState::new(id, side, Some(country), house[2] == true, 0, 10);
-                state.is_defeated = house[1] == true;
-                sim.houses.insert(id, state);
-                sim.session.house_order.push(id);
+                state.set_is_defeated_for_test(house[1] == true);
+                sim.houses.register(state);
                 id
             })
             .collect();
         if row["bridge"] == true {
             let terrain = sim.resolved_terrain.as_mut().unwrap();
             let index = terrain.index(cell.0, cell.1).unwrap();
-            terrain.cells[index].bridge_facts.raw_flags = BRIDGE_FLAG_STRUCTURAL;
+            terrain.cells_mut_for_test()[index].bridge_facts.raw_flags = BRIDGE_FLAG_STRUCTURAL;
         }
         if row["unlimbo"] == false {
             sim.substrate.raw_cell_occupation.mark_ground(
@@ -617,13 +645,14 @@ fn the_make_infantry_end_matches_native() {
         let anim = super::super::spawn_super_anim(&mut sim, &rules, "GENDEATH", [x, y, z])
             .expect("the MakeInfantry anim");
         if let Some(owner) = row["owner"].as_u64() {
-            sim.set_anim_owner_house(anim, houses[owner as usize]);
+            sim.substrate
+                .set_anim_owner_house(anim, houses[owner as usize]);
         }
         sim.substrate
             .anims
             .get_mut(anim)
             .unwrap()
-            .runtime
+            .runtime_mut_for_test()
             .current_frame = int(&row["stage"]);
         let before: BTreeSet<u64> = sim.substrate.entities.keys_sorted().into_iter().collect();
 
@@ -638,7 +667,7 @@ fn the_make_infantry_end_matches_native() {
         assert_eq!(ends, row["end"] == "uninit", "{row}");
         if !ends {
             assert_eq!(
-                sim.anim(anim).unwrap().runtime.current_frame,
+                sim.anim(anim).unwrap().runtime().current_frame,
                 int(&row["stage_after"]),
                 "{row}"
             );
@@ -715,7 +744,7 @@ fn a_dog_dies_with_die1_instead_of_mutating() {
 
 /// Retail rules with the launch's anims and the infantry sequences bound.
 fn retail_rules() -> Option<RuleSet> {
-    retail_rules_with_sequences(&[("RING1", 15), ("GENDEATH", 20)])
+    retail_rules_binding(&[("RING1", 15), ("GENDEATH", 20)])
 }
 
 /// Steps until no GENDEATH anim is left, at most `frames` frames.
@@ -787,7 +816,8 @@ fn retail_mutator_turns_conscripts_into_the_players_brutes() {
 
     assert!(sim.sound_events.iter().any(|event| matches!(
         event,
-        SimSoundEvent::SuperWeaponLaunched { owner, rx: 40, ry: 40, .. } if *owner == americans
+        SimSoundEvent::SuperWeaponLaunched { owner, world, .. }
+            if *owner == americans && world.to_cell_sub_z().0 == 40 && world.to_cell_sub_z().1 == 40
     )));
     for &id in &conscripts {
         assert!(
@@ -840,7 +870,10 @@ fn retail_computer_mutator_leaves_hunting_brutes() {
     };
     let (rules, mut sim, americans) = world_with(rules, 64, &[]);
     let russians = sim.interner.intern("Russians");
-    sim.houses.get_mut(&russians).unwrap().enemy_house = Some(americans);
+    sim.houses
+        .get_mut(&russians)
+        .unwrap()
+        .set_enemy_house_for_test(Some(americans));
     for (x, y) in [(30, 30), (31, 30), (30, 31), (31, 31)] {
         sim.spawn_object_at_height("E1", "Americans", x, y, 0, 0, &rules)
             .unwrap();
@@ -938,7 +971,15 @@ fn a_fourth_infantryman_at_a_full_cells_centre_mutates() {
     // The fourth moves to the centre of (40, 40), behind the three on its list.
     let [x, y] =
         ground_pose::position_world_xy(&sim.substrate.entities.get(fourth).unwrap().position);
-    assert!(sim.object_raw_receiver_at(fourth, DriveCoord { x, y, z: 0 }, false));
+    assert!(Simulation::object_raw_receiver_at(
+        &mut sim.substrate,
+        &sim.path_grid,
+        &sim.resolved_terrain,
+        fourth,
+        DriveCoord { x, y, z: 0 },
+        false,
+        rules.ares_form()
+    ));
     let occupancy = &mut sim.substrate.occupancy;
     occupancy.move_entity(
         41,
@@ -973,7 +1014,15 @@ fn a_fourth_infantryman_at_a_full_cells_centre_mutates() {
         entity.position.put_location(centre);
         entity.set_sub_cell(Some(0));
     }
-    assert!(sim.object_raw_receiver_at(fourth, centre, true));
+    assert!(Simulation::object_raw_receiver_at(
+        &mut sim.substrate,
+        &sim.path_grid,
+        &sim.resolved_terrain,
+        fourth,
+        centre,
+        true,
+        rules.ares_form()
+    ));
     let listed: Vec<u64> = sim
         .substrate
         .occupancy

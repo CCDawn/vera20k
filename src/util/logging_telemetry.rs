@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use crate::util::time::Instant;
 
 const CAPACITY: usize = 4_000;
 const MESSAGE_BYTES: usize = 2_048;
@@ -114,7 +114,7 @@ pub(super) fn record(level: log::Level, target: &str, message: &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_util))]
 mod tests {
     use super::*;
 

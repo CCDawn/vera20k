@@ -3,7 +3,9 @@
 //! FootClass add/remove/move/owner writers are at 0x004D7318, 0x004DB376,
 //! 0x004D8611/0x004D8621, and 0x004DBEFB/0x004DBF81. Building sensor arrays
 //! use 0x00455820/0x004556D0 and deliberately add with `SensorsSight=` but
-//! remove with the signed-byte `CloakRadiusInCells=` value.
+//! remove with the signed-byte `CloakRadiusInCells=` value. The building add
+//! is gated on Is_Operational and the remove is not, so a building whose
+//! opening stamped nothing still debits its owner when it leaves the map.
 
 use crate::map::entities::EntityCategory;
 use crate::rules::object_type::{ObjectCategory, ObjectType};
@@ -13,92 +15,44 @@ use crate::sim::intern::InternedId;
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::world::Simulation;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SensorDeposit {
-    /// The house the circle was stamped FOR — native reads
-    /// `this->Owner->ArrayIndex` live at add time and has no such cache. It is
-    /// a record of the add, not the removal's authority: every native remove
-    /// re-reads the live owner (`0x00455980`, `0x004556D0`, `0x004DE940`), so
-    /// `remove_cached_sensor_deposit` must not consult this field.
-    owner: InternedId,
-    center: (u16, u16),
-    add_radius: u16,
-    remove_radius: i16,
-    building_array: bool,
-    /// `DetectDisguiseRange=` (`TechnoTypeClass+0x5F4`) circle stamped by
-    /// `BuildingClass::AddDetectDisguiseAt @ 0x00455A80` alongside the sensor
-    /// array. Unlike the sensor array, its paired
-    /// `RemoveDetectDisguiseAt @ 0x00455980` reads the SAME field back
-    /// (`0x00455991` loads `+0x5F4`), so add and remove are symmetric and one
-    /// radius suffices.
-    #[serde(default)]
-    detect_disguise_radius: u16,
-}
+/// Ares BuildingExt+4C SensorArrayActiveCounter: Activate (10016D60) counts
+/// every call and adds the sensors only from zero; Deactivate (10016DB0)
+/// removes them only while the count is positive, then clears it.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub(crate) struct SensorArrayCounter(i32);
 
-impl SensorDeposit {
-    /// The house the circle was stamped for.
-    pub(crate) fn owner(&self) -> InternedId {
-        self.owner
+impl SensorArrayCounter {
+    /// Counts one activation; true when it was the first, so the sensors go up.
+    fn activate(&mut self) -> bool {
+        let was = self.0;
+        self.0 = was.wrapping_add(1);
+        was == 0
     }
 
-    /// The stamped cell.
-    pub(crate) fn center(&self) -> (u16, u16) {
-        self.center
-    }
-
-    /// The add radius.
-    pub(crate) fn add_radius(&self) -> u16 {
-        self.add_radius
-    }
-
-    /// The remove radius.
-    pub(crate) fn remove_radius(&self) -> i16 {
-        self.remove_radius
-    }
-
-    /// A building's sensor array, not a unit's.
-    pub(crate) fn building_array(&self) -> bool {
-        self.building_array
-    }
-
-    /// The `DetectDisguiseRange=` circle's radius.
-    pub(crate) fn detect_disguise_radius(&self) -> u16 {
-        self.detect_disguise_radius
-    }
-
-    /// Install a fixture's stamped cell.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn set_center_for_test(&mut self, center: (u16, u16)) {
-        self.center = center;
-    }
-
-    /// A unit sensor array's deposit: one radius for the add and the remove.
-    pub(crate) fn unit(owner: InternedId, center: (u16, u16), radius: u16) -> Self {
-        Self {
-            owner,
-            center,
-            add_radius: radius,
-            remove_radius: radius as i16,
-            building_array: false,
-            detect_disguise_radius: 0,
+    /// True when the count was positive, so the sensors come down; the count
+    /// is then cleared. A zero or wrapped negative count is kept.
+    fn deactivate(&mut self) -> bool {
+        if self.0 <= 0 {
+            return false;
         }
+        self.0 = 0;
+        true
     }
 
-    fn building(
-        owner: InternedId,
-        center: (u16, u16),
-        add: u16,
-        remove: i8,
-        detect_disguise_radius: u16,
-    ) -> Self {
-        Self {
-            owner,
-            center,
-            add_radius: add,
-            remove_radius: i16::from(remove),
-            building_array: true,
-            detect_disguise_radius,
-        }
+    pub(crate) fn is_active(self) -> bool {
+        self.0 > 0
+    }
+
+    pub(crate) fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    #[cfg(test)]
+    fn count(self) -> i32 {
+        self.0
     }
 }
 
@@ -115,6 +69,64 @@ fn unit_sensor_radius(entity_category: EntityCategory, object: &ObjectType) -> O
 }
 
 impl Simulation {
+    fn unit_sensor_parameters(
+        &self,
+        id: u64,
+        rules: &RuleSet,
+    ) -> Option<(InternedId, (u16, u16), u16)> {
+        let entity = self.substrate.entities.get(id)?;
+        let object = self.entity_object_type(entity, rules)?;
+        Some((
+            entity.owner(),
+            (entity.position.rx(), entity.position.ry()),
+            unit_sensor_radius(entity.category(), object)?,
+        ))
+    }
+
+    /// FootClass::RemoveSensorsAt @ 0x004DE940 reads the live type and
+    /// owner. NullCell resolves current GetCoords; PerCell supplies +55C.
+    /// No deposit-presence check may suppress the native counter operation.
+    fn remove_unit_sensors_at(
+        &mut self,
+        id: u64,
+        cell: Option<(i16, i16)>,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+    ) {
+        let Some((owner, current, radius)) = self.unit_sensor_parameters(id, rules) else {
+            return;
+        };
+        let center = cell.map_or(current, |(x, y)| (x as u16, y as u16));
+        self.apply_unit_sensor_remove(owner, center, radius, rules, registry);
+    }
+
+    /// FootClass::AddSensorsAt @ 0x004DE7B0 adds at the freshly sampled
+    /// current cell. It neither removes an earlier add nor changes +55C.
+    /// A non-Foot object or a type without a sensor radius makes no deposit.
+    /// `FootClass::Unlimbo @ 0x004D7170` calls it last (`0x004D7318`), from
+    /// the shared reveal tail.
+    pub(crate) fn add_unit_sensors_at_current(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+    ) {
+        let Some((owner, center, radius)) = self.unit_sensor_parameters(id, rules) else {
+            return;
+        };
+        self.apply_sensor_add(owner, center, radius, rules, registry);
+    }
+
+    /// Foot Limbo4DB376 and ChangeOwner4DBEFB remove at current coordinates,
+    /// even when an airborne sensor circle was last added elsewhere.
+    pub(crate) fn remove_unit_sensors_at_current(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+    ) {
+        self.remove_unit_sensors_at(id, None, rules, registry);
+    }
     fn sensor_residents_in_native_order(&self, cell: (u16, u16)) -> Vec<u64> {
         self.substrate
             .occupancy
@@ -144,12 +156,9 @@ impl Simulation {
     fn sensor_reevaluate_residents(
         &mut self,
         cell: (u16, u16),
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
     ) -> Vec<u64> {
-        let Some(rules) = rules else {
-            return Vec::new();
-        };
         // Add/RemoveSensorsAt @ 0x004DE7B0/0x004DE940 and the BuildingClass
         // variants walk CellClass::FirstObject head-to-tail after mutating this
         // exact cell. OccupancyGrid's ground list is that authoritative order.
@@ -167,7 +176,7 @@ impl Simulation {
         owner: InternedId,
         center: (u16, u16),
         radius: u16,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
     ) -> Vec<u64> {
         let mut callbacks = Vec::new();
@@ -183,7 +192,7 @@ impl Simulation {
         owner: InternedId,
         center: (u16, u16),
         radius: u16,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
     ) -> Vec<u64> {
         let mut callbacks = Vec::new();
@@ -205,7 +214,7 @@ impl Simulation {
         owner: InternedId,
         center: (u16, u16),
         radius: u16,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
     ) -> Vec<u64> {
         let mut callbacks = Vec::new();
@@ -217,140 +226,39 @@ impl Simulation {
         callbacks
     }
 
-    /// Every native remove takes its house index from `this->Owner->ArrayIndex`
-    /// at REMOVAL time, never from anything recorded when the circle was
-    /// stamped. `BuildingClass::RemoveDetectDisguiseAt @ 0x00455980` opens with
-    /// `0045598A MOV EDX,[ECX+0x21C]` / `004559A1 MOV EAX,[EDX+0x30]`;
-    /// `BuildingClass::RemoveSensorArrayAt @ 0x004556D0` and
-    /// `FootClass::RemoveSensorsAt @ 0x004DE940` open with the identical
-    /// `*(int *)(param_1[0x87] + 0x30)` read, and so do both adds
-    /// (`0x00455820`, `0x00455A80`). `TechnoClass::ChangeOwner @ 0x007014A0`
-    /// overwrites that pointer (`param_1[0x87] = param_2`), so the live owner
-    /// is whoever holds the object now.
+    /// `BuildingClass::Place @ 0x00445F80`'s sensor arm, inside its first-opening
+    /// block (`0x00445FD0` skips it for a placed building, so a capture's
+    /// `Place(1)` stamps nothing): `SensorArray=` (`Type+0x16C8`, `0x0044678B`)
+    /// dispatches vt+0x4F4 `AddSensorArrayAt @ 0x00455820` at `0x004467A1`, then
+    /// `DetectDisguise=` (`+0xD31`, `0x004467AD`) vt+0x4FC
+    /// `AddDetectDisguiseAt @ 0x00455A80` at `0x004467C3`. These are the only
+    /// dispatches of either slot. Place passes the empty cell (`0x0089C818`),
+    /// so both centre on vt+0x48 `BuildingClass::GetCoords @ 0x00447AC0`, the
+    /// foundation centre (`0x0045587F`, `0x00455ADF`).
     ///
-    /// For units the two agree: `FootClass::ChangeOwner @ 0x004DBED0` dispatches
-    /// the remove (`vt+0x4EC`) BEFORE the pointer flip and the add
-    /// (`vt+0x4E8`) after, and VERA calls
-    /// `transfer_sensor_before_owner_change` from the same slot. For BUILDINGS
-    /// they diverge permanently, and that asymmetry is native map state:
-    /// construction credits the builder, `ChangeOwner` dispatches neither add
-    /// nor remove, and Limbo debits the CAPTOR. See the residual on
-    /// `transfer_sensor_before_owner_change_inner`.
-    fn remove_cached_sensor_deposit(
-        &mut self,
-        stable_id: u64,
-        rules: Option<&RuleSet>,
-        registry: Option<&OverlayTypeRegistry>,
-    ) -> Option<SensorDeposit> {
-        let (deposit, remove_owner) =
-            self.substrate
-                .entities
-                .get_mut(stable_id)
-                .and_then(|entity| {
-                    let deposit = entity.sensor_deposit.take()?;
-                    Some((deposit, entity.owner()))
-                })?;
-        if deposit.detect_disguise_radius > 0 {
-            // `BuildingClass::RemoveDetectDisguiseAt @ 0x00455980`, reached
-            // ONLY from `BuildingClass::Limbo` — `0x00445A58` reads
-            // `TechnoTypeClass+0xD31` (`DetectDisguise=`) and `0x00445A6C`
-            // dispatches vtable `+0x500`. It walks the same circle it stamped
-            // and decrements `CellClass+0xAC[house]`; no resident callback is
-            // issued. `search_instructions "call [..+0x500]"` returns that one
-            // BuildingClass site program-wide, which is why the owner-change
-            // path below must not come through here.
-            self.fog.disguise_detect_remove_at(
-                remove_owner,
-                deposit.center,
-                deposit.detect_disguise_radius,
-            );
-        }
-        if deposit.building_array {
-            // A building that stamped only a disguise-detect circle never added
-            // sensor counts, so it must not run the asymmetric
-            // `CloakRadiusInCells=` decrement and manufacture negative fringe
-            // counts. VERA-internal guard; gamemd dispatches the two removals
-            // from separate vtable slots and the pairing is UNCHECKED, but no
-            // stock building reaches this case (NAPSIS carries both keys).
-            if deposit.add_radius > 0 {
-                self.apply_building_sensor_remove(
-                    remove_owner,
-                    deposit.center,
-                    deposit.remove_radius.max(0) as u16,
-                    rules,
-                    registry,
-                );
-            }
-        } else {
-            self.apply_unit_sensor_remove(
-                remove_owner,
-                deposit.center,
-                deposit.remove_radius.max(0) as u16,
-                rules,
-                registry,
-            );
-        }
-        Some(deposit)
-    }
-
-    /// `FootClass::Unlimbo` sensor writer. The deposit is absent for a
-    /// rules-less/headless fixture and for non-Foot objects.
-    /// `FootClass::Unlimbo @ 0x004D7170`'s sensor add (vt+0x4E8 at `0x004D7318`), at
-    /// the cell of the object it took out of limbo.
-    pub(crate) fn add_unit_sensor_after_unlimbo(
-        &mut self,
-        stable_id: u64,
-        rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
-    ) {
-        let Some((owner, center, radius, in_limbo)) =
-            self.substrate.entities.get(stable_id).and_then(|entity| {
-                let object = self.interner.object_type(entity.type_ref(), rules)?;
-                Some((
-                    entity.owner(),
-                    (entity.position.rx(), entity.position.ry()),
-                    unit_sensor_radius(entity.category(), object)?,
-                    entity.lifecycle.in_limbo(),
-                ))
-            })
-        else {
-            return;
-        };
-        if in_limbo {
-            return;
-        }
-        let _ = self.remove_cached_sensor_deposit(stable_id, Some(rules), registry);
-        self.apply_sensor_add(owner, center, radius, Some(rules), registry);
-        if let Some(entity) = self.substrate.entities.get_mut(stable_id) {
-            entity.sensor_deposit = Some(SensorDeposit::unit(owner, center, radius));
-        }
-    }
-
-    /// `BuildingClass::AddSensorArrayAt @ 0x00455820` and its sibling
-    /// `BuildingClass::AddDetectDisguiseAt @ 0x00455A80`, used only after map
-    /// initialization or construction completion and only while powered — both
-    /// open with the same `vt+0x350` powered test, and
-    /// `BuildingClass::OnConstructionComplete` dispatches them from adjacent
-    /// slots: `+0x4F4` at `0x004467A1` (sensor array) and `+0x4FC` at
-    /// `0x004467C3` (disguise circle), the latter reached only after
-    /// `0x004467AD` reads `TechnoTypeClass+0xD31` (`DetectDisguise=`). The
-    /// BuildingClass vtable block at `0x007E43B0` is
-    /// `[+0x4F4]=0x00455820` add, `[+0x4F8]=0x004556D0` remove,
-    /// `[+0x4FC]=0x00455A80` disguise add, `[+0x500]=0x00455980` disguise
-    /// remove — `+0x4F8` is the sensor REMOVE, dispatched from
-    /// `BuildingClass::Limbo @ 0x00445A4C`.
+    /// Both adds open with vt+0x350 `Is_Operational_For_Output @ 0x004555D0`
+    /// (`0x0045582A`, `0x00455A8A`) and stamp nothing when it refuses, so any
+    /// first opening that passes Is_Operational stamps. It refuses an effective
+    /// Construction mission, which is current when Mission_Construction opens a
+    /// built building (`0x00449AD4`), so a built one never stamps. Unlimbo's
+    /// CellPUT `DiscoveredBy(PlayerPtr)` runs before Added_To_Game
+    /// (`0x006F6D8F`) and Enter_Idle_Mode (`0x006F6E2A`), so a human-owned
+    /// SpawnBuilding or a human map building read before any other draining
+    /// building of its house can pass too. The resident `+0x420` callbacks of
+    /// the sensor add cannot change the building's own operational facts, so
+    /// one sample serves both adds.
     ///
     /// Stock authors: NAPSIS is the only building that stamps a disguise-detect
     /// circle, because `DetectDisguiseRange=` defaults to zero
     /// (`TechnoTypeClass::Constructor @ 0x0071100E`) and YAPSYT / NAPSYB carry
     /// `DetectDisguise=yes` without a range.
-    pub(crate) fn add_building_sensor_array_if_powered(
+    pub(crate) fn add_building_sensor_circles_at_opening(
         &mut self,
         stable_id: u64,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
     ) {
-        let Some((owner, center, sight, remove_radius, detect_radius, powered, in_limbo)) =
+        let Some((owner, center, sight, detect_radius)) =
             self.substrate.entities.get(stable_id).and_then(|entity| {
                 let object = self.interner.object_type(entity.type_ref(), rules)?;
                 if entity.category() != EntityCategory::Structure
@@ -358,73 +266,237 @@ impl Simulation {
                 {
                     return None;
                 }
-                let sight = if object.sensor_array {
-                    u16::from(object.sensors_sight)
-                } else {
-                    0
-                };
-                let detect_radius = if object.detect_disguise {
-                    u16::from(object.detect_disguise_range)
-                } else {
-                    0
-                };
-                if sight == 0 && detect_radius == 0 {
-                    return None;
-                }
                 Some((
                     entity.owner(),
-                    (entity.position.rx(), entity.position.ry()),
-                    sight,
-                    object.cloak_radius_in_cells,
-                    detect_radius,
-                    crate::sim::power_system::is_building_powered(
-                        &self.power_states,
-                        rules,
-                        entity,
-                        &self.interner,
-                    ),
-                    entity.lifecycle.in_limbo(),
+                    crate::sim::world::object_get_coords_cell(entity)?,
+                    object
+                        .sensor_array
+                        .then_some(u16::from(object.sensors_sight)),
+                    object
+                        .detect_disguise
+                        .then_some(u16::from(object.detect_disguise_range)),
                 ))
             })
         else {
             return;
         };
-        if !powered || in_limbo {
+        // Ares SensorArrayActivate10016D60 (hook455828) replaces the array's
+        // Is_Operational gate with its own, counted one.
+        let sight = if rules.ares_form() {
+            if sight.is_some() {
+                self.ares_sensor_array_activate(stable_id, rules, registry);
+            }
+            None
+        } else {
+            sight
+        };
+        if (sight.is_none() && detect_radius.is_none())
+            || self.building_operational_state(stable_id, rules) != Some(true)
+        {
             return;
         }
-        let _ = self.remove_cached_sensor_deposit(stable_id, Some(rules), registry);
-        if sight > 0 {
-            self.apply_sensor_add(owner, center, sight, Some(rules), registry);
+        if let Some(sight) = sight {
+            self.apply_sensor_add(owner, center, sight, rules, registry);
         }
-        if detect_radius > 0 {
+        if let Some(radius) = detect_radius {
             // The disguise-detect walk issues no resident `+0x420` callback —
             // it only increments `CellClass+0xAC[house]`.
-            self.fog
-                .disguise_detect_add_at(owner, center, detect_radius);
-        }
-        if let Some(entity) = self.substrate.entities.get_mut(stable_id) {
-            entity.sensor_deposit = Some(SensorDeposit::building(
-                owner,
-                center,
-                sight,
-                remove_radius,
-                detect_radius,
-            ));
+            self.fog.disguise_detect_add_at(owner, center, radius);
         }
     }
 
-    /// Exact cached remove used by Foot/Building Limbo.
-    pub(crate) fn remove_sensor_before_limbo(&mut self, stable_id: u64) {
-        let _ = self.remove_cached_sensor_deposit(stable_id, None, None);
-    }
-
-    pub(crate) fn remove_sensor_before_limbo_with_rules(
+    /// `BuildingClass::Limbo @ 0x00445880`'s sensor removals, reached only for a
+    /// building not already in limbo (`0x004458C6` reads `+0x81`) and outside
+    /// the placement scope (`0x00445A2A` tests `0xA8E7AC`): `SensorArray=`
+    /// dispatches vt+0x4F8 `RemoveSensorArrayAt @ 0x004556D0` at `0x00445A4C`,
+    /// then `DetectDisguise=` vt+0x500 `RemoveDetectDisguiseAt @ 0x00455980` at
+    /// `0x00445A6C`, both centred on GetCoords like the adds (`0x0045571C`,
+    /// `0x004559CB`). Neither has the add's Is_Operational gate or any record of
+    /// a stamp, and both decrement with a bare signed-word `DEC` (`0x00487160`,
+    /// `0x00487180`) — no clamp. A building that stamped nothing (any built
+    /// one) therefore leaves its owner at -1 over `CloakRadiusInCells=` (signed
+    /// byte `Type+0x1707`, read live) and over `DetectDisguiseRange=`.
+    ///
+    /// Every remove takes its house from `this->Owner->ArrayIndex` at removal
+    /// time (`0x004556DA`, `0x0045598A`). BuildingChangeOwner448260 and
+    /// Techno7014A0 dispatch no sensor slot, so after a capture the first owner
+    /// keeps its circles and Limbo debits the captor. Preserve that native
+    /// counter asymmetry.
+    pub(crate) fn remove_building_sensor_before_limbo(
         &mut self,
         stable_id: u64,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
     ) {
-        let _ = self.remove_cached_sensor_deposit(stable_id, Some(rules), registry);
+        if self.object_placement_scope_active() {
+            return;
+        }
+        let Some((owner, center, cloak_radius, detect_radius)) =
+            self.substrate.entities.get(stable_id).and_then(|entity| {
+                if entity.category() != EntityCategory::Structure || entity.lifecycle.in_limbo() {
+                    return None;
+                }
+                let object = self.interner.object_type(entity.type_ref(), rules)?;
+                Some((
+                    entity.owner(),
+                    crate::sim::world::object_get_coords_cell(entity)?,
+                    object.sensor_array.then_some(object.cloak_radius_in_cells),
+                    object
+                        .detect_disguise
+                        .then_some(u16::from(object.detect_disguise_range)),
+                ))
+            })
+        else {
+            return;
+        };
+        // Ares SensorArrayDeactivate10016DB0 (hook4556E1) removes only an
+        // active array, with the SensorsSight its add used.
+        let cloak_radius = if rules.ares_form() {
+            if cloak_radius.is_some() {
+                self.ares_sensor_array_deactivate(stable_id, rules, registry);
+            }
+            None
+        } else {
+            cloak_radius
+        };
+        if let Some(radius) = cloak_radius {
+            self.apply_building_sensor_remove(owner, center, radius.max(0) as u16, rules, registry);
+        }
+        if let Some(radius) = detect_radius {
+            // No resident callback, as for the add.
+            self.fog.disguise_detect_remove_at(owner, center, radius);
+        }
+    }
+
+    /// Ares BuildingClass_SensorArrayActivate10016D60 (hook455828), the body
+    /// of AddSensorArrayAt455820: an online (vt+0x350, the shared4555D0
+    /// adapter), not Deactivated building counts the call in BuildingExt+4C
+    /// and adds its SensorsSight circle only when the count was zero.
+    pub(crate) fn ares_sensor_array_activate(
+        &mut self,
+        stable_id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+    ) {
+        if self.building_operational_state(stable_id, rules) != Some(true) {
+            return;
+        }
+        let Some(entity) = self.substrate.entities.get_mut(stable_id) else {
+            return;
+        };
+        if entity.deactivated.is_offline() {
+            return;
+        }
+        if !entity.ares.sensor_array_counter.activate() {
+            return;
+        }
+        let Some((owner, center, sight)) =
+            self.substrate.entities.get(stable_id).and_then(|entity| {
+                Some((
+                    entity.owner(),
+                    crate::sim::world::object_get_coords_cell(entity)?,
+                    self.interner
+                        .object_type(entity.type_ref(), rules)?
+                        .sensors_sight,
+                ))
+            })
+        else {
+            return;
+        };
+        self.apply_sensor_add(owner, center, u16::from(sight), rules, registry);
+    }
+
+    /// Ares BuildingClass_SensorArrayDeactivate10016DB0 (hook4556E1), the
+    /// body of RemoveSensorArrayAt4556D0: only a positive count removes, with
+    /// SensorsSight rather than CloakRadiusInCells, and clears the count.
+    pub(crate) fn ares_sensor_array_deactivate(
+        &mut self,
+        stable_id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+    ) {
+        let Some(entity) = self.substrate.entities.get_mut(stable_id) else {
+            return;
+        };
+        if !entity.ares.sensor_array_counter.deactivate() {
+            return;
+        }
+        let Some((owner, center, sight)) =
+            self.substrate.entities.get(stable_id).and_then(|entity| {
+                Some((
+                    entity.owner(),
+                    crate::sim::world::object_get_coords_cell(entity)?,
+                    self.interner
+                        .object_type(entity.type_ref(), rules)?
+                        .sensors_sight,
+                ))
+            })
+        else {
+            return;
+        };
+        self.apply_building_sensor_remove(owner, center, u16::from(sight), rules, registry);
+    }
+
+    /// Ares BuildingExt::UpdateSensorArray, reached for `SensorArray=` types
+    /// from Building Update (hook43FE69), both operational edges (hooks4549F8
+    /// and454B5F, 10016E30) and DisableStuff (hook4524A3, 10016D00): an
+    /// online, not Deactivated array is active; a change activates or
+    /// deactivates it.
+    pub(crate) fn update_ares_sensor_array(
+        &mut self,
+        stable_id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+    ) {
+        let Some(entity) = self.substrate.entities.get(stable_id) else {
+            return;
+        };
+        if entity.category() != EntityCategory::Structure
+            || !self
+                .interner
+                .object_type(entity.type_ref(), rules)
+                .is_some_and(|object| object.sensor_array)
+        {
+            return;
+        }
+        let was_active = entity.ares.sensor_array_counter.is_active();
+        let active = !entity.deactivated.is_offline()
+            && self.building_operational_state(stable_id, rules) == Some(true);
+        if active == was_active {
+            return;
+        }
+        if active {
+            self.ares_sensor_array_activate(stable_id, rules, registry);
+        } else {
+            self.ares_sensor_array_deactivate(stable_id, rules, registry);
+        }
+    }
+
+    /// Ares ChangeOwnership_SensorArrayA/Destroy_SensorArray10016CA0 and
+    /// ChangeOwnership_SensorArrayB10016CD0: a `SensorArray=` building
+    /// dispatches RemoveSensorArrayAt (vt+0x4F8) or AddSensorArrayAt
+    /// (vt+0x4F4) with the empty cell.
+    pub(crate) fn ares_sensor_array_dispatch(
+        &mut self,
+        stable_id: u64,
+        activate: bool,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+    ) {
+        if !self
+            .substrate
+            .entities
+            .get(stable_id)
+            .and_then(|entity| self.interner.object_type(entity.type_ref(), rules))
+            .is_some_and(|object| object.sensor_array)
+        {
+            return;
+        }
+        if activate {
+            self.ares_sensor_array_activate(stable_id, rules, registry);
+        } else {
+            self.ares_sensor_array_deactivate(stable_id, rules, registry);
+        }
     }
 
     /// Foot4D8611/4D8621 executes both receivers for PerCellProcess(2),
@@ -435,104 +507,19 @@ impl Simulation {
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
     ) {
-        let had_unit_deposit = self
+        let old = self
             .substrate
             .entities
             .get(stable_id)
-            .and_then(|entity| entity.sensor_deposit)
-            .is_some_and(|deposit| !deposit.building_array);
-        if had_unit_deposit {
-            let _ = self.remove_cached_sensor_deposit(stable_id, Some(rules), registry);
+            .map(|entity| entity.navigation.neighbor_state().cell());
+        if let Some(old) = old {
+            self.remove_unit_sensors_at(stable_id, Some(old), rules, registry);
+            self.add_unit_sensors_at_current(stable_id, rules, registry);
         }
-        self.add_unit_sensor_after_unlimbo(stable_id, rules, registry);
-    }
-
-    /// `FootClass::ChangeOwner @ 0x004DBED0` old-remove/new-add pair — both
-    /// arms gated on `TechnoTypeClass+0x5F0` (`SensorsSight=`), removing for
-    /// the old house through vtable `+0x4EC` at `0x004DBEFB` and adding for the
-    /// new one through `+0x4E8` at `0x004DBF81`.
-    ///
-    /// A BUILDING deposit is deliberately left untouched. Neither
-    /// `BuildingClass::ChangeOwner @ 0x00448260` nor the
-    /// `TechnoClass::ChangeOwner @ 0x007014A0` it calls at `0x00448BE8`
-    /// dispatches any of the four BuildingClass sensor slots, and the
-    /// program-wide `search_instructions` for `call [..+0x4f4/0x4f8/0x4fc/
-    /// 0x500]` finds no BuildingClass dispatcher outside
-    /// `OnConstructionComplete` and `Limbo`. So gamemd leaves BOTH the sensor
-    /// array and the disguise-detect circle stamped for the CONSTRUCTING house
-    /// until the building is limboed: capturing a Psychic Sensor transfers
-    /// neither.
-    ///
-    /// DRIFT-BY-DESIGN — this reproduces a permanent native counter skew, it
-    /// does not avoid one. Limbo's removes read the LIVE owner
-    /// (`RemoveDetectDisguiseAt @ 0x00455980` opens `0045598A MOV
-    /// EDX,[ECX+0x21C]` / `004559A1 MOV EAX,[EDX+0x30]`; `RemoveSensorArrayAt
-    /// @ 0x004556D0` repeats the read) and
-    /// `CellClass::DecrementDisguiseDetectCount @ 0x00487180` decrements
-    /// unconditionally. So selling or losing a captured Psychic Sensor debits
-    /// the CAPTOR for the circles the BUILDER was credited with.
-    /// *Trigger:* engineer capture of a building carrying `SensorArray=` or
-    /// `DetectDisguise=` (stock: NAPSIS only), then its limbo. *Player effect:*
-    /// the constructing house keeps a phantom detection circle over that ground
-    /// for the rest of the match, and the capturing house's counters go negative
-    /// there, silently cancelling the detection of the next such building it
-    /// puts on the same cells. *Frequency:* uncommon per match, but the state is
-    /// permanent once it happens. *Downstream risk:* none new — the asymmetric
-    /// `CloakRadiusInCells=` remove radius already produces negative sensor
-    /// fringe counts without a capture, so no reader gains an unseen case.
-    fn transfer_sensor_before_owner_change_inner(
-        &mut self,
-        stable_id: u64,
-        new_owner: InternedId,
-        rules: Option<&RuleSet>,
-        registry: Option<&OverlayTypeRegistry>,
-    ) {
-        let building_deposit = self
-            .substrate
-            .entities
-            .get(stable_id)
-            .and_then(|entity| entity.sensor_deposit)
-            .is_some_and(|deposit| deposit.building_array);
-        if building_deposit {
-            return;
-        }
-        let Some(mut deposit) = self.remove_cached_sensor_deposit(stable_id, rules, registry)
-        else {
-            return;
-        };
-        deposit.owner = new_owner;
-        self.apply_sensor_add(
-            new_owner,
-            deposit.center,
-            deposit.add_radius,
-            rules,
-            registry,
-        );
-        if let Some(entity) = self.substrate.entities.get_mut(stable_id) {
-            entity.sensor_deposit = Some(deposit);
-        }
-    }
-
-    pub(crate) fn transfer_sensor_before_owner_change(
-        &mut self,
-        stable_id: u64,
-        new_owner: InternedId,
-    ) {
-        self.transfer_sensor_before_owner_change_inner(stable_id, new_owner, None, None);
-    }
-
-    pub(crate) fn transfer_sensor_before_owner_change_with_rules(
-        &mut self,
-        stable_id: u64,
-        new_owner: InternedId,
-        rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
-    ) {
-        self.transfer_sensor_before_owner_change_inner(stable_id, new_owner, Some(rules), registry);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 mod tests {
     use super::*;
     use crate::map::entities::{EntityCategory, MapEntity};
@@ -541,8 +528,9 @@ mod tests {
     use crate::sim::components::BuildingUp;
 
     fn rules() -> RuleSet {
-        RuleSet::from_ini(&IniFile::from_str(
-            "[General]\nCloakingStages=9\nCloakDelay=.02\n\
+        RuleSet::from_ini_with_fixed_art_for_test(
+            &IniFile::from_str(
+                "[General]\nCloakingStages=9\nCloakDelay=.02\n\
              [AudioVisual]\nCloakSound=NavalUnitEmerge\n\
              [VehicleTypes]\n0=DEST\n1=SUB\n2=SQD\n3=TGT\n\
              [BuildingTypes]\n0=NAPSIS\n1=NAPOWR\n\
@@ -553,22 +541,25 @@ mod tests {
              [NAPSIS]\nStrength=750\nSensorArray=yes\nSensorsSight=15\nPower=-100\nPowered=yes\n\
              DetectDisguise=yes\nDetectDisguiseRange=15\nCapturable=true\n\
              [NAPOWR]\nStrength=750\nPower=200\n",
-        ))
+            ),
+            // Retail ARTMD.INI's NAPSIS foundation.
+            &IniFile::from_str("[NAPSIS]\nFoundation=2x2\n"),
+        )
         .expect("cloak/sensor rules")
     }
 
     fn sim_with_map_authority() -> Simulation {
         let mut sim = Simulation::with_seed(0x5E45_0A00);
-        sim.fog.width = 64;
-        sim.fog.height = 64;
-        sim.playfield_bounds = Some(PlayfieldBounds::from_normalized_local_size(
+        sim.fog.set_width_for_test(64);
+        sim.fog.set_height_for_test(64);
+        sim.set_playfield_bounds_for_test(Some(PlayfieldBounds::from_normalized_local_size(
             64, 2, 2, 56, 52,
-        ));
+        )));
         sim
     }
 
     #[test]
-    fn unit_sensor_unlimbo_move_owner_limbo_and_overlap_use_cached_deposits() {
+    fn unit_sensor_unlimbo_move_owner_limbo_and_overlap_use_native_callbacks() {
         let rules = rules();
         let mut sim = sim_with_map_authority();
         let first = sim
@@ -587,6 +578,13 @@ mod tests {
             sim.fog.has_sensor_for_house(americans, 33, 30),
             "the overlapping second deposit remains positive"
         );
+        let counters = sim.fog.sensors_by_house().clone();
+        sim.techno_limbo_with_rules(first, &rules, None);
+        assert_eq!(
+            sim.fog.sensors_by_house(),
+            &counters,
+            "repeated Limbo must not debit the second unit's positive coverage"
+        );
 
         sim.substrate
             .entities
@@ -598,38 +596,116 @@ mod tests {
         assert!(!sim.fog.has_sensor_for_house(americans, 33, 30));
         assert!(sim.fog.has_sensor_for_house(americans, 57, 30));
 
-        sim.change_owner(second, soviet);
+        sim.change_owner_with_rules(
+            second,
+            soviet,
+            &rules,
+            None,
+            crate::sim::world::FrameEffects::default(),
+        );
         assert!(!sim.fog.has_sensor_for_house(americans, 57, 30));
         assert!(sim.fog.has_sensor_for_house(soviet, 57, 30));
 
-        // Drift every live fact after the deposit. The cached center still
-        // decides WHICH cells the removal walks, but the HOUSE is re-read live:
-        // `FootClass::RemoveSensorsAt @ 0x004DE940` opens with
-        // `*(int *)(param_1[0x87] + 0x30)`, the same read as the BuildingClass
-        // pair. gamemd cannot reach this state for a Foot — only
-        // `FootClass::ChangeOwner @ 0x004DBED0` moves `+0x21C`, and it dispatches
-        // `vt+0x4EC` first — so this pins the read, not a reachable scenario.
-        let neutral = sim.interner.intern("Neutral");
-        sim.substrate.entities.change_owner(second, neutral);
-        {
-            let entity = sim.substrate.entities.get_mut(second).unwrap();
-            entity.position.set_rx_for_test(5);
-            entity.position.set_ry_for_test(5);
-        }
+        // FootLimbo4DB376 removes the live owner's current-coordinate circle.
         sim.techno_limbo_with_rules(second, &rules, None);
-        assert!(
-            sim.fog.has_sensor_for_house(soviet, 57, 30),
-            "the removal debits the live owner, not the deposit's recorded house"
-        );
-        let index = 30 * usize::from(sim.fog.width) + 57;
-        assert_eq!(
-            sim.fog.sensors_by_house[&neutral][index], 0,
-            "and the unit remove's positive pre-count gate leaves no negative residue"
-        );
+        assert!(!sim.fog.has_sensor_for_house(soviet, 57, 30));
     }
 
+    /// `FootClass::Unlimbo @ 0x004D7170` stamps the circle itself
+    /// (`0x004D7300..0x004D7318`), so a unit put back on the map by any
+    /// caller (a transport unload, a Squid letting go) senses at once, and a
+    /// spawn stamps once, not twice.
     #[test]
-    fn napsis_construction_adds_radius_fifteen_but_limbo_removes_default_twenty() {
+    fn every_foot_unlimbo_stamps_its_sensor_circle_exactly_once() {
+        let rules = rules();
+        let mut sim = sim_with_map_authority();
+        let id = sim
+            .spawn_object_at_height("DEST", "Americans", 40, 30, 0, 0, &rules)
+            .unwrap();
+        let owner = sim.substrate.entities.get(id).unwrap().owner();
+        let index = 30 * usize::from(sim.fog.width()) + 40;
+        assert_eq!(sim.fog.sensors_by_house()[&owner][index], 1);
+        sim.techno_limbo_with_rules(id, &rules, None);
+        assert_eq!(sim.fog.sensors_by_house()[&owner][index], 0);
+
+        let position = sim.substrate.entities.get(id).unwrap().position;
+        let outcome = sim.try_reveal_entity_with_context(
+            id,
+            crate::sim::world::RevealRequest {
+                position,
+                placement: crate::sim::world::PlacementEvidence::EvaluateMark,
+                logic_eligible: true,
+            },
+            crate::sim::world::UninitContext::with_rules(&rules),
+        );
+        assert!(matches!(
+            outcome,
+            crate::sim::world::RevealOutcome::Revealed { .. }
+        ));
+        assert_eq!(sim.fog.sensors_by_house()[&owner][index], 1);
+        assert!(sim.fog.has_sensor_for_house(owner, 33, 30));
+    }
+
+    /// A computer house's 2x2 NAPSIS read from a map's `[Structures]` at
+    /// (40, 40), so its GetCoords cell is (41, 41), with its house's power
+    /// already assessed full. Its Unlimbo under the placement scope queues
+    /// Guard (`0x0044D6DC..0x0044D6F1`), so the owner's discovery opening
+    /// (`0x00440E76` -> `0x0044D68A`) passes Is_Operational. A retail scenario
+    /// read has no such assessment: the building's own drain joins its house at
+    /// `0x00502B4A` while PowerOutput stays 0 until House Update, so a Powered
+    /// sensor building stamps only if its first opening passes Is_Operational
+    /// anyway, as a human one discovered by CellPUT before its own
+    /// Added_To_Game does while its house has no other drain.
+    fn map_placed_napsis(sim: &mut Simulation, rules: &RuleSet) -> u64 {
+        for name in ["Soviet", "Americans"] {
+            let house = sim.interner.intern(name);
+            sim.register_house(crate::sim::house_state::HouseState::new(
+                house, 0, None, false, 0, 10,
+            ));
+        }
+        sim.spawn_object_at_height("NAPOWR", "Soviet", 30, 40, 0, 0, rules)
+            .unwrap();
+        sim.assess_power_for_test(rules);
+        let napsis = MapEntity {
+            owner: "Soviet".into(),
+            type_id: "NAPSIS".into(),
+            health: 256,
+            cell_x: 40,
+            cell_y: 40,
+            facing: 0,
+            category: EntityCategory::Structure,
+            sub_cell: 0,
+            veterancy: None,
+            high: false,
+            mission: None,
+            recruitable_a: true,
+            recruitable_b: true,
+            group: -1,
+            follows: None,
+            structure_columns: Default::default(),
+            structure_ai_sellable: false,
+            structure_ai_repairable: false,
+            structure_online: true,
+            trigger_tag: None,
+        };
+        assert_eq!(sim.spawn_from_map(&[napsis], Some(rules)), 1);
+        sim.entities()
+            .values()
+            .find(|entity| sim.interner.resolve(entity.type_ref()) == "NAPSIS")
+            .unwrap()
+            .stable_id()
+    }
+
+    /// `AddSensorArrayAt @ 0x00455820` and `AddDetectDisguiseAt @ 0x00455A80`
+    /// refuse while Is_Operational (`0x004555D0`) sees Construction, which is
+    /// the current mission when Mission_Construction opens the building
+    /// (`0x00449AD4`). Limbo's removals (`0x004556D0`, `0x00455980`) read the
+    /// type, not the add, and decrement without a clamp around the foundation
+    /// centre (41, 41).
+    // Ares hooks455828/4556E1/43FE69 replace these stock counter skews
+    // (`ares_sensor_array_follows_power_and_removes_what_it_added`).
+    #[test]
+    fn napsis_construction_stamps_nothing_yet_limbo_still_debits_both_circles() {
         let rules = rules();
         let mut sim = sim_with_map_authority();
         sim.spawn_object_at_height("NAPOWR", "Soviet", 30, 40, 0, 0, &rules)
@@ -638,14 +714,6 @@ mod tests {
             .spawn_object_limbo_at_height("NAPSIS", "Soviet", 40, 40, 0, 0, &rules)
             .unwrap();
         let owner = sim.substrate.entities.get(id).unwrap().owner();
-        assert!(
-            sim.substrate
-                .entities
-                .get(id)
-                .unwrap()
-                .sensor_deposit
-                .is_none()
-        );
         sim.substrate
             .entities
             .get_mut(id)
@@ -665,86 +733,106 @@ mod tests {
             .is_some()
         );
         sim.advance_tick(&[], Some(&rules), None, None, 67);
-        assert!(!sim.substrate.entities.get(id).unwrap().building_up());
-        assert!(sim.fog.has_sensor_for_house(owner, 54, 40));
-        assert!(!sim.fog.has_sensor_for_house(owner, 55, 40));
+        assert!(
+            sim.substrate
+                .entities
+                .get(id)
+                .unwrap()
+                .building_art
+                .actually_placed()
+        );
+        assert!(!sim.fog.has_sensor_for_house(owner, 41, 41));
+        assert!(!sim.fog.detects_disguise_for_house(owner, 41, 41));
+
         sim.techno_limbo_with_rules(id, &rules, None);
-        let index = 40 * usize::from(sim.fog.width) + 55;
-        assert_eq!(sim.fog.sensors_by_house[&owner][index], -1);
+        let row = 41 * usize::from(sim.fog.width());
+        // `CloakRadiusInCells=` defaults to 20; `DetectDisguiseRange=15`.
+        assert_eq!(sim.fog.sensors_by_house()[&owner][row + 60], -1);
+        assert_eq!(sim.fog.sensors_by_house()[&owner][row + 61], 0);
+        assert_eq!(sim.fog.disguise_detect_by_house()[&owner][row + 55], -1);
+        assert_eq!(sim.fog.disguise_detect_by_house()[&owner][row + 56], 0);
     }
 
-    /// Engineer capture of a Psychic Sensor moves NEITHER stamped circle.
-    ///
-    /// `BuildingClass::ChangeOwner @ 0x00448260` and the
-    /// `TechnoClass::ChangeOwner @ 0x007014A0` it calls at `0x00448BE8`
-    /// dispatch none of the four BuildingClass sensor slots; program-wide,
-    /// `+0x4F4`/`+0x4FC` are dispatched only by `OnConstructionComplete`
-    /// (`0x004467A1` / `0x004467C3`) and `+0x4F8`/`+0x500` only by `Limbo`
-    /// (`0x00445A4C` / `0x00445A6C`). So the counters stay attached to the
-    /// CONSTRUCTING house until the building is limboed — while the removals
-    /// read the LIVE owner (`0x00455980` / `0x004556D0`), which is what the
-    /// limbo tail below and
-    /// `selling_a_captured_psychic_sensor_debits_the_captor_and_leaves_the_builder_detecting`
-    /// pin.
+    /// ReadScenarioBuildings (`0x0044F820`) adds no circle of its own; the map
+    /// building's one stamp is its discovery opening's, centred on GetCoords
+    /// (`0x00447AC0`): the 2x2 foundation's centre cell (41, 41), not its
+    /// north-west cell.
+    /// Ares BuildingExt::UpdateSensorArray through the actual Building
+    /// AI (hook43FE69) and Limbo: the array follows its power, removes the
+    /// SensorsSight circle it added (hook4556E1), and an inactive array's
+    /// Limbo debits nothing.
     #[test]
-    fn capturing_a_psychic_sensor_leaves_both_circles_with_the_constructing_house() {
+    fn ares_sensor_array_follows_power_and_removes_what_it_added() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
         let rules = rules();
         let mut sim = sim_with_map_authority();
-        sim.spawn_object_at_height("NAPOWR", "Soviet", 30, 40, 0, 0, &rules)
-            .unwrap();
-        let id = sim
-            .spawn_object_at_height("NAPSIS", "Soviet", 40, 40, 0, 0, &rules)
-            .unwrap();
-        let soviet = sim.substrate.entities.get(id).unwrap().owner();
+        let id = map_placed_napsis(&mut sim, &rules);
+        let owner = sim.substrate.entities.get(id).unwrap().owner();
+        let row = 41 * usize::from(sim.fog.width());
+        let sensor = |sim: &Simulation, x: usize| {
+            sim.fog
+                .sensors_by_house()
+                .get(&owner)
+                .map_or(0, |cells| cells[row + x])
+        };
+        let counter = |sim: &Simulation| {
+            sim.substrate
+                .entities
+                .get(id)
+                .unwrap()
+                .ares
+                .sensor_array_counter
+                .count()
+        };
+        assert_eq!((counter(&sim), sensor(&sim, 27)), (1, 1));
+        let visit = |sim: &mut Simulation| {
+            sim.object_ai_visit_one(id, Some(&rules), crate::sim::world::ObjectAiCtx::default());
+        };
         sim.substrate
             .entities
             .get_mut(id)
             .unwrap()
-            .install_building_up(BuildingUp::completing_in_ticks(1, 0), 0);
-        sim.advance_tick(&[], Some(&rules), None, None, 67);
-        assert!(sim.fog.has_sensor_for_house(soviet, 54, 40));
-        assert!(sim.fog.detects_disguise_for_house(soviet, 54, 40));
-
-        let americans = sim.interner.intern("Americans");
-        sim.change_owner(id, americans);
-
-        assert!(
-            sim.fog.detects_disguise_for_house(soviet, 54, 40),
-            "ChangeOwner dispatches no +0x500, so the builder keeps detection"
-        );
-        assert!(
-            !sim.fog.detects_disguise_for_house(americans, 54, 40),
-            "ChangeOwner dispatches no +0x4FC, so the captor is granted none"
-        );
-        assert!(
-            sim.fog.has_sensor_for_house(soviet, 54, 40),
-            "the sensor array is on the same two slots and moves no more"
-        );
-        assert!(!sim.fog.has_sensor_for_house(americans, 54, 40));
-        let deposit = sim
-            .substrate
+            .set_building_online_for_test(false);
+        visit(&mut sim);
+        assert_eq!((counter(&sim), sensor(&sim, 27)), (0, 0));
+        assert_eq!(sensor(&sim, 60), 0, "SensorsSight, not CloakRadiusInCells");
+        sim.substrate
             .entities
-            .get(id)
+            .get_mut(id)
             .unwrap()
-            .sensor_deposit
-            .expect("the construction deposit survives the capture");
-        assert_eq!(deposit.owner, soviet);
-        assert_eq!(deposit.detect_disguise_radius, 15);
-
-        // Selling under the NEW owner unwinds the NEW owner: both removals read
-        // `this->Owner->ArrayIndex` at removal time, and `ChangeOwner` has
-        // already overwritten that pointer (`0x007014A0 param_1[0x87] =
-        // param_2`). The builder's credit is therefore never returned.
+            .set_building_online_for_test(true);
+        visit(&mut sim);
+        assert_eq!((counter(&sim), sensor(&sim, 27)), (1, 1));
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .set_building_online_for_test(false);
+        visit(&mut sim);
         sim.techno_limbo_with_rules(id, &rules, None);
-        let index = 40 * usize::from(sim.fog.width) + 54;
-        assert_eq!(
-            sim.fog.disguise_detect_by_house[&soviet][index], 1,
-            "the builder's increment is permanent: no +0x500 ever names it again"
-        );
-        assert_eq!(
-            sim.fog.disguise_detect_by_house[&americans][index], -1,
-            "0x00455980 debits the LIVE owner and 0x00487180 decrements unconditionally"
-        );
+        assert_eq!((sensor(&sim, 27), sensor(&sim, 60)), (0, 0));
+    }
+
+    #[test]
+    fn map_placed_napsis_stamps_both_circles_once_around_its_foundation_centre() {
+        let rules = rules();
+        let mut sim = sim_with_map_authority();
+        let id = map_placed_napsis(&mut sim, &rules);
+        let owner = sim.substrate.entities.get(id).unwrap().owner();
+        let width = usize::from(sim.fog.width());
+        let row = 41 * width;
+        let sensors = &sim.fog.sensors_by_house()[&owner];
+        // `SensorsSight=15` spans x 27..=55 on the centre row.
+        assert_eq!(sensors[row + 26], 0);
+        assert_eq!(sensors[row + 27], 1);
+        assert_eq!(sensors[row + 55], 1);
+        assert_eq!(sensors[row + 56], 0);
+        assert_eq!(sensors[55 * width + 41], 1);
+        assert_eq!(sensors[56 * width + 41], 0);
+        let disguise = &sim.fog.disguise_detect_by_house()[&owner];
+        assert_eq!(disguise[row + 27], 1);
+        assert_eq!(disguise[row + 55], 1);
+        assert_eq!(disguise[row + 56], 0);
     }
 
     /// Capture, then sell, end to end — the permanent counter skew gamemd
@@ -753,65 +841,79 @@ mod tests {
     /// Adds credit `*(int *)(param_1[0x87] + 0x30)` at add time
     /// (`BuildingClass::AddSensorArrayAt @ 0x00455820`,
     /// `AddDetectDisguiseAt @ 0x00455A80`); `BuildingClass::ChangeOwner @
-    /// 0x00448260` dispatches neither an add nor a remove but does overwrite
-    /// `+0x21C` through `TechnoClass::ChangeOwner @ 0x007014A0`; and Limbo's
-    /// removes (`0x004556D0`, `0x00455980`) re-read `+0x21C` live. Net: the
-    /// builder keeps `SensorsSight=15` and `DetectDisguiseRange=15`, the captor
-    /// takes `-1` over the `CloakRadiusInCells=20` sensor circle and over the
-    /// 15-cell disguise circle.
+    /// 0x00448260` and the `TechnoClass::ChangeOwner @ 0x007014A0` it calls
+    /// dispatch no sensor slot, and its `Place(captured)` at `0x00448CEF`
+    /// skips the sensor arm (`0x00445FD0`), but `0x007014A0` does overwrite
+    /// `+0x21C`; and Limbo's removes (`0x004556D0`, `0x00455980`) re-read
+    /// `+0x21C` live. Net: the first owner keeps `SensorsSight=15` and
+    /// `DetectDisguiseRange=15`, the captor takes `-1` over the
+    /// `CloakRadiusInCells=20` sensor circle and over the 15-cell disguise
+    /// circle.
+    // Ares hooks455828/4556E1/43FE69 replace these stock counter skews
+    // (`ares_sensor_array_follows_power_and_removes_what_it_added`).
     #[test]
-    fn selling_a_captured_psychic_sensor_debits_the_captor_and_leaves_the_builder_detecting() {
+    fn selling_a_captured_psychic_sensor_debits_the_captor_and_leaves_the_first_owner_detecting() {
         let rules = rules();
         let mut sim = sim_with_map_authority();
-        sim.spawn_object_at_height("NAPOWR", "Soviet", 30, 40, 0, 0, &rules)
-            .unwrap();
-        let id = sim
-            .spawn_object_at_height("NAPSIS", "Soviet", 40, 40, 0, 0, &rules)
-            .unwrap();
+        let id = map_placed_napsis(&mut sim, &rules);
         let soviet = sim.substrate.entities.get(id).unwrap().owner();
-        sim.substrate
-            .entities
-            .get_mut(id)
-            .unwrap()
-            .install_building_up(BuildingUp::completing_in_ticks(1, 0), 0);
-        sim.advance_tick(&[], Some(&rules), None, None, 67);
 
         let americans = sim.interner.intern("Americans");
-        sim.change_owner(id, americans);
+        sim.change_owner_with_rules(
+            id,
+            americans,
+            &rules,
+            None,
+            crate::sim::world::FrameEffects::default(),
+        );
+        assert!(
+            sim.fog.has_sensor_for_house(soviet, 55, 41)
+                && sim.fog.detects_disguise_for_house(soviet, 55, 41),
+            "the capture moves neither circle off the first owner"
+        );
+        assert!(
+            !sim.fog.has_sensor_for_house(americans, 55, 41)
+                && !sim.fog.detects_disguise_for_house(americans, 55, 41),
+            "nor grants the captor one"
+        );
         sim.techno_limbo_with_rules(id, &rules, None);
 
-        let row = 40 * usize::from(sim.fog.width);
-        let inside = row + 54; // inside both the 15-cell add and the 20-cell remove
-        let fringe = row + 55; // outside the add, inside the sensor remove only
+        let row = 41 * usize::from(sim.fog.width());
+        let inside = row + 55; // inside both the 15-cell add and the 20-cell remove
+        let fringe = row + 56; // outside the add, inside the sensor remove only
 
         assert_eq!(
-            sim.fog.sensors_by_house[&soviet][inside], 1,
-            "the builder's SensorsSight credit is never returned"
+            sim.fog.sensors_by_house()[&soviet][inside],
+            1,
+            "the first owner's SensorsSight credit is never returned"
         );
         assert_eq!(
-            sim.fog.sensors_by_house[&americans][inside], -1,
+            sim.fog.sensors_by_house()[&americans][inside],
+            -1,
             "0x004556D0 debits the live owner over CloakRadiusInCells"
         );
-        assert_eq!(sim.fog.sensors_by_house[&soviet][fringe], 0);
+        assert_eq!(sim.fog.sensors_by_house()[&soviet][fringe], 0);
         assert_eq!(
-            sim.fog.sensors_by_house[&americans][fringe], -1,
+            sim.fog.sensors_by_house()[&americans][fringe],
+            -1,
             "the asymmetric remove radius reaches past the add circle too"
         );
         assert!(
-            sim.fog.has_sensor_for_house(soviet, 54, 40),
-            "the builder keeps submarine detection over ground it no longer owns"
+            sim.fog.has_sensor_for_house(soviet, 55, 41),
+            "the first owner keeps submarine detection over ground it no longer owns"
         );
-        assert!(!sim.fog.has_sensor_for_house(americans, 54, 40));
+        assert!(!sim.fog.has_sensor_for_house(americans, 55, 41));
 
-        assert_eq!(sim.fog.disguise_detect_by_house[&soviet][inside], 1);
+        assert_eq!(sim.fog.disguise_detect_by_house()[&soviet][inside], 1);
         assert_eq!(
-            sim.fog.disguise_detect_by_house[&americans][inside], -1,
+            sim.fog.disguise_detect_by_house()[&americans][inside],
+            -1,
             "the disguise circle is symmetric in radius but not in house"
         );
-        assert!(sim.fog.detects_disguise_for_house(soviet, 54, 40));
+        assert!(sim.fog.detects_disguise_for_house(soviet, 55, 41));
         assert!(
-            !sim.fog.detects_disguise_for_house(americans, 54, 40),
-            "a later NAPSIS the captor builds here needs two increments to see again"
+            !sim.fog.detects_disguise_for_house(americans, 55, 41),
+            "a later NAPSIS the captor owns here needs two increments to see again"
         );
     }
 
@@ -847,7 +949,7 @@ mod tests {
             cloak.set_state_for_test(0);
         }
 
-        let added = sim.apply_sensor_add(detector, (40, 30), 1, Some(&rules), None);
+        let added = sim.apply_sensor_add(detector, (40, 30), 1, &rules, None);
         assert_eq!(
             added,
             vec![newer, older],
@@ -881,31 +983,32 @@ mod tests {
                 .unwrap();
             cloak.set_state_for_test(0);
         }
-        let removed = sim.apply_unit_sensor_remove(detector, (40, 30), 1, Some(&rules), None);
+        let removed = sim.apply_unit_sensor_remove(detector, (40, 30), 1, &rules, None);
         assert_eq!(removed, vec![newer, older]);
         assert!(sim.sound_events.is_empty());
         assert!(
-            sim.apply_unit_sensor_remove(detector, (40, 30), 1, Some(&rules), None)
+            sim.apply_unit_sensor_remove(detector, (40, 30), 1, &rules, None)
                 .is_empty(),
             "unit RemoveSensorsAt skips decrement and callbacks at nonpositive pre-count"
         );
         assert!(sim.sound_events.is_empty());
 
         let building_removed =
-            sim.apply_building_sensor_remove(detector, (40, 30), 1, Some(&rules), None);
+            sim.apply_building_sensor_remove(detector, (40, 30), 1, &rules, None);
         assert_eq!(building_removed, vec![newer, older]);
-        let index = 30 * usize::from(sim.fog.width) + 40;
+        let index = 30 * usize::from(sim.fog.width()) + 40;
         assert_eq!(
-            sim.fog.sensors_by_house[&detector][index], -1,
+            sim.fog.sensors_by_house()[&detector][index],
+            -1,
             "BuildingClass removal is unconditional and signed"
         );
     }
 
     #[test]
-    fn authored_scope_and_runtime_unlimbo_playfield_gate_are_distinct() {
+    fn authored_and_runtime_units_outside_the_playfield_place_without_membership() {
         let rules = rules();
         let mut sim = sim_with_map_authority();
-        let bounds = sim.playfield_bounds.unwrap();
+        let bounds = sim.playfield_bounds().unwrap();
         let inside = (0u16..64)
             .flat_map(|ry| (0u16..64).map(move |rx| (rx, ry)))
             .find(|&(rx, ry)| bounds.contains_height_aware_packed(rx.into(), ry.into(), 0, 0))
@@ -930,7 +1033,9 @@ mod tests {
                     mission: None,
                     recruitable_a: true,
                     recruitable_b: true,
-                    structure_upgrades: [None, None, None],
+                    group: -1,
+                    follows: None,
+                    structure_columns: Default::default(),
                     structure_ai_sellable: false,
                     structure_ai_repairable: false,
                     structure_online: true,
@@ -950,7 +1055,9 @@ mod tests {
                     mission: None,
                     recruitable_a: true,
                     recruitable_b: true,
-                    structure_upgrades: [None, None, None],
+                    group: -1,
+                    follows: None,
+                    structure_columns: Default::default(),
                     structure_ai_sellable: false,
                     structure_ai_repairable: false,
                     structure_online: true,
@@ -994,9 +1101,13 @@ mod tests {
                 .state(),
             0
         );
-        assert!(
-            outside.is_none(),
-            "runtime outside-playfield Unit must fail Unlimbo"
-        );
+        // No Unlimbo layer refuses on the playfield (Techno `0x006F6CA0`,
+        // Object `0x005F4EC0`), so the runtime Unit places outside it like
+        // the authored one. This map-less fixture skips class admission; with
+        // terrain, a Unit whose +3D5 is clear also passes its Can_Enter_Cell
+        // boundary test (`0x0073F37B`).
+        let outside = sim.substrate.entities.get(outside.unwrap()).unwrap();
+        assert!(!outside.in_playfield());
+        assert!(outside.lifecycle.cell_marked());
     }
 }

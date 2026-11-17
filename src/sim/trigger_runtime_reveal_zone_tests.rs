@@ -133,18 +133,18 @@ fn native_reveal_zone_dispatch_uses_literal_waypoint_raw_zone_and_radius_two() {
         sim.zone_grid = Some(zones);
         sim.install_resolved_terrain_for_new_map(terrain);
         sim.install_fixture_path_grid(Some(&path));
-        sim.playfield_bounds = Some(bounds(row));
-        sim.playfield_size_height = Some(number(&row["size"][1]));
+        sim.set_playfield_bounds_for_test(Some(bounds(row)));
+        sim.set_playfield_size_height_for_test(Some(number(&row["size"][1])));
         let player = sim.interner.intern("Player");
         let other = sim.interner.intern("Other");
-        sim.session.current_house = Some(player);
+        sim.session.set_current_house_for_test(Some(player));
         sim.fog = FogState::new(128, 128);
         if row["input"]["latch"] == 1 {
             sim.fog.reveal_all_for_owner(player);
         }
         for viewer in [player, other] {
             sim.fog
-                .by_owner
+                .by_owner_mut_for_test()
                 .insert(viewer, OwnerVisibility::new(128, 128));
         }
         let mut definitions = RuntimeDefinitions::default();
@@ -159,7 +159,7 @@ fn native_reveal_zone_dispatch_uses_literal_waypoint_raw_zone_and_radius_two() {
             .unwrap()
             .entries()[0]
             .clone();
-        let action = definitions.resolve_action(entry, None, None);
+        let action = definitions.resolve_action(entry, None, None, None);
         assert_eq!(json!(action.value), row["read"]["value"]);
         assert_eq!(json!(action.entry.waypoint_index), row["read"]["waypoint"]);
         let waypoint = number(&row["read"]["value"]) as u32;
@@ -206,9 +206,9 @@ fn native_reveal_zone_dispatch_uses_literal_waypoint_raw_zone_and_radius_two() {
         let (returned, draws) = crate::sim::rng::trace_draws(|| {
             sim.apply_live_trigger_action(
                 &action,
-                sim.trigger_action_context(typ, None, TagEventInput::default(), Some(&rules)),
+                sim.trigger_action_context(typ, None, TagEventInput::default(), &rules),
                 &mut effects,
-                Some(&rules),
+                &rules,
                 None,
                 FrameEffects::default(),
             )
@@ -230,7 +230,7 @@ fn native_reveal_zone_dispatch_uses_literal_waypoint_raw_zone_and_radius_two() {
             "{name}: retained original stream words"
         );
         assert_eq!(
-            json!(sim.session.binary_frame),
+            json!(sim.session.binary_frame()),
             row["frame_after"],
             "{name}"
         );
@@ -277,20 +277,20 @@ fn native_reveal_zone_dispatch_uses_literal_waypoint_raw_zone_and_radius_two() {
                 number(&cell["cell"][1]) as u16,
             );
             if query.lookup((x as i16, y as i16)) != NativeCellIdentity::Dummy {
-                let state = sim.fog.by_owner[&player].shroud_knowledge_raw()
+                let state = sim.fog.by_owner()[&player].shroud_knowledge_raw()
                     [usize::from(y) * 128 + usize::from(x)];
                 assert_eq!(
-                    state.counter,
+                    state.counter(),
                     number(&cell["counter"]),
                     "{name}: counter {x},{y}"
                 );
                 assert_eq!(
-                    state.gap_counter,
+                    state.gap_counter(),
                     number(&cell["gap"]),
                     "{name}: gap {x},{y}"
                 );
                 assert_eq!(
-                    state.local_sources + state.allied_sources,
+                    state.local_sources() + state.allied_sources(),
                     0,
                     "{name}: no sustained source"
                 );

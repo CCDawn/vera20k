@@ -29,10 +29,10 @@ pub fn visit_paid_deso_light_lifecycle(
     let launch: crate::skirmish_launch::SkirmishLaunchSession =
         serde_json::from_value(profile["launch"].clone()).unwrap();
     assert_eq!(
-        launch.local.country,
+        launch.local_slot().country,
         crate::skirmish_launch::LaunchCountry::Iraq
     );
-    let local_name = launch.player_name.clone();
+    let local_name = launch.local_player().name.clone();
     let map = launch.selected_map_file.as_deref().unwrap().to_owned();
     let retail =
         std::path::PathBuf::from(std::env::var_os("RA2_DIR").expect("physical retail root"));
@@ -47,7 +47,7 @@ pub fn visit_paid_deso_light_lifecycle(
     // deliberately not used: the accepted capture advances ordinary22ms.
     scene.runtime.simulation.batch_path_searches();
     scene.runtime.simulation.batch_target_scans();
-    let owner = scene.sim().session.current_house.unwrap();
+    let owner = scene.sim().session.current_house().unwrap();
     assert_eq!(scene.sim().resolve(owner), local_name);
     assert_eq!(
         scene
@@ -76,7 +76,7 @@ pub fn visit_paid_deso_light_lifecycle(
         })
         .collect();
     assert_eq!(queued, ["NAPOWR", "NAHAND", "NAREFN", "NARADR", "DESO"]);
-    let (deso, center) = orders
+    let (captured_deso, center) = orders
         .iter()
         .find_map(|order| match order.payload {
             Command::Move {
@@ -87,6 +87,8 @@ pub fn visit_paid_deso_light_lifecycle(
             _ => None,
         })
         .expect("captured paid DESO Move input");
+    let mut deso = captured_deso;
+    let mut bound_deso = false;
     let deso_type = scene.runtime.resources.rules.object("DESO").unwrap();
     assert!(deso_type.deployer && deso_type.deploy_fire && deso_type.immune_to_radiation);
     let health = deso_type.strength;
@@ -182,7 +184,7 @@ pub fn visit_paid_deso_light_lifecycle(
                     );
                 }
                 paid_start = Some((
-                    scene.sim().houses[&owner].economy.spent_credits(),
+                    scene.sim().houses[&owner].economy().spent_credits(),
                     option.cost,
                 ));
                 assert!(!held && !delivered);
@@ -206,12 +208,54 @@ pub fn visit_paid_deso_light_lifecycle(
             );
         }
         dispatched += due.len();
+        // The App supplies Sidebar's retained factory visits through this
+        // boundary. Admit the existing headless strip projection too, so the
+        // completed paid object reaches the ordinary PLACE/Exit_Object path.
+        let visits = scene
+            .sim()
+            .production()
+            .factories()
+            .strip_visits_for_test(owner);
+        let effects = FrameEffects::default().with_production_strip(&visits, &|_| {});
         let output = scene
             .runtime
-            .advance_frame(&due, 22, TickLane::Ordinary, FrameEffects::default())
+            .advance_frame(&due, 22, TickLane::Ordinary, effects)
             .expect("ordinary paid DESO frame");
         assert!(output.tick.frame_committed);
-        if let Some(actor) = scene.sim().entities().get(deso) {
+        if !bound_deso
+            && let Some(held) = scene
+                .sim()
+                .production()
+                .factories()
+                .view(owner, crate::sim::production::ProductionCategory::Infantry)
+                .and_then(|factory| factory.object)
+            && scene.sim().resolve(held.type_id) == "DESO"
+            && let Some(actual) = held.entity_id
+        {
+            // Captured Rust IDs are inputs, not native goldens. Follow the
+            // factory's own paid identity when addressing subsequent inputs.
+            for order in &mut orders {
+                match &mut order.payload {
+                    Command::Move { entity_id, .. }
+                    | Command::ToggleInfantryDeploy { entity_id } => {
+                        if *entity_id == captured_deso {
+                            *entity_id = actual;
+                        }
+                    }
+                    Command::Select { entity_ids, .. } => {
+                        for id in entity_ids {
+                            if *id == captured_deso {
+                                *id = actual;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            deso = actual;
+            bound_deso = true;
+        }
+        if bound_deso && let Some(actor) = scene.sim().entities().get(deso) {
             assert_eq!(scene.sim().resolve(actor.type_ref()), "DESO");
             assert_eq!(actor.owner(), owner);
             assert!(actor.is_alive() && actor.health.current() == health);
@@ -228,7 +272,7 @@ pub fn visit_paid_deso_light_lifecycle(
                 );
                 let (spent, cost) = paid_start.expect("ordinary DESO production was requested");
                 assert!(
-                    scene.sim().houses[&owner].economy.spent_credits() >= spent + cost,
+                    scene.sim().houses[&owner].economy().spent_credits() >= spent + cost,
                     "paid head must finish charging before world delivery"
                 );
                 delivered = true;
@@ -276,10 +320,10 @@ pub fn visit_paid_deso_light_lifecycle(
                         .radiation
                         .site_at(center)
                         .expect("published live site");
-                    assert_eq!(site.spread, spread);
-                    assert_eq!(site.level, rad_level);
-                    assert!(site.radius_leptons > 0);
-                    assert_eq!(source.radius_leptons, site.radius_leptons);
+                    assert_eq!(site.spread(), spread);
+                    assert_eq!(site.level(), rad_level);
+                    assert!(site.radius_leptons() > 0);
+                    assert_eq!(source.radius_leptons, site.radius_leptons());
                     assert!(source.active && expired_at.is_none());
                     if !active {
                         assert!(shots > 0, "actual FireAt/Bullet creates the site");
@@ -287,7 +331,7 @@ pub fn visit_paid_deso_light_lifecycle(
                         phase = Some("active");
                     } else if !faded && last_source.as_ref() != Some(source) {
                         assert!(
-                            site.remaining < site.duration,
+                            site.remaining() < site.duration(),
                             "source decay follows activation"
                         );
                         faded = true;
@@ -362,7 +406,7 @@ fn assert_paid_deso_lifecycle(profile_path: &'static str) {
         if let Some(output) = output {
             frames += 1;
             assert!(output.tick.frame_committed);
-            assert_eq!(scene.sim().session.total_sim_ms, frames * 22);
+            assert_eq!(scene.sim().session.total_sim_ms(), frames * 22);
         }
         if let Some(phase) = phase {
             phases.push(phase.to_owned());

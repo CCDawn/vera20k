@@ -13,7 +13,7 @@ fn native() -> &'static Value {
 }
 
 fn run(sim: &mut Simulation, rules: &RuleSet, entry: crate::map::actions::ActionEntry) -> bool {
-    let action = RuntimeDefinitions::default().resolve_action(entry, None, None);
+    let action = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
     sim.apply_live_trigger_action(
         &action,
         TriggerActionContext {
@@ -22,7 +22,7 @@ fn run(sim: &mut Simulation, rules: &RuleSet, entry: crate::map::actions::Action
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        Some(rules),
+        rules,
         None,
         FrameEffects::default(),
     )
@@ -55,19 +55,19 @@ fn ambient_action_matches_native_controller_writes_without_resetting_timer_or_ti
             let owner = sim.interner.intern("LightingControlOwner");
             sim.lightning_storm = LightningStorm::raging_for_test(owner, (0, 0));
         }
-        let light = &mut sim.session.lighting;
-        light.normal.ambient_percent = 87;
-        light.normal.red_percent = 90;
-        light.normal.green_percent = 90;
-        light.normal.blue_percent = 100;
+        let light = sim.session.lighting_mut();
+        light.normal_mut_for_test().ambient_percent = 87;
+        light.normal_mut_for_test().red_percent = 90;
+        light.normal_mut_for_test().green_percent = 90;
+        light.normal_mut_for_test().blue_percent = 100;
         if input["nuke"] != 0 || input["chrono"] != 0 {
             light.select(ScenarioLightingProfile::Nuke);
         } else if input["dominator"] != 0 {
             light.select(ScenarioLightingProfile::Dominator);
         }
-        light.current_ambient = 87;
-        light.target_ambient = 43;
-        light.transition_timer = CdTimer::started(12, 8);
+        light.set_current_ambient_for_test(87);
+        light.set_target_ambient_for_test(43);
+        light.set_transition_timer_for_test(CdTimer::started(12, 8));
         let prior = *light;
         let rng_before = [
             sim.main_rng.native_state_hex(),
@@ -82,17 +82,17 @@ fn ambient_action_matches_native_controller_writes_without_resetting_timer_or_ti
             ),
             row["returned"] == 1
         );
-        let light = sim.session.lighting;
+        let light = sim.session.lighting();
         assert_eq!(
-            json!({"normal":light.normal.ambient_percent,"current":light.current_ambient,
-            "target":light.target_ambient,"normal_rgb_ground_level":[light.normal.red_percent,light.normal.green_percent,light.normal.blue_percent,light.normal.ground_units,light.normal.level_units],
-            "timer":[light.transition_timer.start_frame(),light.transition_timer.duration()]}),
+            json!({"normal":light.normal().ambient_percent,"current":light.current_ambient(),
+            "target":light.target_ambient(),"normal_rgb_ground_level":[light.normal().red_percent,light.normal().green_percent,light.normal().blue_percent,light.normal().ground_units,light.normal().level_units],
+            "timer":[light.transition_timer().start_frame(),light.transition_timer().duration()]}),
             row["after"]
         );
-        assert_eq!(light.selected_profile, prior.selected_profile);
+        assert_eq!(light.selected_profile(), prior.selected_profile());
         assert_eq!(light.alternate_rgb(), prior.alternate_rgb());
         assert!(
-            sim.lighting_sources.pending.is_empty(),
+            sim.lighting_sources.pending().is_empty(),
             "73 has no immediate relight"
         );
         assert_eq!(
@@ -136,11 +136,13 @@ fn retail_transylv_ambient_action_reaches_native_fade_and_large_flash_request() 
     let mut sim = Simulation::with_seed(0);
     sim.intern_rule_type_ids(&rules);
     sim.resolve_type_handles(&rules);
-    sim.session.lighting =
-        ScenarioLightingState::from_map(&crate::map::lighting::parse_lighting_profiles(&map.ini));
+    sim.session
+        .set_lighting_for_test(ScenarioLightingState::from_map(
+            &crate::map::lighting::parse_lighting_profiles(&map.ini),
+        ));
     let history = &native()["ambient_history"];
     assert_eq!(
-        sim.session.lighting.current_ambient,
+        sim.session.lighting().current_ambient(),
         history["initial"]["current"].as_i64().unwrap() as i32
     );
     let ambient = map.actions["07718EBC"]
@@ -152,28 +154,34 @@ fn retail_transylv_ambient_action_reaches_native_fade_and_large_flash_request() 
     assert_eq!(ambient.literal_value(), Some(110));
     assert!(run(&mut sim, &rules, ambient));
     for row in history["rows"].as_array().unwrap() {
-        sim.session.binary_frame = row["frame"].as_u64().unwrap() as u32;
-        sim.discard_lighting_events();
+        sim.session
+            .set_binary_frame_for_test(row["frame"].as_u64().unwrap() as u32);
+        sim.lighting_sources.discard_pending();
         sim.tick_scenario_lighting_transition(&rules);
-        let light = sim.session.lighting;
+        let light = sim.session.lighting();
         assert_eq!(
-            light.current_ambient,
+            light.current_ambient(),
             row["current"].as_i64().unwrap() as i32
         );
-        assert_eq!(light.target_ambient, row["target"].as_i64().unwrap() as i32);
+        assert_eq!(
+            light.target_ambient(),
+            row["target"].as_i64().unwrap() as i32
+        );
         assert_eq!(
             json!([
-                light.transition_timer.start_frame(),
-                light.transition_timer.duration()
+                light.transition_timer().start_frame(),
+                light.transition_timer().duration()
             ]),
             row["timer"]
         );
         let emitted = !row["events"].as_array().unwrap().is_empty();
-        assert_eq!(sim.lighting_sources.pending.len(), usize::from(emitted));
+        assert_eq!(sim.lighting_sources.pending().len(), usize::from(emitted));
     }
     // Flat empty declared crop, not Transylv terrain/scene pixel parity.
-    sim.session.map_width = map.header.width.try_into().unwrap();
-    sim.session.map_height = map.header.height.try_into().unwrap();
+    sim.session
+        .set_map_width_for_test(map.header.width.try_into().unwrap());
+    sim.session
+        .set_map_height_for_test(map.header.height.try_into().unwrap());
     sim.install_resolved_terrain_for_new_map(crate::map::resolved_terrain::test_grid(
         map.header.width.try_into().unwrap(),
         map.header.height.try_into().unwrap(),
@@ -330,13 +338,15 @@ fn retail_transylv_ambient_action_reaches_native_fade_and_large_flash_request() 
     assert!(run(&mut sim, &rules, action(71, 1036831949)));
     assert!(run(&mut sim, &rules, action(72, 1065353216)));
     assert_eq!(
-        sim.session.lighting.ambient_change_terms(&rules),
+        sim.session.lighting().ambient_change_terms(&rules),
         (true, 900, 10)
     );
     owner
         .consume_outgoing_scenario_rules(
             sim.retire_object_type_tech_levels(),
-            sim.session.lighting.retire_ambient_change_inputs(),
+            sim.session.lighting_mut().retire_ambient_change_inputs(),
+            sim.retire_building_upgrade_art_names(),
+            sim.retire_voxel_type_damage(),
         )
         .unwrap();
     let next = owner
@@ -359,8 +369,7 @@ fn retail_transylv_ambient_action_reaches_native_fade_and_large_flash_request() 
 
 #[test]
 fn ambient_rate_and_step_match_original_action_bits_and_due_logic_rung() {
-    // Original Steam gamemd.exe SHA256:
-    // 3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600.
+    // Original Steam gamemd.exe.
     // ActionFixture executes ctor6DD000/read6DD5B0/Execute6DD8B0, then
     // Logic55B33D..55B4D7 with current60, target100, timer12/8 at frame20.
     // Relight/redraw are output sinks. These are native outputs, not Rust
@@ -559,9 +568,11 @@ fn ambient_rate_and_step_match_original_action_bits_and_due_logic_rung() {
     let rules = RuleSet::from_ini(&crate::rules::ini_parser::IniFile::empty()).unwrap();
     for &(kind, operand, value, stored, current, timer, relight) in controls {
         let mut sim = Simulation::with_seed(0);
-        sim.session.lighting.current_ambient = 60;
-        sim.session.lighting.target_ambient = 100;
-        sim.session.lighting.transition_timer = CdTimer::started(12, 8);
+        sim.session.lighting_mut().set_current_ambient_for_test(60);
+        sim.session.lighting_mut().set_target_ambient_for_test(100);
+        sim.session
+            .lighting_mut()
+            .set_transition_timer_for_test(CdTimer::started(12, 8));
         let rng = (
             sim.main_rng.native_state_hex(),
             sim.scenario_rng.native_state_hex(),
@@ -574,29 +585,30 @@ fn ambient_rate_and_step_match_original_action_bits_and_due_logic_rung() {
         let entry = parsed["A"].entries()[0].clone();
         assert_eq!(entry.literal_value(), Some(value));
         assert!(run(&mut sim, &rules, entry), "Action{kind}: {operand}");
-        assert_eq!(sim.session.lighting.current_ambient, 60);
+        assert_eq!(sim.session.lighting().current_ambient(), 60);
         assert_eq!(
-            sim.session.lighting.transition_timer,
+            *sim.session.lighting().transition_timer(),
             CdTimer::started(12, 8)
         );
-        assert!(sim.lighting_sources.pending.is_empty());
-        sim.session.binary_frame = 20;
+        assert!(sim.lighting_sources.pending().is_empty());
+        sim.session.set_binary_frame_for_test(20);
         sim.tick_scenario_lighting_transition(&rules);
         assert_eq!(
-            sim.session.lighting.current_ambient, current,
+            sim.session.lighting().current_ambient(),
+            current,
             "{kind}: {operand}"
         );
-        assert_eq!(sim.session.lighting.target_ambient, 100);
+        assert_eq!(sim.session.lighting().target_ambient(), 100);
         assert_eq!(
             [
-                sim.session.lighting.transition_timer.start_frame(),
-                sim.session.lighting.transition_timer.duration()
+                sim.session.lighting().transition_timer().start_frame(),
+                sim.session.lighting().transition_timer().duration()
             ],
             timer,
             "{kind}: {operand}"
         );
-        assert_eq!(!sim.lighting_sources.pending.is_empty(), relight);
-        let changed = sim.session.lighting.retire_ambient_change_inputs();
+        assert_eq!(!sim.lighting_sources.pending().is_empty(), relight);
+        let changed = sim.session.lighting_mut().retire_ambient_change_inputs();
         assert_eq!(changed[usize::from(kind == 71)].unwrap().bits(), stored);
         assert!(changed[usize::from(kind == 72)].is_none());
         assert_eq!(
@@ -639,7 +651,7 @@ fn ambient_action_values_survive_save_and_transfer_to_retained_rules_at_retireme
         .sim;
     assert_eq!(restored.state_hash(), changed_hash);
     assert_eq!(
-        restored.session.lighting.ambient_change_terms(&rules),
+        restored.session.lighting().ambient_change_terms(&rules),
         (true, 90, 20)
     );
     let mut reversed = Simulation::with_seed(0);
@@ -651,20 +663,28 @@ fn ambient_action_values_survive_save_and_transfer_to_retained_rules_at_retireme
         "hash current values, not action order"
     );
     for sim in [&mut sim, &mut restored] {
-        sim.session.lighting.current_ambient = 60;
-        sim.session.lighting.target_ambient = 100;
-        sim.session.binary_frame = 20;
+        sim.session.lighting_mut().set_current_ambient_for_test(60);
+        sim.session.lighting_mut().set_target_ambient_for_test(100);
+        sim.session.set_binary_frame_for_test(20);
         sim.tick_scenario_lighting_transition(&rules);
     }
-    assert_eq!(restored.session.lighting, sim.session.lighting);
+    assert_eq!(restored.session.lighting(), sim.session.lighting());
     owner
         .consume_outgoing_scenario_rules(
             restored.retire_object_type_tech_levels(),
-            restored.session.lighting.retire_ambient_change_inputs(),
+            restored
+                .session
+                .lighting_mut()
+                .retire_ambient_change_inputs(),
+            restored.retire_building_upgrade_art_names(),
+            restored.retire_voxel_type_damage(),
         )
         .unwrap();
     assert_eq!(
-        restored.session.lighting.retire_ambient_change_inputs(),
+        restored
+            .session
+            .lighting_mut()
+            .retire_ambient_change_inputs(),
         [None; 2]
     );
     assert!(owner.saved_scenario_rules().is_none());
@@ -705,11 +725,13 @@ fn ordered_timer_trigger_updates_live_ambient_inputs_before_the_next_fade() {
          [Actions]\nAMBIENT=3,71,0,1045220557,0,0,0,0,A,72,0,1036831949,0,0,0,0,A,73,0,100,0,0,0,0,A\n\
          [Tags]\nAMBIENTTAG=0,Ambient,AMBIENT\n",
     );
-    sim.session.lighting.current_ambient = 60;
-    sim.session.lighting.target_ambient = 60;
-    sim.session.lighting.transition_timer = CdTimer::started(12, 8);
-    sim.session.binary_frame = 20;
-    sim.advance_triggers(Some(&rules), Some(&overlays), FrameEffects::default());
+    sim.session.lighting_mut().set_current_ambient_for_test(60);
+    sim.session.lighting_mut().set_target_ambient_for_test(60);
+    sim.session
+        .lighting_mut()
+        .set_transition_timer_for_test(CdTimer::started(12, 8));
+    sim.session.set_binary_frame_for_test(20);
+    sim.advance_triggers(&rules, Some(&overlays), FrameEffects::default());
     assert_eq!(
         sim.trigger_runtime
             .action_trace
@@ -718,16 +740,16 @@ fn ordered_timer_trigger_updates_live_ambient_inputs_before_the_next_fade() {
             .collect::<Vec<_>>(),
         [71, 72, 73]
     );
-    assert_eq!(sim.session.lighting.current_ambient, 60);
-    assert_eq!(sim.session.lighting.target_ambient, 100);
+    assert_eq!(sim.session.lighting().current_ambient(), 60);
+    assert_eq!(sim.session.lighting().target_ambient(), 100);
     assert_eq!(
-        sim.session.lighting.transition_timer,
+        *sim.session.lighting().transition_timer(),
         CdTimer::started(12, 8)
     );
     sim.tick_scenario_lighting_transition(&rules);
-    assert_eq!(sim.session.lighting.current_ambient, 80);
+    assert_eq!(sim.session.lighting().current_ambient(), 80);
     assert_eq!(
-        sim.session.lighting.transition_timer,
+        *sim.session.lighting().transition_timer(),
         CdTimer::started(20, 90)
     );
 }
@@ -742,20 +764,20 @@ fn live_normal_rate_still_gates_nuke_fades_and_the_step_is_shared() {
         (2143289344, false),
     ] {
         let mut sim = Simulation::with_seed(0);
-        sim.session.lighting.set_nuke_flash_for_test(1, 0, 10);
-        sim.session.lighting.current_ambient = 60;
-        sim.session.lighting.target_ambient = 100;
+        sim.session.lighting_mut().set_nuke_flash_for_test(1, 0, 10);
+        sim.session.lighting_mut().set_current_ambient_for_test(60);
+        sim.session.lighting_mut().set_target_ambient_for_test(100);
         assert!(run(&mut sim, &rules, action(71, 1045220557)));
         assert!(run(&mut sim, &rules, action(72, bits)));
-        sim.session.binary_frame = 20;
+        sim.session.set_binary_frame_for_test(20);
         sim.tick_scenario_lighting_transition(&rules);
         assert_eq!(
-            sim.session.lighting.current_ambient,
+            sim.session.lighting().current_ambient(),
             if enabled { 80 } else { 60 }
         );
         if enabled {
             assert_eq!(
-                sim.session.lighting.transition_timer.duration(),
+                sim.session.lighting().transition_timer().duration(),
                 crate::map::lighting::NUKE_CHANGE_RATE_DEFAULT
             );
         }

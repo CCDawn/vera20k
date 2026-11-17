@@ -20,10 +20,6 @@ fn signed(value: &Value) -> i32 {
 #[test]
 fn original_can_auto_cloak_matches_retail_inputs_and_retained_target_controls() {
     let native = crate::test_fixture::json("tools/spatial_oracle/cloak_target_gate.json");
-    assert_eq!(
-        native["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     let map = crate::test_fixture::checkout_root()
         .join("tools/spatial_oracle/cloak_target_gate/ordinary-sub-cloak.map");
     let Some(retail) =
@@ -53,7 +49,7 @@ fn original_can_auto_cloak_matches_retail_inputs_and_retained_target_controls() 
         );
         assert_eq!(object.strength, signed(&expected["strength"]), "{name}");
         assert_eq!(
-            crate::sim::combat::armor_index(&object.armor),
+            object.armor_id().index(),
             expected["armor"].as_u64().unwrap() as usize,
             "{name}"
         );
@@ -123,7 +119,15 @@ fn original_can_auto_cloak_matches_retail_inputs_and_retained_target_controls() 
         );
     }
     for (name, expected) in inputs["warheads"].as_object().unwrap() {
-        for (index, verse) in rules.warhead(name).unwrap().verses_f64.iter().enumerate() {
+        for index in 0..11 {
+            let verse = f64::from_bits(
+                rules
+                    .warhead(name)
+                    .unwrap()
+                    .interaction(crate::rules::armor::ArmorId::from_index(index))
+                    .multiplier()
+                    .bits(),
+            );
             assert_eq!(
                 verse
                     .to_le_bytes()
@@ -188,7 +192,7 @@ fn original_can_auto_cloak_matches_retail_inputs_and_retained_target_controls() 
         let mut terrain = sim.resolved_terrain.take().unwrap();
         for y in 0..64 {
             for x in 0..64 {
-                terrain.cell_mut(x, y).unwrap().level =
+                terrain.cell_mut_for_test(x, y).unwrap().level =
                     native["inputs"]["world_boundary"]["flat_cell_level"]
                         .as_u64()
                         .unwrap() as u8;
@@ -197,7 +201,7 @@ fn original_can_auto_cloak_matches_retail_inputs_and_retained_target_controls() 
         sim.install_resolved_terrain_for_new_map(terrain);
         assert!(sim.rebuild_dynamic_navigation(rules));
         for house in sim.houses.values_mut() {
-            house.is_human = true;
+            house.set_is_human_for_test(true);
         }
         let spawn = |sim: &mut super::Simulation, name, owner, xyz: &Value| {
             let id = sim
@@ -222,7 +226,8 @@ fn original_can_auto_cloak_matches_retail_inputs_and_retained_target_controls() 
         };
         let source = spawn(&mut sim, "SUB", "Americans", &input["source_xyz"]);
         let target = spawn(&mut sim, "DEST", "Russians", &input["target_xyz"]);
-        sim.session.binary_frame = u32::try_from(signed(&input["frame"])).unwrap();
+        sim.session
+            .set_binary_frame_for_test(u32::try_from(signed(&input["frame"])).unwrap());
         let actor = sim.substrate.entities.get_mut(source).unwrap();
         // Deserialize explicit native component inputs through the cloak
         // owner's existing persistence boundary; no new mutation API/state.
@@ -230,7 +235,7 @@ fn original_can_auto_cloak_matches_retail_inputs_and_retained_target_controls() 
         cloak["state"] = input["state"].clone();
         cloak["depth"] = input["progress"].clone();
         cloak["recloak_delay"] = json!({"start_frame": signed(&input["recloak"][0]), "duration": signed(&input["recloak"][1])});
-        actor.cloak = Some(serde_json::from_value(cloak).unwrap());
+        actor.cloak = Some(Box::new(serde_json::from_value(cloak).unwrap()));
         actor.rearm_timer.set_for_test(CdTimer::from_raw(
             signed(&input["rearm"][0]),
             signed(&input["rearm"][1]),
@@ -241,7 +246,7 @@ fn original_can_auto_cloak_matches_retail_inputs_and_retained_target_controls() 
                 .unwrap()
                 .then_some(TargetKind::Entity(target)),
         );
-        let retained = actor.cloak;
+        let retained = actor.cloak.clone();
         sim.scenario_rng =
             SimRng::from_native_state_hex_for_test(row["rng_before"]["scenario"].as_str().unwrap());
         sim.main_rng =

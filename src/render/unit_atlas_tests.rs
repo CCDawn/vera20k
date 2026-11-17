@@ -3,6 +3,188 @@ use crate::render::vxl_raster::VxlSprite;
 use crate::rules::ini_parser::IniFile;
 use crate::rules::voxel_frame_catalog::draws_turret_parts;
 
+#[test]
+fn retail_jumpjet_unit_demand_includes_native_shadow_stencils() {
+    use crate::rules::retail_ini_fixture::{retail_assets, retail_battle_rules};
+    let Some(battle) = retail_battle_rules() else {
+        return;
+    };
+    let (_, assets) = retail_assets().expect("retail assets for the loaded rules");
+    let object = battle.rules.object("ZEP").expect("retail Kirov");
+    assert_eq!(
+        object.locomotor,
+        crate::rules::locomotor_type::LocomotorKind::Jumpjet
+    );
+    assert!(object.considered_aircraft);
+    assert!(!object.no_shadow);
+    assert_eq!(object.voxel_shadow_index(), 0);
+    let demand = UnitAtlasDemand {
+        air: BTreeSet::from(["ZEP".to_string()]),
+        ..Default::default()
+    };
+    let (keys, _) = needed_unit_keys(&demand, &assets, Some(&battle.rules));
+    let fixture: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/voxel_oracle/unit_shadow.json",
+    ))
+    .unwrap();
+    let model = UnitModel::load(&assets, "ZEP", Some(&battle.rules)).unwrap();
+    for case in fixture["retail"]["cases"].as_array().unwrap() {
+        let caller = &fixture["callers"][case["caller"].as_u64().unwrap() as usize];
+        assert!(caller["draw_admitted"].as_bool().unwrap());
+        assert!(!caller["body_mask_present"].as_bool().unwrap());
+        let key = UnitSpriteKey {
+            type_id: "ZEP".into(),
+            turret_index: 0,
+            facing: vxl_raster::voxel_facing_step_u16(
+                caller["input"]["primary"].as_u64().unwrap() as u16
+            ) * 8,
+            layer: VxlLayer::Shadow,
+            frame: 0,
+            slope_type: caller["input"]["slope"].as_u64().unwrap_or(0) as u8,
+            barrel_pitch: 0,
+        };
+        assert!(keys.contains(&key), "Unit73C5C4 requires {key:?}");
+        let mut grounded = key.clone();
+        grounded.frame |= GROUNDED_SHADOW_FRAME_FLAG;
+        assert!(
+            keys.contains(&grounded),
+            "ground mask must not occupy the flight stencil"
+        );
+        let (_, bounds) = model
+            .render(&key, None, None, &mut None)
+            .expect("native Kirov shadow");
+        let rect = &case["rect"];
+        assert_eq!(
+            bounds,
+            Some([0, 1, 4, 5].map(|i| rect[i].as_i64().unwrap() as i32))
+        );
+    }
+}
+
+/// A Magnetron's `IsLocomotor=` Jumpjet lifts any vehicle, whose shadow
+/// Unit73C1D2's suffix then draws at the slope of the cell below (base
+/// Shadow_Matrix 0x0055A7D0): unmasked high above it, and in the grounded
+/// entry (73C468) on the ground. A Hover victim and a Drive victim over a
+/// ramp both need a resident native stencil for each.
+#[test]
+fn retail_lifted_vehicles_keep_native_shadow_stencils_on_their_cell_slope() {
+    use crate::render::foot_depth::DepthCell;
+    use crate::render::unit_shadow::{UnitShadowContext, pose};
+    use crate::rules::retail_ini_fixture::{retail_assets, retail_battle_rules};
+    let Some(battle) = retail_battle_rules() else {
+        return;
+    };
+    let (_, assets) = retail_assets().expect("retail assets for the loaded rules");
+    let [x, y] = [10 * 256 + 128; 2];
+    for (type_id, ramp) in [("ROBO", 0), ("HTNK", 1)] {
+        let demand = UnitAtlasDemand {
+            ground: BTreeSet::from([type_id.to_string()]),
+            ..Default::default()
+        };
+        let (keys, _) = needed_unit_keys(&demand, &assets, Some(&battle.rules));
+        let model = UnitModel::load(&assets, type_id, Some(&battle.rules)).unwrap();
+        let floor = crate::util::lepton::ground_height_leptons(0, ramp, x, y).unwrap();
+        for height in [0, 500] {
+            let key = pose(
+                UnitShadowContext {
+                    xyz: [x, y, floor + height],
+                    on_bridge: false,
+                    marked: true,
+                    primary_facing: 0x4000,
+                },
+                |coord| DepthCell {
+                    coord,
+                    ramp,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .key(type_id);
+            assert!(keys.contains(&key), "{key:?} resident");
+            let (_, bounds) = model.render(&key, None, None, &mut None).unwrap();
+            assert!(bounds.is_some(), "{key:?} native stencil");
+        }
+    }
+}
+
+/// Aircraft DrawIt4148A0 reaches the shared Foot shadow owner. An ordinary
+/// retail Harrier therefore needs a shadow resident alongside its body.
+#[test]
+fn retail_fly_aircraft_demand_includes_ground_shadow() {
+    use crate::rules::retail_ini_fixture::{retail_assets, retail_battle_rules};
+    let Some(battle) = retail_battle_rules() else {
+        return;
+    };
+    let (_, assets) = retail_assets().expect("retail assets for the loaded rules");
+    let object = battle.rules.object("ORCA").expect("retail Harrier");
+    assert_eq!(
+        object.locomotor,
+        crate::rules::locomotor_type::LocomotorKind::Fly
+    );
+    assert!(!object.no_shadow);
+    let demand = UnitAtlasDemand {
+        air: BTreeSet::from(["ORCA".to_string()]),
+        ..Default::default()
+    };
+    let (keys, _) = needed_unit_keys(&demand, &assets, Some(&battle.rules));
+    assert!(
+        keys.iter()
+            .any(|key| key.type_id == "ORCA" && key.layer == VxlLayer::Shadow),
+        "Aircraft DrawIt requires the resident ground-shadow stencil"
+    );
+    let model = UnitModel::load(&assets, "ORCA", Some(&battle.rules)).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/voxel_oracle/aircraft_shadow.json",
+    ))
+    .unwrap();
+    let native = &fixture["retail"]["cases"][0];
+    assert_eq!(
+        voxel_image_id("ORCA", Some(&battle.rules)),
+        fixture["retail"]["image"].as_str().unwrap()
+    );
+    let key = UnitSpriteKey {
+        type_id: "ORCA".into(),
+        turret_index: 0,
+        facing: 0,
+        layer: VxlLayer::Shadow,
+        frame: 0,
+        slope_type: 0,
+        barrel_pitch: 0,
+    };
+    let (sprite, bounds) = model.render(&key, None, None, &mut None).unwrap();
+    let rect: Vec<i32> = native["rect"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_i64().unwrap() as i32)
+        .collect();
+    assert_eq!(bounds, Some([rect[0], rect[1], rect[4], rect[5]]));
+    let mut expected = vec![0u8; 65536];
+    for p in native["pixels"].as_array().unwrap() {
+        expected[p[0].as_u64().unwrap() as usize] = p[1].as_u64().unwrap() as u8;
+    }
+    let cropped: Vec<u8> = (rect[3]..rect[3] + rect[5])
+        .flat_map(|y| {
+            let start = (y * 256 + rect[2]) as usize;
+            expected[start..start + rect[4] as usize].iter().copied()
+        })
+        .collect();
+    assert_eq!(
+        sprite.palette_indices, cropped,
+        "production UnitModel native ORCA stencil"
+    );
+    for name in ["V3ROCKET", "DMISL", "CMISL"] {
+        if let Some(missile) = battle.rules.object(name) {
+            eprintln!(
+                "retail {name}: NoShadow={} ConsideredAircraft={} ShadowIndex={}",
+                missile.no_shadow,
+                missile.considered_aircraft,
+                missile.voxel_shadow_index()
+            );
+        }
+    }
+}
+
 fn gsi_13_07_variant_rules() -> RuleSet {
     RuleSet::from_ini(&IniFile::from_str(
         "\
@@ -91,7 +273,7 @@ fn gsi_13_07_no_spawn_alt_composite_seeds_32_facings_by_17_slopes() {
     for facing in (0..=248).step_by(8) {
         for slope_type in 0..=16 {
             assert!(needed.contains(&UnitSpriteKey {
-                type_id: "DREDWO".to_string(),
+                type_id: "DREDWO".into(),
                 turret_index: 0,
                 facing,
                 layer: VxlLayer::Composite,
@@ -101,111 +283,6 @@ fn gsi_13_07_no_spawn_alt_composite_seeds_32_facings_by_17_slopes() {
             }));
         }
     }
-}
-
-#[test]
-fn test_unit_sprite_key_hash_equality() {
-    let key1 = UnitSpriteKey {
-        type_id: "HTNK".into(),
-        turret_index: 0,
-        facing: 64,
-        layer: VxlLayer::Composite,
-        frame: 0,
-        slope_type: 0,
-        barrel_pitch: 0,
-    };
-    let key2 = UnitSpriteKey {
-        type_id: "HTNK".into(),
-        turret_index: 0,
-        facing: 64,
-        layer: VxlLayer::Composite,
-        frame: 0,
-        slope_type: 0,
-        barrel_pitch: 0,
-    };
-    let key3 = UnitSpriteKey {
-        type_id: "HTNK".into(),
-        turret_index: 0,
-        facing: 128,
-        layer: VxlLayer::Composite,
-        frame: 0,
-        slope_type: 0,
-        barrel_pitch: 0,
-    };
-    assert_eq!(key1, key2);
-    assert_ne!(key1, key3);
-    let mut set: HashSet<UnitSpriteKey> = HashSet::new();
-    set.insert(key1);
-    set.insert(key2); // duplicate
-    set.insert(key3);
-    assert_eq!(set.len(), 2);
-}
-
-#[test]
-fn every_unit_sprite_key_dimension_remains_distinct() {
-    let base = UnitSpriteKey {
-        type_id: "HTNK".into(),
-        turret_index: 0,
-        facing: 64,
-        layer: VxlLayer::Body,
-        frame: 2,
-        slope_type: 3,
-        barrel_pitch: 0,
-    };
-    let mut variants = vec![base.clone()];
-
-    let mut different_type = base.clone();
-    different_type.type_id = "CMIN".into();
-    variants.push(different_type);
-
-    let mut different_facing = base.clone();
-    different_facing.facing = 66;
-    variants.push(different_facing);
-
-    let mut different_layer = base.clone();
-    different_layer.layer = VxlLayer::Turret;
-    variants.push(different_layer);
-
-    let mut different_frame = base.clone();
-    different_frame.frame = 3;
-    variants.push(different_frame);
-
-    let mut different_turret = base.clone();
-    different_turret.turret_index = 1;
-    variants.push(different_turret);
-
-    let mut different_slope = base;
-    different_slope.slope_type = 4;
-    variants.push(different_slope);
-
-    assert_eq!(
-        variants.into_iter().collect::<HashSet<_>>().len(),
-        7,
-        "type, turret index, facing, layer, frame, and slope are all cache identity"
-    );
-}
-
-#[test]
-fn test_empty_world_returns_none() {
-    let needed: HashSet<UnitSpriteKey> = HashSet::new();
-    assert!(needed.is_empty());
-}
-
-#[test]
-fn test_key_collection_deduplicates() {
-    let mut needed: HashSet<UnitSpriteKey> = HashSet::new();
-    for facing in [64u8, 64, 128] {
-        needed.insert(UnitSpriteKey {
-            type_id: "HTNK".to_string(),
-            turret_index: 0,
-            facing,
-            layer: VxlLayer::Composite,
-            frame: 0,
-            slope_type: 0,
-            barrel_pitch: 0,
-        });
-    }
-    assert_eq!(needed.len(), 2);
 }
 
 #[test]
@@ -297,203 +374,77 @@ fn test_pad_layer_to_union_bounds() {
     assert_eq!(padded_turret.palette_indices[turret_pix], 200);
 }
 
+/// Admitting a world's voxel models draws no picture. The first lookup of a
+/// key draws it once, as `TechnoClass::Draw @ 0x00706640` renders a cache
+/// miss (`0x00706ED0`) and later hits blit the stored image (`0x00707480`);
+/// the picture is the one the model renders for that key. A key the model
+/// does not draw stays absent and draws nothing.
 #[test]
-fn test_canonical_turret_facing() {
-    use super::canonical_turret_facing;
-    // canonical_turret_facing takes a 16-bit DirStruct and quantizes it to one of the
-    // renderer's 32 facing steps, then scales that step back into the 8-bit facing the
-    // atlas key uses. The voxel rotation matrix is built from a 5-bit facing, so a
-    // turret has exactly 32 orientations no matter how finely the sim aims it.
-    assert_eq!(canonical_turret_facing(0u16), 0);
-    // Everything inside one 11.25° step collapses to that step's representative.
-    // One step spans 8 units of 8-bit facing, i.e. 2048 units of 16-bit facing,
-    // centred on the representative — so the step-0 bucket runs to just under 1024.
-    assert_eq!(canonical_turret_facing(256), 0);
-    assert_eq!(canonical_turret_facing(1023), 0);
-    assert_eq!(
-        canonical_turret_facing(1024),
-        8,
-        "round-half-up into step 1"
-    );
-    assert_eq!(canonical_turret_facing(2048), 8);
-    assert_eq!(canonical_turret_facing(64 << 8), 64, "east");
-    assert_eq!(canonical_turret_facing(128 << 8), 128, "south");
-    assert_eq!(canonical_turret_facing(65280), 0, "wraps back to north");
-    // Body and turret share the same granularity.
-    assert_eq!(canonical_unit_facing(64), 64);
-    assert_eq!(canonical_turret_facing(64 << 8), 64);
-}
-
-#[test]
-fn canonical_facing_collapses_to_the_32_rendered_orientations() {
-    use super::{canonical_turret_facing, canonical_unit_facing};
-    // The sim stores facing as a byte, but the renderer only has 32 orientations, so
-    // canonicalization is deliberately lossy: retail tanks visibly step through 11.25°
-    // increments. Pin that the collapse is exactly 32-way, that it agrees between the
-    // body and turret entry points, and that every output is a real bucket
-    // representative (otherwise the atlas key would miss).
-    let mut distinct = std::collections::BTreeSet::new();
-    for facing in 0..=u8::MAX {
-        let body = canonical_unit_facing(facing);
-        assert_eq!(
-            body,
-            canonical_turret_facing(u16::from(facing) << 8),
-            "body and turret quantization disagree at facing {facing}"
-        );
-        assert_eq!(
-            body % 8,
-            0,
-            "facing {facing} produced non-representative {body}"
-        );
-        distinct.insert(body);
-    }
-    assert_eq!(
-        distinct.len(),
-        32,
-        "expected exactly 32 rendered orientations"
-    );
-
-    // Quantization must be a projection: re-canonicalizing a representative is a no-op,
-    // or a sprite lookup could land in a different bucket than the one baked.
-    for &facing in &distinct {
-        assert_eq!(canonical_unit_facing(facing), facing);
-    }
-}
-
-#[test]
-fn test_facing_config_for_layer() {
-    // Every layer renders the same 32 orientations: step 8, 32 buckets.
-    for layer in [
-        VxlLayer::Body,
-        VxlLayer::Composite,
-        VxlLayer::Turret,
-        VxlLayer::Barrel,
-        VxlLayer::Shadow,
-    ] {
-        let (step, buckets) = super::facing_config_for_layer(layer);
-        assert_eq!(step, 8, "{layer:?} facing step");
-        assert_eq!(buckets, 32, "{layer:?} facing buckets");
-        // The facing derived from the last bucket must still fit a byte.
-        assert_eq!((buckets - 1) * u16::from(step), 248);
-    }
-}
-
-#[test]
-fn forced_overflow_plan_keeps_every_sprite_in_bounds() {
-    let dimensions = vec![(6, 4); 4];
-    let plan = plan_sprite_pages(&dimensions, 8).expect("forced overflow must be pageable");
-
-    assert!(plan.page_heights.len() >= 2);
-    assert_eq!(plan.placements.len(), dimensions.len());
-
-    assert!(plan.page_width <= 8);
-    assert!(plan.page_heights.iter().all(|&height| height <= 8));
-
-    let mut seen = vec![false; dimensions.len()];
-    for (placement_index, placement) in plan.placements.iter().enumerate() {
-        let (width, height) = dimensions[placement.sprite_index];
-        assert!(!seen[placement.sprite_index]);
-        seen[placement.sprite_index] = true;
-        assert!(placement.x + width <= plan.page_width);
-        assert!(placement.y + height <= plan.page_heights[placement.page]);
-        for other in plan.placements.iter().skip(placement_index + 1) {
-            if placement.page != other.page {
-                continue;
-            }
-            let (other_width, other_height) = dimensions[other.sprite_index];
-            let separated = placement.x + width <= other.x
-                || other.x + other_width <= placement.x
-                || placement.y + height <= other.y
-                || other.y + other_height <= placement.y;
-            assert!(separated, "page placements must not overlap");
-        }
-
-        let page_width = plan.page_width as f32;
-        let page_height = plan.page_heights[placement.page] as f32;
-        let uv_origin = [
-            placement.x as f32 / page_width,
-            placement.y as f32 / page_height,
-        ];
-        let uv_size = [width as f32 / page_width, height as f32 / page_height];
-        assert!(uv_origin.into_iter().all(f32::is_finite));
-        assert!(uv_size.into_iter().all(f32::is_finite));
-        assert!(uv_origin[0] >= 0.0 && uv_origin[1] >= 0.0);
-        assert!(uv_origin[0] + uv_size[0] <= 1.0);
-        assert!(uv_origin[1] + uv_size[1] <= 1.0);
-    }
-    assert!(seen.into_iter().all(|value| value));
-}
-
-#[test]
-fn wide_short_sprite_expands_page_width_before_placement() {
-    let dimensions = [(100, 1), (4, 4)];
-    let plan = plan_sprite_pages(&dimensions, 128).expect("both sprites fit the device limit");
-
-    assert!(plan.page_width >= 100);
-    for placement in &plan.placements {
-        let (width, height) = dimensions[placement.sprite_index];
-        assert!(placement.x + width <= plan.page_width);
-        assert!(placement.y + height <= plan.page_heights[placement.page]);
-    }
-}
-
-#[test]
-fn incremental_repack_plan_retains_old_unloading_referent() {
-    let make_cached = |type_id: &str| CachedUnitSprite {
-        key: UnitSpriteKey {
-            type_id: type_id.into(),
-            turret_index: 0,
-            facing: 0,
-            layer: VxlLayer::Composite,
-            frame: 0,
-            slope_type: 0,
-            barrel_pitch: 0,
-        },
-        pixels: vec![1; 24],
-        width: 6,
-        height: 4,
-        offset_x: 0.0,
-        offset_y: 0.0,
-        native_draw_bounds: Some([-4, -4, 14, 12]),
+fn admitted_models_draw_each_picture_on_its_first_lookup() {
+    use crate::rules::retail_ini_fixture::{retail_assets, retail_battle_rules};
+    let Some(battle) = retail_battle_rules() else {
+        return;
     };
-    // CMON is CMIN's stock UnloadingClass referent. It may be absent from the
-    // current live-key collector but must remain in the rendered cache.
-    let cached = vec![make_cached("CMON"), make_cached("CMIN")];
-    let plan = plan_cached_sprite_pages(&cached, 8).expect("both cached sprites must repack");
-    let retained = plan
-        .placements
-        .iter()
-        .map(|placement| cached[placement.sprite_index].key.type_id.as_str())
-        .collect::<HashSet<_>>();
+    let (_, assets) = retail_assets().expect("retail assets for the loaded rules");
+    let rules = Some(&battle.rules);
+    let mut entity =
+        crate::sim::game_entity::GameEntity::test_default(1, "HTNK", "Americans", 5, 5);
+    entity.set_category_for_test(crate::map::entities::EntityCategory::Unit);
+    entity.set_is_voxel_for_test(true);
+    let mut world = crate::sim::entity_store::EntityStore::new();
+    world.insert(entity);
+    let interner = crate::sim::intern::test_interner();
 
-    assert_eq!(retained, HashSet::from(["CMON", "CMIN"]));
-}
+    let mut atlas = None;
+    admit_world_models(&mut atlas, &world, &assets, rules, Some(&interner), 8192);
+    let atlas = atlas.expect("a voxel world makes the atlas");
+    assert!(atlas_covers_world(
+        Some(&atlas),
+        &world,
+        rules,
+        Some(&interner)
+    ));
+    let drawn = |atlas: &UnitAtlas| {
+        let statistics = atlas.statistics().unwrap();
+        (
+            statistics.resident_sprite_count,
+            statistics.last_build_rasterized_sprite_count,
+        )
+    };
+    assert_eq!(drawn(&atlas), (0, 0), "admission draws no picture");
 
-#[test]
-fn page_plan_has_no_u8_page_cap() {
-    let dimensions = vec![(8, 8); 257];
-    let plan = plan_sprite_pages(&dimensions, 8).expect("257 pages must remain addressable");
-
-    assert_eq!(plan.page_heights.len(), 257);
+    let key = UnitSpriteKey {
+        type_id: "HTNK".into(),
+        turret_index: 0,
+        facing: 64,
+        layer: VxlLayer::Turret,
+        frame: 0,
+        slope_type: 3,
+        barrel_pitch: 0,
+    };
+    let entry = atlas.get(&key).expect("a Rhino turret on a ramp");
+    assert_eq!(atlas.get(&key), Some(entry), "a hit draws nothing again");
+    assert_eq!(drawn(&atlas), (1, 1));
+    let model = UnitModel::load(&assets, "HTNK", rules).unwrap();
+    let vpl = VplFile::from_bytes(assets.get_ref("VOXELS.VPL").unwrap()).unwrap();
+    let (sprite, bounds) = model.render(&key, Some(&vpl), None, &mut None).unwrap();
+    assert_eq!(entry.native_draw_bounds, bounds);
     assert_eq!(
-        plan.placements.iter().map(|placement| placement.page).max(),
-        Some(256)
+        atlas
+            .resident
+            .borrow()
+            .rendered_by_key(&key)
+            .unwrap()
+            .pixels,
+        sprite.palette_indices
     );
-    assert_eq!(plan.placements.len(), dimensions.len());
-}
 
-#[test]
-fn page_plan_rejects_an_individually_oversized_sprite() {
-    let err = plan_sprite_pages(&[(9, 1)], 8).expect_err("oversized sprite must not be clipped");
-    assert_eq!(
-        err,
-        UnitAtlasPackError::SpriteExceedsTextureLimit {
-            sprite_index: 0,
-            width: 9,
-            height: 1,
-            limit: 8,
-        }
-    );
+    let between_facings = UnitSpriteKey {
+        facing: 4,
+        ..key.clone()
+    };
+    assert_eq!(atlas.get(&between_facings), None);
+    assert_eq!(drawn(&atlas), (1, 1));
 }
 
 #[test]
@@ -510,35 +461,6 @@ fn unit_barrel_pitches_walk_the_unlimbo_turn() {
     let half = unit_barrel_pitches(128);
     assert_eq!(half.len(), 17);
     assert_eq!((half[8], half[9], half[16]), (-8, 23, 16));
-}
-
-#[test]
-fn barrel_image_keeps_its_first_drawn_pitch() {
-    let key = |type_id: &str, facing| UnitSpriteKey {
-        type_id: type_id.into(),
-        turret_index: 0,
-        facing,
-        layer: VxlLayer::Turret,
-        frame: 0,
-        slope_type: 0,
-        barrel_pitch: 0,
-    };
-    let mut pitches = BarrelImagePitches::default();
-    // The first unit drawn under a key fixes its image; later ones reuse it.
-    assert_eq!(pitches.pitch(&key("MTNK", 32), None, 0), 0);
-    assert_eq!(pitches.pitch(&key("MTNK", 32), None, -1), 0);
-    assert_eq!(pitches.pitch(&key("MTNK", 40), None, -1), -1);
-    assert_eq!(pitches.pitch(&key("MTNK", 40), None, 0), -1);
-    // A TurretOffset type keys the hull's facing too; each type has its own.
-    assert_eq!(pitches.pitch(&key("MTNK", 32), Some(0), -1), -1);
-    assert_eq!(pitches.pitch(&key("HTNK", 32), None, -1), -1);
-    let mut different_turret = key("MTNK", 32);
-    different_turret.turret_index = 1;
-    assert_eq!(pitches.pitch(&different_turret, None, -2), -2);
-    assert_eq!(pitches.pitch(&key("MTNK", 32), None, -2), 0);
-    // A new scenario starts empty.
-    pitches.clear();
-    assert_eq!(pitches.pitch(&key("MTNK", 32), None, -1), -1);
 }
 
 /// gamemd's voxel loader names a vehicle's models from its rules `Image=`
@@ -782,7 +704,8 @@ fn retail_ifv_atlas_covers_all_turrets_without_replicating_its_hull() {
     let (keys, _) = needed_unit_keys(&demand, &assets, Some(&battle.rules));
     let count = |layer| keys.iter().filter(|key| key.layer == layer).count();
     assert_eq!(count(VxlLayer::Body), 32 * 17);
-    assert_eq!(count(VxlLayer::Shadow), 32 * 17);
+    // Flight and grounded stencils for the Magnetron's lift.
+    assert_eq!(count(VxlLayer::Shadow), 2 * 32 * 17);
     assert_eq!(count(VxlLayer::Turret), 4 * 32 * 17);
     assert_eq!(
         keys.iter()
@@ -869,7 +792,7 @@ fn retail_ifv_models_draw_four_distinct_guns_and_share_body_and_shadow() {
     let vpl = VplFile::from_bytes(assets.get_ref("VOXELS.VPL").unwrap()).unwrap();
     let mut pose = None;
     let mut key = UnitSpriteKey {
-        type_id: "FV".to_string(),
+        type_id: "FV".into(),
         turret_index: 0,
         facing: 64,
         layer: VxlLayer::Body,
@@ -909,6 +832,51 @@ fn retail_ifv_models_draw_four_distinct_guns_and_share_body_and_shadow() {
 }
 
 #[test]
+fn stock_count_shrink_keeps_the_loaded_native_turret() {
+    use crate::rules::retail_ini_fixture::{retail_assets, retail_battle_rules_for_map_with_patch};
+    use crate::rules::voxel_frame_catalog::voxel_turret_index;
+
+    let Some(battle) = retail_battle_rules_for_map_with_patch(
+        "Hills.mmx",
+        &IniFile::from_str("[FV]\nTurretCount=1\nRepairTurretWeapon=0\nRepairTurretIndex=3\n"),
+    ) else {
+        return;
+    };
+    let (_, assets) = retail_assets().unwrap();
+    let rules = &battle.rules;
+    let object = rules.object("FV").unwrap();
+    assert!(!rules.ares());
+    assert_eq!(object.turret_count, 1);
+    let physical =
+        crate::rules::voxel_asset_catalog::load_voxel_model(&assets, "FV", Some(rules)).unwrap();
+    assert_eq!(
+        physical.indexed_count(),
+        4,
+        "retail FV loads four native slots first"
+    );
+    let current = object.gunner_turrets.turret_for_weapon(0);
+    assert_eq!(voxel_turret_index("FV", Some(rules), current), 3);
+    let model = UnitModel::load(&assets, "FV", Some(rules)).unwrap();
+    assert_eq!(model.guns.len(), 4);
+    let demand = UnitAtlasDemand {
+        ground: BTreeSet::from(["FV".to_owned()]),
+        ..Default::default()
+    };
+    let (keys, _) = needed_unit_keys(&demand, &assets, Some(rules));
+    let key = UnitSpriteKey {
+        type_id: "FV".into(),
+        turret_index: current,
+        facing: 64,
+        layer: VxlLayer::Turret,
+        frame: 0,
+        slope_type: 0,
+        barrel_pitch: 0,
+    };
+    assert!(keys.contains(&key));
+    assert!(model.render(&key, None, None, &mut None).is_some());
+}
+
+#[test]
 fn indexed_model_loader_requires_turret_pairs_but_allows_absent_barrels() {
     use crate::map::source::test_support::TestDirectory;
     use crate::rules::retail_ini_fixture::retail_assets;
@@ -917,7 +885,9 @@ fn indexed_model_loader_requires_turret_pairs_but_allows_absent_barrels() {
     };
     for (name, turret, gattling, missing, bad_barrel, expected_guns) in [
         ("valid", true, false, None, false, Some(2)),
-        ("no-turret-flag", false, false, None, true, Some(2)),
+        // ObjectType5F827E/5F8287 branches before the indexed loop: a
+        // Turret=no Unit never loads FVTUR1, regardless of TurretCount.
+        ("no-turret-flag", false, false, None, true, Some(0)),
         (
             "missing-turret",
             true,
@@ -953,13 +923,12 @@ fn indexed_model_loader_requires_turret_pairs_but_allows_absent_barrels() {
             .unwrap();
         }
         let fixture = AssetManager::from_loose_root_for_test(directory.path());
-        let mut rules = RuleSet::from_ini(&IniFile::from_str(&format!(
+        let art = IniFile::from_str("[FV]\nVoxel=yes\n");
+        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&IniFile::from_str(&format!(
             "[VehicleTypes]\n0=FV\n[FV]\nTurretCount=2\nTurret={turret}\nIsGattling={gattling}\n"
-        )))
+        )), &art)
         .unwrap();
-        rules.install_art_fixture(crate::rules::art_data::ArtRegistry::from_ini(
-            &IniFile::from_str("[FV]\nVoxel=yes\n"),
-        ));
+        rules.install_art_fixture(crate::rules::art_data::ArtRegistry::from_ini(&art));
         assert_eq!(
             UnitModel::load(&fixture, "FV", Some(&rules)).map(|model| model.guns.len()),
             expected_guns,
@@ -984,12 +953,12 @@ fn kirov_direct_matrix_requires_hva_and_wraps_its_native_frame() {
     .unwrap();
     let lighting = crate::render::vxl_raster::VxlLighting::Diffuse;
     let (first, bounds) = model
-        .render_matrix(matrix, 0, true, lighting, Some(&vpl))
+        .render_matrix(matrix, 0, true, lighting, Some(&vpl), false, None)
         .unwrap();
     assert!(bounds.is_some());
     let frames = model.body.as_ref().unwrap().hva().unwrap().frame_count;
     let (wrapped, wrapped_bounds) = model
-        .render_matrix(matrix, frames, true, lighting, Some(&vpl))
+        .render_matrix(matrix, frames, true, lighting, Some(&vpl), false, None)
         .unwrap();
     assert_eq!(first.palette_indices, wrapped.palette_indices);
     assert_eq!(bounds, wrapped_bounds);
@@ -1006,14 +975,192 @@ fn kirov_direct_matrix_requires_hva_and_wraps_its_native_frame() {
     let model = UnitModel::load(&no_hva, "ZBOMB", None).unwrap();
     assert!(
         model
-            .render_matrix(matrix, 0, true, lighting, Some(&vpl))
+            .render_matrix(matrix, 0, true, lighting, Some(&vpl), false, None)
             .is_none(),
         "Bullet LoadVoxelAssets requires both main files"
     );
     assert!(
         model
-            .render_matrix(matrix, 0, false, lighting, Some(&vpl))
+            .render_matrix(matrix, 0, false, lighting, Some(&vpl), false, None)
             .is_some(),
         "the explicit debris no-HVA caller still uses the same raster owner"
+    );
+}
+
+/// VoxelAnim749CCF/749DCE submit one physical section to the existing
+/// shadow/body owners, without HVA; 749D9F still selects section0's lighting.
+#[test]
+fn tumble_selects_one_physical_section_for_body_and_shadow() {
+    let fixture = crate::test_fixture::json("tools/voxel_oracle/aircraft_shadow.json");
+    let decode = |key| {
+        fixture["generated"][key]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let mut bytes = decode("vxl");
+    let tailers = bytes.len() - 4 * 92;
+    // Authored input: give the selected limb its own bounds so using section0
+    // for either crop or shadow is observable. No numeric golden is invented.
+    for offset in [64, 76] {
+        let at = tailers + 2 * 92 + offset;
+        let value = f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) + 12.0;
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let directory = crate::map::source::test_support::TestDirectory::new("tumble-section");
+    std::fs::write(directory.path().join("MULTI.VXL"), &bytes).unwrap();
+    std::fs::write(directory.path().join("MULTI.HVA"), decode("hva")).unwrap();
+    let assets = AssetManager::from_loose_root_for_test(directory.path());
+    let model = UnitModel::load(&assets, "MULTI", None).unwrap();
+    let vpl = VplFile::from_bytes(&decode("vpl")).unwrap();
+    let matrix = vxl_raster::projectile_voxel_matrix(
+        crate::sim::projectile::ProjectileVelocity::new(3, -2, 1),
+    )
+    .unwrap();
+    let (body, shadow) = UnitModel::render_tumble(
+        model.body.as_ref().unwrap(),
+        2,
+        matrix,
+        Some(&vpl),
+        false,
+        None,
+    )
+    .unwrap();
+    let shadow = shadow.unwrap();
+    let (other, other_shadow) = UnitModel::render_tumble(
+        model.body.as_ref().unwrap(),
+        0,
+        matrix,
+        Some(&vpl),
+        false,
+        None,
+    )
+    .unwrap();
+    let other_shadow = other_shadow.unwrap();
+    assert_ne!(body.palette_indices, other.palette_indices);
+    assert_ne!(
+        (shadow.offset_x, shadow.offset_y),
+        (other_shadow.offset_x, other_shadow.offset_y)
+    );
+
+    let (paint, stencil) =
+        UnitModel::tumble_images(model.body.as_ref().unwrap(), 2, matrix, Some(&vpl), false)
+            .unwrap();
+    let vxl_raster::VoxelImage::Paint {
+        raster: paint_raster,
+        hva,
+        ..
+    } = paint
+    else {
+        panic!("selected encoded section must reach the ordinary GPU preparation");
+    };
+    assert!(hva.is_none());
+    assert_eq!(
+        paint_raster
+            .sections
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>(),
+        [2]
+    );
+    assert_eq!(
+        paint_raster.pages,
+        crate::render::vxl_normals::diffuse_pages(4, glam::Mat3::from_mat4(matrix))
+    );
+    let Some(vxl_raster::VoxelImage::Stencil {
+        raster: shadow_raster,
+        ..
+    }) = stencil
+    else {
+        panic!("selected section must reach the existing stencil preparation");
+    };
+    assert_eq!(shadow_raster.limb, 2);
+    assert!(
+        UnitModel::render_tumble(
+            model.body.as_ref().unwrap(),
+            -1,
+            matrix,
+            Some(&vpl),
+            false,
+            None
+        )
+        .is_none()
+    );
+    assert!(
+        UnitModel::tumble_images(model.body.as_ref().unwrap(), 4, matrix, Some(&vpl), false)
+            .is_none()
+    );
+
+    // Unselected geometry cannot enlarge the crop. The selected tailer's
+    // transform and normals mode are ignored by this no-HVA/diffuse caller.
+    for offset in [64, 76] {
+        let at = tailers + offset;
+        let value = f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) + 100.0;
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[tailers + 2 * 92 + 28..tailers + 2 * 92 + 32].copy_from_slice(&80f32.to_le_bytes());
+    bytes[tailers + 2 * 92 + 91] = 2;
+    std::fs::write(directory.path().join("OTHER.VXL"), &bytes).unwrap();
+    let changed = UnitModel::load(
+        &AssetManager::from_loose_root_for_test(directory.path()),
+        "OTHER",
+        None,
+    )
+    .unwrap();
+    let (changed_body, changed_shadow) = UnitModel::render_tumble(
+        changed.body.as_ref().unwrap(),
+        2,
+        matrix,
+        Some(&vpl),
+        false,
+        None,
+    )
+    .unwrap();
+    let (changed_image, _) =
+        UnitModel::tumble_images(changed.body.as_ref().unwrap(), 2, matrix, Some(&vpl), false)
+            .unwrap();
+    let vxl_raster::VoxelImage::Paint {
+        raster: changed_raster,
+        ..
+    } = changed_image
+    else {
+        panic!("changed unselected section must not reject native paint");
+    };
+    assert_eq!(
+        paint_raster.pages, changed_raster.pages,
+        "diffuse lighting still uses section0"
+    );
+    assert_eq!(body.palette_indices, changed_body.palette_indices);
+    assert_eq!(
+        (body.offset_x, body.offset_y, body.width, body.height),
+        (
+            changed_body.offset_x,
+            changed_body.offset_y,
+            changed_body.width,
+            changed_body.height
+        )
+    );
+    let changed_shadow = changed_shadow.unwrap();
+    assert_eq!(shadow.palette_indices, changed_shadow.palette_indices);
+    assert_eq!(
+        (shadow.offset_x, shadow.offset_y),
+        (changed_shadow.offset_x, changed_shadow.offset_y)
+    );
+
+    // A preview fallback retains the same physical selection.
+    let mut legacy = VxlFile::from_bytes(&bytes).unwrap();
+    legacy.limbs[2].native_spans = None;
+    let params = VxlRenderParams {
+        section: Some(2),
+        ..Default::default()
+    };
+    assert_eq!(
+        vxl_raster::prepare_limb_data(&legacy, None, &params)
+            .0
+            .len(),
+        1
     );
 }

@@ -16,6 +16,13 @@ use std::collections::HashMap;
 
 /// Magic value for the "fonT" variant used by GAME.FNT.
 const FONT_MAGIC: u32 = 0x546E_6F66;
+/// A glyph slot that at least this many code points share is a placeholder,
+/// not a drawing of each of them. Retail GAME.FNT has four: it points 3,897
+/// code points (1,937 of GB2312's 6,763 simplified hanzi among them) at one
+/// empty box, slot 345, and 467 more, most of Latin Extended-B, IPA and
+/// general punctuation, at two blanks and a mark (slots 229, 561 and 622). No
+/// real glyph is shared that widely.
+const PLACEHOLDER_SHARE: u32 = 64;
 /// Size of the glyph lookup table in bytes (65536 entries × 2 bytes).
 const LOOKUP_TABLE_BYTES: usize = 65536 * 2;
 /// Header size in bytes (magic + 6 fields).
@@ -42,10 +49,15 @@ pub struct FntFile {
     pub glyph_stride: u32,
     /// Per-glyph data keyed by Unicode codepoint.
     glyphs: HashMap<u16, FntGlyph>,
+    /// The slots that [`PLACEHOLDER_SHARE`] or more code points share.
+    placeholder_slots: Vec<u32>,
 }
 
 /// A single decoded glyph.
 pub struct FntGlyph {
+    /// The 1-based glyph slot the lookup table names for this code point; 0
+    /// for a glyph drawn in GAME.FNT's style that is not its own.
+    pub slot: u32,
     /// Width in pixels (variable per character).
     pub width: u32,
     /// RGBA bitmap: `width × bitmap_rows × 4` bytes.
@@ -119,6 +131,7 @@ impl FntFile {
         let bitmap_data = &data[bitmap_data_offset..];
 
         let mut glyphs = HashMap::new();
+        let mut slot_uses: HashMap<u32, u32> = HashMap::new();
         for codepoint in 0u16..=u16::MAX {
             let lut_off = lookup_start + (codepoint as usize) * 2;
             let index = u16::from_le_bytes([data[lut_off], data[lut_off + 1]]) as u32;
@@ -136,8 +149,21 @@ impl FntFile {
             }
 
             let rgba = decode_glyph_bitmap(&glyph_bytes[1..], width, bitmap_rows, bytes_per_row);
-            glyphs.insert(codepoint, FntGlyph { width, rgba });
+            *slot_uses.entry(index).or_default() += 1;
+            glyphs.insert(
+                codepoint,
+                FntGlyph {
+                    slot: index,
+                    width,
+                    rgba,
+                },
+            );
         }
+        let placeholder_slots = slot_uses
+            .into_iter()
+            .filter(|&(_, uses)| uses >= PLACEHOLDER_SHARE)
+            .map(|(slot, _)| slot)
+            .collect();
 
         log::info!(
             "Parsed GAME.FNT: {} glyphs, cell_height={}, bitmap_rows={}, bytes_per_row={}",
@@ -157,7 +183,45 @@ impl FntFile {
             bytes_per_row,
             glyph_stride,
             glyphs,
+            placeholder_slots,
         })
+    }
+
+    /// A font of GAME.FNT's `cell_height` and `bitmap_rows` that draws
+    /// nothing, for interface text before, or without, the game's files: the
+    /// interface then draws every letter in GAME.FNT's style instead.
+    pub fn blank(cell_height: u32, bitmap_rows: u32) -> Self {
+        Self {
+            source_identity: None,
+            cell_height,
+            bitmap_rows,
+            bytes_per_row: 3,
+            glyph_stride: 1 + 3 * bitmap_rows,
+            glyphs: HashMap::new(),
+            placeholder_slots: Vec::new(),
+        }
+    }
+
+    /// Every codepoint as one solid `width`-pixel, one-row glyph, so tests can
+    /// place text without retail GAME.FNT.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn solid_for_test(width: u32) -> Self {
+        let rgba = [255_u8; 4].repeat(width as usize);
+        Self {
+            source_identity: None,
+            cell_height: 2,
+            bitmap_rows: 1,
+            bytes_per_row: 1,
+            glyph_stride: 2,
+            glyphs: (0..=u16::MAX)
+                .map(|codepoint| {
+                    let rgba = rgba.clone();
+                    let slot = 1;
+                    (codepoint, FntGlyph { slot, width, rgba })
+                })
+                .collect(),
+            placeholder_slots: Vec::new(),
+        }
     }
 
     pub fn source_identity(&self) -> Option<&FntSourceIdentity> {
@@ -167,6 +231,22 @@ impl FntFile {
     /// Look up a glyph by Unicode codepoint.
     pub fn glyph(&self, codepoint: u16) -> Option<&FntGlyph> {
         self.glyphs.get(&codepoint)
+    }
+
+    /// Whether `codepoint` has a glyph of its own: not missing, not a shared
+    /// placeholder (see [`PLACEHOLDER_SHARE`]).
+    pub fn draws(&self, codepoint: u16) -> bool {
+        self.glyphs
+            .get(&codepoint)
+            .is_some_and(|glyph| !self.placeholder_slots.contains(&glyph.slot))
+    }
+
+    /// Every code point with a glyph of its own ([`Self::draws`]).
+    pub fn drawn_codepoints(&self) -> impl Iterator<Item = (u16, &FntGlyph)> {
+        self.glyphs
+            .iter()
+            .filter(|(_, glyph)| !self.placeholder_slots.contains(&glyph.slot))
+            .map(|(&codepoint, glyph)| (codepoint, glyph))
     }
 
     /// Measure the pixel width of a text string.
@@ -214,7 +294,7 @@ fn decode_glyph_bitmap(bitmap: &[u8], width: u32, bitmap_rows: u32, bytes_per_ro
     rgba
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_assets))]
 mod tests {
     use super::*;
 
@@ -285,6 +365,28 @@ mod tests {
         );
     }
 
+    /// Every slot shared by [`PLACEHOLDER_SHARE`] or more code points is a
+    /// placeholder, not only the most shared one.
+    #[test]
+    fn every_widely_shared_slot_is_a_placeholder() {
+        let mut data = vec![0_u8; HEADER_BYTES + LOOKUP_TABLE_BYTES + 3 * 2];
+        for (index, word) in [FONT_MAGIC, 20, 1, 1, 2, 3, 2].into_iter().enumerate() {
+            data[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let shares = [(0x100, 70, 1), (0x200, PLACEHOLDER_SHARE as usize, 2)];
+        for (first, count, slot) in shares {
+            for codepoint in first..first + count {
+                data[HEADER_BYTES + codepoint * 2] = slot;
+            }
+        }
+        data[HEADER_BYTES + usize::from(b'A') * 2] = 3;
+        data[HEADER_BYTES + LOOKUP_TABLE_BYTES..].copy_from_slice(&[1, 0x80, 1, 0x80, 1, 0x80]);
+        let fnt = FntFile::from_bytes(&data).expect("synthetic FNT");
+        let drawn: Vec<u16> = fnt.drawn_codepoints().map(|(cp, _)| cp).collect();
+        assert_eq!(drawn, [u16::from(b'A')]);
+        assert!(!fnt.draws(0x100) && !fnt.draws(0x200) && fnt.draws(u16::from(b'A')));
+    }
+
     #[test]
     fn decode_glyph_bitmap_basic() {
         // 2 pixels wide, 2 rows, 1 byte per row.
@@ -299,19 +401,5 @@ mod tests {
         // Row 1: px0 = transparent, px1 = white
         assert_eq!(rgba[8..12], [0, 0, 0, 0]);
         assert_eq!(rgba[12..16], [255, 255, 255, 255]);
-    }
-
-    #[test]
-    fn text_width_empty() {
-        let fnt = FntFile {
-            source_identity: None,
-            cell_height: 17,
-            bitmap_rows: 16,
-            bytes_per_row: 3,
-            glyph_stride: 49,
-            glyphs: HashMap::new(),
-        };
-        assert_eq!(fnt.text_width(""), 0);
-        assert_eq!(fnt.text_width("xyz"), 0); // no glyphs loaded
     }
 }

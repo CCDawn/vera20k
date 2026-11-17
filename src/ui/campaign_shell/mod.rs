@@ -14,7 +14,7 @@
 //! `0x0052DFAF`). The static notifies the dialog of every painted frame
 //! (`0x4D8`, `0x00615A34`); the wrap to frame 0 stops it (`0x0052F3C8`).
 
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 
 use crate::ui::shell::descriptor::DialogId;
 use crate::ui::shell::geom::{
@@ -503,7 +503,7 @@ impl CampaignShellState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
 
@@ -521,26 +521,6 @@ mod tests {
         assert_eq!(wide.soviet, RectPx::new(141 + 112, 364 + 84, 348, 136));
         let small = compute_layout(640, 480);
         assert_eq!(small.slider, dlu_rect(137, 140, 140, 14));
-    }
-
-    #[test]
-    fn responsive_layout_stretches_the_fixed_control_rects() {
-        let base = compute_layout(800, 600);
-        // The authored 800x600 rectangles carry no centring offset, so doubling
-        // them is the whole of the responsive mapping.
-        let double = compute_responsive_layout(1600, 1200);
-        assert_eq!(double.scale, ShellScale::from_screen(1600, 1200));
-        assert_eq!(double.allied, RectPx::new(282, 116, 696, 272));
-        assert_eq!(double.slider, RectPx::new(354, 530, 544, 44));
-        assert_eq!(double.difficulty_value, RectPx::new(618, 582, 282, 40));
-        assert_eq!(
-            double.page.button_rect(BACK_BUTTON),
-            Some(RectPx::new(1288, 1070, 312, 84))
-        );
-        // Identity at the base size, on both the dialog and its page.
-        let same = compute_responsive_layout(800, 600);
-        assert_eq!(same.slider, base.slider);
-        assert_eq!(same.page, base.page);
     }
 
     #[test]

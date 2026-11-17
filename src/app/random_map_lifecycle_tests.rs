@@ -1,10 +1,11 @@
 use super::RandomMapGenerationRetention;
-use super::frontend::skirmish_session::{OfflineSkirmishRuntime, skirmish_global_defaults};
+use super::frontend::skirmish_session::{MultiplayerShellRuntime, skirmish_global_defaults};
 use super::loading::pump::{LoadingProgressSink, LoadingRequest};
 use super::shell_random_map::{
-    RandomMapUpdate, accept_random_map_setup_owners, begin_random_map_generation_owners,
-    cancel_random_map_setup_owners, finish_random_map_generation_owners,
-    prepare_random_map_generation, spawn_random_map_generation_worker,
+    RandomMapRulesPreparation, RandomMapUpdate, accept_random_map_setup_owners,
+    begin_random_map_generation_owners, cancel_random_map_setup_owners,
+    finish_random_map_generation_owners, prepare_random_map_generation,
+    spawn_random_map_generation_worker,
 };
 use crate::map::rmg::{RmgConstructionPhase, RmgConstructionTrace, RmgOptions, RmgRng};
 use crate::skirmish_launch::{
@@ -18,12 +19,15 @@ use crate::ui::skirmish_shell::{
 struct SilentProgress;
 
 impl LoadingProgressSink for SilentProgress {
-    fn milestone(&mut self, _percent: u32) {}
+    fn milestone(&mut self, _percent: u32) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 fn launch_session(seed_name: &str) -> SkirmishLaunchSession {
     SkirmishLaunchSession {
         mode: SkirmishLaunchMode {
+            class: crate::skirmish_modes::MpModeClass::Battle,
             id: 1,
             ui_name_key: "GUI:Battle".to_string(),
             tooltip_key: "STT:ModeBattle".to_string(),
@@ -34,16 +38,23 @@ fn launch_session(seed_name: &str) -> SkirmishLaunchSession {
             must_ally: false,
         },
         selected_map_file: Some(seed_name.to_string()),
-        player_name: "Player".to_string(),
-        local: SkirmishLocalSlot {
-            country: LaunchCountry::America,
-            country_random: false,
-            color_index: 0,
-            color_random: false,
-            start_position: LaunchStartPosition::Position(0),
-            team: LaunchTeam::None,
-        },
+        humans: vec![crate::skirmish_launch::SkirmishHumanSlot {
+            raw_slot_index: Some(0),
+            name: "Player".to_string(),
+            slot: SkirmishLocalSlot {
+                country: LaunchCountry::America,
+                country_random: false,
+                color_index: 0,
+                color_random: false,
+                start_position: LaunchStartPosition::Position(0),
+                team: LaunchTeam::None,
+            },
+            role: crate::skirmish_launch::LaunchHumanRole::from_observer(false),
+        }],
+        local_player_index: 0,
+        ai_player_count: 1,
         opponents: vec![SkirmishAiSlot {
+            raw_slot_index: 1,
             country: LaunchCountry::Russia,
             country_random: false,
             color_index: 1,
@@ -51,6 +62,7 @@ fn launch_session(seed_name: &str) -> SkirmishLaunchSession {
             start_position: LaunchStartPosition::Position(1),
             team: LaunchTeam::None,
             difficulty: AiDifficulty::Easy,
+            super_tier: None,
         }],
         pre_fill_house_roster: crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(1),
         options: SkirmishLaunchOptions::default(),
@@ -60,21 +72,29 @@ fn launch_session(seed_name: &str) -> SkirmishLaunchSession {
 fn start_production_worker(
     assets: &mut crate::assets::asset_manager::AssetManager,
     options: &RmgOptions,
-    native_rules: &crate::rules::process_owner::NativeRulesProcessOwner,
-    runtime: &mut OfflineSkirmishRuntime,
+    native_rules: &mut crate::rules::process_owner::NativeRulesProcessOwner,
+    runtime: &mut MultiplayerShellRuntime,
     retention: &mut RandomMapGenerationRetention,
     shared_cell_dummy: &crate::map::resolved_terrain::SharedCellDummy,
 ) -> std::sync::mpsc::Receiver<RandomMapUpdate> {
     begin_random_map_generation_owners(runtime, retention, options);
-    let prepared = prepare_random_map_generation(assets, options, Some(native_rules))
-        .expect("production retail generation preparation");
-    let decision = retention.map_storage_decision(options);
+    let decision = retention.begin_map_storage_decision(options);
+    let prepared = prepare_random_map_generation(
+        assets,
+        options,
+        RandomMapRulesPreparation::Generation {
+            owner: Some(native_rules),
+            reinitialize: decision.reinitializes(),
+        },
+        None,
+    )
+    .expect("production retail generation preparation");
     let receiver = spawn_random_map_generation_worker(
         options.clone(),
         prepared.settings,
         prepared.resolved_inputs,
         prepared.blocks,
-        prepared.tech_types,
+        super::shell_random_map::RandomMapObjects::tech(prepared.tech_types, prepared.ares),
         shared_cell_dummy.clone(),
         decision,
     )
@@ -122,7 +142,7 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     )
     .expect("active-retail AssetManager");
     let audio = crate::rules::audio_sources::AudioDefinitions::select(&assets);
-    let (_, _, native_rules) = crate::rules::retail_sources::load_startup_rules(
+    let (_, _, mut native_rules) = crate::rules::retail_sources::load_startup_rules(
         &assets,
         std::sync::Arc::clone(audio.sounds()),
         std::sync::Arc::clone(audio.eva()),
@@ -141,19 +161,27 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     let seed_name = "Unit2Lifecycle.Sed";
     let options = RmgOptions {
         theater: 0,
-        map_type: 3,
+        // Exercise preview Building constructors on a normal four-start map.
+        // The two-player match may use a subset of its accepted start slots.
+        map_type: 1,
         resources: 2,
         ruggedness: 35,
         water_amount: 50,
-        num_players: 2,
+        num_players: 4,
         tiberium: 35,
         vegetation: 30,
         urban_presence: 40,
+        urban_enabled: false,
+        fair_starts: false,
         seed: 4242,
         description: "Unit 2 lifecycle".into(),
         ..Default::default()
     };
-    std::fs::write(seed_dir.join(seed_name), options.to_sed_bytes()).expect("write lifecycle .SED");
+    std::fs::write(
+        seed_dir.join(seed_name),
+        options.to_sed_bytes(native_rules.reads_ares_way()),
+    )
+    .expect("write lifecycle .SED");
     const MATCH_SEED: u32 = 0x0412_0419;
 
     // U2-02: collect cross-thread receipts from the production worker. Every
@@ -163,8 +191,12 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
         mode_id: 1,
         record_index: Some(7),
     };
-    let mut runtime = OfflineSkirmishRuntime::initialize(
+    let mut runtime = MultiplayerShellRuntime::initialize(
         0x0412_0003,
+        &mut crate::app::process_assets::ProcessAssets::new(
+            crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+            false,
+        ),
         None,
         None,
         None,
@@ -185,12 +217,16 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     let receiver = start_production_worker(
         &mut assets,
         &options,
-        &native_rules,
+        &mut native_rules,
         &mut runtime,
         &mut retention,
         &shared_cell_dummy,
     );
     let (entries, generated_a) = receive_production_generation(receiver);
+    assert!(
+        !generated_a.construction_trace.events.is_empty(),
+        "the preview RNG control requires an actual Building constructor"
+    );
     generation_entries += entries;
     let signature_a = (
         generated_a.map_file.ini.content_hash(),
@@ -216,7 +252,7 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     let receiver = start_production_worker(
         &mut assets,
         &options,
-        &native_rules,
+        &mut native_rules,
         &mut runtime,
         &mut retention,
         &shared_cell_dummy,
@@ -254,10 +290,18 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
         Some(&seed_dir),
     )
     .expect("Use Map accepts the completed production result");
+    assert!(
+        retention.map_storage_decision(&options).reinitializes(),
+        "accepted teardown must force the next preview reset before Full_Init can replace Rules"
+    );
     assert_eq!(generation_entries, 2, "valid preview adds no worker run");
     assert!(randmap_img.is_file());
     assert!(!randmap_sed.exists(), "accepted caller follows teardown");
-    std::fs::write(&randmap_sed, committed.to_sed_bytes()).expect("accepted caller writes .SED");
+    std::fs::write(
+        &randmap_sed,
+        committed.to_sed_bytes(native_rules.reads_ares_way()),
+    )
+    .expect("accepted caller writes .SED");
 
     let mut empty_modal = Some(RandomMapSetupModalState::open(
         options.clone(),
@@ -272,7 +316,7 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     let receiver = start_production_worker(
         &mut assets,
         &options,
-        &native_rules,
+        &mut native_rules,
         &mut runtime,
         &mut retention,
         &shared_cell_dummy,
@@ -322,7 +366,7 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     let receiver = start_production_worker(
         &mut assets,
         &options,
-        &native_rules,
+        &mut native_rules,
         &mut runtime,
         &mut retention,
         &shared_cell_dummy,
@@ -340,6 +384,7 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     ));
     let shell_after_preview = runtime.scenario_rng_logical_state_for_test();
     assert_ne!(shell_after_preview, shell_before_cancel_generation);
+    let preview_before_cancel = native_rules.prepared_random_map_rules().unwrap() as *const _;
     assert_eq!(
         cancel_random_map_setup_owners(
             &mut runtime,
@@ -348,6 +393,15 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
             Some(&seed_dir),
         ),
         Some(previous_selection)
+    );
+    assert_eq!(
+        native_rules.prepared_random_map_rules().unwrap() as *const _,
+        preview_before_cancel,
+        "Cancel keeps the same live Rules registry"
+    );
+    assert!(
+        retention.map_storage_decision(&options).reinitializes(),
+        "Cancel drops the dialog cache key before a later scenario can replace Rules"
     );
     assert_eq!(generation_entries, 4);
     assert!(randmap_img.is_file(), "Cancel publishes completed preview");
@@ -391,8 +445,13 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     let direct_initial = super::loading::init::load_map_initial_with_assets(
         seed_dir.clone(),
         &mut assets,
-        Some(&native_rules),
+        Some(&mut native_rules),
+        None,
         Some(seed_name),
+        Some("MPBattleMD.ini"),
+        crate::app::match_runtime::session::SessionMode::Skirmish,
+        false,
+        None,
         &mut SilentProgress,
     )
     .expect("direct .SED launch regeneration");
@@ -423,6 +482,7 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
         start_waypoints: accepted_start_waypoints.clone(),
         stages_run: Vec::new(),
         unfilled_start_slots: 0,
+        fairness: None,
     };
     let mut retention = RandomMapGenerationRetention::default();
     retention.finish_generation(poison);
@@ -445,7 +505,7 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
         .load_random_map_snapshot_for_test(
             seed_dir.clone(),
             &mut assets,
-            Some(&native_rules),
+            Some(&mut native_rules),
             &mut SilentProgress,
         )
         .expect("accepted UI .SED regeneration and admitted bundle transfer");
@@ -459,6 +519,7 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
         start_waypoints: accepted_start_waypoints.clone(),
         stages_run: Vec::new(),
         unfilled_start_slots: 0,
+        fairness: None,
     };
     let mut direct_retention = RandomMapGenerationRetention::default();
     direct_retention.finish_generation(direct_preview);
@@ -535,20 +596,26 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
             visible: ui_launch
                 .startup_crate_slots
                 .iter()
-                .filter(|(_, _, overlay)| overlay.is_some())
+                .filter(|(_, _, overlay, _)| overlay.is_some())
                 .count() as u32,
         }),
         "accepted playable RMG must reach the ordinary startup-crate post-map seam"
     );
     assert_eq!(ui_launch.startup_crate_slots.len(), 1);
-    let (slot_index, slot, live_overlay) = ui_launch.startup_crate_slots[0];
+    let (slot_index, slot, live_overlay, slope) = ui_launch.startup_crate_slots[0];
     assert_eq!(slot_index, 0, "first accepted crate owns slot zero");
     assert!(!slot.is_empty());
     assert_eq!(slot.start_frame, 0);
     assert_ne!(slot.aux, 0);
     assert!(slot.duration > 0);
-    let (_, data) = live_overlay.expect("retail lifecycle fixture places a visible startup crate");
-    assert_eq!(data, u8::MAX);
+    // OverlayClass::Mark (0x5FC570) rejects slope>4 except raw type 0xB2
+    // (0x5FC5CD..0x5FC5E3, false at 0x5FC784) before writing the identity,
+    // while CrateValidate (0x4A18F0) still accepts the cell: the slot then
+    // owns a timed ghost. A marked crate cell gets data 0xFF (0x5FD105). The
+    // generated map decides which, so assert the rule rather than the cell.
+    if slope.expect("accepted crate cell has resolved terrain") > 4 {
+        assert_eq!(live_overlay, None, "Mark rejects a steep crate cell");
+    }
     assert!(ui_launch.startup_crate.crates_enabled);
     assert_eq!(ui_launch.startup_crate.minimum, 1);
     assert_eq!(ui_launch.startup_crate.maximum, 255);
@@ -575,17 +642,33 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
         .water_id
         .expect("installed WCRATE overlay identity");
     assert_ne!(wood_id, water_id);
-    assert_eq!(ui_launch.startup_crate.body_frame, 0);
-    assert_eq!(ui_launch.startup_crate.presented.len(), 1);
-    assert_eq!(
-        ui_launch.startup_crate.presented[0],
-        (
-            u16::try_from(slot.cell_x).expect("positive crate x"),
-            u16::try_from(slot.cell_y).expect("positive crate y"),
-            live_overlay.expect("visible overlay").0,
-            u8::MAX,
-        )
+    assert_ne!(
+        wood_id, 0xB2,
+        "ordinary CRATE is not Mark's steep-slope exception"
     );
+    assert_ne!(
+        water_id, 0xB2,
+        "ordinary WCRATE is not Mark's steep-slope exception"
+    );
+    assert_eq!(ui_launch.startup_crate.body_frame, 0);
+    match live_overlay {
+        Some((overlay_id, data)) => {
+            assert_eq!(data, u8::MAX);
+            assert_eq!(
+                ui_launch.startup_crate.presented,
+                [(
+                    u16::try_from(slot.cell_x).expect("positive crate x"),
+                    u16::try_from(slot.cell_y).expect("positive crate y"),
+                    overlay_id,
+                    u8::MAX,
+                )]
+            );
+        }
+        None => assert!(
+            ui_launch.startup_crate.presented.is_empty(),
+            "a timed ghost cannot enter initial overlay presentation"
+        ),
+    }
     println!(
         "STARTUP_CRATE_PRODUCTION rules=min:{} max:{} regen_bits:{:#018X} wood:{} common:{} water:{} ids:{wood_id}/{water_id} frame:{}",
         ui_launch.startup_crate.minimum,

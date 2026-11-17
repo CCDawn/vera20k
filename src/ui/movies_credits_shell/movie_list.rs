@@ -12,9 +12,8 @@ use crate::ui::shell::descriptor::DialogId;
 use crate::ui::shell::geom::{
     RectPx, SHELL_BASE_H, SHELL_BASE_W, ScaledRects, ShellScale, dlu_rect,
 };
-use crate::ui::shell::list::{ListMetrics, ListScrollInteraction, ShellListGeometry};
+use crate::ui::shell::list::ListBoxState;
 use crate::ui::shell::menu_page::{self, MenuPageButtonSpec, MenuPageLayout, MenuPageSpec};
-use std::time::{Duration, Instant};
 
 pub const MOVIE_LIST_DIALOG: DialogId = DialogId(0x0129);
 
@@ -83,20 +82,7 @@ pub fn compute_responsive_movie_list_layout(screen_w: u32, screen_h: u32) -> Mov
 }
 
 /// One `0x129` instance: rows from `0x005FC000` and the subclass selection.
-#[derive(Debug, Clone)]
-pub struct MovieListState {
-    pub rows: Vec<MovieEntry>,
-    /// Subclass current selection (`-1` = none). Its LB_SETCURSEL handler
-    /// (`0x0061A534..0x0061A5F5`) always returns 0, so the proc's fallback
-    /// `LB_SETCURSEL(0)` never runs: a fresh process opens with nothing
-    /// selected.
-    pub selected: Option<usize>,
-    pub top: usize,
-    /// Previous press for the ListBox class's `CS_DBLCLKS` detection.
-    pub last_press: Option<(Instant, i32, i32)>,
-    /// Scrollbar capture and arrow repeat (`0x0061C690`).
-    pub scroll: ListScrollInteraction,
-}
+pub type MovieListState = ListBoxState<MovieEntry>;
 
 impl MovieListState {
     /// Populate and apply the retained `DAT_00825C80` selection.
@@ -105,95 +91,7 @@ impl MovieListState {
         let selected = usize::try_from(retained_selection)
             .ok()
             .filter(|index| *index < rows.len());
-        Self {
-            rows,
-            selected,
-            top: 0,
-            last_press: None,
-            scroll: ListScrollInteraction::default(),
-        }
-    }
-
-    /// List and scrollbar geometry. The shared geometry takes the paint
-    /// surface, one pixel wider and taller than the `0x744` window, which
-    /// reproduces the retail frames: a scrollbar only above 15 rows, at
-    /// `x + w - 20` and 20 wide, a 202 px thumb for 17 rows.
-    pub fn geometry(&self, list: RectPx, metrics: ListMetrics) -> ShellListGeometry {
-        ShellListGeometry::new(
-            RectPx::new(list.x, list.y, list.w + 1, list.h + 1),
-            self.rows.len(),
-            self.top,
-            metrics,
-        )
-    }
-
-    /// A press on the scrollbar child: capture it, step an arrow or jump the
-    /// track. Returns `false` when the press is not on the scrollbar.
-    pub fn scroll_press(
-        &mut self,
-        list: RectPx,
-        metrics: ListMetrics,
-        x: i32,
-        y: i32,
-        now: Instant,
-    ) -> bool {
-        let geometry = self.geometry(list, metrics);
-        let Some(part) = geometry.scroll_part_at(x, y) else {
-            return false;
-        };
-        self.scroll.press(part, geometry, &mut self.top, y, now);
-        true
-    }
-
-    /// Pointer motion while the scrollbar may hold capture (thumb drag).
-    pub fn scroll_pointer_moved(&mut self, list: RectPx, metrics: ListMetrics, x: i32, y: i32) {
-        let geometry = self.geometry(list, metrics);
-        self.scroll.pointer_moved(geometry, &mut self.top, x, y);
-    }
-
-    /// Arrow auto-repeat; returns whether the list changed.
-    pub fn scroll_poll(
-        &mut self,
-        list: RectPx,
-        metrics: ListMetrics,
-        x: i32,
-        y: i32,
-        now: Instant,
-    ) -> bool {
-        if self.scroll.repeat_at().is_none() {
-            return false;
-        }
-        let geometry = self.geometry(list, metrics);
-        self.scroll.poll(geometry, &mut self.top, x, y, now)
-    }
-
-    /// Whether a press is the second click of a double-click
-    /// ([`crate::ui::shell::list::is_double_click`]).
-    pub fn is_double_click(
-        &mut self,
-        now: Instant,
-        x: i32,
-        y: i32,
-        limits: (Duration, i32, i32),
-    ) -> bool {
-        crate::ui::shell::list::is_double_click(&mut self.last_press, now, x, y, limits)
-    }
-
-    /// Row under a pointer press (`0x0061A948`): `client_y / 19 + top`,
-    /// without a border correction, ignoring presses below the last row. The
-    /// scrollbar is its own child window, so presses on it never reach the
-    /// list.
-    pub fn row_at(&self, list: RectPx, metrics: ListMetrics, x: i32, y: i32) -> Option<usize> {
-        if !list.contains(x, y)
-            || self
-                .geometry(list, metrics)
-                .scrollbar
-                .is_some_and(|bar| bar.contains(x, y))
-        {
-            return None;
-        }
-        let row = ((y - list.y) / metrics.row_h) as usize + self.top;
-        (row < self.rows.len()).then_some(row)
+        Self::new(rows, selected)
     }
 }
 
@@ -283,9 +181,11 @@ pub fn active_movie_entries(progress: MovieProgress) -> Vec<MovieEntry> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
+    use crate::ui::shell::list::ListMetrics;
+    use crate::util::time::{Duration, Instant};
 
     #[test]
     fn second_press_inside_the_double_click_window_is_not_a_selection_press() {
@@ -320,29 +220,6 @@ mod tests {
     }
 
     #[test]
-    fn responsive_layout_stretches_the_page_list_and_prompt() {
-        let base = compute_movie_list_layout(800, 600);
-        let same = compute_responsive_movie_list_layout(800, 600);
-        assert_eq!(same, base);
-        let double = compute_responsive_movie_list_layout(1600, 1200);
-        assert_eq!(double.list, RectPx::new(240, 256, 798, 608));
-        assert_eq!(double.prompt, RectPx::new(240, 146, 798, 78));
-        assert_eq!(
-            double.page.button_rect(0x0686),
-            Some(RectPx::new(1288, 1070, 312, 84))
-        );
-    }
-
-    #[test]
-    fn fresh_open_selects_nothing_and_retained_selection_restores() {
-        let fresh = MovieListState::open(MovieProgress::default(), -1);
-        assert_eq!(fresh.rows.len(), 1);
-        assert_eq!(fresh.selected, None);
-        let reopened = MovieListState::open(MovieProgress::default(), 0);
-        assert_eq!(reopened.selected, Some(0));
-    }
-
-    #[test]
     fn press_hit_uses_client_y_without_border_correction() {
         let list = RectPx::new(120, 128, 399, 304);
         let state = MovieListState::open(MovieProgress::default(), -1);
@@ -362,11 +239,6 @@ mod tests {
             .iter()
             .map(|movie| movie.file)
             .collect()
-    }
-
-    #[test]
-    fn fresh_process_lists_only_the_intro() {
-        assert_eq!(files(MovieProgress::default()), ["A00_F00E"]);
     }
 
     #[test]

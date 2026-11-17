@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::assets::asset_manager::{AssetManager, MediaArchiveMode};
+use crate::util::ares_launch::AresSetting;
 use crate::util::config::GameConfig;
 
 /// Where the retail root came from, for diagnostics.
@@ -60,15 +61,22 @@ fn check(dir: PathBuf, source: RootSource) -> Result<(PathBuf, RootSource), Stri
 ///
 /// `all_mixes` additionally mounts archives the startup path skips. It is a
 /// tooling-only widening of the search set, so results found only that way are
-/// not what the game would resolve.
-pub fn open_manager(ra2_dir: &Path, all_mixes: bool) -> Result<AssetManager, String> {
+/// not what the game would resolve. `ares` is the player's Ares setting the
+/// game opens with: On reads the installation as an Ares game, as the game
+/// does (`AssetManager::ships_ares`).
+pub fn open_manager(
+    ra2_dir: &Path,
+    all_mixes: bool,
+    ares: AresSetting,
+) -> Result<AssetManager, String> {
     let mut manager =
-        AssetManager::new(ra2_dir, MediaArchiveMode::STOCK_DIGITAL).map_err(|err| {
-            format!(
-                "could not mount archives under {}: {err}",
-                ra2_dir.display()
-            )
-        })?;
+        AssetManager::with_mod_and_ares(ra2_dir, None, MediaArchiveMode::STOCK_DIGITAL, ares)
+            .map_err(|err| {
+                format!(
+                    "could not mount archives under {}: {err}",
+                    ra2_dir.display()
+                )
+            })?;
 
     if all_mixes {
         manager
@@ -76,5 +84,40 @@ pub fn open_manager(ra2_dir: &Path, all_mixes: bool) -> Result<AssetManager, Str
             .map_err(|err| format!("--all-mixes failed: {err}"))?;
     }
 
+    Ok(manager)
+}
+
+/// Only INI commands use host INI policy; ordinary archive tools stay retail.
+/// An explicit CLI request replaces the entire config, never individual fields.
+pub fn open_ini_manager(
+    root: &Path,
+    all_mixes: bool,
+    explicit: Option<&crate::util::ini_roots::IniRootConfig>,
+    ares: AresSetting,
+) -> Result<AssetManager, String> {
+    let config = match explicit {
+        Some(config) => config.clone(),
+        None => {
+            GameConfig::load()
+                .map_err(|error| format!("INI configuration: {error:#}"))?
+                .ini
+        }
+    };
+    config.validate()?;
+    open_manager(root, all_mixes, ares)?
+        .with_ini_roots(&config)
+        .map_err(|error| error.to_string())
+}
+
+/// INI expansion may be audited against a MOD/source directory that lacks
+/// required retail media. This explicit tooling scope never changes new() or
+/// the archive stack used by the game and normal asset commands.
+pub fn open_ini_probe_manager(ra2_dir: &Path, all_mixes: bool) -> Result<AssetManager, String> {
+    let mut manager = AssetManager::from_ini_probe_root(ra2_dir).map_err(|err| err.to_string())?;
+    if all_mixes {
+        manager
+            .load_all_disk_mixes()
+            .map_err(|err| err.to_string())?;
+    }
     Ok(manager)
 }

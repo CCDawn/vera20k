@@ -13,8 +13,6 @@
 //! - Part of sim/ — depends on rules/, map terrain, and sim occupancy/components.
 //! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
-use std::collections::BTreeMap;
-
 use super::{EntityDamageEvent, TerrainDamageEvent, cell_spread};
 use crate::map::cell_index::NativeCellIdentity;
 use crate::map::entities::EntityCategory;
@@ -25,8 +23,6 @@ use crate::rules::warhead_type::WarheadType;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::intern::StringInterner;
 use crate::sim::map::bridge_topology::{CellBridgeView, ListLayer};
-use crate::sim::mission::authority::restore_entity_after_target_expiry;
-use crate::sim::mission::concrete_effects::represented_assign_target;
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::occupancy::OccupancyGrid;
 #[cfg(any(test, feature = "test-support"))]
@@ -37,7 +33,6 @@ use crate::sim::overlay_grid::{
 };
 use crate::sim::pathfinding::zone_incremental::ZoneRepairKind;
 use crate::sim::rng::SimRng;
-use crate::sim::terrain_object::{TerrainObjectLifecycle, TerrainObjectState};
 use crate::util::fixed_math::SimFixed;
 use crate::util::lepton::{CELL_CENTER_LEPTON, LEPTONS_PER_LEVEL, ground_height_leptons};
 use crate::util::native_x87::distance_3d_leptons;
@@ -83,6 +78,7 @@ pub(crate) trait AoECellPrelude {
     fn wall_navigation_step(
         &mut self,
         _terrain: &ResolvedTerrainGrid,
+        _overlays: &OverlayGrid,
         _cell: (u16, u16),
         _navigation_changed: bool,
         _repair: ZoneRepairKind,
@@ -93,10 +89,6 @@ pub(crate) trait AoECellPrelude {
 }
 
 struct AoEWallDamageHost<'borrow, 'prelude> {
-    entities: &'borrow mut EntityStore,
-    target_terrain_objects: &'borrow BTreeMap<u64, TerrainObjectState>,
-    #[cfg(any(test, feature = "test-support"))]
-    trace: &'borrow mut Vec<CellTargetDetach>,
     prelude: &'borrow mut Option<&'prelude mut dyn AoECellPrelude>,
 }
 
@@ -110,28 +102,19 @@ impl WallDamageTransactionHost for AoEWallDamageHost<'_, '_> {
     fn navigation_step(
         &mut self,
         terrain: &ResolvedTerrainGrid,
+        overlays: &OverlayGrid,
         cell: (u16, u16),
         navigation_changed: bool,
         repair: ZoneRepairKind,
     ) {
         if let Some(prelude) = self.prelude.as_deref_mut() {
-            prelude.wall_navigation_step(terrain, cell, navigation_changed, repair);
+            prelude.wall_navigation_step(terrain, overlays, cell, navigation_changed, repair);
         }
     }
 
-    fn pointer_expired(&mut self, target: WallPointerTarget) {
-        if let WallPointerTarget::Real(rx, ry) = target {
-            expire_cell_target_references(
-                self.entities,
-                self.target_terrain_objects,
-                rx,
-                ry,
-                None,
-                #[cfg(any(test, feature = "test-support"))]
-                self.trace,
-            );
-        }
-    }
+    // Cell ctor47BBF0 leaves Abstract+14 bit1 clear; 7258D0(Cell) does not
+    // broadcast to Techno listeners. AreaDamage's explicit70D4A0 is separate.
+    fn pointer_expired(&mut self, _target: WallPointerTarget) {}
 }
 
 pub(crate) fn tiberium_reduction_cell_admitted(
@@ -147,6 +130,101 @@ pub(crate) fn tiberium_reduction_cell_admitted(
         .overlay_id
         .and_then(|overlay_id| registry.flags(overlay_id))
         .is_some_and(|flags| flags.tiberium && flags.chain_reaction)
+}
+
+/// `TechnoClass::TriggersCellInset @ 0x006F7660`, retained as a dormant
+/// production query until its native caller is established. It asks the
+/// shared deploy-weapon owner for the selected WeaponType, applies native
+/// `IsAreaFire @ 0x0070DD50`, resolves that weapon's Warhead, then compares
+/// `ftol(Sqrt_Approx(dx² + dy²))` in signed-cell coordinates against
+/// `CellSpread - CellInset`. Native `TriggersCellInset @ 0x006F7660` calls
+/// `Sqrt_Approx @ 0x004CAC40` then `Math__ftol @ 0x007C5F00`. The coordinate
+/// owner dispatches `GetCoords` at vtable +0x48 (Object `0x005F65A0`, Building
+/// `0x00447AC0`, Cell `0x00486840`). Native's `IsAreaFire` and subsequent
+/// weapon read both use `GetDeployWeapon @ 0x0070E120`; this pure selection is
+/// resolved once here and consumes no RNG or mutable state.
+pub fn techno_triggers_cell_inset(
+    world: &crate::sim::world::Simulation,
+    techno_id: u64,
+    target: super::TargetKind,
+    rules: &RuleSet,
+) -> bool {
+    let Some(techno) = world.substrate.entities.get(techno_id) else {
+        return false;
+    };
+    let Some(object_type) = world.interner.object_type(techno.type_ref(), rules) else {
+        return false;
+    };
+    let (_, deployed) = super::combat_weapon::deploy_weapon(object_type, techno.veterancy.rank());
+    let Some((weapon_id, _)) = deployed else {
+        return false;
+    };
+    let Some(weapon) = rules.weapon(weapon_id) else {
+        return false;
+    };
+    if !weapon.area_fire {
+        return false;
+    }
+    let Some(warhead) = rules.weapon_warhead(weapon) else {
+        return false;
+    };
+
+    // Keep the native GetCoords (+0x48) dispatch in ground_pose/target_get_coords
+    // so Buildings, Cells and Terrain targets do not fall back to raw Location
+    // fields or a fabricated point.
+    let cells = world
+        .resolved_terrain
+        .as_ref()
+        .map(NativeCellQuery::canonical);
+    let Some(techno_coords) = crate::sim::movement::ground_pose::target_get_coords(
+        super::TargetKind::Entity(techno_id),
+        world,
+        cells.as_ref(),
+    ) else {
+        return false;
+    };
+    let Some(target_coords) =
+        crate::sim::movement::ground_pose::target_get_coords(target, world, cells.as_ref())
+    else {
+        return false;
+    };
+    let techno_x = crate::util::lepton::lepton_to_cell_packed(techno_coords.x);
+    let techno_y = crate::util::lepton::lepton_to_cell_packed(techno_coords.y);
+    let target_x = crate::util::lepton::lepton_to_cell_packed(target_coords.x);
+    let target_y = crate::util::lepton::lepton_to_cell_packed(target_coords.y);
+    let dx = target_x.wrapping_sub(techno_x);
+    let dy = target_y.wrapping_sub(techno_y);
+    let distance =
+        crate::util::native_x87::sqrt_approx_length([i32::from(dx), i32::from(dy)]) as i16;
+
+    // Native FLD CellSpread / FSUB CellInset / FSTP float produces one
+    // binary32 threshold. The distance is then narrowed to signed i16, so
+    // comparing that exact integer to a downward-projected I16F16 threshold
+    // preserves the inclusive integer boundary while keeping sim math fixed.
+    let threshold = warhead.cell_spread_f64 as f32 - warhead.cell_inset_f32;
+    cell_inset_distance_within_threshold(distance, threshold)
+}
+
+fn cell_inset_distance_within_threshold(distance: i16, threshold: f32) -> bool {
+    if threshold.is_nan() {
+        // Native FCOMP sets the unordered C0/C3 flags; TEST AH, 0x41 is then
+        // nonzero, so the following JZ (false path) is not taken.
+        return true;
+    }
+    if threshold >= 32767.0 {
+        return true;
+    }
+    if threshold < -32768.0 {
+        return false;
+    }
+
+    let nearest = SimFixed::from_num(threshold);
+    let threshold_fixed = if nearest.to_num::<f32>() > threshold {
+        SimFixed::from_bits(nearest.to_bits() - 1)
+    } else {
+        nearest
+    };
+    SimFixed::from_num(i32::from(distance)) <= threshold_fixed
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +296,22 @@ impl From<&str> for AoEDamageOrigin {
     }
 }
 
+/// Apply_area_damage's entry (`0x004892BE`): an inert scenario or a zero
+/// damage returns at once. Ares DamageArea_NullDamage (10053940) lets a
+/// warhead with `AllowZeroDamage=yes` take a zero damage through the area.
+pub(crate) fn area_damage_enters(
+    damage: i32,
+    warhead: &WarheadType,
+    scenario_no_damage: bool,
+    ares: bool,
+) -> bool {
+    let zero_admitted = ares
+        && warhead
+            .ares_combat()
+            .is_some_and(|combat| combat.allow_zero_damage());
+    !scenario_no_damage && (damage != 0 || zero_admitted)
+}
+
 /// Lift the established whole-Level impact coordinate into native absolute
 /// lepton Z while preserving the exact XY subcell sample on slopes.
 fn air_impact_from_layer_z(
@@ -278,8 +372,7 @@ pub(crate) enum AreaDamageReceiver {
 
 #[derive(Clone, Copy)]
 pub(crate) struct TerrainCollectionView<'a> {
-    pub objects: &'a BTreeMap<u64, TerrainObjectState>,
-    pub cells: &'a BTreeMap<(u16, u16), u64>,
+    pub store: &'a crate::sim::terrain_object::TerrainObjectStore,
 }
 
 impl AoEDamageResult {
@@ -372,11 +465,8 @@ pub(crate) fn apply_aoe_damage_with_terrain<O: Into<AoEDamageOrigin>>(
     let handles = Some(crate::sim::type_handle_table::ResolvedRuleHandles::resolve(
         rules, interner,
     ));
-    let no_terrain_objects = BTreeMap::new();
-    let target_terrain_objects = terrain_objects.map_or(&no_terrain_objects, |view| view.objects);
     apply_aoe_damage_with_terrain_and_scenario(
         entities,
-        target_terrain_objects,
         impact_rx,
         impact_ry,
         base_damage,
@@ -392,143 +482,224 @@ pub(crate) fn apply_aoe_damage_with_terrain<O: Into<AoEDamageOrigin>>(
     )
 }
 
-/// `Apply_area_damage` (`0x00489280`): collects its receiver records. Without an
-/// occupancy grid, every unlimboed, living object stands in for the cell lists.
-/// `target_terrain_objects` is the complete target authority, independent of
-/// optional Terrain receiver collection (fixtures may exclude those receivers).
-pub(crate) fn apply_aoe_damage_with_terrain_and_scenario<O: Into<AoEDamageOrigin>>(
-    entities: &mut EntityStore,
-    target_terrain_objects: &BTreeMap<u64, TerrainObjectState>,
+/// Call-local AreaDamage collection cursor. World authorities stay installed
+/// between cells, so synchronous Restore/setter calls can run before capture.
+pub(crate) struct AoECollector {
     impact_rx: u16,
     impact_ry: u16,
     base_damage: i32,
-    warhead: &WarheadType,
-    rules: &RuleSet,
-    interner: &StringInterner,
-    handles: Option<crate::sim::type_handle_table::ResolvedRuleHandles>,
-    origin: O,
-    mut layer_context: AoELayerContext<'_>,
-    terrain_objects: Option<TerrainCollectionView<'_>>,
-    scenario_no_damage: bool,
-    mut cell_prelude: Option<&mut dyn AoECellPrelude>,
-) -> AoEDamageResult {
-    // Apply_area_damage returns at entry for signed zero. Nothing downstream
-    // observes CellSpread, wall routing, object lists, target detach, or RNG.
-    // Native ScenarioFlags bit 0x20 shares that transaction-wide early-out.
-    if base_damage == 0 || scenario_no_damage {
-        return AoEDamageResult::default();
+    origin: AoEDamageOrigin,
+    ground_source_admitted: bool,
+    spread_leptons: i64,
+    exact_impact: AoEAirImpact,
+    native_occupancy: bool,
+    /// Whether Ares plays in this game, read once at the entry: the cells
+    /// walked and the record limit must not change under the collector.
+    ares: bool,
+    /// [`crate::sim::scenario_session::ScenarioSession::truce_harvester_types`]:
+    /// the `HarvesterUnit=` types while ScenarioFlags bit 0x800 is set.
+    truce_harvesters: Vec<crate::sim::intern::InternedId>,
+    pub result: AoEDamageResult,
+}
+
+pub(crate) struct AoESpreadCell {
+    identity: Option<NativeCellIdentity>,
+    real_coord: Option<(u16, u16)>,
+    requested: (u16, u16),
+    target: WallPointerTarget,
+    initial_overlay_present: bool,
+    center: bool,
+}
+
+impl AoESpreadCell {
+    /// 4896B2..4896BA tests the LIVE overlay on the retained allocation after
+    /// all recursive wall callbacks, but only when initially nonempty.
+    pub fn detached_cell(&self, context: &AoELayerContext<'_>) -> Option<(u16, u16)> {
+        (self.initial_overlay_present && retained_overlay(self.target, context).is_none())
+            // A frozen request identifies the shared Dummy without reading or
+            // restamping its mutable coordinate. The sweep compares allocation
+            // identities; a real alias uses the retained canonical coordinate.
+            .then_some(self.real_coord.unwrap_or(self.requested))
     }
-    let mut origin = origin.into();
-    if origin.source_house.is_none() && origin.source_id != super::RAD_NO_ATTACKER {
-        origin.source_house = entities.get(origin.source_id).map(|source| source.owner());
+}
+
+fn retained_overlay(target: WallPointerTarget, context: &AoELayerContext<'_>) -> Option<u8> {
+    match target {
+        WallPointerTarget::Real(rx, ry) => context.overlay_grid.as_deref()?.cell(rx, ry).overlay_id,
+        WallPointerTarget::SharedDummy => u8::try_from(
+            context
+                .terrain
+                .as_deref()?
+                .shared_cell_dummy()
+                .overlay_identity_state()
+                .0,
+        )
+        .ok(),
     }
-    let ground_source_admitted = handles
-        .is_some_and(|handles| handles.is_crush(origin.warhead_ref))
-        || entities
+}
+
+impl AoECollector {
+    pub fn begin(
+        entities: &EntityStore,
+        impact_rx: u16,
+        impact_ry: u16,
+        base_damage: i32,
+        warhead: &WarheadType,
+        rules: &RuleSet,
+        interner: &StringInterner,
+        handles: Option<crate::sim::type_handle_table::ResolvedRuleHandles>,
+        origin: AoEDamageOrigin,
+        layer_context: &AoELayerContext<'_>,
+        scenario_no_damage: bool,
+        truce_harvesters: Vec<crate::sim::intern::InternedId>,
+    ) -> Option<Self> {
+        // Apply_area_damage returns at entry for signed zero. Nothing downstream
+        // observes CellSpread, wall routing, object lists, target detach, or RNG.
+        // Native ScenarioFlags bit 0x20 shares that transaction-wide early-out.
+        if !area_damage_enters(base_damage, warhead, scenario_no_damage, rules.ares()) {
+            return None;
+        }
+        let mut origin = origin;
+        if origin.source_house.is_none() && origin.source_id != super::RAD_NO_ATTACKER {
+            origin.source_house = entities.get(origin.source_id).map(|source| source.owner());
+        }
+        // `MapClass::DamageArea @ 0x00489280`'s ground/deck list excludes the
+        // source object unless its type opts into `DamageSelf`, the warhead is
+        // Rules.CrushWarhead, or Phobos `AllowDamageOnSelf` admits the firer
+        // (`Explosion_Damage_DamageSelf @ 0x004896EC`).
+        let source_damage_self = entities
             .get(origin.source_id)
             .and_then(|source| interner.object_type(source.type_ref(), rules))
             .is_some_and(|source_type| source_type.damage_self);
+        let ground_source_admitted = handles
+            .is_some_and(|handles| handles.is_crush(origin.warhead_ref))
+            || source_damage_self
+            || rules.allow_damage_on_self_for(warhead);
+        // Retail's airborne phase admits the source unconditionally. Phobos
+        // `MapClass_DamageArea_AirDamageSelfFix @ 0x00489416` applies the same
+        // DamageSelf/AllowDamageOnSelf rule there (CrushWarhead does not).
+        #[cfg(feature = "phobos")]
+        let air_source_admitted = source_damage_self || rules.allow_damage_on_self_for(warhead);
+        #[cfg(not(feature = "phobos"))]
+        let air_source_admitted = true;
 
-    let cell_spread = warhead.cell_spread_f64;
+        let cell_spread = warhead.cell_spread_f64;
 
-    // Each candidate's native Sqrt_Approx/ftol distance is compared to this
-    // signed threshold; there is no exact-squared prefilter.
-    let spread_leptons = cell_spread::splash_threshold_leptons(cell_spread);
-    let mut result = AoEDamageResult::default();
-    let exact_impact = layer_context
-        .air_impact
-        .or_else(|| {
-            air_impact_from_layer_z(
-                layer_context.terrain.as_deref(),
-                impact_rx,
-                impact_ry,
-                CELL_CENTER_LEPTON,
-                CELL_CENTER_LEPTON,
-                layer_context.impact_z,
-            )
-        })
-        .unwrap_or(AoEAirImpact {
-            sub_x: CELL_CENTER_LEPTON,
-            sub_y: CELL_CENTER_LEPTON,
-            z_leptons: layer_context
-                .impact_z
-                .wrapping_mul(LEPTONS_PER_LEVEL as i32),
-        });
-
-    result.object_list_layer = layer_context
-        .terrain
-        .as_deref()
-        .map_or(ListLayer::Ground, |terrain| {
-            select_object_damage_layer(terrain, impact_rx, impact_ry, exact_impact)
-        });
-
-    let native_occupancy = layer_context
-        .occupancy
-        .filter(|_| layer_context.terrain.is_some());
-    let selected_layer = match result.object_list_layer {
-        ListLayer::Ground => MovementLayer::Ground,
-        ListLayer::Bridge => MovementLayer::Bridge,
-    };
-    if native_occupancy.is_some() {
-        // Native enters the entire airborne query only when the exact impact
-        // coordinate is strictly above GetGroundHeight at that same XY. Keep
-        // this gate outside bucket materialization: equality observes no air
-        // vector at all.
-        if let Some(air_impact) = layer_context.air_impact
-            && layer_context.terrain.as_deref().is_some_and(|terrain| {
-                impact_is_above_ground(terrain, impact_rx, impact_ry, air_impact)
-            })
-        {
-            // Native appends airborne receiver records before entering the
-            // spread cell loop. Damage dispatch happens only after collection,
-            // so walls still mutate during the later cell walk before any
-            // receiver runs.
-            let center = crate::sim::cell_rect::get_cellclass_fallback(
-                layer_context.terrain.as_deref(),
-                i32::from(impact_rx as i16),
-                i32::from(impact_ry as i16),
-            );
-            for entity_id in entities.airborne_in_query_order(
-                &center,
-                cell_spread::whole_cells(cell_spread),
-                layer_context
-                    .terrain
-                    .as_deref()
-                    .map(|terrain| (terrain.width(), terrain.height()))
-                    .expect("checked terrain Apply_area_damage context"),
-            ) {
-                let terrain = layer_context
-                    .terrain
-                    .as_deref()
-                    .expect("checked terrain Apply_area_damage context");
-                push_airborne_aoe_damage(
-                    &mut result,
-                    entities,
-                    entity_id,
+        // Each candidate's native Sqrt_Approx/ftol distance is compared to this
+        // signed threshold; there is no exact-squared prefilter.
+        let spread_leptons = cell_spread::splash_threshold_leptons(cell_spread);
+        let mut result = AoEDamageResult::default();
+        let exact_impact = layer_context
+            .air_impact
+            .or_else(|| {
+                air_impact_from_layer_z(
+                    layer_context.terrain.as_deref(),
                     impact_rx,
                     impact_ry,
-                    air_impact,
-                    terrain,
-                    spread_leptons,
-                    base_damage,
-                    origin.source_id,
-                    origin.source_house,
-                    origin.warhead_ref,
-                    rules,
-                    interner,
+                    CELL_CENTER_LEPTON,
+                    CELL_CENTER_LEPTON,
+                    layer_context.impact_z,
+                )
+            })
+            .unwrap_or(AoEAirImpact {
+                sub_x: CELL_CENTER_LEPTON,
+                sub_y: CELL_CENTER_LEPTON,
+                z_leptons: layer_context
+                    .impact_z
+                    .wrapping_mul(LEPTONS_PER_LEVEL as i32),
+            });
+
+        result.object_list_layer = layer_context
+            .terrain
+            .as_deref()
+            .map_or(ListLayer::Ground, |terrain| {
+                select_object_damage_layer(terrain, impact_rx, impact_ry, exact_impact)
+            });
+
+        let native_occupancy = layer_context
+            .occupancy
+            .filter(|_| layer_context.terrain.is_some());
+        if native_occupancy.is_some() {
+            // Native enters the entire airborne query only when the exact impact
+            // coordinate is strictly above GetGroundHeight at that same XY. Keep
+            // this gate outside bucket materialization: equality observes no air
+            // vector at all.
+            if let Some(air_impact) = layer_context.air_impact
+                && layer_context.terrain.as_deref().is_some_and(|terrain| {
+                    impact_is_above_ground(
+                        terrain, impact_rx, impact_ry, air_impact, warhead, rules,
+                    )
+                })
+            {
+                // Native appends airborne receiver records before entering the
+                // spread cell loop. Damage dispatch happens only after collection,
+                // so walls still mutate during the later cell walk before any
+                // receiver runs.
+                let center = crate::sim::cell_rect::get_cellclass_fallback(
+                    layer_context.terrain.as_deref(),
+                    i32::from(impact_rx as i16),
+                    i32::from(impact_ry as i16),
                 );
+                for entity_id in entities.airborne_in_query_order(
+                    &center,
+                    cell_spread::whole_cells(cell_spread),
+                    layer_context
+                        .terrain
+                        .as_deref()
+                        .map(|terrain| (terrain.width(), terrain.height()))
+                        .expect("checked terrain Apply_area_damage context"),
+                ) {
+                    let terrain = layer_context
+                        .terrain
+                        .as_deref()
+                        .expect("checked terrain Apply_area_damage context");
+                    push_airborne_aoe_damage(
+                        &mut result,
+                        entities,
+                        entity_id,
+                        impact_rx,
+                        impact_ry,
+                        air_impact,
+                        terrain,
+                        spread_leptons,
+                        base_damage,
+                        origin.source_id,
+                        origin.source_house,
+                        origin.warhead_ref,
+                        air_source_admitted,
+                        rules,
+                        interner,
+                    );
+                }
             }
         }
+
+        Some(Self {
+            impact_rx,
+            impact_ry,
+            base_damage,
+            origin,
+            ground_source_admitted,
+            spread_leptons,
+            exact_impact,
+            native_occupancy: native_occupancy.is_some(),
+            ares: rules.ares(),
+            truce_harvesters,
+            result,
+        })
     }
 
-    // AreaDamage4895C7..489603 adds packed WORD offsets, then performs one
-    // Map5657A0 lookup. Retain that allocation identity across synchronous
-    // tiberium/wall callbacks; an inner lookup may restamp only the Dummy.
-    // Both native-list and legacy headless callers share this ordered sweep.
-    for &(dx, dy) in cell_spread::splash_cells(cell_spread) {
+    pub fn prepare_cell(
+        &mut self,
+        dx: i16,
+        dy: i16,
+        warhead: &WarheadType,
+        layer_context: &mut AoELayerContext<'_>,
+        cell_prelude: &mut Option<&mut dyn AoECellPrelude>,
+    ) -> AoESpreadCell {
         let requested = (
-            (impact_rx as i16).wrapping_add(dx),
-            (impact_ry as i16).wrapping_add(dy),
+            (self.impact_rx as i16).wrapping_add(dx),
+            (self.impact_ry as i16).wrapping_add(dy),
         );
         let cell = layer_context
             .terrain
@@ -544,6 +715,18 @@ pub(crate) fn apply_aoe_damage_with_terrain_and_scenario<O: Into<AoEDamageOrigin
             // No CellClass authority exists in legacy headless fixtures.
             None => Some((requested.0 as u16, requested.1 as u16)),
         };
+        let target = real_coord.map_or(WallPointerTarget::SharedDummy, |(rx, ry)| {
+            WallPointerTarget::Real(rx, ry)
+        });
+        // AreaDamage48960E..489623 retains initial admission and type BEFORE
+        // ReduceTiberium. The final empty-cell sweep is independent of Wall.
+        let initial_overlay = retained_overlay(target, layer_context);
+        let initial_wall = initial_overlay.and_then(|id| {
+            layer_context
+                .overlay_registry?
+                .flags(id)
+                .map(|flags| (flags.wall, flags.armor_is_wood))
+        });
         if let Some((rx, ry)) = real_coord
             && let Some(prelude) = cell_prelude.as_deref_mut()
         {
@@ -557,71 +740,90 @@ pub(crate) fn apply_aoe_damage_with_terrain_and_scenario<O: Into<AoEDamageOrigin
                 layer_context.occupancy,
             );
         }
-        // Ordinary resource placement rejects Dummy (admit_new_tiberium_target),
-        // whose constructor47BC21 overlay is-1. Do not invent grid-backed
-        // tiberium there. Existing modeled nonempty Dummy walls still execute
-        // their retained-pointer recursive owner, including RNG and expiry.
-        let wall_target = real_coord.map_or(WallPointerTarget::SharedDummy, |(rx, ry)| {
-            WallPointerTarget::Real(rx, ry)
-        });
         route_wall_before_cell_objects(
-            entities,
-            target_terrain_objects,
-            wall_target,
-            base_damage,
+            target,
+            initial_wall,
+            self.base_damage,
             warhead,
-            &mut layer_context,
-            &mut cell_prelude,
-            &mut result,
+            layer_context,
+            cell_prelude,
+            &mut self.result,
         );
-        let Some(occupancy) = native_occupancy else {
-            continue;
+        AoESpreadCell {
+            identity: cell,
+            real_coord,
+            requested: (requested.0 as u16, requested.1 as u16),
+            target,
+            initial_overlay_present: initial_overlay.is_some(),
+            center: dx == 0 && dy == 0,
+        }
+    }
+
+    fn selected_layer(&self) -> MovementLayer {
+        match self.result.object_list_layer {
+            ListLayer::Ground => MovementLayer::Ground,
+            ListLayer::Bridge => MovementLayer::Bridge,
+        }
+    }
+
+    pub fn capture_cell(
+        &mut self,
+        cell: &AoESpreadCell,
+        entities: &EntityStore,
+        context: &AoELayerContext<'_>,
+        terrain_objects: Option<TerrainCollectionView<'_>>,
+    ) {
+        let Some(occupancy) = context.occupancy.filter(|_| self.native_occupancy) else {
+            return;
         };
         // Dummy E4/E8 heads are null (47BC82/88). Its mutable coordinates must
         // never turn unrelated rectangular-grid entries into native residents.
-        if cell == Some(NativeCellIdentity::Dummy) {
-            continue;
+        if cell.identity == Some(NativeCellIdentity::Dummy) {
+            return;
         }
-        let (rx, ry) = real_coord.expect("native real cell has its canonical coordinate");
-        let mut terrain_inserted = selected_layer != MovementLayer::Ground;
+        let (rx, ry) = cell
+            .real_coord
+            .expect("native real cell has its canonical coordinate");
+        let mut terrain_inserted = self.selected_layer() != MovementLayer::Ground;
         if let Some(cell_occ) = occupancy.get(rx, ry) {
-            for occupant in cell_occ.iter_layer(selected_layer) {
+            for occupant in cell_occ.iter_layer(self.selected_layer()) {
                 // TerrainClass was revealed before map technos. Native
                 // AddContent prepends later nonbuildings and appends
                 // Buildings, so the captured Terrain record sits at this
                 // exact represented boundary.
                 if !terrain_inserted && occupant.is_building {
                     push_terrain_aoe_damage(
-                        &mut result,
+                        &mut self.result,
                         terrain_objects,
                         rx,
                         ry,
-                        impact_rx,
-                        impact_ry,
-                        exact_impact,
-                        spread_leptons,
-                        base_damage,
-                        origin.warhead_ref,
+                        self.impact_rx,
+                        self.impact_ry,
+                        self.exact_impact,
+                        self.spread_leptons,
+                        self.base_damage,
+                        self.origin.warhead_ref,
                     );
                     terrain_inserted = true;
                 }
                 push_entity_aoe_damage(
-                    &mut result,
+                    &mut self.result,
                     entities,
                     occupant.entity_id,
-                    impact_rx,
-                    impact_ry,
+                    self.impact_rx,
+                    self.impact_ry,
                     rx,
                     ry,
-                    dx == 0 && dy == 0,
-                    exact_impact,
-                    layer_context.terrain.as_deref(),
-                    spread_leptons,
-                    base_damage,
-                    origin.source_id,
-                    origin.source_house,
-                    ground_source_admitted,
-                    origin.warhead_ref,
+                    cell.center,
+                    self.exact_impact,
+                    context.terrain.as_deref(),
+                    self.spread_leptons,
+                    self.base_damage,
+                    self.origin.source_id,
+                    self.origin.source_house,
+                    self.ground_source_admitted,
+                    self.origin.warhead_ref,
+                    &self.truce_harvesters,
                 );
             }
         }
@@ -629,67 +831,196 @@ pub(crate) fn apply_aoe_damage_with_terrain_and_scenario<O: Into<AoEDamageOrigin
             // A tree-only cell has no OccupancyGrid entry. Terrain lookup
             // must remain outside that optional Techno cache.
             push_terrain_aoe_damage(
-                &mut result,
+                &mut self.result,
                 terrain_objects,
                 rx,
                 ry,
-                impact_rx,
-                impact_ry,
-                exact_impact,
-                spread_leptons,
-                base_damage,
-                origin.warhead_ref,
+                self.impact_rx,
+                self.impact_ry,
+                self.exact_impact,
+                self.spread_leptons,
+                self.base_damage,
+                self.origin.warhead_ref,
             );
         }
     }
-    if native_occupancy.is_some() {
-        return finalize_receiver_isolation_metadata(result, warhead);
-    }
 
-    for entity in entities.values() {
-        if entity.lifecycle.in_limbo()
-            || crate::sim::occupancy::cell_list_layer_for_entity(
-                entity,
-                layer_context.terrain.as_deref(),
-            )
-            .is_none()
+    pub fn finish(
+        mut self,
+        entities: &EntityStore,
+        context: &AoELayerContext<'_>,
+        warhead: &WarheadType,
+    ) -> AoEDamageResult {
+        if self.native_occupancy {
+            limit_records_per_object(&mut self.result, warhead, self.ares);
+            return finalize_receiver_isolation_metadata(self.result, warhead);
+        }
+
+        for entity in entities.values() {
+            if entity.lifecycle.in_limbo()
+                || crate::sim::occupancy::cell_list_layer_for_entity(
+                    entity,
+                    context.terrain.as_deref(),
+                )
+                .is_none()
+            {
+                continue;
+            }
+            // Dying corpses (uninit'd this tick, awaiting the end-of-tick drain)
+            // are off the live object list — exclude them. A sold/captured corpse
+            // keeps health>0, so gate on `dying`, not just health.
+            if entity.health.current() == 0 || entity.death.is_dying() {
+                continue;
+            }
+
+            push_entity_aoe_damage(
+                &mut self.result,
+                entities,
+                entity.stable_id(),
+                self.impact_rx,
+                self.impact_ry,
+                entity.position.rx(),
+                entity.position.ry(),
+                entity.position.rx() == self.impact_rx && entity.position.ry() == self.impact_ry,
+                self.exact_impact,
+                context.terrain.as_deref(),
+                self.spread_leptons,
+                self.base_damage,
+                self.origin.source_id,
+                self.origin.source_house,
+                self.ground_source_admitted,
+                self.origin.warhead_ref,
+                &self.truce_harvesters,
+            );
+        }
+
+        limit_records_per_object(&mut self.result, warhead, self.ares);
+        finalize_receiver_isolation_metadata(self.result, warhead)
+    }
+}
+
+/// Ares DamageArea_Damage_MaxAffect (10053400, hook 0x4899DA), after the
+/// spread loop: with `CellSpread.MaxAffect >= 0`, each object keeps only
+/// that many of its records (a building has one per foundation cell). In
+/// record order, the first unhandled record's object collects its records
+/// from there on; beyond the limit, a partial selection sort
+/// (`std::min_element`, first minimum) keeps the nearest and the rest are
+/// dropped, the survivors keeping their order.
+///
+/// RESIDUAL: VERA's near-center Iron Curtain pre-scan runs over the kept
+/// records, while native arms it during collection. Only a dropped record
+/// nearer than 85 leptons that arms while every kept one cannot differs,
+/// which a building's equal-distance records never produce.
+pub(super) fn limit_records_per_object(
+    result: &mut AoEDamageResult,
+    warhead: &WarheadType,
+    ares: bool,
+) {
+    if ares {
+        let Some(max_affect) = warhead
+            .ares_combat()
+            .map(|combat| combat.cell_spread_max_affect())
+            .filter(|&max_affect| max_affect >= 0)
+        else {
+            return;
+        };
+        let max_affect = max_affect as usize;
+        let key = |receiver: &AreaDamageReceiver| match receiver {
+            AreaDamageReceiver::Entity(event) => (false, event.target_id),
+            AreaDamageReceiver::Terrain(event) => (true, event.stable_id),
+        };
+        let distance = |receiver: &AreaDamageReceiver| match receiver {
+            AreaDamageReceiver::Entity(event) => event.distance_leptons,
+            AreaDamageReceiver::Terrain(event) => event.distance_leptons,
+        };
+        let records = &result.receivers;
+        let mut keep = vec![true; records.len()];
+        let mut handled = Vec::new();
+        for first in 0..records.len() {
+            let object = key(&records[first]);
+            if !keep[first] || handled.contains(&object) {
+                continue;
+            }
+            handled.push(object);
+            let mut members: Vec<usize> = (first..records.len())
+                .filter(|&index| key(&records[index]) == object)
+                .collect();
+            if members.len() <= max_affect {
+                continue;
+            }
+            for slot in 0..max_affect {
+                let nearest = (slot..members.len())
+                    .min_by_key(|&at| (distance(&records[members[at]]), at))
+                    .expect("a nonempty tail");
+                members.swap(slot, nearest);
+            }
+            for &dropped in &members[max_affect..] {
+                keep[dropped] = false;
+            }
+        }
+        let mut kept = keep.into_iter();
+        result
+            .receivers
+            .retain(|_| kept.next().expect("one flag per record"));
+        #[cfg(any(test, feature = "test-support"))]
         {
-            continue;
+            result.hits = result
+                .receivers
+                .iter()
+                .filter_map(|receiver| match receiver {
+                    AreaDamageReceiver::Entity(event) => Some(*event),
+                    AreaDamageReceiver::Terrain(_) => None,
+                })
+                .collect();
         }
-        // Dying corpses (uninit'd this tick, awaiting the end-of-tick drain)
-        // are off the live object list — exclude them. A sold/captured corpse
-        // keeps health>0, so gate on `dying`, not just health.
-        if entity.health.current() == 0 || entity.death.is_dying() {
-            continue;
-        }
-
-        push_entity_aoe_damage(
-            &mut result,
-            entities,
-            entity.stable_id(),
-            impact_rx,
-            impact_ry,
-            entity.position.rx(),
-            entity.position.ry(),
-            entity.position.rx() == impact_rx && entity.position.ry() == impact_ry,
-            exact_impact,
-            layer_context.terrain.as_deref(),
-            spread_leptons,
-            base_damage,
-            origin.source_id,
-            origin.source_house,
-            ground_source_admitted,
-            origin.warhead_ref,
-        );
     }
+}
 
-    finalize_receiver_isolation_metadata(result, warhead)
+#[cfg(any(test, feature = "test-support"))]
+/// Geometry-only fixture driver sharing the production collection cursor.
+/// Full-world Restore callbacks are owned by world_receiver::collect_area.
+/// Without occupancy, unlimboed living objects stand in for the cell lists.
+pub(crate) fn apply_aoe_damage_with_terrain_and_scenario<O: Into<AoEDamageOrigin>>(
+    entities: &mut EntityStore,
+    impact_rx: u16,
+    impact_ry: u16,
+    base_damage: i32,
+    warhead: &WarheadType,
+    rules: &RuleSet,
+    interner: &StringInterner,
+    handles: Option<crate::sim::type_handle_table::ResolvedRuleHandles>,
+    origin: O,
+    mut layer_context: AoELayerContext<'_>,
+    terrain_objects: Option<TerrainCollectionView<'_>>,
+    scenario_no_damage: bool,
+    mut cell_prelude: Option<&mut dyn AoECellPrelude>,
+) -> AoEDamageResult {
+    let Some(mut collector) = AoECollector::begin(
+        entities,
+        impact_rx,
+        impact_ry,
+        base_damage,
+        warhead,
+        rules,
+        interner,
+        handles,
+        origin.into(),
+        &layer_context,
+        scenario_no_damage,
+        Vec::new(),
+    ) else {
+        return AoEDamageResult::default();
+    };
+    for &(dx, dy) in cell_spread::area_damage_cells(warhead.cell_spread_f64, rules.ares()).iter() {
+        let cell = collector.prepare_cell(dx, dy, warhead, &mut layer_context, &mut cell_prelude);
+        collector.capture_cell(&cell, entities, &layer_context, terrain_objects);
+    }
+    collector.finish(entities, &layer_context, warhead)
 }
 
 fn route_wall_before_cell_objects(
-    entities: &mut EntityStore,
-    target_terrain_objects: &BTreeMap<u64, TerrainObjectState>,
     target: WallPointerTarget,
+    initial_wall: Option<(bool, bool)>,
     raw_damage: i32,
     warhead: &WarheadType,
     context: &mut AoELayerContext<'_>,
@@ -703,27 +1034,15 @@ fn route_wall_before_cell_objects(
     ) else {
         return;
     };
-    let overlay_id = match target {
-        WallPointerTarget::Real(rx, ry) => grid.cell(rx, ry).overlay_id,
-        WallPointerTarget::SharedDummy => context.terrain.as_deref().and_then(|terrain| {
-            u8::try_from(terrain.shared_cell_dummy().overlay_identity_state().0).ok()
-        }),
-    };
-    let Some(overlay_id) = overlay_id else {
+    let Some((true, armor_is_wood)) = initial_wall else {
         return;
     };
-    let Some(flags) = registry.flags(overlay_id) else {
-        return;
-    };
-    if !flags.wall {
-        return;
-    }
 
     // Active-YR routing precedence: WAD forces literal -1; ordinary Wall and
     // Wood against Armor=wood pass the unchanged signed weapon damage.
     let routed_damage = if warhead.wall_absolute_destroyer {
         -1
-    } else if warhead.wall || (warhead.wood && flags.armor_is_wood) {
+    } else if warhead.wall || (warhead.wood && armor_is_wood) {
         raw_damage
     } else {
         return;
@@ -731,10 +1050,6 @@ fn route_wall_before_cell_objects(
 
     let _wall_result = {
         let mut host = AoEWallDamageHost {
-            entities,
-            target_terrain_objects,
-            #[cfg(any(test, feature = "test-support"))]
-            trace: &mut _result.cell_target_detaches,
             prelude: cell_prelude,
         };
         damage_wall_overlay_with_runtime_host(
@@ -749,55 +1064,6 @@ fn route_wall_before_cell_objects(
     };
     #[cfg(any(test, feature = "test-support"))]
     _result.wall_mutations.extend(_wall_result.mutations);
-}
-
-/// Broadcast one CellClass pointer-expiry notification to represented Techno
-/// listeners. Native walks the listener roster forward, clears the live Target
-/// first, and only then runs Restore when a mission was suspended.
-pub(crate) fn expire_cell_target_references(
-    entities: &mut EntityStore,
-    terrain_objects: &BTreeMap<u64, TerrainObjectState>,
-    rx: u16,
-    ry: u16,
-    types: Option<(
-        &crate::rules::ruleset::RuleSet,
-        &crate::sim::intern::StringInterner,
-    )>,
-    #[cfg(any(test, feature = "test-support"))] trace: &mut Vec<CellTargetDetach>,
-) {
-    let listener_ids = entities.keys_sorted();
-    for listener_id in listener_ids {
-        let saved_target_stored = entities.get(listener_id).and_then(|entity| {
-            crate::sim::mission::concrete_effects::assign_target_stored(
-                entities,
-                terrain_objects,
-                listener_id,
-                entity.suspended_attack_target.target(),
-                types,
-            )
-        });
-        let Some(entity) = entities.get_mut(listener_id) else {
-            continue;
-        };
-        if !matches!(
-            entity.attack_target.target(),
-            Some(super::TargetKind::Cell(tx, ty)) if (tx, ty) == (rx, ry)
-        ) {
-            continue;
-        }
-
-        let mission_was_suspended =
-            entity.mission.suspended() != crate::sim::mission::MissionId::NONE;
-        represented_assign_target(entity, None);
-        let _restored = mission_was_suspended
-            && restore_entity_after_target_expiry(entity, saved_target_stored);
-        #[cfg(any(test, feature = "test-support"))]
-        trace.push(CellTargetDetach {
-            listener_id,
-            restored: _restored,
-            cleared: true,
-        });
-    }
 }
 
 fn select_object_damage_layer(
@@ -828,13 +1094,38 @@ fn impact_is_above_ground(
     impact_rx: u16,
     impact_ry: u16,
     impact: AoEAirImpact,
+    warhead: &WarheadType,
+    rules: &RuleSet,
 ) -> bool {
     let cells = NativeCellQuery::canonical(terrain);
-    crate::sim::movement::ground_pose::query_ground_height(
+    let Ok(floor) = crate::sim::movement::ground_pose::query_ground_height(
         &cells,
         impact.world_point(impact_rx, impact_ry),
-    )
-    .is_ok_and(|floor| floor < impact.z_leptons)
+    ) else {
+        return false;
+    };
+    // Ares DamageArea_DamageAir (100533A0, hook 0x4893BA): the height above
+    // the floor must exceed DamageAirThreshold (default 0, the native
+    // `floor < Z`); with `[General] DamageAirConsiderBridges=yes` a bridge
+    // cell (flag 0x100) measures from its 416-lepton deck once reached.
+    if rules.ares()
+        && let Some(combat) = warhead.ares_combat()
+    {
+        const BRIDGE_HEIGHT_LEPTONS: i32 = 416;
+        let mut height = impact.z_leptons.wrapping_sub(floor);
+        if height >= BRIDGE_HEIGHT_LEPTONS
+            && rules.ares_warhead_globals().damage_air_consider_bridges()
+            && CellBridgeView::from_query(
+                &cells,
+                cells.lookup((impact_rx as i16, impact_ry as i16)),
+            )
+            .is_bridge_cell()
+        {
+            height -= BRIDGE_HEIGHT_LEPTONS;
+        }
+        return height > combat.damage_air_threshold();
+    }
+    floor < impact.z_leptons
 }
 
 fn push_airborne_aoe_damage(
@@ -850,9 +1141,16 @@ fn push_airborne_aoe_damage(
     source_id: u64,
     source_house: Option<crate::sim::intern::InternedId>,
     warhead_ref: crate::sim::intern::InternedId,
+    source_self_admitted: bool,
     rules: &RuleSet,
     interner: &StringInterner,
 ) {
+    // Phobos `MapClass_DamageArea_AirDamageSelfFix @ 0x00489416`: the airborne
+    // phase skips its own source unless DamageSelf or AllowDamageOnSelf admits
+    // it. A non-Phobos build keeps retail's unconditional admission.
+    if entity_id == source_id && !source_self_admitted {
+        return;
+    }
     let Some(entity) = entities.get(entity_id) else {
         return;
     };
@@ -933,11 +1231,12 @@ fn push_entity_aoe_damage(
     source_house: Option<crate::sim::intern::InternedId>,
     source_self_admitted: bool,
     warhead_ref: crate::sim::intern::InternedId,
+    truce_harvesters: &[crate::sim::intern::InternedId],
 ) {
     // Apply_area_damage's selected ground/deck list excludes the source object
-    // unless its type opts into DamageSelf or this is Rules.CrushWarhead.
-    // Airborne collection is a separate native phase and deliberately does
-    // not use this admission gate.
+    // unless its type opts into DamageSelf, the warhead is Rules.CrushWarhead,
+    // or Phobos AllowDamageOnSelf admits the firer. Airborne collection is a
+    // separate native phase and deliberately does not use this admission gate.
     if entity_id == source_id && !source_self_admitted {
         return;
     }
@@ -945,6 +1244,13 @@ fn push_entity_aoe_damage(
         return;
     };
     if entity.health.current() == 0 || entity.death.is_dying() {
+        return;
+    }
+    // `0x00489710..0x00489759`: while ScenarioFlags bit 0x800 (HarvesterImmune,
+    // the Harvester Truce) is set, a Unit whose type is in Rules'
+    // `HarvesterUnit=` list gets no record, so no weapon or splash damage. The
+    // airborne phase has no such skip.
+    if entity.category() == EntityCategory::Unit && truce_harvesters.contains(&entity.type_ref()) {
         return;
     }
 
@@ -989,14 +1295,18 @@ fn push_entity_aoe_damage(
         return;
     }
 
-    result.push_entity(EntityDamageEvent::area(
+    let mut event = EntityDamageEvent::area(
         entity.stable_id(),
         base_damage,
         distance_leptons,
         source_id,
         source_house,
         warhead_ref,
-    ));
+    );
+    // 489932 tests the spread-loop index, independently of the later
+    // transaction-wide filter. The unique zero offset is its first cell.
+    event.adjacent_ground_cell_record = !center_cell;
+    result.push_entity(event);
 }
 
 fn push_terrain_aoe_damage(
@@ -1014,44 +1324,38 @@ fn push_terrain_aoe_damage(
     let Some(view) = terrain_objects else {
         return;
     };
-    let Some(&stable_id) = view.cells.get(&(scan_rx, scan_ry)) else {
-        return;
-    };
-    let Some(object) = view.objects.get(&stable_id) else {
-        return;
-    };
-    if object.lifecycle != TerrainObjectLifecycle::Live
-        || object.rx != scan_rx
-        || object.ry != scan_ry
-    {
-        return;
+    // Apply_area_damage489280 walks every Cell member; GetTerrain's first
+    // matching object is insufficient when generated constructors overlap.
+    for stable_id in view.store.members_at((scan_rx, scan_ry)) {
+        let object = &view.store.objects()[&stable_id];
+        if !object.is_live() {
+            continue;
+        }
+        let impact_point = impact.world_point(impact_rx, impact_ry);
+        let target_coord = object.world_coord();
+        let distance_leptons = distance_3d_leptons(
+            [impact_point.x, impact_point.y, impact.z_leptons],
+            [target_coord.x, target_coord.y, target_coord.z],
+        );
+        if i64::from(distance_leptons) > spread_leptons {
+            continue;
+        }
+        result.push_terrain(TerrainDamageEvent {
+            damage_writeback: None,
+            stable_id,
+            rx: scan_rx,
+            ry: scan_ry,
+            damage: base_damage,
+            distance_leptons,
+            warhead_ref,
+            near_center_ic_isolation_eligible: false,
+        });
     }
-
-    let impact_point = impact.world_point(impact_rx, impact_ry);
-    let (impact_x, impact_y) = (impact_point.x, impact_point.y);
-    let target_coord = object.world_coord();
-    let distance_leptons = distance_3d_leptons(
-        [impact_x, impact_y, impact.z_leptons],
-        [target_coord.x, target_coord.y, target_coord.z],
-    );
-    if i64::from(distance_leptons) > spread_leptons {
-        return;
-    }
-
-    result.push_terrain(TerrainDamageEvent {
-        stable_id,
-        rx: scan_rx,
-        ry: scan_ry,
-        damage: base_damage,
-        distance_leptons,
-        warhead_ref,
-        near_center_ic_isolation_eligible: false,
-    });
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_a_c))]
 mod tests {
-    use std::collections::BTreeMap;
+    use crate::sim::terrain_object::{TerrainObjectLifecycle, TerrainObjectState};
 
     use super::*;
     use crate::map::bridge_facts::{BRIDGE_FLAG_STRUCTURAL, BridgeCellFacts};
@@ -1068,9 +1372,103 @@ mod tests {
     use crate::sim::mission::{MissionDispatchTimer, MissionId, MissionType};
     use crate::sim::movement::locomotor::MovementLayer;
     use crate::sim::occupancy::{CellListInsertion, OccupancyGrid};
+    use crate::sim::world::Simulation;
+
+    const CELL_INSET_FIXTURE_RULES: &str = "[VehicleTypes]\n0=FIRER\n1=SPRAY\n2=NOAREA\n3=EMPTY\n4=TARGET\n\
+             [WeaponTypes]\n0=AREA\n1=DIRECT\n[Projectiles]\n0=INVIS\n\
+             [Warheads]\n0=WH\n[FIRER]\nSecondary=AREA\n\
+             [SPRAY]\nSprayAttack=yes\nPrimary=AREA\nSecondary=DIRECT\n\
+             [NOAREA]\nSecondary=DIRECT\n\
+             [AREA]\nProjectile=INVIS\nWarhead=WH\nAreaFire=yes\n\
+             [DIRECT]\nProjectile=INVIS\nWarhead=WH\nAreaFire=no\n\
+             [INVIS]\n[WH]\nCellSpread=3\nCellInset=2\n";
+
+    fn cell_inset_fixture() -> (RuleSet, Simulation) {
+        let ini = IniFile::from_str(CELL_INSET_FIXTURE_RULES);
+        let rules = RuleSet::from_ini(&ini).expect("CellInset fixture rules parse");
+        cell_inset_world(rules)
+    }
+
+    fn cell_inset_world(rules: RuleSet) -> (RuleSet, Simulation) {
+        let mut world = Simulation::new();
+        let entities = [
+            (1, "FIRER", 10, 10),
+            (2, "TARGET", 11, 10),
+            (3, "TARGET", 12, 10),
+            (4, "SPRAY", 10, 10),
+            (5, "NOAREA", 10, 10),
+            (6, "EMPTY", 10, 10),
+        ];
+        for (stable_id, type_id, rx, ry) in entities {
+            let type_ref = world.interner.intern(type_id);
+            let mut entity = GameEntity::test_default(stable_id, type_id, "House", rx, ry);
+            entity.set_type_ref_for_test(type_ref);
+            world.substrate.entities.insert(entity);
+        }
+        world.interner.bind_types(&rules);
+        (rules, world)
+    }
 
     fn hit_ids(hits: &[EntityDamageEvent]) -> Vec<u64> {
         hits.iter().map(|event| event.target_id).collect()
+    }
+
+    #[test]
+    fn techno_triggers_cell_inset_includes_threshold_and_uses_native_deploy_slot() {
+        let (rules, world) = cell_inset_fixture();
+
+        assert!(techno_triggers_cell_inset(
+            &world,
+            1,
+            TargetKind::Entity(2),
+            &rules,
+        ));
+        assert!(!techno_triggers_cell_inset(
+            &world,
+            1,
+            TargetKind::Entity(3),
+            &rules,
+        ));
+        assert!(techno_triggers_cell_inset(
+            &world,
+            4,
+            TargetKind::Entity(2),
+            &rules,
+        ));
+
+        let mut layers = crate::rules::native_processing::RulesLayerStack::new(IniFile::from_str(
+            CELL_INSET_FIXTURE_RULES,
+        ));
+        layers.push(
+            crate::rules::native_processing::RulesLayerKind::Scenario,
+            IniFile::from_str("[WH]\nCellSpread=1e999\nCellInset=1e999\n"),
+        );
+        let nan_rules = RuleSet::from_rules_layers(&layers).expect("NaN threshold rules");
+        let (nan_rules, nan_world) = cell_inset_world(nan_rules);
+        assert!(techno_triggers_cell_inset(
+            &nan_world,
+            1,
+            TargetKind::Entity(2),
+            &nan_rules,
+        ));
+    }
+
+    #[test]
+    fn techno_triggers_cell_inset_requires_area_fire_and_a_deploy_weapon() {
+        let (rules, world) = cell_inset_fixture();
+
+        assert!(!techno_triggers_cell_inset(
+            &world,
+            5,
+            TargetKind::Entity(2),
+            &rules,
+        ));
+        assert!(!techno_triggers_cell_inset(
+            &world,
+            6,
+            TargetKind::Entity(2),
+            &rules,
+        ));
     }
 
     fn hit_id_distances(hits: &[EntityDamageEvent]) -> Vec<(u64, i32)> {
@@ -1085,12 +1483,13 @@ mod tests {
     ) -> (RuleSet, WarheadType, OverlayTypeRegistry) {
         let ini = IniFile::from_str(&format!(
             "[InfantryTypes]\n\
-             [VehicleTypes]\n\
+             [VehicleTypes]\n0=MTNK\n\
              [AircraftTypes]\n\
              [BuildingTypes]\n\
              [Warheads]\n0=WH\n\
              [OverlayTypes]\n0=GASAND\n1=CYCL\n2=GAWALL\n\
              [WH]\nCellSpread={cell_spread}\n{warhead_flags}\n\
+             [MTNK]\nStrength=300\n\
              [GASAND]\nWall=yes\nArmor=wood\nStrength=400\n\
              [CYCL]\nWall=yes\nArmor=wood\nStrength=400\n\
              [GAWALL]\nWall=yes\nArmor=concrete\nStrength=400\n"
@@ -1173,21 +1572,23 @@ mod tests {
     /// State the production ordered receiver commit (`commit_damage_events`)
     /// keeps across calls; no house order, overlays or traces.
     struct ReceiverCommit {
-        houses: BTreeMap<crate::sim::intern::InternedId, HouseState>,
+        houses: crate::sim::houses::Houses,
         alliances: HouseAllianceMap,
         main_rng: SimRng,
         scenario_rng: SimRng,
         handled_deaths: Vec<u64>,
+        sounds: Option<Vec<crate::sim::world::SimSoundEvent>>,
     }
 
     impl ReceiverCommit {
         fn new() -> Self {
             Self {
-                houses: BTreeMap::new(),
+                houses: crate::sim::houses::Houses::default(),
                 alliances: HouseAllianceMap::new(),
                 main_rng: SimRng::new(1),
                 scenario_rng: SimRng::new(2),
                 handled_deaths: Vec::new(),
+                sounds: None,
             }
         }
 
@@ -1210,7 +1611,6 @@ mod tests {
                 rules,
                 interner,
                 &mut self.houses,
-                &[],
                 &self.alliances,
                 &mut self.main_rng,
                 &mut self.scenario_rng,
@@ -1220,7 +1620,7 @@ mod tests {
                 Some(terrain),
                 0,
                 &mut None,
-                &mut None,
+                &mut self.sounds.as_mut(),
             )
         }
     }
@@ -1312,7 +1712,6 @@ mod tests {
             let mut prelude = RestampDummy { visits: Vec::new() };
             let result = apply_aoe_damage_with_terrain_and_scenario(
                 &mut EntityStore::new(),
-                &BTreeMap::new(),
                 0,
                 1,
                 1,
@@ -1394,15 +1793,13 @@ mod tests {
             }
             let mut overlays = OverlayGrid::new(32, 32);
             overlays.place_overlay(20, 20, 0, 0);
-            let mut objects = BTreeMap::new();
-            objects.insert(8, TerrainObjectState::for_test(8, tree_ref, 20, 20));
-            let mut object_cells = BTreeMap::new();
-            object_cells.insert((20, 20), 8);
+            let mut objects = crate::sim::terrain_object::TerrainObjectStore::default();
+            objects.insert_constructed(TerrainObjectState::for_test(8, tree_ref, 20, 20), false);
+            objects.add_to_cell(8, (20, 20));
             let mut rng = SimRng::new(0x489608);
             let mut prelude = ObserveDummy::default();
             let result = apply_aoe_damage_with_terrain_and_scenario(
                 &mut entities,
-                &BTreeMap::new(),
                 20,
                 20,
                 1,
@@ -1417,10 +1814,7 @@ mod tests {
                     scenario_rng: Some(&mut rng),
                     ..native_lists(&occupancy, &mut terrain, Some(0))
                 },
-                Some(TerrainCollectionView {
-                    objects: &objects,
-                    cells: &object_cells,
-                }),
+                Some(TerrainCollectionView { store: &objects }),
                 false,
                 Some(&mut prelude),
             );
@@ -1451,6 +1845,61 @@ mod tests {
                 dummy_wall,
                 "a nonempty Dummy wall keeps its existing native dirty transaction"
             );
+            if dummy_wall {
+                // Explicit boundary state, not a claimed stock producer of a
+                // nonempty Dummy. Recursive lookups restamp it; the outer
+                // sweep must still match another request for that allocation.
+                dummy.write_overlay_identity_state(0, 0);
+                entities
+                    .get_mut(7)
+                    .unwrap()
+                    .attack_target
+                    .set_for_test(Some(TargetKind::Cell(21, 21)));
+                let wh = interner.intern("WH");
+                let mut world = Simulation::with_seed(0x489608);
+                world.interner = interner;
+                world.substrate.entities = entities;
+                world.substrate.occupancy = occupancy;
+                world.resolved_terrain = Some(terrain);
+                world.overlay_grid = Some(overlays);
+                world.terrain_objects = objects;
+                let result = super::super::world_receiver::collect_area(
+                    &mut world,
+                    &rules,
+                    Some(&registry),
+                    (20, 20),
+                    1,
+                    &warhead,
+                    true,
+                    (super::super::RAD_NO_ATTACKER, None, wh),
+                    Some(center_impact(0)),
+                    0,
+                    crate::sim::world::FrameEffects::default(),
+                );
+                assert!(result.receivers.is_empty());
+                assert_eq!(
+                    result.cell_target_detaches,
+                    vec![CellTargetDetach {
+                        listener_id: 7,
+                        restored: false,
+                        cleared: true
+                    }]
+                );
+                assert_eq!(
+                    world
+                        .substrate
+                        .entities
+                        .get(7)
+                        .unwrap()
+                        .attack_target
+                        .target(),
+                    None
+                );
+                assert_eq!(
+                    world.overlay_grid.as_ref().unwrap().cell(20, 20).overlay_id,
+                    Some(0)
+                );
+            }
         }
     }
 
@@ -1524,7 +1973,6 @@ mod tests {
             crate::sim::type_handle_table::ResolvedRuleHandles::resolve(&rules, &mut interner);
         let result = apply_aoe_damage_with_terrain_and_scenario(
             &mut entities,
-            &BTreeMap::new(),
             8,
             8,
             100,
@@ -1600,7 +2048,6 @@ mod tests {
             crate::sim::type_handle_table::ResolvedRuleHandles::resolve(&rules, &mut interner);
         let _ = apply_aoe_damage_with_terrain_and_scenario(
             &mut EntityStore::new(),
-            &BTreeMap::new(),
             8,
             8,
             1,
@@ -1649,13 +2096,13 @@ mod tests {
             // Ordinary Aircraft41B920 reaches Object5F6B90: Object+74 must
             // be marked before the physical GetHeight threshold is queried.
             air.lifecycle.set_in_limbo_for_test(false);
-            air.lifecycle.set_cell_marked(true);
+            air.lifecycle.set_cell_marked_for_test(true);
             air.position.set_exact_z_leptons_for_test(Some(altitude));
             let mut locomotor = crate::sim::movement::locomotor::LocomotorState::from_object_type(
                 rules.object(type_id).unwrap(),
                 0,
             );
-            locomotor.set_layer(MovementLayer::Air);
+            locomotor.set_layer_for_test(MovementLayer::Air);
             air.locomotor = Some(locomotor);
             air = air
                 .with_air_spatial_membership_for_test(Some(5 + 5 * 20), stable_id)
@@ -1725,13 +2172,13 @@ mod tests {
             air.set_category_for_test(EntityCategory::Aircraft);
             air.health.set_for_test(1000);
             air.lifecycle.set_in_limbo_for_test(false);
-            air.lifecycle.set_cell_marked(marked);
+            air.lifecycle.set_cell_marked_for_test(marked);
             air.position.set_exact_z_leptons_for_test(Some(0));
             let mut locomotor = crate::sim::movement::locomotor::LocomotorState::from_object_type(
                 rules.object("AIR").unwrap(),
                 0,
             );
-            locomotor.set_layer(layer);
+            locomotor.set_layer_for_test(layer);
             air.locomotor = Some(locomotor);
             air = air
                 .with_air_spatial_membership_for_test(Some(5 + 5 * 20), stable_id)
@@ -1755,6 +2202,84 @@ mod tests {
             native_lists(&occupancy, &mut terrain, Some(1)),
         );
         assert_eq!(hit_id_distances(&result.hits), vec![(1, 1)]);
+    }
+
+    /// Phobos `MapClass_DamageArea_AirDamageSelfFix @ 0x00489416`: retail's
+    /// airborne phase admits the source unconditionally; under Phobos it
+    /// keeps the source only for a `DamageSelf` type or an
+    /// `AllowDamageOnSelf` warhead.
+    #[test]
+    fn gsi_04_07_damage_air_source_admission_follows_damage_self() {
+        fn run(damage_self: bool, warhead_name: &str) -> Vec<u64> {
+            let ini = IniFile::from_str(&format!(
+                "[InfantryTypes]\n[VehicleTypes]\n[AircraftTypes]\n0=AIR\n\
+                 [BuildingTypes]\n\
+                 [Warheads]\n0=BlastWH\n1=AllowWH\n\
+                 [AIR]\nStrength=1000\nArmor=none\nDamageSelf={}\n\
+                 [BlastWH]\nCellSpread=1\nPercentAtMax=.25\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
+                 [AllowWH]\nCellSpread=1\nPercentAtMax=.25\nAllowDamageOnSelf=yes\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
+                if damage_self { "yes" } else { "no" }
+            ));
+            let rules = RuleSet::from_ini(&ini).expect("air source admission rules");
+            let warhead = rules.warhead(warhead_name).unwrap().clone();
+            let mut interner = test_interner();
+            let air_type = interner.intern("AIR");
+            let warhead_ref = interner.intern(warhead_name);
+
+            let mut air = GameEntity::test_default(1, "AIR", "Soviet", 5, 5);
+            air.set_type_ref_for_test(air_type);
+            air.set_category_for_test(EntityCategory::Aircraft);
+            air.health.set_for_test(1000);
+            air.lifecycle.set_in_limbo_for_test(false);
+            air.lifecycle.set_cell_marked_for_test(true);
+            air.position.set_exact_z_leptons_for_test(Some(1));
+            let mut locomotor = crate::sim::movement::locomotor::LocomotorState::from_object_type(
+                rules.object("AIR").unwrap(),
+                0,
+            );
+            locomotor.set_layer_for_test(MovementLayer::Air);
+            air.locomotor = Some(locomotor);
+            let mut entities = EntityStore::new();
+            entities.insert(
+                air.with_air_spatial_membership_for_test(Some(5 + 5 * 20), 1)
+                    .with_air_tracker_cell_for_test((5, 5)),
+            );
+            let occupancy = OccupancyGrid::new();
+            let mut terrain = crate::map::resolved_terrain::test_grid(20, 20, test_terrain_cell);
+            let result = apply_aoe_damage(
+                &mut entities,
+                5,
+                5,
+                100,
+                &warhead,
+                &rules,
+                &mut interner,
+                (1, warhead_ref),
+                native_lists(&occupancy, &mut terrain, Some(1)),
+            );
+            hit_ids(&result.hits)
+        }
+
+        // Retail admits the airborne source unconditionally.
+        #[cfg(not(feature = "phobos"))]
+        {
+            assert_eq!(run(false, "BlastWH"), vec![1]);
+            assert_eq!(run(true, "BlastWH"), vec![1]);
+        }
+
+        #[cfg(feature = "phobos")]
+        {
+            assert!(
+                run(false, "BlastWH").is_empty(),
+                "DamageSelf=no source is skipped in the airborne phase"
+            );
+            assert_eq!(run(true, "BlastWH"), vec![1], "DamageSelf=yes admits it");
+            assert_eq!(
+                run(false, "AllowWH"),
+                vec![1],
+                "AllowDamageOnSelf admits it"
+            );
+        }
     }
 
     #[test]
@@ -1931,7 +2456,7 @@ mod tests {
             vulnerable.position.set_sub_x_for_test(CELL_CENTER_LEPTON);
             vulnerable.position.set_sub_y_for_test(CELL_CENTER_LEPTON);
             vulnerable.lifecycle.set_in_limbo_for_test(false);
-            vulnerable.lifecycle.set_cell_marked(true);
+            vulnerable.lifecycle.set_cell_marked_for_test(true);
             entities.insert(vulnerable);
 
             let mut protected = GameEntity::test_default(2, "TARGET", "Victim", 5, 5);
@@ -1944,7 +2469,7 @@ mod tests {
             ));
             protected.position.set_sub_y_for_test(CELL_CENTER_LEPTON);
             protected.lifecycle.set_in_limbo_for_test(false);
-            protected.lifecycle.set_cell_marked(true);
+            protected.lifecycle.set_cell_marked_for_test(true);
             protected.invulnerability = Some(InvulnerabilityState::new(
                 crate::sim::timer::CdTimer::started(0, 100),
                 kind,
@@ -2068,7 +2593,7 @@ mod tests {
                 air.lifecycle.set_in_limbo_for_test(false);
                 // On the map, so marked (`+0x74`): the airborne phase skips
                 // an unmarked member.
-                air.lifecycle.set_cell_marked(true);
+                air.lifecycle.set_cell_marked_for_test(true);
                 air.health.set_for_test(hp);
                 air.position.set_z_for_test(0);
                 let mut air_locomotor =
@@ -2076,7 +2601,7 @@ mod tests {
                         rules.object("AIRBOMB").unwrap(),
                         0,
                     );
-                air_locomotor.set_layer(MovementLayer::Air);
+                air_locomotor.set_layer_for_test(MovementLayer::Air);
                 air.locomotor = Some(air_locomotor);
                 air.position.set_exact_z_leptons_for_test(Some(1));
                 air = air
@@ -2136,7 +2661,7 @@ mod tests {
             let hit_order = hit_ids(&aoe.hits);
             let mut main_rng = SimRng::new(9);
             let mut handled_deaths = Vec::new();
-            let mut houses = BTreeMap::new();
+            let mut houses = crate::sim::houses::Houses::default();
             let mut fatal_lifecycle = None;
             let mut sound_sink = None;
             // The production Apply_area_damage commit, whose dispatch gates
@@ -2149,7 +2674,6 @@ mod tests {
                     &rules,
                     &mut interner,
                     &mut houses,
-                    &[],
                     &HouseAllianceMap::new(),
                     &mut main_rng,
                     &mut scenario_rng,
@@ -2231,6 +2755,8 @@ mod tests {
         }
     }
 
+    /// Stock table only: Ares walks the CellSpreadEnumerator instead
+    /// (`cell_spread::area_damage_cells`, hooks `0x4895B8`..`0x4899BE`).
     #[test]
     fn gsi_04_07_damage_band11_repeated_cell_dispatches_receiver_twice() {
         let ini = IniFile::from_str(
@@ -2335,6 +2861,63 @@ mod tests {
         assert_eq!(entities.get(100).unwrap().health.current(), 70);
         assert_eq!(entities.get(300).unwrap().health.current(), 70);
         assert_eq!(entities.get(400).unwrap().health.current(), 70);
+    }
+
+    /// Ares 3.0 DamageArea_CellSpread1/2/3 (`100531F0`/`10053250`/`10053270`,
+    /// hooks `0x4895B8`/`0x4895C7`/`0x4899BE`): the CellSpreadEnumerator's
+    /// first ring visits `(-1,-1)` before `(1,-1)`; the stock table visits
+    /// `(1,-1)` first.
+    #[test]
+    fn ares_area_damage_walks_the_cell_spread_enumerator_ring_order() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let ini = IniFile::from_str(
+            "[InfantryTypes]\n\
+             [VehicleTypes]\n0=TESTUNIT\n\
+             [AircraftTypes]\n\
+             [BuildingTypes]\n\
+             [Warheads]\n0=RINGWH\n\
+             [TESTUNIT]\nStrength=100\nArmor=heavy\n\
+             [RINGWH]\nCellSpread=1\nPercentAtMax=1\n\
+             Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
+        );
+        let rules = RuleSet::from_ini(&ini).expect("ring rules");
+        let warhead = rules.warhead("RINGWH").unwrap().clone();
+        let make_ground = |stable_id, rx, ry, sub_x, sub_y| {
+            let mut entity = GameEntity::test_default(stable_id, "TESTUNIT", "Soviet", rx, ry);
+            entity
+                .position
+                .set_sub_x_for_test(SimFixed::from_num(sub_x));
+            entity
+                .position
+                .set_sub_y_for_test(SimFixed::from_num(sub_y));
+            entity
+        };
+        let mut entities = EntityStore::new();
+        entities.insert(make_ground(100, 20, 20, 128, 128));
+        // (1,-1) and (-1,-1), each about 182 leptons from the impact.
+        entities.insert(make_ground(200, 21, 19, 0, 255));
+        entities.insert(make_ground(300, 19, 19, 255, 255));
+        let mut occupancy = OccupancyGrid::new();
+        for &(id, rx, ry) in &[(100, 20, 20), (200, 21, 19), (300, 19, 19)] {
+            prepend_ground(&mut occupancy, rx, ry, id);
+        }
+        let mut terrain = crate::map::resolved_terrain::test_grid(48, 48, test_terrain_cell);
+        let mut interner = test_interner();
+        let _handles =
+            crate::sim::type_handle_table::ResolvedRuleHandles::resolve(&rules, &mut interner);
+        let warhead_ref = interner.intern("RINGWH");
+        let result = apply_aoe_damage(
+            &mut entities,
+            20,
+            20,
+            30,
+            &warhead,
+            &rules,
+            &mut interner,
+            (crate::sim::combat::RAD_NO_ATTACKER, warhead_ref),
+            native_lists(&occupancy, &mut terrain, None),
+        );
+        assert_eq!(hit_ids(&result.hits), vec![100, 300, 200]);
     }
 
     #[test]
@@ -2467,7 +3050,7 @@ mod tests {
     }
 
     #[test]
-    fn gsi_04_07_damage_pointer_expiry_is_cleanup_then_direct_forward_clear_first() {
+    fn wall_cleanup_preserves_neighbor_targets_until_an_explicit_outer_sweep() {
         let (rules, warhead, registry) =
             wall_aoe_fixture("0", "WallAbsoluteDestroyer=yes\nWall=yes");
         let mut entities = EntityStore::new();
@@ -2505,24 +3088,32 @@ mod tests {
             .set_for_test(Some(TargetKind::Cell(8, 7)));
         entities.insert(chain_only);
 
-        let mut interner = test_interner();
         let owner = crate::sim::intern::InternedId::from_index(7);
         let mut overlays = OverlayGrid::new(16, 16);
-        let mut terrain = crate::sim::tiberium::test_support::flat_terrain(16, 16);
+        let terrain = crate::sim::tiberium::test_support::flat_terrain(16, 16);
         overlays.place_overlay(8, 8, 2, 0);
         overlays.place_owned_wall(8, 7, 2, 0x24, owner);
-        let mut scenario_rng = SimRng::new(5);
-        let result = apply_aoe_damage(
-            &mut entities,
-            8,
-            8,
+        let mut world = crate::sim::world::Simulation::with_seed(5);
+        world.interner = test_interner();
+        world.substrate.entities = entities;
+        world.resolved_terrain = Some(terrain);
+        world.overlay_grid = Some(overlays);
+        let wh = world.interner.intern("WH");
+        let result = super::super::world_receiver::collect_area(
+            &mut world,
+            &rules,
+            Some(&registry),
+            (8, 8),
             1,
             &warhead,
-            &rules,
-            &mut interner,
-            "Americans",
-            wall_routing(&mut terrain, &mut overlays, &registry, &mut scenario_rng),
+            true,
+            (super::super::RAD_NO_ATTACKER, None, wh),
+            Some(center_impact(0)),
+            0,
+            crate::sim::world::FrameEffects::default(),
         );
+        let overlays = world.overlay_grid.as_ref().unwrap();
+        let entities = &world.substrate.entities;
 
         assert_eq!(overlays.cell(8, 8).overlay_id, None);
         assert_eq!(
@@ -2534,35 +3125,29 @@ mod tests {
             result.cell_target_detaches,
             vec![
                 CellTargetDetach {
-                    listener_id: 40,
+                    listener_id: 30,
                     restored: false,
-                    cleared: true,
+                    cleared: true
                 },
                 CellTargetDetach {
                     listener_id: 20,
                     restored: true,
-                    cleared: true,
-                },
-                CellTargetDetach {
-                    listener_id: 30,
-                    restored: false,
-                    cleared: true,
+                    cleared: true
                 },
             ],
-            "cleanup expiry precedes the direct callback; each roster walk is forward and clears before Restore"
+            "only the impact cell receives70D4A0, after recursion, in descending order"
         );
         assert!(entities.get(30).unwrap().attack_target.target().is_none());
         assert!(!entities.get(30).unwrap().passive_scan.acquired());
-        assert!(matches!(
-            entities.get(20).unwrap().attack_target.target(),
-            Some(TargetKind::Cell(8, 8))
-        ));
-        assert!(entities.get(40).unwrap().attack_target.target().is_none());
+        assert!(entities.get(20).unwrap().attack_target.target().is_none());
+        assert_eq!(
+            entities.get(40).unwrap().attack_target.target(),
+            Some(TargetKind::Cell(8, 7))
+        );
     }
 
-    /// Wall pointer expiry clears the Cell target before Restore asks the
-    /// shared6FCDB0 admission about its saved Object. Excluding Terrain from
-    /// AreaDamage's receiver list must not remove that Object from admission.
+    /// AreaDamage restores before conditionally clearing the Cell target.
+    /// Excluding Terrain receivers must not remove live Terrain from target admission.
     #[test]
     fn cell_expiry_restores_terrain_target_independently_of_damage_collection() {
         use crate::sim::combat::receiver_fixture::{FixturePolicy, FixtureTrace};
@@ -2661,10 +3246,16 @@ mod tests {
                 // transition. Terrain remains in its real owning store.
                 let type_ref = world.interner.intern("TREE01");
                 let mut tree = TerrainObjectState::for_test(100, type_ref, 9, 8);
-                tree.health = health;
-                tree.lifecycle = lifecycle;
-                world.production.terrain_objects.insert(100, tree);
-                world.production.terrain_object_cells.insert((9, 8), 100);
+                tree.set_health_for_test(health);
+                tree.set_lifecycle_for_test(lifecycle);
+                world
+                    .terrain_objects
+                    .objects_mut_for_test()
+                    .insert(100, tree);
+                world
+                    .terrain_objects
+                    .cell_index_mut_for_test()
+                    .insert((9, 8), 100);
             }
             let warhead_ref = world.interner.intern("WH");
             let result = super::super::world_receiver::collect_area(
@@ -2674,9 +3265,11 @@ mod tests {
                 (8, 8),
                 1,
                 &warhead,
+                true,
                 (super::super::RAD_NO_ATTACKER, None, warhead_ref),
                 Some(center_impact(0)),
                 0,
+                crate::sim::world::FrameEffects::default(),
             );
 
             assert_eq!(
@@ -2701,9 +3294,9 @@ mod tests {
                 vec![CellTargetDetach {
                     listener_id: 20,
                     restored: true,
-                    cleared: true,
+                    cleared: false,
                 }],
-                "{label}: clear first, then Restore regardless of target admission"
+                "{label}: Restore replaces the Cell target before the conditional clear"
             );
             assert_eq!(
                 result.receivers.iter().any(|receiver| matches!(
@@ -2763,7 +3356,7 @@ mod tests {
             for (above, expected) in [(208, ListLayer::Ground), (209, ListLayer::Bridge)] {
                 let (mut entities, occupancy, mut terrain, rules, warhead, mut interner) =
                     bridge_layer_test_fixture();
-                let cell = terrain.cell_mut(5, 5).unwrap();
+                let cell = terrain.cell_mut_for_test(5, 5).unwrap();
                 cell.level = level;
                 cell.slope_type = 1;
                 let z = floor + above;
@@ -2815,7 +3408,7 @@ mod tests {
                     self.visited = true;
                     terrain
                         .unwrap()
-                        .cell_mut(5, 5)
+                        .cell_mut_for_test(5, 5)
                         .unwrap()
                         .bridge_facts
                         .raw_flags = self.flags;
@@ -2825,7 +3418,11 @@ mod tests {
         for initial_bridge in [false, true] {
             let (mut entities, occupancy, mut terrain, rules, warhead, interner) =
                 bridge_layer_test_fixture();
-            terrain.cell_mut(5, 5).unwrap().bridge_facts.raw_flags = if initial_bridge {
+            terrain
+                .cell_mut_for_test(5, 5)
+                .unwrap()
+                .bridge_facts
+                .raw_flags = if initial_bridge {
                 BRIDGE_FLAG_STRUCTURAL
             } else {
                 0
@@ -2840,7 +3437,6 @@ mod tests {
             };
             let result = apply_aoe_damage_with_terrain_and_scenario(
                 &mut entities,
-                &BTreeMap::new(),
                 5,
                 5,
                 100,
@@ -2918,6 +3514,9 @@ mod tests {
         );
     }
 
+    // Stock house admission only. Ares replaces the ally gate with
+    // WarheadExt 10051B70 on the live attacker's owner (receiver_call.rs, with
+    // its own tests), where a same-owner target follows AffectsAllies.
     #[test]
     fn gsi_04_07_damage_receiver_pipeline_source_admission_and_house_snapshot() {
         fn run(
@@ -2933,12 +3532,13 @@ mod tests {
                  [VehicleTypes]\n0=SOURCE\n1=TARGET\n\
                  [AircraftTypes]\n\
                  [BuildingTypes]\n\
-                 [Warheads]\n0=OrdinaryWH\n1=CrushWH\n\
+                 [Warheads]\n0=OrdinaryWH\n1=CrushWH\n2=SelfWH\n\
                  [CombatDamage]\nCrushWarhead=CrushWH\nMaxDamage=10000\n\
                  [SOURCE]\nStrength=100\nArmor=heavy\nDamageSelf={}\n\
                  [TARGET]\nStrength=100\nArmor=heavy\n\
                  [OrdinaryWH]\nCellSpread=0\nAffectsAllies=no\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
-                 [CrushWH]\nCellSpread=0\nAffectsAllies=no\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
+                 [CrushWH]\nCellSpread=0\nAffectsAllies=no\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
+                 [SelfWH]\nCellSpread=0\nAffectsAllies=no\nAllowDamageOnSelf=yes\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
                 if damage_self { "yes" } else { "no" }
             ));
             let rules = RuleSet::from_ini(&ini).expect("receiver admission fixture");
@@ -3028,6 +3628,15 @@ mod tests {
         let (crush_ids, _, crush_hp) = run(false, "CrushWH");
         assert_eq!(crush_ids, vec![1, 2, 3]);
         assert_eq!(crush_hp, [60, 100, 60]);
+
+        // Phobos `Explosion_Damage_DamageSelf @ 0x004896EC` skips the source
+        // exclusion, so a DamageSelf=no source still collects its own hit.
+        #[cfg(feature = "phobos")]
+        {
+            let (allow_ids, _, allow_hp) = run(false, "SelfWH");
+            assert_eq!(allow_ids, vec![1, 2, 3]);
+            assert_eq!(allow_hp, [60, 100, 60]);
+        }
     }
 
     #[test]
@@ -3098,7 +3707,11 @@ mod tests {
                 "Immune remains an ordered receiver record, not a collector filter"
             );
 
-            let (death, pings) = ReceiverCommit::new().run(
+            let mut commit = ReceiverCommit {
+                sounds: Some(Vec::new()),
+                ..ReceiverCommit::new()
+            };
+            let (death, pings) = commit.run(
                 &aoe.hits,
                 &mut entities,
                 &mut occupancy,
@@ -3106,11 +3719,16 @@ mod tests {
                 &mut interner,
                 &mut terrain,
             );
-            (
-                entities.get(2).unwrap().health.current(),
-                pings.len(),
-                death,
-            )
+            assert!(pings.is_empty(), "building warnings are already submitted");
+            let warnings = commit
+                .sounds
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    matches!(event, crate::sim::world::SimSoundEvent::UnderAttack { .. })
+                })
+                .count();
+            (entities.get(2).unwrap().health.current(), warnings, death)
         }
 
         let (immune_hp, immune_pings, immune_death) = run(true);
@@ -3205,8 +3823,8 @@ mod tests {
 
         let mut commit = ReceiverCommit::new();
         let mut target_house = HouseState::new(american, 0, Some(american), true, 0, 10);
-        target_house.difficulty = HouseDifficulty::Normal;
-        commit.houses.insert(american, target_house);
+        target_house.set_difficulty_for_test(HouseDifficulty::Normal);
+        commit.houses.register(target_house);
         let (death, pings) = commit.run(
             &aoe.hits,
             &mut entities,
@@ -3247,8 +3865,22 @@ mod tests {
         let rules = RuleSet::from_ini(&ini).expect("stock-like Chaos gas fixture");
         let warhead = rules.warhead("PsychGasCreate").unwrap().clone();
         assert_eq!(rules.weapon("ChaosAttack").unwrap().damage, 600);
-        assert_eq!(warhead.verses_f64[5], 0.5);
-        assert_eq!(rules.warhead("PsychGas").unwrap().verses_f64[5], 0.5);
+        let armor = rules.object("TARGET").unwrap().armor_id();
+        assert_eq!(
+            f64::from_bits(warhead.interaction(armor).multiplier().bits()),
+            0.5
+        );
+        assert_eq!(
+            f64::from_bits(
+                rules
+                    .warhead("PsychGas")
+                    .unwrap()
+                    .interaction(armor)
+                    .multiplier()
+                    .bits()
+            ),
+            0.5
+        );
 
         let mut interner = test_interner();
         let yuri = interner.intern("YuriHouse");
@@ -3497,11 +4129,11 @@ mod tests {
 
         let mut commit = ReceiverCommit::new();
         let mut normal = HouseState::new(normal_house, 0, None, false, 0, 10);
-        normal.difficulty = HouseDifficulty::Normal;
-        commit.houses.insert(normal_house, normal);
+        normal.set_difficulty_for_test(HouseDifficulty::Normal);
+        commit.houses.register(normal);
         let mut easy = HouseState::new(easy_house, 0, None, false, 0, 10);
-        easy.difficulty = HouseDifficulty::Easy;
-        commit.houses.insert(easy_house, easy);
+        easy.set_difficulty_for_test(HouseDifficulty::Easy);
+        commit.houses.register(easy);
         let (death, _) = commit.run(
             &aoe.hits,
             &mut entities,
@@ -3682,13 +4314,18 @@ mod tests {
                 victim.navigation.set_nav_com_aux_for_test(Some(
                     crate::sim::components::NavTargetRef::cell(1, 1),
                 ));
-                victim.navigation.path_replay =
-                    FootPathQueue::for_test(vec![2, 3, 4, 5], 0, Some((9, 8)));
-                let path = &mut victim.navigation.path_runtime;
+                victim
+                    .navigation
+                    .set_path_replay_for_test(FootPathQueue::for_test(
+                        vec![2, 3, 4, 5],
+                        0,
+                        Some((9, 8)),
+                    ));
+                let path = victim.navigation.path_runtime_mut();
                 path.set_movement_timer_for_test(CdTimer::started(50, 5));
                 path.set_blocked_timer_for_test(CdTimer::started(40, 6));
-                path.set_path_blocked(true);
-                path.set_retries_left(7);
+                path.set_path_blocked_for_test(true);
+                path.set_retries_left_for_test(7);
                 let loco = victim.locomotor.as_mut().unwrap();
                 loco.set_powered_for_test(case["power_off"] != true);
                 if let Some(head) = case["head"].as_array() {
@@ -3749,19 +4386,23 @@ mod tests {
                 .flat_map(|ry| {
                     (0..10).map(move |rx| {
                         let mut cell = test_terrain_cell(rx, ry);
-                        cell.speed_costs.foot = Some(100);
+                        cell.speed_costs.foot = Some(crate::util::native_x87::NativeF32Bits::ONE);
                         cell
                     })
                 })
                 .collect();
             let mut terrain = ResolvedTerrainGrid::from_cells(10, 10, cells);
             if fixture.first_bridge {
-                terrain.cell_mut(6, 4).unwrap().bridge_facts.raw_flags = 0x100;
+                terrain
+                    .cell_mut_for_test(6, 4)
+                    .unwrap()
+                    .bridge_facts
+                    .raw_flags = 0x100;
             }
             if fixture.all_bridges {
                 for (dx, dy) in crate::util::direction::DIRECTION_DELTAS {
                     terrain
-                        .cell_mut((5 + dx) as u16, (5 + dy) as u16)
+                        .cell_mut_for_test((5 + dx) as u16, (5 + dy) as u16)
                         .unwrap()
                         .bridge_facts
                         .raw_flags = 0x100;
@@ -3779,17 +4420,19 @@ mod tests {
                 };
                 for cell in case["cells"].as_array().into_iter().flatten() {
                     let (x, y) = xy(cell);
-                    let out = terrain.cell_mut(x, y).unwrap();
+                    let out = terrain.cell_mut_for_test(x, y).unwrap();
                     out.level = cell[2].as_i64().unwrap() as u8;
                     out.bridge_facts.raw_flags = cell[3].as_u64().unwrap() as u32;
                 }
                 for cell in case["slopes"].as_array().into_iter().flatten() {
                     let (x, y) = xy(cell);
-                    terrain.cell_mut(x, y).unwrap().slope_type = cell[2].as_u64().unwrap() as u8;
+                    terrain.cell_mut_for_test(x, y).unwrap().slope_type =
+                        cell[2].as_u64().unwrap() as u8;
                 }
                 for cell in case["blocked_terrain"].as_array().into_iter().flatten() {
                     let (x, y) = xy(cell);
-                    terrain.cell_mut(x, y).unwrap().speed_costs.foot = Some(0);
+                    terrain.cell_mut_for_test(x, y).unwrap().speed_costs.foot =
+                        Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO);
                 }
                 for cell in case["raw"].as_array().into_iter().flatten() {
                     let (x, y) = xy(cell);
@@ -3825,27 +4468,29 @@ mod tests {
             world.substrate.raw_cell_occupation = raw;
             world.interner = interner;
             world.resolved_terrain = Some(terrain);
-            world.playfield_bounds = Some(
+            world.set_playfield_bounds_for_test(Some(
                 crate::sim::cell_rect::PlayfieldBounds::from_normalized_local_size(
                     16, -16, -16, 64, 64,
                 ),
-            );
+            ));
             if fixture.outside {
-                world.playfield_bounds = Some(
+                world.set_playfield_bounds_for_test(Some(
                     crate::sim::cell_rect::PlayfieldBounds::from_normalized_local_size(
                         16, 0, 0, 1, 1,
                     ),
-                );
+                ));
             }
-            world.session.binary_frame = 100;
+            world.session.set_binary_frame_for_test(100);
             world.main_rng = SimRng::new(7).into();
             world.scenario_rng = SimRng::new(1);
             // Some(false) models campaign PlayerControl without IsHuman.
-            world.session.game_mode_nonzero = false;
+            world.session.set_game_mode(
+                crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false),
+            );
             let mut house =
                 HouseState::new(victim_house, 0, None, human_control == Some(true), 0, 10);
-            house.player_control = human_control.is_some();
-            world.houses.insert(victim_house, house);
+            house.set_player_control_for_test(human_control.is_some());
+            world.houses.register(house);
             if team {
                 let script = world.interner.intern("ScatterFixture");
                 world
@@ -3886,7 +4531,7 @@ mod tests {
                 },
                 setter: {
                     let loco = victim.locomotor.as_ref().unwrap();
-                    let path = &victim.navigation.path_runtime;
+                    let path = victim.navigation.path_runtime();
                     let coord = |value: Option<crate::sim::components::DriveCoord>| {
                         value.map_or([0, 0, 0], |v| [v.x + 1280, v.y + 1280, v.z])
                     };
@@ -3899,8 +4544,8 @@ mod tests {
                     serde_json::json!({
                         "nav": nav, "aux": if victim.navigation.nav_com_aux().is_none() { 0 } else { 123 },
                         "destination": coord(loco.walk_destination()), "head": coord(loco.step_head()),
-                        "queue": victim.navigation.path_replay.directions().iter().map(|&v| if v == 255 { -1 } else { i32::from(v) }).collect::<Vec<_>>(),
-                        "reference": victim.navigation.path_replay.reference_cell(),
+                        "queue": victim.navigation.path_replay().directions().iter().map(|&v| if v == 255 { -1 } else { i32::from(v) }).collect::<Vec<_>>(),
+                        "reference": victim.navigation.path_replay().reference_cell(),
                         "queued_mission": victim.mission.queued().raw(),
                         "facing": u32::from(victim.body_facing.destination()) * 65537,
                         "moving": u8::from(loco.walk_is_moving().unwrap()), "powered": u8::from(loco.is_powered()),
@@ -4216,14 +4861,14 @@ mod tests {
         let mut air = GameEntity::test_default(10, "AIR", "Americans", 5, 5);
         air.set_category_for_test(EntityCategory::Aircraft);
         air.lifecycle.set_in_limbo_for_test(false);
-        air.lifecycle.set_cell_marked(true);
+        air.lifecycle.set_cell_marked_for_test(true);
         air.position.set_sub_x_for_test(CELL_CENTER_LEPTON);
         air.position.set_sub_y_for_test(CELL_CENTER_LEPTON);
         let mut air_locomotor = crate::sim::movement::locomotor::LocomotorState::from_object_type(
             rules.object("AIR").expect("air type"),
             0,
         );
-        air_locomotor.set_layer(MovementLayer::Air);
+        air_locomotor.set_layer_for_test(MovementLayer::Air);
         air.locomotor = Some(air_locomotor);
         air.position.set_exact_z_leptons_for_test(Some(1));
         air = air
@@ -4240,15 +4885,17 @@ mod tests {
         prepend_ground(&mut occupancy, 5, 5, 20);
         append_building(&mut occupancy, 5, 5, 30);
 
-        let mut terrain_objects = BTreeMap::new();
-        let mut terrain_cells = BTreeMap::new();
+        let mut terrain_objects = crate::sim::terrain_object::TerrainObjectStore::default();
         for (stable_id, rx) in [(100, 5), (101, 6), (102, 8)] {
-            terrain_objects.insert(stable_id, {
-                let mut terrain = TerrainObjectState::for_test(stable_id, tree_ref, rx, 5);
-                terrain.occupation_bits = 4;
-                terrain
-            });
-            terrain_cells.insert((rx, 5), stable_id);
+            terrain_objects.insert_constructed(
+                {
+                    let mut terrain = TerrainObjectState::for_test(stable_id, tree_ref, rx, 5);
+                    terrain.set_occupation_bits_for_test(4);
+                    terrain
+                },
+                false,
+            );
+            terrain_objects.add_to_cell(stable_id, (rx, 5));
         }
 
         let mut terrain = crate::map::resolved_terrain::test_grid(12, 12, test_terrain_cell);
@@ -4263,8 +4910,7 @@ mod tests {
             (crate::sim::combat::RAD_NO_ATTACKER, None, warhead_ref),
             native_lists(&occupancy, &mut terrain, Some(1)),
             Some(TerrainCollectionView {
-                objects: &terrain_objects,
-                cells: &terrain_cells,
+                store: &terrain_objects,
             }),
         );
 
@@ -4304,8 +4950,9 @@ mod tests {
                 adjacent.damage,
                 warhead.cell_spread_f64,
                 warhead.percent_at_max_f64,
-                &warhead.verses_f64,
-                super::super::damage::ArmorClass(super::super::armor_index("wood") as u8),
+                warhead
+                    .interaction(crate::rules::armor::ArmorId::WOOD)
+                    .multiplier(),
                 adjacent.distance_leptons,
                 false,
                 rules.combat_damage.max_damage,
@@ -4369,24 +5016,24 @@ mod tests {
         let terrain_ref = sim.interner.intern("TIBTREE");
         let terrain_state = {
             let mut terrain = TerrainObjectState::for_test(terrain_id, terrain_ref, 5, 5);
-            terrain.health = 10;
-            terrain.max_health = 10;
-            terrain.occupation_bits = 4;
+            terrain.set_health_for_test(10);
+            terrain.set_max_health_for_test(10);
+            terrain.set_occupation_bits_for_test(4);
             terrain
         };
-        sim.production
-            .terrain_objects
+        sim.terrain_objects
+            .objects_mut_for_test()
             .insert(terrain_id, terrain_state.clone());
-        sim.production
-            .terrain_object_cells
+        sim.terrain_objects
+            .cell_index_mut_for_test()
             .insert((5, 5), terrain_id);
-        sim.production
-            .tiberium_spawning_terrain_cells
+        sim.terrain_objects
+            .spawning_cells_mut_for_test()
             .insert((5, 5));
         crate::sim::terrain_object::mark_terrain_raw_occupation(
             &mut sim.substrate.raw_cell_occupation,
             (5, 5),
-            terrain_state.occupation_bits,
+            terrain_state.occupation_bits(),
         );
         sim.substrate.raw_cell_occupation.mark_ground(5, 5, 0x80);
         sim.substrate.raw_cell_occupation.mark_deck(5, 5, 0xA5);
@@ -4415,6 +5062,7 @@ mod tests {
             None,
             &[
                 AreaDamageReceiver::Terrain(TerrainDamageEvent {
+                    damage_writeback: None,
                     stable_id: terrain_id,
                     rx: 5,
                     ry: 5,
@@ -4448,20 +5096,18 @@ mod tests {
                 .is_none(),
             "nested and parent null-source events do not fabricate an attacker"
         );
-        let destroyed = &sim.production.terrain_objects[&terrain_id];
-        assert_eq!(destroyed.health, 0);
-        assert_eq!(destroyed.lifecycle, TerrainObjectLifecycle::Destroyed);
-        assert!(!sim.production.terrain_object_cells.contains_key(&(5, 5)));
+        let destroyed = &sim.terrain_objects.objects()[&terrain_id];
+        assert_eq!(destroyed.health(), 0);
+        assert_eq!(destroyed.lifecycle(), TerrainObjectLifecycle::Destroyed);
+        assert!(!sim.terrain_objects.cell_index().contains_key(&(5, 5)));
         assert!(
-            !sim.production
-                .tiberium_spawning_terrain_cells
-                .contains(&(5, 5)),
+            !sim.terrain_objects.spawning_cells().contains(&(5, 5)),
             "the outer Terrain finalizes once after the Wood-enabled C4 re-entry is guarded"
         );
         assert_eq!(
             sim.substrate.raw_cell_occupation.ground_bits(5, 5)
                 & crate::sim::terrain_object::terrain_raw_occupation_mask(
-                    terrain_state.occupation_bits
+                    terrain_state.occupation_bits()
                 ),
             0,
             "Terrain-specific raw occupation clears even though the live Techno remains"
@@ -4515,20 +5161,22 @@ mod tests {
 
         let terrain_id = 901;
         let terrain_ref = sim.interner.intern("TIBTREE");
-        sim.production.terrain_objects.insert(terrain_id, {
-            let mut terrain = TerrainObjectState::for_test(terrain_id, terrain_ref, 5, 5);
-            terrain.health = 10;
-            terrain.max_health = 10;
-            terrain.occupation_bits = 4;
-            terrain
-        });
-        sim.production
-            .terrain_object_cells
+        sim.terrain_objects
+            .objects_mut_for_test()
+            .insert(terrain_id, {
+                let mut terrain = TerrainObjectState::for_test(terrain_id, terrain_ref, 5, 5);
+                terrain.set_health_for_test(10);
+                terrain.set_max_health_for_test(10);
+                terrain.set_occupation_bits_for_test(4);
+                terrain
+            });
+        sim.terrain_objects
+            .cell_index_mut_for_test()
             .insert((5, 5), terrain_id);
-        sim.production
-            .tiberium_spawning_terrain_cells
+        sim.terrain_objects
+            .spawning_cells_mut_for_test()
             .insert((5, 5));
-        sim.session.no_damage = true;
+        sim.session.set_no_damage_for_test(true);
         let outer_ref = sim.interner.intern("OUTERWH");
         let before_hash = sim.state_hash();
         let before_rng = sim.scenario_rng.state();
@@ -4550,6 +5198,7 @@ mod tests {
                     },
                 )),
                 AreaDamageReceiver::Terrain(TerrainDamageEvent {
+                    damage_writeback: None,
                     stable_id: terrain_id,
                     rx: 5,
                     ry: 5,
@@ -4571,10 +5220,10 @@ mod tests {
                 .current(),
             1000
         );
-        let terrain = &sim.production.terrain_objects[&terrain_id];
-        assert_eq!(terrain.health, 10);
-        assert_eq!(terrain.lifecycle, TerrainObjectLifecycle::Live);
-        assert_eq!(sim.production.terrain_object_cells[&(5, 5)], terrain_id);
+        let terrain = &sim.terrain_objects.objects()[&terrain_id];
+        assert_eq!(terrain.health(), 10);
+        assert_eq!(terrain.lifecycle(), TerrainObjectLifecycle::Live);
+        assert_eq!(sim.terrain_objects.cell_index()[&(5, 5)], terrain_id);
         assert_eq!(sim.scenario_rng.state(), before_rng);
         assert_eq!(sim.state_hash(), before_hash);
     }

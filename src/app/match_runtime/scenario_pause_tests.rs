@@ -10,7 +10,7 @@ fn original_pause_histories_pin_overflow_rearm_nesting_and_world_branch() {
     for row in controls["controls"].as_array().unwrap() {
         let mode = SessionMode::from_game_mode(row["mode"].as_i64().unwrap() as i32);
         let mut sim = crate::sim::world::Simulation::with_seed(0);
-        sim.session.set_input_locked(true);
+        sim.session_mut_for_test().set_input_locked_for_test(true);
         let mut clock = ScenarioPauseClock::default();
         for step in row["steps"].as_array().unwrap() {
             let ms = step["bucket"].as_u64().unwrap() * 16;
@@ -20,15 +20,15 @@ fn original_pause_histories_pin_overflow_rearm_nesting_and_world_branch() {
                 "enter" => {
                     let value = step["value"].as_i64().unwrap() as i32;
                     clock.rearm(value, ms);
-                    sim.pause_scenario(value)
+                    sim.pause_scenario_for_test(value)
                 }
                 "exit" => sim.resume_scenario(),
                 "poll"
                     if matches!(mode, SessionMode::Campaign | SessionMode::Skirmish)
                         && clock.elapsed(ms)
-                        && sim.session.scenario_pause_timed() =>
+                        && sim.session().scenario_pause_timed() =>
                 {
-                    sim.expire_scenario_pause()
+                    sim.expire_scenario_pause_for_test()
                 }
                 "poll" => Vec::new(),
                 _ => unreachable!(),
@@ -50,10 +50,12 @@ fn original_pause_histories_pin_overflow_rearm_nesting_and_world_branch() {
                     startup_admitted: true,
                     frame_stepping: false,
                     paused: false,
-                    scenario_paused: sim.session.scenario_paused(),
+                    scenario_paused: sim.session().scenario_paused(),
                     menu_open: false,
                     session_mode: mode,
                     pacer_timing_admits: true,
+                    network_wait: false,
+                    network_dialog_open: false,
                 });
                 events.push(if decision.run_sim {
                     "world_branch"
@@ -61,18 +63,18 @@ fn original_pause_histories_pin_overflow_rearm_nesting_and_world_branch() {
                     "paused_branch"
                 });
                 if matches!(mode, SessionMode::Campaign | SessionMode::Skirmish)
-                    && sim.session.scenario_paused()
+                    && sim.session().scenario_paused()
                 {
                     assert!(
-                        !decision.scroll_input,
+                        !decision.scroll_input && !decision.camera_scroll,
                         "native pause bypasses55D8AB input poll"
                     );
                 }
             }
-            let words = serde_json::to_value(&sim.session).unwrap();
+            let words = serde_json::to_value(sim.session()).unwrap();
             assert_eq!(words["scenario_pause"]["depth"], step["depth"], "{step}");
             assert_eq!(
-                u64::from(sim.session.scenario_pause_timed()),
+                u64::from(sim.session().scenario_pause_timed()),
                 step["timed"].as_u64().unwrap(),
                 "{step}"
             );
@@ -94,24 +96,24 @@ fn original_pause_histories_pin_overflow_rearm_nesting_and_world_branch() {
 #[test]
 fn saved_timed_hold_rearms_zero_without_losing_an_untimed_hold() {
     let mut sim = crate::sim::world::Simulation::with_seed(0);
-    sim.pause_scenario(0);
-    sim.pause_scenario(120);
+    sim.pause_scenario_for_test(0);
+    sim.pause_scenario_for_test(120);
     let bytes = crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "", 0);
     let mut restored = crate::sim::snapshot::GameSnapshot::load(&bytes)
         .unwrap()
         .sim;
     restored.restore_after_snapshot_load().unwrap();
-    assert!(restored.session.scenario_paused());
-    assert!(restored.session.scenario_pause_timed());
+    assert!(restored.session().scenario_paused());
+    assert!(restored.session().scenario_pause_timed());
     let clock = ScenarioPauseClock::after_load(999_000); // PostRead starts now, duration0.
     assert!(clock.elapsed(999_000));
-    assert!(restored.expire_scenario_pause().is_empty());
-    assert!(restored.session.scenario_paused());
-    assert!(!restored.session.scenario_pause_timed());
+    assert!(restored.expire_scenario_pause_for_test().is_empty());
+    assert!(restored.session().scenario_paused());
+    assert!(!restored.session().scenario_pause_timed());
     assert!(
         restored
             .resume_scenario()
             .contains(&TriggerEffect::ScenarioResume)
     );
-    assert!(!restored.session.scenario_paused());
+    assert!(!restored.session().scenario_paused());
 }

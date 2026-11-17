@@ -19,13 +19,14 @@ use crate::sim::world::Simulation;
 
 fn gsi_04_12_terrain(width: u16, height: u16) -> ResolvedTerrainGrid {
     let speed_costs = SpeedCostProfile {
-        foot: Some(100),
-        track: Some(100),
-        wheel: Some(100),
-        float: Some(100),
-        amphibious: Some(100),
-        float_beach: Some(100),
-        hover: Some(100),
+        foot: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        track: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        float: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        amphibious: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        float_beach: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        hover: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
     };
     let cells = (0..height)
         .flat_map(|ry| {
@@ -170,13 +171,13 @@ fn caller_count_bridge_detour(
             path.set_blocked(x, y, !open);
             if open {
                 path.set_cell_for_test(x, y, 4, false, false);
-                terrain.cell_mut(x, y).unwrap().level = 4;
+                terrain.cell_mut_for_test(x, y).unwrap().level = 4;
             }
         }
     }
     for x in 2..=4 {
         path.set_cell_for_test(x, 2, 0, true, true);
-        let cell = terrain.cell_mut(x, 2).unwrap();
+        let cell = terrain.cell_mut_for_test(x, 2).unwrap();
         cell.level = 0;
         // Keep the native Cell flags consistent with PathCell.transition.
         // Foot4D9C60 requires raw200 for both the height4 -> deck entry and
@@ -342,13 +343,13 @@ fn gsi_04_12_interaction_order_entry_threads_exact_blocker_counts() {
     let mut sim = Simulation::new();
     // Explicit fixture Map Size=(6,4), separate from the generous LocalSize
     // bounds. Foot's production precheck consumes both header dimensions.
-    sim.playfield_bounds = Some(PlayfieldBounds {
+    sim.set_playfield_bounds_for_test(Some(PlayfieldBounds {
         base: 6,
         ..rectangular_spawn_bounds(6)
-    });
-    sim.playfield_size_height = Some(4);
+    }));
+    sim.set_playfield_size_height_for_test(Some(4));
     sim.install_resolved_terrain_for_new_map(terrain);
-    sim.zone_grid = Some(zone_grid);
+    sim.zone_grid = Some(zone_grid.into());
     let engineer_id = sim
         .spawn_object("ENGINEER", "Americans", 1, 0, 0, &rules)
         .expect("engineer should spawn");
@@ -384,7 +385,7 @@ fn gsi_04_12_interaction_order_entry_threads_exact_blocker_counts() {
     assert!(
         engineer
             .navigation
-            .path_replay
+            .path_replay()
             .remaining_directions()
             .is_empty(),
         "Walk searches during Process, after order admission"
@@ -398,7 +399,7 @@ fn gsi_04_12_interaction_order_entry_threads_exact_blocker_counts() {
     // The direct Process seam omits Object/Techno AI. Run the production
     // Ready -> Commence checkpoint first: Infantry51C300 reads CURRENT
     // mission when admitting the Building NavCom, not its queued Capture.
-    sim.mission_host_promote(engineer_id, sim.session.binary_frame, &rules);
+    sim.mission_host_promote(engineer_id, sim.session.binary_frame(), &rules);
     assert_eq!(
         sim.substrate
             .entities
@@ -490,7 +491,7 @@ fn gsi_04_12_interaction_order_entry_threads_exact_blocker_counts() {
     // boundary. This Rust route check does not claim full native AStar parity.
     // The installed Foot+5E0 route runs from the start Cell to the building
     // Cell; its words carry no layer.
-    let route = &engineer.navigation.path_replay;
+    let route = engineer.navigation.path_replay();
     assert_eq!(route.reference_cell(), Some((1, 0)));
     assert_eq!(
         route
@@ -538,7 +539,7 @@ fn tube_hierarchy_gate_uses_raw_invalid_labels_and_goal_bridge_flag() {
     {
         let base = zones.base_topology_mut();
         base.zone_ids = vec![2, 3, 2, 3];
-        base.raw_zone_ids_by_row[row] = vec![0, 0, 1, u16::MAX];
+        base.raw_zone_ids_by_row[row] = vec![0, 0, 1, (u16::MAX as ZoneId)];
     }
     {
         let map = zones.map_mut(MovementZone::Normal).unwrap();
@@ -570,7 +571,7 @@ fn tube_hierarchy_gate_uses_raw_invalid_labels_and_goal_bridge_flag() {
     );
     assert_eq!(
         zones.get_zone_id_native(&terrain, (1, 0), MovementZone::Normal, false),
-        Some(u32::from(u16::MAX))
+        Some(u32::from(u16::MAX as ZoneId))
     );
     assert_eq!(
         zones
@@ -599,11 +600,11 @@ fn tube_hierarchy_gate_uses_raw_invalid_labels_and_goal_bridge_flag() {
     zones
         .map_mut(MovementZone::Normal)
         .unwrap()
-        .set_bridge_redirect(Some(vec![None, Some((0, 0)), None, None]));
+        .set_bridge_redirect(Some(vec![None, Some((0, 0)), None, None].into()));
     zones.set_hierarchy(level0_hierarchy(vec![1; 4], 2, 2, &[]));
-    terrain.cell_mut(0, 0).unwrap().level = 4;
+    terrain.cell_mut_for_test(0, 0).unwrap().level = 4;
     {
-        let cell = terrain.cell_mut(1, 0).unwrap();
+        let cell = terrain.cell_mut_for_test(1, 0).unwrap();
         cell.bridge_facts.raw_flags = BRIDGE_FLAG_STRUCTURAL;
         cell.has_bridge_deck = true;
         cell.bridge_walkable = true;
@@ -619,7 +620,11 @@ fn tube_hierarchy_gate_uses_raw_invalid_labels_and_goal_bridge_flag() {
         expected_admission(2, 2),
         "goal Flags0x100 must select the redirected raw zone"
     );
-    terrain.cell_mut(1, 0).unwrap().bridge_facts.raw_flags = 0;
+    terrain
+        .cell_mut_for_test(1, 0)
+        .unwrap()
+        .bridge_facts
+        .raw_flags = 0;
     assert_eq!(
         route(&zones, &terrain).is_some(),
         expected_admission(2, 3),
@@ -650,7 +655,7 @@ fn tube_hierarchy_dword_zone_query_matches_original_executable() {
         terrain.test_set_high_bridge_set_starts(Some(100), Some(200));
         for entry in &extras {
             let c = coord(&entry[0]);
-            let cell = terrain.cell_mut(c.0, c.1).unwrap();
+            let cell = terrain.cell_mut_for_test(c.0, c.1).unwrap();
             cell.final_tile_index = entry[1].as_i64().unwrap() as i32;
             cell.land_type = entry[2].as_u64().unwrap() as u8;
             cell.bridge_facts.raw_flags = entry[3].as_u64().unwrap() as u32;
@@ -660,7 +665,7 @@ fn tube_hierarchy_dword_zone_query_matches_original_executable() {
         dummy.stamp_coord(1234, -2345);
         if real {
             terrain
-                .cell_mut(canonical.0, canonical.1)
+                .cell_mut_for_test(canonical.0, canonical.1)
                 .unwrap()
                 .bridge_facts
                 .raw_flags = flags;
@@ -707,7 +712,7 @@ fn tube_hierarchy_dword_zone_query_matches_original_executable() {
                 }
             }
             base.raw_zone_ids_by_row[MovementZone::Normal.matrix_row().unwrap()] =
-                vec![0, case["raw"].as_u64().unwrap() as u16, 3];
+                vec![0, case["raw"].as_u64().unwrap() as ZoneId, 3];
         }
         dummy.stamp_coord(1234, -2345);
         assert_eq!(
@@ -748,7 +753,7 @@ fn tube_hierarchy_native_entry_prefix_matches_original_executable() {
         terrain.test_set_high_bridge_set_starts(Some(100), Some(200));
         for row in rows {
             let c = coord(&row[0]);
-            let cell = terrain.cell_mut(c.0, c.1).unwrap();
+            let cell = terrain.cell_mut_for_test(c.0, c.1).unwrap();
             cell.bridge_facts.raw_flags = row[1].as_u64().unwrap() as u32;
             cell.final_tile_index = row[2].as_i64().unwrap() as i32;
             cell.land_type = row[3].as_u64().unwrap() as u8;

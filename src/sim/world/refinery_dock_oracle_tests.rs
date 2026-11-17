@@ -28,7 +28,7 @@ use crate::rules::ruleset::RuleSet;
 use crate::sim::bridge_state::BridgeRuntimeState;
 use crate::sim::components::NavTargetRef;
 use crate::sim::miner::{CargoBale, MinerState, ResourceType};
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::movement::FacingClass;
 use crate::sim::overlay_grid::OverlayGrid;
@@ -49,9 +49,9 @@ pub(super) const RULES: &str = "[VehicleTypes]\n0=HARV\n1=MTNK\n\
     NumberImpassableRows=3\n\
     [GAREFX]\nStrength=900\nRefinery=yes\nNumberOfDocks=1\nNumberImpassableRows=3\n\
     [GAOREP]\nStrength=1000\nOrePurifier=yes\n\
-    [Tiberiums]\n0=Riparius\n1=Cruentus\n\
+    [Tiberiums]\n0=Riparius\n1=Cruentus\n2=Vinifera\n3=Aboreus\n\
     [Riparius]\nImage=1\nValue=25\n[Cruentus]\nImage=2\nValue=50\n\
-    [General]\nHarvesterTooFarDistance=5\nChronoHarvTooFarDistance=50\n\
+    [Vinifera]\nImage=3\nValue=25\n[Aboreus]\nImage=4\nValue=25\n[General]\nHarvesterTooFarDistance=5\nChronoHarvTooFarDistance=50\n\
     PurifierBonus=.25\nAIVirtualPurifiers=4,2,0\n\
     [AudioVisual]\nConditionYellow=50%\n\
     [Guard]\nRate=.030\n[Enter]\nRate=.016\n[Harvest]\nRate=.016\n[Unload]\nRate=.016\n";
@@ -61,6 +61,211 @@ const OTHER_NW: (u16, u16) = (20, 20);
 
 fn corpus() -> &'static Value {
     crate::test_fixture::json("tools/spatial_oracle/refinery_dock.json")
+}
+
+/// Native income rows supply raw Rules/cargo priors; the surrounding world,
+/// House, typed country/resource readers, construction and dispatch stay real.
+// Ares replaces the stock payment (DepositTiberium 10044230, hooks
+// 0x73E4A2/0x522D75): no score (`sim::ares_tiberium_storage` tests).
+fn income_scene(row: &Value) -> Scene {
+    use crate::util::native_x87::NativeF32Bits;
+    let input = &row["input"];
+    let mut setup = corpus()["mission_unload"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["input"]["name"] == "unload_gate_ore")
+        .unwrap()["input"]
+        .clone();
+    let income_bits = u32::from_str_radix(input["income_bits"].as_str().unwrap(), 16).unwrap();
+    let income = f32::from_bits(income_bits);
+    setup["income_mult"] = serde_json::json!(f64::from(income));
+    setup["human"] = false.into();
+    setup["balance"] = input["balance"].clone();
+    setup["stage"][0] = 123.into();
+    let mut storage = [0; 4];
+    if let Some(slot) = input["slot"].as_u64() {
+        storage[slot as usize] = input["bales"].as_i64().unwrap() as i32;
+    }
+    setup["storage"] = serde_json::json!(storage);
+    let mut text = String::from(RULES);
+    text.push_str(&format!(
+        "[Countries]\n0=Americans\n[Americans]\nIncomeMult={income}\n\
+         [InfantryTypes]\n0=SLAV\n[SLAV]\nStrength=125\nSpeed=4\nStorage=40\n\
+         Locomotor={{4A582744-9839-11D1-B709-00A024DDAFD1}}\n"
+    ));
+    for land in crate::rules::terrain_rules::LandType::ALL.iter().take(9) {
+        text.push_str(&format!(
+            "[{}]\nFoot=100%\nTrack=100%\nWheel=100%\nBuildable=yes\n",
+            land.section_name()
+        ));
+    }
+    let mut ini = crate::rules::tiberium_type::with_tiberium_image_slots(&IniFile::from_str(&text));
+    for (slot, name) in ["Riparius", "Cruentus", "Vinifera", "Aboreus"]
+        .iter()
+        .enumerate()
+    {
+        ini.merge(&IniFile::from_str(&format!(
+            "[{name}]\nValue={}\n",
+            input["values"][slot]
+        )));
+    }
+    let art = IniFile::from_str(
+        "[GAREFN]\nFoundation=4x3\nQueueingCell=4,1\n[GAREFX]\nFoundation=4x3\nQueueingCell=4,1\n[GAOREP]\nFoundation=2x2\n",
+    );
+    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
+    rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
+    assert_eq!(rules.country_income_mult("Americans").bits(), income_bits);
+    rules.general.purifier_bonus = NativeF32Bits::from_bits(
+        u32::from_str_radix(input["purifier_bits"].as_str().unwrap(), 16).unwrap(),
+    );
+    // The native interior begins after count selection. Use the real AI
+    // virtual-count owner to supply that same signed prior, with no plants.
+    rules.general.ai_virtual_purifiers = [input["effective_purifiers"].as_i64().unwrap() as i32; 3];
+    let mut scene = scene_with(&setup, rules, &ini);
+    let owner = scene.sim.interner.get("Americans").unwrap();
+    let wallet = scene.sim.houses.get_mut(&owner).unwrap().economy_mut();
+    wallet.set_score_for_test(input["score"].as_i64().unwrap() as i32);
+    wallet.set_spent_for_test(7);
+    // Cached pickup values deliberately disagree. Native payment must read
+    // the live signed32 Tiberium type, including negative/large Values.
+    let miner = scene
+        .sim
+        .substrate
+        .entities
+        .get_mut(scene.miner)
+        .unwrap()
+        .miner
+        .as_mut()
+        .unwrap();
+    let mut cargo = miner.cargo().to_vec();
+    for bale in &mut cargo {
+        bale.value = 1;
+    }
+    miner.set_cargo_for_test(cargo);
+    scene
+}
+
+// Ares replaces the stock payment (DepositTiberium 10044230, hooks
+// 0x73E4A2/0x522D75): no score (`sim::ares_tiberium_storage` tests).
+#[test]
+fn native_income_controls_reach_unit_and_slave_payment_callers() {
+    let native = crate::test_fixture::json("tools/spatial_oracle/refinery_income.json");
+    let rows = native["unit_rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 258);
+    for row in rows {
+        for slave in [false, true] {
+            let mut scene = income_scene(row);
+            if slave {
+                let id = scene
+                    .sim
+                    .spawn_object("SLAV", "Americans", 14, 14, 0, &scene.rules)
+                    .unwrap();
+                let cargo = scene
+                    .sim
+                    .substrate
+                    .entities
+                    .get(scene.miner)
+                    .unwrap()
+                    .miner
+                    .as_ref()
+                    .unwrap()
+                    .cargo()
+                    .to_vec();
+                scene.sim.substrate.entities.get_mut(id).unwrap().slave =
+                    crate::sim::slave_manager::SlaveLink::for_test(Some(scene.refinery), cargo);
+                scene.sim.slave_deposit(id, scene.refinery, &scene.rules);
+                assert!(
+                    scene
+                        .sim
+                        .entities()
+                        .get(id)
+                        .unwrap()
+                        .slave
+                        .cargo()
+                        .is_empty()
+                );
+            } else {
+                crate::sim::miner::mission_unload(
+                    &mut scene.sim,
+                    &scene.rules,
+                    scene.miner,
+                    super::FrameEffects::default(),
+                );
+                let entity = scene.sim.entities().get(scene.miner).unwrap();
+                assert!(entity.miner.as_ref().unwrap().cargo().is_empty());
+                assert_eq!(
+                    i64::from(entity.native_stage().value()),
+                    row["output"]["stage"].as_i64().unwrap()
+                );
+            }
+            let owner = scene.sim.interner.get("Americans").unwrap();
+            let wallet = scene.sim.houses[&owner].economy();
+            assert_eq!(
+                (
+                    i64::from(wallet.credits()),
+                    i64::from(wallet.score()),
+                    i64::from(wallet.spent_credits())
+                ),
+                (
+                    row["output"]["balance"].as_i64().unwrap(),
+                    row["output"]["score"].as_i64().unwrap(),
+                    row["output"]["spent"].as_i64().unwrap()
+                ),
+                "{} slave={slave}",
+                row["input"]["name"]
+            );
+        }
+    }
+}
+
+// Ares replaces the stock payment (DepositTiberium 10044230, hooks
+// 0x73E4A2/0x522D75): no score (`sim::ares_tiberium_storage` tests).
+#[test]
+fn virtual_purifier_wrap_and_saved_payment_use_native_inputs() {
+    let native = crate::test_fixture::json("tools/spatial_oracle/refinery_income.json");
+    let row = native["unit_rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["input"]["bales"] == 7 && row["input"]["effective_purifiers"] == i32::MIN)
+        .unwrap();
+    let mut scene = income_scene(row);
+    scene
+        .sim
+        .spawn_object("GAOREP", "Americans", 24, 24, 0, &scene.rules)
+        .unwrap();
+    scene.rules.general.ai_virtual_purifiers = [i32::MAX; 3];
+    assert_eq!(
+        crate::sim::miner::miner_system::effective_purifier_count(
+            &scene.sim,
+            &scene.rules,
+            "Americans"
+        ),
+        i32::MIN
+    );
+    let bytes = crate::sim::snapshot::GameSnapshot::save(&scene.sim, 0, 0, "native-income", 0);
+    let mut restored = crate::sim::snapshot::GameSnapshot::load(&bytes)
+        .unwrap()
+        .sim;
+    restored.restore_after_snapshot_load().unwrap();
+    let slot =
+        crate::rules::tiberium_type::TiberiumTypeId(row["input"]["slot"].as_u64().unwrap() as u8);
+    let bales = row["input"]["bales"].as_i64().unwrap() as i32;
+    for sim in [&mut scene.sim, &mut restored] {
+        crate::sim::miner::pay_refinery_owner(sim, &scene.rules, scene.refinery, slot, bales);
+        let owner = sim.interner.get("Americans").unwrap();
+        assert_eq!(
+            (
+                i64::from(sim.houses[&owner].economy().credits()),
+                i64::from(sim.houses[&owner].economy().score())
+            ),
+            (
+                row["output"]["balance"].as_i64().unwrap(),
+                row["output"]["score"].as_i64().unwrap()
+            )
+        );
+    }
 }
 
 pub(super) struct Scene {
@@ -135,7 +340,7 @@ pub(super) fn world_with(
         .speed_costs;
     for y in 0..33 {
         for x in 0..33 {
-            let c = terrain.cell_mut(x, y).unwrap();
+            let c = terrain.cell_mut_for_test(x, y).unwrap();
             c.speed_costs = costs;
             c.base_speed_costs = costs;
         }
@@ -161,11 +366,11 @@ pub(super) fn world_with(
     sim.resolve_type_handles(rules);
     sim.playfield_bounds = Some(bounds);
     sim.playfield_size_height = Some(32);
-    sim.session.map_width = 33;
-    sim.session.map_height = 33;
+    sim.session.set_map_width_for_test(33);
+    sim.session.set_map_height_for_test(33);
     sim.overlay_grid = Some(OverlayGrid::new(33, 33));
     sim.bridge_state = Some(bridges);
-    sim.zone_grid = Some(zones);
+    sim.zone_grid = Some(zones.into());
     sim.path_grid = Some(Arc::new(path));
     sim.install_resolved_terrain_for_new_map(terrain);
     sim
@@ -207,7 +412,7 @@ pub(super) fn scene(input: &Value) -> Scene {
             "[Countries]\n0=Americans\n[Americans]\nIncomeMult={mult}\n"
         ));
     }
-    let ini = IniFile::from_str(&text);
+    let ini = crate::rules::tiberium_type::with_tiberium_image_slots(&IniFile::from_str(&text));
     let art = IniFile::from_str(
         "[GAREFN]\nFoundation=4x3\nQueueingCell=4,1\n[GAREFX]\nFoundation=4x3\nQueueingCell=4,1\n[GAOREP]\nFoundation=2x2\n",
     );
@@ -221,22 +426,27 @@ pub(super) fn scene_with(input: &Value, rules: RuleSet, ini: &IniFile) -> Scene 
     let mut sim = world(&rules, ini);
     let owner = sim.interner.intern("Americans");
     let mut house = crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10);
-    house.is_human = input["human"].as_bool().unwrap_or(true);
-    house.player_control = house.is_human;
-    house.difficulty = match input["difficulty"].as_u64().unwrap_or(0) {
+    house.set_is_human_for_test(input["human"].as_bool().unwrap_or(true));
+    house.set_player_control_for_test(house.is_human());
+    house.set_difficulty_for_test(match input["difficulty"].as_u64().unwrap_or(0) {
         0 => crate::sim::house_state::HouseDifficulty::Hard,
         1 => crate::sim::house_state::HouseDifficulty::Normal,
         _ => crate::sim::house_state::HouseDifficulty::Easy,
-    };
+    });
     house
-        .economy
+        .economy_mut()
         .set_credits_for_test(input["balance"].as_i64().unwrap_or(0) as i32);
     if input["income_mult"].is_number() {
-        house.country = Some(owner);
+        house.set_country_for_test(Some(owner));
     }
-    sim.houses.insert(owner, house);
-    sim.session.game_mode_nonzero = input["game_mode"].as_u64().unwrap_or(1) != 0;
-    sim.session.binary_frame = input["frame"].as_u64().unwrap_or(200) as u32;
+    sim.houses.register(house);
+    sim.session.set_game_mode(
+        crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+            input["game_mode"].as_u64().unwrap_or(1) != 0,
+        ),
+    );
+    sim.session
+        .set_binary_frame_for_test(input["frame"].as_u64().unwrap_or(200) as u32);
     let dock_type = if input["dock_unload"] == false {
         "GAREFX"
     } else {
@@ -269,10 +479,10 @@ pub(super) fn scene_with(input: &Value, rules: RuleSet, ini: &IniFile) -> Scene 
             .resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(spawn_x, spawn_y)
+            .cell_mut_for_test(spawn_x, spawn_y)
             .unwrap();
         let prior = cell.speed_costs;
-        cell.speed_costs.wheel = Some(100);
+        cell.speed_costs.wheel = Some(crate::util::native_x87::NativeF32Bits::ONE);
         prior
     };
     let miner = sim
@@ -281,7 +491,7 @@ pub(super) fn scene_with(input: &Value, rules: RuleSet, ini: &IniFile) -> Scene 
     sim.resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(spawn_x, spawn_y)
+        .cell_mut_for_test(spawn_x, spawn_y)
         .unwrap()
         .speed_costs = spawn_speed_costs;
     if relocate {
@@ -316,11 +526,12 @@ pub(super) fn scene_with(input: &Value, rules: RuleSet, ini: &IniFile) -> Scene 
 
 /// Apply the row's prestate to the spawned objects.
 fn dress(mut s: Scene, input: &Value) -> Scene {
-    let frame = s.sim.session.binary_frame;
+    let frame = s.sim.session.binary_frame();
     let (miner, refinery, other) = (s.miner, s.refinery, s.other);
     // Missions, as the oracle writes +AC/+B4.
     let current = mission(input["mission"].as_str().unwrap_or("enter"));
     s.sim
+        .substrate
         .mission_assign_exact(miner, MissionId::from_known(current), frame)
         .unwrap();
     if let Some(queued) = input["queued"].as_str() {
@@ -330,13 +541,16 @@ fn dress(mut s: Scene, input: &Value) -> Scene {
                 MissionId::from_known(mission(queued)),
                 0,
                 frame,
-                &EntityReadyInputProvider,
+                &LiveReadyInputProvider {
+                    rules: crate::rules::ruleset::RuleSet::empty_for_test(),
+                },
             )
             .unwrap();
     }
     let status = input["status"].as_u64().unwrap_or(0) as u32;
     let building_mission = mission(input["refinery_mission"].as_str().unwrap_or("guard"));
     s.sim
+        .substrate
         .mission_assign_exact(refinery, MissionId::from_known(building_mission), frame)
         .unwrap();
     // Contacts: linked both ways unless the row names the holders.
@@ -433,24 +647,27 @@ fn dress(mut s: Scene, input: &Value) -> Scene {
         if let Some(miner_state) = entity.miner.as_mut() {
             miner_state.set_unload_active_for_test(input["unloading"] == true);
             if let Some(storage) = input["storage"].as_array() {
-                let ore = storage[0].as_f64().unwrap() as usize;
-                let gems = storage[1].as_f64().unwrap() as usize;
                 miner_state.set_cargo_for_test(
-                    std::iter::repeat_n(
-                        CargoBale {
-                            resource_type: ResourceType::Ore,
-                            value: 25,
-                        },
-                        ore,
-                    )
-                    .chain(std::iter::repeat_n(
-                        CargoBale {
-                            resource_type: ResourceType::Gem,
-                            value: 50,
-                        },
-                        gems,
-                    ))
-                    .collect(),
+                    storage
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(slot, amount)| {
+                            let tiberium_type =
+                                crate::rules::tiberium_type::TiberiumTypeId(slot as u8);
+                            let ty = s.rules.tiberium_types.get(tiberium_type).unwrap();
+                            std::iter::repeat_n(
+                                CargoBale {
+                                    tiberium_type,
+                                    resource_type:
+                                        crate::sim::tiberium::resource_type_for_tiberium_slot(
+                                            ty.id,
+                                        ),
+                                    value: ty.value as u16,
+                                },
+                                amount.as_f64().unwrap() as usize,
+                            )
+                        })
+                        .collect(),
                 );
             }
         }
@@ -602,58 +819,40 @@ fn compare_unload(s: &Scene, row: &Value, context: &str) {
         expected["stage"][0].as_i64().unwrap(),
         "{context}: stage value"
     );
-    let ore = state
-        .cargo()
-        .iter()
-        .filter(|b| b.resource_type == ResourceType::Ore)
-        .count() as f64;
-    let gems = state
-        .cargo()
-        .iter()
-        .filter(|b| b.resource_type == ResourceType::Gem)
-        .count() as f64;
-    assert_eq!(
-        ore,
-        expected["storage"][0].as_f64().unwrap(),
-        "{context}: ore"
-    );
-    assert_eq!(
-        gems,
-        expected["storage"][1].as_f64().unwrap(),
-        "{context}: gems"
-    );
+    for slot in 0..4 {
+        let amount = state
+            .cargo()
+            .iter()
+            .filter(|bale| usize::from(bale.tiberium_type.0) == slot)
+            .count() as f64;
+        assert_eq!(
+            amount,
+            expected["storage"][slot].as_f64().unwrap(),
+            "{context}: native slot{slot}"
+        );
+    }
     let house = s
         .sim
         .houses
         .get(&s.sim.interner.get("Americans").unwrap())
         .unwrap();
     let (balance, score) = (
-        i64::from(house.economy.credits()),
-        i64::from(house.economy.score()),
+        i64::from(house.economy().credits()),
+        i64::from(house.economy().score()),
     );
-    if row["input"]["name"] == "unload_gate_income_mult" {
-        // RESIDUAL (documented on `refinery_dock`): native 0.9f pays
-        // ftol(25 * 0.9f * 40) = 899, VERA's integer economy 900.
-        assert_eq!((balance, expected["balance"].as_i64().unwrap()), (900, 899));
-    } else if row["input"]["name"] == "unload_gate_income_mult_bonus" {
-        // Native 877 + ftol(243.37.. + 877) = 1096; VERA 877 + 219 = 1096.
+    assert_eq!(
+        balance,
+        expected["balance"].as_i64().unwrap(),
+        "{context}: balance"
+    );
+    // Ares' DepositTiberium (10044230, hook 0x73E4A2) adds no score.
+    if !s.rules.ares() {
         assert_eq!(
-            balance,
-            expected["balance"].as_i64().unwrap(),
-            "{context}: balance"
-        );
-    } else {
-        assert_eq!(
-            balance,
-            expected["balance"].as_i64().unwrap(),
-            "{context}: balance"
+            score,
+            expected["score"].as_i64().unwrap(),
+            "{context}: score"
         );
     }
-    assert_eq!(
-        score,
-        expected["score"].as_i64().unwrap(),
-        "{context}: score"
-    );
 }
 
 /// Assert the dispatch delay: the native delay minus its draw is the Rate
@@ -705,69 +904,51 @@ pub(super) fn compare_delay(
     }
 }
 
+/// The docking handshake (`can_dock`: the miner's CanDock to its refinery)
+/// and the radio core's other transmits.
 #[test]
-fn docking_handshake_matches_the_original_receivers() {
+fn docking_handshake_and_radio_core_match_the_original_transmits() {
     let corpus = corpus();
-    for row in corpus["can_dock"].as_array().unwrap() {
-        let input = &row["input"];
-        let context = input["name"].as_str().unwrap().to_string();
-        let mut s = scene(input);
-        radio::take_transmit_log();
-        let reply = radio::transmit(
-            &mut s.sim,
-            s.miner,
-            s.refinery,
-            RadioMessage::CanDock,
-            RadioPayload::default(),
-            Some(&s.rules),
-            crate::sim::world::FrameEffects::default(),
-        );
-        assert_eq!(
-            u64::from(reply.code()),
-            row["reply"].as_u64().unwrap(),
-            "{context}: reply"
-        );
-        assert_eq!(sends(&s), oracle_sends(row), "{context}: transmit sequence");
-        compare_state(&s, row, &context);
-    }
-}
-
-#[test]
-fn radio_core_matches_the_original_transmits() {
-    let corpus = corpus();
-    for row in corpus["radio"].as_array().unwrap() {
-        let input = &row["input"];
-        let context = input["name"].as_str().unwrap().to_string();
-        let mut s = scene(input);
-        let (sender, target) = match input["from"].as_str().unwrap() {
-            "miner" => (s.miner, s.refinery),
-            _ => (s.refinery, s.miner),
-        };
-        let msg = match input["msg"].as_u64().unwrap() {
-            2 => RadioMessage::Hello,
-            3 => RadioMessage::Break,
-            0x15 => RadioMessage::DockNow,
-            0x18 => RadioMessage::Tether,
-            0x19 => RadioMessage::Untether,
-            other => panic!("unmapped message {other}"),
-        };
-        radio::take_transmit_log();
-        let reply = radio::transmit(
-            &mut s.sim,
-            sender,
-            target,
-            msg,
-            RadioPayload::default(),
-            Some(&s.rules),
-            crate::sim::world::FrameEffects::default(),
-        );
-        assert_eq!(
-            u64::from(reply.code()),
-            row["reply"].as_u64().unwrap(),
-            "{context}: reply"
-        );
-        assert_eq!(sends(&s), oracle_sends(row), "{context}: transmit sequence");
-        compare_state(&s, row, &context);
+    for group in ["can_dock", "radio"] {
+        for row in corpus[group].as_array().unwrap() {
+            let input = &row["input"];
+            let context = input["name"].as_str().unwrap().to_string();
+            let mut s = scene(input);
+            let (sender, target, msg) = if group == "can_dock" {
+                (s.miner, s.refinery, RadioMessage::CanDock)
+            } else {
+                let (sender, target) = match input["from"].as_str().unwrap() {
+                    "miner" => (s.miner, s.refinery),
+                    _ => (s.refinery, s.miner),
+                };
+                let msg = match input["msg"].as_u64().unwrap() {
+                    2 => RadioMessage::Hello,
+                    3 => RadioMessage::Break,
+                    0x15 => RadioMessage::DockNow,
+                    0x18 => RadioMessage::Tether,
+                    0x19 => RadioMessage::Untether,
+                    other => panic!("unmapped message {other}"),
+                };
+                (sender, target, msg)
+            };
+            radio::take_transmit_log();
+            let reply = radio::transmit(
+                &mut s.sim,
+                sender,
+                target,
+                msg,
+                RadioPayload::default(),
+                &s.rules,
+                crate::sim::world::FrameEffects::default(),
+            );
+            assert_eq!(
+                u64::from(reply.code()),
+                row["reply"].as_u64().unwrap(),
+                "{context}: reply"
+            );
+            assert_eq!(sends(&s), oracle_sends(row), "{context}: transmit sequence");
+            compare_state(&s, row, &context);
+        }
     }
 }
 
@@ -836,6 +1017,7 @@ fn mission_harvest_states_two_and_three_match_the_original_dispatch() {
             let miner = entity.miner.as_mut().unwrap();
             miner.set_cargo_for_test(vec![
                 CargoBale {
+                    tiberium_type: crate::rules::tiberium_type::TiberiumTypeId(0),
                     resource_type: ResourceType::Ore,
                     value: 25,
                 };
@@ -850,18 +1032,17 @@ fn mission_harvest_states_two_and_three_match_the_original_dispatch() {
         }
         radio::take_transmit_log();
         let mut stream = s.sim.scenario_rng.clone();
-        let config = crate::sim::miner::MinerConfig::from_rules(&s.rules);
-        let frame = s.sim.session.binary_frame;
+        let frame = s.sim.session.binary_frame();
         crate::sim::world::dispatch_foot_mission(
             &mut s.sim,
             s.miner,
             &s.rules,
             crate::sim::world::ObjectAiCtx {
-                miner_config: Some(&config),
                 overlay_registry: Some(crate::sim::tiberium::test_support::overlay_registry()),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         let entity = s.sim.substrate.entities.get(s.miner).unwrap();
         let timer = entity.mission.dispatch_timer();
         let delay = timer.delay();
@@ -896,6 +1077,16 @@ fn mission_unload_matches_the_original_harvester_branch() {
     for row in corpus["mission_unload"].as_array().unwrap() {
         let input = &row["input"];
         let context = input["name"].as_str().unwrap().to_string();
+        // Ares hook 0x0073DF66 replaces the East window these two rows
+        // probe (`ares_mission_unload_faces_the_dock_exactly`).
+        if crate::rules::ares_switch::ares_way()
+            && matches!(
+                context.as_str(),
+                "unload_window_low_edge" | "unload_facing_west_latch"
+            )
+        {
+            continue;
+        }
         let mut s = scene(input);
         radio::take_transmit_log();
         let mut stream = s.sim.scenario_rng.clone();
@@ -912,20 +1103,47 @@ fn mission_unload_matches_the_original_harvester_branch() {
     }
 }
 
+/// Ares 3.0 `10014910` (hook `0x0073DF66`): Mission_Unload compares the hull
+/// with the dock's DockUnloadFacing exactly (east for this refinery), so the
+/// stock window's low edge turns and waits as the outside row does, and a
+/// mid-swing turret counts as facing it, so the latched west row arms the
+/// unload as the first pass does.
+#[test]
+fn ares_mission_unload_faces_the_dock_exactly() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let rows = corpus()["mission_unload"].as_array().unwrap();
+    for (name, waits) in [
+        ("unload_window_low_edge", true),
+        ("unload_facing_west_latch", false),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row["input"]["name"] == name)
+            .unwrap();
+        let mut s = scene(&row["input"]);
+        let delay = crate::sim::miner::mission_unload(
+            &mut s.sim,
+            &s.rules,
+            s.miner,
+            crate::sim::world::FrameEffects::default(),
+        );
+        let miner = s.sim.substrate.entities.get(s.miner).unwrap();
+        let unloading = miner.miner.as_ref().unwrap().unload_active();
+        assert_eq!((delay == 5, unloading), (waits, !waits), "{name}");
+    }
+}
+
 #[test]
 fn per_cell_dock_now_matches_the_original_track_end_arm() {
     let corpus = corpus();
     for row in corpus["per_cell"].as_array().unwrap() {
         let input = &row["input"];
         let context = input["name"].as_str().unwrap().to_string();
-        // The refusal's Scatter is the recorded residual (`refinery_dock`
-        // module doc); it must stay confined to the selling row.
-        let scatters = row["events"]
+        let scatter = row["events"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e[0] == "scatter");
-        assert_eq!(scatters, context == "per_cell_pad_selling", "{context}");
+            .find(|e| e[0] == "scatter");
         let mut s = scene(input);
         radio::take_transmit_log();
         s.sim.unit_dock_now(
@@ -935,7 +1153,20 @@ fn per_cell_dock_now_matches_the_original_track_end_arm() {
             crate::sim::world::FrameEffects::default(),
         );
         assert_eq!(sends(&s), oracle_sends(row), "{context}: transmit sequence");
-        compare_state(&s, row, &context);
+        let mut expected = row.clone();
+        if let Some(scatter) = scatter {
+            // The oracle records Scatter(&0xB1CFE8, 1, 0) without running it,
+            // so the row certifies the call and its arguments, not the cell:
+            // that is the Unit Scatter's own (scatter_tests). It runs here, so
+            // the miner's NavCom is the cell it chose.
+            assert_eq!(scatter.as_array().unwrap()[2..], [1, 0], "{context}");
+            let miner = s.sim.substrate.entities.get(s.miner).unwrap();
+            let Some(NavTargetRef::Cell { rx, ry }) = miner.navigation.nav_com() else {
+                panic!("{context}: the refusal Scatters the miner");
+            };
+            expected["state"]["miner_nav"] = serde_json::json!([rx, ry]);
+        }
+        compare_state(&s, &expected, &context);
     }
 }
 
@@ -962,7 +1193,7 @@ fn per_cell_release_matches_the_original_track_end_arm() {
             .is_some_and(|miner| miner.unload_active())
         {
             s.sim
-                .mission_host_promote(s.miner, s.sim.session.binary_frame, &s.rules);
+                .mission_host_promote(s.miner, s.sim.session.binary_frame(), &s.rules);
         }
         crate::sim::miner::per_cell_release_dock_contact(
             &mut s.sim,
@@ -989,13 +1220,15 @@ fn stage_tick_matches_the_original_stageclass_step() {
         let context = input["name"].as_str().unwrap().to_string();
         let mut s = scene(input);
         for sample in row["values"].as_array().unwrap() {
-            s.sim.session.binary_frame = sample[0].as_u64().unwrap() as u32;
+            s.sim
+                .session
+                .set_binary_frame_for_test(sample[0].as_u64().unwrap() as u32);
             s.sim
                 .substrate
                 .entities
                 .get_mut(s.miner)
                 .unwrap()
-                .tick_native_stage(s.sim.session.binary_frame as i32);
+                .tick_native_stage(s.sim.session.binary_frame() as i32);
             let value = s
                 .sim
                 .substrate
@@ -1022,7 +1255,7 @@ fn replay_covers_every_row() {
     assert_eq!(count("radio"), 18);
     assert_eq!(count("mission_enter"), 9);
     assert_eq!(count("mission_harvest"), 9);
-    assert_eq!(count("mission_unload"), 30);
+    assert_eq!(count("mission_unload"), 34);
     assert_eq!(count("per_cell"), 6);
     assert_eq!(count("per_cell_release"), 13);
     assert_eq!(count("stage_tick"), 3);

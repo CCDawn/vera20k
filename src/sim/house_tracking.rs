@@ -82,7 +82,9 @@
 //! (`0x004FF8C0`, `0x004FF6C8`). TEvent55 reads this scalar; TEvent56 reads
 //! vehicles minus navy, then tracked infantry (`0x0071F159..0x0071F187`).
 //! Limbo does not remove tracking, so transports and constructed limbo objects
-//! must not be inferred from the on-map sets. `+0x2F8` is not kept.
+//! must not be inferred from the on-map sets. `+0x2F8`, the tracked aircraft,
+//! moves with `+0x553C` in the aircraft arms (`0x004FF7C8`, `0x004FF607`), so
+//! it is that counter's total; only the observer strip reads it.
 //!
 //! Factory counters (`+0x5378` aircraft, `+0x537C` infantry, `+0x5380`
 //! vehicle, `+0x5384` building, `+0x5388` naval): a building whose type has
@@ -94,6 +96,8 @@
 //! from a house (`0x0044870E`). An ordinary building death limbos it at once:
 //! `BuildingClass::ReceiveDamage` UnInits it in its death arm (`0x0044269A`)
 //! while the death timer DestructionEffects armed (`+0x528`, 8 frames) runs.
+//! An `Explodes=` type (every shipyard) or a building dying while Selling gets
+//! a zero timer and leaves at its next Update's Limbo (`0x004400C5`).
 //! Time_To_Build reads one counter (`HouseClass::GetFactoryCount @
 //! 0x00500910`); the EVA funds nag sums four.
 //!
@@ -106,30 +110,20 @@
 //! Whole Added_To_Game and Removed_From_Game are read, not executed; only
 //! their capacity/amount transfer slices have executable controls here.
 //!
-//! RESIDUAL: the survivor flag `+0x6D9` is not written. SpawnSurvivors sets it
+//! The retained survivor flag `+0x6D9` is written by SpawnSurvivors
 //! (`0x00443111..0x00443127`), before the survivor's Unlimbo, on a `Nominal=`
 //! survivor (the Technician) of a building with Buildup art (Init_Managers sets
 //! `+0x6E9` when the type has a Buildup shape, `0x00442CAA..0x00442CCF`); the
-//! sale crew sets it after a successful Unlimbo (`0x0044A733..0x0044A747`;
-//! VERA has no sale crew). Nothing clears it. Added_To_Game skips a flagged
+//! sale crew sets it after a successful Unlimbo (`0x0044A733..0x0044A747`).
+//! Nothing clears it. Added_To_Game skips a flagged
 //! infantry on every Unlimbo while Removed_From_Game still decrements it on
 //! every Limbo, so each time a flagged Technician leaves the map (dies,
 //! garrisons, boards) native `+0x5578` drops by one for good. Trigger: a
 //! Technician survivor of an armed building (the 15% crew roll) leaving the
 //! map in a normal (non-short) game. Effect: native's sum can reach zero while
 //! objects stand (the house is defeated and they are blown up) or stay
-//! negative when nothing is left (the house is never defeated); VERA does
-//! neither.
-//!
-//! RESIDUAL: a factory whose type is `Explodes=` (TechnoType `+0xD15`) or
-//! that dies while selling leaves its counter one frame late natively.
-//! DestructionEffects arms its death timer at 0 (`0x00441C43..0x00441C8C`),
-//! so ReceiveDamage skips the UnInit, and the next Update limbos it
-//! (`0x004400C5`) before its UnInit; VERA UnInits every building at once
-//! (`crate::sim::crew_survival` records the same split). Trigger: every
-//! shipyard death (GAYARD, NAYARD and YAYARD are `Explodes=yes`) and any
-//! factory killed while sold. Effect: a build started or re-rated in that
-//! frame counts one factory more natively (one more MultipleFactory step).
+//! negative when nothing is left (the house is never defeated). Retain this
+//! native asymmetry instead of rebuilding counts from current objects.
 //!
 //! RESIDUAL: while the game-active byte `[0x00A8E9A0]` is clear, Limbo skips
 //! everything after `0x00445AC6`, Recount and TechnoClass::Limbo included;
@@ -146,12 +140,19 @@ use crate::map::entities::EntityCategory;
 use crate::rules::object_type::{FactoryType, ObjectType};
 use crate::rules::ruleset::{HouseCostFactors, RuleSet};
 use crate::sim::game_entity::GameEntity;
+use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
+
+#[cfg(feature = "phobos")]
+mod phobos;
+#[cfg(feature = "phobos")]
+pub(crate) use phobos::{PhobosLimboControl, PhobosPlacement};
 
 /// The type facts the counters test, fixed when the Techno is constructed
 /// ([`TrackingFacts::of`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackingFacts {
     /// `DontScore=`: the score bookkeeping and the house counts skip the
     /// object. Persisted, so a count removed after a reload skips it as its
@@ -187,6 +188,32 @@ pub struct TrackingFacts {
     /// deploy/undeploy constructs a replacement with its own type facts.
     #[serde(default)]
     storage_capacity: i32,
+    /// Ares10021F70 resolves TypeExt.KeepAlive before the original score
+    /// exclusions. Retained with the other constructor-bound type facts,
+    /// and set only for facts built from Rules read the Ares way
+    /// (`RuleSet::ares_form`), so the counters need no other answer.
+    keep_alive: bool,
+}
+
+/// The stock facts hash as the derived hash did, in declaration order; an
+/// object Ares keeps its House alive for adds its own fold, so a game
+/// without Ares hashes as before.
+impl std::hash::Hash for TrackingFacts {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.dont_score.hash(state);
+        self.insignificant.hash(state);
+        self.unit_like_building.hash(state);
+        self.naval_combatant.hash(state);
+        self.resource_gatherer.hash(state);
+        self.resource_destination.hash(state);
+        self.war_factory.hash(state);
+        self.force_value.hash(state);
+        self.factory.hash(state);
+        self.storage_capacity.hash(state);
+        if self.keep_alive {
+            b"ares-keep-alive-fact-v1".hash(state);
+        }
+    }
 }
 
 impl TrackingFacts {
@@ -195,20 +222,23 @@ impl TrackingFacts {
     /// `0x004FF761..0x004FF791`) when its vtable `+0x80` answers (a 1x1
     /// undeployer) or it undeploys (`+0x408`) into a `ResourceGatherer=`
     /// (`+0x5EC`).
-    pub(crate) fn of(
-        category: EntityCategory,
-        ty: Option<&ObjectType>,
-        rules: Option<&RuleSet>,
-    ) -> Self {
+    pub(crate) fn of(category: EntityCategory, ty: Option<&ObjectType>, rules: &RuleSet) -> Self {
         let Some(ty) = ty else {
             return Self::default();
         };
+        let ares = rules.ares_form();
         let unit_like_building = category == EntityCategory::Structure
             && (ty.is_1x1_with_undeploy()
                 || ty
                     .undeploys_into
                     .as_deref()
-                    .and_then(|undeploys| rules.and_then(|rules| rules.object(undeploys)))
+                    // TechnoType7132B2's UndeploysInto reader retains a UnitType.
+                    .and_then(|undeploys| {
+                        rules.object_in_category(
+                            crate::rules::object_type::ObjectCategory::Vehicle,
+                            undeploys,
+                        )
+                    })
                     .is_some_and(|undeploys| undeploys.resource_gatherer));
         Self {
             dont_score: ty.dont_score,
@@ -218,7 +248,7 @@ impl TrackingFacts {
             resource_gatherer: ty.resource_gatherer,
             resource_destination: ty.resource_destination,
             war_factory: category == EntityCategory::Structure && ty.weapons_factory && !ty.naval,
-            force_value: ForceValueFacts::of(category, ty),
+            force_value: ForceValueFacts::of(category, ty, ares),
             factory: (category == EntityCategory::Structure)
                 .then(|| {
                     FactoryType::for_production_rtti(ty.factory_rtti())
@@ -230,15 +260,22 @@ impl TrackingFacts {
             } else {
                 0
             },
+            keep_alive: ares
+                && ty.keep_alive().unwrap_or(
+                    category == EntityCategory::Structure && !ty.insignificant && !ty.dont_score,
+                ),
         }
     }
 
-    /// The retained input affects a later Added/Removed even while in limbo.
-    pub(crate) fn hash_storage_capacity(self, hasher: &mut impl std::hash::Hasher) {
+    /// Retained inputs affect later tracking removal even while in limbo.
+    pub(crate) fn hash_retained_inputs(self, hasher: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
         if self.storage_capacity != 0 {
             b"building-storage-capacity-input-v1".hash(hasher);
             self.storage_capacity.hash(hasher);
+        }
+        if self.keep_alive {
+            b"ares-keep-alive-input-v1".hash(hasher);
         }
     }
 
@@ -363,7 +400,7 @@ pub enum ForceKind {
 }
 
 /// What the on-map writers price: the total and the type's `Cost_Of` inputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForceValueFacts {
     kind: ForceKind,
     /// `TechnoType+0x610`, the `Cost=` that `Cost_Of` scales (read through
@@ -371,12 +408,68 @@ pub struct ForceValueFacts {
     cost: i32,
     /// [`ObjectType::factor_slot`].
     factor_slot: u8,
+    /// Whether `Cost_Of` takes its Ares form for this object:
+    /// `RuleSet::ares_form` of the Rules the facts were built from. Its
+    /// `FactoryPlant.Multiplier` sits in the object's Ares part
+    /// ([`retained_plant_multiplier`]), so the facts stay their stock size.
+    #[serde(default)]
+    ares_form: bool,
+}
+
+/// The Ares `FactoryPlant.Multiplier` an object of class `category` and type
+/// `ty` retains beside its facts (`AresPart::factory_plant_multiplier`): the
+/// type's, for a priced object in a game read the Ares way, unless it is the
+/// neutral 1.0, which an unset one reads as.
+pub(crate) fn retained_plant_multiplier(
+    category: EntityCategory,
+    ty: Option<&ObjectType>,
+    rules: &RuleSet,
+) -> Option<crate::util::native_x87::NativeF64Bits> {
+    let ty = ty.filter(|_| rules.ares_form() && category != EntityCategory::Structure)?;
+    let multiplier = ty.ares_production().factory_plant_multiplier();
+    (multiplier != crate::util::native_x87::NativeF64Bits::ONE).then_some(multiplier)
+}
+
+/// The stock inputs hash as the derived hash did, in declaration order; an
+/// object priced the Ares way adds its own fold, so a game without Ares
+/// hashes as before.
+impl std::hash::Hash for ForceValueFacts {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.kind.hash(state);
+        self.cost.hash(state);
+        self.factor_slot.hash(state);
+        if self.ares_form {
+            b"ares-force-value-v1".hash(state);
+        }
+    }
+}
+
+impl ForceValueFacts {
+    /// `Cost_Of` for this House's `factors`, in the form the facts were
+    /// built for. `plant_multiplier` is the object's retained Ares
+    /// `FactoryPlant.Multiplier` ([`retained_plant_multiplier`]), which
+    /// `Cost_Of`'s plant factor reads (`HouseCostFactors::ares_factory_plant`).
+    fn priced(
+        self,
+        factors: &HouseCostFactors,
+        plant_multiplier: Option<crate::util::native_x87::NativeF64Bits>,
+    ) -> i32 {
+        if self.ares_form {
+            factors.ares_adjust(
+                self.cost,
+                self.factor_slot.into(),
+                plant_multiplier.unwrap_or(crate::util::native_x87::NativeF64Bits::ONE),
+            )
+        } else {
+            factors.adjust(self.cost, self.factor_slot.into())
+        }
+    }
 }
 
 impl ForceValueFacts {
     /// The value arm an object of class `category` and type `ty` takes (see
-    /// the module doc).
-    fn of(category: EntityCategory, ty: &ObjectType) -> Option<Self> {
+    /// the module doc), priced the Ares way when `ares_form`.
+    fn of(category: EntityCategory, ty: &ObjectType, ares_form: bool) -> Option<Self> {
         let kind = match category {
             EntityCategory::Aircraft => ForceKind::Air,
             EntityCategory::Infantry if ty.considered_aircraft => ForceKind::Air,
@@ -389,6 +482,7 @@ impl ForceValueFacts {
             kind,
             cost: ty.cost,
             factor_slot: ty.factor_slot() as u8,
+            ares_form,
         })
     }
 }
@@ -416,6 +510,10 @@ impl ForceValues {
 /// the module doc).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HouseTracking {
+    /// Phobos HouseExt's separate limbo counters, in Unit/Infantry/Building/Aircraft order.
+    #[cfg(feature = "phobos")]
+    #[serde(default)]
+    phobos_limbo_counts: [BTreeMap<InternedId, i32>; 4],
     /// `HouseClass+0x2F0`.
     buildings: i32,
     /// `HouseClass+0x2E8`: the tracked vehicles and the buildings tracked
@@ -475,6 +573,15 @@ pub struct HouseTracking {
     /// filtered active-building counts and the separate raw amount stores.
     #[serde(default)]
     storage_capacity: i32,
+    /// Ares HouseExt+18, constructor10021050; raw signed event total, not a
+    /// projection of active objects. Saved by1001F4D7 and loaded by1001F366.
+    #[serde(default)]
+    keep_alive: i32,
+    /// Ares HouseExt+1C KeepAliveBuildingCount: the KeepAlive part of
+    /// +18 that Buildings contribute (RegisterKeepAlive 10021F70, RTTI 6).
+    /// Only trigger event 88 reads it.
+    #[serde(default)]
+    keep_alive_buildings: i32,
 }
 
 impl HouseTracking {
@@ -492,6 +599,16 @@ impl HouseTracking {
     /// Infantry latches `+0x438`/`+0x439`: `0x004FF81A..0x004FF83B`, `0x004FF636..0x004FF64D`.
     fn track(&mut self, entity: &mut GameEntity, delta: i32) {
         let facts = entity.tracking_facts;
+        // Ares4FF71B/4FF563 ->10021F70 runs before the original early return.
+        // Explicit KeepAlive=yes also counts insignificant/DontScore objects.
+        // Runs in every game: only facts built from Rules read the Ares way
+        // set it ([`TrackingFacts::of`]).
+        if facts.keep_alive {
+            self.keep_alive = self.keep_alive.wrapping_add(delta);
+            if entity.category() == EntityCategory::Structure {
+                self.keep_alive_buildings = self.keep_alive_buildings.wrapping_add(delta);
+            }
+        }
         if facts.insignificant || entity.tracking_facts.dont_score() {
             return;
         }
@@ -502,7 +619,7 @@ impl HouseTracking {
             EntityCategory::Structure | EntityCategory::Unit => {
                 self.vehicles = self.vehicles.wrapping_add(delta);
                 if facts.naval_combatant() {
-                    // Steam 3e81a617..08600: 4FF8C0 INC / 4FF6C8 DEC.
+                    // Steam gamemd: 4FF8C0 INC / 4FF6C8 DEC.
                     // tools/spatial_oracle/house_tracking.py (36 controls),
                     // replayed by tag_lifecycle.py --naval-land-events.
                     self.navy = self.navy.wrapping_add(delta);
@@ -570,7 +687,7 @@ impl HouseTracking {
     /// `0x00445946..0x00445988`) and its ChangeOwner (`-=` on the old house,
     /// unclamped, `0x00448B4C..0x00448B6A`; `+=` on the new one,
     /// `0x00449229..0x00449245`), none of which test the house.
-    pub(crate) const fn airport_docks(&self) -> i32 {
+    pub const fn airport_docks(&self) -> i32 {
         self.airport_docks
     }
 
@@ -671,6 +788,11 @@ impl HouseTracking {
     /// the gatherer count joined it (schema `HouseDefeatTracking`).
     pub(crate) fn hash_defeat_counters(&self, hasher: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
+        #[cfg(feature = "phobos")]
+        {
+            b"phobos-house-limbo-v1".hash(hasher);
+            self.phobos_limbo_counts.hash(hasher);
+        }
         self.buildings.hash(hasher);
         self.unit_types.hash(hasher);
         // The totals, which the per-type counts replaced (schema v238 keeps
@@ -687,6 +809,20 @@ impl HouseTracking {
             b"house-storage-capacity-v1".hash(hasher);
             self.storage_capacity.hash(hasher);
         }
+        if self.keep_alive != 0 {
+            b"ares-house-keep-alive-v1".hash(hasher);
+            self.keep_alive.hash(hasher);
+        }
+        if self.keep_alive_buildings != 0 {
+            b"ares-house-keep-alive-buildings-v1".hash(hasher);
+            self.keep_alive_buildings.hash(hasher);
+        }
+    }
+
+    /// Ares HouseExt+18 and +1C, which trigger events 87 and 88 read
+    /// (TEventExt::HasOccured 1004F7A0).
+    pub(crate) const fn keep_alive_counts(&self) -> (i32, i32) {
+        (self.keep_alive, self.keep_alive_buildings)
     }
 
     /// Retained House+310, not AvailableStorage4F69D0 for nonempty stores.
@@ -741,6 +877,16 @@ impl HouseTracking {
         counts.get(&type_id).copied().unwrap_or(0)
     }
 
+    /// The sum of the four on-map counters' totals (`CounterClass+0x10` of
+    /// `+0x5550`, `+0x5564`, `+0x5578` and `+0x558C`), as the co-op score
+    /// rows add them (`0x0049B7E0`).
+    pub(crate) fn active_total(&self) -> i32 {
+        wrapping_total(&self.active_building_types)
+            .wrapping_add(self.active_units())
+            .wrapping_add(self.active_infantry())
+            .wrapping_add(self.active_aircraft())
+    }
+
     fn active_units(&self) -> i32 {
         wrapping_total(&self.active_unit_types)
     }
@@ -775,7 +921,8 @@ impl HouseTracking {
         }
         if let Some(value) = entity.tracking_facts.force_value {
             let total = self.force_values.total(value.kind);
-            *total = total.wrapping_add(factors.adjust(value.cost, value.factor_slot.into()));
+            *total =
+                total.wrapping_add(value.priced(factors, entity.ares.factory_plant_multiplier));
         }
         let dont_score = entity.tracking_facts.dont_score();
         let counts = match entity.category() {
@@ -783,7 +930,11 @@ impl HouseTracking {
             EntityCategory::Unit => &mut self.active_unit_types,
             EntityCategory::Aircraft if !dont_score => &mut self.active_aircraft_types,
             EntityCategory::Structure if !dont_score => &mut self.active_building_types,
-            EntityCategory::Infantry if !dont_score => &mut self.active_infantry_types,
+            //502C3C..502C7A: force value above still changes. Removed does
+            //not test6D9, so repeated placement can retain negative counts.
+            EntityCategory::Infantry if !dont_score && !entity.is_nominal_survivor() => {
+                &mut self.active_infantry_types
+            }
             _ => return,
         };
         let count = counts.entry(entity.type_ref()).or_default();
@@ -818,7 +969,8 @@ impl HouseTracking {
         }
         if let Some(value) = entity.tracking_facts.force_value {
             let total = self.force_values.total(value.kind);
-            *total = total.wrapping_sub(factors.adjust(value.cost, value.factor_slot.into()));
+            *total =
+                total.wrapping_sub(value.priced(factors, entity.ares.factory_plant_multiplier));
         }
         if entity.tracking_facts.dont_score() {
             return;
@@ -833,15 +985,65 @@ impl HouseTracking {
         *count = count.wrapping_sub(1);
     }
 
-    /// The short game's test (`0x004F8EC6..0x004F8F1D`): alive while
-    /// `+0x2F0 > 0` or the tracked counts of `BaseUnit=` entries 1, 2 and 0
-    /// sum above zero.
-    pub(crate) fn short_game_alive(&self, base_units: &[Option<InternedId>; 3]) -> bool {
-        let tracked = |slot: usize| {
-            base_units[slot].map_or(0, |unit| self.unit_types.get(&unit).copied().unwrap_or(0))
-        };
-        let base = tracked(1).wrapping_add(tracked(2)).wrapping_add(tracked(0));
-        self.buildings > 0 || base > 0
+    /// Sole multiplayer survival decision. Retail4F8EBD..4F8F77 uses the
+    /// three-entry BaseUnit sum or the normal active-counter sum. Optional
+    /// Ares10024990 replaces both arms: retained KeepAlive first, then any
+    /// nonzero BaseUnit count, or class-total-gated Foot presence.
+    /// `foot_present` reads the authoritative object registry only when needed;
+    /// it must test owner and (!InLimbo || ParasiteImUsing), without health gates.
+    /// `ares`: the game's Rules were read the Ares way (`RuleSet::ares_form`).
+    pub(crate) fn game_alive(
+        &self,
+        ares: bool,
+        short_game: bool,
+        base_units: impl IntoIterator<Item = Option<InternedId>>,
+        build_refinery_2: Option<InternedId>,
+        foot_present: impl Fn(EntityCategory) -> bool,
+    ) -> bool {
+        if ares {
+            if self.keep_alive != 0 {
+                return true;
+            }
+            if short_game {
+                return base_units
+                    .into_iter()
+                    .flatten()
+                    .any(|unit| self.unit_types.get(&unit).copied().unwrap_or(0) != 0);
+            }
+            [
+                (EntityCategory::Unit, self.active_units()),
+                (EntityCategory::Infantry, self.active_infantry()),
+                (EntityCategory::Aircraft, self.active_aircraft()),
+            ]
+            .into_iter()
+            .any(|(category, total)| total != 0 && foot_present(category))
+        } else if short_game {
+            let mut units = base_units.into_iter();
+            let mut tracked = || {
+                units
+                    .next()
+                    .flatten()
+                    .map_or(0, |unit| self.unit_types.get(&unit).copied().unwrap_or(0))
+            };
+            let first = tracked();
+            let second = tracked();
+            let third = tracked();
+            let base = second.wrapping_add(third).wrapping_add(first);
+            self.buildings > 0 || base > 0
+        } else {
+            let refinery = build_refinery_2.map_or(0, |refinery| {
+                self.active_building_types
+                    .get(&refinery)
+                    .copied()
+                    .unwrap_or(0)
+            });
+            self.buildings
+                .wrapping_add(self.active_units())
+                .wrapping_add(self.active_infantry())
+                .wrapping_add(self.active_aircraft())
+                .wrapping_add(refinery)
+                != 0
+        }
     }
 
     /// `+0x2F0`, the tracked buildings.
@@ -849,8 +1051,18 @@ impl HouseTracking {
         self.buildings
     }
 
+    /// The observer strip's Units line: `+0x2F8 + +0x2F4 + +0x2F0 + +0x2E8`
+    /// (`StripClass::AI @ 0x006A8B30`, `0x006A9108..0x006A9127`). The
+    /// buildings tracked as vehicles count once, in `+0x2E8`.
+    pub fn observer_units(&self) -> i32 {
+        wrapping_total(&self.aircraft_types)
+            .wrapping_add(self.infantry)
+            .wrapping_add(self.buildings)
+            .wrapping_add(self.vehicles)
+    }
+
     /// TEvent9 / DestroyedUnitsAll (`71F12F..71F187`, Steam
-    /// `3e81a617..08600`) reads the two CounterClass totals independently.
+    /// gamemd) reads the two CounterClass totals independently.
     /// Aircraft and tracked/limbo units do not participate; a negative total
     /// is accepted rather than canceling a positive total of the other class.
     /// Source: tools/spatial_oracle/tag_lifecycle.py --destroyed-house-events.
@@ -864,47 +1076,18 @@ impl HouseTracking {
     pub(crate) fn all_destroyed(&self) -> bool {
         self.buildings <= 0 && self.units_destroyed()
     }
-
-    /// The normal game's test (`0x004F8F21..0x004F8F77`): alive while
-    /// `+0x2F0` plus the on-map totals and the on-map count of `[AI]
-    /// BuildRefinery=`'s third type is not zero.
-    pub(crate) fn normal_game_alive(&self, build_refinery_2: Option<InternedId>) -> bool {
-        let refinery = build_refinery_2.map_or(0, |refinery| {
-            self.active_building_types
-                .get(&refinery)
-                .copied()
-                .unwrap_or(0)
-        });
-        self.buildings
-            .wrapping_add(self.active_units())
-            .wrapping_add(self.active_infantry())
-            .wrapping_add(self.active_aircraft())
-            .wrapping_add(refinery)
-            != 0
-    }
 }
 
 impl Simulation {
-    /// Native Infantry::PerCellProcess sets `+0x439` immediately before the
-    /// absorber's Limbo (`0x0051A2ED..0x0051A316`). This only suppresses a
-    /// subsequent Add_Tracking total increment; it does not affect `+0x5528`.
-    pub(crate) fn set_infantry_absorber_entry(&mut self, stable_id: u64, absorbed: bool) {
-        if let Some(entity) = self
-            .substrate
-            .entities
-            .get_mut(stable_id)
-            .filter(|entity| entity.category() == EntityCategory::Infantry)
-        {
-            entity.house_tracking_latches_mut().set_absorbed(absorbed);
-        }
-    }
-
     /// After the absorber's Limbo, native `0x0051A327..0x0051A348` removes
     /// the once-counted infantry total and clears `+0x438`; per-type tracking
     /// remains intact while the passenger is hidden in the building.
-    pub(crate) fn account_infantry_absorber_entry(&mut self, stable_id: u64) {
-        let Some(owner) = self
-            .substrate
+    pub(crate) fn account_infantry_absorber_entry(
+        substrate: &mut ObjectSubstrate,
+        houses: &mut Houses,
+        stable_id: u64,
+    ) {
+        let Some(owner) = substrate
             .entities
             .get(stable_id)
             .filter(|entity| entity.category() == EntityCategory::Infantry)
@@ -913,12 +1096,12 @@ impl Simulation {
             return;
         };
         let (Some(entity), Some(house)) = (
-            self.substrate.entities.get_mut(stable_id),
-            self.houses.get_mut(&owner),
+            substrate.entities.get_mut(stable_id),
+            houses.get_mut(&owner),
         ) else {
             return;
         };
-        house.tracking.absorber_entry(entity);
+        house.tracking_mut().absorber_entry(entity);
     }
 
     /// Successful reveals from a Bio Reactor, SpawnSurvivors or Selling restore
@@ -926,9 +1109,12 @@ impl Simulation {
     /// Native writers: Building Mission_Unload `0x0044DBEA..0x0044DC02`,
     /// SpawnSurvivors `0x00442F6D..0x00442FA1`, and Mission_Selling
     /// `0x0044A510..0x0044A548`. The per-type counter never changes here.
-    pub(crate) fn restore_absorbed_infantry_tracking(&mut self, stable_id: u64) {
-        let Some(owner) = self
-            .substrate
+    pub(crate) fn restore_absorbed_infantry_tracking(
+        substrate: &mut ObjectSubstrate,
+        houses: &mut Houses,
+        stable_id: u64,
+    ) {
+        let Some(owner) = substrate
             .entities
             .get(stable_id)
             .filter(|entity| entity.category() == EntityCategory::Infantry)
@@ -937,12 +1123,27 @@ impl Simulation {
             return;
         };
         let (Some(entity), Some(house)) = (
-            self.substrate.entities.get_mut(stable_id),
-            self.houses.get_mut(&owner),
+            substrate.entities.get_mut(stable_id),
+            houses.get_mut(&owner),
         ) else {
             return;
         };
-        house.tracking.restore_absorbed_infantry(entity);
+        house.tracking_mut().restore_absorbed_infantry(entity);
+    }
+}
+
+impl crate::sim::world::ObjectSubstrate {
+    /// Native Infantry::PerCellProcess sets `+0x439` immediately before the
+    /// absorber's Limbo (`0x0051A2ED..0x0051A316`). This only suppresses a
+    /// subsequent Add_Tracking total increment; it does not affect `+0x5528`.
+    pub(crate) fn set_infantry_absorber_entry(&mut self, stable_id: u64, absorbed: bool) {
+        if let Some(entity) = self
+            .entities
+            .get_mut(stable_id)
+            .filter(|entity| entity.category() == EntityCategory::Infantry)
+        {
+            entity.house_tracking_latches_mut().set_absorbed(absorbed);
+        }
     }
 }
 
@@ -958,6 +1159,13 @@ impl HouseTracking {
     /// Stand in for tracked buildings a fixture places without the lifecycle.
     pub fn set_buildings_for_test(&mut self, buildings: i32) {
         self.buildings = buildings;
+        // Synthetic ordinary-building priors stand for default scoreable
+        // Building instances, which also contribute to Ares HouseExt+18 in
+        // a fixture whose thread reads Rules the Ares way.
+        if crate::rules::ares_switch::ares_way() {
+            self.keep_alive = buildings;
+            self.keep_alive_buildings = buildings;
+        }
     }
 
     /// Explicit native TEvent55/56 scalar priors, without fabricating objects.
@@ -1040,7 +1248,7 @@ impl HouseTracking {
         active: (i32, i32, i32),
         active_building_types: &[(InternedId, i32)],
     ) {
-        self.buildings = buildings;
+        self.set_buildings_for_test(buildings);
         self.unit_types = unit_types.iter().copied().collect();
         // The fixture's totals, counted under no type.
         let untyped = |total: i32| BTreeMap::from([(InternedId::default(), total)]);
@@ -1051,10 +1259,14 @@ impl HouseTracking {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "house_tracking_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "house_storage_capacity_tests.rs"]
 mod storage_capacity_tests;
+
+#[cfg(all(test, tests_sim_h_o))]
+#[path = "ares_house_survival_tests.rs"]
+mod ares_survival_tests;

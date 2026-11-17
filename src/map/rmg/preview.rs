@@ -49,8 +49,9 @@ const BLACK_PIXEL_SUBSTITUTE: [u8; 3] = [0x80, 0x80, 0x80];
 const MARKER_SIZE: i32 = 4;
 const MARKER_RGB: [u8; 3] = [0xF0, 0x00, 0x00];
 const MARKER_ORIGIN_BIAS: i32 = -1;
-/// Only the first eight waypoints get a marker.
-pub const MARKER_WAYPOINT_COUNT: u8 = 8;
+/// The original marks only the first eight waypoints, all a random map has.
+/// VERA marks every start of a random map for up to thirty players.
+pub const MARKER_WAYPOINT_COUNT: u8 = super::MAX_PLAYERS as u8;
 
 /// Project a cell centre to the preview's coordinate space.
 ///
@@ -94,27 +95,6 @@ fn projected_bounds(cells: &[PreviewCell]) -> Option<(i32, i32, i32, i32)> {
         });
     }
     bounds
-}
-
-/// Overlay id bands whose radar colour comes back with green and blue swapped.
-///
-/// Two contiguous bands are re-packed on the way out; everything else is copied
-/// straight through. Copying all of them straight through leaves these bands the
-/// wrong hue while the rest look correct, which is a miserable thing to spot by
-/// eye.
-const SWAPPED_CHANNEL_BANDS: [(u8, u8); 2] = [(0x7F, 0x8A), (0x93, 0x9E)];
-
-/// Reorder an overlay's radar triple for the bands that need it.
-pub const fn overlay_radar_channel_order(overlay_id: u8, rgb: [u8; 3]) -> [u8; 3] {
-    let mut band = 0;
-    while band < SWAPPED_CHANNEL_BANDS.len() {
-        let (low, high) = SWAPPED_CHANNEL_BANDS[band];
-        if overlay_id >= low && overlay_id <= high {
-            return [rgb[0], rgb[2], rgb[1]];
-        }
-        band += 1;
-    }
-    rgb
 }
 
 /// Density (growth stage) of each overlay cell, keyed by cell position.
@@ -176,14 +156,14 @@ impl PreviewPalette {
     }
 }
 
-/// `overlay_radar` resolves an ore/gem overlay's colour from its id and growth
-/// stage. An overlay that resolves to a colour paints BOTH pixels with it —
-/// unlike terrain, whose two halves differ — so ore reads as a solid patch
-/// rather than a dither of ore and ground.
+/// Presentation callbacks project an Overlay or ground-head Terrain color
+/// over the current TMP pair. They own device-format packing; None preserves
+/// the TMP pair. An Overlay suppresses the Terrain branch even on a color miss.
 pub fn preview_cells_from_map(
     map: &crate::map::map_file::MapFile,
     resolved: &crate::map::resolved_terrain::ResolvedTerrainGrid,
-    overlay_radar: &dyn Fn(u8, u8) -> Option<[u8; 3]>,
+    overlay_radar: &dyn Fn(u8, u8, PreviewColorPair) -> Option<PreviewColorPair>,
+    terrain_radar: &dyn Fn(u16, u16, PreviewColorPair) -> Option<PreviewColorPair>,
 ) -> Vec<PreviewCell> {
     let playfield = PlayfieldBounds::from_map_header(&map.header);
     let overlays = overlay_densities(map);
@@ -195,21 +175,18 @@ pub fn preview_cells_from_map(
         if !playfield.contains_geometry_packed(i32::from(cell.rx), i32::from(cell.ry)) {
             continue;
         }
-        let overlay = overlays
-            .get(&(cell.rx, cell.ry))
-            .and_then(|(id, density)| {
-                overlay_radar(*id, *density).map(|rgb| overlay_radar_channel_order(*id, rgb))
-            })
-            // A black overlay colour means "not an ore/gem overlay" rather than
-            // a real colour, so it falls through to the terrain underneath.
-            .filter(|rgb| *rgb != [0, 0, 0]);
-        let resolved_cell = resolved.cell(cell.rx, cell.ry);
-        let (left, right) = match overlay {
-            Some(rgb) => (rgb, rgb),
-            None => resolved_cell.map_or(([0, 0, 0], [0, 0, 0]), |resolved| {
+        let terrain = resolved
+            .cell(cell.rx, cell.ry)
+            .map_or(([0; 3], [0; 3]), |resolved| {
                 palette.tile_colors((resolved.radar_left, resolved.radar_right), resolved.level)
-            }),
-        };
+            });
+        // GenerateTerrainPreview6413AA..6413C3 reaches the Terrain head
+        // branch6415E1 only for Overlay==-1, not when an Overlay color misses.
+        let (left, right) = match overlays.get(&(cell.rx, cell.ry)) {
+            Some((id, density)) => overlay_radar(*id, *density, terrain),
+            None => terrain_radar(cell.rx, cell.ry, terrain),
+        }
+        .unwrap_or(terrain);
         cells.push(PreviewCell {
             x: cell.rx,
             y: cell.ry,
@@ -263,8 +240,9 @@ pub fn render_preview(cells: &[PreviewCell], waypoints: &[(u16, u16)]) -> Option
         let (projected_x, projected_y) = project_cell_centre(i32::from(cell.x), i32::from(cell.y));
         let column = (preview_cell_column(projected_x) - min_col) * 2;
         let row = preview_cell_row(projected_y) - min_row;
-        image.put_pixel(column, row, substitute_if_black(cell.left));
-        image.put_pixel(column + 1, row, substitute_if_black(cell.right));
+        let (left, right) = substitute_black_pair((cell.left, cell.right));
+        image.put_pixel(column, row, left);
+        image.put_pixel(column + 1, row, right);
     }
 
     for (cell_x, cell_y) in waypoints.iter().take(MARKER_WAYPOINT_COUNT as usize) {
@@ -278,13 +256,15 @@ pub fn render_preview(cells: &[PreviewCell], waypoints: &[(u16, u16)]) -> Option
     Some(image)
 }
 
-/// A black colour means the lookup failed rather than that the cell is black,
-/// so it becomes mid grey.
-const fn substitute_if_black(rgb: [u8; 3]) -> [u8; 3] {
-    if rgb[0] == 0 && rgb[1] == 0 && rgb[2] == 0 {
-        BLACK_PIXEL_SUBSTITUTE
+/// GenerateTerrainPreview641140 at64168B..6416EF replaces both packed
+/// halves when either is zero. App device conversion precedes this owner.
+const fn substitute_black_pair(pair: PreviewColorPair) -> PreviewColorPair {
+    if (pair.0[0] == 0 && pair.0[1] == 0 && pair.0[2] == 0)
+        || (pair.1[0] == 0 && pair.1[1] == 0 && pair.1[2] == 0)
+    {
+        (BLACK_PIXEL_SUBSTITUTE, BLACK_PIXEL_SUBSTITUTE)
     } else {
-        rgb
+        pair
     }
 }
 
@@ -310,6 +290,32 @@ impl PreviewImage {
         }
     }
 
+    /// VERA extension: the image at half its width and height, each pixel the
+    /// rounded mean of the 2x2 block it covers; an odd last row or column
+    /// drops. A preview too large to send to other players is written so.
+    pub fn halved(&self) -> Self {
+        let (width, height) = (self.width / 2, self.height / 2);
+        let stride = self.width as usize * 4;
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let corner = 2 * y * stride + 2 * x * 4;
+                for channel in 0..4 {
+                    let sum: u32 = [0, 4, stride, stride + 4]
+                        .into_iter()
+                        .map(|offset| u32::from(self.rgba[corner + offset + channel]))
+                        .sum();
+                    rgba.push(((sum + 2) / 4) as u8);
+                }
+            }
+        }
+        Self {
+            width,
+            height,
+            rgba,
+        }
+    }
+
     /// The pixel at `(x, y)` as RGB, for tests that inspect output.
     #[cfg(test)]
     pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 3]> {
@@ -325,7 +331,7 @@ impl PreviewImage {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
 
@@ -345,24 +351,41 @@ mod tests {
     }
 
     #[test]
-    fn origin_cell_projects_to_the_x_bias() {
-        // Cell 0's centre sits on the projection's axis, so X lands exactly on
-        // the bias and Y on zero.
-        assert_eq!(project_cell_centre(0, 0), (PROJECT_X_BIAS, 15));
-    }
-
-    #[test]
-    fn moving_east_and_south_moves_opposite_ways_in_x() {
-        let (east_x, east_y) = project_cell_centre(10, 0);
-        let (south_x, south_y) = project_cell_centre(0, 10);
-        let (origin_x, _) = project_cell_centre(0, 0);
-        assert!(east_x > origin_x, "east goes right");
-        assert!(south_x < origin_x, "south goes left");
-        assert_eq!(
-            preview_cell_row(east_y),
-            preview_cell_row(south_y),
-            "both are the same distance down the screen"
+    fn overlay_color_miss_still_suppresses_terrain_callback() {
+        let mut map = super::super::emit::empty_map_file(&Default::default(), 20, 20);
+        map.cells.push(crate::map::map_file::MapCell {
+            legacy_ice_byte: 0,
+            rx: 20,
+            ry: 20,
+            tile_index: 0,
+            sub_tile: 0,
+            z: 0,
+        });
+        map.overlays.push(crate::map::overlay::OverlayEntry {
+            rx: 20,
+            ry: 20,
+            overlay_id: 3,
+            frame: 7,
+        });
+        let resolved = crate::map::resolved_terrain::test_grid(32, 32, |rx, ry| {
+            let mut terrain = crate::map::resolved_terrain::test_flat_cell(rx, ry);
+            terrain.radar_left = [10, 20, 30];
+            terrain.radar_right = [40, 50, 60];
+            terrain
+        });
+        let overlay_calls = std::cell::Cell::new(0);
+        let cells = preview_cells_from_map(
+            &map,
+            &resolved,
+            &|id, density, _| {
+                assert_eq!((id, density), (3, 7));
+                overlay_calls.set(overlay_calls.get() + 1);
+                None
+            },
+            &|_, _, _| panic!("6413AA: an existing Overlay suppresses Terrain"),
         );
+        assert_eq!(overlay_calls.get(), 1);
+        assert_eq!(cells, [cell(20, 20, [10, 20, 30], [40, 50, 60])]);
     }
 
     #[test]
@@ -384,45 +407,39 @@ mod tests {
     }
 
     #[test]
-    fn each_cell_writes_a_left_and_a_right_pixel() {
-        let cells = diamond(20);
-        let image = render_preview(&cells, &[]).expect("image");
-        // Every written column pair carries the two distinct colours, so a
-        // solid-colour run would mean the pair collapsed.
-        let mut saw_left = false;
-        let mut saw_right = false;
-        for y in 0..image.height {
-            for x in 0..image.width {
-                match image.pixel(x, y) {
-                    Some([10, 20, 30]) => saw_left = true,
-                    Some([40, 50, 60]) => saw_right = true,
-                    _ => {}
-                }
-            }
-        }
-        assert!(
-            saw_left && saw_right,
-            "both halves of the diamond are drawn"
-        );
+    fn halving_averages_each_block_and_drops_an_odd_edge() {
+        let mut image = PreviewImage {
+            width: 5,
+            height: 3,
+            rgba: vec![0; 5 * 3 * 4],
+        };
+        image.fill_rect(0, 0, 2, 2, [200, 100, 0]);
+        image.put_pixel(3, 1, [40, 80, 120]);
+        let half = image.halved();
+        assert_eq!((half.width, half.height, half.rgba.len()), (2, 1, 8));
+        assert_eq!(half.pixel(0, 0), Some([200, 100, 0]));
+        assert_eq!(half.pixel(1, 0), Some([10, 20, 30]));
     }
 
     #[test]
     fn a_black_cell_becomes_grey_rather_than_black() {
         let cells = vec![
-            cell(0, 0, [0, 0, 0], [0, 0, 0]),
+            cell(0, 0, [0, 0, 0], [10, 20, 30]),
             cell(20, 0, [1, 1, 1], [1, 1, 1]),
             cell(0, 20, [1, 1, 1], [1, 1, 1]),
             cell(20, 20, [1, 1, 1], [1, 1, 1]),
         ];
         let image = render_preview(&cells, &[]).expect("image");
-        assert!(
+        assert_eq!(
             image
                 .rgba
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .any(|px| px[..3] == BLACK_PIXEL_SUBSTITUTE),
-            "the black cell was substituted"
+                .filter(|px| px[..3] == BLACK_PIXEL_SUBSTITUTE)
+                .count(),
+            2,
+            "64168B..6416EF substitutes both halves when either is black"
         );
     }
 
@@ -443,25 +460,6 @@ mod tests {
             marker_pixels <= (MARKER_WAYPOINT_COUNT as usize) * 16,
             "at most eight 4x4 markers, got {marker_pixels} pixels"
         );
-    }
-
-    #[test]
-    fn only_the_two_bands_get_their_channels_reordered() {
-        let rgb = [10, 20, 30];
-        // Straight through outside the bands.
-        assert_eq!(overlay_radar_channel_order(0x00, rgb), rgb);
-        assert_eq!(overlay_radar_channel_order(0x7E, rgb), rgb);
-        assert_eq!(overlay_radar_channel_order(0x8B, rgb), rgb);
-        assert_eq!(overlay_radar_channel_order(0x92, rgb), rgb);
-        assert_eq!(overlay_radar_channel_order(0x9F, rgb), rgb);
-        // Green and blue swap inside them, edges included.
-        for id in [0x7F, 0x8A, 0x93, 0x9E] {
-            assert_eq!(
-                overlay_radar_channel_order(id, rgb),
-                [10, 30, 20],
-                "id {id:#04x} sits in a swapped band"
-            );
-        }
     }
 
     #[test]

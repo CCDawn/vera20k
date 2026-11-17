@@ -143,22 +143,9 @@ impl DamageConsequences {
         } = self;
         let ordinary = matches!(&delivery, DamageDelivery::Ordinary { .. });
         for &dead_id in &effects.immediate_uninit_ids {
-            if world
-                .substrate
-                .entities
-                .get(dead_id)
-                .and_then(|building| building.bunker.occupant())
-                .is_some()
-            {
-                crate::sim::docking::bunker_link::release_sell_destroy(
-                    world,
-                    dead_id,
-                    frame_effects,
-                );
-            }
             world.uninit_with_context(
                 dead_id,
-                UninitContext::new(Some(rules), overlay_registry).with_effects(frame_effects),
+                UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
             );
         }
 
@@ -166,29 +153,22 @@ impl DamageConsequences {
         // returning to the caller's animation/cluster tail. Delivery carries
         // only the resulting frame notification, never deferred gameplay.
         let bridge_state_changed = effects.bridge_state_changed;
+        #[cfg(any(test, feature = "test-support"))]
         debug_assert!(effects.tiberium_reduction_requests.is_empty());
-        for request in &effects.tiberium_reduction_requests {
-            world.reduce_tiberium_at_with_native_context(
-                (request.rx, request.ry),
-                request.amount,
-                Some(rules),
-                overlay_registry,
-            );
-        }
         for detonation in effects.rad_detonations.drain(..) {
             world.radiation.apply_detonation(
                 detonation,
-                world.session.binary_frame,
-                &world.session.theater,
-                &rules.radiation,
+                world.session.binary_frame(),
+                &world.session.theater(),
+                rules,
                 world.resolved_terrain.as_ref(),
-                &mut world.lighting_sources.pending,
+                &mut world.lighting_sources,
             );
         }
 
         world.finish_terrain_navigation_changes(rules, &terrain_navigation_changed_cells);
 
-        world.admit_death_debris(std::mem::take(&mut effects.voxel_debris));
+        world.admit_death_debris(std::mem::take(&mut effects.voxel_debris), rules);
         // Explicit callback-disabled fixtures retain their effect packets;
         // production death producers already admitted each birth inline.
         // Remaining effects are `AnimClass` instances, not legacy world effects: only the real
@@ -200,7 +180,7 @@ impl DamageConsequences {
         }
         world
             .combat_light_requests
-            .append(&mut effects.combat_light_requests);
+            .emit_all(effects.combat_light_requests.drain(..));
         // RevealOnFire only lifts the shooter's shroud above. gamemd reaches
         // `CreateRadarEvent @ 0x0065FA70` from no weapon-fire path: its 24
         // constant-type call sites never pass type 0 (the 25th,
@@ -208,26 +188,27 @@ impl DamageConsequences {
         // in `BulletClass::AI` (`0x00467EA7`) is the silent type 13 of the
         // `NUKE` payload (`sim::superweapon::nuke::impact`).
         if let DamageDelivery::Ordinary { fire_events, .. } = delivery {
-            world.fire_events.extend(fire_events);
+            world.fire_events.emit_all(fire_events);
         }
-        for (die_sound_id, rx, ry) in effects.death_sounds.drain(..) {
-            world.sound_events.push(SimSoundEvent::EntityDied {
+        for (die_sound_id, location) in effects.death_sounds.drain(..) {
+            world.sound_events.emit(SimSoundEvent::EntityDied {
                 die_sound_id,
-                rx,
-                ry,
+                world: location,
             });
         }
-        world.dispatch_under_attack_events(&effects.under_attack_events, rules);
+        Simulation::dispatch_under_attack_events(
+            &world.interner,
+            &world.session,
+            &world.house_alliances,
+            &mut world.sound_events,
+            &world.houses,
+            &effects.under_attack_events,
+            rules,
+        );
         world.dispatch_unit_lost_events(&effects.unit_lost_events);
         debug_assert!(effects.smudge_spawn_requests.is_empty());
         if ordinary {
-            debug_assert!(world.pending_smudge_requests.is_empty());
-            world.flush_smudge_dirty();
-            world.pending_smudge_requests.clear();
-        } else {
-            world
-                .pending_smudge_requests
-                .append(&mut effects.smudge_spawn_requests);
+            Simulation::flush_smudge_dirty(&mut world.smudge_grid, &mut world.dirty_cells);
         }
         DamageCommitReceipt {
             area_result: None,
@@ -249,7 +230,7 @@ pub(crate) fn admit_explosion_effect(
             world.admit_death_anim(rules, fx.shp_name, spawn);
         }
         None => {
-            world.spawn_combat_explosion_anim(
+            world.spawn_combat_explosion_anim_with_z_adjust(
                 rules,
                 fx.shp_name,
                 fx.rx,
@@ -258,6 +239,10 @@ pub(crate) fn admit_explosion_effect(
                 fx.sub_y,
                 fx.z,
                 fx.world_z,
+                fx.z_adjust,
+                fx.owner_house,
+                // The impact packet keeps no hold on its anim.
+                false,
             );
         }
     }
@@ -308,7 +293,14 @@ pub(crate) fn admit_muzzle_anim(world: &mut Simulation, rules: &RuleSet, event: 
             type_name, rx, ry, sub_x, sub_y, level,
         )
     };
-    if let Err(error) = world.spawn_anim_at_world(rules, descriptor, coord) {
+    let constructor = world.effect_anim_constructor(rules, type_name);
+    if let Err(error) = world.spawn_anim_at_world_with_constructor(
+        rules,
+        descriptor,
+        coord,
+        constructor,
+        FrameEffects::default(),
+    ) {
         log::debug!(
             "muzzle anim [{}] did not construct: {error}",
             world.interner.resolve(type_name)
@@ -316,7 +308,7 @@ pub(crate) fn admit_muzzle_anim(world: &mut Simulation, rules: &RuleSet, event: 
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_c_o))]
 mod muzzle_anim_tests {
     use super::*;
     use crate::rules::art_data::ArtRegistry;
@@ -325,14 +317,20 @@ mod muzzle_anim_tests {
     use crate::sim::combat::Health;
     use crate::sim::game_entity::GameEntity;
     use crate::sim::projectile::ProjectileCoord;
+    use crate::sim::world::display_layers::DisplayLayer;
 
     fn fixture(category: EntityCategory) -> (Simulation, RuleSet, u64) {
         let mut rules = RuleSet::from_ini(&IniFile::from_str(
             "[VehicleTypes]\n0=TANK\n[BuildingTypes]\n0=TOWER\n[TANK]\nStrength=100\n[TOWER]\nStrength=100\n",
         ))
         .expect("rules");
-        let mut art = ArtRegistry::from_ini(&IniFile::from_str("[GUNFIRE]\nRate=900\n"));
+        // FLASH is a presentation anim; Scorch= keeps GUNFIRE an ordinary
+        // one (its Middle never runs here).
+        let mut art = ArtRegistry::from_ini(&IniFile::from_str(
+            "[GUNFIRE]\nRate=900\nScorch=yes\n[FLASH]\nRate=900\n",
+        ));
         art.bind_anim_frame_count_for_test("GUNFIRE", 6);
+        art.bind_anim_frame_count_for_test("FLASH", 6);
         // Synthetic fixture supplies ART directly, without native read-admission replay.
         rules.install_art_fixture(art);
 
@@ -345,7 +343,7 @@ mod muzzle_anim_tests {
             } else {
                 "TANK"
             });
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         sim.substrate
             .entities
             .insert(GameEntity::new_at_frame_zero_for_test(
@@ -384,14 +382,14 @@ mod muzzle_anim_tests {
         let event = shot(&mut sim, tank, EntityCategory::Unit);
         admit_muzzle_anim(&mut sim, &rules, &event);
         let id = *sim.substrate.anims.iter().next().expect("muzzle anim").0;
-        let relative = sim.anim(id).unwrap().world_coord;
+        let relative = sim.anim(id).unwrap().world_coord();
 
         sim.uninit_with_rules(tank, &rules);
 
         let anim = sim.anim(id).expect("the anim is still stored this frame");
-        assert_eq!(anim.owner_entity, None, "the teardown detached it");
+        assert_eq!(anim.owner_entity(), None, "the teardown detached it");
         assert!(
-            anim.runtime.inactive,
+            anim.runtime().inactive,
             "native19B requests expiry on its next AI"
         );
         assert!(!sim.substrate.pending_delete.contains_object(&id));
@@ -401,5 +399,41 @@ mod muzzle_anim_tests {
             "expiry preserves the stored delta after clearing the owner"
         );
         assert_eq!(sim.substrate.display.layer_of(id), None);
+    }
+
+    /// A flash of a presentation type rides its firer outside Display and
+    /// Logic, spends no unique id, leaves the firer's Object+84 alone and
+    /// ends with the firer's UnInit.
+    #[test]
+    fn a_presentation_flash_rides_its_firer_outside_display_and_ends_with_it() {
+        let (mut sim, rules, tank) = fixture(EntityCategory::Unit);
+        sim.present_effect_anims();
+        sim.reveal(tank);
+        let unique_before = sim.next_native_runtime_id();
+        let mut event = shot(&mut sim, tank, EntityCategory::Unit);
+        event.muzzle_anim = Some(sim.interner.intern("FLASH"));
+        admit_muzzle_anim(&mut sim, &rules, &event);
+
+        assert_eq!(
+            sim.substrate.anims.iter().count(),
+            0,
+            "not in the Anim array"
+        );
+        let drawn: Vec<_> = sim.presentation_anims().collect();
+        assert_eq!(drawn.len(), 1);
+        let (id, layer) = drawn[0];
+        assert_eq!(
+            layer,
+            DisplayLayer::GROUND,
+            "an attached anim draws in Ground"
+        );
+        assert_eq!(sim.substrate.display.layer_of(id), None);
+        assert_eq!(sim.anim(id).unwrap().owner_entity(), Some(tank));
+        assert!(!sim.substrate.entities.get(tank).unwrap().is_parachuted());
+        assert_eq!(sim.next_native_runtime_id(), unique_before + 1);
+        assert!(!sim.presentation_anim_orphaned(id));
+
+        sim.uninit_with_rules(tank, &rules);
+        assert!(sim.presentation_anim_orphaned(id));
     }
 }

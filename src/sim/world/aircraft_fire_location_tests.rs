@@ -44,13 +44,18 @@ fn insert(
         .position
         .set_sub_y_for_test(SimFixed::from_num(point[1] % 256));
     entity.position.set_exact_z_leptons_for_test(Some(point[2]));
-    entity.lifecycle.set_object_alive_for_test(marked);
+    entity.lifecycle.set_object_alive_for_test(true);
+    entity.lifecycle.set_cell_marked_for_test(marked);
     entity.lifecycle.set_in_limbo_for_test(false);
     sim.substrate.entities.insert(entity);
-    sim.substrate.next_stable_object_id = sim.substrate.next_stable_object_id.max(id + 1);
+    sim.set_next_stable_object_id_for_test(sim.next_stable_object_id().max(id + 1));
 }
 
 fn fixture(input: &Value) -> (Simulation, RuleSet) {
+    fixture_with_art(input, &IniFile::empty())
+}
+
+fn fixture_with_art(input: &Value, art: &IniFile) -> (Simulation, RuleSet) {
     let passengers = input["passengers"].as_array().cloned().unwrap_or_default();
     let mut definitions = String::new();
     let mut registered = String::new();
@@ -90,10 +95,13 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
         }
         definitions.push_str(&weapons);
     }
+    // The oracle supplies a zero-filled Type packet rather than constructing
+    // TechnoTypeClass. Match its flat Fly matrix instead of INI defaults.
     let ini = format!(
         "[General]\nFlightLevel=1500\n[AircraftTypes]\n0=TEST\n[VehicleTypes]\n0=TARGET\n1=DEST\n2=BLOCKER\n{registered}\
          [BuildingTypes]\n0=BUILDING\n[BUILDING]\nFoundation=1x1\n\
          [TEST]\nStrength=100\nSpeed=8\nAmmo=2\nLandable=yes\nLocomotor={{4A582746-9839-11D1-B709-00A024DDAFD1}}\n\
+         PitchAngle=0\nPitchSpeed=0\nRollAngle=0\n\
          Primary={}\n{}AirportBound={}\nCarryall={}\nSpawned={}\nOpenTopped={}\nFighter={}\n\
          [TARGET]\nStrength=100\n[DEST]\nStrength=100\n\
          [BLOCKER]\nStrength=100\nSpawned={}\nSpawns=TEST\nSpawnsNumber=1\n\
@@ -121,11 +129,17 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
         input["rot"].as_i64().unwrap_or(3),
         input["inviso"].as_bool().unwrap_or(false),
     );
-    let rules = RuleSet::from_ini(&IniFile::from_str(&ini)).unwrap();
+    let mut rules =
+        RuleSet::from_ini_with_fixed_art_for_test(&IniFile::from_str(&ini), art).unwrap();
+    rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(art));
     let mut sim = Simulation::with_seed(input["seed"].as_u64().unwrap_or(31));
-    sim.session.map_width = 128;
-    sim.session.map_height = 128;
-    sim.session.game_mode_nonzero = input["game_mode"].as_u64().unwrap_or(1) != 0;
+    sim.session.set_map_width_for_test(128);
+    sim.session.set_map_height_for_test(128);
+    sim.session.set_game_mode(
+        crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+            input["game_mode"].as_u64().unwrap_or(1) != 0,
+        ),
+    );
     let local = input["local"]
         .as_array()
         .cloned()
@@ -213,6 +227,14 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
             sim.substrate.entities.get_mut(4).unwrap().spawn_manager = manager;
         }
         if input.get("blocker_cells").is_some() {
+            // Let Mark(DOWN) publish the native packet's explicit ground-list
+            // member; insert() already supplied the independent marked byte.
+            sim.substrate
+                .entities
+                .get_mut(4)
+                .unwrap()
+                .lifecycle
+                .set_cell_marked_for_test(false);
             sim.add_entity_occupancy(4);
         }
     }
@@ -258,12 +280,11 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
     // The original global Cell flags belong to CurrentHouse, even when the
     // searching aircraft belongs to a different house. No UI cache is built.
     let viewer = sim.interner.intern("CURRENT_HOUSE");
-    sim.session.current_house = Some(viewer);
-    sim.houses.insert(
-        viewer,
-        crate::sim::house_state::HouseState::new(viewer, 0, None, true, 0, 1),
-    );
-    sim.session.house_order.push(viewer);
+    sim.session.set_current_house_for_test(Some(viewer));
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            viewer, 0, None, true, 0, 1,
+        ));
     let mut view = serde_json::to_value(OwnerVisibility::new(128, 128)).unwrap();
     for cell in view["ground_flags"].as_array_mut().unwrap() {
         *cell = json!(if input["visible"].as_bool().unwrap_or(true) {
@@ -285,25 +306,29 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
         }
     }
     sim.fog
-        .by_owner
+        .by_owner_mut_for_test()
         .insert(viewer, serde_json::from_value(view).unwrap());
     (sim, rules)
 }
 
 pub(super) fn reengagement_fixture(input: &Value) -> (Simulation, RuleSet) {
+    reengagement_fixture_with_art(input, &IniFile::empty())
+}
+
+pub(super) fn reengagement_fixture_with_art(input: &Value, art: &IniFile) -> (Simulation, RuleSet) {
     use crate::sim::ammo::TechnoAmmo;
     use crate::sim::mission::{MissionDispatchTimer, MissionId, MissionLeafState};
     use crate::sim::movement::locomotor::LocomotorState;
     let mut case = input.clone();
     case["open_topped"] = json!(input["open_transport"].as_bool().unwrap_or(false));
-    let (mut sim, mut rules) = fixture(&case);
+    let (mut sim, mut rules) = fixture_with_art(&case, art);
     rules.general.blockage_path_delay_ticks = 11;
     rules.mission_control =
         crate::rules::mission_data::MissionControl::from_ini(&IniFile::from_str(&format!(
             "[Attack]\nRate={}\n",
             input["rate"].as_f64().unwrap_or(0.016)
         )));
-    sim.session.binary_frame = 100;
+    sim.session.set_binary_frame_for_test(100);
     if input["open_transport"].as_bool().unwrap_or(false) {
         insert(
             &mut sim,
@@ -363,11 +388,11 @@ pub(super) fn reengagement_fixture(input: &Value) -> (Simulation, RuleSet) {
             .bunker
             .set_bunker_link_for_test(crate::sim::docking::bunker_link::BunkerLink::Installed(2));
     }
-    let path = &mut entity.navigation.path_runtime;
+    let path = entity.navigation.path_runtime_mut();
     path.set_movement_timer_for_test(crate::sim::timer::CdTimer::from_raw(7, 23));
     path.set_blocked_timer_for_test(crate::sim::timer::CdTimer::from_raw(9, 29));
-    path.set_retries_left(19);
-    path.set_path_blocked(true);
+    path.set_retries_left_for_test(19);
+    path.set_path_blocked_for_test(true);
     let mut loco = LocomotorState::from_object_type(rules.object("TEST").unwrap(), 0);
     loco.set_powered_for_test(input["powered"].as_bool().unwrap_or(true));
     loco.set_fly_target_height(37);
@@ -398,7 +423,7 @@ pub(super) fn assert_reengagement(sim: &mut Simulation, row: &Value) {
     };
     let fly = entity.locomotor.as_ref().unwrap().fly_runtime().unwrap();
     let point = fly.destination();
-    let path = &entity.navigation.path_runtime;
+    let path = entity.navigation.path_runtime();
     let fields = json!({
         "state": sub_state,
         "delay": entity.mission.dispatch_timer().delay(),
@@ -464,7 +489,7 @@ fn aircraft_reengagement_reserves_in_logic_order_and_ignores_inactive_objects() 
             other.set_stable_id_for_test(id);
             sim.substrate.entities.insert(other);
         }
-        sim.substrate.next_stable_object_id = 10;
+        sim.set_next_stable_object_id_for_test(10);
         sim.set_logic_order_for_test(order.clone());
         crate::sim::aircraft::tick_aircraft_missions(&mut sim, &rules);
         let first = sim.substrate.entities.get(order[0]).unwrap();
@@ -556,6 +581,8 @@ fn fire_location_reads_restored_reservations_cargo_and_current_house() {
     .unwrap();
     for name in [
         "reserved_live",
+        "reserved_unmarked",
+        "reserved_limbo",
         "target_destination",
         "cargo_turret_slot",
         "cargo_elite",
@@ -588,4 +615,193 @@ fn fire_location_reads_restored_reservations_cargo_and_current_house() {
         }
         assert_eq!(sim.state_hash(), restored.state_hash(), "{name}");
     }
+}
+
+/// Unit737E43 restores a fatally hit surface ship, then737F7A unmarks it.
+/// Aircraft419C13..419C22 ignores that hull even while it remains alive.
+/// The supplied sea has one structural bridge: its deck admits Track landing
+/// checks while the hull sinks underneath. Types/read order are stock Hills/Battle.
+#[test]
+fn retail_hornet_launch_move_ignores_an_unmarked_sinking_aegis() {
+    use crate::map::resolved_terrain::test_grid;
+    use crate::rules::terrain_rules::LandType;
+    use crate::sim::combat::{EntityDamageEvent, RAD_NO_ATTACKER, ReceiverCallFlags, TargetKind};
+    use crate::sim::house_state::HouseState;
+    use crate::sim::world::{FrameEffects, ObjectAiCtx};
+
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = retail.rules;
+    let aircraft = rules.object("HORNET").unwrap();
+    assert!(aircraft.spawned && !aircraft.airport_bound && !aircraft.carryall);
+    let hull = rules.object("AEGIS").unwrap();
+    assert!(hull.naval && !hull.organic && hull.spawns.is_none());
+    assert_eq!(hull.weight, 4.0);
+
+    let mut sim = Simulation::with_seed(91);
+    sim.session.set_map_width_for_test(128);
+    sim.session.set_map_height_for_test(128);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+    let mut terrain = test_grid(128, 128, |x, y| {
+        let mut cell = super::super::lifecycle_tests::common_raw_terrain_cell(
+            x,
+            y,
+            0,
+            y == 64 && (58..=60).contains(&x),
+        );
+        cell.land_type = LandType::Water.as_index();
+        cell.base_land_type = cell.land_type;
+        cell.speed_costs = rules.terrain_rules.row(LandType::Water).speed_costs;
+        cell.base_speed_costs = cell.speed_costs;
+        cell.ground_walk_blocked = true;
+        cell
+    });
+    terrain.set_land_speed_rules_for_test(&rules.terrain_rules);
+    sim.install_resolved_terrain_for_new_map(terrain);
+    sim.set_playfield_bounds_for_test(Some(
+        crate::map::playfield::PlayfieldBounds::from_normalized_local_size(64, 0, 0, 64, 64),
+    ));
+    sim.set_playfield_size_height_for_test(Some(64));
+    assert!(sim.rebuild_dynamic_navigation(&rules));
+    for (index, name) in ["Americans", "Russians"].into_iter().enumerate() {
+        let owner = sim.interner.intern(name);
+        sim.houses
+            .register(HouseState::new(owner, index as i32, None, true, 0, 10));
+    }
+    let owner = sim.interner.intern("Americans");
+    sim.session.set_current_house_for_test(Some(owner));
+    let carrier = sim
+        .spawn_object("CARRIER", "Americans", 59, 65, 0, &rules)
+        .unwrap();
+    let hornet = sim
+        .substrate
+        .entities
+        .get(carrier)
+        .unwrap()
+        .spawn_manager
+        .as_ref()
+        .unwrap()
+        .slots()[0]
+        .spawn()
+        .unwrap();
+    assert_eq!(
+        sim.substrate
+            .entities
+            .get(carrier)
+            .unwrap()
+            .spawn_manager
+            .as_ref()
+            .unwrap()
+            .slots()
+            .len(),
+        3
+    );
+    let ship = sim
+        .spawn_object("AEGIS", "Russians", 59, 64, 0, &rules)
+        .unwrap();
+    let enemy = sim
+        .spawn_object("AEGIS", "Russians", 63, 65, 0, &rules)
+        .unwrap();
+    assert!(
+        !crate::sim::combat::in_range::is_on_bridge_for_firing(
+            sim.substrate.entities.get(carrier).unwrap(),
+            sim.resolved_terrain.as_ref().unwrap(),
+        ),
+        "the adjacent deck must not suppress the Spawner weapon"
+    );
+    // The Spawner weapon's existing target writer, then the manager's real
+    // constructor timer, launch and queued Move. Spawned craft cannot take
+    // ordinary player Move orders (Techno700C40). Three slots keep the first
+    // Hornet on Move; a one-slot DEST switches it to Attack in this same visit.
+    sim.substrate
+        .entities
+        .get_mut(carrier)
+        .unwrap()
+        .spawn_manager
+        .as_mut()
+        .unwrap()
+        .set_target(Some(TargetKind::Entity(enemy)));
+    for frame in [20, 30] {
+        sim.session.set_binary_frame_for_test(frame);
+        crate::sim::spawn_manager::spawn_manager_ai(
+            &mut sim,
+            &rules,
+            carrier,
+            None,
+            FrameEffects::default(),
+        );
+    }
+    let target = Some(NavTargetRef::cell(59, 64));
+    let actor = sim.substrate.entities.get(hornet).unwrap();
+    assert!(!actor.lifecycle.in_limbo());
+    assert_eq!(actor.navigation.nav_com(), target, "launch Adjacent(0)");
+    assert_eq!(
+        actor.mission.queued().known(),
+        Some(crate::sim::mission::MissionType::Move)
+    );
+    if actor.mission.current().known() != Some(crate::sim::mission::MissionType::Move) {
+        assert!(sim.mission_ready_to_commence(hornet, &rules));
+        assert!(
+            sim.substrate
+                .mission_commence_exact(hornet, sim.session.binary_frame())
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        sim.substrate
+            .entities
+            .get(hornet)
+            .unwrap()
+            .mission
+            .handler_state(),
+        0
+    );
+    let ship_entity = sim.substrate.entities.get(ship).unwrap();
+    assert!(ship_entity.lifecycle.cell_marked());
+    assert!(!ship_entity.on_bridge.get());
+    assert!(ship_entity.spawn_manager.is_none());
+    assert!(!sim.aircraft_cell_free_for_landing(hornet, (59, 64), false, &rules, &mut None));
+
+    let warhead = sim.interner.intern(&rules.bridge_warheads.c4_name);
+    let hit = EntityDamageEvent::direct_receiver(
+        ship,
+        100_000,
+        0,
+        RAD_NO_ATTACKER,
+        None,
+        warhead,
+        ReceiverCallFlags {
+            ignore_defenses: false,
+            arg6: false,
+        },
+    );
+    sim.commit_noncombat_aoe_hits(&rules, None, &[hit], FrameEffects::default());
+    let retained = sim.substrate.entities.get(ship).unwrap();
+    assert!(retained.sinking.is_active());
+    assert_eq!(retained.health.current(), 1);
+    assert!(retained.lifecycle.object_alive() && !retained.lifecycle.in_limbo());
+    assert!(!retained.lifecycle.cell_marked());
+    assert!(!sim.substrate.pending_delete.contains_object(&ship));
+    assert!(sim.aircraft_cell_free_for_landing(hornet, (59, 64), false, &rules, &mut None));
+    assert!(
+        sim.foot_land_zone_clear(hornet, target.unwrap(), &rules),
+        "empty bridge deck"
+    );
+    let before = sim.scenario_rng.logical_state();
+    assert_eq!(
+        sim.aircraft_find_attack_cell(hornet, target, &rules),
+        target
+    );
+    assert_eq!(sim.scenario_rng.logical_state(), before, "no ring search");
+
+    crate::sim::aircraft::dispatch_mission(&mut sim, hornet, &rules, ObjectAiCtx::default());
+    let actor = sim.substrate.entities.get(hornet).unwrap();
+    assert_eq!(
+        actor.mission.current().known(),
+        Some(crate::sim::mission::MissionType::Move)
+    );
+    assert_eq!(actor.mission.handler_state(), 1);
+    assert_eq!(actor.navigation.nav_com(), target);
 }

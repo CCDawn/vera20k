@@ -20,20 +20,24 @@
 //!    all distances are zero and the first house in HouseClass::Array that is
 //!    not the house, not passive and not defeated takes one anger point,
 //!    ally or not. The anger rescan ([`update_anger_nodes`]) picks the enemy.
-//!    Its own timer (`+0x5640`/`+0x5648`, [`ENEMY_SEARCH_TIMER`]) has no
-//!    writer after the constructor.
+//!    Its own per-house timer (`+0x5640`/`+0x5648`) starts from
+//!    `AIHateDelays[difficulty]` during non-campaign Post_Map_Init
+//!    (`0x00686A12..0x00686A2B`); Strategy never restarts it.
 //! 2. A defeated enemy's anger is cancelled and the enemy forgotten
 //!    (`0x004FD723..0x004FD772`).
 //! 3. AI_TryFireSW (`0x005098F0`, `superweapon::ai_fire`) in a nonzero game
 //!    mode or from `[IQ] SuperWeapons=` (`0x004FD77C..0x004FD79B`): the
 //!    house fires its charged superweapons.
-//! 4. The emergency block ([`advance_emergency_state`]); state four sells
-//!    everything and sends everyone hunting.
+//! 4. The emergency block
+//!    ([`crate::sim::house_state::HouseStrategyEmergencyState::advance`]);
+//!    state four sells everything and sends everyone hunting.
 //! 5. In a nonzero game mode, a house outside state three with no live
 //!    building whose type has `Factory=` sells everything and sends everyone
 //!    hunting as well (`0x004FD879..0x004FD904`); then a house that must
 //!    rebuild its economy (Check_Build_Need, asked first) runs
-//!    Manage_Build_Queue (`sim::ai_build_need`).
+//!    Manage_Build_Queue (`sim::ai_build_need`). Phobos
+//!    `[General] AIFireSale=`/`AIAllToHunt=` gate only these two last-legs
+//!    calls; `AIFireSaleDelay=` arms a per-house timer on the first reach.
 //!
 //! Evidence: `tools/ai_strategy_oracle.py` runs the Update block, whole
 //! Strategy with the original UpdateAngerNodes, Fire_Sale and All_To_Hunt;
@@ -50,30 +54,21 @@
 //!   (`0x004FD5B9..0x004FD5E5`) is dormant: no cell's coordinate is zero.
 
 use crate::sim::world::FrameEffects;
-use std::collections::BTreeMap;
 
 use crate::map::entities::EntityCategory;
-use crate::map::houses::HouseAllianceMap;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::house_state::{HouseState, HouseStrategyEmergencyState};
+use crate::sim::house_diplomacy::HouseAlliances;
+use crate::sim::house_state::HouseState;
+use crate::sim::houses::Houses;
 use crate::sim::intern::{InternedId, StringInterner};
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::production::{SellOrder, sell_back};
-use crate::sim::timer::CdTimer;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::world::Simulation;
 
-const LOW_WALLET_THRESHOLD: i32 = 25;
-const ATTACK_SUPPRESSION_FRAMES: i32 = 900;
-const ANGER_DECAY_PERIOD_FRAMES: i32 = 100;
 /// `0x004FD918..0x004FD928`: `RandomRanged(1, 7) + 105`.
 const RESCHEDULE_BASE_FRAMES: i32 = 105;
-/// The enemy search's timer (`+0x5640`/`+0x5648`) as the constructor leaves
-/// it (`0x004F5BAE..0x004F5BBA`), started at the construction frame, 0, with
-/// no delay; nothing writes it later. It is expired until the signed frame
-/// wraps.
-const ENEMY_SEARCH_TIMER: CdTimer = CdTimer::started(0, 0);
-
 /// `HouseClass::Update @ 0x004F8FBE..0x004F9032`: a computer house whose
 /// Strategy timer has expired runs [`building_strategy`], and the timer
 /// restarts at this frame with the delay it returns.
@@ -84,19 +79,29 @@ pub(crate) fn update_strategy(
     registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     frame_effects: FrameEffects<'_>,
 ) {
-    let frame = sim.session.binary_frame as i32;
+    let frame = sim.session.binary_frame() as i32;
     let Some(house) = sim.houses.get(&owner) else {
         return;
     };
-    if !house.strategy_timer.expired(frame)
-        || house.is_controlled_by_human(sim.session.game_mode_nonzero)
-        || house.multiplay_passive
-    {
+    if !house.strategy_timer().expired(frame) {
+        return;
+    }
+    if house.is_controlled_by_human(sim.session.game_mode_nonzero()) {
+        // Ares4F9004 hook10034CD0 calls AI_TryFireSW for humans, after
+        // the existing strategy timer gate, without restarting that timer.
+        if rules.ares_form() {
+            crate::sim::superweapon::ai_fire::try_fire(sim, rules, owner, registry, frame_effects);
+        }
+        return;
+    }
+    // Fork: command-driven houses (the Super AI) run their own economy;
+    // the native building strategy must not fight it.
+    if house.multiplay_passive() || house.command_driven() {
         return;
     }
     let delay = building_strategy(sim, rules, owner, registry, frame_effects);
     if let Some(house) = sim.houses.get_mut(&owner) {
-        house.strategy_timer.start(frame, delay);
+        house.restart_strategy_timer(frame, delay);
     }
 }
 
@@ -109,25 +114,42 @@ fn building_strategy(
     registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     frame_effects: FrameEffects<'_>,
 ) -> i32 {
-    pick_enemy(sim, owner);
-    forget_defeated_enemy(sim, owner);
+    pick_enemy(
+        &sim.interner,
+        &sim.session,
+        &sim.house_alliances,
+        &mut sim.houses,
+        owner,
+        rules.ares_form(),
+        rules.general.ai_nearest_enemy,
+    );
+    forget_defeated_enemy(
+        &sim.interner,
+        &sim.house_alliances,
+        &mut sim.houses,
+        owner,
+        sim.session.game_mode_nonzero(),
+        rules.ares_form(),
+        rules.general.ai_nearest_enemy,
+    );
     // `0x004FD77C..0x004FD79B`: a signed IQ (`+0x24C`) compare.
-    if sim.session.game_mode_nonzero
+    if sim.session.game_mode_nonzero()
         || sim
             .houses
             .get(&owner)
-            .is_some_and(|house| house.current_iq >= rules.general.iq_super_weapons)
+            .is_some_and(|house| house.current_iq() >= rules.general.iq_super_weapons)
     {
         crate::sim::superweapon::ai_fire::try_fire(sim, rules, owner, registry, frame_effects);
     }
 
     // Available_Money (IHouse vt+0x18) is a pure read; the block's second
     // query sees the same value.
-    let money = crate::sim::credit_income::available_money(sim, owner);
-    let frame = sim.session.binary_frame as i32;
-    let emergency = sim.houses.get_mut(&owner).is_some_and(|house| {
-        advance_emergency_state(&mut house.strategy_emergency, frame, || money)
-    });
+    let money = crate::sim::credit_income::available_money(&sim.houses, owner);
+    let frame = sim.session.binary_frame() as i32;
+    let emergency = sim
+        .houses
+        .get_mut(&owner)
+        .is_some_and(|house| house.strategy_emergency_mut().advance(frame, || money));
     if emergency {
         sell_off_and_hunt(sim, rules, owner, "state four", registry, frame_effects);
     }
@@ -136,15 +158,15 @@ fn building_strategy(
     // slot 1 Check_Build_Need's answer (0 or 1), both asked before either
     // acts; from level 4 down, slot 0's sells off and hunts and slot 1's
     // runs Manage_Build_Queue.
-    if sim.session.game_mode_nonzero {
+    if sim.session.game_mode_nonzero() {
         let suppressed = sim
             .houses
             .get(&owner)
-            .is_none_or(|house| house.strategy_emergency.mode == 3);
+            .is_none_or(|house| house.strategy_emergency().mode() == 3);
         let no_factory = !suppressed && !has_live_factory(sim, rules, owner);
         let build_need = crate::sim::ai_build_need::check_build_need(sim, rules, owner);
         if no_factory {
-            sell_off_and_hunt(sim, rules, owner, "no factory", registry, frame_effects);
+            last_legs_actions(sim, rules, owner, registry, frame_effects);
         }
         if build_need {
             crate::sim::ai_build_need::manage_build_queue(
@@ -179,68 +201,166 @@ fn sell_off_and_hunt(
     all_to_hunt(sim, rules, owner, registry, frame_effects);
 }
 
+/// `0x004FD8F7..0x004FD907`, the no-factory block's calls, as Phobos
+/// `[General] AIFireSale=`, `AIFireSaleDelay=` and `AIAllToHunt=` gate them
+/// (`src/Ext/House/Hooks.cpp`) when Phobos plays (`RuleSet::phobos`).
+/// All_To_Hunt still runs while the delayed sale waits, and the timer is armed
+/// once and then only read.
+fn last_legs_actions(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    frame_effects: FrameEffects<'_>,
+) {
+    if rules.phobos() {
+        phobos_last_legs_actions(sim, rules, owner, registry, frame_effects);
+    } else {
+        sell_off_and_hunt(sim, rules, owner, "no factory", registry, frame_effects);
+    }
+}
+
+fn phobos_last_legs_actions(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    frame_effects: FrameEffects<'_>,
+) {
+    if rules.general.ai_fire_sale {
+        let frame = sim.session.binary_frame() as i32;
+        let delay = rules.general.ai_fire_sale_delay;
+        let sale_due = if delay <= 0 {
+            true
+        } else {
+            match sim
+                .houses
+                .get(&owner)
+                .map(|house| house.strategy_emergency().ai_fire_sale_delay_timer())
+            {
+                Some(Some(timer)) => timer.expired(frame),
+                Some(None) => {
+                    if let Some(house) = sim.houses.get_mut(&owner) {
+                        house
+                            .strategy_emergency_mut()
+                            .start_ai_fire_sale_delay(frame, delay);
+                    }
+                    false
+                }
+                None => false,
+            }
+        };
+        if sale_due {
+            log::debug!("{} sells off on its last legs", sim.interner.resolve(owner));
+            fire_sale(sim, rules, owner, registry, frame_effects);
+        }
+    }
+    if rules.general.ai_all_to_hunt {
+        all_to_hunt(sim, rules, owner, registry, frame_effects);
+    }
+}
+
 /// `0x004FD538..0x004FD71E`: see the module doc.
-fn pick_enemy(sim: &mut Simulation, owner: InternedId) {
-    if !ENEMY_SEARCH_TIMER.expired(sim.session.binary_frame as i32)
-        || !sim.session.game_mode_nonzero
+fn pick_enemy(
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    house_alliances: &HouseAlliances,
+    houses: &mut Houses,
+    owner: InternedId,
+    ares: bool,
+    nearest_enemy: bool,
+) {
+    if !session.game_mode_nonzero() {
+        return;
+    }
+    let Some(house) = houses.get(&owner) else {
+        return;
+    };
+    if !house
+        .enemy_search_timer()
+        .expired(session.binary_frame() as i32)
+        || house.enemy_house().is_some()
+        || house.multiplay_passive()
+        || house.base_origin() == (0, 0)
     {
         return;
     }
-    let Some(house) = sim.houses.get(&owner) else {
-        return;
-    };
-    if house.enemy_house.is_some() || house.multiplay_passive || house.base_origin() == (0, 0) {
-        return;
-    }
-    let first = sim.session.house_order.iter().copied().find(|&peer| {
+    let first = houses.order().iter().copied().find(|&peer| {
         peer != owner
-            && sim
-                .houses
+            && houses
                 .get(&peer)
-                .is_some_and(|peer| !peer.multiplay_passive && !peer.is_defeated)
+                .is_some_and(|peer| !peer.multiplay_passive() && !peer.is_defeated())
     });
-    if let Some(peer) = first {
+    // VERA `[General] AINearestEnemy=` (off by default; the original's
+    // distances are all zero, see the module doc): the candidate that is no
+    // ally and whose base centre is nearest, the earlier house on a tie.
+    let nearest = nearest_enemy
+        .then(|| {
+            let origin = house.base_origin();
+            houses
+                .order()
+                .iter()
+                .copied()
+                .filter(|&peer| {
+                    peer != owner
+                        && houses
+                            .get(&peer)
+                            .is_some_and(|peer| !peer.multiplay_passive() && !peer.is_defeated())
+                        && !house_alliances.is_allied(interner, owner, peer)
+                })
+                .min_by_key(|peer| base_distance_squared(origin, houses[peer].base_origin()))
+        })
+        .flatten();
+    if let Some(peer) = nearest.or(first) {
         update_anger_nodes(
-            &mut sim.houses,
-            &sim.session.house_order,
-            &sim.house_alliances,
-            &sim.interner,
+            houses,
+            house_alliances,
+            interner,
             owner,
             peer,
             1,
+            session.game_mode_nonzero(),
+            ares,
+            nearest_enemy,
         );
     }
 }
 
 /// `0x004FD723..0x004FD772`: a defeated enemy's anger node is cancelled
 /// (the anger rescan runs) and the enemy forgotten.
-fn forget_defeated_enemy(sim: &mut Simulation, owner: InternedId) {
-    let Some(enemy) = sim.houses.get(&owner).and_then(|house| house.enemy_house) else {
+fn forget_defeated_enemy(
+    interner: &StringInterner,
+    house_alliances: &HouseAlliances,
+    houses: &mut Houses,
+    owner: InternedId,
+    game_mode_nonzero: bool,
+    ares: bool,
+    nearest_enemy: bool,
+) {
+    let Some(enemy) = houses.get(&owner).and_then(|house| house.enemy_house()) else {
         return;
     };
-    if !sim
-        .houses
-        .get(&enemy)
-        .is_some_and(|house| house.is_defeated)
-    {
+    if !houses.get(&enemy).is_some_and(|house| house.is_defeated()) {
         return;
     }
-    let anger = sim.houses[&owner]
-        .grudge_scores
+    let anger = houses[&owner]
+        .grudge_scores()
         .get(&enemy)
         .copied()
         .unwrap_or(0);
     update_anger_nodes(
-        &mut sim.houses,
-        &sim.session.house_order,
-        &sim.house_alliances,
-        &sim.interner,
+        houses,
+        house_alliances,
+        interner,
         owner,
         enemy,
         anger.wrapping_neg(),
+        game_mode_nonzero,
+        ares,
+        nearest_enemy,
     );
-    if let Some(house) = sim.houses.get_mut(&owner) {
-        house.enemy_house = None;
+    if let Some(house) = houses.get_mut(&owner) {
+        house.forget_enemy();
     }
 }
 
@@ -249,7 +369,7 @@ fn forget_defeated_enemy(sim: &mut Simulation, owner: InternedId) {
 /// `Factory=` (`+0xEB8`).
 fn has_live_factory(sim: &Simulation, rules: &RuleSet, owner: InternedId) -> bool {
     sim.houses.get(&owner).is_some_and(|house| {
-        house.base_projection.buildings().iter().any(|&id| {
+        house.base_projection().buildings().iter().any(|&id| {
             sim.substrate.entities.get(id).is_some_and(|building| {
                 building.is_ai_alive()
                     && !building.lifecycle.in_limbo()
@@ -276,14 +396,14 @@ pub(crate) fn fire_sale(
     let Some(house) = sim.houses.get(&owner) else {
         return;
     };
-    if house.tracking.buildings() <= 0 {
+    if house.tracking().buildings() <= 0 {
         return;
     }
-    for slot in 0..house.base_projection.buildings().len() {
+    for slot in 0..house.base_projection().buildings().len() {
         let Some(id) = sim
             .houses
             .get(&owner)
-            .and_then(|house| house.base_projection.buildings().get(slot).copied())
+            .and_then(|house| house.base_projection().buildings().get(slot).copied())
         else {
             break;
         };
@@ -321,11 +441,11 @@ pub(crate) fn all_to_hunt(
     registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     frame_effects: FrameEffects<'_>,
 ) {
-    // Steam3e81a617..08600:501400 captures count once;50141D/501423
+    // Steam gamemd:501400 captures count once;50141D/501423
     // re-read the array and its indexed object after callbacks. Storage
     // snapshots hide intervening removals from this existing registry.
     let count = sim.substrate.entities.techno_registry_len();
-    let human = sim.houses.get(&owner).is_some_and(|house| house.is_human);
+    let human = sim.houses.get(&owner).is_some_and(|house| house.is_human());
     let hunt = MissionId::from_known(MissionType::Hunt);
     for index in (0..count).rev() {
         let Some(id) = sim.substrate.entities.techno_registry_at(index) else {
@@ -360,6 +480,9 @@ pub(crate) fn all_to_hunt(
             continue;
         }
         if techno.category() == EntityCategory::Structure {
+            // RESIDUAL (invisible): native sells only a building with
+            // occupants (0x005014F9); this also clears an empty building's
+            // CurrentFireIdx.
             crate::sim::passenger::garrison_eject::sell_building_occupants(
                 sim,
                 rules,
@@ -370,17 +493,17 @@ pub(crate) fn all_to_hunt(
             );
             continue;
         }
-        sim.leave_team(id, false, Some(rules), frame_effects);
+        sim.leave_team(id, false, rules, frame_effects);
         let _ = sim.mission_queue_exact(
             id,
             hunt,
             0,
-            sim.session.binary_frame,
-            &EntityReadyInputProvider,
+            sim.session.binary_frame(),
+            &LiveReadyInputProvider { rules },
         );
     }
     if let Some(house) = sim.houses.get_mut(&owner) {
-        house.strategy_emergency.set_all_to_hunt_bias();
+        house.strategy_emergency_mut().set_all_to_hunt_bias();
     }
 }
 
@@ -391,114 +514,92 @@ pub(crate) fn all_to_hunt(
 /// a strict-positive/strict-greater winner rule. Rust's sparse map represents
 /// untouched constructor-zero nodes without materializing serialized state.
 /// With no winner the enemy is cleared (`0x0050484F`).
+///
+/// Ares 3.0 HouseClass_AddAnger_MultiplayPassive 10023FB0 (hook
+/// `0x00504796`): outside a campaign (`game_mode_nonzero`) the node update
+/// loop runs zero times for a `MultiplayPassive` peer; the enemy rescan
+/// still runs. `ares` is the caller's `rules.ares_form()`.
+///
+/// VERA `[General] AINearestEnemy=` (`nearest_enemy`, off by default): among
+/// peers of equal anger the one whose base centre is nearer wins, instead of
+/// the earlier house.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn update_anger_nodes(
-    houses: &mut BTreeMap<InternedId, HouseState>,
-    house_order: &[InternedId],
-    alliances: &HouseAllianceMap,
+    houses: &mut crate::sim::houses::Houses,
+    alliances: &HouseAlliances,
     interner: &StringInterner,
     owner: InternedId,
     peer: InternedId,
     delta: i32,
+    game_mode_nonzero: bool,
+    ares: bool,
+    nearest_enemy: bool,
 ) {
-    let peer_is_registered =
-        peer != owner && house_order.contains(&peer) && houses.contains_key(&peer);
+    let passive_peer =
+        ares && game_mode_nonzero && houses.get(&peer).is_some_and(HouseState::multiplay_passive);
+    let peer_is_registered = peer != owner && houses.contains_key(&peer);
     if peer_is_registered
+        && !passive_peer
         && let Some(house) = houses.get_mut(&owner)
-        && (delta != 0 || house.grudge_scores.contains_key(&peer))
     {
-        let score = house.grudge_scores.entry(peer).or_insert(0);
-        *score = score.wrapping_add(delta);
+        house.add_anger(peer, delta);
     }
 
     let Some(house) = houses.get(&owner) else {
         return;
     };
+    let origin = house.base_origin();
     let mut best_score = 0;
+    let mut best_distance = u64::MAX;
     let mut best_house = None;
-    for &candidate_id in house_order {
+    for &candidate_id in houses.order() {
         if candidate_id == owner {
             continue;
         }
         let Some(candidate) = houses.get(&candidate_id) else {
             continue;
         };
-        let score = house.grudge_scores.get(&candidate_id).copied().unwrap_or(0);
-        if score > best_score
-            && !candidate.is_defeated
-            && !crate::map::houses::is_allied_with(
-                alliances,
-                interner.resolve(owner),
-                interner.resolve(candidate_id),
-            )
+        let score = house
+            .grudge_scores()
+            .get(&candidate_id)
+            .copied()
+            .unwrap_or(0);
+        let distance = if nearest_enemy {
+            base_distance_squared(origin, candidate.base_origin())
+        } else {
+            0
+        };
+        let nearer_tie = nearest_enemy
+            && best_house.is_some()
+            && score == best_score
+            && distance < best_distance;
+        if (score > best_score || nearer_tie)
+            && !candidate.is_defeated()
+            && !alliances.is_allied(interner, owner, candidate_id)
         {
             best_score = score;
+            best_distance = distance;
             best_house = Some(candidate_id);
         }
     }
     if let Some(house) = houses.get_mut(&owner) {
-        house.enemy_house = best_house;
+        house.assign_enemy(best_house);
     }
 }
 
-/// Apply the unconditional House-update anger decay without enemy reselection.
-///
-/// gamemd-derived: `HouseClass__Update @ 0x004F8440`. On exact signed frame
-/// multiples of 100, native forward-walks the registered peer vector and
-/// decrements only scores strictly greater than one.
-pub(crate) fn decay_anger_scores(
-    house: &mut HouseState,
-    house_order: &[InternedId],
-    current_frame: i32,
-) {
-    if current_frame % ANGER_DECAY_PERIOD_FRAMES != 0 {
-        return;
+/// VERA `AINearestEnemy=`: the squared cell distance between two base
+/// centres. A house without one (`(0, 0)`) is the farthest; with no centre
+/// of its own every peer is equally far and house order decides.
+fn base_distance_squared(origin: (u16, u16), peer: (u16, u16)) -> u64 {
+    if origin == (0, 0) {
+        return 0;
     }
-    for &peer in house_order {
-        if peer == house.name {
-            continue;
-        }
-        if let Some(score) = house.grudge_scores.get_mut(&peer)
-            && *score > 1
-        {
-            *score = score.wrapping_sub(1);
-        }
+    if peer == (0, 0) {
+        return u64::MAX;
     }
-}
-
-/// Strategy's emergency block (`0x004FD7A0..0x004FD848`) on `House+0x250`:
-/// state four only asks for Fire_Sale and All_To_Hunt (true). Otherwise zero
-/// becomes one below 25 credits and one becomes zero at 25 or more (a zero
-/// that just became one asks again); then three ends once the last building
-/// attack (`+0x54D8`) is more than 900 frames ago, and any other state
-/// becomes three within those 900 frames.
-pub(crate) fn advance_emergency_state(
-    state: &mut HouseStrategyEmergencyState,
-    current_frame: i32,
-    mut available_wallet: impl FnMut() -> i32,
-) -> bool {
-    if state.mode == 4 {
-        return true;
-    }
-
-    if state.mode == 0 && available_wallet() < LOW_WALLET_THRESHOLD {
-        state.mode = 1;
-    }
-    if state.mode == 1 && available_wallet() >= LOW_WALLET_THRESHOLD {
-        state.mode = 0;
-    }
-
-    let deadline = state
-        .last_building_attack_frame
-        .wrapping_add(ATTACK_SUPPRESSION_FRAMES);
-    if state.mode == 3 {
-        if deadline < current_frame {
-            state.mode = 0;
-        }
-    } else if current_frame < deadline {
-        state.mode = 3;
-    }
-
-    false
+    let dx = u64::from(origin.0.abs_diff(peer.0));
+    let dy = u64::from(origin.1.abs_diff(peer.1));
+    dx * dx + dy * dy
 }
 
 /// Exact `House+0x249` decision consumed by native
@@ -509,9 +610,9 @@ pub(crate) fn all_to_hunt_score_override(
     attacker_house: &HouseState,
     candidate_owner: InternedId,
 ) -> Option<i32> {
-    if attacker_house.strategy_emergency.all_to_hunt_bias
+    if attacker_house.strategy_emergency().all_to_hunt_bias()
         && attacker_house
-            .enemy_house
+            .enemy_house()
             .is_some_and(|enemy| candidate_owner != enemy)
     {
         Some(1)
@@ -520,6 +621,6 @@ pub(crate) fn all_to_hunt_score_override(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "house_strategy_tests.rs"]
 mod tests;

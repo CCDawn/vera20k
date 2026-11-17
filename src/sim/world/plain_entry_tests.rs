@@ -74,7 +74,7 @@ fn terrain_cell(
     sim.resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(x as u16, y as u16)
+        .cell_mut_for_test(x as u16, y as u16)
         .unwrap()
 }
 
@@ -151,6 +151,13 @@ fn east(sim: &Simulation, height: i32) -> InfantryEntryArgs {
 #[test]
 fn a_plain_step_answers_as_the_full_body() {
     let (mut sim, rules, registry) = fixture();
+    // An interior target, whose backstep is found by its index.
+    let terrain = sim.resolved_terrain.as_ref().unwrap();
+    assert!(
+        terrain
+            .interior_cells()
+            .is_some_and(|interior| interior.contains((16, 15)))
+    );
     let answered = |sim: &Simulation, id, height| {
         let (plain, full) = step(sim, &rules, &registry, id, east(sim, height));
         assert_eq!(plain.map(Ok), Some(full.clone()), "mover {id}");
@@ -164,15 +171,16 @@ fn a_plain_step_answers_as_the_full_body() {
         .as_mut()
         .unwrap()
         .place_overlay(16, 15, 5, 0);
-    terrain_cell(&mut sim, TARGET).bridge_facts.overlay_id = Some(5);
     for id in [ENGINEER, TRUCK] {
         assert_eq!(answered(&sim, id, 0), 0);
     }
     // A zero Wheel row refuses only the truck.
-    terrain_cell(&mut sim, TARGET).speed_costs.wheel = Some(0);
+    terrain_cell(&mut sim, TARGET).speed_costs.wheel =
+        Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO);
     assert_eq!(answered(&sim, ENGINEER, 0), 0);
     assert_eq!(answered(&sim, TRUCK, 0), 7);
-    terrain_cell(&mut sim, TARGET).speed_costs.foot = Some(0);
+    terrain_cell(&mut sim, TARGET).speed_costs.foot =
+        Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO);
     assert_eq!(answered(&sim, ENGINEER, 0), 7);
     sim.substrate
         .entities
@@ -229,7 +237,6 @@ fn a_step_needing_more_than_the_land_row_takes_the_full_body() {
                 .as_mut()
                 .unwrap()
                 .place_overlay(16, 15, 2, 0);
-            terrain_cell(sim, TARGET).bridge_facts.overlay_id = Some(2);
         },
         &level,
     );
@@ -240,7 +247,6 @@ fn a_step_needing_more_than_the_land_row_takes_the_full_body() {
                 .as_mut()
                 .unwrap()
                 .place_overlay(16, 15, 4, 0);
-            terrain_cell(sim, TARGET).bridge_facts.overlay_id = Some(4);
         },
         &level,
     );
@@ -250,7 +256,6 @@ fn a_step_needing_more_than_the_land_row_takes_the_full_body() {
             .as_mut()
             .unwrap()
             .place_overlay(16, 15, 5, 0);
-        terrain_cell(&mut sim, TARGET).bridge_facts.overlay_id = Some(5);
         for id in [ENGINEER, TRUCK] {
             let args = east(&sim, 0);
             assert_eq!(step_to(&sim, &rules, None, id, TARGET, args).0, None);

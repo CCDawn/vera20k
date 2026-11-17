@@ -13,7 +13,7 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
     let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
         "[AircraftTypes]\n0=ORCA\n[ORCA]\nStrength=150\nSpeed=8\nAmmo=2\nROT=5\n\
          Primary=Gun\n{}Fighter={}\nLocomotor={{4A582746-9839-11d1-B709-00A024DDAFD1}}\n{}\
-         [Gun]\nDamage=10\nROF=20\nRange=20\nBurst={}\nOmniFire={}\nProjectile=Shell\nWarhead=WH\n{}\
+         [Gun]\nDamage=10\nROF=20\nRange=20\nBurst={}\nOmniFire={}\nProjectile=Shell\nWarhead=WH\n{}{}\
          [EliteGun]\nDamage=10\nROF=37\nRange=20\nBurst={}\nProjectile=Shell\nWarhead=WH\n\
          [Shell]\nROT={}\nInviso={}\nAG=yes\nAA=yes\n\
          [WH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n{}{}",
@@ -29,6 +29,11 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
         input["speed"]
             .as_i64()
             .map_or(String::new(), |speed| format!("Speed={speed}\n")),
+        if input["suicide"].as_bool().unwrap_or(false) {
+            "Suicide=yes\n"
+        } else {
+            ""
+        },
         input["elite_burst"].as_i64().unwrap_or(3),
         input["rot"].as_i64().unwrap_or(3),
         input["inviso"].as_bool().unwrap_or(true),
@@ -79,7 +84,7 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
         entity.passenger_role = crate::sim::passenger::PassengerRole::transport(cargo);
     }
     sim.substrate.entities.insert(entity);
-    sim.substrate.next_stable_object_id = 2;
+    sim.set_next_stable_object_id_for_test(2);
     sim.interner = test_interner();
     if passenger {
         // Retail Clear ground and a playfield holding the aircraft's cell
@@ -87,13 +92,13 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
         sim.install_resolved_terrain_for_new_map(
             crate::map::resolved_terrain::test_retail_clear_grid(64, 64),
         );
-        sim.playfield_bounds = Some(crate::map::playfield::PlayfieldBounds {
+        sim.set_playfield_bounds_for_test(Some(crate::map::playfield::PlayfieldBounds {
             base: 10,
             off_fc: 0,
             off_100: 0,
             off_104: 60,
             off_108: 60,
-        });
+        }));
         let mut infantry = GameEntity::test_default(2, "E1", "Americans", 10, 10);
         infantry.set_owner_for_test(sim.interner.intern("Americans"));
         infantry.set_type_ref_for_test(sim.interner.intern("E1"));
@@ -102,7 +107,7 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
         infantry.set_sub_cell(Some(2));
         infantry.passenger_role = crate::sim::passenger::PassengerRole::inside_for_test(1, false);
         sim.substrate.entities.insert(infantry);
-        sim.substrate.next_stable_object_id = 3;
+        sim.set_next_stable_object_id_for_test(3);
     }
     sim.set_logic_order_for_test(vec![1]);
     (sim, rules)
@@ -113,7 +118,10 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
 fn dispatch(sim: &mut Simulation, rules: &RuleSet) -> Vec<SimFireEvent> {
     let before = sim.fire_events.len();
     crate::sim::aircraft::tick_aircraft_missions(sim, rules);
-    sim.fire_events.split_off(before)
+    let mut events = sim.fire_events.take_for_test();
+    let fired = events.split_off(before);
+    sim.fire_events.emit_all(events);
+    fired
 }
 
 #[test]
@@ -133,10 +141,10 @@ fn shared_fireat_refuses_positive_health_limbo_objects_before_emission() {
         ("terrain", true, false, true),
     ] {
         let (mut sim, rules) = fixture(&serde_json::json!({
-            "extra_ini": format!("[TerrainTypes]\n0=TREE01\n[TREE01]\nStrength=100\n\
+            "suicide": suicide,
+            "extra_ini": "[TerrainTypes]\n0=TREE01\n[TREE01]\nStrength=100\n\
                 [VehicleTypes]\n0=TARGET\n[TARGET]\nStrength=100\n\
-                [BuildingTypes]\n0=TARGETBUILD\n[TARGETBUILD]\nStrength=100\n\
-                [Gun]\nSuicide={}\n", if suicide { "yes" } else { "no" })
+                [BuildingTypes]\n0=TARGETBUILD\n[TARGETBUILD]\nStrength=100\n"
         }));
         match kind {
             "unit" | "building" => {
@@ -153,7 +161,7 @@ fn shared_fireat_refuses_positive_health_limbo_objects_before_emission() {
             }
             "terrain" => {
                 let type_ref = sim.interner.intern("TREE01");
-                sim.production.terrain_objects.insert(
+                sim.terrain_objects.objects_mut_for_test().insert(
                     2,
                     crate::sim::terrain_object::TerrainObjectState::for_test(2, type_ref, 11, 10),
                 );
@@ -180,9 +188,15 @@ fn shared_fireat_refuses_positive_health_limbo_objects_before_emission() {
                 target.lifecycle.set_in_limbo_for_test(true);
                 assert!(target.lifecycle.object_alive() && target.health.current() > 0);
             } else {
-                let target = sim.production.terrain_objects.get_mut(&2).unwrap();
-                target.lifecycle = crate::sim::terrain_object::TerrainObjectLifecycle::Limbo;
-                assert!(target.object_alive() && target.health > 0);
+                let target = sim
+                    .terrain_objects
+                    .objects_mut_for_test()
+                    .get_mut(&2)
+                    .unwrap();
+                target.set_lifecycle_for_test(
+                    crate::sim::terrain_object::TerrainObjectLifecycle::Limbo,
+                );
+                assert!(target.object_alive() && target.health() > 0);
             }
         }
         let before = sim.state_hash();
@@ -284,7 +298,7 @@ fn aircraft_request_preserves_rearm_and_state3_does_not_fire_early() {
             3,
         );
     assert!(dispatch(&mut sim, &rules).is_empty());
-    let frame = sim.session.binary_frame as i32;
+    let frame = sim.session.binary_frame() as i32;
     sim.substrate
         .entities
         .get_mut(1)
@@ -322,7 +336,7 @@ fn aircraft_release_uses_raw_burst_above_byte_width_and_one_ammo_charge() {
     assert_eq!(entity.ammo().unwrap().current(), 2);
     assert_eq!(entity.weapon_burst.index(), 0);
     // The Mission return owns cadence, independent of the final rearm jitter.
-    sim.session.binary_frame = 19;
+    sim.session.set_binary_frame_for_test(19);
     assert!(crate::sim::aircraft::tick_aircraft_missions(&mut sim, &rules).is_empty());
     assert_eq!(
         sim.substrate
@@ -334,7 +348,7 @@ fn aircraft_release_uses_raw_burst_above_byte_width_and_one_ammo_charge() {
             .current(),
         2
     );
-    sim.session.binary_frame = 20;
+    sim.session.set_binary_frame_for_test(20);
     crate::sim::aircraft::tick_aircraft_missions(&mut sim, &rules);
     let entity = sim.substrate.entities.get(1).unwrap();
     assert_eq!(entity.ammo().unwrap().current(), 1);
@@ -366,7 +380,7 @@ fn aircraft_release_snapshot_retains_burst_pending_and_mission_delay() {
     restored.scenario_rng = sim.scenario_rng.clone();
     assert_eq!(restored.state_hash(), sim.state_hash());
     for world in [&mut sim, &mut restored] {
-        world.session.binary_frame = 20;
+        world.session.set_binary_frame_for_test(20);
         crate::sim::aircraft::tick_aircraft_missions(world, &rules);
         let entity = world.substrate.entities.get(1).unwrap();
         assert_eq!(entity.weapon_burst.index(), 1);
@@ -411,7 +425,7 @@ fn a_strike_fires_before_a_later_unit_in_the_same_pass() {
     tank.attack_target
         .set_for_test(Some(TargetKind::Cell(12, 9)));
     sim.substrate.entities.insert(tank);
-    sim.substrate.next_stable_object_id = 4;
+    sim.set_next_stable_object_id_for_test(4);
     sim.set_logic_order_for_test(vec![1, 3]);
     sim.advance_tick(&[], Some(&rules), None, None, 67);
     let shooters: Vec<u64> = sim
@@ -457,7 +471,7 @@ fn a_strafer_drops_five_bombs_on_one_pass() {
     let mut bombs = Vec::new();
     let mut states = vec![4u8];
     for frame in 0..400u32 {
-        sim.session.binary_frame = frame;
+        sim.session.set_binary_frame_for_test(frame);
         let fired = dispatch(&mut sim, &rules).len();
         if fired > 0 {
             bombs.push((frame, fired));
@@ -511,7 +525,7 @@ fn a_fighter_out_of_range_cycles_back_to_its_search() {
     assert_eq!(entity.mission.dispatch_timer().delay(), 1);
 
     let before = sim.scenario_rng.clone();
-    sim.session.binary_frame = 1;
+    sim.session.set_binary_frame_for_test(1);
     assert!(dispatch(&mut sim, &rules).is_empty());
     let entity = sim.substrate.entities.get(1).unwrap();
     assert_eq!(crate::sim::aircraft::attack_state(entity), Some(1));
@@ -529,7 +543,7 @@ fn a_fighter_out_of_range_cycles_back_to_its_search() {
 /// The first bullet a strike releases.
 fn first_bullet(sim: &mut Simulation, rules: &RuleSet) -> crate::sim::projectile::Projectile {
     for frame in 0..60u32 {
-        sim.session.binary_frame = frame;
+        sim.session.set_binary_frame_for_test(frame);
         dispatch(sim, rules);
         if let Some((_, bullet)) = sim.projectiles.iter().next() {
             return bullet.clone();
@@ -551,7 +565,7 @@ fn a_strafers_bomb_leaves_at_its_weapon_speed_toward_the_target() {
     assert_eq!(weapon_speed, 76);
     let bomb = first_bullet(&mut sim, &rules);
     let [x, y, z] = bomb
-        .velocity
+        .velocity()
         .native()
         .map(|axis| f64::from_bits(axis.bits()));
     let speed = (x * x + y * y + z * z).sqrt();
@@ -615,8 +629,8 @@ fn a_human_aircraft_shooting_over_shroud_maps_the_cells_around_it() {
             64,
             crate::map::resolved_terrain::test_flat_cell,
         ));
-        sim.fog.width = 64;
-        sim.fog.height = 64;
+        sim.fog.set_width_for_test(64);
+        sim.fog.set_height_for_test(64);
         sim.substrate
             .entities
             .get_mut(1)
@@ -624,10 +638,10 @@ fn a_human_aircraft_shooting_over_shroud_maps_the_cells_around_it() {
             .position
             .set_exact_z_leptons_for_test(Some(1500));
         let americans = sim.interner.intern("Americans");
-        sim.houses.insert(
-            americans,
-            crate::sim::house_state::HouseState::new(americans, 0, None, human, 0, 10),
-        );
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                americans, 0, None, human, 0, 10,
+            ));
         let result = dispatch(&mut sim, &rules);
         assert_eq!(result.len(), 1, "one shot");
         let mapped = |rx, ry| sim.fog.is_ground_unshrouded(americans, rx, ry);
@@ -636,6 +650,50 @@ fn a_human_aircraft_shooting_over_shroud_maps_the_cells_around_it() {
         assert!(!mapped(6, 3), "radius 2, human {human}");
         assert!(!mapped(10, 10), "not the ground under it, human {human}");
     }
+}
+
+/// In a campaign IsHumanPlayer (`0x0050B6F0`) admits the player's
+/// PlayerControl ally (ALL01's Alliance flies Harriers), so its aircraft asks
+/// the player's map, and RevealArea's house gate (`0x00567AB0..0x00567B12`)
+/// maps the cells there under `AllyReveal=`.
+#[test]
+fn a_campaign_ally_aircraft_shooting_over_shroud_maps_the_players_cells() {
+    let (mut sim, mut rules) = fixture(&serde_json::json!({"burst": 1}));
+    rules.general.attacking_aircraft_sight_range = 2;
+    sim.resolved_terrain = Some(crate::map::resolved_terrain::test_grid(
+        64,
+        64,
+        crate::map::resolved_terrain::test_flat_cell,
+    ));
+    sim.fog.set_width_for_test(64);
+    sim.fog.set_height_for_test(64);
+    sim.substrate
+        .entities
+        .get_mut(1)
+        .unwrap()
+        .position
+        .set_exact_z_leptons_for_test(Some(1500));
+    let americans = sim.interner.intern("Americans");
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            americans, 0, None, true, 0, 10,
+        ));
+    sim.session.set_current_house_for_test(Some(americans));
+    let alliance = sim.interner.intern("Alliance");
+    let mut ally = crate::sim::house_state::HouseState::new(alliance, 0, None, false, 0, 10);
+    ally.set_player_control_for_test(true);
+    sim.houses.register(ally);
+    sim.house_alliances_mut_for_test()
+        .insert("ALLIANCE".into(), ["AMERICANS".to_string()].into());
+    sim.substrate
+        .entities
+        .get_mut(1)
+        .unwrap()
+        .set_owner_for_test(alliance);
+    let result = dispatch(&mut sim, &rules);
+    assert_eq!(result.len(), 1, "one shot");
+    assert!(sim.fog.is_ground_unshrouded(americans, 3, 3));
+    assert!(sim.fog.is_ground_unshrouded(americans, 5, 3), "radius 2");
 }
 
 /// `0x0041659E..0x004165AC`: a missile on the kamikaze tracker (`+0x6CA`,
@@ -673,8 +731,8 @@ fn an_aircraft_strike_scatters_the_target_cell_away_from_the_aircraft() {
     crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
     let russians = sim.interner.intern("Russians");
     let mut house = crate::sim::house_state::HouseState::new(russians, 0, None, false, 0, 10);
-    house.current_iq = 5;
-    sim.houses.insert(russians, house);
+    house.set_current_iq_for_test(5);
+    sim.houses.register(house);
     let tank = sim
         .spawn_object("MTNK", "Russians", 10, 9, 0, &rules)
         .unwrap();

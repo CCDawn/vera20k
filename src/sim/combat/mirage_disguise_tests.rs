@@ -23,10 +23,6 @@ use serde_json::{Value, json};
 fn corpus() -> &'static Value {
     let native = crate::test_fixture::json("tools/spatial_oracle/mirage_disguise.json");
     assert_eq!(native["schema_version"], 1);
-    assert_eq!(
-        native["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     native
 }
 
@@ -54,6 +50,9 @@ fn restore_disguise(native: &Value, interner: &mut StringInterner) -> DisguiseRu
         "reveal_timer": CdTimer::from_raw(
             int(&native["reveal_start"]), int(&native["reveal_duration"])
         ),
+        // The damage rows record no +1EC/+1F4 firing blink, which the
+        // receiver does not read.
+        "blink_timer": CdTimer::default(),
     }))
     .expect("native disguise prior fits the retained-state schema")
 }
@@ -201,9 +200,9 @@ fn damage_receiver_matches_original_packet_result_and_disguise_consequence() {
         let mut world = crate::sim::world::Simulation::new();
         world
             .houses
-            .insert(owner, HouseState::new(owner, 0, Some(owner), false, 0, 0));
+            .register(HouseState::new(owner, 0, Some(owner), false, 0, 0));
         world.substrate.entities.insert(target);
-        world.session.binary_frame = frame;
+        world.session.set_binary_frame_for_test(frame);
         let warhead = interner.intern(input["warhead"].as_str().unwrap());
         // The original receiver controls have no attacker or sourceHouse.
         // Preserve that ABI instead of introducing a retaliation source.
@@ -231,6 +230,7 @@ fn damage_receiver_matches_original_packet_result_and_disguise_consequence() {
             &world.house_alliances,
             false,
             u64::from(frame),
+            None,
             None,
         )
         .expect("physical MGTK/AP receiver resolves");

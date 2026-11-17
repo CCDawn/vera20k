@@ -137,12 +137,14 @@ fn fixture_clip(name: &str) -> Option<DecodedAudio> {
             let value = f32::from(i16::from_le_bytes(*pair)) / 32768.0;
             [value, value]
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
     Some(DecodedAudio {
         samples,
         sample_rate: clip["rate"].as_u64().unwrap() as u32,
         channels: 2,
-        native_frame_bytes: 2,
+        native_channels: 1,
+        native_sample_bytes: 2,
     })
 }
 
@@ -328,6 +330,7 @@ fn apply_native_stage_report(
         &table,
         elite,
         call["args"][0].as_i64().unwrap() as i32,
+        None,
         |index| {
             assert_eq!(index, 2, "original stage1 ground weapon slot");
             Some(reports.len() as i32)
@@ -611,14 +614,12 @@ fn replay(name: &str) {
                         &json!({"rng": fill["rng_before"]}),
                         label,
                     );
-                    let rate = shifts[&pointer]
-                        .shifted_sample_rate(loaded.clips[&initial.unwrap()].sample_rate);
                     let (source, control) = RingSource::new(
                         loaded,
                         cursor,
                         initial.unwrap(),
                         observer.draws.clone(),
-                        rate,
+                        shifts[&pointer],
                         PAN_CENTRE,
                         Some(&entry.sounds),
                     )
@@ -825,7 +826,12 @@ fn start_sim_ring(
     boundary: &Value,
     entry: &SoundEntry,
 ) -> HeadlessOutput {
-    assert_main(&sim.main_rng, row, &boundary["before"], "before ring start");
+    assert_main(
+        sim.main_rng(),
+        row,
+        &boundary["before"],
+        "before ring start",
+    );
     let retained = sim.presentation_main_draws();
     let mut draws = PlaybackDraws::new(move |low, high| retained.ranged(low, high));
     let shifts = PlayShifts::draw(entry, &mut draws);
@@ -845,13 +851,12 @@ fn start_sim_ring(
     );
     cursor.prepare(&mut draws, true).unwrap();
     let initial = cursor.prepare(&mut draws, true).unwrap();
-    let rate = shifts.shifted_sample_rate(loaded.clips[&initial].sample_rate);
     let (source, control) = RingSource::new(
         loaded,
         cursor,
         initial,
         draws,
-        rate,
+        shifts,
         PAN_CENTRE,
         Some(&entry.sounds),
     )
@@ -869,9 +874,9 @@ fn start_sim_ring(
         compact_slots,
         names: entry.sounds.clone(),
     };
-    output.assert_fill(&sim.main_rng, row, fill);
+    output.assert_fill(sim.main_rng(), row, fill);
     assert!(output.pull_quarter() > 0, "retained actual attack PCM");
-    assert_main(&sim.main_rng, row, &boundary["after"], "after ring start");
+    assert_main(sim.main_rng(), row, &boundary["after"], "after ring start");
     output
 }
 
@@ -918,7 +923,7 @@ impl crate::sim::world::SoundBoundary for RecordingBoundary<'_> {
             }
             self.calls.set(self.calls.get() + 1);
             assert_main(
-                &sim.main_rng,
+                sim.main_rng(),
                 self.row,
                 &self.boundary["before"],
                 "native Stop/Release before later Main report",
@@ -928,7 +933,7 @@ impl crate::sim::world::SoundBoundary for RecordingBoundary<'_> {
                 // Original Update70E000 reaches Release406060 before clearing
                 // the report latch or subtracting RateDown from the value.
                 let before = &self.boundary["before"]["gattling"];
-                let state = sim.substrate.entities.get(self.entity).unwrap().gattling;
+                let state = sim.entities().get(self.entity).unwrap().gattling;
                 assert_eq!(i64::from(state.stage()), before["stage"].as_i64().unwrap());
                 assert_eq!(i64::from(state.value()), before["value"].as_i64().unwrap());
                 assert_eq!(state.report_latch(), before["latch"].as_i64().unwrap() != 0);
@@ -951,7 +956,7 @@ impl crate::sim::world::SoundBoundary for RecordingBoundary<'_> {
                 );
             }
             assert_main(
-                &sim.main_rng,
+                sim.main_rng(),
                 self.row,
                 &self.boundary["before"],
                 "control has no Main draw",
@@ -967,6 +972,18 @@ impl crate::sim::world::SoundBoundary for RecordingBoundary<'_> {
 
 #[test]
 fn production_gattling_stop_and_release_reach_retained_source_at_native_boundaries() {
+    assert_gattling_stop_and_release_at_native_boundaries(false);
+}
+
+/// [`production_gattling_stop_and_release_reach_retained_source_at_native_boundaries`]
+/// in a game read the Ares way.
+#[test]
+fn production_gattling_stop_and_release_reach_retained_source_read_the_ares_way() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    assert_gattling_stop_and_release_at_native_boundaries(true);
+}
+
+fn assert_gattling_stop_and_release_at_native_boundaries(ares_way: bool) {
     use crate::sim::combat::gattling::{GattlingState, gattling_sound_owner};
     use crate::sim::world::{FrameEffects, SimSoundEvent, Simulation};
 
@@ -983,19 +1000,21 @@ fn production_gattling_stop_and_release_reach_retained_source_at_native_boundari
         .unwrap();
     let owner = gattling_sound_owner(id);
     let initial = recorded_boundary(row, "original_admitted_Unit_fire_tail");
-    sim.main_rng = SimRng::from_native_state_hex_for_test(main_hex(row, &initial["before"])).into();
-    sim.substrate.entities.get_mut(id).unwrap().gattling = GattlingState::from_fields(0, 0, false);
+    *sim.main_rng_mut_for_test() =
+        SimRng::from_native_state_hex_for_test(main_hex(row, &initial["before"])).into();
+    sim.entities_mut_for_test().get_mut(id).unwrap().gattling =
+        GattlingState::from_fields(0, 0, false);
     let (_, raw) = trace_draws(|| sim.gattling_increase(id, rules, 1, FrameEffects::default()));
     assert_eq!(raw.len(), 1);
     assert_eq!(raw[0]["value"], initial["requests"][0]["result"]);
     assert_main(
-        &sim.main_rng,
+        sim.main_rng(),
         row,
         &initial["after"],
         "initial production report",
     );
     let initial_reports: Vec<_> = sim
-        .sound_events
+        .sound_events()
         .iter()
         .filter(|event| matches!(event, SimSoundEvent::GattlingLoop { .. }))
         .collect();
@@ -1022,20 +1041,30 @@ fn production_gattling_stop_and_release_reach_retained_source_at_native_boundari
         registry.get("GattlingGunAttackLoop1").unwrap(),
     );
     let threshold = recorded_boundary(row, "original_Increase_threshold_component_ticks199");
-    let (_, raw) = trace_draws(|| sim.gattling_increase(id, rules, 199, FrameEffects::default()));
-    assert!(
-        raw.is_empty(),
-        "original retained latch crosses no new report"
-    );
-    assert_main(
-        &sim.main_rng,
-        row,
-        &threshold["after"],
-        "threshold component",
-    );
+    // Ares TechnoClass_UpdateGattling_Cycle (Ares.dll 1004B6C0, hook
+    // 0x70DEBA) tests the stage against the charged value, so the 199-tick
+    // charge (to Stage1=200) already makes the native transition's
+    // Stop/Stop/Loop2, from the same Main state: the native threshold
+    // Increase draws nothing. The native transition Increase then only
+    // charges.
+    if !ares_way {
+        let (_, raw) =
+            trace_draws(|| sim.gattling_increase(id, rules, 199, FrameEffects::default()));
+        assert!(
+            raw.is_empty(),
+            "original retained latch crosses no new report"
+        );
+        assert_main(
+            sim.main_rng(),
+            row,
+            &threshold["after"],
+            "threshold component",
+        );
+    }
+    let transition_ticks = if ares_way { 199 } else { 1 };
     let transition = recorded_boundary(row, "original_Unit_tail_hard_stage_transition");
     let native_transition_facts = native_gattling_sound_facts(row, transition);
-    let transition_prefix = sim.sound_events.len();
+    let transition_prefix = sim.sound_events().len();
     let hard = RecordingBoundary {
         delivered: std::cell::Cell::new(transition_prefix),
         calls: std::cell::Cell::new(0),
@@ -1046,8 +1075,9 @@ fn production_gattling_stop_and_release_reach_retained_source_at_native_boundari
         boundary: transition,
         release: false,
     };
-    let (_, raw) =
-        trace_draws(|| sim.gattling_increase(id, rules, 1, FrameEffects::for_sound(&hard)));
+    let (_, raw) = trace_draws(|| {
+        sim.gattling_increase(id, rules, transition_ticks, FrameEffects::for_sound(&hard))
+    });
     assert_eq!(
         hard.calls.get(),
         native_transition_facts
@@ -1059,13 +1089,13 @@ fn production_gattling_stop_and_release_reach_retained_source_at_native_boundari
     assert_eq!(raw.len(), 1);
     assert_eq!(raw[0]["value"], transition["requests"][0]["result"]);
     assert_main(
-        &sim.main_rng,
+        sim.main_rng(),
         row,
         &transition["after"],
         "production stage1 report",
     );
     assert_eq!(
-        sim.sound_events[transition_prefix..]
+        sim.sound_events()[transition_prefix..]
             .iter()
             .map(|event| match event {
                 SimSoundEvent::GattlingLoopStop { owner: stopped } => {
@@ -1087,7 +1117,18 @@ fn production_gattling_stop_and_release_reach_retained_source_at_native_boundari
         native_transition_facts,
         "native Stop/Stop/Loop2 order after the retained prefix"
     );
-    let state = sim.substrate.entities.get(id).unwrap().gattling;
+    if ares_way {
+        let state = sim.entities().get(id).unwrap().gattling;
+        assert_eq!(
+            i64::from(state.value()),
+            threshold["after"]["gattling"]["value"].as_i64().unwrap()
+        );
+        let events = sim.sound_events().len();
+        let (_, raw) = trace_draws(|| sim.gattling_increase(id, rules, 1, FrameEffects::default()));
+        assert!(raw.is_empty(), "the stage-1 latch holds below Stage2");
+        assert_eq!(sim.sound_events().len(), events);
+    }
+    let state = sim.entities().get(id).unwrap().gattling;
     assert_eq!(
         i64::from(state.stage()),
         transition["after"]["gattling"]["stage"].as_i64().unwrap()
@@ -1113,7 +1154,7 @@ fn production_gattling_stop_and_release_reach_retained_source_at_native_boundari
     );
     let release = recorded_boundary(row, "original_Unit_no_target_soft_release");
     let soft = RecordingBoundary {
-        delivered: std::cell::Cell::new(sim.sound_events.len()),
+        delivered: std::cell::Cell::new(sim.sound_events().len()),
         calls: std::cell::Cell::new(0),
         source: std::cell::RefCell::new(new),
         owner,
@@ -1134,12 +1175,12 @@ fn production_gattling_stop_and_release_reach_retained_source_at_native_boundari
     );
     assert!(raw.is_empty());
     assert_main(
-        &sim.main_rng,
+        sim.main_rng(),
         row,
         &release["after"],
         "production soft release",
     );
-    let state = sim.substrate.entities.get(id).unwrap().gattling;
+    let state = sim.entities().get(id).unwrap().gattling;
     let after = &release["after"]["gattling"];
     assert_eq!(i64::from(state.stage()), after["stage"].as_i64().unwrap());
     assert_eq!(i64::from(state.value()), after["value"].as_i64().unwrap());
@@ -1147,7 +1188,7 @@ fn production_gattling_stop_and_release_reach_retained_source_at_native_boundari
 }
 
 #[test]
-fn production_limbo_preserves_frame_sound_scope_without_local_rules() {
+fn production_limbo_preserves_frame_sound_scope_in_a_nested_context() {
     use crate::sim::combat::gattling::{GattlingState, gattling_sound_owner};
     use crate::sim::world::{ConcealOutcome, FrameEffects, Simulation, UninitContext};
 
@@ -1164,12 +1205,12 @@ fn production_limbo_preserves_frame_sound_scope_without_local_rules() {
         .spawn_object("YTNK", "Americans", 13, 14, 0, rules)
         .unwrap();
     let before = &release["before"]["gattling"];
-    sim.substrate.entities.get_mut(id).unwrap().gattling = GattlingState::from_fields(
+    sim.entities_mut_for_test().get_mut(id).unwrap().gattling = GattlingState::from_fields(
         before["stage"].as_i64().unwrap() as i32,
         before["value"].as_i64().unwrap() as i32,
         before["latch"].as_i64().unwrap() != 0,
     );
-    sim.main_rng =
+    *sim.main_rng_mut_for_test() =
         SimRng::from_native_state_hex_for_test(main_hex(row, &playback["before"])).into();
     let source = start_sim_ring(
         &sim,
@@ -1178,7 +1219,7 @@ fn production_limbo_preserves_frame_sound_scope_without_local_rules() {
         registry.get("GattlingGunAttackLoop2").unwrap(),
     );
     let boundary = RecordingBoundary {
-        delivered: std::cell::Cell::new(sim.sound_events.len()),
+        delivered: std::cell::Cell::new(sim.sound_events().len()),
         calls: std::cell::Cell::new(0),
         source: std::cell::RefCell::new(source),
         owner: gattling_sound_owner(id),
@@ -1188,17 +1229,16 @@ fn production_limbo_preserves_frame_sound_scope_without_local_rules() {
         release: true,
     };
     // Rust lifecycle regression: recorded Loop2/Main inputs and real PCM
-    // controls, through a rules-free nested context. Limbo6F6C6B's Release
+    // controls, through a nested context. Limbo6F6C6B's Release
     // before6F6C76 is instruction-established; this is not an executed native
     // comparison of the complete Limbo transaction.
-    let effects = FrameEffects::for_sound(&boundary).with_rules(Some(rules));
-    let context = UninitContext::new(None, None).with_effects(effects);
-    assert!(context.rules().is_none());
+    let effects = FrameEffects::for_sound(&boundary);
+    let context = UninitContext::new(rules, None).with_effects(effects);
     let (outcome, raw) = trace_draws(|| sim.techno_limbo_with_context(id, context));
     assert_eq!(outcome, ConcealOutcome::Concealed);
     assert!(raw.is_empty());
     assert_eq!(boundary.calls.get(), 1);
-    let entity = sim.substrate.entities.get(id).unwrap();
+    let entity = sim.entities().get(id).unwrap();
     assert!(entity.lifecycle.in_limbo());
     assert!(!entity.gattling.report_latch());
     assert_eq!(
@@ -1295,16 +1335,12 @@ impl PlaybackService for OneShotService<'_> {
         assert_eq!(event, pending.token.event);
         let loaded = pending.loaded.take().unwrap();
         let initial = pending.initial.unwrap();
-        let rate = pending
-            .shifts
-            .unwrap()
-            .shifted_sample_rate(loaded.clips[&initial].sample_rate);
         pending.source = RingSource::new(
             loaded,
             pending.cursor.take().unwrap(),
             initial,
             self.draws.clone(),
-            rate,
+            pending.shifts.unwrap(),
             pan,
             Some(&self.entry.sounds),
         );
@@ -1323,6 +1359,10 @@ impl PlaybackService for OneShotService<'_> {
                 self.stops += 1;
             }
         }
+    }
+
+    fn channel_volume(&self, _: EventId) -> i32 {
+        0
     }
 }
 
@@ -1677,13 +1717,12 @@ fn native_uniform_consumer_continues_across_first_ring_quarter() {
             loaded.selected.attack
         );
         let initial = cursor.prepare(&mut observer.draws, true).unwrap();
-        let rate = shifts.shifted_sample_rate(loaded.clips[&initial].sample_rate);
         let (source, control) = RingSource::new(
             loaded,
             cursor,
             initial,
             observer.draws.clone(),
-            rate,
+            shifts,
             PAN_CENTRE,
             None,
         )
@@ -1770,9 +1809,16 @@ fn retail_gattling_registry_and_all_executed_pcm_clips_match_native() {
             u64::from(decoded.sample_rate),
             clip["rate"].as_u64().unwrap()
         );
-        assert_eq!((decoded.channels, decoded.native_frame_bytes), (2, 2));
         assert_eq!(
-            mono_bytes(decoded.samples.into_iter()),
+            (
+                decoded.channels,
+                decoded.native_channels,
+                decoded.native_sample_bytes
+            ),
+            (2, 1, 2)
+        );
+        assert_eq!(
+            mono_bytes(decoded.samples.iter().copied()),
             bytes_from_hex(clip["pcm_hex"].as_str().unwrap()),
             "{name}: every original decoded PCM byte"
         );

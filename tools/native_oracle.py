@@ -12,6 +12,7 @@ from collections import deque
 from functools import lru_cache
 import hashlib
 import gzip
+import inspect
 import io
 import json
 import os
@@ -30,14 +31,6 @@ from unicorn.x86_const import (
 
 from tools import oracle_sources
 
-# Historical vector/reference identity, retained for existing Rust-facing payloads.
-# Actual input identity belongs in image_sha256()/provenance, not this constant.
-NATIVE_SHA256 = "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-STEAM_NATIVE_SHA256 = "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-# Steam's four file-backed sections and their layouts match the sealed original
-# loader witness. See native_oracle.md for comparison and reproduction; this does
-# not admit arbitrary builds or claim equivalence of the Windows loader/startup.
-SUPPORTED_NATIVE_SHA256 = (NATIVE_SHA256, STEAM_NATIVE_SHA256)
 IMAGE_BASE = 0x00400000
 # Preserve the original fixture mapping, including runtime globals in BSS.
 IMAGE_SIZE = 0x00A00000
@@ -55,6 +48,27 @@ class OracleError(RuntimeError):
 
 class OracleMismatch(OracleError):
     """A comparison ran, and its native output or evidence differs from the reference."""
+
+
+def require(condition, message: str) -> None:
+    """A fixture or observation check that `python -O` cannot remove."""
+    if not condition:
+        raise OracleError(message)
+
+
+def edited_source(function, *edits: tuple[str, str]) -> str:
+    """`function`'s source with each (anchor, replacement) applied in order.
+
+    For harnesses that adapt a shared Python fixture in memory before exec: an
+    anchor that is missing or repeated fails instead of leaving the old setup.
+    """
+    source = inspect.getsource(function)
+    for anchor, replacement in edits:
+        count = source.count(anchor)
+        require(count == 1, f"{function.__qualname__}: fixture edit anchor occurs "
+                            f"{count} times: {anchor!r}")
+        source = source.replace(anchor, replacement)
+    return source
 
 
 class NativeCallTrace:
@@ -96,6 +110,16 @@ class NativeCallTrace:
             cleanup=cleanup, entry_fpcw=self.uc.reg_read(UC_X86_REG_FPCW)))
         self.pending.setdefault((caller, sp + 4 + cleanup), []).append(index)
         return index
+
+
+def stored_value(size: int, value: int) -> int:
+    """The bytes a UC_HOOK_MEM_WRITE store writes, as an unsigned integer.
+
+    For a store narrower than its source register, Unicorn passes the whole
+    register on some hosts (arm64) and only the stored bytes on others
+    (x86-64), so recording the raw hook value makes a corpus host-dependent.
+    """
+    return value & ((1 << (8 * size)) - 1)
 
 
 def reconstruct_byte_spans(before: bytes, changed: list) -> bytes:
@@ -231,25 +255,16 @@ def configured_gamemd() -> Path:
 
 
 @lru_cache(maxsize=2)
-def _verified_image(path: Path) -> bytes:
-    # Hash the same immutable bytes subsequently mapped, not a separate read.
-    data = path.read_bytes()
-    digest = hashlib.sha256(data).hexdigest()
-    if digest not in SUPPORTED_NATIVE_SHA256:
-        raise OracleError(f"Unsupported gamemd.exe SHA-256 {digest}; expected one of {SUPPORTED_NATIVE_SHA256}")
-    return data
+def _image(path: Path) -> bytes:
+    # One immutable read, reused by every mapping and span of this run.
+    return path.read_bytes()
 
 
 def image_bytes() -> bytes:
-    return _verified_image(configured_gamemd())
+    return _image(configured_gamemd())
 
 
-def image_sha256(data: bytes | None = None) -> str:
-    """Actual input identity; supplied data must be the verified immutable bytes."""
-    return hashlib.sha256(image_bytes() if data is None else data).hexdigest()
-
-
-def _sections(data: bytes):
+def _sections(data: bytes, *, image_base: int = IMAGE_BASE, image_size: int = IMAGE_SIZE):
     if len(data) < 0x40:
         raise OracleError("Truncated PE DOS header")
     pe = struct.unpack_from("<I", data, 0x3C)[0]
@@ -264,21 +279,20 @@ def _sections(data: bytes):
         raise OracleError("Truncated PE section table")
     if (data[:2] != b"MZ" or data[pe:pe + 4] != b"PE\0\0" or machine != 0x14C
             or struct.unpack_from("<H", data, optional)[0] != 0x10B
-            or struct.unpack_from("<I", data, optional + 28)[0] != IMAGE_BASE):
-        raise OracleError("Expected the pinned PE32 x86 image at 0x00400000")
+            or struct.unpack_from("<I", data, optional + 28)[0] != image_base):
+        raise OracleError(f"Expected a PE32 x86 image at 0x{image_base:08X}")
     for index in range(count):
         offset = optional + optional_size + index * 40
         virtual_size, rva, raw_size, raw_ptr = struct.unpack_from("<IIII", data, offset + 8)
         flags = struct.unpack_from("<I", data, offset + 36)[0]
-        if rva + max(virtual_size, raw_size) > IMAGE_SIZE or raw_ptr + raw_size > len(data):
-            raise OracleError("PE section exceeds the verified fixture mapping")
+        if rva + max(virtual_size, raw_size) > image_size or raw_ptr + raw_size > len(data):
+            raise OracleError("PE section exceeds the fixture mapping")
         yield rva, raw_ptr, raw_size, virtual_size, flags
 
 
 def file_span(data: bytes, va: int, size: int) -> tuple[int, bytes]:
     """Resolve one original file-backed section span, never synthesized memory.
 
-    The input bytes must be identity-checked by the caller for native claims.
     Unlike load_image's zero-filled mapping, headers, gaps, BSS and requests
     crossing a section boundary have no supported file span. Section raw padding
     remains readable exactly as load_image maps it, even beyond VirtualSize.
@@ -312,12 +326,28 @@ def load_image(uc: Uc) -> None:
     does not authorize treating patched code or supplied call results as native.
     """
     data = image_bytes()
-    sections = list(_sections(data))
-    uc.mem_map(IMAGE_BASE, IMAGE_SIZE)
-    uc.mem_write(IMAGE_BASE, data[:0x1000])
+    map_pe32_image(uc, data, image_base=IMAGE_BASE, image_size=IMAGE_SIZE,
+                   header_size=min(0x1000, len(data)))
+
+
+def map_pe32_image(uc: Uc, data: bytes, *, image_base: int, image_size: int,
+                   header_size: int) -> None:
+    """Map caller-identified PE32 bytes at their preferred base; no relocations.
+
+    DLL fixture users supply explicit bounds and header length; no Windows
+    loader, imports, TLS or runtime initialization is implied. This shares the
+    section parser without changing stock executable selection or validation.
+    """
+    if (image_base < 0 or image_base % 0x1000 or image_size <= 0
+            or image_size % 0x1000 or image_base + image_size > 0x100000000
+            or not 0 < header_size <= min(len(data), image_size)):
+        raise OracleError("Invalid explicit PE mapping bounds")
+    sections = list(_sections(data, image_base=image_base, image_size=image_size))
+    uc.mem_map(image_base, image_size)
+    uc.mem_write(image_base, data[:header_size])
     for rva, raw_ptr, raw_size, _, _ in sections:
         if raw_size:
-            uc.mem_write(IMAGE_BASE + rva, data[raw_ptr:raw_ptr + raw_size])
+            uc.mem_write(image_base + rva, data[raw_ptr:raw_ptr + raw_size])
 
 
 def run_checked(uc: Uc, begin: int, end: int | tuple[int, ...], *,
@@ -397,9 +427,6 @@ def run_checked(uc: Uc, begin: int, end: int | tuple[int, ...], *,
                 "context": diagnostic_context,
                 "fault": {"errno": fault.errno, "message": str(fault)} if fault else None,
                 "unicorn_binding": unicorn.__version__, "unicorn_core": list(unicorn.uc_version()),
-                # run_checked also accepts synthetic machines and cannot attest
-                # their image identity just because this runner knows the pin.
-                "supported_native_sha256": list(SUPPORTED_NATIVE_SHA256),
             }
             raise NativeExecutionError(
                 f"{message}; reason={reason}, timeout={timed_out}, "
@@ -474,11 +501,11 @@ def call(func: int, *, ecx=None, edx=None, stack_args=None, writes=None,
 
 def provenance(*, scope: str, assumptions: list[str], substitutions: list[str],
                entry_points: dict[str, int]) -> dict:
-    """Record identity and claims separately from legacy vector payloads."""
+    """Record the runtime and claims separately from legacy vector payloads."""
     if not scope.strip() or not assumptions or not entry_points:
         raise ValueError("Declare scope, runtime assumptions, and native entry points")
     return {
-        "schema_version": 1, "native_sha256": image_sha256(),
+        "schema_version": 1,
         "unicorn_binding": unicorn.__version__, "unicorn_core": list(unicorn.uc_version()),
         "scope": scope, "assumptions": assumptions, "substitutions": substitutions,
         "entry_points": {name: f"0x{value:08X}" for name, value in entry_points.items()},
@@ -487,6 +514,60 @@ def provenance(*, scope: str, assumptions: list[str], substitutions: list[str],
 
 def _canonical(data) -> bytes:
     return json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def corpus_text(data, depth=0) -> str:
+    """Committed corpus layout: one entry per line through two levels, compact JSON below.
+
+    Indented corpora were twice this size in every checkout, and the rows still diff by line.
+    """
+    indent = " " * (depth + 1)
+    if depth < 2 and isinstance(data, dict) and data:
+        entries = (f"{indent}{json.dumps(key)}: {corpus_text(value, depth + 1)}" for key, value in data.items())
+        return "{\n" + ",\n".join(entries) + "\n" + " " * depth + "}" + ("\n" if depth == 0 else "")
+    if depth < 2 and isinstance(data, list) and data and isinstance(data[0], (dict, list)):
+        entries = (indent + corpus_text(value, depth + 1) for value in data)
+        return "[\n" + ",\n".join(entries) + "\n" + " " * depth + "]" + ("\n" if depth == 0 else "")
+    return json.dumps(data, separators=(",", ":"), allow_nan=False) + ("\n" if depth == 0 else "")
+
+
+RNG_STATE_KEYS = ["disabled", "index_a", "index_b", "state"]
+
+
+def shared_rng_states(data: dict | list) -> dict:
+    """The corpus with each distinct RNG stream state stored once, in `shared_rng_states`.
+
+    A corpus that records every stream before and after each row repeats a few
+    250-word states thousands of times. Each state becomes `{"rng_state": n}`,
+    numbered in the order first met. Rust tests read the corpus through
+    `test_fixture::json`, which puts the states back, so they see the same data.
+    A corpus that is a bare list has no place for the table and becomes
+    `{"rows": list}`.
+    """
+    if isinstance(data, list):
+        data = {"rows": data}
+    if "shared_rng_states" in data:
+        raise OracleError("The corpus already stores its RNG states in shared_rng_states")
+    table, numbers = [], {}
+
+    def share(value):
+        if isinstance(value, dict):
+            if list(value) == ["rng_state"]:
+                raise OracleError("A corpus object already reads as an rng_state reference")
+            if sorted(value) == RNG_STATE_KEYS and isinstance(value["state"], list):
+                key = _canonical(value)
+                if key not in numbers:
+                    numbers[key] = len(table)
+                    table.append(value)
+                return {"rng_state": numbers[key]}
+            return {key: share(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [share(item) for item in value]
+        return value
+
+    shared = share(data)
+    shared["shared_rng_states"] = table
+    return shared
 
 
 def first_difference(expected, actual, path="$", limit=180) -> str | None:
@@ -518,6 +599,52 @@ def first_difference(expected, actual, path="$", limit=180) -> str | None:
     return None
 
 
+def _hash_paths(value, digests, path="$", found=None) -> set[tuple[str, str]]:
+    """(JSON path, digest) for each key or string containing a digest.
+
+    List indices read [*], so a field counts once however many rows repeat it.
+    """
+    found = set() if found is None else found
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{path}.{key}"
+            found.update((child, digest) for digest in digests if digest in key.lower())
+            _hash_paths(item, digests, child, found)
+    elif isinstance(value, list):
+        for item in value:
+            _hash_paths(item, digests, f"{path}[*]", found)
+    elif isinstance(value, str):
+        found.update((path, digest) for digest in digests if digest in value.lower())
+    return found
+
+
+def _refuse_executable_hashes(target: Path, documents) -> None:
+    """Refuse output that would publish a gamemd.exe hash (AGENTS.md).
+
+    Every gamemd.exe build is the same game, so a corpus records what the
+    executable computes, never which build ran it. The configured executable's
+    SHA-256 is refused anywhere. Each document is (reference suffix, or None
+    for the payload; document; its serialized text).
+    """
+    try:
+        digest = hashlib.sha256(image_bytes()).hexdigest()
+    except (OracleError, OSError):
+        return  # Nothing here can have hashed an executable that is not readable.
+    refused = set()
+    for suffix, document, text in documents:
+        if digest in text.lower():
+            name = (target if suffix is None else target.with_suffix(suffix)).name
+            refused.update(f"{name} {path}" for path, _ in _hash_paths(document, {digest}))
+    if refused:
+        locations = sorted(refused)
+        more = f" and {len(locations) - 4} more" if len(locations) > 4 else ""
+        raise OracleError(
+            f"Refusing to publish a gamemd.exe hash at {', '.join(locations[:4])}{more}. "
+            "Every gamemd.exe build is the same game: oracle outputs record what the "
+            "executable computes, not which build ran it. Remove these fields from the "
+            "producer (tools/native_oracle.md, Evidence identity).")
+
+
 def finish_vectors(data, default_path: Path, *, provenance: dict, argv=None,
                    source_paths: dict[str, Path] | None = None,
                    projection=None, raw_archive_sha256: str | None = None) -> None:
@@ -532,11 +659,13 @@ def finish_vectors(data, default_path: Path, *, provenance: dict, argv=None,
     deterministic full raw .json.gz archive. An optional raw-byte identity
     guards compaction of already accepted evidence. Without that guard,
     --write deliberately accepts a newly executed reference; --check still
-    compares the full archive, decompressed bytes and both metadata records.
+    compares the decompressed archive and both metadata records.
 
     Sidecars pin no repository source hashes (AGENTS.md): an edit to a shared
     helper must not fail a check whose native output is unchanged. The recorded
-    replay command says how the payload was made; it is not evidence.
+    replay command and runtime versions say how the payload was made; they are
+    not evidence (oracle_sources.evidence). Neither workflow proceeds with
+    output that would publish a gamemd.exe hash.
     """
     parser = argparse.ArgumentParser(description="Compare native outputs with recorded reference data")
     mode = parser.add_mutually_exclusive_group()
@@ -552,8 +681,8 @@ def finish_vectors(data, default_path: Path, *, provenance: dict, argv=None,
     sources = source_identity()
     data = data() if callable(data) else data
     provenance = provenance() if callable(provenance) else provenance
-    if any(key in provenance for key in (oracle_sources.REPLAY_FIELD, oracle_sources.LEGACY_SOURCE_FIELD)):
-        raise OracleError("finish_vectors records the replay command, and sidecars pin no sources")
+    if oracle_sources.REPLAY_FIELD in provenance:
+        raise OracleError("finish_vectors records the replay command")
     if replay := oracle_sources.replay_command():
         provenance = dict(provenance, replay_command=replay)
     # Normalize tuples before comparisons; reject NaN/Infinity in either workflow.
@@ -562,8 +691,9 @@ def finish_vectors(data, default_path: Path, *, provenance: dict, argv=None,
     sidecar = target.with_suffix(".meta.json")
     archive_path = target.with_suffix(".raw.json.gz")
     archive_sidecar = target.with_suffix(".raw.meta.json")
-    archive_record = archive_bytes = raw_archive = None
+    archive_record = archive_bytes = raw_archive = raw_document = None
     if projection is not None:
+        raw_document = normalized
         raw_archive = (json.dumps(normalized, indent=2, allow_nan=False) + "\n").encode("utf-8")
         digest = hashlib.sha256(raw_archive).hexdigest()
         if raw_archive_sha256 is not None and digest != raw_archive_sha256:
@@ -587,10 +717,15 @@ def finish_vectors(data, default_path: Path, *, provenance: dict, argv=None,
         archive_metadata = dict(provenance, payload_sha256=archive_record["canonical_payload_sha256"],
                                 raw_archive=archive_record, projected_payload_sha256=metadata["payload_sha256"])
         archive_metadata_text = json.dumps(archive_metadata, indent=2, allow_nan=False) + "\n"
-    payload_text = json.dumps(normalized, indent=2, allow_nan=False) + "\n"
+    payload_text = corpus_text(normalized)
     metadata_text = json.dumps(metadata, indent=2, allow_nan=False) + "\n"
     if difference := first_difference(sources, source_identity()):
         raise OracleError(f"Source changed during native generation: {difference}")
+    documents = [(None, normalized, payload_text), (".meta.json", metadata, metadata_text)]
+    if archive_record is not None:
+        documents += [(".raw.json.gz", raw_document, raw_archive.decode("utf-8")),
+                      (".raw.meta.json", archive_metadata, archive_metadata_text)]
+    _refuse_executable_hashes(target, documents)
     if args.write:
         target.parent.mkdir(parents=True, exist_ok=True)
         if archive_record is not None:
@@ -617,8 +752,8 @@ def finish_vectors(data, default_path: Path, *, provenance: dict, argv=None,
     if archive_record is not None:
         if not archive_path.is_file() or not archive_sidecar.is_file():
             raise OracleError(f"Full raw archive or provenance missing: {archive_path}")
-        expected_archive = archive_path.read_bytes()
-        if expected_archive != archive_bytes or gzip.decompress(expected_archive) != raw_archive:
+        # Compare the archive's content: another zlib build compresses it differently.
+        if gzip.decompress(archive_path.read_bytes()) != raw_archive:
             raise OracleMismatch(f"Full raw archive mismatch: {archive_path}")
         expected_archive_metadata = json.loads(archive_sidecar.read_text(encoding="utf-8"))
         if difference := first_difference(oracle_sources.evidence(expected_archive_metadata),

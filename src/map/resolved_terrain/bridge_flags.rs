@@ -67,8 +67,28 @@ impl RealCellBridgeFlags0x1180 {
 /// Route one exact `SetBridgeDirection_*` transaction through native fixed
 /// indexing. A real slot mutates its retained facts; every miss stamps and
 /// mutates the same process-global dummy identity.
+/// Cell storage a bridge stamp writes: the loader's vector or the live
+/// grid's shared chunks.
+pub(super) trait StampCells:
+    std::ops::IndexMut<usize, Output = ResolvedTerrainCell>
+{
+    fn cell_count(&self) -> usize;
+}
+
+impl StampCells for Vec<ResolvedTerrainCell> {
+    fn cell_count(&self) -> usize {
+        self.len()
+    }
+}
+
+impl StampCells for crate::util::synced::ChunkedVec<ResolvedTerrainCell> {
+    fn cell_count(&self) -> usize {
+        self.len()
+    }
+}
+
 pub(super) fn apply_native_bridge_flag_stamp_to_parts(
-    cells: &mut [ResolvedTerrainCell],
+    cells: &mut impl StampCells,
     width: u16,
     height: u16,
     native_allocated: Option<&[bool]>,
@@ -83,7 +103,7 @@ pub(super) fn apply_native_bridge_flag_stamp_to_parts(
         width,
         height,
         native_allocated,
-        cells.len(),
+        cells.cell_count(),
         i32::from(stamp.anchor.0),
         i32::from(stamp.anchor.1),
     )
@@ -94,7 +114,7 @@ pub(super) fn apply_native_bridge_flag_stamp_to_parts(
             continue;
         };
         if let Some(index) =
-            native_resolved_cell_index(width, height, native_allocated, cells.len(), x, y)
+            native_resolved_cell_index(width, height, native_allocated, cells.cell_count(), x, y)
         {
             let facts = &mut cells[index].bridge_facts;
             if let Some(family) = map_family {
@@ -162,7 +182,7 @@ impl ResolvedTerrainGrid {
     /// Give every fixture deck the CellClass bit0x100 a loaded deck carries.
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_mark_decks_structural(mut self) -> Self {
-        for cell in &mut self.cells {
+        for cell in self.cells.iter_mut() {
             if cell.has_bridge_deck {
                 cell.bridge_facts.raw_flags |= BRIDGE_FLAG_STRUCTURAL;
             }
@@ -178,10 +198,10 @@ impl ResolvedTerrainGrid {
         stamp: BridgeFlagStamp,
     ) -> Vec<(usize, u32)> {
         apply_native_bridge_flag_stamp_to_parts(
-            &mut self.cells,
+            self.cells.all_mut(),
             self.width,
             self.height,
-            self.native_allocated.as_deref(),
+            self.native_allocated.as_deref().map(Vec::as_slice),
             &self.shared_cell_dummy,
             stamp,
             None,
@@ -204,7 +224,7 @@ impl ResolvedTerrainGrid {
         if let Some(index) = native_resolved_cell_index(
             self.width,
             self.height,
-            self.native_allocated.as_deref(),
+            self.native_allocated.as_deref().map(Vec::as_slice),
             self.cells.len(),
             x,
             y,
@@ -242,10 +262,10 @@ impl ResolvedTerrainGrid {
         family: BridgeStampFamily,
     ) -> Vec<(usize, u32)> {
         let updates = apply_native_bridge_flag_stamp_to_parts(
-            &mut self.cells,
+            self.cells.all_mut(),
             self.width,
             self.height,
-            self.native_allocated.as_deref(),
+            self.native_allocated.as_deref().map(Vec::as_slice),
             &self.shared_cell_dummy,
             stamp,
             Some(family),
@@ -258,81 +278,24 @@ impl ResolvedTerrainGrid {
         updates
     }
 
-    /// Project a direct runtime overlay-field write into the map-owned bridge
-    /// cache. The literal identity/data remain owned by OverlayGrid; this is
-    /// only the derived bridge metadata that pathing and bridge damage read.
-    pub(crate) fn set_runtime_overlay_bridge_identity(
-        &mut self,
-        rx: u16,
-        ry: u16,
-        overlay_id: u8,
-        overlay_data: u8,
-        overlay_name: &str,
-    ) {
-        let Some(cell) = self.cell_mut(rx, ry) else {
-            return;
-        };
-        cell.bridge_facts.overlay_id = Some(overlay_id);
-        cell.bridge_facts.state_byte = overlay_data;
+    /// Project a runtime bridge-overlay identity write into the bridge layer
+    /// and deck that pathing and bridge damage read. OverlayGrid owns the
+    /// identity itself; a non-bridge identity changes nothing here.
+    pub(crate) fn set_runtime_overlay_bridge_identity(&mut self, rx: u16, ry: u16, overlay_id: u8) {
         if !crate::rules::overlay_types::is_bridge_overlay_index(overlay_id) {
             return;
         }
+        let Some(cell) = self.cell_mut(rx, ry) else {
+            return;
+        };
 
-        let direction = match overlay_id {
-            0x18 | 0xED => BridgeDirection::EastWest,
-            0x19 | 0xEE => BridgeDirection::NorthSouth,
-            _ => BridgeDirection::Low,
-        };
-        let deck_level = match direction {
-            BridgeDirection::EastWest | BridgeDirection::NorthSouth => cell.level.saturating_add(4),
-            BridgeDirection::Low => cell.level,
-        };
-        cell.bridge_layer = Some(BridgeLayer {
-            overlay_id,
-            overlay_name: overlay_name.to_string(),
-            deck_level,
-            direction,
-        });
+        let layer = BridgeLayer::for_overlay(overlay_id, cell.level);
         cell.has_bridge_deck = true;
-        cell.bridge_walkable = direction != BridgeDirection::Low
+        cell.bridge_walkable = layer.direction != BridgeDirection::Low
             && !cell.terrain_object_blocks
             && !cell.overlay_blocks;
-        cell.bridge_deck_level = deck_level;
-    }
-
-    /// Project a direct `CellClass::OverlayData` write into the derived bridge
-    /// facts without inventing an overlay identity. The native high-bridge
-    /// setters write this byte on four cells before `OverlayClass::Mark`
-    /// decides whether the anchor itself receives an overlay.
-    pub(crate) fn set_runtime_overlay_bridge_state_byte(
-        &mut self,
-        rx: u16,
-        ry: u16,
-        overlay_data: u8,
-    ) -> bool {
-        let Some(cell) = self.cell_mut(rx, ry) else {
-            return false;
-        };
-        cell.bridge_facts.state_byte = overlay_data;
-        true
-    }
-
-    /// Project the two literal field writes a crate removal performs.
-    ///
-    /// `CrateSlot__RemoveCrateOverlayFromCell @ 0x004A1AA0` stores
-    /// `CellClass+0x44 = -1` at `0x004A1BE1` and `CellClass+0x11E = 0` at
-    /// `0x004A1BE8` and touches nothing else — no `RecalcAttributes` tail and
-    /// no bridge setter. The derived bridge layer/deck projection therefore
-    /// stays as it is: the random placer only admits cells that already carry
-    /// no overlay, so a removal can never be undoing a bridge identity in
-    /// stock rules.
-    pub(crate) fn clear_runtime_overlay_identity(&mut self, rx: u16, ry: u16) -> bool {
-        let Some(cell) = self.cell_mut(rx, ry) else {
-            return false;
-        };
-        cell.bridge_facts.overlay_id = None;
-        cell.bridge_facts.state_byte = 0;
-        true
+        cell.bridge_deck_level = layer.deck_level;
+        cell.bridge_layer = Some(layer);
     }
 
     pub fn capture_real_cell_bridge_flags_0x1180(&self) -> RealCellBridgeFlags0x1180 {

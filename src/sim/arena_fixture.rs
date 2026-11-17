@@ -2,9 +2,14 @@
 //! grid, for fixtures that order units around through `advance_tick`, and
 //! the native map inputs a component fixture's Foot Process reads.
 
+use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::ruleset::RuleSet;
+use crate::sim::bridge_state::BridgeRuntimeState;
 use crate::sim::pathfinding::PathGrid;
+use crate::sim::pathfinding::zone_map::ZoneGrid;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
+use std::sync::Arc;
 
 /// Explicit rules prior for a synthetic clear-ground component scene.
 /// Native LandType defaults are not buildable; an arena intended to host
@@ -35,22 +40,48 @@ pub fn rival_arena(rules: &RuleSet, seed: u64) -> Simulation {
 }
 
 /// The same two-house arena with enough room for a mechanism's footprint.
-pub(crate) fn rival_arena_with_size(rules: &RuleSet, seed: u64, size: u16) -> Simulation {
+pub fn rival_arena_with_size(rules: &RuleSet, seed: u64, size: u16) -> Simulation {
     let mut sim = Simulation::with_seed(seed);
     flat_ground_with_size(&mut sim, rules, size);
     for (name, human) in [("Russians", false), ("Americans", true)] {
         let id = sim.interner.intern(name);
         let mut house = crate::sim::house_state::HouseState::new(id, 0, None, human, 0, 10);
-        house.difficulty = crate::sim::house_state::HouseDifficulty::Normal;
-        house.current_iq = if human {
+        house.set_difficulty_for_test(crate::sim::house_state::HouseDifficulty::Normal);
+        house.set_current_iq_for_test(if human {
             0
         } else {
             rules.general.max_iq_levels
-        };
-        sim.houses.insert(id, house);
-        sim.session.house_order.push(id);
+        });
+        sim.houses.register(house);
     }
     sim
+}
+
+/// The player has discovered `id` (Techno `+0x41B`), as a campaign object in
+/// explored ground is from its first AI tick (`update_techno_discovery_from_shroud`).
+/// The arena runs the campaign without a current player, so nothing is
+/// discovered there, and a human player's unit acquires only what the player
+/// owns or has discovered (Evaluate_Candidate `0x006F81BE..0x006F81F4`).
+pub fn discover(sim: &mut Simulation, id: u64) {
+    sim.substrate
+        .entities
+        .get_mut(id)
+        .expect("discovered object")
+        .discovery
+        .set_discovered_by_current_house_for_test(true);
+}
+
+/// The player owns `id` (Techno `+0x41A`), as every object of the campaign
+/// player's house does (InitManagers `0x006F3F40`): a human player's healer
+/// or repairer takes its own side's units only with it, for the reason
+/// [`discover`] gives.
+pub fn own(sim: &mut Simulation, id: u64) {
+    sim.substrate
+        .entities
+        .get_mut(id)
+        .expect("owned object")
+        .discovery
+        .set_owned_by_current_house_for_test(true);
 }
 
 /// The rival-house arena with flat Water cells and the production rules'
@@ -83,7 +114,7 @@ pub fn flood(
         .expect("Water land semantics");
     let mut terrain = clear_ground(size);
     for (x, y) in cells {
-        let cell = terrain.cell_mut(x, y).unwrap();
+        let cell = terrain.cell_mut_for_test(x, y).unwrap();
         cell.land_type = LandType::Water.as_index();
         cell.speed_costs = water.speed_costs;
         cell.ground_walk_blocked = water.ground_blocked;
@@ -106,7 +137,7 @@ pub fn flood(
 /// Install the arena on `sim`, with commands executing on the next tick, and
 /// return its path grid.
 pub fn flat_arena(sim: &mut Simulation, rules: &RuleSet) -> PathGrid {
-    sim.input_delay_ticks = 0;
+    sim.set_input_delay_ticks(0);
     flat_ground(sim, rules)
 }
 
@@ -117,12 +148,20 @@ pub fn flat_ground(sim: &mut Simulation, rules: &RuleSet) -> PathGrid {
 }
 
 fn flat_ground_with_size(sim: &mut Simulation, rules: &RuleSet, size: u16) -> PathGrid {
-    sim.session.map_width = size;
-    sim.session.map_height = size;
+    sim.session.set_map_width_for_test(size);
+    sim.session.set_map_height_for_test(size);
     sim.install_resolved_terrain_for_new_map(clear_ground(size));
-    sim.playfield_bounds = Some(OPEN_PLAYFIELD);
-    sim.playfield_size_height = Some(20);
-    install_empty_arena_navigation(sim, rules, size);
+    sim.set_playfield_bounds_for_test(Some(OPEN_PLAYFIELD));
+    sim.set_playfield_size_height_for_test(Some(20));
+    install_empty_arena_navigation(
+        &sim.substrate,
+        &mut sim.zone_grid,
+        &mut sim.path_grid,
+        &sim.resolved_terrain,
+        &sim.bridge_state,
+        rules,
+        size,
+    );
     assert!(sim.rebuild_dynamic_navigation(rules));
     sim.path_grid_snapshot()
         .map(|grid| (*grid).clone())
@@ -135,16 +174,23 @@ fn flat_ground_with_size(sim: &mut Simulation, rules: &RuleSet, size: u16) -> Pa
 /// test process for each size and starting Dummy state. The rebuild keeps an
 /// installed copy because its path grid and movement classes still match. An
 /// arena that already holds objects, bridges or navigation builds its own.
-fn install_empty_arena_navigation(sim: &mut Simulation, rules: &RuleSet, size: u16) {
-    if !(sim.substrate.entities.is_empty()
-        && sim.bridge_state.is_none()
-        && sim.zone_grid.is_none()
-        && sim.path_grid.is_none())
+fn install_empty_arena_navigation(
+    substrate: &ObjectSubstrate,
+    zone_grid: &mut Option<ZoneGrid>,
+    path_grid: &mut Option<Arc<PathGrid>>,
+    resolved_terrain: &Option<ResolvedTerrainGrid>,
+    bridge_state: &Option<BridgeRuntimeState>,
+    rules: &RuleSet,
+    size: u16,
+) {
+    if !(substrate.entities.is_empty()
+        && bridge_state.is_none()
+        && zone_grid.is_none()
+        && path_grid.is_none())
     {
         return;
     }
-    let dummy = sim
-        .resolved_terrain
+    let dummy = resolved_terrain
         .as_ref()
         .expect("arena terrain")
         .shared_cell_dummy();
@@ -152,7 +198,7 @@ fn install_empty_arena_navigation(sim: &mut Simulation, rules: &RuleSet, size: u
         crate::test_fixture::once_per_process(("empty arena", size, dummy.state_words()), || {
             let mut probe = Simulation::with_seed(0);
             probe.install_resolved_terrain_for_new_map(clear_ground(size));
-            probe.playfield_bounds = Some(OPEN_PLAYFIELD);
+            probe.set_playfield_bounds_for_test(Some(OPEN_PLAYFIELD));
             let probe_dummy = probe.resolved_terrain.as_ref()?.shared_cell_dummy();
             probe_dummy.adopt_prepared_load_state(&dummy);
             assert!(probe.rebuild_dynamic_navigation(rules));
@@ -164,20 +210,23 @@ fn install_empty_arena_navigation(sim: &mut Simulation, rules: &RuleSet, size: u
         })
         .expect("arena navigation");
     dummy.adopt_prepared_load_state(&built);
-    sim.zone_grid = Some(zones);
-    sim.path_grid = Some(path);
+    *zone_grid = Some(zones);
+    *path_grid = Some(path);
 }
 
 /// A `size` x `size` grid of clear ground cells.
 fn clear_ground(size: u16) -> crate::map::resolved_terrain::ResolvedTerrainGrid {
     let clear = crate::rules::terrain_rules::SpeedCostProfile {
-        foot: Some(100),
-        track: Some(100),
-        wheel: Some(100),
+        foot: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        track: Some(crate::util::native_x87::NativeF32Bits::ONE),
+        wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
         float: None,
-        amphibious: Some(80),
+        amphibious: Some(crate::rules::terrain_rules::test_speed_percent(80)),
         float_beach: None,
-        hover: Some(50),
+        hover: Some(crate::util::native_x87::NativeF32Bits::from_bits(
+            0x3f00_0000,
+        )),
+        winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
     };
     let cell = |x, y| {
         let mut cell = crate::map::resolved_terrain::test_flat_cell(x, y);
@@ -216,25 +265,29 @@ pub fn supply_native_map(sim: &mut Simulation) {
         // Every supplied clear ground has the same zones; a fixture builds
         // them once per test process and installs a copy.
         static CLEAR_GROUND_ZONES: std::sync::OnceLock<ZoneGrid> = std::sync::OnceLock::new();
-        sim.zone_grid = Some(if supplies_ground {
-            CLEAR_GROUND_ZONES
-                .get_or_init(|| native_zones(&grid, terrain))
-                .clone()
-        } else {
-            native_zones(&grid, terrain)
-        });
+        sim.zone_grid = Some(
+            if supplies_ground {
+                CLEAR_GROUND_ZONES
+                    .get_or_init(|| native_zones(&grid, terrain))
+                    .clone()
+            } else {
+                native_zones(&grid, terrain)
+            }
+            .into(),
+        );
     }
-    if sim.playfield_bounds.is_none() {
+    if sim.playfield_bounds().is_none() {
         let span = size.0.max(size.1);
-        sim.playfield_bounds = Some(crate::sim::cell_rect::PlayfieldBounds {
+        sim.set_playfield_bounds_for_test(Some(crate::sim::cell_rect::PlayfieldBounds {
             base: size.0,
             off_fc: -span,
             off_100: -span,
             off_104: span * 2,
             off_108: span * 2,
-        });
+        }));
     }
-    sim.playfield_size_height.get_or_insert(size.1);
+    sim.playfield_size_height_mut_for_test()
+        .get_or_insert(size.1);
     sim.install_fixture_path_grid(Some(&grid));
 }
 
@@ -254,7 +307,7 @@ pub fn supply_native_map_keyed<K: Ord + Send + 'static>(sim: &mut Simulation, te
             })
             .expect("keyed fixture zones");
         dummy.adopt_prepared_load_state(&built);
-        sim.zone_grid = Some(zones);
+        sim.zone_grid = Some(zones.into());
     }
     supply_native_map(sim);
 }
@@ -298,28 +351,21 @@ pub fn install_status_miner_cargo(
     ore: usize,
     gems: usize,
 ) {
+    use crate::rules::tiberium_type::TiberiumTypeId;
     use crate::sim::miner::{CargoBale, Miner, MinerConfig, ResourceType, miner_kind_for_object};
-    let config = MinerConfig::from_rules(rules);
     let kind = miner_kind_for_object(object).expect("native prior is a miner");
-    let mut miner = Miner::new(kind, &config, object.storage.max(0) as u16);
+    let mut miner = Miner::new(kind, &MinerConfig::default(), object.storage.max(0) as u16);
+    let bale = |id, resource| {
+        CargoBale::of_type(TiberiumTypeId(id), resource, rules)
+            .expect("rules list the first two Tiberium types")
+    };
     miner.set_cargo_for_test(
-        std::iter::repeat_n(
-            CargoBale {
-                resource_type: ResourceType::Ore,
-                value: config.ore_bale_value,
-            },
-            ore,
-        )
-        .chain(std::iter::repeat_n(
-            CargoBale {
-                resource_type: ResourceType::Gem,
-                value: config.gem_bale_value,
-            },
-            gems,
-        ))
-        .collect(),
+        std::iter::repeat_with(|| bale(0, ResourceType::Ore))
+            .take(ore)
+            .chain(std::iter::repeat_with(|| bale(1, ResourceType::Gem)).take(gems))
+            .collect(),
     );
-    entity.miner = Some(miner);
+    entity.miner = Some(Box::new(miner));
 }
 
 /// Explicit Foot+694 prior for an object-action consumer comparison. Actual
@@ -337,15 +383,15 @@ pub fn install_status_capture_count(
     count: u32,
 ) {
     let victims: Vec<_> = (0..count).map(|index| u64::from(index) + 10_000).collect();
-    entity.capture_manager = Some(
+    entity.capture_manager = Some(Box::new(
         crate::sim::capture_manager::CaptureManagerState::with_victims_for_test(
             capacity, infinite, &victims,
         ),
-    );
+    ));
 }
 
 /// One physical retail scene shared by the flight/rearm and presentation tests.
-/// The existing dock-cycle fixture loads Death.mmx, admits a real GAAIRC,
+/// The default scene loads Death.mmx and admits a real GAAIRC,
 /// two stock ORCAs and an enemy Rhino through the production placement/spawn
 /// owners. Callers issue their own commands and advance the bound runtime.
 pub struct RetailHarrierDockScene {
@@ -359,22 +405,37 @@ pub struct RetailHarrierDockScene {
 pub fn retail_harrier_dock_scene(
     retail: &std::path::Path,
 ) -> Result<RetailHarrierDockScene, String> {
+    retail_harrier_dock_scene_on_map(retail, "Death.mmx")
+}
+
+/// The same admitted scene on an explicitly selected physical retail map.
+pub fn retail_harrier_dock_scene_on_map(
+    retail: &std::path::Path,
+    map: &str,
+) -> Result<RetailHarrierDockScene, String> {
     use crate::sim::house_state::HouseState;
     use crate::sim::runtime::SimRuntime;
-    let mut scenario = crate::headless_scenario::load(retail, "Death.mmx", 0x5EED_0001)?;
+    let mut scenario = crate::headless_scenario::load(retail, map, 0x5EED_0001)?;
     let SimRuntime {
         simulation: sim,
         resources,
     } = &mut scenario.runtime;
     let rules = &resources.rules;
-    // Both houses human, so no house AI moves the Rhino.
+    // The normal Battle loader already registers Player. Reuse that house
+    // rather than replacing its bootstrap state; both scene houses are human,
+    // so no house AI moves the Rhino.
     let mut owners = Vec::new();
     for (index, name) in ["Player", "Enemy"].into_iter().enumerate() {
         let id = sim.interner.intern(name);
-        let mut house = HouseState::new(id, index as u8, None, true, 0, 10);
-        house.multiplay_passive = true;
-        sim.houses.insert(id, house);
-        sim.session.house_order.push(id);
+        let house = sim.houses.get_or_register_for_test(id, || {
+            let mut house = HouseState::new(id, index as i32, None, true, 0, 10);
+            // An extra house in an admitted scenario needs its native name
+            // for snapshot restore. Existing bootstrap names stay intact.
+            house.initialize_scenario_name(name);
+            house
+        });
+        assert!(house.is_human(), "retail dock scene's {name} is human");
+        house.set_multiplay_passive_for_test(true);
         owners.push(id);
     }
     let mut cells: Vec<(u16, u16)> = sim
@@ -409,6 +470,7 @@ pub fn retail_harrier_dock_scene(
                     airfield_type,
                     site,
                     Some(owners[owner]),
+                    None,
                     None,
                 )
             {
@@ -464,5 +526,5 @@ pub fn install_status_ammo_state(
 }
 /// Explicit DrawExtras consumer prior; repair lifecycle tests use ToggleRepair.
 pub fn install_status_repair(entity: &mut crate::sim::game_entity::GameEntity, repairing: bool) {
-    entity.repairing.set_for_test(repairing);
+    entity.building.repairing.set_for_test(repairing);
 }

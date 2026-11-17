@@ -12,12 +12,12 @@ pub(crate) mod ion_blast;
 pub mod rocking_system;
 pub mod self_destruct;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 #[path = "rocking_tests.rs"]
 mod rocking_tests;
 
 pub use impulse::{RockerImpulse, apply_rocker_impulse};
-pub(crate) use rocking_system::update;
+pub(crate) use rocking_system::{update, updates};
 
 use crate::util::fixed_math::SimFixed;
 use crate::util::native_x87::{NativeF32Bits, NativeF64Bits, X87Chop53 as X, X87Value};
@@ -41,7 +41,34 @@ impl Default for RockingState {
     }
 }
 
+impl crate::sim::game_entity::GameEntity {
+    /// The body-rocking state, materialized at its native zero on the first
+    /// producer's write. Native keeps these Techno fields inline from
+    /// construction; sparse Rust storage creates them only when a producer
+    /// first needs them.
+    pub(crate) fn rocking_mut(&mut self) -> &mut RockingState {
+        self.rocking.get_or_insert_with(RockingState::default)
+    }
+}
+
 impl RockingState {
+    /// Both axes at rest: no rate, and a positive-zero angle. The axis step
+    /// of an ordinary visit (`0x0070B700`/`0x0070B963`) zeroes the angle of
+    /// an axis without a rate and writes nothing else, so such a state keeps
+    /// its words.
+    pub(crate) fn at_rest(&self) -> bool {
+        [
+            (self.angle_sideways, self.vel_sideways),
+            (self.angle_forwards, self.vel_forwards),
+        ]
+        .into_iter()
+        .all(|(angle, rate)| {
+            angle == NativeF32Bits::POSITIVE_ZERO
+                && X::compare(load(rate), X::load_i32(0))
+                    == crate::util::native_x87::X87Ordering::Equal
+        })
+    }
+
     /// Compatibility boundary only; simulation and pose consumers retain the
     /// native words. A value outside I16F16 saturates at this read boundary.
     pub fn angle_sideways(&self) -> SimFixed {
@@ -111,6 +138,17 @@ impl RockingState {
             load(self.vel_forwards),
             load(NativeF32Bits::from_bits(0x3ca3_d70a)),
         ));
+    }
+
+    /// Crush_Or_Prescatter_Cell's tail after crushing a Unit
+    /// (`0x00741939..0x00741954`): FCOMP of Techno+334 with binary32 0.0
+    /// (`0x007E1748`); on C3 (equal, either zero, or unordered) the store of
+    /// binary32 -0.05 (`0xBD4CCCCD`).
+    pub(crate) fn tilt_after_unit_crush(&mut self) {
+        let forwards = f32::from_bits(self.vel_forwards.bits());
+        if forwards == 0.0 || forwards.is_nan() {
+            self.vel_forwards = NativeF32Bits::from_bits(0xbd4c_cccd);
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]

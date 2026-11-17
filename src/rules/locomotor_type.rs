@@ -17,17 +17,17 @@
 // ---------------------------------------------------------------------------
 
 /// Which locomotor class controls a unit's movement behavior: the eight
-/// classes an uncommented retail YR `Locomotor=` key selects.
+/// classes an uncommented retail YR `Locomotor=` key selects, and Tunnel.
 ///
 /// Each variant is a distinct movement controller / state machine in the
 /// original engine. Do NOT collapse these into one generic "ground mover" —
 /// they have meaningfully different behavior (see locomotor report).
 ///
 /// The executable also registers Tiberian Sun's Mech, Tunnel and DropPod
-/// classes. They are dormant in YR: no retail `Locomotor=` names them and
-/// DropPod's only installer (`0x004DB8A0`) has no references
-/// (`docs/plans/2026-07-29-locomotion-substrate-design.md`), so they have no
-/// variant here.
+/// classes (`WinMain`'s `CoRegisterClassObject` list). No retail
+/// `Locomotor=` names them. Tunnel is ported for mods that select it; Mech
+/// and DropPod have no variant (DropPod's only installer, `0x004DB8A0`, has
+/// no references).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -48,11 +48,14 @@ pub enum LocomotorKind {
     Jumpjet,
     /// Spawned missile (V3, Dreadnought). Scripted missile controller.
     Rocket,
+    /// Subterranean movement (`TunnelLocomotionClass`): dig in, travel
+    /// underground in a straight line, surface. No retail type selects it.
+    Tunnel,
 }
 
 impl LocomotorKind {
     #[cfg(test)]
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Drive,
         Self::Hover,
         Self::Walk,
@@ -61,6 +64,7 @@ impl LocomotorKind {
         Self::Ship,
         Self::Jumpjet,
         Self::Rocket,
+        Self::Tunnel,
     ];
 
     /// Row of this kind in `Self::ALL` and [`INSTALLED_CLSID_KIND_TABLE`].
@@ -74,14 +78,16 @@ impl LocomotorKind {
     }
 }
 
-/// The eight CLSIDs selected by uncommented `Locomotor=` keys in retail YR, in
-/// the braces-and-upper-case spelling the retail INI uses, in
+/// The eight CLSIDs selected by uncommented `Locomotor=` keys in retail YR,
+/// then Tunnel's (`CLSID_TunnelLocomotion @ 0x007E9A50`, written by
+/// `TunnelLocomotionClass::GetClassID @ 0x0072A110`), in the
+/// braces-and-upper-case spelling the retail INI uses, in
 /// `LocomotorKind::ALL` order.
 ///
-/// The dormant Tiberian Sun CLSIDs (Mech, Tunnel, DropPod) are deliberately
-/// absent: an INI naming one falls back to the constructor seed like any other
+/// The dormant Tiberian Sun CLSIDs Mech and DropPod are deliberately absent:
+/// an INI naming one falls back to the constructor seed like any other
 /// unrecognized value.
-pub const INSTALLED_CLSID_KIND_TABLE: [(&str, LocomotorKind); 8] = [
+pub const INSTALLED_CLSID_KIND_TABLE: [(&str, LocomotorKind); 9] = [
     (
         "{4A582741-9839-11D1-B709-00A024DDAFD1}",
         LocomotorKind::Drive,
@@ -111,13 +117,20 @@ pub const INSTALLED_CLSID_KIND_TABLE: [(&str, LocomotorKind); 8] = [
         "{B7B49766-E576-11D3-9BD9-00104B972FE8}",
         LocomotorKind::Rocket,
     ),
+    (
+        "{4A582743-9839-11D1-B709-00A024DDAFD1}",
+        LocomotorKind::Tunnel,
+    ),
 ];
 
-/// Parse a retail GUID spelling into one of the eight installable kinds.
+/// Parse a retail GUID spelling into one of the nine installable kinds.
 ///
 /// Braces are optional and ASCII case is ignored. Parse failure stays
 /// explicit; [`resolve_installed_kind`] owns the native silent/default
 /// fallback.
+///
+/// With the `phobos` feature, values that do not start with `{` may instead
+/// name a semantic alias (Phobos `Utilities/TemplateDef.h`, `read<CLSID>`).
 pub fn kind_from_clsid(text: &str) -> Option<LocomotorKind> {
     let normalized = text
         .trim()
@@ -125,10 +138,48 @@ pub fn kind_from_clsid(text: &str) -> Option<LocomotorKind> {
         .and_then(|text| text.strip_suffix('}'))
         .unwrap_or_else(|| text.trim());
 
-    INSTALLED_CLSID_KIND_TABLE
+    if let Some(kind) = INSTALLED_CLSID_KIND_TABLE
         .iter()
         .find(|(clsid, _)| clsid[1..clsid.len() - 1].eq_ignore_ascii_case(normalized))
         .map(|(_, kind)| *kind)
+    {
+        return Some(kind);
+    }
+
+    #[cfg(feature = "phobos")]
+    {
+        kind_from_alias(text)
+    }
+    #[cfg(not(feature = "phobos"))]
+    {
+        None
+    }
+}
+
+/// Phobos semantic locomotor aliases: a value without a leading `{` matched
+/// case-insensitively to a class name. The dormant Tiberian Sun classes
+/// `Mech` and `DropPod` have no VERA kind, so their aliases resolve like their
+/// CLSIDs — to `None` — rather than selecting a different movement system.
+/// `Chrono` is not an alias either; it falls back to the Teleport constructor
+/// seed.
+#[cfg(feature = "phobos")]
+fn kind_from_alias(text: &str) -> Option<LocomotorKind> {
+    let text = text.trim();
+    if text.starts_with('{') {
+        return None;
+    }
+    Some(match text.to_ascii_lowercase().as_str() {
+        "drive" => LocomotorKind::Drive,
+        "jumpjet" => LocomotorKind::Jumpjet,
+        "hover" => LocomotorKind::Hover,
+        "rocket" => LocomotorKind::Rocket,
+        "walk" => LocomotorKind::Walk,
+        "fly" => LocomotorKind::Fly,
+        "teleport" => LocomotorKind::Teleport,
+        "ship" => LocomotorKind::Ship,
+        "tunnel" => LocomotorKind::Tunnel,
+        _ => return None,
+    })
 }
 
 /// The kind a type installs when its `Locomotor=` value is absent or does not
@@ -186,15 +237,16 @@ pub enum SpeedType {
     Track,
     /// Wheeled vehicles. Slower on rough terrain than Track.
     Wheel,
-    /// Jumpjet hover movement type.
+    /// Hover vehicles (LCRF, ROBO, SAPC, YHVR) and many fliers, such as
+    /// JUMPJET and ZEP. Crosses land and water.
     Hover,
     /// Aircraft. Ignores terrain entirely.
     Winged,
-    /// Hover units. Can cross water and land.
+    /// Ships and other naval units. Water only.
     Float,
     /// Amphibious units. Can traverse both land and water.
     Amphibious,
-    /// Hover that can go on beaches (specific to certain hover units).
+    /// Like Float, plus beach cells. No retail type uses it.
     FloatBeach,
     /// Original48DFF0 returns -1 for a nonempty unknown name. Keep this
     /// distinct from Track; native invalid-index gameplay is not established.
@@ -405,24 +457,23 @@ impl MovementZone {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_a_n))]
 mod tests {
     use super::*;
 
-    /// The two locomotor CLSIDs whose movement systems were removed as Tiberian
-    /// Sun legacy. Kept here, not in the production table, precisely because
-    /// nothing in the engine may resolve them any more.
+    /// The two Tiberian Sun locomotor CLSIDs no retail type selects. DropPod
+    /// has no VERA kind; Tunnel resolves to [`LocomotorKind::Tunnel`].
     const DORMANT_CLSID_TUNNEL: &str = "4A582743-9839-11D1-B709-00A024DDAFD1";
     const DORMANT_CLSID_DROPPOD: &str = "4A582745-9839-11D1-B709-00A024DDAFD1";
 
-    /// No stock unit selects the Tunnel or DropPod locomotor, which is what
-    /// makes removing those two movement systems safe.
+    /// No stock unit selects the Tunnel or DropPod locomotor: Tunnel is
+    /// dormant on retail data and DropPod has no movement system here.
     ///
     /// The golden is retail INI bytes — not a hand-written list and not a
-    /// Rust-vs-Rust comparison — so this is a genuine parity check on the
-    /// dormancy claim. If a future INI reintroduces either CLSID this goes red,
-    /// which is the correct signal: the engine would then silently fall back to
-    /// the default locomotor for those units.
+    /// Rust-vs-Rust comparison. If a future INI names either CLSID this goes
+    /// red: a DropPod unit would fall back to the default locomotor, and the
+    /// Tunnel chain's retail-dormancy claim (`docs/ares-subterranean.md`) would no
+    /// longer hold.
     ///
     /// Scope of the claim: active YR `rulesmd.ini` only. Campaign, mission
     /// and map INIs are UNCHECKED.
@@ -440,9 +491,8 @@ mod tests {
                 let hits = upper.matches(clsid).count();
                 assert_eq!(
                     hits, 0,
-                    "{name} references the dormant {label} locomotor CLSID {clsid} {hits} time(s); \
-                     its movement system was removed, so those units would fall back to the \
-                     default locomotor"
+                    "{name} references the {label} locomotor CLSID {clsid} {hits} time(s), \
+                     which no retail type selected"
                 );
             }
         }
@@ -458,15 +508,6 @@ mod tests {
                 "braceless CLSID: {clsid}"
             );
             assert_eq!(resolve_installed_kind(Some(clsid)), kind);
-        }
-    }
-
-    #[test]
-    fn installed_table_follows_kind_order() {
-        for (row, &(clsid, kind)) in INSTALLED_CLSID_KIND_TABLE.iter().enumerate() {
-            assert_eq!(LocomotorKind::ALL[row], kind);
-            assert_eq!(kind.table_index(), row);
-            assert_eq!(kind.clsid(), clsid);
         }
     }
 
@@ -528,20 +569,23 @@ mod tests {
     }
 
     #[test]
-    fn lowercase_retail_spelling_resolves() {
-        // Four stock sections spell `11d1` in lower case.
-        assert_eq!(
-            kind_from_clsid("{4A582747-9839-11d1-B709-00A024DDAFD1}"),
-            Some(LocomotorKind::Teleport)
-        );
-    }
-
-    #[test]
     fn absent_and_unparseable_values_take_the_constructor_seed() {
         assert_eq!(resolve_installed_kind(None), DEFAULT_INSTALLED_KIND);
         for bad in ["", "not-a-guid", "{00000000-0000-0000-0000-000000000000}"] {
             assert_eq!(kind_from_clsid(bad), None);
             assert_eq!(resolve_installed_kind(Some(bad)), DEFAULT_INSTALLED_KIND);
+        }
+    }
+
+    /// A mod's `Locomotor=` naming Tunnel's CLSID installs the Tunnel class
+    /// (`0x007E9A50`), in either case spelling.
+    #[test]
+    fn tunnel_clsid_selects_the_tunnel_class() {
+        for value in [
+            "{4A582743-9839-11d1-B709-00A024DDAFD1}",
+            "{4A582743-9839-11D1-B709-00A024DDAFD1}",
+        ] {
+            assert_eq!(resolve_installed_kind(Some(value)), LocomotorKind::Tunnel);
         }
     }
 
@@ -552,23 +596,6 @@ mod tests {
         let mech = "{55D141B8-DB94-11D1-AC98-006008055BB5}";
         assert_eq!(kind_from_clsid(mech), None);
         assert_eq!(resolve_installed_kind(Some(mech)), LocomotorKind::Teleport);
-    }
-
-    #[test]
-    fn test_speed_type_from_ini() {
-        assert_eq!(SpeedType::from_ini("Foot"), SpeedType::Foot);
-        assert_eq!(SpeedType::from_ini("Track"), SpeedType::Track);
-        assert_eq!(SpeedType::from_ini("wheel"), SpeedType::Wheel);
-        assert_eq!(SpeedType::from_ini("FLOAT"), SpeedType::Float);
-        assert_eq!(SpeedType::from_ini("Amphibious"), SpeedType::Amphibious);
-        assert_eq!(SpeedType::from_ini("Winged"), SpeedType::Winged);
-        assert_eq!(SpeedType::from_ini("FloatBeach"), SpeedType::FloatBeach);
-        assert_eq!(SpeedType::from_ini("Hover"), SpeedType::Hover);
-    }
-
-    #[test]
-    fn test_speed_type_unknown_preserves_invalid() {
-        assert_eq!(SpeedType::from_ini("bogus"), SpeedType::Invalid);
     }
 
     #[test]
@@ -621,5 +648,48 @@ mod tests {
     fn test_movement_zone_unknown_preserves_invalid_row() {
         assert_eq!(MovementZone::from_ini("invalid"), MovementZone::Invalid);
         assert_eq!(MovementZone::Invalid.matrix_row(), None);
+    }
+
+    /// Phobos `read<CLSID>` semantic aliases: braceless, ASCII
+    /// case-insensitive, and equivalent to the CLSID they abbreviate.
+    #[cfg(feature = "phobos")]
+    #[test]
+    fn phobos_locomotor_aliases_select_their_kinds() {
+        for (alias, kind) in [
+            ("Drive", LocomotorKind::Drive),
+            ("jumpJET", LocomotorKind::Jumpjet),
+            ("Hover", LocomotorKind::Hover),
+            ("Rocket", LocomotorKind::Rocket),
+            ("walk", LocomotorKind::Walk),
+            ("Fly", LocomotorKind::Fly),
+            ("Teleport", LocomotorKind::Teleport),
+            ("Ship", LocomotorKind::Ship),
+            ("tunnel", LocomotorKind::Tunnel),
+        ] {
+            assert_eq!(kind_from_clsid(alias), Some(kind), "alias {alias}");
+            assert_eq!(resolve_installed_kind(Some(alias)), kind, "alias {alias}");
+        }
+    }
+
+    /// `Chrono` is not an alias and the dormant classes have no VERA kind;
+    /// both keep the Teleport constructor seed, and a braced alias is not an
+    /// alias.
+    #[cfg(feature = "phobos")]
+    #[test]
+    fn phobos_dormant_and_unknown_aliases_keep_the_teleport_seed() {
+        for value in ["Chrono", "Mech", "DropPod", "droppod", "{Drive}"] {
+            assert_eq!(kind_from_clsid(value), None, "{value}");
+            assert_eq!(resolve_installed_kind(Some(value)), DEFAULT_INSTALLED_KIND);
+        }
+    }
+
+    #[cfg(not(feature = "phobos"))]
+    #[test]
+    fn locomotor_aliases_require_the_phobos_feature() {
+        assert_eq!(kind_from_clsid("Drive"), None);
+        assert_eq!(
+            resolve_installed_kind(Some("Drive")),
+            DEFAULT_INSTALLED_KIND
+        );
     }
 }

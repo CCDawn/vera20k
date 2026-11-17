@@ -23,13 +23,10 @@ fn cheer_matches_original_admission_and_shared_do_action_clock() {
              Ready=100,6,6\nIdle1=100,6,6\nIdle2=100,6,6\n\
              Die1=100,6,6\nCheer=100,{count},6\n"
         ));
-        let (mut sim, mut rules, _) =
+        let (mut sim, rules, _) =
             crate::sim::world::entry_test_fixture::fixture_with_rules_and_fixed_art("", &art);
-        // The original control supplies Type+E3C's signed action bank. ART
-        // metadata alone does not bind that bank, as the app loader does.
-        rules.bind_animation_sequences(
-            &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-        );
+        // The original control supplies Type+E3C's signed action bank through
+        // the same fixed-ART read as the loader.
         assert_eq!(
             i64::from(
                 rules
@@ -43,14 +40,14 @@ fn cheer_matches_original_admission_and_shared_do_action_clock() {
             "{input}: supplied native Cheer count"
         );
         let owner = sim.interner.intern("Americans");
-        sim.houses.insert(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 0, None, false, 0, 10),
-        );
-        sim.session.binary_frame = 100;
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                owner, 0, None, false, 0, 10,
+            ));
+        sim.session.set_binary_frame_for_test(100);
         // infantry_deploy_action leaves GameOptions+A8EB60 at the loaded
         // image's zero prior; Cheer normalizes its action-table delay there.
-        sim.session.game_options.game_speed = 0;
+        sim.session.game_options_mut_for_test().game_speed = 0;
         let id = sim
             .construct_object_limbo_at_height(
                 "ENGINEER",
@@ -150,7 +147,7 @@ fn do_action_refuses_unchanged_and_uninterruptible_actions() {
 /// The retail `[RocketeerSequence]` (artmd.ini) with the Hover record's
 /// value as given; `WALKJET` flies the Jumpjet locomotor without `JumpJet=`.
 fn rocketeer_rules(hover: &str) -> RuleSet {
-    let mut rules = RuleSet::from_ini(&IniFile::from_str(
+    let ini = IniFile::from_str(
         "[InfantryTypes]\n0=JUMPJET\n1=WALKJET\n\
          [JUMPJET]\nStrength=125\nJumpJet=yes\nBalloonHover=yes\nCrashable=yes\n\
          Locomotor={92612C46-F71F-11d1-AC9F-006008055BB5}\nSpeedType=Hover\n\
@@ -159,8 +156,7 @@ fn rocketeer_rules(hover: &str) -> RuleSet {
          [WALKJET]\nStrength=125\nImage=JUMPJET\nBalloonHover=yes\n\
          Locomotor={92612C46-F71F-11d1-AC9F-006008055BB5}\nSpeedType=Hover\n\
          MovementZone=Fly\nJumpjetSpeed=30\nJumpjetHeight=500\n",
-    ))
-    .unwrap();
+    );
     let art = IniFile::from_str(&format!(
         "[JUMPJET]\nSequence=RocketeerSequence\n\
          [RocketeerSequence]\nReady=0,1,1\nGuard=0,1,1\nProne=86,1,6\nWalk=8,6,6\n\
@@ -170,11 +166,8 @@ fn rocketeer_rules(hover: &str) -> RuleSet {
          Tumble=340,15,0\nAirDeathStart=340,8,0\nAirDeathFalling=348,1,0\n\
          AirDeathFinish=349,6,0\nParadrop=418,1,0\nCheer=419,8,0,E\nPanic=8,6,6\n"
     ));
+    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
     rules.replace_art_registry_for_test(crate::rules::art_data::ArtRegistry::from_ini(&art));
-    let registry = crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art);
-    rules.replace_animation_sequences_for_test(
-        crate::rules::animation_sequence::build_animation_sequence_catalog(&rules, Some(&registry)),
-    );
     rules
 }
 
@@ -186,13 +179,14 @@ fn rocketeer(input: &Value) -> (Simulation, RuleSet, u64) {
     let rules = rocketeer_rules(&format!("{hover_start},6,6"));
     let mut sim = Simulation::with_seed(0);
     // Original Actions/States supplies A8ED84=1000.
-    sim.session.binary_frame = 1000;
+    sim.session.set_binary_frame_for_test(1000);
     let house = sim.interner.intern("Americans");
-    sim.houses.insert(
-        house,
-        crate::sim::house_state::HouseState::new(house, 0, None, true, 0, 10),
-    );
-    sim.session.game_options.game_speed = input["game_speed"].as_i64().unwrap_or(1) as i32;
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            house, 0, None, true, 0, 10,
+        ));
+    sim.session.game_options_mut_for_test().game_speed =
+        input["game_speed"].as_i64().unwrap_or(1) as i32;
     let type_id = if input["jumpjet"].as_bool().unwrap_or(true) {
         "JUMPJET"
     } else {
@@ -215,7 +209,7 @@ fn rocketeer(input: &Value) -> (Simulation, RuleSet, u64) {
     entity.lifecycle.set_in_limbo_for_test(false);
     // jumpjet_infantry_actions.Actions supplies OWNER+74=1; Do_Action's
     // Object5F6B90 height predicate requires this independently of XYZ.
-    entity.lifecycle.set_cell_marked(true);
+    entity.lifecycle.set_cell_marked_for_test(true);
     entity
         .health
         .set_for_test(input["health"].as_i64().unwrap_or(125) as _);
@@ -307,7 +301,6 @@ fn jumpjet_infantry_actions_match_the_native_bodies() {
     ))
     .expect("corpus parses");
     let mut compared = 0;
-    let mut truncated = 0;
     for (index, row) in corpus["rows"].as_array().expect("rows").iter().enumerate() {
         let input = &row["input"];
         let output = &row["output"];
@@ -375,44 +368,31 @@ fn jumpjet_infantry_actions_match_the_native_bodies() {
             }
             other => panic!("unknown row kind {other}"),
         }
-        // A fraction within 2^-16 above 0.8 truncates to 0.8 itself
-        // (`set_speed_fraction_native_bits`): the tail reads it as a hover
-        // where native flies. The corpus probes that boundary on purpose.
-        let fraction = input["fraction"].as_f64().unwrap_or(0.0);
-        if kind == "movement"
-            && fraction > 0.8
-            && fraction * 65536.0 < 52429.0
-            && native_doing == DO_FLY
-        {
-            assert_eq!(doing(&sim, id), DO_HOVER, "{name}: truncated fraction");
-            truncated += 1;
-            continue;
-        }
         assert_eq!(doing(&sim, id), native_doing, "{name}");
         assert_stage(&sim, id, output, &name);
         compared += 1;
     }
-    assert_eq!((compared, truncated), (497, 30));
+    assert_eq!(compared, 527);
 }
 
-/// The truncation of `FootClass::SetSpeedFraction @ 0x004D3710`'s stored
-/// double to `SimFixed`: a Jumpjet at speed 30 braking by 3 reaches 3/30 and
+/// `FootClass::SetSpeedFraction @ 0x004D3710` retains the native double:
+/// a Jumpjet at speed 30 braking by 3 reaches 3/30 and
 /// 24/30, which the truncating native division leaves just below 0.1 and 0.8.
 /// The clamp itself is checked against the original setter in
 /// `components::tests::speed_fraction_setter_matches_the_original`.
 #[test]
-fn a_native_speed_fraction_is_truncated_below_its_thresholds() {
+fn a_native_speed_fraction_retains_bits_below_its_thresholds() {
     let mut speed = crate::sim::components::FootSpeedState::default();
     let mut set = |bits: u64| {
         speed.set_speed_fraction_native_bits(bits);
-        speed.applied_fraction().to_bits()
+        speed.native_applied_fraction().bits()
     };
     // 3/30 and 24/30 divided with truncation: one ulp below 0.1 and 0.8.
     let tenth = 0x3FB9_9999_9999_9999;
     let eight_tenths = 0x3FE9_9999_9999_9999;
     assert!(f64::from_bits(tenth) < 0.1 && f64::from_bits(eight_tenths) < 0.8);
-    assert_eq!(set(tenth), 6553);
-    assert_eq!(set(eight_tenths), 52428);
+    assert_eq!(set(tenth), tenth);
+    assert_eq!(set(eight_tenths), eight_tenths);
     // Neither reads as above its threshold; the next step above does.
     let mut entity =
         crate::sim::game_entity::GameEntity::test_default(1, "JUMPJET", "Americans", 0, 0);
@@ -458,28 +438,24 @@ fn the_default_arm_follows_the_native_sequencer_tables() {
 /// destination and IsMoving byte (+0x34) keep the constructor's null and
 /// false, as in a row without motion.
 fn walk_consumer(input: &Value) -> (Simulation, RuleSet, u64) {
-    let mut rules = RuleSet::from_ini(&IniFile::from_str(
+    let ini = IniFile::from_str(
         "[InfantryTypes]\n0=E1\n[E1]\nStrength=100\nSpeed=4\n\
          Locomotor={4A582744-9839-11D1-B709-00A024DDAFD1}\nMovementZone=Infantry\n",
-    ))
-    .unwrap();
+    );
     let mut text = String::from("[E1]\nSequence=SuppliedSequence\n[SuppliedSequence]\n");
     for name in crate::rules::infantry_sequence::NATIVE_SEQUENCE_NAMES {
         text.push_str(&format!("{name}=0,6,0\n"));
     }
     let art = IniFile::from_str(&text);
+    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
     rules.replace_art_registry_for_test(crate::rules::art_data::ArtRegistry::from_ini(&art));
-    let registry = crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art);
-    rules.replace_animation_sequences_for_test(
-        crate::rules::animation_sequence::build_animation_sequence_catalog(&rules, Some(&registry)),
-    );
     let mut sim = Simulation::with_seed(0);
-    sim.session.binary_frame = 100;
+    sim.session.set_binary_frame_for_test(100);
     let house = sim.interner.intern("Americans");
-    sim.houses.insert(
-        house,
-        crate::sim::house_state::HouseState::new(house, 0, None, true, 0, 10),
-    );
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            house, 0, None, true, 0, 10,
+        ));
     let id = sim
         .construct_object_limbo_at_height(
             "E1",
@@ -589,11 +565,8 @@ fn retail_teleport_default_action_matches_the_native_sequencer() {
     else {
         return;
     };
-    let mut rules = RuleSet::from_ini(&retail_rules).unwrap();
+    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&retail_rules, &retail_art).unwrap();
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&retail_art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&retail_art),
-    );
     let corpus: Value = serde_json::from_str(crate::test_fixture::text(
         "tools/spatial_oracle/infantry_default_motion.json",
     ))
@@ -635,13 +608,13 @@ fn retail_teleport_default_action_matches_the_native_sequencer() {
                     .collect(),
             ),
         );
-        sim.session.binary_frame = 1000;
-        sim.session.game_options.game_speed = 1;
+        sim.session.set_binary_frame_for_test(1000);
+        sim.session.game_options_mut_for_test().game_speed = 1;
         let house = sim.interner.intern("Americans");
-        sim.houses.insert(
-            house,
-            crate::sim::house_state::HouseState::new(house, 0, None, true, 0, 10),
-        );
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                house, 0, None, true, 0, 10,
+            ));
         let id = sim
             .construct_object_limbo_at_height(
                 "CLEG",
@@ -656,7 +629,7 @@ fn retail_teleport_default_action_matches_the_native_sequencer() {
             .unwrap();
         let actor = sim.substrate.entities.get_mut(id).unwrap();
         actor.lifecycle.set_in_limbo_for_test(false);
-        actor.lifecycle.set_cell_marked(true);
+        actor.lifecycle.set_cell_marked_for_test(true);
         actor.health.set_for_test(125);
         actor.position.set_exact_z_leptons_for_test(Some(0));
         actor
@@ -742,9 +715,6 @@ fn retail_full_slaves_remap_walk_before_fear_and_keep_the_action_clock_on_refusa
     };
     let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-    );
     assert_eq!(rules.object("SLAV").unwrap().storage, 4);
     let bank = rules.animation_sequence("SLAV").unwrap();
     assert_eq!(bank.infantry_action(3).unwrap().start_frame, 8);
@@ -779,6 +749,7 @@ fn retail_full_slaves_remap_walk_before_fear_and_keep_the_action_clock_on_refusa
             owner.then_some(123),
             vec![
                 CargoBale {
+                    tiberium_type: crate::rules::tiberium_type::TiberiumTypeId(0),
                     resource_type: ResourceType::Ore,
                     value: 25,
                 };
@@ -807,5 +778,90 @@ fn retail_full_slaves_remap_walk_before_fear_and_keep_the_action_clock_on_refusa
             assert_eq!(sim.entities().get(id).unwrap().native_stage(), &old_stage);
         }
         assert_eq!(sim.rng_state(), rng);
+    }
+}
+
+/// `DoType_Sequencer`'s Shovel arm (`0x00520B61..0x00520B84`) asks
+/// `Get_Mission` (vt+0x184, `0x005B3040`: the current Mission, or the queued
+/// one while current is -1) whether it is Harvest; any other answer takes the
+/// forced Ready at `0x00520E42`. Only the current -1 row with Harvest queued
+/// tells this apart from reading the current Mission alone, and no path was
+/// found that brings a digging slave there. Do_Action refuses the Shovel
+/// already playing before its force test (`0x0051D90B`), so Doing and the
+/// stage stay put and the draw wraps.
+#[test]
+fn retail_slave_shovel_completion_follows_the_effective_mission() {
+    use crate::sim::mission::state::MissionTestFixture;
+    use crate::sim::mission::{MissionDispatchTimer, MissionId};
+    use crate::sim::world::FrameEffects;
+    let Some((ini, art)) = crate::rules::retail_ini_fixture::retail_rules_and_art() else {
+        return;
+    };
+    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
+    rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
+    let shovel = rules
+        .animation_sequence("SLAV")
+        .unwrap()
+        .infantry_action(38)
+        .unwrap()
+        .frames_per_facing;
+    let harvest = MissionId::from_raw(10);
+    let guard = MissionId::from_raw(5);
+    for (current, queued, expected) in [
+        (harvest, MissionId::NONE, 38),
+        (MissionId::NONE, harvest, 38),
+        (guard, harvest, 0),
+        (MissionId::NONE, MissionId::NONE, 0),
+    ] {
+        let mut sim = Simulation::with_seed(6);
+        let id = sim
+            .construct_object_limbo_at_height(
+                "SLAV",
+                "YuriCountry",
+                10,
+                10,
+                0,
+                0,
+                &rules,
+                FrameEffects::default(),
+            )
+            .unwrap();
+        let actor = sim.substrate.entities.get_mut(id).unwrap();
+        actor.mission.apply_test_fixture(MissionTestFixture {
+            current,
+            suspended: MissionId::NONE,
+            queued,
+            movement_bypass_latch: 0,
+            handler_state: 0,
+            mission_start_frame: 0,
+            ai_counter: 0,
+            dispatch_timer: MissionDispatchTimer::at_frame(0),
+        });
+        actor.mission_leaf.set_infantry_doing_verified(38).unwrap();
+        actor.install_native_stage_fixture(crate::sim::stage::StageClass::from_native_fixture(
+            shovel,
+            0,
+            crate::sim::timer::CdTimer::from_raw(17, 91),
+            92,
+            1,
+        ));
+        assert!(!sim.infantry_sequencer(id, &rules, FrameEffects::default()));
+        assert_eq!(
+            doing(&sim, id),
+            expected,
+            "current {current:?}, queued {queued:?}"
+        );
+        if expected == 38 {
+            assert_eq!(
+                sim.substrate
+                    .entities
+                    .get(id)
+                    .unwrap()
+                    .native_stage()
+                    .value(),
+                shovel,
+                "refused re-request keeps the stage: current {current:?}, queued {queued:?}"
+            );
+        }
     }
 }

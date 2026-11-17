@@ -2,7 +2,9 @@
 //! Native callbacks visit Techno registration order, ordinary sight then Gap on
 //! each object. House240 idempotence is distinct from House577A SpySatActive;
 //! Map577F30 (RevealEntireMap) shares the House240 latch.
-use super::{FogState, InternedId, OwnerVisibility, SightAdmission, gap_footprint};
+use super::{FogState, InternedId, OwnerVisibility};
+#[cfg(any(test, feature = "test-support"))]
+use super::{SightAdmission, gap_footprint};
 
 /// The three native bulk writers have different counter semantics.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -22,12 +24,14 @@ impl FogState {
     /// `MapClass::RevealEntireMap`'s one-time House+240 test and set
     /// (`0x00577F9A..0x00577FAD`): false when the map is already revealed.
     pub(crate) fn admit_whole_map_reveal(&mut self, owner: InternedId) -> bool {
+        self.note_map(owner);
         self.whole_map_revealed_owners.insert(owner)
     }
 
     /// Successful native6FB170 gap re-admission invalidates House+240,
     /// including a friendly generator whose footprint leaves no hostile gap.
     pub(crate) fn invalidate_whole_map_reveal_for_owner(&mut self, owner: InternedId) {
+        self.note_map(owner);
         self.whole_map_revealed_owners.remove(&owner);
     }
 
@@ -95,9 +99,50 @@ impl FogState {
         *self = world.fog;
     }
 
-    /// Prepare the existing represented House-map bracket. This contains no
-    /// source event: Simulation performs each release/re-entry and delivers
-    /// Cell notifications synchronously between individual writes.
+    /// Map577D90's entry240 guard, before the shared live callbacks. The
+    /// reset writers577AB0/577C90 always enter. Source: original gamemd.
+    pub(crate) fn begin_map_transition(
+        &mut self,
+        owner: InternedId,
+        transition: MapTransition,
+    ) -> bool {
+        if transition == MapTransition::Reveal && self.whole_map_revealed_owners.contains(&owner) {
+            return false;
+        }
+        self.begin_whole_map_store(owner)
+    }
+
+    /// Admits a store to every cell of `owner`'s map: its plane exists and
+    /// its tracked changes are no longer complete. False for an empty map.
+    fn begin_whole_map_store(&mut self, owner: InternedId) -> bool {
+        if self.width == 0 || self.height == 0 {
+            return false;
+        }
+        self.by_owner
+            .get_or_insert_with(owner, || OwnerVisibility::new(self.width, self.height))
+            .tracked
+            .complete = false;
+        true
+    }
+
+    /// `MapClass::Reset_Shroud @ 0x00577BB0`'s cell pass on `owner`'s map
+    /// ([`OwnerVisibility::store_cleared_map_cell`] on each of `cells`).
+    /// Unlike the [`MapTransition`]s it releases no sight or gap; its caller
+    /// clears House+240 afterwards.
+    pub(crate) fn store_cleared_map(&mut self, owner: InternedId, cells: Vec<(u16, u16)>) {
+        if !self.begin_whole_map_store(owner) {
+            return;
+        }
+        self.note_map(owner);
+        let vis = self.by_owner.get_mut(&owner).expect("admitted map store");
+        for cell in cells {
+            vis.store_cleared_map_cell(cell);
+        }
+    }
+
+    /// Explicit footprint-only fixture inputs; no live source admission or
+    /// native House/Techno decision is implemented here.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn prepare_map_transition(
         &mut self,
         owner: InternedId,
@@ -106,11 +151,7 @@ impl FogState {
         gap_reentry: Option<&[super::GapGeneratorSource]>,
         alternates: &std::collections::BTreeMap<u64, SightAdmission>,
     ) -> Option<MapTransitionPlan> {
-        if self.width == 0
-            || self.height == 0
-            || (transition == MapTransition::Reveal
-                && self.whole_map_revealed_owners.contains(&owner))
-        {
+        if !self.begin_map_transition(owner, transition) {
             return None;
         }
         let held: std::collections::BTreeSet<_> = self
@@ -139,18 +180,17 @@ impl FogState {
             .chain(reentry.keys().copied())
             .chain(alternates.keys().copied())
             .collect();
-        self.by_owner
-            .get_or_insert_with(owner, || OwnerVisibility::new(self.width, self.height))
-            .tracked
-            .complete = false;
         Some(MapTransitionPlan {
             held,
+            #[cfg(any(test, feature = "test-support"))]
             gaps,
+            #[cfg(any(test, feature = "test-support"))]
             reentry,
             ids,
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn remove_map_transition_gap(
         &mut self,
         owner: InternedId,
@@ -162,7 +202,7 @@ impl FogState {
             .get_mut(&owner)
             .expect("admitted map transition");
         for index in gap_footprint(gap, usize::from(self.width), usize::from(self.height)) {
-            vis.shroud_knowledge[index].remove_gap(old_spy_sat_active);
+            vis.remove_gap_cell(index, old_spy_sat_active);
         }
     }
 
@@ -172,6 +212,7 @@ impl FogState {
         cells: Vec<(u16, u16)>,
         transition: MapTransition,
     ) {
+        self.note_map(owner);
         self.gap_sources.remove(&owner);
         if transition == MapTransition::Reveal {
             self.whole_map_revealed_owners.insert(owner);
@@ -189,6 +230,7 @@ impl FogState {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reenter_map_transition_gap(
         &mut self,
         owner: InternedId,
@@ -199,17 +241,20 @@ impl FogState {
             .get_mut(&owner)
             .expect("admitted map transition");
         for index in gap_footprint(gap, usize::from(self.width), usize::from(self.height)) {
-            vis.shroud_knowledge[index].add_gap();
-            vis.publish_knowledge(index);
+            vis.add_gap_cell(index);
         }
+        self.note_map(owner);
         self.gap_sources.entry(owner).or_default().insert(gap);
         self.whole_map_revealed_owners.remove(&owner);
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct MapTransitionPlan {
     pub held: std::collections::BTreeSet<u64>,
+    #[cfg(any(test, feature = "test-support"))]
     pub gaps: std::collections::BTreeMap<u64, Vec<super::GapGeneratorSource>>,
+    #[cfg(any(test, feature = "test-support"))]
     pub reentry: std::collections::BTreeMap<u64, Vec<super::GapGeneratorSource>>,
     pub ids: std::collections::BTreeSet<u64>,
 }

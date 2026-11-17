@@ -13,6 +13,13 @@
     allow(dead_code, unused_imports)
 )]
 
+// A focused test build leaves out the other test groups, and with them the
+// callers of test-only helpers outside the group (tools/README.md, "Test groups").
+#![cfg_attr(test_focus, allow(dead_code, unused_imports))]
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown", not(feature = "wasm")))]
+compile_error!("browser builds require --features wasm");
+
 // Asset parsers — .mix, .shp, .vxl, .pal, .tmp, .hva, .csf, .aud
 // No dependencies on game modules. Standalone parser library.
 pub mod assets;

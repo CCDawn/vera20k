@@ -1,6 +1,6 @@
 //! Comparisons with original gamemd Force_Track4B0C40, its Ship twin 6A0310
 //! and bunker459190..4591C4.
-//! See locomotor_force_track.meta.json for binary identity and supplied state.
+//! See locomotor_force_track.meta.json for supplied state.
 //! Full Force calls use allocated flat, no-overlay cells; the separate crate
 //! continuations supply callback effects, not an implementation of crate AI.
 //! Rust's raw occupation owner retains the native low byte, not the untouched
@@ -9,8 +9,7 @@
 use super::*;
 use crate::map::resolved_terrain::{ResolvedTerrainGrid, test_flat_cell};
 use crate::rules::locomotor_type::LocomotorKind;
-use crate::sim::docking::bunker_install::{BunkerRuntime, BunkerState, tick_bunker_install};
-use crate::sim::docking::bunker_link::BunkerLink;
+use crate::sim::docking::bunker_install::{BunkerRuntime, BunkerState, update_bunker};
 use crate::sim::movement::{DriveLocomotionRuntime, FacingClass, ShipLocomotionRuntime};
 use crate::util::fixed_math::SimFixed;
 use serde_json::{Value, json};
@@ -119,6 +118,15 @@ fn owner_state(entity: &GameEntity, exclude_bunker_speed_write: bool) -> Value {
             .unwrap()
             .remove("applied_fraction");
     }
+    // Ares TechnoExt AltOccupation (hooks 0x007441B6/0x00744216) is outside
+    // the native Unit these rows describe.
+    if let Some(ares) = value
+        .get_mut("seldom")
+        .and_then(|seldom| seldom.get_mut("ares"))
+        .and_then(Value::as_object_mut)
+    {
+        ares.remove("ares_alt_occupation");
+    }
     value
 }
 
@@ -157,7 +165,7 @@ fn fixture(case: &Value) -> Simulation {
     entity
         .lifecycle
         .set_in_limbo_for_test(integer(&before["owner_limbo"]) != 0);
-    entity.lifecycle.set_cell_marked(false);
+    entity.lifecycle.set_cell_marked_for_test(false);
     entity.set_foot_occupation_enabled(input["occupation_enabled"].as_bool().unwrap_or(false));
     entity
         .foot_speed
@@ -255,7 +263,7 @@ fn bunker_dispatch_matches_separate_native_force_then_owner_speed_write() {
             UNIT,
             selector,
             supplied(case),
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             None,
             crate::sim::world::FrameEffects::default()
         ));
@@ -284,9 +292,7 @@ fn bunker_dispatch_matches_separate_native_force_then_owner_speed_write() {
             y: y * 256 + 128,
             z: 312,
         });
-        entity
-            .bunker
-            .set_bunker_link_for_test(BunkerLink::Approaching(2));
+        entity.radio_contacts.set_slot(0, 2);
         let current = match selector {
             67 => 0x2000,
             68 => 0x6000,
@@ -307,17 +313,18 @@ fn bunker_dispatch_matches_separate_native_force_then_owner_speed_write() {
         building.set_owner_for_test(sim.intern("Americans"));
         building.set_type_ref_for_test(sim.intern("NATBNK"));
         building.position.put_location(supplied(case));
-        building.bunker_runtime = Some({
+        building.building.bunker_runtime = Some({
             let mut runtime = BunkerRuntime::idle();
             runtime.set_state_for_test(BunkerState::TurnToBuilding);
-            runtime.set_installing_unit_for_test(Some(UNIT));
             runtime
         });
+        building.radio_contacts.set_slot(0, UNIT);
         sim.substrate.entities.insert(building);
-        tick_bunker_install(
+        update_bunker(
             &mut sim,
             &rules,
             None,
+            2,
             crate::sim::world::FrameEffects::default(),
         );
         let entity = sim.substrate.entities.get(UNIT).unwrap();
@@ -333,6 +340,7 @@ fn bunker_dispatch_matches_separate_native_force_then_owner_speed_write() {
                 .entities
                 .get(2)
                 .unwrap()
+                .building
                 .bunker_runtime
                 .unwrap()
                 .state(),

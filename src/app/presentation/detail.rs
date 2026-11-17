@@ -2,10 +2,10 @@
 //!
 //! Logic55AFB0 counts visits; Throttle55E33B publishes them every 60 wall-clock
 //! buckets (timeGetTime >> 4). GameGetMinFrameRate55AF60 owns the hysteresis
-//! shared by Anim and LaserDraw. This state does not affect simulation.
+//! shared by Anim and LaserDraw. Its published rate also supplies WOL's
+//! transport pacing without directly mutating deterministic simulation state.
 //! Executed controls: tools/spatial_oracle/building_prism.{py,json,meta.json},
-//! `laser_fps` and `laser_detail_selection`; binary SHA256
-//! 1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c.
+//! `laser_fps` and `laser_detail_selection`; gamemd binary.
 
 use crate::rules::ruleset::DetailRules;
 use crate::sim::timer::CdTimer;
@@ -66,8 +66,14 @@ impl DetailState {
     /// Fill_In_Data6850F5..685110 calls 55AF40/55AF50 with retained Rules
     /// values. These setters preserve the counter, sample timer and latch.
     pub(crate) fn configure_normal(&mut self, rules: &DetailRules) {
-        self.minimum = rules.min_frame_rate_normal as u32;
+        self.set_min_frame_rate(rules.min_frame_rate_normal);
         self.buffer = rules.buffer_zone_width as u32;
+    }
+
+    /// `Game__SetMinFrameRate @ 0x0055AF40` stores 829FF4 alone; the
+    /// counter, sample timer and reduced latch stay as they are.
+    pub(crate) fn set_min_frame_rate(&mut self, minimum: i32) {
+        self.minimum = minimum as u32;
     }
 
     /// Logic55AFB3..55AFD3 increments ABCD40 before the Logic body runs.
@@ -106,6 +112,13 @@ impl DetailState {
         self.frame_rate
     }
 
+    /// Whether minimum + buffer wraps (signed INI values). Each
+    /// [`Self::minimum_frame_rate`] query can then flip the latch, so two
+    /// draws with the same inputs need not agree.
+    pub(crate) fn threshold_wraps(&self) -> bool {
+        self.minimum.checked_add(self.buffer).is_none()
+    }
+
     pub(crate) fn observation(&self) -> DetailObservation {
         DetailObservation {
             frame_rate: self.frame_rate,
@@ -140,7 +153,7 @@ impl DetailState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation))]
 mod tests {
     use super::*;
     use serde_json::{Value, json};

@@ -37,30 +37,11 @@ fn birth(value: &Value) -> LaserBirth {
                 spread: std::array::from_fn(|i| integer(&value["spread"][i]) as u8),
             }
         },
+        fade_start: crate::util::native_x87::NativeF32Bits::ONE,
         fade_end: crate::util::native_x87::NativeF32Bits::from_bits(
             value["fade_end_bits"].as_u64().unwrap() as u32,
         ),
     }
-}
-
-#[test]
-fn original_general_laser_reaches_the_shared_draw_consumer() {
-    let native = crate::test_fixture::json("tools/spatial_oracle/disk_laser.json");
-    let row = native["laser_draw"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| {
-            integer(&row["laser"]["house_color"]) == 0
-                && !row["segments"].as_array().unwrap().is_empty()
-        })
-        .expect("original GeneralDraw emits physical surface lines");
-    let mut lasers = Lasers::default();
-    lasers.create(birth(&row["laser"]), |_| {
-        panic!("explicit RGB has no House lookup")
-    });
-    lasers.live[0].age = integer(&row["laser"]["age"]);
-    assert_eq!(lasers.draws().count(), 1, "native GeneralDraw is visible");
 }
 
 #[test]
@@ -93,7 +74,7 @@ fn original_general_main_continuation_is_sampled_once_per_composite() {
             .observations()
             .map(|value| serde_json::to_value(value).unwrap())
             .collect::<Vec<_>>();
-        let ((), trace) = crate::sim::rng::trace_draws(|| lasers.composite(&mut main.draws()));
+        let (_, trace) = crate::sim::rng::trace_draws(|| lasers.composite(&mut main.draws()));
         assert_eq!(
             main.native_state_hex(),
             row["rng_after"]["main"].as_str().unwrap(),

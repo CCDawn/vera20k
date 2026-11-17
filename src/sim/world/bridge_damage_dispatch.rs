@@ -13,8 +13,8 @@ use std::hash::{Hash, Hasher};
 /// Map+D4's ordered packed-cell vector, independent of optional bridge geometry.
 /// Native5650E3/5651EB initializes it empty; MouseSave5BE8E1..927 and
 /// MouseLoad5BE598..61E retain the count and every coordinate, including duplicates.
-/// Source: original587180..58740E and47DDD5..47DE2B (gamemd1cdd1180).
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+/// Source: original587180..58740E and47DDD5..47DE2B (gamemd).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(in crate::sim::world) struct PendingBridgeCells {
     cells: Vec<(i16, i16)>,
 }
@@ -46,7 +46,7 @@ impl PendingBridgeCells {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "bridge_moving_collapse_tests.rs"]
 mod moving_collapse_tests;
 
@@ -94,10 +94,7 @@ impl CellReader for LiveCells<'_> {
     fn fields(&self, cell: Self::Cell) -> CellFields {
         let terrain = self.terrain();
         // Every bridge writer publishes CellClass+44 synchronously.
-        let overlay = match cell {
-            NativeCellIdentity::Real(index) => terrain.cells()[index].bridge_facts.overlay_id,
-            NativeCellIdentity::Dummy => terrain.shared_cell_dummy().overlay_fields().0,
-        };
+        let overlay = self.sim.cell_overlay(cell).overlay_id;
         CellFields {
             flags: terrain.native_cell_flags(cell),
             tile: terrain.native_cell_tile_index(cell),
@@ -293,7 +290,7 @@ impl DamageHost for LiveDamage<'_> {
         self.drivers.sim.stop_all_targeting_cell(
             rx as u16,
             ry as u16,
-            Some(rules),
+            rules,
             self.drivers.registry,
             self.drivers.frame_effects,
         );
@@ -304,8 +301,8 @@ impl DamageHost for LiveDamage<'_> {
         // same native damage attempt even when its driver returns false.
         self.drivers
             .sim
-            .tactical_dirty_cells
-            .push((self.event.rx, self.event.ry));
+            .dirty_cells
+            .mark_tactical((self.event.rx, self.event.ry));
     }
 }
 

@@ -214,8 +214,9 @@ fn replicate_previous(dest: &mut [u8], di: usize, src_idx: usize, count: usize) 
 /// Decompress chunked LCW data (same chunk format as LZO).
 ///
 /// Chunk layout: [u16 LE src_len][u16 LE dst_len][src_len bytes of LCW data]
-/// Chunks repeat until all data is consumed.
-pub fn decompress_chunks(data: &[u8]) -> Result<Vec<u8>, LcwError> {
+/// Chunks repeat until all data is consumed. The caller supplies the maximum
+/// total decoded size; every advertised chunk is checked before allocation.
+pub fn decompress_chunks(data: &[u8], maximum_output: usize) -> Result<Vec<u8>, LcwError> {
     let mut result: Vec<u8> = Vec::new();
     let mut offset: usize = 0;
 
@@ -228,19 +229,84 @@ pub fn decompress_chunks(data: &[u8]) -> Result<Vec<u8>, LcwError> {
             return Err(LcwError::InputTruncated);
         }
 
-        let mut temp: Vec<u8> = vec![0u8; dst_len.max(262_144)];
-        let written: usize = lcw_decompress(&data[offset..offset + src_len], &mut temp)?;
-
-        // Use dst_len bytes (the expected output), not necessarily all written bytes.
-        let copy_len: usize = dst_len.min(written);
-        result.extend_from_slice(&temp[..copy_len]);
+        let start = result.len();
+        let end = start
+            .checked_add(dst_len)
+            .filter(|&end| end <= maximum_output)
+            .ok_or(LcwError::OutputOverflow {
+                needed: start.saturating_add(dst_len),
+                capacity: maximum_output,
+            })?;
+        result
+            .try_reserve_exact(dst_len)
+            .map_err(|_| LcwError::OutputOverflow {
+                needed: end,
+                capacity: result.capacity(),
+            })?;
+        result.resize(end, 0);
+        let written = lcw_decompress(&data[offset..offset + src_len], &mut result[start..end])?;
+        result.truncate(start + written);
         offset += src_len;
     }
 
     Ok(result)
 }
 
-#[cfg(test)]
+/// Write `data` in the chunk layout [`decompress_chunks`] reads: blocks of at
+/// most `block_size` bytes, each behind `[u16 compressed_len][u16
+/// uncompressed_len]`.
+///
+/// RESIDUAL: native's LCW compressor also emits back-references; this writes
+/// only fills (`0xFE`) for runs and literal copies, which decode to the same
+/// bytes but are larger on data that is not mostly runs.
+pub fn compress_chunks(data: &[u8], block_size: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for block in data.chunks(block_size.clamp(1, 0xFFFF)) {
+        let stream = fill_and_literal_stream(block);
+        out.extend_from_slice(&(stream.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(block.len() as u16).to_le_bytes());
+        out.extend_from_slice(&stream);
+    }
+    out
+}
+
+/// One LCW stream of `block`: a fill command for each run of four or more
+/// equal bytes, literal copies of up to 63 bytes otherwise, then the `0x80`
+/// end marker.
+fn fill_and_literal_stream(block: &[u8]) -> Vec<u8> {
+    const MIN_FILL: usize = 4;
+    let mut out = Vec::with_capacity(block.len() / 8 + 16);
+    let mut literal_start = 0;
+    let mut at = 0;
+    let flush = |out: &mut Vec<u8>, literals: &[u8]| {
+        for run in literals.chunks(0x3F) {
+            out.push(0x80 | run.len() as u8);
+            out.extend_from_slice(run);
+        }
+    };
+    while at < block.len() {
+        let value = block[at];
+        let run = block[at..]
+            .iter()
+            .take_while(|&&byte| byte == value)
+            .count();
+        if run >= MIN_FILL {
+            flush(&mut out, &block[literal_start..at]);
+            out.push(0xFE);
+            out.extend_from_slice(&(run as u16).to_le_bytes());
+            out.push(value);
+            at += run;
+            literal_start = at;
+        } else {
+            at += run;
+        }
+    }
+    flush(&mut out, &block[literal_start..]);
+    out.push(0x80);
+    out
+}
+
+#[cfg(all(test, tests_util))]
 mod tests {
     use super::*;
 
@@ -289,15 +355,6 @@ mod tests {
     }
 
     #[test]
-    fn test_end_marker() {
-        // Just the end marker.
-        let src: &[u8] = &[0x80];
-        let mut dest: [u8; 16] = [0; 16];
-        let n: usize = lcw_decompress(src, &mut dest).unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[test]
     fn test_chunk_decompression() {
         // Build a chunk: src_len=5, dst_len=3, then LCW data (3 literal bytes + end).
         let lcw_data: &[u8] = &[0x83, 0xAA, 0xBB, 0xCC, 0x80];
@@ -306,7 +363,7 @@ mod tests {
         chunk.extend_from_slice(&3u16.to_le_bytes()); // dst_len
         chunk.extend_from_slice(lcw_data);
 
-        let result: Vec<u8> = decompress_chunks(&chunk).unwrap();
+        let result: Vec<u8> = decompress_chunks(&chunk, 3).unwrap();
         assert_eq!(result, vec![0xAA, 0xBB, 0xCC]);
     }
 }

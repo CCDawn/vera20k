@@ -18,12 +18,10 @@
 //! calls keep their own.
 
 use crate::map::entities::EntityCategory;
-use crate::rules::object_type::Ability;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::combat::veterancy::has_weapon_ability;
 use crate::sim::components::NavTargetRef;
 use crate::sim::game_entity::GameEntity;
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::movement::bump_crush::{CrushTarget, object_is_crushable_by};
 use crate::sim::radio::{self, RadioMessage, RadioPayload, RadioResponse};
@@ -101,6 +99,7 @@ impl Simulation {
         id: u64,
         rules: &RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        effects: crate::sim::world::FrameEffects<'_>,
     ) {
         use crate::rules::locomotor_type::{MovementZone, SpeedType};
         use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
@@ -140,10 +139,19 @@ impl Simulation {
         // A8B261 is the existing session Crates option. Native checks it
         // AFTER FNPC, whose Dummy writes must survive even when disabled.
         if let Some((x, y)) = cell.filter(|&cell| cell != (0, 0))
-            && self.session.game_options.crates
+            && self.session.game_options().crates
             && let Some(registry) = registry
         {
-            crate::sim::crates::place_crate(self, rules, registry, (x as i16, y as i16), Some(20));
+            if let Err(error) = crate::sim::crates::place_crate(
+                self,
+                rules,
+                registry,
+                (x as i16, y as i16),
+                Some(20),
+                effects,
+            ) {
+                log::error!("Unit cargo crate placement failed: {error}");
+            }
         }
     }
 
@@ -197,7 +205,7 @@ impl Simulation {
         {
             return;
         }
-        let now = self.session.binary_frame;
+        let now = self.session.binary_frame();
         if self.unit_should_crush(id, source, rules) {
             self.set_unit_destination(id, NavTargetRef::object(source), rules, true, effects);
             let _ = self.mission_queue_exact(
@@ -205,7 +213,7 @@ impl Simulation {
                 MissionId::from_known(MissionType::Move),
                 0,
                 now,
-                &EntityReadyInputProvider,
+                &LiveReadyInputProvider { rules },
             );
             return;
         }
@@ -216,7 +224,8 @@ impl Simulation {
             return;
         };
         if !(object.harvester || object.weeder)
-            || unit.techno_pip_fill_level(object, rules) <= 0
+            || unit.techno_pip_fill_level(object, rules, self.capture_effective_count(id, rules))
+                <= 0
             || unit
                 .health
                 .compare_ratio(object.strength, rules.general.condition_yellow)
@@ -242,7 +251,7 @@ impl Simulation {
                 dock,
                 RadioMessage::Hello,
                 RadioPayload::default(),
-                Some(rules),
+                rules,
                 effects,
             ) == RadioResponse::Roger
         {
@@ -251,7 +260,7 @@ impl Simulation {
                 MissionId::from_known(MissionType::Enter),
                 0,
                 now,
-                &EntityReadyInputProvider,
+                &LiveReadyInputProvider { rules },
             );
         }
     }
@@ -277,12 +286,11 @@ impl Simulation {
             [coord.x, coord.y, coord.z]
         };
         CrushCharge {
-            crusher: object.crusher
-                || has_weapon_ability(unit.veterancy.rank_kind(), object, Ability::Crusher),
+            crusher: crate::sim::combat::veterancy::is_crusher(unit.veterancy.rank_kind(), object),
             // `0x00743927`: Is_Crushable_By, its ally test included.
             crushable: object_is_crushable_by(
                 object.omni_crusher,
-                CrushTarget::from_entity(victim, self.session.binary_frame),
+                CrushTarget::from_entity(victim, self.session.binary_frame()),
                 |owner| {
                     crate::sim::combat::combat_weapon::is_ally_by_object(
                         Some(&self.house_alliances),
@@ -294,8 +302,8 @@ impl Simulation {
             ),
             distance: crush_distance(coords(unit), coords(victim)),
             reach: rules.combat_damage.crush,
-            easy: house.difficulty == crate::sim::house_state::HouseDifficulty::Easy,
-            iq: house.current_iq,
+            easy: house.difficulty() == crate::sim::house_state::HouseDifficulty::Easy,
+            iq: house.current_iq(),
             iq_auto_crush: rules.general.iq_auto_crush,
             disguised: victim.is_disguised_to(
                 unit.owner(),

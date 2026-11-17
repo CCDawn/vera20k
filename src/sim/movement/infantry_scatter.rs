@@ -115,6 +115,11 @@ impl Simulation {
             .entities
             .get(id)
             .ok_or("Scatter lost its infantryman")?;
+        // Ares InfantryClass_Scatter1004CC60 (hook51D0DD): a Deactivated
+        // infantryman returns before the Doing test.
+        if rules.ares_form() && infantry.deactivated.is_offline() {
+            return Ok(false);
+        }
         let doing = infantry
             .mission_leaf
             .as_infantry()
@@ -134,7 +139,7 @@ impl Simulation {
             .get(id)
             .ok_or("Scatter lost its infantryman")?;
         let object = self
-            .object_type(infantry.type_ref(), rules)
+            .entity_object_type(infantry, rules)
             .ok_or("Scatter requires an Infantry type")?;
         // Is_Moving only matters to a forced call; the query has no effect.
         let moving = flags.forced
@@ -198,7 +203,7 @@ impl Simulation {
         let coord = super::foot_coordinate::current_coordinate(infantry);
         let start = super::scatter_cell::null_start_direction(
             (coord.x, coord.y),
-            infantry.body_facing.current(self.session.binary_frame),
+            infantry.body_facing.current(self.session.binary_frame()),
             &mut self.scenario_rng,
         );
         if let Some(cell) = self.scatter_nearby_cell(id, rules) {
@@ -330,7 +335,7 @@ impl Simulation {
         let outcome = self
             .process_active_locomotor(
                 id,
-                Some(rules),
+                rules,
                 crate::sim::world::ObjectAiCtx {
                     overlay_registry: registry,
                     effects: frame_effects,
@@ -346,7 +351,7 @@ impl Simulation {
 /// replays of oracles that answer the Walk Process slot (`0x0075AC80`) as
 /// not moving: while installed, each Process is recorded and its body does
 /// not run.
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 pub(crate) mod answered_process {
     use std::cell::RefCell;
 
@@ -389,7 +394,7 @@ impl Simulation {
     /// receiver. This checks port coverage, not native admission.
     pub(crate) fn infantry_setter_receiver(&self, id: u64, rules: &RuleSet) -> bool {
         self.substrate.entities.get(id).is_some_and(|actor| {
-            self.object_type(actor.type_ref(), rules).is_some()
+            self.entity_object_type(actor, rules).is_some()
                 && represented_infantry_destination(actor)
         })
     }
@@ -410,7 +415,7 @@ impl Simulation {
         let Some(actor) = self.substrate.entities.get(id) else {
             return false;
         };
-        if self.object_type(actor.type_ref(), rules).is_none() {
+        if self.entity_object_type(actor, rules).is_none() {
             return false;
         }
         if !represented_infantry_destination(actor) || actor.infantry.is_none() {
@@ -556,7 +561,7 @@ impl Simulation {
             .get(id)
             .ok_or("Infantry destination lost actor")?;
         let object = self
-            .object_type(actor.type_ref(), rules)
+            .entity_object_type(actor, rules)
             .ok_or("Infantry destination requires type")?;
         if !represented_infantry_destination(actor) {
             return Ok(false);
@@ -587,7 +592,8 @@ impl Simulation {
             let actor = self.substrate.entities.get(id).unwrap();
             if jumpjet_type
                 || actor.mission.current().raw() != 1
-                || actor.navigation.nav_com() != Some(requested)
+                // Infantry51ABC4 compares the retained NavCom pointer.
+                || !actor.navigation.nav_com().is_some_and(|nav| nav.same_pointer(requested, self.resolved_terrain.as_ref()))
             {
                 self.infantry_stop_driver(id, rules, registry, frame_effects)?;
             }
@@ -602,7 +608,8 @@ impl Simulation {
             .ok_or("destination lost infantry after Stop_Driver")?;
         if human
             && type_allows_up
-            && actor.navigation.nav_com() == Some(requested)
+            // Infantry51ABEA compares the same allocation before DoAction.
+            && actor.navigation.nav_com().is_some_and(|nav| nav.same_pointer(requested, self.resolved_terrain.as_ref()))
             && actor
                 .infantry
                 .as_ref()
@@ -627,21 +634,21 @@ impl Simulation {
                 EnterRadioArm::Continue => {}
                 // 51ACB1..51ACC5: Foot's setter takes NULL (51B1D2).
                 EnterRadioArm::Queued => {
-                    self.foot_null_destination(id, Some(rules), registry, frame_effects);
+                    self.foot_null_destination(id, rules, registry, frame_effects);
                     return Ok(true);
                 }
                 // 51ACF7: no Foot setter at all.
                 EnterRadioArm::Docking => return Ok(true),
             }
         }
-        if !self.begin_foot_destination(id, true, Some(rules), registry, frame_effects) {
+        if !self.begin_foot_destination(id, true, rules, registry, frame_effects) {
             return Ok(true);
         }
         match kind {
             LocomotorKind::Teleport => {
                 // Foot tail: NavCom, then Teleport Move_To, then the accepted
                 // timers whatever it answered (`0x004D96C2..0x004D9707`).
-                let frame = self.session.binary_frame;
+                let frame = self.session.binary_frame();
                 let actor = self.substrate.entities.get_mut(id).unwrap();
                 super::navcom::publish_nav_com(actor, requested);
                 // Infantry51AA40 -> Foot4D94B0 samples destination +4C before
@@ -658,7 +665,7 @@ impl Simulation {
                 let accepted =
                     self.teleport_move_to(id, point, rules, false, registry, frame_effects)?;
                 let actor = self.substrate.entities.get_mut(id).unwrap();
-                super::DestinationTiming::from_rules(frame, Some(rules)).accept(actor);
+                super::DestinationTiming::from_rules(frame, rules).accept(actor);
                 Ok(accepted)
             }
             LocomotorKind::Jumpjet => Ok(self.jumpjet_foot_destination(id, requested, rules)),
@@ -675,7 +682,7 @@ impl Simulation {
                     id,
                     (requested, coord),
                     self.resolved_terrain.as_ref(),
-                    super::DestinationTiming::from_rules(self.session.binary_frame, Some(rules)),
+                    super::DestinationTiming::from_rules(self.session.binary_frame(), rules),
                 );
                 Ok(true)
             }
@@ -726,7 +733,7 @@ impl Simulation {
             target,
             RadioMessage::Hello,
             RadioPayload::default(),
-            Some(rules),
+            rules,
             frame_effects,
         ) != RadioResponse::Roger
         {
@@ -736,7 +743,7 @@ impl Simulation {
             self,
             id,
             RadioMessage::CanDock,
-            Some(rules),
+            rules,
             frame_effects,
         ) {
             RadioResponse::Docking => EnterRadioArm::Docking,
@@ -746,7 +753,7 @@ impl Simulation {
                     self,
                     id,
                     RadioMessage::Break,
-                    Some(rules),
+                    rules,
                     frame_effects,
                 );
                 EnterRadioArm::Continue
@@ -797,7 +804,7 @@ impl Simulation {
     pub(crate) fn set_infantry_null_destination(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
@@ -859,6 +866,6 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "infantry_scatter_tests.rs"]
 mod tests;

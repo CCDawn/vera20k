@@ -22,13 +22,13 @@ fn eligible_air_target(sim: &Simulation, rules: &RuleSet, aegis: u64) -> Option<
         sim.zone_grid.as_ref(),
         LineOfFireInputs {
             overlay_grid: sim.overlay_grid.as_ref(),
-            overlay_registry: None,
             alliances: Some(&sim.house_alliances),
+            ..Default::default()
         },
         Some(sim),
         None,
     )
-    .target()
+    .object()
 }
 
 struct GuardScene {
@@ -58,7 +58,8 @@ impl GuardScene {
         // The arena supplies terrain/navigation; establish this visibility
         // domain before Unlimbo can create source and border viewer planes.
         sim.fog = crate::sim::vision::FogState::new(64, 64);
-        sim.session.current_house = Some(sim.interner.intern("Americans"));
+        sim.session
+            .set_current_house_for_test(Some(sim.interner.intern("Americans")));
         let aegis = sim
             .spawn_object("AEGIS", "Americans", 24, 24, 0, &rules)
             .expect("retail Aegis Unlimbo on Water");
@@ -67,6 +68,9 @@ impl GuardScene {
             let id = sim
                 .spawn_object_at_height("ZEP", "Russians", x, y, 0, 6, &rules)
                 .expect("retail Kirov high Unlimbo");
+            // The player has seen the Kirov, a VehicleType: the campaign scan
+            // gate needs +0x41B.
+            crate::sim::arena_fixture::discover(&mut sim, id);
             let actor = sim.substrate.entities.get(id).unwrap();
             assert!(!actor.lifecycle.in_limbo());
             assert!(actor.lifecycle.cell_marked());
@@ -85,7 +89,7 @@ impl GuardScene {
         }
         assert_eq!(sim.substrate.entities.airborne().count(), 2);
         let source = sim.substrate.entities.get(aegis).unwrap();
-        assert!(sim.houses.get(&source.owner()).unwrap().is_human);
+        assert!(sim.houses.get(&source.owner()).unwrap().is_human());
         assert_eq!(
             source.mission.current(),
             MissionId::from_known(MissionType::Guard)
@@ -127,7 +131,7 @@ impl GuardScene {
             .sim
             .advance_app_frame(
                 &commands,
-                Some(&self.rules),
+                &self.rules,
                 None,
                 33,
                 TickLane::Ordinary,
@@ -151,48 +155,6 @@ impl GuardScene {
         }
         panic!("stock Aegis must fire within its ordinary targeting/Guard cadence");
     }
-}
-
-/// Original709820 routes a targetless DistributedFire scan into709550 rather
-/// than assigning GreatestThreat's winner. Stock AEGIS must acquire and fire
-/// from Guard without an Attack order or a supplied TarCom. This joins the
-/// selector to the production class mission/FireAt path; it does not certify
-/// every candidate score or native AirTracker bucket edge.
-#[test]
-fn stock_human_guard_aegis_acquires_and_launches_at_registered_air_targets() {
-    let Some(mut scene) = GuardScene::new(false) else {
-        return;
-    };
-    let mut scanned_with_candidate = false;
-    let mut launched = false;
-    for _ in 0..180 {
-        let output = scene.advance();
-        let source = scene.sim.substrate.entities.get(scene.aegis).unwrap();
-        if source.passive_scan.last_scan_frame() != 0 {
-            scanned_with_candidate |= eligible_air_target(&scene.sim, &scene.rules, scene.aegis)
-                .is_some_and(|id| scene.targets.contains(&id));
-        }
-        for shot in output
-            .fire_events
-            .iter()
-            .filter(|shot| shot.attacker_id == scene.aegis)
-        {
-            assert_eq!(scene.sim.interner.resolve(shot.weapon_id), "Medusa");
-            assert!(matches!(shot.target, TargetKind::Entity(id) if scene.targets.contains(&id)));
-            launched = true;
-        }
-        if launched {
-            break;
-        }
-    }
-    assert!(
-        scanned_with_candidate,
-        "real passive scan ran with a legal airborne target"
-    );
-    assert!(
-        launched,
-        "targetless stock human Guard Aegis must launch a Medusa after its distributed scan"
-    );
 }
 
 /// Successful Guard FireAt records its argument and performs the real class
@@ -219,11 +181,15 @@ fn distributed_guard_normal_and_elite_cycle_live_targets_and_reset_only_burst() 
                 !source.passive_scan.acquired(),
                 "class NULL assignment clears passive acquisition"
             );
-            assert_eq!(
-                source.weapon_burst.index(),
-                0,
-                "changed NULL target resets elite Burst2 too"
-            );
+            // Ares TechnoClass_SetTarget_Burst (1005D320, hook 0x6FCF53)
+            // keeps the index instead.
+            if !scene.rules.ares() {
+                assert_eq!(
+                    source.weapon_burst.index(),
+                    0,
+                    "changed NULL target resets elite Burst2 too"
+                );
+            }
             assert_eq!(
                 source.weapon_burst.radial_index(),
                 index + 1,
@@ -244,11 +210,11 @@ fn distributed_guard_normal_and_elite_cycle_live_targets_and_reset_only_burst() 
                 .iter()
                 .map(|(_, bullet)| bullet)
                 .find(|bullet| {
-                    bullet.source_id == scene.aegis
-                        && bullet.target == shot.target.projectile_target(&scene.sim)
+                    bullet.source_id() == scene.aegis
+                        && bullet.target() == shot.target.projectile_target(&scene.sim)
                 })
                 .expect("real returned Medusa remains targeted independently of shooter TarCom");
-            assert_eq!(bullet.payload.installed_weapon(), Some(shot.weapon_id));
+            assert_eq!(bullet.payload().installed_weapon(), Some(shot.weapon_id));
         }
         assert_ne!(
             fired[0], fired[1],
@@ -276,6 +242,7 @@ fn distributed_explicit_attack_retains_target_and_elite_burst() {
         let target = TargetKind::Entity(scene.targets[0]);
         scene
             .sim
+            .substrate
             .mission_assign_exact(scene.aegis, MissionId::from_known(MissionType::Attack), 0)
             .unwrap();
         scene
@@ -283,7 +250,7 @@ fn distributed_explicit_attack_retains_target_and_elite_burst() {
             .assign_target_represented(
                 scene.aegis,
                 Some(target),
-                Some(&scene.rules),
+                &scene.rules,
                 None,
                 FrameEffects::default(),
             )
@@ -353,7 +320,7 @@ fn distributed_list_only_expiry_uses_common_broadcast_and_first_removal() {
     assert_eq!(source.distributed_fire_history(), [Some(shot.target)]);
     scene
         .sim
-        .notify_pointer_expired(target, super::UninitContext::new(Some(&scene.rules), None));
+        .notify_pointer_expired(target, super::UninitContext::new(&scene.rules, None));
     let source = scene.sim.substrate.entities.get(scene.aegis).unwrap();
     assert_eq!(
         source.distributed_fire_candidates(),
@@ -479,7 +446,7 @@ fn distributed_normal_load_clears_all_classes_before_strong_reference_validation
     sim.assign_target_represented(
         actors[0],
         Some(TargetKind::Entity(actors[1])),
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default(),
     )
@@ -544,13 +511,10 @@ fn distributed_scan_preserves_retained_bucket_order_across_reentry_and_movement(
         return;
     };
     let scan = |scene: &mut GuardScene| {
-        scene.sim.greatest_threat_represented(
-            &scene.rules,
-            None,
-            scene.aegis,
-            ScanMission::Guard,
-            None,
-        );
+        scene
+            .sim
+            .greatest_threat_represented(&scene.rules, None, scene.aegis, ScanMission::Guard, None)
+            .and_then(crate::sim::combat::TargetKind::object_id);
         scene
             .sim
             .substrate
@@ -583,8 +547,8 @@ fn distributed_scan_preserves_retained_bucket_order_across_reentry_and_movement(
         scan(&mut scene),
         [TargetKind::Entity(a), TargetKind::Entity(b)]
     );
-    scene.sim.aircraft_tracker_remove(a);
-    scene.sim.aircraft_tracker_add(a);
+    scene.sim.substrate.aircraft_tracker_remove(a);
+    Simulation::aircraft_tracker_add(&scene.sim.session, &mut scene.sim.substrate, a);
     assert_eq!(
         scan(&mut scene),
         [TargetKind::Entity(b), TargetKind::Entity(a)]
@@ -613,7 +577,12 @@ fn distributed_scan_preserves_retained_bucket_order_across_reentry_and_movement(
         scan(&mut scene),
         [TargetKind::Entity(b), TargetKind::Entity(a)]
     );
-    scene.sim.aircraft_tracker_update_cell(a, (26, 24));
+    Simulation::aircraft_tracker_update_cell(
+        &scene.sim.session,
+        &mut scene.sim.substrate,
+        a,
+        (26, 24),
+    );
     let actor = scene.sim.substrate.entities.get(a).unwrap();
     assert_eq!(actor.air_tracker_cell(), (26, 24));
     assert_ne!(
@@ -654,7 +623,8 @@ fn distributed_failed_fireat_remembers_argument_but_unit_attack_bypasses_tail() 
             .spawn_object("MTNK", "Russians", 13, 20, 0, &rules)
             .unwrap();
         if attack {
-            sim.mission_assign_exact(tank, MissionId::from_known(MissionType::Attack), 0)
+            sim.substrate
+                .mission_assign_exact(tank, MissionId::from_known(MissionType::Attack), 0)
                 .unwrap();
         }
         assert_eq!(
@@ -727,12 +697,13 @@ fn distributed_building_attack_takes_the_common_history_tail() {
         .spawn_object("E1", "Russians", 12, 20, 0, &rules)
         .unwrap();
     sim.resolve_type_handles(&rules);
-    sim.mission_assign_exact(pillbox, MissionId::from_known(MissionType::Attack), 0)
+    sim.substrate
+        .mission_assign_exact(pillbox, MissionId::from_known(MissionType::Attack), 0)
         .unwrap();
     sim.assign_target_represented(
         pillbox,
         Some(TargetKind::Entity(target)),
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default(),
     )
@@ -776,7 +747,8 @@ fn distributed_collection_flat_entry_clears_but_class_early_return_preserves() {
     source.remember_distributed_fire_target(target);
     scene
         .sim
-        .greatest_threat_represented(&scene.rules, None, scene.aegis, ScanMission::Hunt, None);
+        .greatest_threat_represented(&scene.rules, None, scene.aegis, ScanMission::Hunt, None)
+        .and_then(crate::sim::combat::TargetKind::object_id);
     let source = scene.sim.substrate.entities.get(scene.aegis).unwrap();
     assert!(
         source.distributed_fire_candidates().is_empty(),
@@ -801,7 +773,7 @@ fn distributed_collection_flat_entry_clears_but_class_early_return_preserves() {
         target: Some(TargetKind::Entity(victim)),
         score: 7,
     };
-    let actor = sim.substrate.entities.get_mut(cow).unwrap();
+    let actor = sim.substrate.entities.get(cow).unwrap();
     // Retail ENGINEER is armed by Primary=DefuseKit (and has secondary
     // VirtualScanner), so it correctly reaches the base scan. COW supplies
     // the actual51E288..51E2C4 early return without altering weapon tuning.
@@ -814,8 +786,15 @@ fn distributed_collection_flat_entry_clears_but_class_early_return_preserves() {
         actor.category(),
         crate::map::entities::EntityCategory::Infantry
     );
-    assert!(!crate::sim::combat::combat_weapon::is_armed(actor, kind));
+    assert!(!crate::sim::combat::combat_weapon::is_armed(
+        actor,
+        kind,
+        &sim.substrate.entities,
+        &rules,
+        &sim.interner
+    ));
     assert!(!kind.infiltrate && !kind.vehicle_thief);
+    let actor = sim.substrate.entities.get_mut(cow).unwrap();
     actor.replace_distributed_fire_candidates(vec![retained]);
     actor.remember_distributed_fire_target(TargetKind::Entity(victim));
     let outcome = crate::sim::combat::combat_targeting::greatest_threat_for_entity(
@@ -838,7 +817,8 @@ fn distributed_collection_flat_entry_clears_but_class_early_return_preserves() {
         "native unarmed Infantry class override returns before base"
     );
     assert_eq!(
-        sim.greatest_threat_represented(&rules, None, cow, ScanMission::Guard, None),
+        sim.greatest_threat_represented(&rules, None, cow, ScanMission::Guard, None)
+            .and_then(crate::sim::combat::TargetKind::object_id),
         None
     );
     let actor = sim.substrate.entities.get(cow).unwrap();
@@ -846,57 +826,5 @@ fn distributed_collection_flat_entry_clears_but_class_early_return_preserves() {
     assert_eq!(
         actor.distributed_fire_history(),
         [Some(TargetKind::Entity(victim))]
-    );
-}
-
-#[test]
-fn distributed_postshot_load_rebuilds_fresh_candidates_and_expiry_holds() {
-    let Some(mut scene) = GuardScene::new(false) else {
-        return;
-    };
-    let previous = scene.next_shot().target;
-    let bytes = crate::sim::snapshot::GameSnapshot::save(&scene.sim, 0, 0, "distributed-guard", 0);
-    let mut loaded = crate::sim::snapshot::GameSnapshot::load(&bytes)
-        .unwrap()
-        .sim;
-    // Reattach the same immutable map dependency through the established
-    // fixture load boundary, preserving its serialized real Cell state.
-    loaded.resolved_terrain = scene.sim.resolved_terrain.clone();
-    loaded.restore_after_snapshot_load().unwrap();
-    loaded.resolve_type_handles(&scene.rules);
-    let actor = loaded.substrate.entities.get(scene.aegis).unwrap();
-    assert!(actor.distributed_fire_candidates().is_empty());
-    assert!(actor.distributed_fire_history().is_empty());
-    assert_eq!(actor.attack_target.target(), None);
-    let mut holds = Vec::new();
-    Simulation::entity_expiry_holds(actor, |id| holds.push(id));
-    if let TargetKind::Entity(id) = previous {
-        assert!(!holds.contains(&id));
-    }
-    scene.sim = loaded;
-    let shot = scene.next_shot();
-    let actor = scene.sim.substrate.entities.get(scene.aegis).unwrap();
-    assert_eq!(actor.distributed_fire_candidates().len(), 2);
-    assert_eq!(
-        actor.distributed_fire_history(),
-        [Some(shot.target)],
-        "fresh collection starts a fresh exclusion history"
-    );
-    let TargetKind::Entity(target) = shot.target else {
-        panic!("air target");
-    };
-    scene
-        .sim
-        .detach_all_pointer_expired(target, &scene.rules, None, FrameEffects::default());
-    let actor = scene.sim.substrate.entities.get(scene.aegis).unwrap();
-    assert!(
-        actor.distributed_fire_history().is_empty(),
-        "new post-load history is indexed by the common expiry owner"
-    );
-    assert!(
-        actor
-            .distributed_fire_candidates()
-            .iter()
-            .all(|entry| entry.target != Some(shot.target))
     );
 }

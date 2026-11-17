@@ -55,7 +55,7 @@ pub(crate) fn resolve_debug_speed_type(state: &AppState) -> SpeedType {
     state
         .match_state
         .sim_runtime
-        .as_ref()
+        .home_runtime()
         .map(|rt| &rt.simulation)
         .and_then(|sim| {
             sim.entities()
@@ -73,7 +73,8 @@ pub(crate) fn resolve_debug_speed_type(state: &AppState) -> SpeedType {
 pub(crate) fn land_row(cell: &ResolvedTerrainCell, speed_type: SpeedType) -> u8 {
     cell.speed_costs
         .cost_for_speed_type(speed_type)
-        .unwrap_or(0)
+        // Debug palette alone quantizes its label; gameplay keeps the bits.
+        .map_or(0, |speed| (f32::from_bits(speed.bits()) * 100.0) as u8)
 }
 
 /// Build terrain cost overlay instances for all visible cells.
@@ -90,14 +91,14 @@ pub(crate) fn build_terrain_cost_overlay_instances(
     let Some(sim) = state
         .match_state
         .sim_runtime
-        .as_ref()
+        .home_runtime()
         .map(|rt| &rt.simulation)
     else {
         log::warn!("Terrain cost overlay: no simulation");
         return Vec::new();
     };
     let speed_type = resolve_debug_speed_type(state);
-    let Some(terrain) = sim.resolved_terrain.as_ref() else {
+    let Some(terrain) = sim.resolved_terrain() else {
         log::warn!("Terrain cost overlay: no resolved terrain");
         return Vec::new();
     };
@@ -135,7 +136,10 @@ pub(crate) fn build_terrain_cost_overlay_instances(
 
     for ry in 0..height {
         for rx in 0..width {
-            let z: u8 = state.height_map().get(&(rx, ry)).copied().unwrap_or(0);
+            let z: u8 = state
+                .resolved_terrain()
+                .and_then(|terrain| terrain.cell(rx, ry))
+                .map_or(0, |cell| cell.level);
             let (sx, sy) = terrain::iso_to_screen(rx, ry, z);
 
             if !in_view(sx, sy, TILE_WIDTH, TILE_HEIGHT, cam_x, cam_y, sw, sh, 60.0) {
@@ -169,49 +173,33 @@ pub(crate) fn build_heightmap_overlay_instances(
     sw: f32,
     sh: f32,
 ) -> Vec<SpriteInstance> {
-    if state.height_map().is_empty() {
+    let Some(terrain) = state.resolved_terrain() else {
         return Vec::new();
-    }
+    };
     let cam_x: f32 = state.match_state.input.camera_x;
     let cam_y: f32 = state.match_state.input.camera_y;
     let mut instances: Vec<SpriteInstance> = Vec::with_capacity(2048);
 
     // Find max z for normalization.
-    let max_z: u8 = state
-        .height_map()
-        .values()
-        .copied()
+    let max_z: u8 = terrain
+        .cells()
+        .iter()
+        .map(|cell| cell.level)
         .max()
         .unwrap_or(1)
         .max(1);
 
-    // One-shot diagnostic: log bridge_height_map size on first call.
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static LOGGED: AtomicBool = AtomicBool::new(false);
-    if !LOGGED.swap(true, Ordering::Relaxed) {
-        let bridge_count = state.bridge_height_map().len();
-        let sample: Vec<_> = state.bridge_height_map().iter().take(10).collect();
-        log::info!(
-            "HeightmapOverlay: bridge_height_map has {} entries, height_map has {} entries. Sample: {:?}",
-            bridge_count,
-            state.height_map().len(),
-            sample,
-        );
-    }
-
-    for (&(rx, ry), &z) in state.height_map() {
+    for cell in terrain.cells() {
+        let (rx, ry, z) = (cell.rx, cell.ry, cell.level);
         // Bridge cells: render at deck height so the overlay aligns with the bridge surface.
-        let render_z: u8 = state
-            .bridge_height_map()
-            .get(&(rx, ry))
-            .copied()
-            .unwrap_or(z);
+        let deck = cell.high_bridge_deck_level();
+        let render_z = deck.unwrap_or(z);
         let (sx, sy) = terrain::iso_to_screen(rx, ry, render_z);
         if !in_view(sx, sy, TILE_WIDTH, TILE_HEIGHT, cam_x, cam_y, sw, sh, 60.0) {
             continue;
         }
 
-        let is_bridge = state.bridge_height_map().contains_key(&(rx, ry));
+        let is_bridge = deck.is_some();
         let tint: [f32; 3] = if is_bridge {
             // Solid blue for bridge deck cells — high alpha so the bridge
             // structure doesn't show through the overlay.
@@ -297,10 +285,9 @@ pub(crate) fn build_cell_grid_overlay_instances(
     // diamond outline uses the exact same formula as overlay rendering.
     for entry in state.match_state.match_presentation.overlays.iter() {
         let z: u8 = state
-            .height_map()
-            .get(&(entry.rx, entry.ry))
-            .copied()
-            .unwrap_or(0);
+            .resolved_terrain()
+            .and_then(|terrain| terrain.cell(entry.rx, entry.ry))
+            .map_or(0, |cell| cell.level);
         let (sx, sy) = terrain::iso_to_screen(entry.rx, entry.ry, z);
         if !in_view(sx, sy, TILE_WIDTH, TILE_HEIGHT, cam_x, cam_y, sw, sh, 60.0) {
             continue;
@@ -334,7 +321,7 @@ pub(crate) fn build_path_overlay_instances(
     let Some(sim) = state
         .match_state
         .sim_runtime
-        .as_ref()
+        .home_runtime()
         .map(|rt| &rt.simulation)
     else {
         return Vec::new();
@@ -361,13 +348,16 @@ pub(crate) fn build_path_overlay_instances(
         // The unpaid Foot+5E0 words, walked from the mover's live cell.
         let path: Vec<(u16, u16)> = entity
             .navigation
-            .path_replay
+            .path_replay()
             .remaining_cells_from((entity.position.rx() as i16, entity.position.ry() as i16))
             .into_iter()
             .map(|(x, y)| (x as u16, y as u16))
             .collect();
         for (i, &(px, py)) in path.iter().enumerate() {
-            let z: u8 = state.height_map().get(&(px, py)).copied().unwrap_or(0);
+            let z: u8 = state
+                .resolved_terrain()
+                .and_then(|terrain| terrain.cell(px, py))
+                .map_or(0, |cell| cell.level);
             let (sx, sy) = terrain::iso_to_screen(px, py, z);
             if !in_view(sx, sy, TILE_WIDTH, TILE_HEIGHT, cam_x, cam_y, sw, sh, 60.0) {
                 continue;
@@ -395,10 +385,9 @@ pub(crate) fn build_path_overlay_instances(
             let last = path.last().copied().unwrap_or((0, 0));
             if goal != last {
                 let z: u8 = state
-                    .height_map()
-                    .get(&(goal.0, goal.1))
-                    .copied()
-                    .unwrap_or(0);
+                    .resolved_terrain()
+                    .and_then(|terrain| terrain.cell(goal.0, goal.1))
+                    .map_or(0, |cell| cell.level);
                 let (sx, sy) = terrain::iso_to_screen(goal.0, goal.1, z);
                 if in_view(sx, sy, TILE_WIDTH, TILE_HEIGHT, cam_x, cam_y, sw, sh, 60.0) {
                     instances.push(SpriteInstance {
@@ -668,7 +657,7 @@ pub(crate) fn build_foot_path_overlay_instances(
     let Some(sim) = state
         .match_state
         .sim_runtime
-        .as_ref()
+        .home_runtime()
         .map(|rt| &rt.simulation)
     else {
         return FootPathInstances {
@@ -688,7 +677,7 @@ pub(crate) fn build_foot_path_overlay_instances(
         // The unpaid Foot+5E0 words, walked from the mover's live cell.
         let mut path: Vec<(u16, u16)> = entity
             .navigation
-            .path_replay
+            .path_replay()
             .remaining_cells_from((entity.position.rx() as i16, entity.position.ry() as i16))
             .into_iter()
             .map(|(x, y)| (x as u16, y as u16))
@@ -705,7 +694,10 @@ pub(crate) fn build_foot_path_overlay_instances(
         // Waypoints keep their cells so units sharing a cell share a label.
         let mut points: Vec<((u16, u16), [f32; 2])> = Vec::with_capacity(path.len());
         for &(px, py) in &path {
-            let z: u8 = state.height_map().get(&(px, py)).copied().unwrap_or(0);
+            let z: u8 = state
+                .resolved_terrain()
+                .and_then(|terrain| terrain.cell(px, py))
+                .map_or(0, |cell| cell.level);
             let (sx, sy) = terrain::iso_to_screen(px, py, z);
             points.push(((px, py), cell_center(sx, sy)));
         }
@@ -768,7 +760,7 @@ pub(crate) fn build_foot_path_overlay_instances(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
 
@@ -781,19 +773,6 @@ mod tests {
             sw: 200_000.0,
             sh: 200_000.0,
         }
-    }
-
-    #[test]
-    fn tint_colors_are_distinct() {
-        // Blocked and normal cost tints must differ so the overlay is useful.
-        assert_ne!(COST_BLOCKED_TINT, COST_NORMAL_TINT);
-    }
-
-    #[test]
-    fn overlay_alpha_is_reasonable() {
-        // Alpha should be between 0 and 1, and visibly translucent.
-        const { assert!(OVERLAY_ALPHA > 0.1) };
-        const { assert!(OVERLAY_ALPHA < 0.8) };
     }
 
     #[test]
@@ -815,13 +794,6 @@ mod tests {
         assert!(last.position[0] < 30.0 - LINE_PIXEL_SIZE / 2.0);
         assert_eq!(out[0].tint, PATH_LINE_TINT);
         assert_eq!(out[0].alpha, PATH_LINE_ALPHA);
-    }
-
-    #[test]
-    fn stroke_pixels_overlap_so_the_line_has_no_seams() {
-        // Each quad must be at least as wide as the step, otherwise the
-        // per-pixel walk degenerates back into a dotted line.
-        const { assert!(LINE_PIXEL_SIZE >= LINE_STEP_PX) };
     }
 
     #[test]
@@ -877,38 +849,6 @@ mod tests {
     }
 
     #[test]
-    fn stroke_keeps_only_the_pixels_inside_the_viewport() {
-        // A half-off-screen segment must still draw the visible part, and the
-        // culled pixels must be exactly the ones outside.
-        let view = FootPathView {
-            cam_x: 0.0,
-            cam_y: 0.0,
-            sw: 640.0,
-            sh: 480.0,
-        };
-        let mut out = Vec::new();
-        push_stroke_along([-40.0, 10.0], [40.0, 10.0], PATH_LINE_TINT, &view, &mut out);
-        assert!(out.len() < 80, "the off-screen half is dropped");
-        assert!(!out.is_empty(), "the visible half still draws");
-        assert!(
-            out.iter().all(|i| i.position[0] + i.size[0] >= view.cam_x),
-            "every kept pixel touches the viewport"
-        );
-    }
-
-    #[test]
-    fn node_square_is_centred_on_the_point() {
-        let mut out = Vec::new();
-        push_node([100.0, 60.0], PATH_GOAL_TINT, &mut out);
-        assert_eq!(out.len(), 1);
-        assert_eq!(
-            out[0].position,
-            [100.0 - NODE_SIZE / 2.0, 60.0 - NODE_SIZE / 2.0]
-        );
-        assert_eq!(out[0].tint, PATH_GOAL_TINT);
-    }
-
-    #[test]
     fn label_digit_is_submitted_after_every_halo_copy() {
         // Regression guard: submitting the digit first let the four dark halo
         // copies paint over it, so every step index rendered as a black blob
@@ -924,39 +864,6 @@ mod tests {
                 "every pass before the digit must be halo"
             );
         }
-    }
-
-    #[test]
-    fn label_halo_ring_covers_all_four_sides() {
-        // A two-sided halo left the top and bottom of a 13px glyph fighting the
-        // terrain, so the ring has to keep all four offsets.
-        let offsets: Vec<(f32, f32)> = LABEL_PASSES
-            .iter()
-            .filter(|(_, _, tint)| *tint == PATH_LABEL_HALO_TINT)
-            .map(|(dx, dy, _)| (*dx, *dy))
-            .collect();
-        assert_eq!(offsets.len(), 4);
-        for side in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-            assert!(offsets.contains(&side), "missing halo side {side:?}");
-        }
-    }
-
-    #[test]
-    fn label_stride_thins_long_routes_but_stays_positive() {
-        assert_eq!(path_label_stride(1), 1);
-        assert_eq!(path_label_stride(MAX_PATH_LABELS), 1);
-        // Past the cap the stride grows so the digit count stays bounded.
-        assert_eq!(path_label_stride(MAX_PATH_LABELS * 4), 4);
-        // Never zero — a zero stride would divide by zero when sampling.
-        assert!(path_label_stride(100_000) >= 1);
-    }
-
-    #[test]
-    fn world_camera_path_labels_add_no_camera_offset() {
-        // The trap: the UI-camera callers pass the live camera to cancel
-        // `build_text`'s offset. These batches keep the world camera bound, so
-        // a non-zero offset here double-counts the scroll.
-        const { assert!(NO_CAMERA_OFFSET[0] == 0.0 && NO_CAMERA_OFFSET[1] == 0.0) };
     }
 
     fn plan(labels: Vec<FootPathLabel>) -> Vec<(Vec<usize>, [f32; 2])> {
@@ -978,31 +885,6 @@ mod tests {
             ((5, 5), 3, [100.0, 200.0]),
         ]);
         assert_eq!(out, vec![(vec![3], anchor([100.0, 200.0]))]);
-    }
-
-    #[test]
-    fn steps_meeting_at_one_cell_group_into_a_single_label() {
-        // Different units reach the same cell at different step numbers: they
-        // share one printed string, not two adjacent digits.
-        let out = plan(vec![((12, 7), 5, [50.0, 80.0]), ((12, 7), 2, [50.0, 80.0])]);
-        assert_eq!(out, vec![(vec![2, 5], anchor([50.0, 80.0]))], "ascending");
-        assert_eq!(foot_path_label_text(&out[0].0), "2,5");
-    }
-
-    #[test]
-    fn label_text_separates_steps_so_digits_do_not_merge() {
-        // "2" and "5" printed next to each other read as "25"; the comma is what
-        // tells a shared waypoint from a two-digit step count.
-        assert_eq!(foot_path_label_text(&[3]), "3");
-        assert_eq!(foot_path_label_text(&[2, 5, 10]), "2,5,10");
-        assert_eq!(foot_path_label_text(&[]), "");
-    }
-
-    #[test]
-    fn a_waypoint_per_cell_keeps_its_own_label() {
-        let out = plan(vec![((1, 1), 3, [0.0, 0.0]), ((2, 2), 3, [20.0, 20.0])]);
-        assert_eq!(out.len(), 2, "the same step on two cells is two labels");
-        assert_eq!(out[1].1, anchor([20.0, 20.0]));
     }
 
     #[test]

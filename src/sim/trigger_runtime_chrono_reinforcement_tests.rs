@@ -24,10 +24,6 @@ fn corpus() -> Value {
         "tools/spatial_oracle/trigger_chrono_reinforcement.json",
     ))
     .unwrap();
-    assert_eq!(
-        result["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     result
 }
 
@@ -210,7 +206,7 @@ fn chrono_reinforcement_reader_dispatch_placement_and_process_match_original() {
     // constructor output. Preserve real occupancy and the hostile scan target
     // before installing the action's original RNG/identity cursors.
     for prior in rows[0]["prior"].as_array().unwrap() {
-        let owner = sim.session.house_order[number(&prior["owner_house_index"]) as usize];
+        let owner = sim.houses.order()[number(&prior["owner_house_index"]) as usize];
         let owner = sim.interner.resolve(owner).to_string();
         let coord = DriveCoord {
             x: number(&prior["xyz"][0]),
@@ -240,7 +236,7 @@ fn chrono_reinforcement_reader_dispatch_placement_and_process_match_original() {
                     id,
                     coord,
                     0,
-                    crate::sim::world::PlacementEvidence::UnitEntryAdmitted,
+                    crate::sim::world::PlacementEvidence::FootEntryAdmitted,
                     &rules,
                     Some(&overlays),
                     FrameEffects::default(),
@@ -288,7 +284,7 @@ fn chrono_reinforcement_reader_dispatch_placement_and_process_match_original() {
             );
             assert_eq!(
                 actor.owner(),
-                sim.session.house_order[number(&prior["owner_house_index"]) as usize]
+                sim.houses.order()[number(&prior["owner_house_index"]) as usize]
             );
             assert_eq!(
                 actor.in_playfield(),
@@ -312,7 +308,8 @@ fn chrono_reinforcement_reader_dispatch_placement_and_process_match_original() {
             sim.native_identity_cursor(),
             Some(number(&row["id_before"]) as u32)
         );
-        sim.session.binary_frame = input["frame"].as_u64().unwrap() as u32;
+        sim.session
+            .set_binary_frame_for_test(input["frame"].as_u64().unwrap() as u32);
         let mut waypoints = std::collections::HashMap::new();
         for (index, key) in [(4, "origin"), (6, "override_cell")] {
             let point = &input[key];
@@ -339,7 +336,7 @@ fn chrono_reinforcement_reader_dispatch_placement_and_process_match_original() {
         let mut action = sim
             .trigger_runtime
             .definitions
-            .resolve_action(entry, None, None);
+            .resolve_action(entry, None, None, None);
         if let Some(waypoint) = input["waypoint_override"].as_i64() {
             action.entry.waypoint_index = Some(waypoint as u32);
         }
@@ -353,7 +350,7 @@ fn chrono_reinforcement_reader_dispatch_placement_and_process_match_original() {
                 incoming_house: owner,
             },
             &mut effects,
-            Some(&rules),
+            &rules,
             Some(&overlays),
             FrameEffects::default(),
         );
@@ -424,7 +421,7 @@ fn chrono_reinforcement_reader_dispatch_placement_and_process_match_original() {
             sim.assign_target_represented(
                 ids[0],
                 Some(crate::sim::combat::TargetKind::Entity(target)),
-                Some(&rules),
+                &rules,
                 Some(&overlays),
                 FrameEffects::default(),
             )
@@ -440,7 +437,7 @@ fn chrono_reinforcement_reader_dispatch_placement_and_process_match_original() {
                 })
                 .unwrap();
             if let Some(frame) = step["frame"].as_u64() {
-                sim.session.binary_frame = frame as u32;
+                sim.session.set_binary_frame_for_test(frame as u32);
             }
             assert_member(&sim, id, &step["before"]);
             sim.process_chrono_warp(

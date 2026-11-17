@@ -12,11 +12,12 @@ fn pip_frames(scene: &MindScene, hovered: Option<u64>) -> Vec<usize> {
     let Some(controller) = sim.entities().get(scene.mind()) else {
         return Vec::new();
     };
+    let frame = crate::app::presentation::frame::PresentationFrame::of_test(sim, scene.rules());
     super::scale_pip_draws(
         sim,
-        controller,
+        frame.object(scene.mind()).unwrap(),
         hovered,
-        Some(sim.interner.resolve(controller.owner())),
+        Some(controller.owner()),
         scene.rules(),
     )
     .into_iter()
@@ -71,11 +72,15 @@ fn stock_selected_mastermind_submits_real_capture_count_and_overload_pips() {
     // three ordinary slots, then IsOverloading4726C0 adds exactly one idle
     // overload slot. Exercise the same status submission used by rendering,
     // after actual FireAt/CaptureUnit and ordinary selection/body admission.
+    let frame = crate::app::presentation::frame::PresentationFrame::of_test(
+        scene.simulation(),
+        scene.rules(),
+    );
     let frames: Vec<_> = crate::app::presentation::ui_overlays::scale_pip_draws(
         scene.simulation(),
-        controller,
+        frame.object(scene.mind()).unwrap(),
         None,
-        Some(scene.simulation().interner.resolve(owner)),
+        Some(owner),
         scene.rules(),
     )
     .into_iter()
@@ -85,7 +90,7 @@ fn stock_selected_mastermind_submits_real_capture_count_and_overload_pips() {
 
     scene.queue_command(CommandEnvelope::new(
         owner,
-        scene.simulation().session.tick + 1,
+        scene.simulation().session().tick() + 1,
         Command::Select {
             entity_ids: Vec::new(),
             additive: false,
@@ -144,9 +149,9 @@ fn ordinary_overload_pip_uses_ten_manager_visits_and_queries_preserve_rng() {
     for visits_since_pulse in 0..=10 {
         let expected = if visits_since_pulse < 10 { 3 } else { 4 };
         let before = (
-            scene.simulation().main_rng.native_state_hex(),
-            scene.simulation().scenario_rng.native_state_hex(),
-            scene.simulation().mapgen_rng.native_state_hex(),
+            scene.simulation().main_rng().native_state_hex(),
+            scene.simulation().scenario_rng().native_state_hex(),
+            scene.simulation().mapgen_rng().native_state_hex(),
         );
         let manager_before = scene
             .simulation()
@@ -162,9 +167,9 @@ fn ordinary_overload_pip_uses_ten_manager_visits_and_queries_preserve_rng() {
         assert_eq!(
             before,
             (
-                scene.simulation().main_rng.native_state_hex(),
-                scene.simulation().scenario_rng.native_state_hex(),
-                scene.simulation().mapgen_rng.native_state_hex(),
+                scene.simulation().main_rng().native_state_hex(),
+                scene.simulation().scenario_rng().native_state_hex(),
+                scene.simulation().mapgen_rng().native_state_hex(),
             )
         );
         assert_eq!(
@@ -202,12 +207,12 @@ fn stock_captive_force_attack_death_reduces_overload_then_the_controller_settles
     assert_eq!(rings_before.len(), 4);
     eprintln!(
         "MIND reduction Attack issue_tick={} due_tick={} attacker={attacker} target={victim}",
-        scene.simulation().session.tick,
-        scene.simulation().session.tick + 1
+        scene.simulation().session().tick(),
+        scene.simulation().session().tick() + 1
     );
     scene.queue_command(CommandEnvelope::new(
         owner,
-        scene.simulation().session.tick + 1,
+        scene.simulation().session().tick() + 1,
         Command::Attack {
             attacker_id: attacker,
             target_id: victim,
@@ -237,12 +242,15 @@ fn stock_captive_force_attack_death_reduces_overload_then_the_controller_settles
         for shot in shots.iter().filter(|shot| {
             shot.attacker_id == attacker && shot.target == TargetKind::Entity(victim)
         }) {
-            assert_eq!(scene.simulation().interner.resolve(shot.weapon_id), "105mm");
+            assert_eq!(
+                scene.simulation().interner().resolve(shot.weapon_id),
+                "105mm"
+            );
             assert_eq!(shot.weapon_slot, WeaponSlot::Primary);
             genuine_fire = true;
             assert!(crate::map::playfield::size_diamond_contains(
-                scene.simulation().playfield_bounds.unwrap().base,
-                scene.simulation().playfield_size_height.unwrap(),
+                scene.simulation().playfield_bounds().unwrap().base,
+                scene.simulation().playfield_size_height().unwrap(),
                 (
                     (shot.fire_coord.x / 256) as i16,
                     (shot.fire_coord.y / 256) as i16,
@@ -250,7 +258,7 @@ fn stock_captive_force_attack_death_reduces_overload_then_the_controller_settles
             ));
             eprintln!(
                 "MIND reduction105mm visited_frame={} fire={:?} target_hp={:?} controller_hp={}",
-                scene.simulation().session.binary_frame - 1,
+                scene.simulation().session().binary_frame() - 1,
                 shot.fire_coord,
                 scene
                     .simulation()
@@ -263,7 +271,7 @@ fn stock_captive_force_attack_death_reduces_overload_then_the_controller_settles
         if genuine_fire {
             flight.push_back(format!(
                 "frame={} target={:?} shooter={:?} bullets={:?}",
-                scene.simulation().session.binary_frame - 1,
+                scene.simulation().session().binary_frame() - 1,
                 scene.simulation().entities().get(victim).map(|actor| (
                     actor.health.current(),
                     crate::sim::movement::ground_pose::position_world_coord(&actor.position)
@@ -273,17 +281,17 @@ fn stock_captive_force_attack_death_reduces_overload_then_the_controller_settles
                 }),
                 scene
                     .simulation()
-                    .projectiles
+                    .projectiles()
                     .iter()
-                    .filter(|(_, bullet)| bullet.source_id == attacker)
+                    .filter(|(_, bullet)| bullet.source_id() == attacker)
                     .map(|(id, bullet)| (
                         id,
-                        bullet.position,
-                        bullet.launch_origin,
-                        bullet.launch_target,
-                        bullet.target,
-                        bullet.velocity,
-                        bullet.payload
+                        bullet.position(),
+                        bullet.launch_origin(),
+                        bullet.launch_target(),
+                        bullet.target(),
+                        bullet.velocity(),
+                        bullet.payload()
                     ))
                     .collect::<Vec<_>>()
             ));
@@ -309,14 +317,14 @@ fn stock_captive_force_attack_death_reduces_overload_then_the_controller_settles
             assert!(!scene.victims().contains(&victim));
             eprintln!(
                 "MIND reduction completed visited_frame={} Stop issue_tick={} due_tick={} controller_hp={}",
-                scene.simulation().session.binary_frame - 1,
-                scene.simulation().session.tick,
-                scene.simulation().session.tick + 1,
+                scene.simulation().session().binary_frame() - 1,
+                scene.simulation().session().tick(),
+                scene.simulation().session().tick() + 1,
                 controller.health.current()
             );
             scene.queue_command(CommandEnvelope::new(
                 owner,
-                scene.simulation().session.tick + 1,
+                scene.simulation().session().tick() + 1,
                 Command::Stop {
                     entity_id: attacker,
                 },
@@ -370,7 +378,7 @@ fn stock_fatal_overload_releases_real_captives_and_retires_rings_and_sparks() {
     };
     scene.select_controller();
     scene.capture_four_through_real_attacks();
-    let original = scene.simulation().interner.get("Russians").unwrap();
+    let original = scene.simulation().interner().get("Russians").unwrap();
     let rings = captive_ring_ids(&scene);
     assert_eq!(rings.len(), 4);
     let damage = scene.rules().mind_control.overload_damage[1];
@@ -391,7 +399,7 @@ fn stock_fatal_overload_releases_real_captives_and_retires_rings_and_sparks() {
             let after = spark_ids(&scene);
             eprintln!(
                 "MIND actual HPdrop visited_frame={} previous={} health={} words_before={before_words:?} words_after={:?} new_sparks={} shots={:?}",
-                scene.simulation().session.binary_frame - 1,
+                scene.simulation().session().binary_frame() - 1,
                 previous_health,
                 health,
                 scene
@@ -404,7 +412,7 @@ fn stock_fatal_overload_releases_real_captives_and_retires_rings_and_sparks() {
                     .iter()
                     .map(|shot| (
                         shot.attacker_id,
-                        scene.simulation().interner.resolve(shot.weapon_id),
+                        scene.simulation().interner().resolve(shot.weapon_id),
                         shot.target
                     ))
                     .collect::<Vec<_>>()
@@ -429,7 +437,7 @@ fn stock_fatal_overload_releases_real_captives_and_retires_rings_and_sparks() {
             pulses += 1;
             eprintln!(
                 "MIND natural overload visited_frame={} pulse={pulses} health={health}",
-                scene.simulation().session.binary_frame - 1
+                scene.simulation().session().binary_frame() - 1
             );
         }
         if health == 0 {
@@ -475,10 +483,14 @@ fn stock_fatal_overload_releases_real_captives_and_retires_rings_and_sparks() {
     );
     // Released AI units receive real Stop inputs so their native fate/Hunt
     // does not turn the cleanup observation into a second distant battle.
+    // The human Americans send them: the DoList skips computer Houses' events
+    // (0x0064C4FB..0x0064C50D), and IDLE never compares sender and actor
+    // (0x004C74CB..0x004C76BB).
+    let sender = scene.simulation().interner().get("Americans").unwrap();
     for &id in &scene.targets() {
         scene.queue_command(CommandEnvelope::new(
-            original,
-            scene.simulation().session.tick + 1,
+            sender,
+            scene.simulation().session().tick() + 1,
             Command::Stop { entity_id: id },
         ));
     }
@@ -499,9 +511,9 @@ fn stock_fatal_overload_releases_real_captives_and_retires_rings_and_sparks() {
     assert!(
         scene
             .simulation()
-            .projectiles
+            .projectiles()
             .iter()
-            .all(|(_, bullet)| bullet.source_id != scene.mind())
+            .all(|(_, bullet)| bullet.source_id() != scene.mind())
     );
 }
 
@@ -548,16 +560,16 @@ fn internal_snapshot_continues_real_overload_links_rocking_and_next_pulse() {
         );
         assert_eq!(spark_ids(&scene), spark_ids(&restored));
         assert_eq!(
-            scene.simulation().main_rng.native_state_hex(),
-            restored.simulation().main_rng.native_state_hex()
+            scene.simulation().main_rng().native_state_hex(),
+            restored.simulation().main_rng().native_state_hex()
         );
         assert_eq!(
-            scene.simulation().scenario_rng.native_state_hex(),
-            restored.simulation().scenario_rng.native_state_hex()
+            scene.simulation().scenario_rng().native_state_hex(),
+            restored.simulation().scenario_rng().native_state_hex()
         );
         assert_eq!(
-            scene.simulation().mapgen_rng.native_state_hex(),
-            restored.simulation().mapgen_rng.native_state_hex()
+            scene.simulation().mapgen_rng().native_state_hex(),
+            restored.simulation().mapgen_rng().native_state_hex()
         );
         for &id in &scene.targets() {
             let a = scene.simulation().entities().get(id).unwrap();

@@ -2,8 +2,7 @@
 //!
 //! Native: constructor41D380, ShouldUpdateTarget41D7E0, SetTarget41D830,
 //! Start41D860, Reset41DA20, Clear41DB40, PointerExpired41D540, Remove41DC80.
-//! Source: original gamemd.exe SHA256
-//! 1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c.
+//! Source: original gamemd.exe.
 //! These control-flow bodies draw no RNG. Aircraft construction/placement and
 //! tint stepping use their shared owners. The manager has no per-frame AI.
 
@@ -13,17 +12,22 @@ use crate::rules::ruleset::RuleSet;
 use crate::sim::combat::TargetKind;
 use crate::sim::combat::veterancy::VeterancyRank;
 use crate::sim::game_entity::GameEntity;
+use crate::sim::intern::StringInterner;
 use crate::sim::mission::{MissionId, MissionType};
+use crate::sim::scenario_session::ScenarioSession;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::{FrameEffects, SimSoundEvent, Simulation};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 
 /// Techno+294 has one identity: an owned manager or a borrowed aircraft/marker
 /// link. Its manager ID is the owning Techno's stable ID, not a second entity.
+/// The manager is boxed: only a type with an airstrike team constructs one,
+/// and every object carries this state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AirstrikeState {
     link: Option<u64>,
-    manager: Option<AirstrikeManager>,
+    manager: Option<Box<AirstrikeManager>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +44,10 @@ struct AirstrikeManager {
 }
 
 impl AirstrikeState {
+    /// Whether Techno+294 names `id`, as a designating Techno's own link does.
+    pub fn links_to(&self, id: u64) -> bool {
+        self.link == Some(id)
+    }
     pub(crate) fn owns_manager(&self) -> bool {
         self.manager.is_some()
     }
@@ -84,24 +92,36 @@ impl GameEntity {
     pub fn has_airstrike_marker(&self) -> bool {
         self.airstrike.link.is_some()
     }
+    /// The strike owner this marker borrows its `+0x294` pointer from; its
+    /// type supplies the Phobos airstrike colours. `None` without a marker.
+    #[cfg(feature = "phobos")]
+    pub fn airstrike_owner(&self) -> Option<u64> {
+        self.airstrike.link
+    }
 }
 
 impl Simulation {
     /// InitManagers6F41C0: only positive normal team count creates a manager.
-    pub(crate) fn initialize_airstrike(&mut self, owner: u64, rules: &RuleSet) {
-        let Some(settings) = self
-            .substrate
+    pub(crate) fn initialize_airstrike(
+        interner: &StringInterner,
+        substrate: &mut ObjectSubstrate,
+        owner: u64,
+        rules: &RuleSet,
+    ) {
+        let Some(settings) = substrate
             .entities
             .get(owner)
-            .and_then(|e| self.object_type(e.type_ref(), rules))
+            .and_then(|e| {
+                interner.object_type_in_category(e.type_ref(), e.category().into(), rules)
+            })
             .map(|o| o.airstrike.clone())
             .filter(|s| s.normal_count > 0)
         else {
             return;
         };
-        let e = self.substrate.entities.get_mut(owner).unwrap();
+        let e = substrate.entities.get_mut(owner).unwrap();
         e.airstrike.link = Some(owner);
-        e.airstrike.manager = Some(AirstrikeManager {
+        e.airstrike.manager = Some(Box::new(AirstrikeManager {
             settings,
             aircraft: Vec::new(),
             remaining: 0,
@@ -109,37 +129,7 @@ impl Simulation {
             active: false,
             target: None,
             returned_at: None,
-        });
-    }
-
-    pub(crate) fn link_airstrike_aircraft(&mut self, owner: u64, aircraft: u64) {
-        self.airstrike_manager_mut(owner)
-            .expect("strike owner")
-            .aircraft
-            .insert(0, aircraft);
-        self.substrate
-            .entities
-            .get_mut(aircraft)
-            .expect("constructed aircraft")
-            .airstrike
-            .link = Some(owner);
-    }
-
-    fn airstrike_manager(&self, owner: u64) -> Option<&AirstrikeManager> {
-        self.substrate
-            .entities
-            .get(owner)?
-            .airstrike
-            .manager
-            .as_ref()
-    }
-    fn airstrike_manager_mut(&mut self, owner: u64) -> Option<&mut AirstrikeManager> {
-        self.substrate
-            .entities
-            .get_mut(owner)?
-            .airstrike
-            .manager
-            .as_mut()
+        }));
     }
 
     /// Bullet469705..469789 admits any Techno target through the firer's link.
@@ -162,7 +152,7 @@ impl Simulation {
         else {
             return;
         };
-        let Some(m) = self.airstrike_manager(owner) else {
+        let Some(m) = self.substrate.airstrike_manager(owner) else {
             return;
         };
         let elite = self
@@ -180,7 +170,7 @@ impl Simulation {
         };
         let ready = !m.busy
             && m.returned_at
-                .is_some_and(|at| at.wrapping_add(recharge) <= self.session.binary_frame as i32);
+                .is_some_and(|at| at.wrapping_add(recharge) <= self.session.binary_frame() as i32);
         if !ready && m.target == Some(target) {
             return;
         }
@@ -206,7 +196,7 @@ impl Simulation {
             .veterancy
             .rank_kind()
             == VeterancyRank::Elite;
-        let m = self.airstrike_manager_mut(owner).unwrap();
+        let m = self.substrate.airstrike_manager_mut(owner).unwrap();
         m.busy = true;
         m.active = true;
         let (kind, count) = if elite {
@@ -219,7 +209,7 @@ impl Simulation {
         };
         let spawned = self.create_airstrike_aircraft(owner, target, &kind, count, rules, effects);
         let first = spawned.aircraft.first().copied();
-        let m = self.airstrike_manager_mut(owner).unwrap();
+        let m = self.substrate.airstrike_manager_mut(owner).unwrap();
         m.remaining = spawned.count;
         m.aircraft = spawned.aircraft;
         if spawned.count == 0 {
@@ -227,21 +217,20 @@ impl Simulation {
         }
         m.target = Some(target);
         if let Some(first) = first {
-            self.airstrike_sound(
-                first,
-                rules.general.airstrike_attack_voice.as_deref(),
-                None,
-                Some(rules),
-                effects,
-            );
+            let voice = self.airstrike_voice(false, first, owner, rules);
+            self.airstrike_sound(first, voice, None, rules, effects);
         }
-        self.airstrike_mark_target(owner, target);
+        Self::airstrike_mark_target(&self.session, &mut self.substrate, owner, target);
     }
 
-    fn airstrike_mark_target(&mut self, owner: u64, target: u64) {
-        let frame = self.session.binary_frame as i32;
-        if let Some(e) = self
-            .substrate
+    fn airstrike_mark_target(
+        session: &ScenarioSession,
+        substrate: &mut ObjectSubstrate,
+        owner: u64,
+        target: u64,
+    ) {
+        let frame = session.binary_frame() as i32;
+        if let Some(e) = substrate
             .entities
             .get_mut(target)
             .filter(|e| e.category() == EntityCategory::Structure)
@@ -258,7 +247,7 @@ impl Simulation {
         rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) {
-        let m = self.airstrike_manager(owner).unwrap();
+        let m = self.substrate.airstrike_manager(owner).unwrap();
         let aircraft = m.aircraft.clone();
         let old_target = m.target;
         let remaining = m.remaining.max(0) as usize;
@@ -273,7 +262,7 @@ impl Simulation {
             .first()
             .is_some_and(|&first| aircraft.iter().any(|&id| ammo(id) != ammo(first)))
         {
-            self.airstrike_clear_target(owner, Some(rules), effects);
+            self.airstrike_clear_target(owner, rules, effects);
             return;
         }
         if let Some(old) = old_target
@@ -281,11 +270,11 @@ impl Simulation {
             .filter(|e| e.category() == EntityCategory::Structure)
         {
             old.airstrike.link = None;
-            old.airstrike_tint.stop(self.session.binary_frame as i32);
+            old.airstrike_tint.stop(self.session.binary_frame() as i32);
         }
-        self.airstrike_manager_mut(owner).unwrap().target = None;
-        self.airstrike_mark_target(owner, target);
-        self.airstrike_manager_mut(owner).unwrap().target = Some(target);
+        self.substrate.airstrike_manager_mut(owner).unwrap().target = None;
+        Self::airstrike_mark_target(&self.session, &mut self.substrate, owner, target);
+        self.substrate.airstrike_manager_mut(owner).unwrap().target = Some(target);
         for aircraft in aircraft.into_iter().take(remaining) {
             if self
                 .substrate
@@ -297,7 +286,7 @@ impl Simulation {
                 let _ = self.assign_target_represented(
                     aircraft,
                     Some(TargetKind::Entity(target)),
-                    Some(rules),
+                    rules,
                     None,
                     effects,
                 );
@@ -305,10 +294,10 @@ impl Simulation {
                     aircraft,
                     MissionId::from_known(MissionType::Attack),
                     0,
-                    self.session.binary_frame,
-                    &crate::sim::mission::authority::EntityReadyInputProvider,
+                    self.session.binary_frame(),
+                    &crate::sim::mission::authority::LiveReadyInputProvider { rules },
                 );
-                self.airstrike_manager_mut(owner).unwrap().active = true;
+                self.substrate.airstrike_manager_mut(owner).unwrap().active = true;
             }
         }
     }
@@ -317,10 +306,10 @@ impl Simulation {
     pub(crate) fn airstrike_clear_target(
         &mut self,
         owner: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) {
-        let Some(m) = self.airstrike_manager(owner) else {
+        let Some(m) = self.substrate.airstrike_manager(owner) else {
             return;
         };
         let aircraft = m.aircraft.clone();
@@ -349,13 +338,13 @@ impl Simulation {
                 id,
                 MissionId::from_known(MissionType::Retreat),
                 0,
-                self.session.binary_frame,
-                &crate::sim::mission::authority::EntityReadyInputProvider,
+                self.session.binary_frame(),
+                &crate::sim::mission::authority::LiveReadyInputProvider { rules },
             );
             let _ = self.assign_target_represented(id, None, rules, None, effects);
             let _ = self.assign_destination_represented(id, None, rules, None, effects);
         }
-        self.airstrike_manager_mut(owner).unwrap().active = false;
+        self.substrate.airstrike_manager_mut(owner).unwrap().active = false;
         if let Some(target) = target.filter(|&id| {
             self.substrate.entities.get(id).is_some_and(|e| {
                 e.category() == EntityCategory::Structure && e.airstrike.link == Some(owner)
@@ -383,7 +372,38 @@ impl Simulation {
                 .airstrike
                 .link = replacement;
         }
-        self.airstrike_manager_mut(owner).unwrap().target = None;
+        self.substrate.airstrike_manager_mut(owner).unwrap().target = None;
+    }
+
+    /// The sound an airstrike plays as it starts (`abort` false) or is
+    /// called off: `[AudioVisual] AirstrikeAttackVoice`/`AirstrikeAbortSound`.
+    /// Ares AirstrikeClass_Fire_AirstrikeAttackVoice (10048D60, hook
+    /// 0x41D940) and AirstrikeClass_PointerGotInvalid_AirstrikeAbortSound
+    /// (10048DE0, hook 0x41D5AE) let the first aircraft's type and then the
+    /// designator's `VoiceAirstrikeAttack`/`VoiceAirstrikeAbort` replace it.
+    fn airstrike_voice<'r>(
+        &self,
+        abort: bool,
+        first: u64,
+        designator: u64,
+        rules: &'r RuleSet,
+    ) -> Option<&'r str> {
+        let general = if abort {
+            rules.general.airstrike_abort_sound.as_deref()
+        } else {
+            rules.general.airstrike_attack_voice.as_deref()
+        };
+        if !rules.ares_form() {
+            return general;
+        }
+        [first, designator].into_iter().fold(general, |voice, id| {
+            self.substrate
+                .entities
+                .get(id)
+                .and_then(|entity| self.interner.object_type(entity.type_ref(), rules))
+                .and_then(|object| object.techno_combat().presentation().airstrike_voice(abort))
+                .unwrap_or(voice)
+        })
     }
 
     fn airstrike_sound(
@@ -391,11 +411,11 @@ impl Simulation {
         source: u64,
         sound: Option<&str>,
         audible_to: Option<[crate::sim::intern::InternedId; 2]>,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) {
         if let (Some(sound), Some(entity)) = (sound, self.substrate.entities.get(source)) {
-            self.sound_events.push(SimSoundEvent::voc_at_for(
+            self.sound_events.emit(SimSoundEvent::voc_at_for(
                 sound.to_owned(),
                 audible_to,
                 &entity.position,
@@ -405,9 +425,14 @@ impl Simulation {
     }
 
     /// Remove41DC80 clears only this aircraft link; last removal starts recharge.
-    fn airstrike_remove_aircraft(&mut self, owner: u64, aircraft: u64) {
-        let frame = self.session.binary_frame as i32;
-        let Some(m) = self.airstrike_manager_mut(owner) else {
+    fn airstrike_remove_aircraft(
+        session: &ScenarioSession,
+        substrate: &mut ObjectSubstrate,
+        owner: u64,
+        aircraft: u64,
+    ) {
+        let frame = session.binary_frame() as i32;
+        let Some(m) = substrate.airstrike_manager_mut(owner) else {
             return;
         };
         if let Some(index) = m.aircraft.iter().take(102).position(|&id| id == aircraft) {
@@ -418,7 +443,7 @@ impl Simulation {
                 m.active = false;
                 m.returned_at = Some(frame);
             }
-            if let Some(e) = self.substrate.entities.get_mut(aircraft) {
+            if let Some(e) = substrate.entities.get_mut(aircraft) {
                 e.airstrike.link = None;
             }
         }
@@ -429,10 +454,10 @@ impl Simulation {
         &mut self,
         owner: u64,
         expired: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) {
-        let Some(m) = self.airstrike_manager(owner) else {
+        let Some(m) = self.substrate.airstrike_manager(owner) else {
             return;
         };
         if self
@@ -453,23 +478,20 @@ impl Simulation {
                     .entities
                     .get(owner)
                     .and_then(|e| self.houses.get(&e.owner()))
-                    .is_some_and(|h| h.is_human)
+                    .is_some_and(|h| h.is_controlled_by_human(self.session.game_mode_nonzero()))
             {
-                // IsHumanPlayer50B6F0 in skirmish means this machine's local
-                // house. The common sound boundary resolves that audience;
-                // another human player's Boris must not play our abort voice.
+                // IsHumanPlayer (`0x0041D5A5 CALL 0x0050B6F0`): in a campaign
+                // the human or `PlayerControl=` flag. In a multiplayer game it
+                // means this machine's local house; any human house passes
+                // here and the common sound boundary resolves that audience,
+                // so another human player's Boris does not play our abort voice.
                 let house = self.substrate.entities.get(owner).unwrap().owner();
-                self.airstrike_sound(
-                    first,
-                    rules.and_then(|r| r.general.airstrike_abort_sound.as_deref()),
-                    Some([house, house]),
-                    rules,
-                    effects,
-                );
+                let voice = self.airstrike_voice(true, first, owner, rules);
+                self.airstrike_sound(first, voice, Some([house, house]), rules, effects);
             }
             self.airstrike_clear_target(owner, rules, effects);
             for id in aircraft {
-                self.airstrike_remove_aircraft(owner, id);
+                Self::airstrike_remove_aircraft(&self.session, &mut self.substrate, owner, id);
             }
         } else if self
             .substrate
@@ -483,7 +505,7 @@ impl Simulation {
                 .get(expired)
                 .is_some_and(|e| e.category() != EntityCategory::Structure)
         {
-            self.airstrike_remove_aircraft(owner, expired);
+            Self::airstrike_remove_aircraft(&self.session, &mut self.substrate, owner, expired);
         } else if self.substrate.entities.get(expired).is_some_and(|e| {
             e.category() == EntityCategory::Structure
                 && e.airstrike.link == Some(owner)
@@ -498,7 +520,7 @@ impl Simulation {
             .entities
             .get(listener)
             .and_then(GameEntity::airstrike_link)
-            .and_then(|id| self.airstrike_manager(id))
+            .and_then(|id| self.substrate.airstrike_manager(id))
             .is_some_and(|m| m.target == Some(target))
             && self
                 .substrate
@@ -510,8 +532,14 @@ impl Simulation {
     /// Tactical6D47FB..6D48D4 reads the owning manager and current Building
     /// target, irrespective of active/busy or remaining aircraft. Source is
     /// GetFLH(0,zero); target is GetCoords(+48), without TargetCoordOffset.
-    /// Presentation owns the planning/Health gate and clock-driven wobble.
+    /// Presentation owns the planning gate and clock-driven wobble. A Techno
+    /// with no Health skips only the CaptureManager links (`0x006D47A4`
+    /// jumps to `0x006D47FB`), so its beam still draws.
     /// No RNG draw, timer write or detach; isolate the shared fallback Cell.
+    ///
+    /// Phobos `DEFINE_JUMP(LJMP, 0x6D481D, 0x6D482D)` ("Allow airstrike flare
+    /// draw to foot") skips the building-only gate, so a foot target draws the
+    /// line too.
     pub fn airstrike_designation_coordinates(
         &self,
         owner: u64,
@@ -520,13 +548,14 @@ impl Simulation {
         use crate::sim::combat::fire_coord::{FireSource, fire_coordinate};
         use crate::sim::movement::ground_pose::object_get_coords;
         let source = self.substrate.entities.get(owner)?;
-        if source.airstrike.link != Some(owner) {
+        if !source.airstrike.links_to(owner) {
             return None;
         }
         let target = self
             .substrate
             .entities
             .get(source.airstrike.manager.as_ref()?.target?)?;
+        #[cfg(not(feature = "phobos"))]
         if target.category() != EntityCategory::Structure {
             return None;
         }
@@ -554,16 +583,74 @@ impl Simulation {
     }
 
     pub fn airstrike_tint_active(&self, target: u64) -> bool {
+        self.substrate.airstrike_tint_active(target)
+    }
+
+    /// Phobos `TechnoExt::GetTintColor`'s airstrike arm
+    /// (`src/Ext/Techno/Body.Internal.cpp`): the `[ColorAdd]` index of the
+    /// strike owner type's `TintColorAirstrike`, which `TechnoTypeExt` resolves
+    /// as its own `LaserTargetColor`, then `[AudioVisual] LaserTargetColor`.
+    #[cfg(feature = "phobos")]
+    pub fn airstrike_laser_target_color(&self, target: u64, rules: &RuleSet) -> i32 {
         self.substrate
             .entities
+            .get(target)
+            .and_then(GameEntity::airstrike_owner)
+            .and_then(|owner| self.substrate.entities.get(owner))
+            .and_then(|owner| self.object_type(owner.type_ref(), rules))
+            .and_then(crate::rules::object_type::ObjectType::laser_target_color)
+            .unwrap_or(rules.general.laser_target_color)
+    }
+
+    /// Phobos `AirstrikeLineColor.Get(RulesExt::AirstrikeLineColor)` for a
+    /// strike drawn by `owner` (`TechnoClass_DrawAirstrikeFlare_LineColor`,
+    /// `0x007058F6`): its type's own value, then `[AudioVisual]`.
+    #[cfg(feature = "phobos")]
+    pub fn airstrike_line_color(&self, owner: u64, rules: &RuleSet) -> [u8; 3] {
+        self.substrate
+            .entities
+            .get(owner)
+            .and_then(|owner| self.object_type(owner.type_ref(), rules))
+            .and_then(crate::rules::object_type::ObjectType::airstrike_line_color)
+            .unwrap_or(rules.general.airstrike_line_color)
+    }
+}
+
+impl crate::sim::world::ObjectSubstrate {
+    fn airstrike_manager(&self, owner: u64) -> Option<&AirstrikeManager> {
+        self.entities.get(owner)?.airstrike.manager.as_deref()
+    }
+
+    /// Whether `target` is a Structure whose strike owner's manager targets it.
+    pub(crate) fn airstrike_tint_active(&self, target: u64) -> bool {
+        self.entities
             .get(target)
             .filter(|e| e.category() == EntityCategory::Structure)
             .and_then(GameEntity::airstrike_link)
             .and_then(|id| self.airstrike_manager(id))
             .is_some_and(|m| m.target == Some(target))
     }
+
+    pub(crate) fn link_airstrike_aircraft(&mut self, owner: u64, aircraft: u64) {
+        self.airstrike_manager_mut(owner)
+            .expect("strike owner")
+            .aircraft
+            .insert(0, aircraft);
+        self.entities
+            .get_mut(aircraft)
+            .expect("constructed aircraft")
+            .airstrike
+            .link = Some(owner);
+    }
+    fn airstrike_manager_mut(&mut self, owner: u64) -> Option<&mut AirstrikeManager> {
+        self.entities
+            .get_mut(owner)?
+            .airstrike
+            .manager
+            .as_deref_mut()
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "airstrike_tests.rs"]
 mod tests;

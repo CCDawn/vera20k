@@ -1,9 +1,16 @@
 # Projectile native comparisons
 
-These tools execute the pinned retail `gamemd.exe` under Unicorn. See the
+These tools execute the retail `gamemd.exe` under Unicorn. See the
 [shared native runner](../native_oracle.md) for installation and executable
 identity. This page indexes the consolidated FireAt-tail, load-timer and collision
 fixtures; other projectile families still need their own inventory.
+
+## Retained Airburst flag
+
+[`airburst_retained`](airburst_retained.md) executes the original whole
+BulletType reader across eight ordered flag histories, with no asset inputs.
+`python -m tools.projectile_oracle.airburst_retained --check` verifies the native
+current-value defaults independently of the existing child-fan corpus.
 
 ## Bullet trailer animations
 
@@ -102,7 +109,7 @@ of 877 rows. Normal and optimized Python reproduce the same existing reference.
 The default is a read-only check; import/help do not load native bytes or write.
 `--write --output <candidate.json>` explicitly generates a candidate and sidecar.
 
-This fixture shares image identity, execution completion and golden publication
+This fixture shares image loading, execution completion and golden publication
 with `tools.native_oracle`. Its native vtables, stream services and case matrix
 remain local: adjacent collision and trail fixtures have different state and
 coverage. Save executes outside assertions, and stream bounds, HRESULTs and byte
@@ -143,7 +150,7 @@ The prior 1,148 observations are preserved. The shared collision corpus appends
 six retained Bullet OnBridge controls; a separate 12-row line-walk corpus covers
 the signed XYZ stepping dependency. See [shared collision boundaries](shared_collision.md)
 for commands, supplied inputs and coverage limits.
-The checked `.meta.json` sidecars record executable identity, emulator version,
+The checked `.meta.json` sidecars record the emulator version,
 canonical payload hash, boundaries, supplied state and substituted receivers.
 Ordinary admission/reflection and homing use live FPCW `0x0E7F` without changing
 the image's cached control word; shared geometry and nearest selection set both.
@@ -182,7 +189,7 @@ A native rejection is a valid observation; an execution exception now aborts the
 entire run instead of becoming an `*_error` golden field. The current corpus has
 no such error rows.
 
-The generator uses the shared `call`, executable identity and publisher directly;
+The generator uses the shared `call`, image loader and publisher directly;
 there is no eager RMG compatibility import, import-time emulation or automatic
 write. Default invocation and `--check` are read-only; `--write` and optional
 `--output <candidate.json>` are explicit. Repeat with `python -O -m` to check that

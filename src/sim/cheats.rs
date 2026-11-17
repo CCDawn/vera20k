@@ -7,6 +7,7 @@
 //! rewrites Iron Curtain timers, and power keeps its real assessed totals.
 
 use crate::sim::intern::InternedId;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
 
 pub const MAX_MONEY_TARGET: i32 = 1_000_000_000;
@@ -104,6 +105,7 @@ impl Simulation {
     }
 
     pub fn clear_debug_tools(&mut self) {
+        self.note_revision();
         let old_tech_owner = self
             .debug_tools
             .owner
@@ -121,14 +123,14 @@ impl Simulation {
             },
             ..Default::default()
         };
-        for power in self.power_states.values_mut() {
+        for (_, power) in self.power_states.iter_mut() {
             power.set_debug_full_power(false);
         }
         if let Some(owner) = old_tech_owner {
-            self.request_house_tech_tree_recheck(owner);
+            self.houses.request_house_tech_tree_recheck(owner);
         }
         for id in logged {
-            if let Some(entity) = self.entities_mut().get_mut(id) {
+            if let Some(entity) = self.substrate.entities.get_mut(id) {
                 entity.set_debug_logging(false);
             }
         }
@@ -139,9 +141,10 @@ impl Simulation {
     }
 
     fn debug_local_owner(&self) -> Option<InternedId> {
-        self.session.current_house.filter(|owner| {
+        self.session.current_house().filter(|owner| {
             self.houses.get(owner).is_some_and(|house| {
-                !house.is_defeated && house.is_controlled_by_human(self.session.game_mode_nonzero)
+                !house.is_defeated()
+                    && house.is_controlled_by_human(self.session.game_mode_nonzero())
             })
         })
     }
@@ -184,7 +187,7 @@ impl Simulation {
                 .debug_tools
                 .owner
                 .and_then(|owner| self.power_states.get(&owner))
-                .is_some_and(|power| power.is_low_power)
+                .is_some_and(|power| power.is_low_power())
     }
 
     pub fn debug_reveal_map(&self) -> bool {
@@ -193,22 +196,24 @@ impl Simulation {
 
     pub fn set_cheat_flags(&mut self, flags: CheatFlags) -> Result<(), DebugToolsError> {
         let owner = self.trainer_write_owner()?;
+        self.note_revision();
         let flags = flags.normalized();
         self.debug_tools.modified |= flags.active();
         let old = self.debug_tools.flags;
         self.debug_tools.flags = flags;
         self.debug_tools.owner = Some(owner);
-        for (&id, power) in &mut self.power_states {
+        for (&id, power) in self.power_states.iter_mut() {
             power.set_debug_full_power(id == owner && flags.infinite_power);
         }
         if old.tech_all != flags.tech_all || old.tech_boost != flags.tech_boost {
-            self.request_house_tech_tree_recheck(owner);
+            self.houses.request_house_tech_tree_recheck(owner);
         }
         Ok(())
     }
 
     pub fn request_trainer_action(&mut self, action: TrainerAction) -> Result<(), DebugToolsError> {
         self.debug_tools.owner = Some(self.trainer_write_owner()?);
+        self.note_revision();
         self.debug_tools.pending |= match action {
             TrainerAction::HealAll => 1,
             TrainerAction::VeteranAll => 2,
@@ -219,8 +224,9 @@ impl Simulation {
     }
 
     /// At the existing master-frame boundary; queued actions are consumed once.
-    pub fn apply_debug_tools(&mut self, rules: Option<&crate::rules::ruleset::RuleSet>) {
-        self.refresh_debug_event_selection();
+    pub fn apply_debug_tools(&mut self, rules: &crate::rules::ruleset::RuleSet) {
+        self.note_revision();
+        Self::refresh_debug_event_selection(&mut self.debug_tools, &mut self.substrate);
         let Ok(owner) = self.trainer_write_owner() else {
             if self.debug_tools.owner.is_some() || self.debug_tools.pending != 0 {
                 self.clear_debug_tools();
@@ -235,17 +241,14 @@ impl Simulation {
         let pending = std::mem::take(&mut self.debug_tools.pending);
         if flags.infinite_money
             && let Some(house) = self.houses.get_mut(&owner)
-            && house.economy.credits() < flags.money_target
+            && house.economy().credits() < flags.money_target
         {
             // Add_Credits is the existing balance owner. Modulo subtraction
             // reaches the bounded target even from a native negative balance.
-            house
-                .economy
-                .add_credits(flags.money_target.wrapping_sub(house.economy.credits()));
+            let shortfall = flags.money_target.wrapping_sub(house.economy().credits());
+            house.economy_mut().add_credits(shortfall);
         }
-        if pending & 1 != 0
-            && let Some(rules) = rules
-        {
+        if pending & 1 != 0 {
             let mut healed_structure = false;
             let (entities, interner) = self.entities_mut_and_interner();
             for entity in entities.values_mut() {
@@ -268,11 +271,11 @@ impl Simulation {
             // Ask the existing House owner to refresh retained generation even
             // if the building's next live AI visit is gated.
             if healed_structure {
-                self.invalidate_house_power(owner, true);
+                Self::invalidate_house_power(&self.houses, &mut self.power_states, owner, true);
             }
         }
         if pending & 2 != 0 {
-            for entity in self.entities_mut().values_mut() {
+            for entity in self.substrate.entities.values_mut() {
                 if entity.owner() == owner
                     && entity.lifecycle.object_alive()
                     && !entity.death.is_dying()
@@ -282,20 +285,11 @@ impl Simulation {
                 }
             }
         }
-        if pending & 4 != 0
-            && let Some(rules) = rules
-            && let Some(weapons) = self.super_weapons.get_mut(&owner)
-        {
-            let frame = self.session.binary_frame;
-            for (type_id, instance) in weapons {
-                if !instance.is_active || instance.is_suspended {
-                    continue;
-                }
-                if let Some(sw) = rules.super_weapon(self.interner.resolve(*type_id))
-                    && instance.set_charge_percentage(100, sw, frame)
-                {
-                    instance.is_ready = true;
-                    instance.ready_tick = frame as i32;
+        if pending & 4 != 0 {
+            let frame = self.session.binary_frame();
+            for (type_id, instance) in self.super_weapons.house_instances_mut(&owner) {
+                if let Some(sw) = rules.super_weapon(self.interner.resolve(*type_id)) {
+                    instance.debug_charge_full(sw, frame);
                 }
             }
         }
@@ -342,15 +336,19 @@ impl Simulation {
 
     pub fn set_debug_event_logging(&mut self, enabled: bool) {
         self.debug_tools.event_logging = enabled && self.trainer_available();
-        self.refresh_debug_event_selection();
+        Self::refresh_debug_event_selection(&mut self.debug_tools, &mut self.substrate);
     }
 
-    fn refresh_debug_event_selection(&mut self) {
-        if !self.debug_tools.event_logging && self.debug_tools.logged_entities.is_empty() {
+    fn refresh_debug_event_selection(
+        debug_tools: &mut DebugToolsState,
+        substrate: &mut ObjectSubstrate,
+    ) {
+        if !debug_tools.event_logging && debug_tools.logged_entities.is_empty() {
             return;
         }
-        let selected: Vec<_> = if self.debug_tools.event_logging {
-            self.entities()
+        let selected: Vec<_> = if debug_tools.event_logging {
+            substrate
+                .entities
                 .values()
                 .filter(|e| e.selection.is_selected())
                 .take(crate::sim::debug_event_log::DEBUG_EVENT_ENTITY_LIMIT)
@@ -359,26 +357,26 @@ impl Simulation {
         } else {
             Vec::new()
         };
-        if selected == self.debug_tools.logged_entities {
+        if selected == debug_tools.logged_entities {
             return;
         }
-        let old = std::mem::replace(&mut self.debug_tools.logged_entities, selected.clone());
+        let old = std::mem::replace(&mut debug_tools.logged_entities, selected.clone());
         for id in old {
             if !selected.contains(&id)
-                && let Some(entity) = self.entities_mut().get_mut(id)
+                && let Some(entity) = substrate.entities.get_mut(id)
             {
                 entity.set_debug_logging(false);
             }
         }
         for id in selected {
-            if let Some(entity) = self.entities_mut().get_mut(id) {
+            if let Some(entity) = substrate.entities.get_mut(id) {
                 entity.set_debug_logging(true);
             }
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
     use crate::sim::game_entity::GameEntity;
@@ -388,9 +386,8 @@ mod tests {
         let mut sim = Simulation::new();
         let owner = sim.interner.intern("Allies");
         sim.houses
-            .insert(owner, HouseState::new(owner, 0, None, true, 500, 10));
-        sim.session.current_house = Some(owner);
-        sim.session.house_order.push(owner);
+            .register(HouseState::new(owner, 0, None, true, 500, 10));
+        sim.session.set_current_house_for_test(Some(owner));
         (sim, owner)
     }
 
@@ -424,7 +421,7 @@ mod tests {
             );
         }
         let (mut sim, _) = offline();
-        sim.session.current_house = None;
+        sim.session.set_current_house_for_test(None);
         assert_eq!(
             sim.set_cheat_flags(flags),
             Err(DebugToolsError::NoLocalHouse)
@@ -444,19 +441,26 @@ mod tests {
         .unwrap();
         assert_eq!(sim.cheat_flags().money_target, MAX_MONEY_TARGET);
         assert_eq!(sim.cheat_flags().damage_scale, MAX_DAMAGE_SCALE);
-        sim.apply_debug_tools(None);
-        assert_eq!(sim.houses[&owner].economy.credits(), MAX_MONEY_TARGET);
-        sim.houses.get_mut(&owner).unwrap().economy.add_credits(100);
-        sim.apply_debug_tools(None);
-        assert_eq!(sim.houses[&owner].economy.credits(), MAX_MONEY_TARGET + 100);
+        sim.apply_debug_tools(crate::rules::ruleset::RuleSet::empty_for_test());
+        assert_eq!(sim.houses[&owner].economy().credits(), MAX_MONEY_TARGET);
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .economy_mut()
+            .add_credits(100);
+        sim.apply_debug_tools(crate::rules::ruleset::RuleSet::empty_for_test());
+        assert_eq!(
+            sim.houses[&owner].economy().credits(),
+            MAX_MONEY_TARGET + 100
+        );
         sim.set_cheat_flags(CheatFlags::default()).unwrap();
         sim.houses
             .get_mut(&owner)
             .unwrap()
-            .economy
+            .economy_mut()
             .spend_money(MAX_MONEY_TARGET);
-        sim.apply_debug_tools(None);
-        assert_eq!(sim.houses[&owner].economy.credits(), 100);
+        sim.apply_debug_tools(crate::rules::ruleset::RuleSet::empty_for_test());
+        assert_eq!(sim.houses[&owner].economy().credits(), 100);
         assert!(
             sim.trainer_modified(),
             "turning switches off cannot resume deterministic recording"
@@ -466,10 +470,14 @@ mod tests {
     #[test]
     fn context_change_drops_pending_actions_and_power_without_corrupting_totals() {
         let (mut sim, owner) = offline();
-        let power = sim.power_states.entry(owner).or_default();
-        power.total_output = 100;
-        power.total_drain = 200;
-        power.is_low_power = true;
+        let power = sim
+            .power_states
+            .map_mut_for_test()
+            .entry(owner)
+            .or_default();
+        power.set_total_output_for_test(100);
+        power.set_total_drain_for_test(200);
+        power.set_is_low_power_for_test(true);
         sim.set_cheat_flags(CheatFlags {
             infinite_power: true,
             infinite_money: true,
@@ -482,8 +490,8 @@ mod tests {
         assert!(!sim.power_states[&owner].low_power());
         assert_eq!(
             (
-                sim.power_states[&owner].total_output,
-                sim.power_states[&owner].total_drain
+                sim.power_states[&owner].total_output(),
+                sim.power_states[&owner].total_drain()
             ),
             (100, 200)
         );
@@ -492,8 +500,8 @@ mod tests {
         assert_eq!(sim.debug_tools.pending, 0);
         assert!(sim.power_states[&owner].low_power());
         assert_eq!(sim.power_states[&owner].effective_totals(), (100, 200));
-        sim.apply_debug_tools(None);
-        assert_eq!(sim.houses[&owner].economy.credits(), 500);
+        sim.apply_debug_tools(crate::rules::ruleset::RuleSet::empty_for_test());
+        assert_eq!(sim.houses[&owner].economy().credits(), 500);
     }
 
     #[test]
@@ -515,12 +523,12 @@ mod tests {
             false,
         );
         entity.selection.set_selected_for_test(true);
-        sim.entities_mut().insert(entity);
+        sim.substrate.entities.insert(entity);
         let hash = sim.state_hash();
         let before = crate::util::save_codec::serialize(&sim).unwrap();
         sim.set_cheat_flags(CheatFlags::default()).unwrap();
         sim.set_debug_event_logging(true);
-        sim.apply_debug_tools(None);
+        sim.apply_debug_tools(crate::rules::ruleset::RuleSet::empty_for_test());
         assert!(sim.entities().get(1).unwrap().debug_log().is_some());
         assert_eq!(sim.state_hash(), hash);
         assert_eq!(crate::util::save_codec::serialize(&sim).unwrap(), before);
@@ -551,7 +559,7 @@ mod tests {
                 false,
             );
             entity.selection.set_selected_for_test(true);
-            sim.entities_mut().insert(entity);
+            sim.substrate.entities.insert(entity);
         }
         sim.set_debug_event_logging(true);
         assert_eq!(
@@ -561,7 +569,8 @@ mod tests {
                 .count(),
             32
         );
-        sim.entities_mut()
+        sim.substrate
+            .entities
             .get_mut(1)
             .unwrap()
             .selection
@@ -584,8 +593,8 @@ mod tests {
         .unwrap();
         let _ = sim.take_due_replay_commands([]);
         assert!(!sim.trainer_available());
-        sim.apply_debug_tools(None);
-        assert_eq!(sim.houses[&owner].economy.credits(), 500);
+        sim.apply_debug_tools(crate::rules::ruleset::RuleSet::empty_for_test());
+        assert_eq!(sim.houses[&owner].economy().credits(), 500);
     }
 
     #[test]
@@ -596,11 +605,12 @@ mod tests {
         let (mut sim, owner) = offline();
         let other = sim.interner.intern("Enemy");
         sim.houses
-            .insert(other, HouseState::new(other, 1, None, false, 0, 10));
+            .register(HouseState::new(other, 1, None, false, 0, 10));
         let ty = sim.interner.intern("E1");
         let warhead = sim.interner.intern("SA");
         for (id, house) in [(1, owner), (2, other)] {
-            sim.entities_mut()
+            sim.substrate
+                .entities
                 .insert(GameEntity::new_at_frame_zero_for_test(
                     id,
                     1,
@@ -651,10 +661,10 @@ mod tests {
             crate::sim::world::FrameEffects::default(),
         );
         assert_eq!(sim.entities().get(2).unwrap().health.current(), 70);
-        let entity = sim.entities_mut().get_mut(1).unwrap();
+        let entity = sim.substrate.entities.get_mut(1).unwrap();
         apply_invulnerability(entity, 0, 300, InvulnKind::IronCurtain);
         let original = crate::util::save_codec::serialize(&entity.invulnerability).unwrap();
-        sim.apply_debug_tools(Some(&rules));
+        sim.apply_debug_tools(&rules);
         sim.set_cheat_flags(CheatFlags::default()).unwrap();
         assert_eq!(
             crate::util::save_codec::serialize(&sim.entities().get(1).unwrap().invulnerability)
@@ -688,7 +698,8 @@ mod tests {
         let enemy = sim.interner.intern("Enemy");
         let ty = sim.interner.intern("E1");
         for (id, house) in [(1, owner), (2, enemy)] {
-            sim.entities_mut()
+            sim.substrate
+                .entities
                 .insert(GameEntity::new_at_frame_zero_for_test(
                     id,
                     1,
@@ -707,13 +718,13 @@ mod tests {
         sim.request_trainer_action(TrainerAction::HealAll).unwrap();
         sim.request_trainer_action(TrainerAction::VeteranAll)
             .unwrap();
-        sim.apply_debug_tools(Some(&rules));
+        sim.apply_debug_tools(&rules);
         assert_eq!(sim.entities().get(1).unwrap().health.current(), 100);
         assert_eq!(sim.entities().get(1).unwrap().veterancy.rank(), 200);
         assert_eq!(sim.entities().get(2).unwrap().health.current(), 10);
         assert_eq!(sim.entities().get(2).unwrap().veterancy.rank(), 0);
-        sim.entities_mut().get_mut(1).unwrap().health.set(50);
-        sim.apply_debug_tools(Some(&rules));
+        sim.substrate.entities.get_mut(1).unwrap().health.set(50);
+        sim.apply_debug_tools(&rules);
         assert_eq!(
             sim.entities().get(1).unwrap().health.current(),
             50,
@@ -727,27 +738,29 @@ mod tests {
         let (mut sim, owner) = offline();
         let ty = sim.interner.intern("TestSpecial");
         let mut instance = crate::sim::superweapon::SuperWeaponInstance::new(ty, owner, 0);
-        instance.is_active = true;
+        instance.set_is_active_for_test(true);
         sim.super_weapons
+            .map_mut_for_test()
             .entry(owner)
             .or_default()
             .insert(ty, instance);
         sim.request_trainer_action(TrainerAction::SuperweaponsReady)
             .unwrap();
-        sim.apply_debug_tools(Some(&rules));
-        assert!(sim.super_weapons[&owner][&ty].is_ready);
+        sim.apply_debug_tools(&rules);
+        assert!(sim.super_weapons[&owner][&ty].is_ready());
         let instance = sim
             .super_weapons
+            .map_mut_for_test()
             .get_mut(&owner)
             .unwrap()
             .get_mut(&ty)
             .unwrap();
-        instance.is_ready = false;
-        instance.is_suspended = true;
+        instance.set_is_ready_for_test(false);
+        instance.set_is_suspended_for_test(true);
         sim.request_trainer_action(TrainerAction::SuperweaponsReady)
             .unwrap();
-        sim.apply_debug_tools(Some(&rules));
-        assert!(!sim.super_weapons[&owner][&ty].is_ready);
+        sim.apply_debug_tools(&rules);
+        assert!(!sim.super_weapons[&owner][&ty].is_ready());
     }
     #[test]
     fn healing_a_structure_requests_power_and_radar_refresh_once() {
@@ -772,21 +785,21 @@ mod tests {
             1,
             false,
         );
-        sim.entities_mut().insert(entity);
-        sim.power_states.insert(
+        sim.substrate.entities.insert(entity);
+        sim.power_states.map_mut_for_test().insert(
             owner,
             crate::sim::power_system::PowerState::settled_for_test(),
         );
         sim.request_trainer_action(TrainerAction::HealAll).unwrap();
-        sim.apply_debug_tools(Some(&rules));
+        sim.apply_debug_tools(&rules);
         assert_eq!(sim.entities().get(1).unwrap().health.current(), 100);
         assert!(sim.power_states[&owner].power_recheck_for_test());
         assert!(sim.power_states[&owner].radar_recheck_for_test());
-        sim.power_states.insert(
+        sim.power_states.map_mut_for_test().insert(
             owner,
             crate::sim::power_system::PowerState::settled_for_test(),
         );
-        sim.apply_debug_tools(Some(&rules));
+        sim.apply_debug_tools(&rules);
         assert!(!sim.power_states[&owner].power_recheck_for_test());
     }
 

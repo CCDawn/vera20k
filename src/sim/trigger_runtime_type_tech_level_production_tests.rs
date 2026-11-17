@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::rules::process_owner::NativeScenarioRulesPrefix;
-use crate::sim::command::Command;
+use crate::sim::command::{Command, ProductionEvent, ProductionRecord};
 use crate::sim::intern::InternedId;
 use crate::sim::production::{self, CanBuild, ProductionCategory};
 use crate::sim::runtime::{SimResources, SimRuntime};
@@ -67,52 +67,54 @@ fn assert_production_state(
         "{name}: House+1FC"
     );
     assert_eq!(
-        house.economy.credits(),
+        house.economy().credits(),
         number(&original["credits"]),
         "{name}: actual wallet"
     );
     assert_eq!(
-        house.economy.spent_credits(),
+        house.economy().spent_credits(),
         number(&original["spent"]),
         "{name}: money-spent statistic"
     );
     let actual = sim
         .production
-        .factories
+        .factories()
         .iter_insertion_ordered()
         .into_iter()
-        .find(|factory| factory.owner == owner && factory.category == ProductionCategory::Aircraft);
+        .find(|factory| {
+            factory.owner() == owner && factory.category() == ProductionCategory::Aircraft
+        });
     let expected = &original["factory"];
     if expected.is_null() || expected["exists"] == false {
         assert!(actual.is_none(), "{name}: the empty Factory was deleted");
     } else {
         let factory = actual.expect("native retained the aircraft Factory");
         assert_eq!(
-            i32::from(factory.progress),
+            i32::from(factory.progress()),
             number(&expected["stage"]),
             "{name}"
         );
-        assert_eq!(factory.balance, number(&expected["balance"]), "{name}");
+        assert_eq!(factory.balance(), number(&expected["balance"]), "{name}");
         assert_eq!(
-            i32::from(factory.step_rate_frames),
+            i32::from(factory.step_rate_frames()),
             number(&expected["rate"]),
             "{name}"
         );
         // CdTimer owns the start/duration fields. The unused native middle
         // timer dword is outside this representation and this comparison.
         assert_eq!(
-            factory.step_timer.start_frame(),
+            factory.step_timer().start_frame(),
             number(&expected["timer"][0]),
             "{name}"
         );
         assert_eq!(
-            factory.step_timer.duration(),
+            factory.step_timer().duration(),
             number(&expected["timer"][2]),
             "{name}"
         );
         assert_eq!(
             factory
-                .object
+                .object()
                 .as_ref()
                 .map(|object| sim.interner.resolve(object.type_id)),
             expected["held_type"].as_str(),
@@ -181,9 +183,6 @@ fn retail_production_world(history: &Value) -> Option<(SimRuntime, InternedId)> 
         .unwrap()
         .into_parts();
     rules.install_art_data(crate::rules::retail_ini_fixture::art_registry(&fixed_art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&fixed_art),
-    );
     let owner_name = input["house"].as_str().unwrap();
     let country_name = input["country"].as_str().unwrap();
     let authored_house = map.ini.section(owner_name).unwrap();
@@ -221,17 +220,18 @@ fn retail_production_world(history: &Value) -> Option<(SimRuntime, InternedId)> 
     sim.install_resolved_terrain_for_new_map(crate::map::resolved_terrain::test_flat_ground_grid(
         extent_x.checked_add(1).unwrap(),
     ));
-    sim.session.map_width = width;
-    sim.session.map_height = height;
-    sim.playfield_bounds = Some(crate::sim::cell_rect::PlayfieldBounds {
+    sim.session.set_map_width_for_test(width);
+    sim.session.set_map_height_for_test(height);
+    sim.set_playfield_bounds_for_test(Some(crate::sim::cell_rect::PlayfieldBounds {
         base: i32::from(width),
         off_fc: number(&bounds[0]),
         off_100: number(&bounds[1]),
         off_104: number(&bounds[2]),
         off_108: number(&bounds[3]),
-    });
-    sim.playfield_size_height = Some(i32::from(height));
-    sim.session.game_mode_nonzero = false;
+    }));
+    sim.set_playfield_size_height_for_test(Some(i32::from(height)));
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false));
     sim.set_input_delay_ticks(0);
     let owner = sim.interner.intern(owner_name);
     let country = sim.interner.intern(country_name);
@@ -245,9 +245,8 @@ fn retail_production_world(history: &Value) -> Option<(SimRuntime, InternedId)> 
         number(&input["house_tech"]),
     );
     house.project_country_mults(&rules, &sim.interner);
-    sim.houses.insert(owner, house);
-    sim.session.house_order.push(owner);
-    sim.session.current_house = Some(owner);
+    sim.houses.register(house);
+    sim.session.set_current_house_for_test(Some(owner));
     for building in geometry["owned_buildings"].as_array().unwrap() {
         sim.spawn_object(
             building["type"].as_str().unwrap(),
@@ -268,21 +267,22 @@ fn retail_production_world(history: &Value) -> Option<(SimRuntime, InternedId)> 
         &mut sim.substrate.entities,
         &rules,
         &sim.interner,
-        sim.session.binary_frame,
+        sim.session.binary_frame(),
     );
     let power = &sim.power_states[&owner];
     assert_eq!(
-        json!([power.total_output, power.total_drain]),
+        json!([power.total_output(), power.total_drain()]),
         input["house_power"]
     );
     assert_eq!(
-        sim.houses[&owner].tracking.airport_docks(),
+        sim.houses[&owner].tracking().airport_docks(),
         number(&input["airport_docks"])
     );
     if !history["initial_state"]["dirty"].as_bool().unwrap() {
         assert!(sim.houses.get_mut(&owner).unwrap().take_tech_recheck());
     }
-    sim.session.binary_frame = u32::try_from(number(&input["initial_frame"])).unwrap();
+    sim.session
+        .set_binary_frame_for_test(u32::try_from(number(&input["initial_frame"])).unwrap());
     // These are complete observed Random2 objects at the production boundary,
     // after original setup. Importing them does not assert constructor parity.
     let random = &history["rng_seed_states"];
@@ -294,7 +294,7 @@ fn retail_production_world(history: &Value) -> Option<(SimRuntime, InternedId)> 
     Some((
         SimRuntime {
             simulation: sim,
-            resources,
+            resources: std::sync::Arc::new(resources),
         },
         owner,
     ))
@@ -312,7 +312,7 @@ fn retail_all05_type_tech_level_recheck_cancels_paid_harrier_and_unlocks_black_e
         &runtime.resources.rules,
         owner,
         &history["initial_state"],
-        runtime.simulation.session.binary_frame,
+        runtime.simulation.session.binary_frame(),
     );
     assert_eq!(
         rng_hashes(&runtime.simulation),
@@ -330,7 +330,7 @@ fn retail_all05_type_tech_level_recheck_cancels_paid_harrier_and_unlocks_black_e
     let held = runtime
         .simulation
         .production
-        .factories
+        .factories()
         .view(owner, ProductionCategory::Aircraft)
         .unwrap()
         .object
@@ -348,9 +348,12 @@ fn retail_all05_type_tech_level_recheck_cancels_paid_harrier_and_unlocks_black_e
     );
     let paid = production_stage(history, "paid_orca");
     let paid_frame = u32::try_from(number(&paid["frame"])).unwrap();
-    assert!(paid_frame >= runtime.simulation.session.binary_frame);
-    while runtime.simulation.session.binary_frame < paid_frame {
-        runtime.simulation.session.binary_frame += 1;
+    assert!(paid_frame >= runtime.simulation.session.binary_frame());
+    while runtime.simulation.session.binary_frame() < paid_frame {
+        runtime
+            .simulation
+            .session
+            .set_binary_frame_for_test(runtime.simulation.session.binary_frame() + 1);
         production::step_factories(&mut runtime.simulation);
     }
     assert_production_state(
@@ -358,7 +361,7 @@ fn retail_all05_type_tech_level_recheck_cancels_paid_harrier_and_unlocks_black_e
         &runtime.resources.rules,
         owner,
         paid,
-        runtime.simulation.session.binary_frame,
+        runtime.simulation.session.binary_frame(),
     );
     assert_eq!(rng_hashes(&runtime.simulation), paid["rng"]);
     let actions = input["raw_actions"].as_array().unwrap();
@@ -375,7 +378,7 @@ fn retail_all05_type_tech_level_recheck_cancels_paid_harrier_and_unlocks_black_e
             &runtime.resources.rules,
             owner,
             original,
-            runtime.simulation.session.binary_frame,
+            runtime.simulation.session.binary_frame(),
         );
         assert_eq!(rng_hashes(&runtime.simulation), original["rng"]);
     }
@@ -384,7 +387,7 @@ fn retail_all05_type_tech_level_recheck_cancels_paid_harrier_and_unlocks_black_e
     // its generated ABANDON events and their same-frame command dispatcher.
     // The native receipt stops before MainTick's frame increment. Rust's API
     // additionally commits that frame; observe the tail's pre-commit frame.
-    let native_tail_frame = runtime.simulation.session.binary_frame;
+    let native_tail_frame = runtime.simulation.session.binary_frame();
     let mut output = runtime
         .advance_frame(&[], 67, TickLane::Ordinary, FrameEffects::default())
         .unwrap();
@@ -392,15 +395,36 @@ fn retail_all05_type_tech_level_recheck_cancels_paid_harrier_and_unlocks_black_e
     let events: Vec<_> = commands
         .iter()
         .map(|command| {
-            assert_eq!(command.owner, owner);
             assert_eq!(command.execute_tick, output.tick.tick);
-            let Command::CancelProductionByType { type_id, all } = &command.payload else {
+            let Command::SynchronizedRecord { record } = &command.payload else {
                 panic!(
                     "unexpected generated production event {:?}",
                     command.payload
                 )
             };
-            let id = runtime.simulation.interner.resolve(*type_id);
+            // The shared command owner now publishes byte records. Their
+            // header owns House/frame; the outer envelope is diagnostic only.
+            let event = ProductionRecord::decode(record).expect("production cancellation record");
+            assert!(matches!(
+                event.event,
+                ProductionEvent::Abandon | ProductionEvent::AbandonAll
+            ));
+            assert_eq!(
+                runtime
+                    .simulation
+                    .houses
+                    .order()
+                    .get(usize::try_from(event.house_id).unwrap()),
+                Some(&owner)
+            );
+            assert_eq!(event.naval, 0);
+            let id = runtime
+                .resources
+                .rules
+                .type_array_ids(ObjectCategory::Aircraft)
+                .get(usize::try_from(event.type_index).unwrap())
+                .expect("record names a registered aircraft type")
+                .as_str();
             let object = runtime.resources.rules.object(id).unwrap();
             assert_eq!(object.category, ObjectCategory::Aircraft);
             // Native's declared fixture constructs selected AircraftTypes;
@@ -414,9 +438,9 @@ fn retail_all05_type_tech_level_recheck_cancels_paid_harrier_and_unlocks_black_e
                 .find(|entry| entry["id"] == id)
                 .expect("the generated command names an observed native AircraftType");
             json!({
-                "kind": if *all { 0x2e } else { 0x10 },
-                "frame": native_tail_frame,
-                "rtti": 3,
+                "kind": event.event.opcode(),
+                "frame": event.frame,
+                "rtti": event.rtti,
                 "index": native_type["index"],
             })
         })
@@ -433,7 +457,7 @@ fn retail_all05_type_tech_level_recheck_cancels_paid_harrier_and_unlocks_black_e
         native_tail_frame,
     );
     assert_eq!(
-        runtime.simulation.session.binary_frame,
+        runtime.simulation.session.binary_frame(),
         native_tail_frame.wrapping_add(1)
     );
     assert!(

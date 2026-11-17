@@ -2,8 +2,8 @@
 //! class body delegates to the existing FacingClass state owner; this adapter
 //! selects which controller and whether Set or SetCurrent is called.
 //!
-//! Original Steam gamemd3e81a617..08600: Drive4B0EF0, Ship6A05C0,
-//! Hover516370 and Teleport7192C0 Set PrimaryFacing; Walk75AE00 and
+//! Original Steam gamemd: Drive4B0EF0, Ship6A05C0,
+//! Hover516370, Teleport7192C0 and Tunnel72A0E0 Set PrimaryFacing; Walk75AE00 and
 //! Jumpjet54B6E0 SetCurrent PrimaryFacing; Fly4CFC10 SetCurrent
 //! SecondaryFacing. Rocket's active interface table7F0B1C+4C names the
 //! inherited55AC30 no-op (constructor661F1F). tools/team_recruit_oracle.py
@@ -28,14 +28,15 @@ pub(crate) fn locomotor_do_turn(entity: &mut GameEntity, desired: u16, frame: u3
         LocomotorKind::Drive
         | LocomotorKind::Ship
         | LocomotorKind::Hover
-        | LocomotorKind::Teleport => {
+        | LocomotorKind::Teleport
+        | LocomotorKind::Tunnel => {
             super::drive_do_turn(entity, desired, frame);
         }
         LocomotorKind::Walk | LocomotorKind::Jumpjet => {
             walk_do_turn(entity, desired, frame);
         }
         LocomotorKind::Fly => {
-            super::air_movement::ensure_fly_secondary_facing(entity);
+            entity.ensure_fly_secondary_facing();
             entity
                 .barrel_facing
                 .as_mut()

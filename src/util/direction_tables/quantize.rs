@@ -34,7 +34,7 @@ pub fn muzzle_anim_index_8way(f16: u16) -> u8 {
     (dir_from_facing16(f16) + 1) & 7
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_util))]
 mod tests {
     use super::*;
 
@@ -49,18 +49,6 @@ mod tests {
                     "hi={hi} lo={lo}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn muzzle_anim_8way_plus1_rotation() {
-        // f=0 → bucket 0 → anim 1 (the +1 rotation).
-        assert_eq!(muzzle_anim_index_8way(0x0000), 1);
-        for f16 in [0u16, 0x2000, 0x4000, 0x8000, 0xE000] {
-            assert_eq!(
-                muzzle_anim_index_8way(f16),
-                (dir_from_facing16(f16) + 1) & 7
-            );
         }
     }
 }

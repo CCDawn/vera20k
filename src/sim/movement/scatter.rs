@@ -29,11 +29,9 @@ use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::entity_store::EntityStore;
 use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
 use crate::sim::game_entity::GameEntity;
-use crate::sim::house_state::HouseState;
-use crate::sim::intern::{InternedId, StringInterner};
+use crate::sim::intern::StringInterner;
 use crate::sim::world::FrameEffects;
 use crate::sim::world::Simulation;
-use std::collections::BTreeMap;
 
 use super::locomotor::MovementLayer;
 use super::scatter_cell::OctantJitter;
@@ -86,6 +84,10 @@ pub(super) fn unit_scatter_admitted(
     rules: &RuleSet,
     binary_frame: u32,
 ) -> bool {
+    // Techno CanScatter6F3283 -> Ares10049F90/6F32C5: no driver, no scatter.
+    if rules.ares_form() && unit.driver_killed() {
+        return false;
+    }
     if matches!(unit.mission.effective().raw(), 0 | 6 | 16) {
         return false;
     }
@@ -112,27 +114,27 @@ pub(super) struct ScatterTechno {
 impl ScatterTechno {
     pub(super) fn from_entity(
         entity: &GameEntity,
-        rules: Option<&RuleSet>,
-        houses: &BTreeMap<InternedId, HouseState>,
+        rules: &RuleSet,
+        houses: &crate::sim::houses::Houses,
         interner: &StringInterner,
     ) -> Self {
         use crate::sim::combat::veterancy::has_weapon_ability;
         Self {
-            has_scatter_ability: rules
-                .and_then(|rules| interner.object_type(entity.type_ref(), rules))
-                .is_some_and(|object| {
+            has_scatter_ability: interner.object_type(entity.type_ref(), rules).is_some_and(
+                |object| {
                     has_weapon_ability(
                         entity.veterancy.rank_kind(),
                         object,
                         crate::rules::object_type::Ability::Scatter,
                     )
-                }),
-            // A rulesless/component fixture may omit its House. Runtime houses
+                },
+            ),
+            // A component fixture may omit its House. Runtime houses
             // own CurrentIQ; zero is their constructor default, not a human/AI
             // inference. The value is already saved/restored by HouseState.
             house_iq: houses
                 .get(&entity.owner())
-                .map_or(0, |house| house.current_iq),
+                .map_or(0, |house| house.current_iq()),
         }
     }
 }
@@ -146,22 +148,12 @@ pub(super) struct ScatterEligibility {
     pub(super) iq_scatter: i32,
 }
 
-impl Default for ScatterEligibility {
-    /// The RulesClass constructor values, used when no ruleset is loaded.
-    fn default() -> Self {
-        Self {
-            player_scatter: false,
-            iq_scatter: 3,
-        }
-    }
-}
-
 impl ScatterEligibility {
-    pub(super) fn from_rules(rules: Option<&RuleSet>) -> Self {
-        rules.map_or_else(Self::default, |rules| Self {
+    pub(super) fn from_rules(rules: &RuleSet) -> Self {
+        Self {
             player_scatter: rules.general.player_scatter,
             iq_scatter: rules.general.iq_scatter,
-        })
+        }
     }
 }
 
@@ -192,9 +184,9 @@ pub(super) fn scatter_dispatch_allowed(
 pub(super) fn scatter_objects_admitted(
     occupants: &[u64],
     no_kidding: bool,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
     entities: &EntityStore,
-    houses: &BTreeMap<InternedId, HouseState>,
+    houses: &crate::sim::houses::Houses,
     interner: &StringInterner,
 ) -> Vec<u64> {
     let listed = || occupants.iter().copied();
@@ -311,11 +303,11 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get(id) else {
             return Ok(false);
         };
-        // RESIDUAL: VERA builds no locomotor for a zero-`Speed=` Foot whose
-        // locomotor is neither Drive nor Ship (`should_construct_locomotor`);
-        // native always has one, whose answers would decide the gates and the
-        // Scatter body. No retail Foot type is built that way. Such a Foot
-        // never takes this Scatter.
+        // RESIDUAL: VERA builds no locomotor for a zero-`Speed=` Unit or
+        // Aircraft whose locomotor is neither Drive nor Ship
+        // (`should_construct_locomotor`); native always has one, whose answers
+        // would decide the gates and the Scatter body. No retail Foot type is
+        // built that way. Such a Foot never takes this Scatter.
         if entity.locomotor.is_none() {
             return Ok(false);
         }
@@ -349,7 +341,7 @@ impl Simulation {
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> Result<bool, String> {
-        if self.session.binary_frame & 0x3F != 0x3F {
+        if self.session.binary_frame() & 0x3F != 0x3F {
             return Ok(false);
         }
         let (Some(entity), Some(terrain)) = (
@@ -458,7 +450,7 @@ impl Simulation {
         let Some(unit) = self.substrate.entities.get(id) else {
             return;
         };
-        if !unit_scatter_admitted(unit, flags, rules, self.session.binary_frame) {
+        if !unit_scatter_admitted(unit, flags, rules, self.session.binary_frame()) {
             return;
         }
         if let Some(cell) = self.scatter_nearby_cell(id, rules) {
@@ -503,7 +495,7 @@ impl Simulation {
         let Some(unit) = self.substrate.entities.get(id) else {
             return Ok(());
         };
-        if !unit_scatter_admitted(unit, flags, rules, self.session.binary_frame)
+        if !unit_scatter_admitted(unit, flags, rules, self.session.binary_frame())
             || crate::sim::mission::control::current_control(rules, &unit.mission)
                 .is_some_and(|entry| entry.paralyzed)
             || unit
@@ -601,7 +593,7 @@ impl Simulation {
         let admitted = scatter_objects_admitted(
             &occupants,
             flags.no_kidding,
-            Some(rules),
+            rules,
             &self.substrate.entities,
             &self.houses,
             &self.interner,
@@ -637,7 +629,7 @@ impl Simulation {
             .as_ref()
             .map(crate::map::resolved_terrain::NativeCellQuery::canonical);
         let Some(cell) = super::ground_pose::target_get_coords(target, self, cells.as_ref())
-            .and_then(|coord| self.map_coord_cell(coord.x, coord.y))
+            .and_then(|coord| Self::map_coord_cell(&self.resolved_terrain, coord.x, coord.y))
         else {
             return Ok(false);
         };
@@ -653,6 +645,6 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "scatter_tests.rs"]
 mod tests;

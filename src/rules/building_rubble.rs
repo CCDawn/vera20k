@@ -91,8 +91,9 @@ impl RubbleAssetCatalog {
             let image = rules
                 .art()
                 .resolve_effective_image_id(&object.id, &object.image);
-            let Some((shp, data)) = crate::rules::art_data::object_shp_candidates(
+            let Some((shp, data)) = crate::rules::art_data::building_body_shp_candidates(
                 Some(rules.art()),
+                &object.image,
                 &image,
                 theater_ext,
                 theater_name,
@@ -127,7 +128,7 @@ impl RubbleAssetCatalog {
 
     /// `type_id`'s rubble art, or `None` when it leaves no rubble.
     pub fn art(&self, type_id: &str) -> Option<&RubbleArt> {
-        self.art.get(&type_id.to_ascii_uppercase())
+        crate::util::native_string::with_ascii_uppercase(type_id, |key| self.art.get(key))
     }
 
     /// Every bound rubble art, in type-ID order.
@@ -142,7 +143,7 @@ impl RubbleAssetCatalog {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_a_n))]
 mod tests {
     use super::*;
 

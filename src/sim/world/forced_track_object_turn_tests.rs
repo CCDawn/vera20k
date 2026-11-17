@@ -21,8 +21,8 @@ fn fixture(selector: i32) -> Simulation {
     // Native Scenario deserialization reseeds this RNG to zero. Using that
     // same initial seed isolates track persistence from the separate RNG rule.
     let mut sim = Simulation::with_seed(0);
-    sim.fog.width = 32;
-    sim.fog.height = 32;
+    sim.fog.set_width_for_test(32);
+    sim.fog.set_height_for_test(32);
     let turn = drive_track::turn_track_at(selector as usize).unwrap();
     let first = drive_track::raw_track_points(turn.normal_track)[0];
     let (dx, dy, facing) =
@@ -57,7 +57,7 @@ fn fixture(selector: i32) -> Simulation {
             .install_drive_state_for_test(Some(DriveLocomotionRuntime::default()))
     );
     sim.substrate.entities.insert(entity);
-    sim.substrate.next_stable_object_id = 2;
+    sim.set_next_stable_object_id_for_test(2);
     assert!(matches!(
         sim.reveal(1),
         super::super::RevealOutcome::Revealed { .. }
@@ -66,7 +66,7 @@ fn fixture(selector: i32) -> Simulation {
         1,
         selector,
         head,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default()
     ));
@@ -80,12 +80,12 @@ fn fixture(selector: i32) -> Simulation {
 }
 
 fn tick(sim: &mut Simulation, rules: &RuleSet, frame: u32) -> movement::MovementTickStats {
-    sim.session.tick = u64::from(frame);
-    sim.session.binary_frame = frame;
+    sim.session.set_tick_for_test(u64::from(frame));
+    sim.session.set_binary_frame_for_test(frame);
     // The track end's own-cell request searches; a reloaded save carries no
     // map inputs.
     crate::sim::arena_fixture::supply_native_map(sim);
-    sim.advance_live_object_turn(1, Some(rules), techno_ai::ObjectAiCtx::default())
+    sim.advance_live_object_turn(1, rules, techno_ai::ObjectAiCtx::default())
         .unwrap()
         .movement
 }
@@ -106,7 +106,6 @@ fn every_bunker_selector_restores_before_first_point_midcurve_and_paid_sentinel(
         .len() as i32;
         let mut observed = [false; 3];
         let mut restored_probes: Vec<(usize, Simulation)> = Vec::new();
-        let initial_rng = sim.scenario_rng.logical_state();
         for frame in 0..180 {
             let track = sim
                 .substrate
@@ -143,10 +142,13 @@ fn every_bunker_selector_restores_before_first_point_midcurve_and_paid_sentinel(
                 assert!(!loaded_sound.is_active());
                 assert_eq!(loaded_sound.countdown(), 0);
                 // FootLoad4DB60D..4DB624 clears +540 even for an inactive
-                // empty-list Foot. Apply only that documented load transition
-                // to the control and earlier probes at each new save boundary.
-                // Their track, occupation, mission and facing state stay live.
-                sim.restore_move_sound_state_after_load(1);
+                // empty-list Foot, and Scenario load reseeds its RNG to zero
+                // (the Guard mission's dispatches draw from it). Apply only
+                // those documented load transitions to the control and earlier
+                // probes at each new save boundary. Their track, occupation,
+                // mission and facing state stay live.
+                sim.substrate.restore_move_sound_state_after_load(1);
+                sim.scenario_rng = crate::sim::rng::SimRng::new(0);
                 for (_, probe) in &mut restored_probes {
                     assert!(
                         !probe
@@ -157,7 +159,8 @@ fn every_bunker_selector_restores_before_first_point_midcurve_and_paid_sentinel(
                             .move_sound
                             .is_active()
                     );
-                    probe.restore_move_sound_state_after_load(1);
+                    probe.substrate.restore_move_sound_state_after_load(1);
+                    probe.scenario_rng = crate::sim::rng::SimRng::new(0);
                 }
                 restored.rebuild_caches_after_load(
                     sim.resolved_terrain.as_ref().unwrap().clone(),
@@ -192,7 +195,7 @@ fn every_bunker_selector_restores_before_first_point_midcurve_and_paid_sentinel(
                 crate::sim::movement::track_head::committed_track_head(entity).is_none()
                     || entity
                         .navigation
-                        .path_replay
+                        .path_replay()
                         .remaining_directions()
                         .is_empty()
             );
@@ -224,11 +227,6 @@ fn every_bunker_selector_restores_before_first_point_midcurve_and_paid_sentinel(
                 .track()
                 .turn_index(),
             -1
-        );
-        assert_eq!(
-            sim.scenario_rng.logical_state(),
-            initial_rng,
-            "track/AI fixture has no random receiver"
         );
     }
 }

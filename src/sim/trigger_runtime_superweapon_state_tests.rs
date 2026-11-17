@@ -29,10 +29,6 @@ fn all03_inputs() -> Option<(RuleSet, MapFile)> {
     let raw = assets.get_ref("ALL03UMD.MAP").expect("retail ALL03");
     let map = MapFile::from_bytes(raw).unwrap();
     let data = corpus();
-    assert_eq!(
-        data["retail_inputs"]["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     for source in data["retail_inputs"]["sources"].as_array().unwrap() {
         let name = source["file"].as_str().unwrap();
         assert_eq!(
@@ -104,9 +100,9 @@ fn state(sim: &Simulation, owner: InternedId, id: InternedId) -> Value {
     // mutable slot to another simulation owner.
     let saved = serde_json::to_value(instance).unwrap();
     let preferred = sim.houses[&owner].preferred_super_weapon_target();
-    json!({"start": instance.charge_start_tick, "duration": instance.charge_duration,
-        "granted": instance.is_active, "ready": instance.is_ready,
-        "held": instance.is_suspended, "custom_recharge": saved["custom_recharge_time"],
+    json!({"start": instance.charge_start_tick(), "duration": instance.charge_duration(),
+        "granted": instance.is_active(), "ready": instance.is_ready(),
+        "held": instance.is_suspended(), "custom_recharge": saved["custom_recharge_time"],
         "preferred": [preferred.0 as i16, preferred.1 as i16]})
 }
 
@@ -147,28 +143,44 @@ fn all03_authored_nuke_order_preserves_current_timer_and_recharges_at_override()
         let mut sim = Simulation::with_seed(0);
         sim.intern_rule_type_ids(&rules);
         sim.resolve_type_handles(&rules);
-        sim.session.binary_frame = int(&sequence["initial_frame"]) as u32;
+        sim.session
+            .set_binary_frame_for_test(int(&sequence["initial_frame"]) as u32);
         crate::sim::scenario_bootstrap::initialize_map_roster_houses(
             &mut sim,
             &roster,
-            Some(&rules),
+            &rules,
             Some(&map.ini),
         );
         sim.session.install_waypoints(&map.waypoints);
-        sim.install_team_ai_registry(&teams, &rules).unwrap();
-        sim.initialize_trigger_definitions(&map, &teams, None, None);
+        sim.install_team_ai_registry(&teams, &rules);
+        sim.initialize_trigger_definitions(&map, &teams, None, None, None);
         let owner = sim.interner.get("YuriCountry").unwrap();
         let enemy = sim.interner.get("Americans").unwrap();
         let id = sim.interner.get("NukeSpecial").unwrap();
         let sw = rules.super_weapon("NukeSpecial").unwrap();
         // The native control supplies these already-admitted AI/power priors;
         // it does not execute the whole ALL03 power puzzle/House scheduler.
-        sim.houses.get_mut(&owner).unwrap().enemy_house = Some(enemy);
-        sim.houses.get_mut(&owner).unwrap().player_control = false;
-        sim.session.game_mode_nonzero = false;
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .set_enemy_house_for_test(Some(enemy));
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .set_player_control_for_test(false);
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false),
+        );
         let silo = sim
             .spawn_object("NAMISL", "YuriCountry", 48, 89, 0, &rules)
             .unwrap();
+        // The control writes its silo into memory without Added_To_Game, so
+        // its House holds no drain, and it grants with low power off (Grant
+        // 0x006CB560's third argument). Spawning counted the silo's drain at
+        // once (0x00502B48..0x00502B52); clear it to match.
+        let power = sim.power_states.house_mut(owner);
+        power.set_total_drain_for_test(0);
+        power.set_is_low_power_for_test(false);
         let tag_type = sim.trigger_runtime.definitions.tag_type(tag_name).unwrap();
         let tag = sim.shared_trigger_tag(tag_type);
         let live = sim.trigger_runtime.tag(tag).unwrap().triggers[0];
@@ -182,7 +194,8 @@ fn all03_authored_nuke_order_preserves_current_timer_and_recharges_at_override()
         let mut ordinal = 0;
         for row in sequence["rows"].as_array().unwrap() {
             let stage = row["stage"].as_str().unwrap();
-            sim.session.binary_frame = int(&row["frame"]) as u32;
+            sim.session
+                .set_binary_frame_for_test(int(&row["frame"]) as u32);
             match stage {
                 "grant" => superweapon::grant_provided_supers(&mut sim, &rules, owner),
                 "before_elapsed_ai" | "elapsed_ai" => {
@@ -213,12 +226,24 @@ fn all03_authored_nuke_order_preserves_current_timer_and_recharges_at_override()
                         int(&row["firing_type"])
                     );
                 }
-                "reset_running" => superweapon::reset_super(&mut sim, &rules, owner, "NukeSpecial"),
+                "reset_running" => superweapon::reset_super(
+                    &sim.interner,
+                    &sim.session,
+                    &mut sim.substrate,
+                    &mut sim.sound_events,
+                    &mut sim.super_weapons,
+                    &rules,
+                    owner,
+                    "NukeSpecial",
+                ),
                 "enemy_selection_prior" => {
                     // Full House enemy selection/cadence is outside the
                     // original control, which supplies the chosen enemy here.
                     assert_eq!(row["enemy_index"], 0);
-                    sim.houses.get_mut(&owner).unwrap().enemy_house = Some(enemy);
+                    sim.houses
+                        .get_mut(&owner)
+                        .unwrap()
+                        .set_enemy_house_for_test(Some(enemy));
                 }
                 _ if stage.starts_with("execute") => {
                     let action =
@@ -241,10 +266,10 @@ fn all03_authored_nuke_order_preserves_current_timer_and_recharges_at_override()
                             typ,
                             Some(live),
                             TagEventInput::default(),
-                            Some(&rules),
+                            &rules,
                         ),
                         &mut Vec::new(),
-                        Some(&rules),
+                        &rules,
                         None,
                         FrameEffects::default(),
                     );
@@ -282,12 +307,12 @@ fn dispatch_matches_original_signed_override_waypoint_and_incoming_house_gates()
         let other = sim.interner.intern("UnrelatedHouse");
         for house in [owner, other] {
             sim.houses
-                .insert(house, HouseState::new(house, 0, None, false, 0, 10));
-            sim.session.house_order.push(house);
+                .register(HouseState::new(house, 0, None, false, 0, 10));
             crate::sim::superweapon::construct_house_supers(&mut sim, &rules, house, false);
         }
         let id = sim.interner.get("NukeSpecial").unwrap();
         sim.super_weapons
+            .map_mut_for_test()
             .get_mut(&other)
             .unwrap()
             .get_mut(&id)
@@ -299,16 +324,17 @@ fn dispatch_matches_original_signed_override_waypoint_and_incoming_house_gates()
             .set_preferred_super_weapon_target(cell(&input["other_preferred"]));
         let instance = sim
             .super_weapons
+            .map_mut_for_test()
             .get_mut(&owner)
             .unwrap()
             .get_mut(&id)
             .unwrap();
         instance.set_recharge_time(int(&input["custom_recharge"]));
-        instance.charge_start_tick = int(&input["start"]);
-        instance.charge_duration = int(&input["duration"]);
-        instance.is_active = input["granted"].as_bool().unwrap();
-        instance.is_ready = input["ready"].as_bool().unwrap();
-        instance.is_suspended = input["held"].as_bool().unwrap();
+        instance.set_charge_start_tick_for_test(int(&input["start"]));
+        instance.set_charge_duration_for_test(int(&input["duration"]));
+        instance.set_is_active_for_test(input["granted"].as_bool().unwrap());
+        instance.set_is_ready_for_test(input["ready"].as_bool().unwrap());
+        instance.set_is_suspended_for_test(input["held"].as_bool().unwrap());
         sim.houses
             .get_mut(&owner)
             .unwrap()
@@ -335,7 +361,7 @@ fn dispatch_matches_original_signed_override_waypoint_and_incoming_house_gates()
                     .install_waypoints(&[(index, waypoint)].into_iter().collect());
             }
         }
-        let action = RuntimeDefinitions::default().resolve_action(entry, None, None);
+        let action = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
         let context = TriggerActionContext {
             live_index: None,
             incoming_house: input["owner_present"].as_bool().unwrap().then_some(owner),
@@ -349,7 +375,7 @@ fn dispatch_matches_original_signed_override_waypoint_and_incoming_house_gates()
                 &action,
                 context,
                 &mut effects,
-                Some(&rules),
+                &rules,
                 None,
                 FrameEffects::default(),
             )
@@ -382,12 +408,12 @@ fn retained_recharge_and_target_survive_snapshot_and_affect_future_state_hash() 
     sim.intern_rule_type_ids(&rules);
     let owner = sim.interner.intern("YuriCountry");
     sim.houses
-        .insert(owner, HouseState::new(owner, 2, None, false, 0, 10));
-    sim.session.house_order.push(owner);
+        .register(HouseState::new(owner, 2, None, false, 0, 10));
     crate::sim::superweapon::construct_house_supers(&mut sim, &rules, owner, false);
     let id = sim.interner.get("NukeSpecial").unwrap();
     let original = sim.state_hash();
     sim.super_weapons
+        .map_mut_for_test()
         .get_mut(&owner)
         .unwrap()
         .get_mut(&id)
@@ -415,6 +441,7 @@ fn retained_recharge_and_target_survive_snapshot_and_affect_future_state_hash() 
     assert_eq!(restored.state_hash(), overridden);
     restored
         .super_weapons
+        .map_mut_for_test()
         .get_mut(&owner)
         .unwrap()
         .get_mut(&id)

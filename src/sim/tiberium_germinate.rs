@@ -6,7 +6,6 @@
 //! render/, ui/, app/, audio/, or net/.
 
 use crate::map::authored_overlay::NativeOverlayMapShape;
-use crate::map::cell_index::canonical_cell_coord;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::map::tiberium_cell::{GerminatedCell, spread_cell_germinate_without_randomization};
 use crate::rules::overlay_types::OverlayTypeRegistry;
@@ -32,9 +31,11 @@ pub struct GeneratedCellAttributesReceipt {
 /// Resolve one native fixed-stride lookup to an allocated real cell of the
 /// generated grid; `None` is a `Get_CellClass` miss (the shared dummy).
 fn resolve_real_cell(terrain: &ResolvedTerrainGrid, x: i16, y: i16) -> Option<(u16, u16)> {
-    terrain
-        .native_fixed_cell_index(x, y)
-        .and_then(|_| canonical_cell_coord(i32::from(x), i32::from(y)))
+    terrain.native_fixed_cell_index(x, y).and_then(|_| {
+        terrain
+            .cell_grid()
+            .canonical_coord(i32::from(x), i32::from(y))
+    })
 }
 
 /// Generated launch tail of `RandomMapGenerator::Generate @ 0x00598960`.
@@ -61,6 +62,11 @@ fn resolve_real_cell(terrain: &ResolvedTerrainGrid, x: i16, y: i16) -> Option<(u
 /// depend on the visiting order; the order still fixes which missing
 /// neighbour the shared dummy's coordinate retains last. The density lives in
 /// the overlay grid alone, as every runtime density write does.
+///
+/// Residual: with a non-zero `CliffBackImpassability` byte each skipped Recalc
+/// (`0x00568DF4`, after the cell's germination at `0x00568DD8`) also reads
+/// the cell's six CliffBack neighbours through the Map lookup, so gamemd's
+/// pass can leave the dummy at one of those neighbours instead.
 pub fn run_generated_final_cell_attributes(
     terrain: &ResolvedTerrainGrid,
     overlay_grid: &mut OverlayGrid,
@@ -68,7 +74,7 @@ pub fn run_generated_final_cell_attributes(
     overlay_registry: &OverlayTypeRegistry,
     map_width: u16,
     map_height: u16,
-) -> GeneratedCellAttributesReceipt {
+) -> Result<GeneratedCellAttributesReceipt, crate::rules::overlay_types::TiberiumImageError> {
     let dummy = terrain.shared_cell_dummy();
     let mut receipt = GeneratedCellAttributesReceipt::default();
     let shape = NativeOverlayMapShape::new(i32::from(map_width), i32::from(map_height));
@@ -96,20 +102,20 @@ pub fn run_generated_final_cell_attributes(
                         dummy.overlay_fields()
                     }
                 },
-            )
+            )?
         };
         let Some(GerminatedCell { density, value }) = germinated else {
             continue;
         };
         // Direct `CellClass+0x11E` write: no runtime dirtiness on a fresh load.
-        overlay_grid.cell_mut(rx, ry).overlay_data = density;
+        overlay_grid.write_cell_data(rx, ry, density);
         receipt.germinated_cells += 1;
         receipt.tiberium_value_total = receipt.tiberium_value_total.wrapping_add(value);
     }
-    receipt
+    Ok(receipt)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_t_z))]
 mod tests {
     use super::*;
     use crate::map::tiberium_cell::ORE_DENSITY_BY_NEIGHBOR_COUNT;
@@ -163,11 +169,13 @@ mod tests {
             "{GEM}=GEM\n{ROCK}=ROCK\n[ORE]\nTiberium=yes\n[GEM]\nTiberium=yes\n[ROCK]\nIsARock=yes\n"
         ));
         let ini = IniFile::from_str(&ini);
+        let ini = crate::rules::tiberium_type::with_tiberium_image_slots(&ini);
         let rules = RuleSet::from_ini(&ini).expect("germination rules");
         let registry = OverlayTypeRegistry::from_ini(&ini, None);
         assert_eq!(
             registry
                 .tiberium_type_for_overlay(&rules.tiberium_types, GEM)
+                .unwrap()
                 .map(|id| id.0),
             Some(1),
             "the gem overlay must resolve to the second TiberiumClass"
@@ -208,7 +216,8 @@ mod tests {
             &registry,
             MAP_WIDTH,
             MAP_HEIGHT,
-        );
+        )
+        .unwrap();
 
         let mut expected_total = 0i32;
         for ry in 6..=9u16 {
@@ -273,7 +282,8 @@ mod tests {
             &registry,
             MAP_WIDTH,
             MAP_HEIGHT,
-        );
+        )
+        .unwrap();
 
         // NE (16,8), E (16,9), SE (16,10) miss the 16-wide storage; the five
         // other neighbours are real, empty cells.
@@ -310,7 +320,7 @@ mod tests {
         let mut grid = painted_grid();
         // Painted 0 qualifies for growth (below MaxDensity - 1) and not for
         // spread; the interior germinates to 11, which would invert both.
-        grid.cell_mut(7, 7).overlay_data = 0;
+        grid.cell_mut_for_test(7, 7).overlay_data = 0;
         let scenario_before = sim.scenario_rng.state();
         let main_before = sim.main_rng.state();
         let basic = BasicSection::default();
@@ -325,10 +335,10 @@ mod tests {
             Some(&grid),
             (MAP_WIDTH, MAP_HEIGHT),
         )
+        .unwrap()
         .expect("a grid seeds the native queues");
         let queue_bitmaps = |sim: &Simulation| {
-            sim.production
-                .ore_growth_state
+            sim.ore_growth_state
                 .native_tiberium_state()
                 .classes
                 .iter()
@@ -343,7 +353,8 @@ mod tests {
             &registry,
             MAP_WIDTH,
             MAP_HEIGHT,
-        );
+        )
+        .unwrap();
 
         assert_eq!(grid.cell(7, 7).overlay_data, 11);
         assert_eq!(receipt.germinated_cells, 18);

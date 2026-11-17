@@ -10,7 +10,7 @@
 //! different field subsets, so they cannot be folded into a fixed teardown
 //! without diverging.
 
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::radio::{self, RadioMessage};
 use crate::sim::world::FrameEffects;
@@ -35,7 +35,7 @@ impl Simulation {
         mission: MissionType,
         target: Option<crate::sim::combat::TargetKind>,
         destination: Option<crate::sim::combat::TargetKind>,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         frame_effects: FrameEffects<'_>,
     ) -> MissionType {
         let Some(entity) = self.substrate.entities.get(id) else {
@@ -57,12 +57,10 @@ impl Simulation {
                     contact.is_object_alive()
                         && contact.category() == crate::map::entities::EntityCategory::Structure
                 })
-                .zip(rules)
-                .and_then(|(contact, rules)| self.object_type(contact.type_ref(), rules))
+                .and_then(|contact| self.object_type(contact.type_ref(), rules))
                 .is_some_and(|object| object.dock_unload);
         if !tethered || break_tether {
             radio::transmit_to_contact(self, id, RadioMessage::Break, rules, frame_effects);
-            crate::sim::docking::bunker_link::cancel_approach(self, id);
         }
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             if break_tether {
@@ -93,13 +91,15 @@ impl Simulation {
         rules: &crate::rules::ruleset::RuleSet,
         frame_effects: FrameEffects<'_>,
     ) {
-        let now = self.session.binary_frame;
-        self.assign_null_destination(id, Some(rules), None, frame_effects);
-        let _ = self.assign_target_represented(id, None, Some(rules), None, frame_effects);
+        let now = self.session.binary_frame();
+        self.assign_null_destination(id, rules, None, frame_effects);
+        let _ = self.assign_target_represented(id, None, rules, None, frame_effects);
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             entity.set_archive_target(None);
         }
-        let _ = self.mission_assign_exact(id, MissionId::from_known(MissionType::Guard), now);
+        let _ =
+            self.substrate
+                .mission_assign_exact(id, MissionId::from_known(MissionType::Guard), now);
     }
 
     /// Retask `id` onto a fresh `mission`: queue the mission through the
@@ -109,8 +109,13 @@ impl Simulation {
     /// the MEGAMISSION event arm (`Simulation::apply_megamission_command`,
     /// through [`Self::queue_megamission`]) and the transport unload's
     /// passenger moves. Stop has its own no-queue Event6 route above.
-    pub fn queue_order_mission(&mut self, id: u64, mission: MissionType) {
-        let now = self.session.binary_frame;
+    pub fn queue_order_mission(
+        &mut self,
+        id: u64,
+        mission: MissionType,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) {
+        let now = self.session.binary_frame();
         // A missing receiver performs no write (same as the native event path
         // skipping a dead target); Queue's own guards decide the rest.
         let _ = self.mission_queue_exact(
@@ -118,7 +123,7 @@ impl Simulation {
             MissionId::from_known(mission),
             0,
             now,
-            &EntityReadyInputProvider,
+            &LiveReadyInputProvider { rules },
         );
     }
 
@@ -152,12 +157,12 @@ impl Simulation {
     /// store to `+0x2B8` or `+0x5A8`. Clearing there would leave a unit parked
     /// after a Stop where retail resumes its archived move on the next Restore.
     ///
-    /// HarvestCell also uses this funnel, retaining its unload-latch reset
-    /// after radio Break. EjectBunker and dormant aircraft passenger Unload
-    /// still bypass the prefix. These
-    /// pre-existing command routes can Restore a cancelled archive; their
-    /// complete DTO/mission migration is separate from ordinary Unit depot
-    /// servicing.
+    /// A Harvest order also uses this funnel, retaining its unload-latch reset
+    /// after radio Break. Event9 DEPLOY orders (including the VERA-only
+    /// bunker-eject record, #3675) and dormant aircraft passenger Unload
+    /// still bypass the prefix. These pre-existing command routes can Restore
+    /// a cancelled archive; their complete DTO/mission migration is separate
+    /// from ordinary Unit depot servicing.
     ///
     /// Without the clear on the sites that DO need it, a unit Overridden by a
     /// blocked step or by the retaliation at 0x00702B41, then retasked, then
@@ -169,7 +174,7 @@ impl Simulation {
         mission: MissionType,
         target: Option<crate::sim::combat::TargetKind>,
         destination: Option<crate::sim::combat::TargetKind>,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         frame_effects: FrameEffects<'_>,
     ) {
         let queued =
@@ -177,9 +182,9 @@ impl Simulation {
         // Retain the existing miner adapter after radio Break, before Queue.
         // Both ordinary and planned Harvest use this same event prefix.
         if mission == MissionType::Harvest {
-            crate::sim::miner::clear_unload_latch(self, id);
+            crate::sim::miner::clear_unload_latch(&mut self.substrate, id);
         }
-        self.queue_order_mission(id, queued);
+        self.queue_order_mission(id, queued, rules);
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             entity.suspended_attack_target.clear();
             if entity.category() != crate::map::entities::EntityCategory::Structure {
@@ -188,33 +193,10 @@ impl Simulation {
         }
         // `0x004C73E1..0x004C73EA`: any queued mission but Attack takes a
         // Slave Miner off its hunt (`sim::slave_manager`).
-        if queued != MissionType::Attack
-            && let Some(rules) = rules
-        {
+        if queued != MissionType::Attack {
             self.reset_slave_manager(id, rules, frame_effects);
         }
-        self.megamission_foot_clears(id, mission);
-    }
-
-    /// The MEGAMISSION event's Foot arm after its Slave Manager reset: the
-    /// ArchiveTarget clears through TechnoClass70C610 (`0x004C7448..
-    /// 0x004C7451`) and the navigation list empties (`0x004C7453`).
-    /// Event4C7446 tests the Foot receiver; non-Foot actors skip these
-    /// calls. Raw mission11 (`0x004C73EF` reads the event's own byte) uses
-    /// AreaGuard's separate Archive assignment at4C7430.
-    pub(crate) fn megamission_foot_clears(&mut self, id: u64, mission: MissionType) {
-        if mission != MissionType::AreaGuard
-            && let Some(entity) = self.substrate.entities.get_mut(id)
-            && matches!(
-                entity.category(),
-                crate::map::entities::EntityCategory::Unit
-                    | crate::map::entities::EntityCategory::Infantry
-                    | crate::map::entities::EntityCategory::Aircraft
-            )
-        {
-            entity.set_archive_target(None);
-            entity.navigation.clear_nav_list();
-        }
+        self.substrate.megamission_foot_clears(id, mission);
     }
 
     /// The ore-miner arm of the Stop command.
@@ -231,11 +213,11 @@ impl Simulation {
     ///
     /// The flag is the type's `Harvester=` (`+0xE0E`, `0x004C766B`): every
     /// VERA miner but the Slave Miner, whose Miner component is only an
-    /// order marker (`sim::slave_manager`).
-    pub fn commit_stop_miner_guard(&mut self, id: u64) {
+    /// order marker (`sim::slave_manager`). The Stop arm calls this only for
+    /// a Unit (`0x004C7655..0x004C765F`).
+    pub fn commit_stop_miner_guard(&mut self, id: u64, rules: &crate::rules::ruleset::RuleSet) {
         let is_stoppable_miner = self.substrate.entities.get(id).is_some_and(|entity| {
-            entity.category() == crate::map::entities::EntityCategory::Unit
-                && entity.is_harvester()
+            entity.is_harvester()
                 && matches!(
                     entity.mission.current().known(),
                     Some(MissionType::Harvest) | Some(MissionType::Return)
@@ -244,14 +226,37 @@ impl Simulation {
         if !is_stoppable_miner {
             return;
         }
-        let now = self.session.binary_frame;
+        let now = self.session.binary_frame();
         let _ = self.mission_queue_exact(
             id,
             MissionId::from_known(MissionType::Guard),
             0,
             now,
-            &EntityReadyInputProvider,
+            &LiveReadyInputProvider { rules },
         );
-        let _ = self.mission_commence_exact(id, now);
+        let _ = self.substrate.mission_commence_exact(id, now);
+    }
+}
+
+impl crate::sim::world::ObjectSubstrate {
+    /// The MEGAMISSION event's Foot arm after its Slave Manager reset: the
+    /// ArchiveTarget clears through TechnoClass70C610 (`0x004C7448..
+    /// 0x004C7451`) and the navigation list empties (`0x004C7453`).
+    /// Event4C7446 tests the Foot receiver; non-Foot actors skip these
+    /// calls. Raw mission11 (`0x004C73EF` reads the event's own byte) uses
+    /// AreaGuard's separate Archive assignment at4C7430.
+    pub(crate) fn megamission_foot_clears(&mut self, id: u64, mission: MissionType) {
+        if mission != MissionType::AreaGuard
+            && let Some(entity) = self.entities.get_mut(id)
+            && matches!(
+                entity.category(),
+                crate::map::entities::EntityCategory::Unit
+                    | crate::map::entities::EntityCategory::Infantry
+                    | crate::map::entities::EntityCategory::Aircraft
+            )
+        {
+            entity.set_archive_target(None);
+            entity.navigation.clear_nav_list();
+        }
     }
 }

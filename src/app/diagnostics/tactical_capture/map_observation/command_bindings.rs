@@ -104,7 +104,7 @@ impl MapScheduledCommand {
                             .with_context(|| format!(
                                 "production type {name:?} at {pointer} is absent from loaded rules"))?
                     };
-                    let id = sim.interner.get(name).with_context(|| {
+                    let id = sim.interner().get(name).with_context(|| {
                         format!("rule type {name:?} at {pointer} was not preinterned")
                     })?;
                     (
@@ -118,8 +118,8 @@ impl MapScheduledCommand {
                         entity.is_active()
                             && entity.is_alive()
                             && !entity.lifecycle.in_limbo()
-                            && sim.interner.resolve(entity.type_ref()) == selector.type_id
-                            && sim.interner.resolve(entity.owner()) == selector.owner
+                            && sim.interner().resolve(entity.type_ref()) == selector.type_id
+                            && sim.interner().resolve(entity.owner()) == selector.owner
                             && selector.cell.is_none_or(|cell| {
                                 cell == [entity.position.rx(), entity.position.ry()]
                             })
@@ -135,8 +135,8 @@ impl MapScheduledCommand {
                     (
                         json!(id),
                         json!({"stable_id": id,
-                        "owner": sim.interner.resolve(entity.owner()),
-                        "type_id": sim.interner.resolve(entity.type_ref()),
+                        "owner": sim.interner().resolve(entity.owner()),
+                        "type_id": sim.interner().resolve(entity.type_ref()),
                         "cell": [entity.position.rx(), entity.position.ry()]}),
                     )
                 }
@@ -231,12 +231,18 @@ fn substitute_symbols(
                         | "target_id"
                         | "engineer_id"
                         | "target_building_id"
-                        | "passenger_id"
                         | "transport_id"
-                        | "depot_id"
                 ) && argument.is_object()
                 {
                     *argument = bind(&pointer, actor_symbol(argument)?)?;
+                } else if variant == "MegaMission"
+                    && field == "destination"
+                    && let Some(entity) = argument
+                        .as_object_mut()
+                        .and_then(|destination| destination.get_mut("Entity"))
+                        .filter(|entity| entity.is_object())
+                {
+                    *entity = bind(&format!("{pointer}/Entity"), actor_symbol(entity)?)?;
                 } else if ((variant == "Select" && field == "entity_ids")
                     || (variant == "SetRally" && field == "producer_ids"))
                     && let Some(elements) = argument.as_array_mut()
@@ -258,7 +264,7 @@ fn substitute_symbols(
     Ok((command, count))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
     use crate::map::entities::EntityCategory;
@@ -283,8 +289,8 @@ mod tests {
     }
 
     fn add_actor(sim: &mut Simulation, id: u64, cell: [u16; 2]) {
-        let owner = sim.interner.intern("Computer1");
-        let type_ref = sim.interner.intern("MTNK");
+        let owner = sim.intern("Computer1");
+        let type_ref = sim.intern("MTNK");
         let mut entity = GameEntity::new_at_frame_zero_for_test(
             id,
             cell[0],
@@ -300,7 +306,7 @@ mod tests {
             true,
         );
         entity.lifecycle.set_in_limbo_for_test(false);
-        sim.entities_mut().insert(entity);
+        sim.entities_mut_for_test().insert(entity);
     }
 
     #[test]
@@ -309,7 +315,7 @@ mod tests {
         let mut first = Simulation::new();
         first.intern_rule_type_ids(&rules);
         let mut second = Simulation::new();
-        second.interner.intern("ORCA");
+        second.intern("ORCA");
         second.intern_rule_type_ids(&rules);
         let command = scheduled(json!({"LaunchSuperWeapon": {
             "sw_type_id": "IronCurtainSpecial", "target_rx": 3, "target_ry": 4}}));
@@ -322,7 +328,7 @@ mod tests {
         assert_eq!(
             first_command,
             Command::LaunchSuperWeapon {
-                sw_type_id: first.interner.get("IronCurtainSpecial").unwrap(),
+                sw_type_id: first.interner().get("IronCurtainSpecial").unwrap(),
                 target_rx: 3,
                 target_ry: 4,
             }
@@ -330,7 +336,7 @@ mod tests {
         assert_eq!(
             second_command,
             Command::LaunchSuperWeapon {
-                sw_type_id: second.interner.get("IronCurtainSpecial").unwrap(),
+                sw_type_id: second.interner().get("IronCurtainSpecial").unwrap(),
                 target_rx: 3,
                 target_ry: 4,
             }
@@ -348,7 +354,7 @@ mod tests {
         assert_eq!(
             resolved,
             Command::QueueProduction {
-                type_id: second.interner.get("MTNK").unwrap(),
+                type_id: second.interner().get("MTNK").unwrap(),
             }
         );
         assert_eq!(
@@ -363,10 +369,10 @@ mod tests {
             assert!(scheduled(payload).resolve(&second, &rules).is_err());
         }
         let mut absent = Simulation::new();
-        absent.interner.intern("Computer1");
+        absent.intern("Computer1");
         assert!(production.resolve(&absent, &rules).is_err());
         assert!(
-            absent.interner.get("MTNK").is_none(),
+            absent.interner().get("MTNK").is_none(),
             "resolution must never intern"
         );
     }
@@ -401,7 +407,7 @@ mod tests {
             json!({
             "stable_id": 28, "type_id": "MTNK", "owner": "Computer1", "cell": [12, 13]})
         );
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(28)
             .unwrap()
             .position
@@ -410,7 +416,7 @@ mod tests {
             narrowed.resolve(&sim, &rules).is_err(),
             "cell is current, not initial"
         );
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(28)
             .unwrap()
             .health
@@ -419,18 +425,18 @@ mod tests {
             command.resolve(&sim, &rules).unwrap().0,
             Command::Stop { entity_id: 17 }
         );
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(17)
             .unwrap()
             .lifecycle
             .set_in_limbo_for_test(true);
         assert!(command.resolve(&sim, &rules).is_err());
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(17)
             .unwrap()
             .lifecycle
             .set_in_limbo_for_test(false);
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(17)
             .unwrap()
             .death
@@ -473,6 +479,35 @@ mod tests {
             assert_eq!(bindings.len(), 1);
             assert_eq!(bindings[pointer]["stable_id"], 17);
         }
+    }
+
+    /// An Enter order's object rides the MEGAMISSION's Destination token, so
+    /// a selector there binds as an actor ID field does.
+    #[test]
+    fn a_megamission_destination_binds_an_actor_selector() {
+        let rules = rules();
+        let mut sim = Simulation::new();
+        sim.intern_rule_type_ids(&rules);
+        add_actor(&mut sim, 17, [10, 11]);
+        let payload = json!({"MegaMission": {"entity_id": 7, "mission": "Enter",
+            "target": null, "destination": {"Entity": {
+            "type_id": "MTNK", "owner": "Computer1"}}}});
+        let command = scheduled(payload.clone());
+        assert_eq!(command.symbolic_count(), 1);
+        assert_eq!(serde_json::to_value(&command).unwrap()["payload"], payload);
+        let (resolved, bindings) = command.resolve(&sim, &rules).unwrap();
+        assert_eq!(
+            resolved,
+            Command::clicked_mission(
+                7,
+                crate::sim::mission::MissionType::Enter,
+                crate::sim::combat::TargetKind::Entity(17),
+            )
+        );
+        assert_eq!(
+            bindings.unwrap()["/MegaMission/destination/Entity"]["stable_id"],
+            17
+        );
     }
 
     #[test]

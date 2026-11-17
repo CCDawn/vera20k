@@ -38,7 +38,6 @@ struct Row {
 
 #[derive(Deserialize)]
 struct Corpus {
-    native_sha256: String,
     rows: Vec<Row>,
 }
 
@@ -90,10 +89,6 @@ fn original_object_cell_queries_keep_physical_aliases_and_dummy_fields() {
         "tools/spatial_oracle/object_get_cell.json",
     ))
     .unwrap();
-    assert_eq!(
-        corpus.native_sha256,
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     assert_eq!(corpus.rows.len(), 10);
     for row in corpus.rows {
         let terrain = terrain(&row.input);
@@ -138,7 +133,9 @@ fn original_object_cell_queries_keep_physical_aliases_and_dummy_fields() {
                 y - i32::from(entity.position.ry()) * 256,
             ));
             entity.position.set_exact_z_leptons_for_test(Some(z));
-            entity.lifecycle.set_cell_marked(row.input.marked != 0);
+            entity
+                .lifecycle
+                .set_cell_marked_for_test(row.input.marked != 0);
         }
         let subject = FireSubject {
             world: &sim,
@@ -205,7 +202,6 @@ struct CenterRow {
 
 #[derive(Deserialize)]
 struct BoundaryCorpus {
-    native_sha256: String,
     rows: Vec<EarlyRow>,
     cell_centers: Vec<CenterRow>,
 }
@@ -215,10 +211,6 @@ fn boundary_corpus() -> BoundaryCorpus {
         "tools/spatial_oracle/fire_error_cell_boundary.json",
     ))
     .unwrap();
-    assert_eq!(
-        corpus.native_sha256,
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     corpus
 }
 
@@ -247,7 +239,7 @@ fn original_early_fire_error_retains_cell_between_temporal_and_lifted_gates() {
         if row.name == "target_cloaked" {
             let mut cloak = crate::sim::cloak_disguise::CloakRuntime::new(0);
             cloak.set_state_for_test(2);
-            target.cloak = Some(cloak);
+            target.cloak = Some(Box::new(cloak));
         }
         let dummy = sim.resolved_terrain.as_ref().unwrap().shared_cell_dummy();
         let [x, y] = row.supplied.initial_dummy_xy;

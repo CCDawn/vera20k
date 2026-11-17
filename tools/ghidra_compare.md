@@ -24,10 +24,9 @@ program and that `/get_metadata?program=gamemd.exe` resolves it before comparing
 The server's project-loading argument separately uses the project path.
 `--before-program` and `--after-program` are required; the tool never uses a
 mutable current-program selection. The client does not attest the
-server's loaded bytes. Native frame bytes are independently checked through the
-shared oracle owner against the two supported identities documented in
-[`native_oracle.md`](native_oracle.md#steam-compatibility-and-evidence-identity).
-Frame reports record the actual selected file hash, not the legacy vector identifier.
+server's loaded bytes. Native frame bytes are read independently through the
+shared oracle owner from whichever `gamemd.exe` is selected, with no identity check
+(see [`native_oracle.md`](native_oracle.md#evidence-identity)).
 
 Coordinate with the project owner and compare stable saved/rehearsal projects.
 Do not open the same project concurrently in GUI and headless Ghidra. Follow
@@ -165,6 +164,15 @@ High p-code is compared instruction by instruction. Constant stack/member
 expressions stay within one instruction; call-prototype inputs do not certify a
 frame. For a native MOV into an ESP/EBP slot, only a stack output or a checked
 STORE destination counts: a carried stack source cannot approve that write.
+Ghidra places the COPY that feeds a successor block's MULTIEQUAL at the
+predecessor's last instruction address. Such a phi-edge copy (at its block's
+stop, into a temporary defined once and read only by MULTIEQUALs) is not an
+operand of that instruction: `0x41028C` reads Stack+4 while its block ends with
+a Stack+8 copy for the next `REPE CMPSD`
+([fixture](ghidra_compare/fixtures/query_interface_410260.json)). The report
+keeps those copies out of agreement and lists their stack inputs beside the
+native access at the same site (`edges`); a before/after difference in them is
+an `edge_changed` finding.
 The report distinguishes right-to-wrong changes from errors already visible
 before, and lists native accesses absent from each p-code map. Optimized-away,
 indexed and otherwise unmapped accesses are outside its agreement coverage.
@@ -193,8 +201,9 @@ escaping without opening a program. With `GHIDRA_INSTALL_DIR` and `JAVA_HOME`
 set, run `python -m unittest tools.tests.test_ghidra_census_exporter -v`.
 Otherwise that test is skipped; it is not a live export validation.
 
-Tests use synthetic x86 bytes, p-code and HTTP responses, with network connection
-attempts blocked. They cover incomplete reads on either/both sides, pagination,
+Tests use synthetic x86 bytes, p-code and HTTP responses, plus the one exported
+phi-edge fixture above (original function bytes and Ghidra 12.1.2 basic p-code),
+with network connection attempts blocked. They cover incomplete reads on either/both sides, pagination,
 thunks and virtual callers, warning identities, member-address expressions,
 write-role counterexamples, stack equations and CLI receipts. They do not
 certify a live Ghidra installation or regenerate native goldens.

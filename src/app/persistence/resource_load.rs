@@ -22,14 +22,15 @@ use crate::sim::snapshot::{GameSnapshot, SnapshotError};
 use crate::sim::world::{Simulation, SnapshotProcessState};
 use crate::ui::sidebar::power_bar_anim::PowerBarAnimState;
 
-/// Borrowed preparation capabilities. Outgoing app presentation/input is not
-/// available to the fallible candidate; both menu and game supply this view.
+/// Borrowed preparation capabilities. The fallible candidate lends only the
+/// required outgoing owners and publishes no mutations before commit.
 pub(crate) struct SavedGamePreparationView<'a> {
     pub(crate) repository: &'a SaveRepository,
     pub(crate) current_simulation: Option<&'a Simulation>,
     pub(crate) frontend_main: &'a MainRng,
     pub(crate) rules_owner: &'a NativeRulesProcessOwner,
     pub(crate) tile_cache: &'a TileVariantSelectorCache,
+    pub(crate) lighting: &'a crate::app::presentation::lighting::MatchLighting,
     pub(crate) load_clock: &'a dyn Fn() -> u64,
 }
 
@@ -48,6 +49,11 @@ struct PreparedSavedResources {
     map: SavedMapMetadata,
     local_view: PreparedSavedLocalView,
     power_bar_anim: PowerBarAnimState,
+    radar_events: crate::render::radar::ClientRadarEvents,
+    radar_housing: Option<crate::sim::snapshot::saved_local_view::SavedRadarHousing>,
+    credits_counter: Option<i32>,
+    lighting: crate::map::lighting::SavedCellLighting,
+    scheme_normal_rgb: [i32; 3],
     tile_cache: TileVariantSelectorCache,
     theater: theater::TheaterData,
     elapsed_clock: crate::app::match_runtime::frame_pacer::ScenarioElapsedClock,
@@ -59,6 +65,9 @@ pub(crate) struct CommittedSavedGame {
     pub(crate) terrain_grid: Option<TerrainGrid>,
     pub(crate) local_view: PreparedSavedLocalView,
     pub(crate) power_bar_anim: PowerBarAnimState,
+    pub(crate) radar_events: crate::render::radar::ClientRadarEvents,
+    pub(crate) radar_housing: Option<crate::sim::snapshot::saved_local_view::SavedRadarHousing>,
+    pub(crate) credits_counter: Option<i32>,
     pub(crate) details: CommittedLoadPresentation,
     pub(crate) elapsed_clock: crate::app::match_runtime::frame_pacer::ScenarioElapsedClock,
 }
@@ -87,7 +96,7 @@ impl PreparedSavedGame {
         assets: &mut AssetManager,
     ) -> Result<PreparedSavedResources, PreparedLoadError> {
         let mut snapshot = GameSnapshot::load_with_resources(bytes)?;
-        let saved = snapshot
+        let mut saved = snapshot
             .take_scenario_resources()
             .ok_or(SnapshotError::MissingScenarioResources)?;
         let elapsed_clock =
@@ -98,10 +107,20 @@ impl PreparedSavedGame {
         let mut saved_view = snapshot
             .take_local_view()
             .ok_or(SnapshotError::MissingLocalView)?;
-        let power_bar_anim = PowerBarAnimState::from_saved(
-            saved_view.take_power_bar().ok_or(
-                crate::sim::snapshot::saved_local_view::SavedLocalViewError::MissingPowerBar,
-            )?,
+        let lighting = saved_view.take_lighting().ok_or(
+            crate::sim::snapshot::saved_local_view::SavedLocalViewError::InvalidLighting {
+                field: "missing Cell values",
+            },
+        )?;
+        let power_bar_anim = PowerBarAnimState::from_saved(saved_view.take_power_bar().ok_or(
+            crate::sim::snapshot::saved_local_view::SavedLocalViewError::MissingPowerBar,
+        )?)?;
+        let credits_counter = saved_view.take_credits_counter();
+        let radar_housing = saved_view.take_radar_housing();
+        let radar_events = crate::render::radar::ClientRadarEvents::from_saved(
+            saved_view
+                .take_radar_events()
+                .ok_or(crate::render::radar::SavedRadarEventsError::Missing)?,
         )?;
         if saved.fixed_art_hash() != view.rules_owner.fixed_art().content_hash() {
             return Err(PreparedLoadError::Resources(
@@ -111,21 +130,22 @@ impl PreparedSavedGame {
         saved.terrain().validate()?;
         if saved.terrain().dimensions()
             != (
-                snapshot.sim.session.map_width,
-                snapshot.sim.session.map_height,
+                snapshot.sim.session().map_width(),
+                snapshot.sim.session().map_height(),
             )
         {
             return Err(PreparedLoadError::Resources(
                 "saved terrain and scenario dimensions disagree".into(),
             ));
         }
-        let theater_name = snapshot.sim.session.theater.clone();
+        let theater_name = snapshot.sim.session().theater().to_owned();
         let theater = theater::load_theater(assets, &theater_name).ok_or_else(|| {
             PreparedLoadError::Resources(format!("cannot load theater {theater_name}"))
         })?;
         let mut rules = view
             .rules_owner
             .project_saved_scenario_rules(saved.processed_rules())?;
+        let overlay_registry = rules.overlay_registry().clone();
         init_helpers::bind_rules_art_metadata(
             &mut rules,
             view.rules_owner.fixed_art(),
@@ -135,12 +155,13 @@ impl PreparedSavedGame {
         );
         init_helpers::bind_rules_asset_closure(
             &mut rules,
-            saved.processed_rules().ini(),
-            view.rules_owner.fixed_art(),
+            &overlay_registry,
             saved.scheduler_anim_roots(),
+            &[],
             assets,
             theater.extension,
             &theater_name,
+            crate::rules::terrain_asset_catalog::TerrainAssetLoadPhase::Saved,
         )
         .map_err(|error| PreparedLoadError::Resources(error.to_string()))?;
         // Asset-dependent simulation metadata participates in this digest.
@@ -153,10 +174,43 @@ impl PreparedSavedGame {
             }
             .into());
         }
-        let overlay_registry = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(
-            saved.processed_rules().ini(),
-            Some(view.rules_owner.fixed_art()),
+        // Native family TypeLoad mutates retained image history after raw
+        // fields arrive (Terrain71E211/18, Infantry5249AD/B4). Validate the
+        // pre-load resource digest first, then derive the runtime projection
+        // from this same incoming record. Outgoing authority remains borrowed.
+        saved.restore_object_image_loads(&theater_name)?;
+        let mut rules = view
+            .rules_owner
+            .project_saved_scenario_rules(saved.processed_rules())?;
+        // OverlayLoad5FEB45 and MouseLoad5BE668 can replace the restored
+        // shape policy. Refresh this immutable projection from the same
+        // incoming record, rather than retaining its pre-load registry.
+        let overlay_registry = rules.overlay_registry().clone();
+        init_helpers::bind_rules_art_metadata(
+            &mut rules,
+            view.rules_owner.fixed_art(),
+            assets,
+            theater.extension,
+            &theater_name,
         );
+        init_helpers::bind_rules_asset_closure(
+            &mut rules,
+            &overlay_registry,
+            saved.scheduler_anim_roots(),
+            &[],
+            assets,
+            theater.extension,
+            &theater_name,
+            crate::rules::terrain_asset_catalog::TerrainAssetLoadPhase::Saved,
+        )
+        .map_err(|error| PreparedLoadError::Resources(error.to_string()))?;
+        // The saved hash was checked above against the unchanged incoming
+        // Type state. TerrainTypeLoad71E22D now binds even a ctor-null list;
+        // carry that legitimate same-envelope mutation into runtime admission.
+        snapshot.rules_hash = rules.simulation_config_hash();
+        // Only a live-value capture can run the native user-file Cell reset.
+        // Baseline-only headless payloads remain on their separate adapter.
+        let saved_land = saved.terrain().user_load_land_values()?;
         let (mut resources, processed_rules, map) =
             saved.into_restored_parts(rules, overlay_registry, SharedCellDummy::fresh())?;
         let rules = &resources.rules;
@@ -202,6 +256,7 @@ impl PreparedSavedGame {
             terrain_speed,
             overlay_types,
             Some(&mut bind_loaded_cells),
+            Some(saved_land),
         )?;
         resources
             .terrain_template
@@ -216,15 +271,14 @@ impl PreparedSavedGame {
                 rules.general.cliff_back_impassability,
                 tile_cache.selector(),
             )?;
-        // MouseLoad reads a different theater through 545150 (5BE647), which
-        // republishes ClearTile/WaterSet at 545D27/545E17 for a later map's
-        // Fill; the same theater keeps the values its own load published.
-        // Like the fresh loader's, this reaches the process cache on commit.
-        tile_cache.complete_theater_registry_load(
-            theater.rmg_tiles.clear_tile,
-            theater.rmg_tiles.water_set,
-        );
         let local_view = PreparedSavedLocalView::new(saved_view, &world.simulation, rules)?;
+        crate::app::presentation::lighting::validate_saved_lighting(&lighting, &world.simulation)?;
+        // Shared user-load preparation reselected the incoming effects'
+        // lighting before refreshing Anim conversions. The one Cell refresh
+        // is staged below; outgoing process palettes remain unchanged.
+        let scheme_normal_rgb = view
+            .lighting
+            .normal_scheme_for_user_load(view.current_simulation, &theater_name);
         Ok(PreparedSavedResources {
             world,
             resources,
@@ -232,6 +286,11 @@ impl PreparedSavedGame {
             map,
             local_view,
             power_bar_anim,
+            radar_events,
+            radar_housing,
+            credits_counter,
+            lighting,
+            scheme_normal_rgb,
             tile_cache,
             theater,
             elapsed_clock,
@@ -250,17 +309,17 @@ impl PreparedSavedGame {
         let PreparedSavedResources {
             world,
             resources,
-            processed_rules,
             map,
             theater,
+            lighting,
+            scheme_normal_rgb,
             ..
         } = &candidate;
         let rules = &resources.rules;
-        let theater_name = &world.simulation.session.theater;
+        let theater_name = &world.simulation.session().theater();
         let terrain = world
             .simulation
-            .resolved_terrain
-            .as_ref()
+            .resolved_terrain()
             .expect("prepared world terrain");
         let terrain_grid =
             build_terrain_grid_from_resolved(terrain, BridgeMiddleTiles::from_theater(theater));
@@ -274,6 +333,7 @@ impl PreparedSavedGame {
             &theater.iso_palette,
             theater.extension,
             &terrain_grid,
+            rules.combat_damage.terrain_deformation,
             gpu,
             batch,
         );
@@ -298,14 +358,13 @@ impl PreparedSavedGame {
             batch,
             theater.extension,
             theater_name,
-            processed_rules.ini(),
             rules,
             &resources.overlay_registry,
             Some(&theater.iso_palette),
             Some(&theater.unit_palette),
             Some(&theater.tiberium_palette),
         );
-        let presentation = init_helpers::finish_presentation_assets(
+        let mut presentation = init_helpers::finish_presentation_assets(
             gpu,
             batch,
             assets,
@@ -319,7 +378,11 @@ impl PreparedSavedGame {
             overlays,
             map.house_colors().clone(),
             csf,
-        );
+        )
+        .map_err(|error| PreparedLoadError::Resources(error.to_string()))?;
+        presentation
+            .lighting_grid
+            .stage_saved_local_lighting(lighting, *scheme_normal_rgb);
         Ok(Self {
             candidate,
             presentation,
@@ -340,7 +403,7 @@ impl PreparedSavedGame {
         self,
         process: &mut ProcessAssets,
         process_main: &MainRng,
-        runtime: &mut Option<SimRuntime>,
+        runtime: &mut crate::app::match_runtime::sim_host::SimHost,
     ) -> CommittedSavedGame {
         let PreparedSavedResources {
             world,
@@ -349,6 +412,9 @@ impl PreparedSavedGame {
             map,
             local_view,
             power_bar_anim,
+            radar_events,
+            radar_housing,
+            credits_counter,
             tile_cache,
             elapsed_clock,
             ..
@@ -370,22 +436,25 @@ impl PreparedSavedGame {
             .expect("prepared saved terrain");
         template.bind_shared_cell_dummy(dummy);
         template.bind_tile_variant_selector(selector);
-        *runtime = Some(SimRuntime {
+        runtime.install(Some(SimRuntime {
             simulation,
-            resources,
-        });
+            resources: resources.into(),
+        }));
         CommittedSavedGame {
             map,
             presentation: self.presentation,
             terrain_grid: self.terrain_grid,
             local_view,
             power_bar_anim,
+            radar_events,
+            radar_housing,
+            credits_counter,
             details,
             elapsed_clock,
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 #[path = "resource_load_tests.rs"]
 mod tests;

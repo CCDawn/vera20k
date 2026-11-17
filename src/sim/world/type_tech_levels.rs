@@ -24,7 +24,7 @@ const CATEGORIES: [ObjectCategory; 4] = [
 /// Keys retain category and exact constructor spelling, rather than the broad
 /// case-insensitive name lookup. Maps give canonical save/hash order and allow
 /// allocation-free reads; only the trigger and retirement owners mutate them.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TypeTechLevels {
     changed: [BTreeMap<String, i32>; 4],
 }
@@ -81,10 +81,8 @@ impl Simulation {
         if let Some(object) = rules.native_techno_type_exact(name) {
             self.type_tech_levels.set(object, value);
         }
-        for owner in self.session.house_order.iter().rev() {
-            if let Some(house) = self.houses.get_mut(owner) {
-                house.request_tech_recheck();
-            }
+        for house in self.houses.in_order_mut().rev() {
+            house.request_tech_recheck();
         }
     }
 

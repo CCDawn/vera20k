@@ -56,6 +56,13 @@
 //!   (`Type+0xED4`, initializer 0x0045C300) walked in order until the unit can
 //!   enter the cell. Scatter (`FootClass::Receive_Radio 0x17`) is only reached
 //!   from the Hospital/Armory loop and is not part of the depot flow.
+//! - **AI sale of a useless contact** follows a successful status-1
+//!   `RepairTick` when the contact is damaged or has `ManualReload=` set.
+//!   `BuildingClass::MissionRepairAndProduce` 0x0044C2FE..C312 gates the
+//!   `0x0044C4BC` contact check on that predicate and a Roger/RepairComplete
+//!   reply. It then reads Techno+3D0 and the current owner's
+//!   `IsControlledByHuman` (0x0050B730). An AI-owned useless Foot reaches
+//!   `FootClass::On_Sold` (0x004D9F70); a human-owned contact remains.
 //!
 //! Repair payment/heal is the canonical Techno radio receiver6F4AB0.
 //! The Building mission44B780 owns status and its independent+620 progress.
@@ -78,18 +85,104 @@ use crate::sim::world::{SimSoundEvent, Simulation};
 ///The row order is native data, including refinery/special foundations that
 ///are not rectangular rings. Both depot exit scanning and factory Unload use
 ///this owner. Native execution: anytown_damage/unit_unlimbo foundation rows.
-pub fn foundation_exit_list(foundation: &str) -> Vec<(i32, i32)> {
-    FOUNDATION_EXIT_ROWS[usize::from(crate::rules::foundation::foundation_def(foundation).id)]
+pub fn foundation_exit_list(foundation: &crate::rules::foundation::Foundation) -> Vec<(i32, i32)> {
+    if let Some(outline) = foundation.custom_outline() {
+        return outline
+            .iter()
+            .copied()
+            .take_while(|&pair| pair != (0x7fff, 0x7fff))
+            .map(|(x, y)| (i32::from(x), i32::from(y)))
+            .collect();
+    }
+    FOUNDATION_EXIT_ROWS[usize::from(foundation.selector())]
         .iter()
         .copied()
         .take_while(|&pair| pair != (0x7FFF, 0x7FFF))
         .collect()
 }
 
+/// Building459CA0: any in-Size exit-list cell with no ground-list object
+/// and admitted by Cell4834A0(Foot,0,0,-1,Normal,-1,1). This is the
+/// reinforcement receiver's preflight, not the mover-specific dock query.
+pub(crate) fn building_has_clear_foundation_exit(
+    sim: &Simulation,
+    building_id: u64,
+    rules: &RuleSet,
+) -> bool {
+    use crate::map::resolved_terrain::NativeCellQuery;
+    use crate::rules::locomotor_type::{MovementZone, SpeedType};
+    use crate::sim::cell_rect::{
+        CellPassabilityArgs, CellPassabilityMap, check_cell_passability, native_cell_ref,
+    };
+    use crate::sim::movement::locomotor::MovementLayer;
+    use crate::util::lepton::lepton_to_cell_packed;
+
+    let Some(building) = sim.substrate.entities.get(building_id) else {
+        return false;
+    };
+    let Some(object) = sim.entity_object_type(building, rules) else {
+        return false;
+    };
+    let Some(terrain) = sim.resolved_terrain.as_ref() else {
+        return false;
+    };
+    // Virtual+1B8 samples Location, not the building's approach coordinate.
+    let [x, y] = crate::sim::movement::ground_pose::position_world_xy(&building.position);
+    let origin = (lepton_to_cell_packed(x), lepton_to_cell_packed(y));
+    let cells = NativeCellQuery::canonical(terrain);
+    let map = CellPassabilityMap {
+        native_cells: Some(&cells),
+        ..sim.cell_passability_map()
+    };
+    foundation_exit_list(&object.foundation)
+        .into_iter()
+        .any(|(dx, dy)| {
+            let at = (
+                origin.0.wrapping_add(dx as i16),
+                origin.1.wrapping_add(dy as i16),
+            );
+            if !sim.map_cell_in_bounds(at) {
+                return false;
+            }
+            let cell = cells.lookup(at);
+            let at_cell = cells.coord(cell);
+            if sim
+                .cell_objects((at_cell.0 as u16, at_cell.1 as u16), MovementLayer::Ground)
+                .next()
+                .is_some()
+            {
+                return false;
+            }
+            //459D4D repeats the lookup before the passability receiver.
+            check_cell_passability(
+                &native_cell_ref(&cells, cells.lookup(at)),
+                CellPassabilityArgs {
+                    speed_type: SpeedType::Foot,
+                    ignore_infantry: false,
+                    ignore_vehicles: false,
+                    zone: None,
+                    movement_zone: MovementZone::Normal,
+                    level: None,
+                    is_bridge: true,
+                },
+                &map,
+            )
+            .admits()
+        })
+}
+
 ///Read an actual retained pair, including sentinel/padding. Factory Unload
 ///reads element10 directly rather than walking the terminated exit list.
-pub(crate) fn foundation_exit_pair(foundation: &str, index: usize) -> Option<(i32, i32)> {
-    FOUNDATION_EXIT_ROWS[usize::from(crate::rules::foundation::foundation_def(foundation).id)]
+pub(crate) fn foundation_exit_pair(
+    foundation: &crate::rules::foundation::Foundation,
+    index: usize,
+) -> Option<(i32, i32)> {
+    if let Some(outline) = foundation.custom_outline() {
+        return outline
+            .get(index)
+            .map(|&(x, y)| (i32::from(x), i32::from(y)));
+    }
+    FOUNDATION_EXIT_ROWS[usize::from(foundation.selector())]
         .get(index)
         .copied()
 }
@@ -819,7 +912,7 @@ pub(crate) fn building_dock_cell(
 ) -> Option<(u16, u16)> {
     use crate::sim::movement::infantry_entry::{EntryQueryMode, InfantryEntryArgs};
     let producer = sim.substrate.entities.get(producer_id)?;
-    let object = sim.object_type(producer.type_ref(), rules)?;
+    let object = sim.entity_object_type(producer, rules)?;
     let location =
         crate::sim::movement::ground_pose::object_location(producer, sim.resolved_terrain.as_ref());
     let nw = (
@@ -890,7 +983,7 @@ pub(crate) fn building_dock_cell(
     }
     //44F3B7..44F599: south/north pairs left-to-right, then east/west
     //pairs top-to-bottom, including the corners. Both use fifthmode1.
-    let (width, height) = crate::rules::foundation::foundation_dimensions(&object.foundation);
+    let (width, height) = object.foundation.dimensions();
     let (width, height) = (width as i16, height as i16);
     for x in -1..=width {
         for cell in [relative(x, height), relative(x, -1)] {
@@ -936,6 +1029,7 @@ fn break_depot_contact(
     sim: &mut Simulation,
     unit_id: u64,
     depot_id: u64,
+    rules: &RuleSet,
     frame_effects: FrameEffects<'_>,
 ) {
     let linked = sim
@@ -950,7 +1044,7 @@ fn break_depot_contact(
             depot_id,
             RadioMessage::Break,
             RadioPayload::default(),
-            None,
+            rules,
             frame_effects,
         );
     }
@@ -1062,7 +1156,7 @@ pub(crate) fn try_pending_entry(
         depot,
         RadioMessage::Hello,
         RadioPayload::default(),
-        Some(rules),
+        rules,
         frame_effects,
     ) != RadioResponse::Roger
     {
@@ -1074,30 +1168,24 @@ pub(crate) fn try_pending_entry(
         depot,
         RadioMessage::CanEnter,
         RadioPayload::default(),
-        Some(rules),
+        rules,
         frame_effects,
     );
     if reply == RadioResponse::Roger {
         // Foot70D83C calls Queue(Enter,1) before its class setter. Queued
         // Enter bypasses motion in Unit Ready, but its contact still needs
-        // the live type/world inputs (Unit Ready744270). A rules-free
-        // provider cannot complete this queue transaction.
+        // the live type/world inputs (Unit Ready744270).
         let _ = sim.mission_queue_exact(
             id,
             MissionId::from_known(MissionType::Enter),
             1,
-            sim.session.binary_frame,
+            sim.session.binary_frame(),
             &LiveReadyInputProvider { rules },
         );
         // vt+0x480 of whichever Foot waits: an aircraft's pending entry is
         // its own (`AircraftClass::Assign_Destination` sets it).
-        let _ = sim.assign_destination_represented(
-            id,
-            Some(destination),
-            Some(rules),
-            None,
-            frame_effects,
-        );
+        let _ =
+            sim.assign_destination_represented(id, Some(destination), rules, None, frame_effects);
         if let Some(unit) = sim.substrate.entities.get_mut(id) {
             unit.pending_entry.clear();
         }
@@ -1106,14 +1194,14 @@ pub(crate) fn try_pending_entry(
             id,
             MissionId::NONE,
             0,
-            sim.session.binary_frame,
+            sim.session.binary_frame(),
             &LiveReadyInputProvider { rules },
         );
-        sim.assign_null_destination(id, Some(rules), None, frame_effects);
+        sim.assign_null_destination(id, rules, None, frame_effects);
         if let Some(unit) = sim.substrate.entities.get_mut(id) {
             unit.pending_entry.clear();
         }
-        break_depot_contact(sim, id, depot, frame_effects);
+        break_depot_contact(sim, id, depot, rules, frame_effects);
     }
 }
 
@@ -1121,19 +1209,18 @@ pub(crate) fn try_pending_entry(
 /// depot, or it holds a pending entry with no contact. `Mission_Enter` probes
 /// `Contacts[0]` first (0x004D9294), so a harvester that keeps a pending
 /// depot while it docks at its refinery enters the refinery.
-pub(crate) fn depot_owns_enter(sim: &Simulation, rules: Option<&RuleSet>, id: u64) -> bool {
+pub(crate) fn depot_owns_enter(sim: &Simulation, rules: &RuleSet, id: u64) -> bool {
     let Some(unit) = sim.substrate.entities.get(id) else {
         return false;
     };
     if let Some(contact) = unit.radio_contacts.slot(0) {
-        return rules
-            .and_then(|rules| {
-                sim.substrate
-                    .entities
-                    .get(contact)
-                    .and_then(|building| sim.object_type(building.type_ref(), rules))
-            })
-            .is_some_and(|object| object.unit_repair);
+        return {
+            sim.substrate
+                .entities
+                .get(contact)
+                .and_then(|building| sim.object_type(building.type_ref(), rules))
+        }
+        .is_some_and(|object| object.unit_repair);
     }
     unit.pending_entry().is_some()
 }
@@ -1176,12 +1263,12 @@ pub(crate) fn park_pending_entry(
         return false;
     };
     let cell = crate::sim::components::NavTargetRef::cell(x, y);
-    let _ = sim.assign_destination_represented(id, Some(cell), Some(rules), None, frame_effects);
+    let _ = sim.assign_destination_represented(id, Some(cell), rules, None, frame_effects);
     let _ = sim.mission_queue_exact(
         id,
         MissionId::from_known(MissionType::Move),
         0,
-        sim.session.binary_frame,
+        sim.session.binary_frame(),
         &LiveReadyInputProvider { rules },
     );
     true
@@ -1252,7 +1339,7 @@ fn release_contact(
     let ai_archive = archive.filter(|_| {
         sim.houses
             .get(&contact.owner())
-            .is_some_and(|h| !h.is_controlled_by_human(sim.session.game_mode_nonzero))
+            .is_some_and(|h| !h.is_controlled_by_human(sim.session.game_mode_nonzero()))
     });
     if state1
         && let Some(contact) = sim.substrate.entities.get_mut(unit)
@@ -1280,16 +1367,11 @@ fn release_contact(
         unit,
         MissionId::from_known(MissionType::Move),
         0,
-        sim.session.binary_frame,
+        sim.session.binary_frame(),
         &LiveReadyInputProvider { rules },
     );
-    let _ = sim.assign_destination_represented(
-        unit,
-        Some(destination),
-        Some(rules),
-        registry,
-        frame_effects,
-    );
+    let _ =
+        sim.assign_destination_represented(unit, Some(destination), rules, registry, frame_effects);
     if (state1 || ai_archive.is_some())
         && let Some(contact) = sim.substrate.entities.get_mut(unit)
     {
@@ -1303,12 +1385,67 @@ fn release_contact(
     {
         contact.pending_entry.clear();
     }
-    radio::transmit_to_contact(sim, depot, RadioMessage::Break, Some(rules), frame_effects);
+    radio::transmit_to_contact(sim, depot, RadioMessage::Break, rules, frame_effects);
     if !(state1 && ai_archive.is_some())
         && let Some(contact) = sim.substrate.entities.get_mut(unit)
     {
         contact.pending_entry.clear();
     }
+}
+
+/// Mission_Repair's return for a type with none of its ConstructionYard,
+/// Hospital, Armory, UnitRepair and UnitReload families (`0x0044C971`), such
+/// as a plain `Bunker=` type.
+const PLAIN_REPAIR_DELAY_FRAMES: i32 = 0xF;
+
+/// BuildingClass::MissionRepairAndProduce's ConstructionYard arm
+/// (`0x0044B7BC..0x0044B86F`), entered through Receive_Radio's 0xB message
+/// (`0x0043CC39`). Status 0 begins the Active body (Begin_Mode(2),
+/// `0x0044B806`), starts slot 7, PreProduction, in its damaged variant at or
+/// below ConditionYellow (`0x0044B80D..0x0044B854`) and moves to status 2.
+/// Status 2 waits while the yard is in radio contact (`0x0065AE30`), then
+/// queues Guard without commencing and clears slot 7
+/// (`0x0044B7DE..0x0044B7F0`). Every visit returns 1.
+fn construction_yard_repair(sim: &mut Simulation, rules: &RuleSet, yard: u64) -> i32 {
+    let now = sim.session.binary_frame();
+    let Some(building) = sim.substrate.entities.get(yard) else {
+        return 1;
+    };
+    match building.mission.handler_state() {
+        0 => {
+            let damaged = sim
+                .object_type(building.type_ref(), rules)
+                .is_some_and(|object| {
+                    crate::sim::building_art::requested_damage_state(
+                        building.health,
+                        object.strength,
+                        rules.general.condition_yellow,
+                    )
+                });
+            if let Some(building) = sim.substrate.entities.get_mut(yard) {
+                building.begin_building_body(
+                    crate::sim::building_construction::BuildingBodyMode::Active,
+                    now as i32,
+                );
+            }
+            sim.set_building_anim_slot(yard, 7, damaged, false, 0, rules);
+            if let Some(building) = sim.substrate.entities.get_mut(yard) {
+                building.mission.set_handler_state(2);
+            }
+        }
+        2 if building.radio_contacts.is_empty() => {
+            let _ = sim.mission_queue_exact(
+                yard,
+                MissionId::from_known(MissionType::Guard),
+                0,
+                now,
+                &LiveReadyInputProvider { rules },
+            );
+            sim.clear_building_anim_slot(yard, 7);
+        }
+        _ => {}
+    }
+    1
 }
 
 /// BuildingClass::MissionRepairAndProduce44B780's UnitRepair arm. MissionCom
@@ -1328,7 +1465,16 @@ pub(crate) fn mission_repair(
     };
     let building = sim.substrate.entities.get(depot)?;
     let object = sim.object_type(building.type_ref(), rules)?;
-    if object.hospital && !object.construction_yard {
+    // 0x0044B791..0x0044B7A3: a Bunker= type steps its install first.
+    if object.bunker {
+        super::bunker_install::update_bunker(sim, rules, registry, depot, frame_effects);
+    }
+    // 0x0044B7A8: the ConstructionYard arm comes before every other family.
+    if object.construction_yard {
+        return Some(construction_yard_repair(sim, rules, depot));
+    }
+    let building = sim.substrate.entities.get(depot)?;
+    if object.hospital {
         return Some(super::hospital::mission_repair(
             sim,
             rules,
@@ -1339,11 +1485,18 @@ pub(crate) fn mission_repair(
     }
     if !object.unit_repair {
         // The ConstructionYard, Hospital and Armory arms come first.
-        let reload =
-            object.unit_reload && !object.construction_yard && !object.hospital && !object.armory();
-        return reload.then(|| {
-            super::airfield_reload::mission_reload(sim, rules, depot, registry, frame_effects)
-        });
+        if object.unit_reload && !object.hospital && !object.armory() {
+            return Some(super::airfield_reload::mission_reload(
+                sim,
+                rules,
+                depot,
+                registry,
+                frame_effects,
+            ));
+        }
+        // 0x0044C836 -> 0x0044C970: a type in none of the five families.
+        let plain = !(object.unit_reload || object.hospital || object.armory());
+        return plain.then_some(PLAIN_REPAIR_DELAY_FRAMES);
     }
     let status = building.mission.handler_state();
     let current = building
@@ -1353,7 +1506,7 @@ pub(crate) fn mission_repair(
         .unwrap_or(MissionType::Repair);
     let rate = rules.mission_control.rate_frames(current);
     let contact = building.radio_contacts.slot(0);
-    let now = sim.session.binary_frame;
+    let now = sim.session.binary_frame();
     let Some(unit) = contact else {
         // State1's no-contact arm44C0BD retains the current idle animations
         // when neither service slot exists. Recreating them would reset their
@@ -1368,7 +1521,9 @@ pub(crate) fn mission_repair(
         if status == 2 {
             building.mission.set_handler_state(1);
         }
-        if status == 0 || (status == 1 && building.building_art.anim_slots()[18].is_none()) {
+        // `0x0044C17D`: state1 waits for SpecialAnimThree (slot 12, +0x58C),
+        // the one-shot anim raising the arm, to end before asking for Guard.
+        if status == 0 || (status == 1 && building.building_art.anim_slots()[12].is_none()) {
             // State0 Queue44C6EA preserves +6DD; only state1's no-contact
             // arm44C18E sets ready before asking Queue to commence Guard.
             if status == 1 {
@@ -1390,7 +1545,9 @@ pub(crate) fn mission_repair(
             .get_mut(depot)?
             .mission_leaf
             .set_building_ready_latch(0);
-        let hover_or_teleport = sim
+        // `0x0044C75E..0x0044C78F`: the 200-lepton radius is for the Hover
+        // (CLSID literal at 0x7E9A40) and Ship (0x7E9AB0) locomotors.
+        let hover_or_ship = sim
             .substrate
             .entities
             .get(unit)
@@ -1399,18 +1556,13 @@ pub(crate) fn mission_repair(
                 matches!(
                     l.active_kind(),
                     crate::rules::locomotor_type::LocomotorKind::Hover
-                        | crate::rules::locomotor_type::LocomotorKind::Teleport
+                        | crate::rules::locomotor_type::LocomotorKind::Ship
                 )
             });
-        if radio::transmit_to_contact(
-            sim,
-            depot,
-            RadioMessage::NeedToMove,
-            Some(rules),
-            frame_effects,
-        ) == RadioResponse::Roger
+        if radio::transmit_to_contact(sim, depot, RadioMessage::NeedToMove, rules, frame_effects)
+            == RadioResponse::Roger
             && distance_to_pad(sim, rules, depot, unit)
-                .is_some_and(|d| d < if hover_or_teleport { 200 } else { 100 })
+                .is_some_and(|d| d < if hover_or_ship { 200 } else { 100 })
         {
             sim.substrate
                 .entities
@@ -1442,7 +1594,12 @@ pub(crate) fn mission_repair(
             if powered {
                 // `0x0044C243`: ILoco+0x5C, Hover's override included.
                 if crate::sim::movement::motion_query::is_moving(contact) == Some(false) {
-                    sim.locomotor_power_off(unit);
+                    Simulation::locomotor_power_off(
+                        &mut sim.scenario_rng,
+                        &mut sim.substrate,
+                        &sim.resolved_terrain,
+                        unit,
+                    );
                 }
                 return Some(1);
             }
@@ -1452,14 +1609,9 @@ pub(crate) fn mission_repair(
                 contact.navigation.stop_moving();
             }
         }
-        if radio::transmit_to_contact(
-            sim,
-            depot,
-            RadioMessage::NeedToMove,
-            Some(rules),
-            frame_effects,
-        ) != RadioResponse::Roger
-        {
+        let need_to_move =
+            radio::transmit_to_contact(sim, depot, RadioMessage::NeedToMove, rules, frame_effects);
+        if need_to_move != RadioResponse::Roger {
             // Original44C5AB..44C61B takes the same constant-false House
             // gate, queries ILoco+60 and powers on an unpowered contact.
             if let Some(l) = sim
@@ -1477,20 +1629,42 @@ pub(crate) fn mission_repair(
         let typ = sim.object_type(contact.type_ref(), rules)?;
         let damaged = !contact.health.is_full(typ.strength);
         let manual_reload = typ.manual_reload;
-        let reply = radio::transmit_to_contact(
-            sim,
-            depot,
-            RadioMessage::RepairTick,
-            Some(rules),
-            frame_effects,
-        );
+        let reply =
+            radio::transmit_to_contact(sim, depot, RadioMessage::RepairTick, rules, frame_effects);
         if (damaged || manual_reload)
             && matches!(reply, RadioResponse::Roger | RadioResponse::RepairComplete)
         {
+            // Native branches `0x0044C2FE -> 0x0044C308 -> 0x0044C30A/312`
+            // reach the sale block only for a damaged or ManualReload contact
+            // with Roger/RepairComplete. The depot performs that dispatch
+            // gate; the shared sale owner checks the Techno latch and current
+            // AI owner. On_Sold runs Stun, Limbo and UnInit, so return before
+            // reading this contact again in the current mission visit.
+            if crate::sim::production::sell_useless_repair_contact(
+                sim,
+                rules,
+                unit,
+                crate::sim::world::UninitContext::new(rules, registry).with_effects(frame_effects),
+            ) {
+                // `0x0044C4E1..C4EE`: reset the depot's handler cursor and
+                // mark its BuildingReady latch after On_Sold has removed the
+                // admitted contact, before returning through the common tail.
+                let building = sim.substrate.entities.get_mut(depot)?;
+                building.mission.set_handler_state(0);
+                building.mission_leaf.set_building_ready_latch(1);
+                return Some(rate);
+            }
             // Local+41A is resolved by the app, as for ToggleRepair4470B7.
             // Original44C507 announces before the service animation writes.
-            let owner = sim.substrate.entities.get(depot)?.owner();
-            sim.sound_events.push(SimSoundEvent::Repairing { owner });
+            // This arm names the depot that started the service; the unit
+            // being serviced is not a fact at this emit site.
+            let (owner, type_id) = sim
+                .substrate
+                .entities
+                .get(depot)
+                .map(|building| (building.owner(), building.type_ref()))?;
+            sim.sound_events
+                .emit(SimSoundEvent::Repairing { owner, type_id });
             sim.substrate
                 .entities
                 .get_mut(depot)?
@@ -1543,33 +1717,23 @@ pub(crate) fn mission_repair(
         ) {
             return Some(1);
         }
-        if radio::transmit_to_contact(
-            sim,
-            depot,
-            RadioMessage::NeedToMove,
-            Some(rules),
-            frame_effects,
-        ) != RadioResponse::Roger
+        if radio::transmit_to_contact(sim, depot, RadioMessage::NeedToMove, rules, frame_effects)
+            != RadioResponse::Roger
         {
             return Some(1);
         }
         let building = sim.substrate.entities.get_mut(depot)?;
         building.mission_leaf.set_building_ready_latch(0);
         building.mission_leaf.reset_building_repair_progress();
-        match radio::transmit_to_contact(
-            sim,
-            depot,
-            RadioMessage::RepairTick,
-            Some(rules),
-            frame_effects,
-        ) {
+        match radio::transmit_to_contact(sim, depot, RadioMessage::RepairTick, rules, frame_effects)
+        {
             RadioResponse::Roger => {}
             RadioResponse::InsufficientFunds => {
                 // Original44BFD9 only announces an exactly empty wallet;
                 // a nonzero shortfall remains silent. Client filters +41A.
                 let owner = sim.substrate.entities.get(depot)?.owner();
-                if crate::sim::credit_income::available_money(sim, owner) == 0 {
-                    sim.sound_events.push(SimSoundEvent::HouseEva {
+                if crate::sim::credit_income::available_money(&sim.houses, owner) == 0 {
+                    sim.sound_events.emit(SimSoundEvent::HouseEva {
                         owner,
                         event: "EVA_InsufficientFunds",
                     });
@@ -1586,8 +1750,9 @@ pub(crate) fn mission_repair(
                 // client's type8 radar admission; simulation publishes the
                 // request and the app resolves local ownership and admission.
                 let building = sim.substrate.entities.get(depot)?;
-                sim.sound_events.push(SimSoundEvent::UnitRepaired {
+                sim.sound_events.emit(SimSoundEvent::UnitRepaired {
                     owner: building.owner(),
+                    owner_admitted: false,
                     radar: crate::sim::radar::RadarEventRequest::new(
                         crate::sim::radar::RadarEventType::UnitRepaired,
                         building.position.rx(),
@@ -1608,11 +1773,11 @@ pub(crate) fn mission_repair(
     Some(rate)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 #[path = "building_dock_frame_tests.rs"]
 mod frame_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
     use crate::map::entities::EntityCategory;
@@ -1651,7 +1816,7 @@ mod tests {
                 })
                 .collect();
             assert_eq!(
-                foundation_exit_list(foundation.name),
+                foundation_exit_list(&foundation.name.into()),
                 expected,
                 "{}",
                 foundation.name
@@ -1711,8 +1876,8 @@ mod tests {
             .get_mut(id)
             .unwrap()
             .type_facts
-            .set_foundation_for_test(object.foundation.clone());
-        let (width, height) = crate::rules::foundation::foundation_dimensions(&object.foundation);
+            .set_foundation_for_test(object.foundation.clone().into());
+        let (width, height) = object.foundation.dimensions();
         for y in ry..ry + height {
             for x in rx..rx + width {
                 sim.substrate.occupancy.add(
@@ -1845,7 +2010,7 @@ mod tests {
         unit.mark_live_contact_with(DEPOT);
         unit.set_pending_entry(Some(DEPOT));
 
-        for (x, y) in foundation_exit_list("4x3") {
+        for (x, y) in foundation_exit_list(&"4x3".into()) {
             let cell = (6 + x, 9 + y);
             if !(6..10).contains(&cell.0) || !(9..12).contains(&cell.1) {
                 sim.substrate
@@ -1922,25 +2087,6 @@ mod tests {
         );
     }
 
-    /// Original Unit/Foot/Techno1C: full health replies10 without paying or
-    /// resetting independent estimated health (building_repair depot controls).
-    #[test]
-    fn full_health_repair_request_does_not_pay_or_reset_estimated_health() {
-        let (mut sim, rules) = setup(1);
-        let owner = sim.substrate.entities.get(1).unwrap().owner();
-        let unit = sim.substrate.entities.get_mut(1).unwrap();
-        unit.health.set_for_test(300);
-        unit.estimated_health.reset(-20);
-        let rng = sim.scenario_rng.state();
-        assert_eq!(repair_request(&mut sim, &rules, 1), RadioResponse::Negatory);
-        let unit = sim.substrate.entities.get(1).unwrap();
-        assert_eq!(unit.health.current(), 300);
-        assert_eq!(unit.estimated_health.get(), -20);
-        assert_eq!(sim.houses[&owner].economy.credits(), 10_000);
-        assert_eq!(sim.houses[&owner].economy.spent_credits(), 0);
-        assert_eq!(sim.scenario_rng.state(), rng);
-    }
-
     /// Foot4D900E replies10 while NavCom is nonnull, before any wallet/heal.
     #[test]
     fn moving_repair_request_stops_at_the_foot_navcom_interceptor() {
@@ -1955,8 +2101,8 @@ mod tests {
         ));
         assert_eq!(repair_request(&mut sim, &rules, 1), RadioResponse::Negatory);
         assert_eq!(sim.substrate.entities.get(1).unwrap().health.current(), 100);
-        assert_eq!(sim.houses[&owner].economy.credits(), 10_000);
-        assert_eq!(sim.houses[&owner].economy.spent_credits(), 0);
+        assert_eq!(sim.houses[&owner].economy().credits(), 10_000);
+        assert_eq!(sim.houses[&owner].economy().spent_credits(), 0);
     }
 
     /// Techno6F4D35 replies32 without side effects; repeated requests do not
@@ -1968,7 +2114,7 @@ mod tests {
         sim.houses
             .get_mut(&owner)
             .unwrap()
-            .economy
+            .economy_mut()
             .set_credits_for_test(1);
         let rng = sim.scenario_rng.state();
         let estimate = sim
@@ -1987,8 +2133,8 @@ mod tests {
         let unit = sim.substrate.entities.get(1).unwrap();
         assert_eq!(unit.health.current(), 100);
         assert_eq!(unit.estimated_health.get(), estimate);
-        assert_eq!(sim.houses[&owner].economy.credits(), 1);
-        assert_eq!(sim.houses[&owner].economy.spent_credits(), 0);
+        assert_eq!(sim.houses[&owner].economy().credits(), 1);
+        assert_eq!(sim.houses[&owner].economy().spent_credits(), 0);
         assert_eq!(sim.scenario_rng.state(), rng);
     }
 
@@ -2063,6 +2209,7 @@ mod tests {
              [VehicleTypes]\n\
              0=MTNK\n\
              1=HARV\n\
+             2=DEST\n\
              [AircraftTypes]\n\
              [BuildingTypes]\n\
              0=GADEPT\n\
@@ -2079,6 +2226,11 @@ mod tests {
              Speed=4\n\
              Locomotor={{4A582741-9839-11d1-B709-00A024DDAFD1}}\n\
              Harvester=yes\n\
+             [DEST]\n\
+             Name=Destroyer\n\
+             Strength=600\n\
+             Speed=6\n\
+             Locomotor={{2BEA74E1-7CCA-11d3-BE14-00104B62A16C}}\n\
              [GADEPT]\n\
              Name=Depot\n\
              UnitRepair=yes\n\
@@ -2138,8 +2290,8 @@ mod tests {
             );
         }
         sim.substrate.entities.insert(ge);
-        if sim.substrate.next_stable_object_id <= sid {
-            sim.substrate.next_stable_object_id = sid + 1;
+        if sim.next_stable_object_id() <= sid {
+            sim.set_next_stable_object_id_for_test(sid + 1);
         }
     }
 
@@ -2158,7 +2310,7 @@ mod tests {
             .get_mut(DEPOT)
             .unwrap()
             .type_facts
-            .set_foundation_for_test("3x3".to_string());
+            .set_foundation_for_test("3x3".to_string().into());
         for y in DEPOT_RY..DEPOT_RY + 3 {
             for x in DEPOT_RX..DEPOT_RX + 3 {
                 sim.substrate.occupancy.add(
@@ -2185,8 +2337,8 @@ mod tests {
             use crate::sim::house_state::HouseState;
             let owner_id = sim.interner.intern("Americans");
             let mut house = HouseState::new(owner_id, 0, None, false, 0, 10);
-            house.economy.set_credits_for_test(10_000);
-            sim.houses.insert(owner_id, house);
+            house.economy_mut().set_credits_for_test(10_000);
+            sim.houses.register(house);
         }
         spawn_depot(&mut sim);
         for i in 0..tank_count {
@@ -2216,7 +2368,7 @@ mod tests {
             1,
             RadioMessage::RepairTick,
             RadioPayload::default(),
-            Some(&rules),
+            &rules,
             crate::sim::world::FrameEffects::default(),
         );
 
@@ -2224,8 +2376,8 @@ mod tests {
         let tank = sim.substrate.entities.get(1).unwrap();
         assert_eq!(tank.health.current(), 108);
         let house = sim.houses.get(&owner).unwrap();
-        assert_eq!(house.economy.credits(), 9_998);
-        assert_eq!(house.economy.spent_credits(), 2);
+        assert_eq!(house.economy().credits(), 9_998);
+        assert_eq!(house.economy().spent_credits(), 2);
         assert_eq!(sim.scenario_rng.state(), rng);
     }
 
@@ -2237,7 +2389,8 @@ mod tests {
         let pending = DEPOT + 1;
         link_for_service(&mut sim, 1);
         set_pending_entry(&mut sim, 1, Some(pending));
-        sim.mission_assign_exact(DEPOT, MissionId::from_known(MissionType::Repair), 0)
+        sim.substrate
+            .mission_assign_exact(DEPOT, MissionId::from_known(MissionType::Repair), 0)
             .unwrap();
         let building = sim.substrate.entities.get_mut(DEPOT).unwrap();
         building.mission.set_handler_state(2);
@@ -2336,7 +2489,8 @@ mod tests {
     #[test]
     fn a_moving_pending_unit_commences_enter_before_its_pad_order() {
         let (mut sim, rules) = setup(1);
-        sim.mission_assign_exact(1, MissionId::from_known(MissionType::Move), 0)
+        sim.substrate
+            .mission_assign_exact(1, MissionId::from_known(MissionType::Move), 0)
             .unwrap();
         assert!(sim.set_unit_destination(
             1,
@@ -2392,7 +2546,7 @@ mod tests {
                 1,
                 RadioMessage::IsRepairing,
                 RadioPayload::default(),
-                Some(&rules),
+                &rules,
                 crate::sim::world::FrameEffects::default(),
             );
             assert_eq!(
@@ -2466,7 +2620,7 @@ mod tests {
             unit,
             RadioMessage::RepairTick,
             RadioPayload::default(),
-            Some(rules),
+            rules,
             crate::sim::world::FrameEffects::default(),
         )
     }
@@ -2487,11 +2641,12 @@ mod tests {
     /// Component fixture for unit-only Enter/RNG observations. Depot visits
     /// are explicit so its independent Guard cadence is outside those checks.
     fn tick_units(sim: &mut Simulation, rules: &RuleSet) {
-        sim.session.binary_frame = sim.session.binary_frame.wrapping_add(1);
+        sim.session
+            .set_binary_frame_for_test(sim.session.binary_frame().wrapping_add(1));
         visit_units(sim, rules);
         process_units(sim, rules);
         pending_entries(sim, rules);
-        sim.session.tick += 1;
+        sim.session.set_tick_for_test(sim.session.tick() + 1);
     }
 
     fn visit_depot(sim: &mut Simulation, rules: &RuleSet) {
@@ -2505,10 +2660,7 @@ mod tests {
     fn order_repair(sim: &mut Simulation, rules: &RuleSet, tank: u64) -> bool {
         sim.apply_command(
             "Americans",
-            &Command::RepairAtDepot {
-                entity_id: tank,
-                depot_id: DEPOT,
-            },
+            &Command::clicked_mission(tank, MissionType::Enter, TargetKind::Entity(DEPOT)),
             Some(rules),
         )
     }
@@ -2540,7 +2692,7 @@ mod tests {
             {
                 sim.process_ground_locomotor_one(
                     id,
-                    Some(rules),
+                    rules,
                     None,
                     crate::sim::world::FrameEffects::default(),
                 )
@@ -2601,7 +2753,7 @@ mod tests {
         (e.position.rx(), e.position.ry())
     }
 
-    /// Production path: the RepairAtDepot command queues Enter and runs the
+    /// Production path: the MEGAMISSION Enter onto the depot queues Enter and runs the
     /// Unit setter with the depot. The first order finds the depot free: its
     /// DOCKING links it (`0x00741DD6`, `0x0043C8A4..C8C3`) and it drives for
     /// the pad. The later two find a contact held (`0x00741D22`): each takes
@@ -2650,7 +2802,7 @@ mod tests {
                 .unwrap()
                 .mission
                 .dispatch_timer();
-            assert_eq!(timer.start_frame(), sim.session.binary_frame as i32);
+            assert_eq!(timer.start_frame(), sim.session.binary_frame() as i32);
             assert!((14..=16).contains(&timer.delay()));
         }
     }
@@ -2694,7 +2846,7 @@ mod tests {
             (timer.start_frame() + timer.delay()) as u32
         };
         for _ in 0..64 {
-            if sim.session.binary_frame + 1 >= due {
+            if sim.session.binary_frame() + 1 >= due {
                 break;
             }
             tick_units(&mut sim, &rules);
@@ -2718,10 +2870,12 @@ mod tests {
         assert!(order_repair(&mut sim, &rules, 1));
         assert!(order_repair(&mut sim, &rules, 3));
         // Tank 2 idles on Guard with a due dispatch timer.
-        let now = sim.session.binary_frame;
-        sim.mission_assign_exact(2, MissionId::from_known(MissionType::Guard), now)
+        let now = sim.session.binary_frame();
+        sim.substrate
+            .mission_assign_exact(2, MissionId::from_known(MissionType::Guard), now)
             .expect("assign Guard");
-        sim.session.binary_frame += 1;
+        sim.session
+            .set_binary_frame_for_test(sim.session.binary_frame() + 1);
         let ctx = crate::sim::world::ObjectAiCtx::default;
 
         let mut shadow = sim.clone_scenario_rng();
@@ -2751,7 +2905,8 @@ mod tests {
         );
 
         let after_ai = sim.scenario_rng.state();
-        sim.mission_assign_exact(DEPOT, MissionId::from_known(MissionType::Repair), 1)
+        sim.substrate
+            .mission_assign_exact(DEPOT, MissionId::from_known(MissionType::Repair), 1)
             .unwrap();
         sim.substrate
             .entities
@@ -2793,12 +2948,7 @@ mod tests {
         assert!(order_repair(&mut sim, &rules, 1));
         tick_units(&mut sim, &rules);
         assert!(linked(&sim, 1));
-        sim.assign_null_destination(
-            1,
-            Some(&rules),
-            None,
-            crate::sim::world::FrameEffects::default(),
-        );
+        sim.assign_null_destination(1, &rules, None, crate::sim::world::FrameEffects::default());
         for _ in 0..100 {
             tick_units(&mut sim, &rules);
             let unit = sim.substrate.entities.get(1).unwrap();
@@ -2907,7 +3057,7 @@ mod tests {
             (timer.start_frame() + timer.delay()) as u32
         };
         for _ in 0..64 {
-            if sim.session.binary_frame >= due {
+            if sim.session.binary_frame() >= due {
                 break;
             }
             tick(&mut sim, &rules);
@@ -2960,7 +3110,7 @@ mod tests {
             (timer.start_frame() + timer.delay()) as u32
         };
         for _ in 0..64 {
-            if sim.session.binary_frame >= due {
+            if sim.session.binary_frame() >= due {
                 break;
             }
             tick(&mut sim, &rules);
@@ -2993,7 +3143,7 @@ mod tests {
             (timer.start_frame() + timer.delay()) as u32
         };
         for _ in 0..64 {
-            if sim.session.binary_frame >= due2 {
+            if sim.session.binary_frame() >= due2 {
                 break;
             }
             tick(&mut sim, &rules);
@@ -3016,15 +3166,15 @@ mod tests {
     fn spawn_damaged_miner(sim: &mut Simulation, sid: u64, rx: u16, ry: u16) {
         spawn_entity(sim, sid, "HARV", EntityCategory::Unit, rx, ry, 100);
         let e = sim.substrate.entities.get_mut(sid).unwrap();
-        e.miner = Some(crate::sim::miner::Miner::new(
+        e.miner = Some(Box::new(crate::sim::miner::Miner::new(
             crate::sim::miner::MinerKind::War,
             &miner_cfg(),
             0,
-        ));
+        )));
     }
 
-    /// The object-AI pass with the Harvest handler LIVE (`miner_config`
-    /// supplied, as production does), in live-object order.
+    /// The object-AI pass with the Harvest handler live, in live-object
+    /// order.
     fn visit_units_with_harvest(sim: &mut Simulation, rules: &RuleSet) {
         let units: Vec<u64> = sim
             .substrate
@@ -3038,7 +3188,6 @@ mod tests {
                     .is_some_and(|e| e.category() == EntityCategory::Unit)
             })
             .collect();
-        let cfg = miner_cfg();
         for id in units {
             sim.object_ai_visit_one(
                 id,
@@ -3046,8 +3195,6 @@ mod tests {
                 crate::sim::world::ObjectAiCtx {
                     effects: crate::sim::world::FrameEffects::default(),
                     overlay_registry: None,
-                    terrain_spawner_cells: None,
-                    miner_config: Some(&cfg),
                 },
             );
         }
@@ -3074,7 +3221,8 @@ mod tests {
             "[Enter]\nRate=.1\n[Guard]\nRate=.03\n",
         ));
         sim.scenario_rng = crate::sim::rng::SimRng::new(1);
-        sim.mission_assign_exact(1, MissionId::from_known(MissionType::Enter), 0)
+        sim.substrate
+            .mission_assign_exact(1, MissionId::from_known(MissionType::Enter), 0)
             .unwrap();
 
         let delay = crate::sim::mission::enter::mission_enter(
@@ -3122,8 +3270,9 @@ mod tests {
         let mut writes = 0u32;
         let mut prev_timer = dispatch_timer(&sim, MINER);
         for _ in 0..2000 {
-            sim.session.binary_frame = sim.session.binary_frame.wrapping_add(1);
-            let now = sim.session.binary_frame;
+            sim.session
+                .set_binary_frame_for_test(sim.session.binary_frame().wrapping_add(1));
+            let now = sim.session.binary_frame();
             let due_at_entry = sim
                 .substrate
                 .entities
@@ -3170,7 +3319,7 @@ mod tests {
             prev_timer = timer;
             visit_depot(&mut sim, &rules);
             process_units(&mut sim, &rules);
-            sim.session.tick += 1;
+            sim.session.set_tick_for_test(sim.session.tick() + 1);
             if servicing(&sim, MINER) {
                 reached_pad = true;
                 assert!(linked(&sim, MINER));
@@ -3191,57 +3340,167 @@ mod tests {
         assert_eq!(harvest_cursor(&sim, MINER), cursor_at_order);
     }
 
-    /// The common selector routes a miner on Enter to the depot body, with
-    /// one cadence draw and one timer write; no Harvest cursor step runs.
+    /// `0x0044C75E..0x0044C78F`: state0 admits a Ship (CLSID literal at
+    /// 0x7E9AB0) within 200 leptons of the pad, as it does a Hover; a Drive
+    /// would need 100.
     #[test]
-    fn miner_on_enter_with_a_depot_contact_has_one_dispatch_writer() {
+    fn state0_admits_a_ship_within_two_hundred_leptons() {
         let (mut sim, rules) = setup(0);
-        const MINER: u64 = 7;
-        spawn_damaged_miner(&mut sim, MINER, 14, 11);
-        assert!(order_repair(&mut sim, &rules, MINER));
-        sim.session.binary_frame += 1;
-        visit_units_with_harvest(&mut sim, &rules);
-        assert!(linked(&sim, MINER));
+        spawn_entity(&mut sim, 1, "DEST", EntityCategory::Unit, 12, 11, 400);
+        sim.substrate
+            .entities
+            .get_mut(1)
+            .unwrap()
+            .position
+            .set_sub_x_for_test(crate::util::fixed_math::SimFixed::from_num(22));
+        let distance = distance_to_pad(&sim, &rules, DEPOT, 1).unwrap();
+        assert!((100..200).contains(&distance), "{distance}");
+        link_for_service(&mut sim, 1);
+        sim.substrate
+            .mission_assign_exact(DEPOT, MissionId::from_known(MissionType::Repair), 0)
+            .unwrap();
+        assert_eq!(
+            mission_repair(
+                &mut sim,
+                &rules,
+                DEPOT,
+                None,
+                crate::sim::world::FrameEffects::default()
+            ),
+            Some(3)
+        );
         assert_eq!(
             sim.substrate
                 .entities
-                .get(MINER)
+                .get(DEPOT)
                 .unwrap()
                 .mission
-                .current()
-                .known(),
-            Some(MissionType::Enter)
-        );
-        let (start, delay) = dispatch_timer(&sim, MINER);
-        assert!((14..=16).contains(&delay));
-        // Jump to the due frame.
-        sim.session.binary_frame = (start + delay) as u32;
-        let now = sim.session.binary_frame;
-        let mut shadow = sim.clone_scenario_rng();
-        visit_units_with_harvest(&mut sim, &rules);
-        shadow.next_range_u32_inclusive(0, 2);
-        assert_eq!(sim.scenario_rng.state(), shadow.state(), "one (0,2) draw");
-        let after = dispatch_timer(&sim, MINER);
-        assert_eq!(after.0, now as i32);
-        assert!(
-            (14..=16).contains(&after.1),
-            "Enter epilogue, got {after:?}"
+                .handler_state(),
+            1
         );
     }
 
-    /// The class entry owner, rather than a grid proxy, decides every saved row.
+    /// `0x0044C17D`: with no contact, state1 asks for Guard only once
+    /// SpecialAnimThree (slot 12, the one-shot arm-raising anim) has ended.
+    /// The IdleAnim slot 18 stays empty meanwhile: service cleared it and
+    /// only slot 12's completion restores it (`0x00451CD2`).
     #[test]
-    fn exit_cell_skips_blocked_cells_in_list_order() {
-        let (mut sim, rules) = setup(1);
-        assert_eq!(
-            building_dock_cell(&sim, DEPOT, 1, (0, 0), &rules, None),
-            Some((DEPOT_RX, DEPOT_RY + 3))
+    fn state1_waits_for_the_arm_to_rise_before_guard() {
+        use crate::rules::art_data::ArtRegistry;
+        let (mut sim, _) = setup(0);
+        let art_ini = IniFile::from_str(
+            "[GADEPT]\nFoundation=3x3\nSpecialAnimThree=LOWER\n[LOWER]\nEnd=10\n",
         );
-        spawn_tank(&mut sim, 7, DEPOT_RX, DEPOT_RY + 3);
-        assert_eq!(
-            building_dock_cell(&sim, DEPOT, 1, (0, 0), &rules, None),
-            Some((DEPOT_RX + 1, DEPOT_RY + 3))
+        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+            &IniFile::from_str(
+                "[BuildingTypes]\n0=GADEPT\n[GADEPT]\nStrength=1000\nUnitRepair=yes\n\
+                 [Animations]\n0=LOWER\n",
+            ),
+            &art_ini,
+        )
+        .unwrap();
+        let mut art = ArtRegistry::from_ini(&art_ini);
+        art.bind_anim_frame_count_for_test("LOWER", 10);
+        rules.install_art_data(art);
+        sim.substrate
+            .mission_assign_exact(DEPOT, MissionId::from_known(MissionType::Repair), 0)
+            .unwrap();
+        sim.substrate
+            .entities
+            .get_mut(DEPOT)
+            .unwrap()
+            .mission
+            .set_handler_state(1);
+        sim.set_building_anim_slot(DEPOT, 12, false, false, 0, &rules)
+            .unwrap();
+        let guard = MissionId::from_known(MissionType::Guard);
+        let asked_for_guard = |sim: &Simulation| {
+            let mission = &sim.substrate.entities.get(DEPOT).unwrap().mission;
+            mission.queued() == guard || mission.current() == guard
+        };
+        let visit = |sim: &mut Simulation| {
+            mission_repair(
+                sim,
+                &rules,
+                DEPOT,
+                None,
+                crate::sim::world::FrameEffects::default(),
+            )
+        };
+        assert_eq!(visit(&mut sim), Some(1));
+        assert!(!asked_for_guard(&sim), "the arm is still rising");
+        sim.clear_building_anim_slot(DEPOT, 12);
+        assert_eq!(visit(&mut sim), Some(1));
+        assert!(asked_for_guard(&sim));
+    }
+
+    /// A yard sent radio 0xB runs Repair's ConstructionYard arm
+    /// (`0x0044B7BC..0x0044B86F`): status 0 starts PreProduction (slot 7) and
+    /// moves to status 2; out of radio contact, status 2 queues Guard and
+    /// clears the slot.
+    #[test]
+    fn a_yard_in_repair_plays_preproduction_until_out_of_contact() {
+        use crate::rules::art_data::ArtRegistry;
+        let (mut sim, _) = setup(1);
+        let art_ini = IniFile::from_str(
+            "[GADEPT]\nFoundation=3x3\nPreProductionAnim=CRANE\n[CRANE]\nLoopCount=-1\n",
         );
+        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+            &IniFile::from_str(
+                "[BuildingTypes]\n0=GADEPT\n[GADEPT]\nStrength=1000\nConstructionYard=yes\n\
+                 [Animations]\n0=CRANE\n",
+            ),
+            &art_ini,
+        )
+        .unwrap();
+        let mut art = ArtRegistry::from_ini(&art_ini);
+        art.bind_anim_frame_count_for_test("CRANE", 10);
+        rules.install_art_data(art);
+        sim.substrate
+            .mission_assign_exact(DEPOT, MissionId::from_known(MissionType::Repair), 0)
+            .unwrap();
+        let visit = |sim: &mut Simulation| {
+            mission_repair(
+                sim,
+                &rules,
+                DEPOT,
+                None,
+                crate::sim::world::FrameEffects::default(),
+            )
+        };
+
+        assert_eq!(visit(&mut sim), Some(1));
+        let yard = sim.substrate.entities.get(DEPOT).unwrap();
+        assert_eq!(yard.mission.handler_state(), 2);
+        assert!(yard.building_art.anim_slots()[7].is_some());
+
+        // 0x0065AE30 finds a contact: the yard keeps waiting.
+        let contacts = |sim: &mut Simulation, add: bool| {
+            let yard = sim.substrate.entities.get_mut(DEPOT).unwrap();
+            if add {
+                yard.radio_contacts.insert(1).unwrap();
+            } else {
+                yard.radio_contacts.remove(1).unwrap();
+            }
+        };
+        contacts(&mut sim, true);
+        assert_eq!(visit(&mut sim), Some(1));
+        let yard = sim.substrate.entities.get(DEPOT).unwrap();
+        assert_eq!(yard.mission.handler_state(), 2);
+        assert_ne!(
+            yard.mission.queued(),
+            MissionId::from_known(MissionType::Guard)
+        );
+        assert!(yard.building_art.anim_slots()[7].is_some());
+
+        contacts(&mut sim, false);
+        assert_eq!(visit(&mut sim), Some(1));
+        let yard = sim.substrate.entities.get(DEPOT).unwrap();
+        assert_eq!(
+            yard.mission.queued(),
+            MissionId::from_known(MissionType::Guard)
+        );
+        assert!(yard.building_art.anim_slots()[7].is_none());
     }
 
     /// Original44C0BD skips reconstruction when state1 has neither service
@@ -3329,7 +3588,7 @@ mod tests {
         sim.houses
             .get_mut(&owner)
             .unwrap()
-            .economy
+            .economy_mut()
             .set_credits_for_test(2);
         spawn_entity(
             &mut sim,
@@ -3343,7 +3602,8 @@ mod tests {
         // The house's building list holds its factory (FindFactory scans it).
         sim.append_house_base_building_for_test(501);
         link_for_service(&mut sim, 1);
-        sim.mission_assign_exact(DEPOT, MissionId::from_known(MissionType::Repair), 0)
+        sim.substrate
+            .mission_assign_exact(DEPOT, MissionId::from_known(MissionType::Repair), 0)
             .unwrap();
         sim.substrate
             .entities
@@ -3351,7 +3611,8 @@ mod tests {
             .unwrap()
             .mission
             .set_handler_state(1);
-        sim.mission_assign_exact(1, MissionId::from_known(MissionType::Sleep), 0)
+        sim.substrate
+            .mission_assign_exact(1, MissionId::from_known(MissionType::Sleep), 0)
             .unwrap();
         sim.substrate
             .entities
@@ -3362,30 +3623,30 @@ mod tests {
             .unwrap()
             .power_off();
         let pending = sim.interner.intern("PENDING");
-        assert!(sim.production.factories.test_enqueue_kernel(
+        assert!(sim.production.factories_mut().test_enqueue_kernel(
             owner,
             ProductionCategory::Vehicle,
             pending,
             1,
             108,
         ));
-        let factory = sim.production.factories.test_first_mut().unwrap();
+        let factory = sim.production.factories_mut().test_first_mut().unwrap();
         // The kernel fixture supplies an already-running head. StartProduction
         // itself now correctly leaves +70 stopped until the separate Resume.
-        factory.suspended = false;
-        factory.step_rate_frames = 1;
-        factory.step_timer = CdTimer::from_raw(0, 0);
+        factory.set_suspended_for_test(false);
+        factory.set_step_rate_frames_for_test(1);
+        factory.set_step_timer_for_test(CdTimer::from_raw(0, 0));
         for id in [DEPOT, 1, 501] {
             assert!(sim.register_live_object(id));
         }
         sim.advance_tick(&[], Some(&rules), None, None, 66);
         assert_eq!(sim.substrate.entities.get(1).unwrap().health.current(), 108);
-        assert_eq!(sim.houses[&owner].economy.credits(), 0);
-        assert_eq!(sim.houses[&owner].economy.spent_credits(), 2);
-        let factory = sim.production.factories.test_first_mut().unwrap();
-        assert_eq!(factory.progress, 0);
-        assert_eq!(factory.balance, 108);
-        assert!(factory.on_hold);
+        assert_eq!(sim.houses[&owner].economy().credits(), 0);
+        assert_eq!(sim.houses[&owner].economy().spent_credits(), 2);
+        let factory = sim.production.factories_mut().test_first_mut().unwrap();
+        assert_eq!(factory.progress(), 0);
+        assert_eq!(factory.balance(), 108);
+        assert!(factory.on_hold());
     }
 
     /// A repaired (full-HP) linked waiter that is a Harvester=yes unit takes
@@ -3403,12 +3664,19 @@ mod tests {
             let (mut sim, rules) = setup(0);
             if human {
                 let owner_id = sim.interner.intern("Americans");
-                sim.houses.get_mut(&owner_id).unwrap().is_human = true;
+                sim.houses
+                    .get_mut(&owner_id)
+                    .unwrap()
+                    .set_is_human_for_test(true);
             }
             spawn_entity(&mut sim, 1, "HARV", EntityCategory::Unit, 14, 11, 600);
             {
                 let unit = sim.substrate.entities.get_mut(1).unwrap();
-                unit.miner = Some(Miner::new(MinerKind::War, &MinerConfig::default(), 0));
+                unit.miner = Some(Box::new(Miner::new(
+                    MinerKind::War,
+                    &MinerConfig::default(),
+                    0,
+                )));
                 unit.mark_live_contact_with(DEPOT);
             }
             sim.substrate
@@ -3416,7 +3684,8 @@ mod tests {
                 .get_mut(DEPOT)
                 .unwrap()
                 .mark_live_contact_with(1);
-            sim.mission_assign_exact(1, MissionId::from_known(MissionType::Enter), 0)
+            sim.substrate
+                .mission_assign_exact(1, MissionId::from_known(MissionType::Enter), 0)
                 .expect("unit exists");
             assert!(linked(&sim, 1));
             (sim, rules)

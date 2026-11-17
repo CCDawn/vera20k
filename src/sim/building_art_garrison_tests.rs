@@ -6,7 +6,7 @@ use super::*;
 use crate::map::entities::EntityCategory;
 use crate::rules::art_data::{ArtRegistry, BuildingAnimVariantConfig};
 use crate::rules::ini_parser::IniFile;
-use crate::sim::passenger::{PassengerCargo, PassengerRole};
+use crate::sim::passenger::PassengerRole;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -25,11 +25,12 @@ fn fixture(input: &Value) -> (Simulation, RuleSet, u64) {
         }
     }
     let mut rules_text = format!(
-        "[BuildingTypes]\n0=B\n[B]\nStrength={}\nCanBeOccupied=yes\nTechLevel=-1\n\
+        "[BuildingTypes]\n0=B\n[B]\nStrength={}\nCanBeOccupied=yes\nTechLevel=-1\nUpgrades=3\n\
          [InfantryTypes]\n0=E1\n[E1]\nStrength=100\nOccupier=yes\n[Animations]\n",
         integer(&input["strength"]),
     );
-    let mut art_text = String::from("[B]\nActiveAnim=OLD\n");
+    let mut art_text =
+        String::from("[B]\nActiveAnim=OLD\nPowerUp1Anim=OLD\nPowerUp2Anim=OLD\nPowerUp3Anim=OLD\n");
     for (index, name) in names.iter().enumerate() {
         rules_text.push_str(&format!("{index}={name}\n"));
         art_text.push_str(&format!("[{name}]\nLoopCount=-1\nRate=150\n"));
@@ -51,7 +52,12 @@ fn fixture(input: &Value) -> (Simulation, RuleSet, u64) {
         art.bind_anim_frame_count_for_test(name, 40);
     }
     let entry = art.get_mut("B").unwrap();
-    let template = entry.building_anims[0].clone();
+    let template = entry
+        .building_anims
+        .iter()
+        .find(|config| config.native_slot == 3)
+        .unwrap()
+        .clone();
     // Install the supplied native slot-presence controls with an identifiable
     // old animation. Requested names are installed after creation, so even an
     // empty normal name can test preservation of an already live slot.
@@ -63,6 +69,8 @@ fn fixture(input: &Value) -> (Simulation, RuleSet, u64) {
         })
         .collect();
     rules.install_art_data(art);
+    // Slot 9's record belongs to the rules type, not to art.
+    rules.set_turret_anim_names_for_test("B", "OLD", "OLD");
     let (mut sim, _, id) = slot_test_fixture();
     for slot in input["live_slots"].as_array().unwrap() {
         let slot = integer(slot) as u8;
@@ -73,8 +81,15 @@ fn fixture(input: &Value) -> (Simulation, RuleSet, u64) {
             .anims
             .get_mut(anim)
             .unwrap()
-            .runtime
+            .runtime_mut_for_test()
             .current_frame = i32::from(slot) + 1;
+    }
+    if let Some(variants) = input["slot_names"].get("9") {
+        rules.set_turret_anim_names_for_test(
+            "B",
+            variants["normal"].as_str().unwrap(),
+            variants["damaged"].as_str().unwrap(),
+        );
     }
     let entry = rules.art_entry_mut_for_test("B").unwrap();
     for (slot, variants) in input["slot_names"].as_object().unwrap() {
@@ -99,9 +114,9 @@ fn fixture(input: &Value) -> (Simulation, RuleSet, u64) {
     }
     let count = integer(&input["occupant_count"]);
     assert!((0..=1).contains(&count));
-    let mut cargo = PassengerCargo::new(1, 0.0);
+    let mut occupants = Vec::new();
     for _ in 0..count {
-        let occupant_id = sim.allocate_stable_id();
+        let occupant_id = sim.substrate.allocate_stable_id();
         let mut occupant = GameEntity::test_default_of_category(
             occupant_id,
             "E1",
@@ -114,10 +129,13 @@ fn fixture(input: &Value) -> (Simulation, RuleSet, u64) {
         occupant.set_owner_for_test(sim.interner.intern("A"));
         occupant.passenger_role = PassengerRole::inside_for_test(id, false);
         sim.substrate.entities.insert(occupant);
-        cargo.board_forced_chain(&[(occupant_id, 1.0)]);
+        occupants.push(occupant_id);
     }
     let building = sim.substrate.entities.get_mut(id).unwrap();
-    building.passenger_role = PassengerRole::transport(cargo);
+    building
+        .passenger_role
+        .occupants_mut()
+        .set_ids_for_test(occupants);
     building.health.set_for_test(integer(&input["current_hp"]));
     building.building_art.damage_state_active = input["retained_damage_state"].as_bool().unwrap();
     (sim, rules, id)
@@ -156,17 +174,17 @@ fn native_refresh_corpus_replays_through_live_animation_slots() {
             assert!(sim.anim(old).is_none(), "{name}: old slot {slot} survives");
             let anim = sim.anim(new).unwrap();
             assert_eq!(
-                sim.interner.resolve(anim.type_id),
+                sim.interner.resolve(anim.type_id()),
                 call["name"].as_str().unwrap(),
                 "{name}: slot {slot} selection",
             );
             assert_eq!(
-                i32::from(anim.runtime.delay_remaining),
+                i32::from(anim.runtime().delay_remaining),
                 integer(&call["delay"]),
                 "{name}: slot {slot} delay",
             );
-            assert_eq!(anim.runtime.current_frame, slot as i32 + 1, "{name}");
-            assert_eq!(anim.building_slot, Some((id, slot as u8)), "{name}");
+            assert_eq!(anim.runtime().current_frame, slot as i32 + 1, "{name}");
+            assert_eq!(anim.building_slot(), Some((id, slot as u8)), "{name}");
             // Shared451890 may first synchronize all live slots when retained
             // damage changes. Its extra allocations precede these final IDs;
             // their increasing order must still match native458330's calls.

@@ -5,15 +5,22 @@
 //!
 //! F12 owner tree: options persistence lives here beside the save repository.
 
+pub(crate) mod account;
 pub(crate) mod commands;
+pub(crate) mod intro_play;
 pub(crate) mod options;
 pub(crate) mod options_profile;
+#[cfg(feature = "phobos")]
+pub(crate) mod phobos_settings;
+pub(crate) mod profile_file;
 mod resource_load;
+pub(crate) mod rules_profile;
+pub(crate) mod wol_profile;
 pub(crate) use resource_load::{PreparedSavedGame, SavedGamePreparationView};
 
-use std::path::{Path, PathBuf};
 #[cfg(any(feature = "dev-overlays", test))]
-use std::time::SystemTime;
+use crate::util::time::SystemTime;
+use std::path::{Path, PathBuf};
 
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::overlay_types::OverlayTypeRegistry;
@@ -23,10 +30,18 @@ use crate::sim::snapshot::{
 };
 use crate::sim::world::Simulation;
 
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
 const DEFAULT_SAVES_DIRECTORY: &str = "saves";
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+const DEFAULT_SAVES_DIRECTORY: &str = "/saves";
 
 /// Process-lifetime save-game state owned by the app persistence domain.
 pub(crate) struct PersistenceState {
+    /// MainTick55DBCD's process-global ABCE08. It is deliberately outside
+    /// the saved Scenario and survives a same-mission restart.
+    initial_campaign_save_attempted: bool,
+    /// The one UI load awaiting its loading frame and subsequent redraw.
+    pub(crate) pending_load: Option<commands::PendingSavedGameLoad>,
     /// The process-lifetime retail Options/Video/Audio profile. UI, window,
     /// render, and audio state are projections of this single retained value.
     pub(crate) options_profile: options_profile::RetailOptionsProfile,
@@ -36,14 +51,42 @@ pub(crate) struct PersistenceState {
 impl PersistenceState {
     pub(crate) fn new(options_profile: options_profile::RetailOptionsProfile) -> Self {
         Self {
+            initial_campaign_save_attempted: false,
+            pending_load: None,
             options_profile,
             repository: SaveRepository::new(),
         }
     }
 
+    /// CampaignDialog52F28B and successful MapSelect5AE126 arm one attempt.
+    pub(crate) fn arm_initial_campaign_save(&mut self) {
+        self.initial_campaign_save_attempted = false;
+    }
+
+    /// Successful campaign content load67F7C1 suppresses a new initial save.
+    pub(crate) fn loaded_campaign(&mut self) {
+        self.initial_campaign_save_attempted = true;
+    }
+
+    /// 55DBCD..55DC92 stores the latch before IO; failure must not retry each frame.
+    fn take_initial_campaign_save(&mut self, campaign: bool) -> bool {
+        if !campaign || self.initial_campaign_save_attempted {
+            return false;
+        }
+        self.initial_campaign_save_attempted = true;
+        true
+    }
+
+    pub(crate) fn initial_campaign_save_pending(&self, campaign: bool) -> bool {
+        campaign && !self.initial_campaign_save_attempted
+    }
+
     /// A one-shot production capture uses its own new directory, so the
     /// ordinary save command cannot replace a player's existing saves.
     pub(crate) fn isolate_capture_saves(&mut self, directory: &Path) -> std::io::Result<()> {
+        if self.repository.directory == directory {
+            return Ok(());
+        }
         std::fs::create_dir(directory)?;
         self.repository = SaveRepository::at(directory);
         Ok(())
@@ -55,6 +98,8 @@ impl PersistenceState {
 pub(crate) enum PreparedLoadError {
     #[error("could not read save file: {0}")]
     ReadFile(#[source] std::io::Error),
+    #[error("a network match cannot load a saved game")]
+    NetworkMatch,
     // The four `#[cfg(test)]` variants belong to the headless same-content
     // fixture route; saved-resource preparation rebuilds those inputs.
     #[cfg(test)]
@@ -89,6 +134,8 @@ pub(crate) enum PreparedLoadError {
     Terrain(#[from] crate::map::resolved_terrain::SavedTerrainError),
     #[error(transparent)]
     LocalView(#[from] crate::sim::snapshot::saved_local_view::SavedLocalViewError),
+    #[error(transparent)]
+    RadarEvents(#[from] crate::render::radar::SavedRadarEventsError),
 }
 
 /// Fully validated, cache-rebuilt replacement state ready for one infallible commit.
@@ -96,6 +143,7 @@ pub(crate) struct PreparedLoad {
     simulation: Simulation,
     map_restore: SnapshotMapRestoreOutput,
     sinking_waterlines: Vec<(u64, i16)>,
+    anim_intensities: Vec<(u64, i32)>,
     tactical_view: Option<crate::sim::snapshot::SavedTacticalView>,
     sidebar_order: Option<crate::app::sidebar_projection::PreparedSidebarOrder>,
 }
@@ -104,6 +152,7 @@ pub(crate) struct PreparedLoad {
 pub(crate) struct CommittedLoadPresentation {
     pub(crate) occupied_overlays: Vec<crate::map::overlay::OverlayEntry>,
     pub(crate) sinking_waterlines: Vec<(u64, i16)>,
+    pub(crate) anim_intensities: Vec<(u64, i32)>,
     pub(crate) tactical_view: Option<crate::sim::snapshot::SavedTacticalView>,
     pub(crate) sidebar_order: Option<crate::app::sidebar_projection::PreparedSidebarOrder>,
 }
@@ -206,7 +255,7 @@ impl PreparedLoad {
             bytes,
             expected_map_hash,
             rules.simulation_config_hash(),
-            &current_simulation.session.map_name,
+            current_simulation.session().map_name(),
         )?;
         let terrain_template = terrain_template
             .cloned()
@@ -217,8 +266,9 @@ impl PreparedLoad {
             crate::sim::world::SnapshotProcessState::Live(current_simulation),
             rules,
             terrain_template,
-            current_simulation.terrain_speed_config.clone(),
+            current_simulation.terrain_speed_config().clone(),
             overlay_registry.ok_or(PreparedLoadError::MissingOverlayRegistry)?,
+            None,
             None,
         )
     }
@@ -226,6 +276,10 @@ impl PreparedLoad {
     /// One world restore for production resource loads and headless fixtures.
     /// The caller supplies the incoming bound resources and only lends the
     /// current process RNG owners; no fresh scenario construction is replayed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "bound resources and explicit user-file Cell values"
+    )]
     fn prepare_snapshot(
         snapshot: GameSnapshot,
         process: crate::sim::world::SnapshotProcessState<'_>,
@@ -236,6 +290,7 @@ impl PreparedLoad {
         prepare_terrain_assets: Option<
             &mut crate::sim::snapshot::SnapshotTerrainAssetPreparation<'_>,
         >,
+        saved_land: Option<crate::map::resolved_terrain::SavedCellLandValues>,
     ) -> Result<Self, PreparedLoadError> {
         let saved_sidebar_order = snapshot.sidebar_order().cloned();
         let tactical_view = snapshot.tactical_view().cloned();
@@ -250,27 +305,48 @@ impl PreparedLoad {
         // that state without touching the running match's retained identity.
         simulation.bind_shared_cell_dummy(crate::map::resolved_terrain::SharedCellDummy::fresh());
         simulation.reconstruct_cellclass_dummy_for_map_resize();
+        // InfantryLoad521A0C -> TechnoNoInit6F4335 resets the transition
+        // clock. This user-file seam is separate from internal continuations.
+        simulation.restart_cloak_progress_after_player_load();
+        simulation.reconstruct_building_repair_progress_after_player_load();
+        simulation.validate_ares_state_for_load(rules.ares())?;
         simulation.restore_after_snapshot_load()?;
         crate::sim::production::validate_restored_factory_state(&simulation, rules)?;
         simulation.rebuild_caches_after_load(terrain_template, terrain_speed_config, rules);
 
-        let map_restore = simulation.restore_map_authority_after_snapshot_load(
-            rules,
-            overlay_registry,
-            prepare_terrain_assets,
-        )?;
+        let map_restore = match saved_land {
+            Some(saved_land) => simulation.restore_map_authority_after_user_load(
+                rules,
+                overlay_registry,
+                prepare_terrain_assets,
+                saved_land,
+            )?,
+            None => simulation.restore_map_authority_after_snapshot_load(
+                rules,
+                overlay_registry,
+                prepare_terrain_assets,
+            )?,
+        };
         // Older headless saves may omit types that had never spawned. Add
         // those canonical names without changing any saved ID, then build
         // the handle table; a missing name must never become sidebar ID zero.
         simulation.intern_rule_type_ids(rules);
         simulation.resolve_type_handles(rules);
         simulation.rebuild_lighting_sources_after_load(rules);
+        // Post_Load_Game6851AC/6851B1 reselects lighting, then refreshes the
+        // flagged Anim conversions from the incoming stored Locations.
+        simulation.reinitialize_lighting_after_user_load();
+        simulation
+            .refresh_animated_tiberium_after_load(rules, overlay_registry)
+            .map_err(SnapshotRestoreError::from)?;
 
         // A render cache can retain an outgoing ID until its next sweep. Only
         // restored entity identities may re-enter the new presentation owner;
         // do not infer +3CA from current height or from the sinking byte.
         let mut sinking_waterlines = snapshot.sinking_waterlines;
         sinking_waterlines.retain(|(id, _)| simulation.entities().contains(*id));
+        let mut anim_intensities = snapshot.anim_intensities;
+        anim_intensities.retain(|(id, _)| simulation.anim(*id).is_some());
         // MouseLoad5BDF70 preserves the four strip lists; no-init5BE9B0
         // resets their progress only. Hydration is fallible and borrows no
         // outgoing projection, so a rejected save cannot replace its order.
@@ -284,6 +360,7 @@ impl PreparedLoad {
             simulation,
             map_restore,
             sinking_waterlines,
+            anim_intensities,
             sidebar_order,
             tactical_view,
         })
@@ -307,12 +384,13 @@ impl PreparedLoad {
         self.simulation.install_fresh_process_main(process_main);
         // Original successful LoadGame67E6C4 publishes A8ED5C=1 after the
         // fallible content/read tail. Failed preparation never changes it.
-        self.simulation.session.set_started(true);
+        self.simulation.publish_scenario_started();
         (
             self.simulation,
             CommittedLoadPresentation {
                 occupied_overlays: self.map_restore.occupied_overlays,
                 sinking_waterlines: self.sinking_waterlines,
+                anim_intensities: self.anim_intensities,
                 sidebar_order: self.sidebar_order,
                 tactical_view: self.tactical_view,
             },
@@ -326,7 +404,7 @@ impl PreparedLoad {
     ) -> CommittedLoadPresentation {
         let (simulation, presentation) = self.into_committed(
             runtime.simulation.effective_shared_cell_dummy(),
-            &runtime.simulation.main_rng,
+            runtime.simulation.main_rng(),
         );
         runtime.replace_simulation(simulation);
         presentation
@@ -407,7 +485,7 @@ impl SaveRepository {
     }
 
     pub(crate) fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-        std::fs::read(path)
+        crate::util::file_system::read(path)
     }
 
     pub(crate) fn write_named(
@@ -415,10 +493,12 @@ impl SaveRepository {
         file_name: &str,
         bytes: &[u8],
     ) -> Result<PathBuf, SaveWriteError> {
-        std::fs::create_dir_all(&self.directory).map_err(|source| SaveWriteError {
-            #[cfg(any(feature = "dev-overlays", test))]
-            stage: SaveWriteStage::CreateDirectory,
-            source,
+        crate::util::file_system::create_dir_all(&self.directory).map_err(|source| {
+            SaveWriteError {
+                #[cfg(any(feature = "dev-overlays", test))]
+                stage: SaveWriteStage::CreateDirectory,
+                source,
+            }
         })?;
         let path = self.directory.join(file_name);
         self.create_new_file(&path, bytes)?;
@@ -428,19 +508,26 @@ impl SaveRepository {
     /// New saves may not silently replace a timestamp-name collision. Remove
     /// only our newly created partial file if writing fails.
     fn create_new_file(&self, path: &Path, bytes: &[u8]) -> Result<(), SaveWriteError> {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(SaveWriteError::write_file)?;
-        let result = file.write_all(bytes).and_then(|()| file.sync_all());
-        drop(file);
-        if let Err(source) = result {
-            let _ = std::fs::remove_file(path);
-            return Err(SaveWriteError::write_file(source));
+        #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+        {
+            crate::util::file_system::write_new(path, bytes).map_err(SaveWriteError::write_file)
         }
-        Ok(())
+        #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(SaveWriteError::write_file)?;
+            let result = file.write_all(bytes).and_then(|()| file.sync_all());
+            drop(file);
+            if let Err(source) = result {
+                let _ = crate::util::file_system::remove_file(path);
+                return Err(SaveWriteError::write_file(source));
+            }
+            Ok(())
+        }
     }
 
     /// Only an explicit existing repository row can be replaced. Stage the
@@ -451,43 +538,111 @@ impl SaveRepository {
         path: &Path,
         bytes: &[u8],
     ) -> Result<(), SaveWriteError> {
-        if path.parent() != Some(self.directory.as_path())
-            || path.extension().and_then(|ext| ext.to_str()) != Some("bin")
-        {
+        if path.parent() != Some(self.directory.as_path()) || !Self::is_save_file(path) {
             return Err(SaveWriteError::write_file(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "overwrite target is not a save in this repository",
             )));
         }
+        self.validate_existing_save(path)?;
+        self.replace_file(path, bytes)
+    }
+
+    fn validate_existing_save(&self, path: &Path) -> Result<(), SaveWriteError> {
         let previous = self.read(path).map_err(SaveWriteError::write_file)?;
-        GameSnapshot::read_header(&previous).map_err(|error| {
+        // SaveGame67CF42 replaces the slot; an old VERA body's load layout
+        // must not prevent replacement of its recognizable product metadata.
+        GameSnapshot::read_metadata(&previous).map_err(|error| {
             SaveWriteError::write_file(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
         })?;
-        static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let stage = loop {
-            let id = NEXT_STAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let stage = self
-                .directory
-                .join(format!(".save-{}-{id}.tmp", std::process::id()));
-            match self.create_new_file(&stage, bytes) {
-                Ok(()) => break stage,
-                Err(error) if error.source.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        };
-        let result = std::fs::rename(&stage, path);
-        if result.is_err() {
-            let _ = std::fs::remove_file(&stage);
+        Ok(())
+    }
+
+    fn replace_file(&self, path: &Path, bytes: &[u8]) -> Result<(), SaveWriteError> {
+        #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+        {
+            crate::util::file_system::write(path, bytes).map_err(SaveWriteError::write_file)
         }
-        result.map_err(SaveWriteError::write_file)
+        #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+        {
+            static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let directory = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let stage = loop {
+                let id = NEXT_STAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let stage = directory.join(format!(".save-{}-{id}.tmp", std::process::id()));
+                match self.create_new_file(&stage, bytes) {
+                    Ok(()) => break stage,
+                    Err(error) if error.source.kind() == std::io::ErrorKind::AlreadyExists => {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            let result = std::fs::rename(&stage, path);
+            if result.is_err() {
+                let _ = crate::util::file_system::remove_file(&stage);
+            }
+            result.map_err(SaveWriteError::write_file)
+        }
+    }
+
+    /// The game's one retained initial save per mission. Native67CF13..67CF42
+    /// forwards the entire filename to StgCreateDocfile(CREATE). Relative paths
+    /// use VERA's save root; absolute paths retain their selected location.
+    /// Missing subdirectories fail, and an existing VERA automatic slot is replaced.
+    /// The Rust-format boundary preserves foreign/native SAV files rather than
+    /// replacing them with an incompatible snapshot. The attempt still consumes
+    /// the native latch; this does not claim native SAV compatibility.
+    /// User saves keep their separate create-new/explicit-overwrite policy.
+    pub(crate) fn write_initial_campaign(
+        &self,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<PathBuf, SaveWriteError> {
+        let file = Path::new(filename);
+        if file.file_name().is_none()
+            || file.extension().and_then(|ext| ext.to_str()) != Some("sav")
+        {
+            return Err(SaveWriteError::write_file(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "initial campaign save must name a .sav file",
+            )));
+        }
+        if file.is_relative() {
+            crate::util::file_system::create_dir_all(&self.directory).map_err(|source| {
+                SaveWriteError {
+                    #[cfg(any(feature = "dev-overlays", test))]
+                    stage: SaveWriteStage::CreateDirectory,
+                    source,
+                }
+            })?;
+        }
+        let path = self.directory.join(file);
+        if crate::util::file_system::exists(&path) {
+            self.validate_existing_save(&path)?;
+            self.replace_file(&path, bytes)?;
+        } else {
+            self.create_new_file(&path, bytes)?;
+        }
+        Ok(path)
+    }
+
+    fn is_save_file(path: &Path) -> bool {
+        matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("bin" | "sav")
+        )
     }
 
     pub(crate) fn delete(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::remove_file(path)
+        crate::util::file_system::remove_file(path)
     }
 
     pub(crate) fn exists(&self, path: &Path) -> bool {
-        path.exists()
+        crate::util::file_system::exists(&path)
     }
 
     /// Native5596A0 browser metadata with each file's write time. The shared
@@ -497,30 +652,58 @@ impl SaveRepository {
         self.readable_entries().collect()
     }
 
-    /// Whether any compatible save reads: the scan stops at the first one, like
-    /// `LoadOptionsClass__HasLoadableSave` `0x00559C20`.
+    /// Whether any save reads: the scan stops at the first one, like
+    /// `LoadOptionsClass__HasLoadableSave` `0x00559C20`. VERA-only: a save
+    /// another build wrote counts too, because Load lists it (marked, not
+    /// loadable) where gamemd hides it.
     pub(crate) fn has_browser_entry(&self) -> bool {
-        self.readable_entries()
-            .any(|(entry, _)| entry.header.is_current_version())
+        self.readable_entries().next().is_some()
+    }
+
+    /// SaveInfo681840/559ED0 needs metadata, not the simulation body. Reuse
+    /// the one snapshot parser with a growing prefix: strings can exceed a
+    /// fixed page, but ordinary headers must not read a 200 MB saved world.
+    fn read_browser_metadata(
+        mut reader: impl std::io::Read,
+    ) -> std::io::Result<GameSnapshotHeader> {
+        use std::io::Read;
+        let mut prefix = Vec::new();
+        let mut next = 64;
+        loop {
+            let added = reader.by_ref().take(next).read_to_end(&mut prefix)?;
+            match GameSnapshot::read_metadata(&prefix) {
+                Ok(header) => return Ok(header),
+                Err(SnapshotError::DeserializeFailed(
+                    crate::util::save_codec::Error::UnexpectedEnd,
+                )) if added != 0 => next = prefix.len() as u64,
+                Err(error) => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+                }
+            }
+        }
     }
 
     /// Saves whose header reads, with their file time, in directory order.
     fn readable_entries(&self) -> impl Iterator<Item = (SaveEntry, u64)> + '_ {
-        std::fs::read_dir(&self.directory)
+        crate::util::file_system::read_dir(&self.directory)
             .into_iter()
             .flatten()
             .filter_map(|item| {
                 let item = item.ok()?;
                 let path = item.path();
-                if path.extension().and_then(|extension| extension.to_str()) != Some("bin") {
+                if !Self::is_save_file(&path) {
                     return None;
                 }
                 let metadata = item.metadata().ok()?;
                 if !metadata.is_file() {
                     return None;
                 }
-                let bytes = self.read(&path).ok()?;
-                let header = GameSnapshot::read_metadata(&bytes).ok()?;
+                #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+                let reader = std::fs::File::open(&path).ok()?;
+                #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+                let reader =
+                    std::io::Cursor::new(crate::util::file_system::read_shared(&path).ok()?);
+                let header = Self::read_browser_metadata(reader).ok()?;
                 let ticks = crate::map::rmg::saved_seeds::system_time_to_file_time(
                     metadata.modified().ok()?,
                 );
@@ -532,11 +715,11 @@ impl SaveRepository {
     /// modification time without reading or validating its snapshot header.
     #[cfg(any(feature = "dev-overlays", test))]
     pub(crate) fn quickload_path_by_modified_time(&self) -> Option<PathBuf> {
-        let directory = std::fs::read_dir(&self.directory).ok()?;
+        let directory = crate::util::file_system::read_dir(&self.directory).ok()?;
         newest_modified_path(directory.filter_map(|item| {
             let item = item.ok()?;
             let path = item.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("bin") {
+            if !Self::is_save_file(&path) {
                 return None;
             }
             Some((path, item.metadata().ok()?.modified().ok()?))
@@ -553,7 +736,7 @@ fn newest_modified_path(
         .map(|(path, _)| path)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
     use crate::app::match_runtime::frame_pacer::LocalFramePacer;
@@ -595,6 +778,7 @@ mod tests {
     fn load_fixture_launch() -> SkirmishLaunchSession {
         SkirmishLaunchSession {
             mode: SkirmishLaunchMode {
+                class: crate::skirmish_modes::MpModeClass::Battle,
                 id: 1,
                 ui_name_key: "GUI:Battle".into(),
                 tooltip_key: "STT:ModeBattle".into(),
@@ -605,16 +789,23 @@ mod tests {
                 must_ally: false,
             },
             selected_map_file: Some(LOAD_FIXTURE_MAP_NAME.into()),
-            player_name: "Player".into(),
-            local: SkirmishLocalSlot {
-                country: LaunchCountry::America,
-                country_random: false,
-                color_index: 0,
-                color_random: false,
-                start_position: LaunchStartPosition::Position(0),
-                team: LaunchTeam::None,
-            },
+            humans: vec![crate::skirmish_launch::SkirmishHumanSlot {
+                raw_slot_index: Some(0),
+                name: "Player".into(),
+                slot: SkirmishLocalSlot {
+                    country: LaunchCountry::America,
+                    country_random: false,
+                    color_index: 0,
+                    color_random: false,
+                    start_position: LaunchStartPosition::Position(0),
+                    team: LaunchTeam::None,
+                },
+                role: crate::skirmish_launch::LaunchHumanRole::from_observer(false),
+            }],
+            local_player_index: 0,
+            ai_player_count: 1,
             opponents: vec![SkirmishAiSlot {
+                raw_slot_index: 1,
                 country: LaunchCountry::Russia,
                 country_random: false,
                 color_index: 1,
@@ -622,6 +813,7 @@ mod tests {
                 start_position: LaunchStartPosition::Position(1),
                 team: LaunchTeam::None,
                 difficulty: AiDifficulty::Easy,
+                super_tier: None,
             }],
             pre_fill_house_roster:
                 crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(1),
@@ -679,8 +871,8 @@ mod tests {
                 pixel_conversion_bounds: Default::default(),
                 version: 1,
                 tick_hz: 15,
-                seed: simulation.session.seed,
-                map_name: simulation.session.map_name.clone(),
+                seed: simulation.session().seed(),
+                map_name: simulation.session().map_name().to_owned(),
                 rules_hash: rules.simulation_config_hash(),
             });
             replay.record_tick(1, Vec::new(), Some(simulation.state_hash()));
@@ -725,8 +917,8 @@ mod tests {
                 }),
                 startup: self.startup.clone(),
                 screen: self.screen.clone(),
-                pacer_admits_same_bucket: self.frame_pacer.should_admit(32, 1, false),
-                pacer_admits_next_bucket: self.frame_pacer.should_admit(48, 1, false),
+                pacer_admits_same_bucket: self.frame_pacer.should_admit(32, 1, None, false),
+                pacer_admits_next_bucket: self.frame_pacer.should_admit(48, 1, None, false),
                 overlay_render_index: self
                     .overlay_render_index
                     .iter()
@@ -762,6 +954,9 @@ mod tests {
         in_game_menu: crate::ui::pause_menu::InGameMenuState,
     }
 
+    mod animated_tiberium_restore_tests;
+    mod building_repair_restore_tests;
+    mod cloak_restore_tests;
     mod factory_restore_tests;
     mod infantry_death_restore_tests;
     mod rule_cache_restore_tests;
@@ -772,7 +967,9 @@ mod tests {
 
     fn load_fixture_rules() -> RuleSet {
         let ini = IniFile::from_str(
-            "[InfantryTypes]\n\
+            "[Countries]\n0=Americans\n1=Alliance\n2=French\n3=Germans\n\
+             4=British\n5=Africans\n6=Arabs\n7=Confederation\n8=Russians\n\
+             [InfantryTypes]\n\
              [VehicleTypes]\n\
              [AircraftTypes]\n\
              [BuildingTypes]\n\
@@ -784,8 +981,10 @@ mod tests {
 
     pub(super) fn load_fixture_simulation(with_overlay_grid: bool) -> Simulation {
         let mut simulation = Simulation::with_seed(u64::from(LOAD_FIXTURE_SEED));
-        simulation.session.map_name = LOAD_FIXTURE_MAP_NAME.to_string();
-        simulation.overlay_grid = with_overlay_grid.then(|| OverlayGrid::new(0, 0));
+        simulation
+            .session_mut_for_test()
+            .set_map_name_for_test(LOAD_FIXTURE_MAP_NAME.to_string());
+        *simulation.overlay_grid_mut_for_test() = with_overlay_grid.then(|| OverlayGrid::new(0, 0));
         simulation
     }
 
@@ -847,7 +1046,9 @@ mod tests {
 
     fn snapshot(description: &str, save_timestamp: u64) -> Vec<u8> {
         let mut simulation = Simulation::new();
-        simulation.session.map_name = "POLICY.MAP".to_string();
+        simulation
+            .session_mut_for_test()
+            .set_map_name_for_test("POLICY.MAP".to_string());
         GameSnapshot::save_validated(&simulation, 1, 2, description, save_timestamp)
     }
 
@@ -881,7 +1082,7 @@ mod tests {
             .expect("write bad-byte transaction fixture");
 
         let mut invalid_identity = load_fixture_simulation(true);
-        invalid_identity.substrate.next_stable_object_id = 0;
+        invalid_identity.set_next_stable_object_id_for_test(0);
         let invalid_identity_path = repository
             .write_named(
                 "invalid-identity.bin",
@@ -999,10 +1200,14 @@ mod tests {
         let directory = isolated_directory("load-transaction-startup");
         let repository = SaveRepository::at(&directory);
         let mut saved = load_fixture_simulation(true);
-        saved.substrate.base_reservations.reserve(None, 3, 4, 2);
-        saved.substrate.base_reservations.reserve(None, -1, 0, 5);
         saved
-            .session
+            .base_reservations_mut_for_test()
+            .reserve(None, 3, 4, 2);
+        saved
+            .base_reservations_mut_for_test()
+            .reserve(None, -1, 0, 5);
+        saved
+            .session_mut_for_test()
             .install_waypoints(&std::collections::HashMap::from([(
                 701,
                 crate::map::waypoints::Waypoint {
@@ -1017,9 +1222,9 @@ mod tests {
 
         let startup_before = state.startup.clone();
         let baseline = state.baseline();
-        state.runtime.resources.rules = rules;
-        state.runtime.resources.overlay_registry = registry;
-        state.runtime.resources.terrain_template = Some(terrain);
+        state.runtime.resources_mut().rules = rules;
+        state.runtime.resources_mut().overlay_registry = registry;
+        state.runtime.resources_mut().terrain_template = Some(terrain);
         let rules_before = state.runtime.resources.rules.simulation_config_hash();
         let prepared = PreparedLoad::from_repository(
             LoadPreparationView::from_runtime(
@@ -1035,16 +1240,12 @@ mod tests {
         let live_dummy = state.runtime.simulation.effective_shared_cell_dummy();
         assert_eq!(live_dummy.snapshot().coord, (7, 9));
         assert_eq!(
-            prepared
-                .simulation
-                .substrate
-                .base_reservations
-                .raw_mask(None, 3, 4),
+            prepared.simulation.base_reservations().raw_mask(None, 3, 4),
             1 << 2,
             "candidate preparation restores real reservation authority verbatim"
         );
         assert_eq!(
-            prepared.simulation.substrate.base_reservations.dummy_mask(),
+            prepared.simulation.base_reservations().dummy_mask(),
             0,
             "raw snapshot decode reconstructs the process-global dummy cleared"
         );
@@ -1058,7 +1259,7 @@ mod tests {
         );
         assert!(runtime.resources.terrain_template.is_some());
         assert_eq!(
-            runtime.simulation.session.waypoint_cell(701),
+            runtime.simulation.session().waypoint_cell(701),
             Some((122, 135))
         );
         let simulation = &mut runtime.simulation;
@@ -1075,26 +1276,25 @@ mod tests {
             "successful load publishes the prepared post-Resize dummy fields"
         );
         assert_eq!(
-            simulation.substrate.base_reservations.raw_mask(None, 3, 4),
+            simulation.base_reservations().raw_mask(None, 3, 4),
             1 << 2,
             "the narrow dummy reconstruction leaves real reservation state untouched"
         );
-        assert_eq!(simulation.substrate.base_reservations.dummy_mask(), 0);
+        assert_eq!(simulation.base_reservations().dummy_mask(), 0);
 
         let accepted_hash = simulation.state_hash();
         simulation
-            .substrate
-            .base_reservations
+            .base_reservations_mut_for_test()
             .reserve(None, -1, 0, 6);
         assert_ne!(simulation.state_hash(), accepted_hash);
         simulation.reconstruct_cellclass_dummy_for_map_resize();
-        assert_eq!(simulation.substrate.base_reservations.dummy_mask(), 0);
+        assert_eq!(simulation.base_reservations().dummy_mask(), 0);
         assert_eq!(
             simulation.state_hash(),
             accepted_hash,
             "with the shared dummy already zero, reconstruction removes only the hashed stale mask"
         );
-        let tick_before = runtime.simulation.session.tick;
+        let tick_before = runtime.simulation.session().tick();
         runtime
             .advance_frame(
                 &[],
@@ -1103,7 +1303,7 @@ mod tests {
                 crate::sim::world::FrameEffects::default(),
             )
             .expect("fixture frame must complete");
-        assert_eq!(runtime.simulation.session.tick, tick_before + 1);
+        assert_eq!(runtime.simulation.session().tick(), tick_before + 1);
         assert_eq!(state.startup, startup_before);
         assert!(state.startup.admits_exact_step());
         std::fs::remove_dir_all(directory).expect("remove startup fixture directory");
@@ -1122,12 +1322,12 @@ mod tests {
         crate::sim::scenario_bootstrap::initialize_map_roster_houses(
             &mut saved,
             &roster,
-            Some(&rules),
+            &rules,
             Some(&roster_ini),
         );
-        crate::sim::scenario_bootstrap::initialize_campaign_current_house(&mut saved, &roster_ini);
-        let saved_owner = saved.interner.get("SavedPlayer").unwrap();
-        let outgoing_owner = saved.interner.get("OutgoingPlayer").unwrap();
+        saved.initialize_campaign_current_house_for_test(&roster_ini);
+        let saved_owner = saved.interner().get("SavedPlayer").unwrap();
+        let outgoing_owner = saved.interner().get("OutgoingPlayer").unwrap();
         let directory = isolated_directory("current-house-full-load");
         let repository = SaveRepository::at(&directory);
         let path = repository
@@ -1137,19 +1337,18 @@ mod tests {
         crate::sim::scenario_bootstrap::initialize_map_roster_houses(
             &mut current,
             &roster,
-            Some(&rules),
+            &rules,
             Some(&roster_ini),
         );
-        crate::sim::scenario_bootstrap::initialize_campaign_current_house(
-            &mut current,
-            &IniFile::from_str("[Basic]\nPlayer=OutgoingPlayer\n"),
-        );
-        assert_eq!(current.session.current_house, Some(outgoing_owner));
-        assert!(!current.houses[&saved_owner].is_human);
+        current.initialize_campaign_current_house_for_test(&IniFile::from_str(
+            "[Basic]\nPlayer=OutgoingPlayer\n",
+        ));
+        assert_eq!(current.session().current_house(), Some(outgoing_owner));
+        assert!(!current.houses()[&saved_owner].is_human());
         let mut runtime = crate::sim::runtime::SimRuntime::from_simulation(current);
-        runtime.resources.rules = rules;
-        runtime.resources.overlay_registry = registry;
-        runtime.resources.terrain_template = Some(terrain);
+        runtime.resources_mut().rules = rules;
+        runtime.resources_mut().overlay_registry = registry;
+        runtime.resources_mut().terrain_template = Some(terrain);
         let outgoing_hash = runtime.simulation.state_hash();
         let outgoing_rng = runtime.simulation.rng_state();
         let prepared = PreparedLoad::from_repository(
@@ -1162,19 +1361,25 @@ mod tests {
         )
         .expect("repository transaction prepares saved House identity");
         assert_eq!(
-            runtime.simulation.session.current_house,
+            runtime.simulation.session().current_house(),
             Some(outgoing_owner)
         );
         assert_eq!(runtime.simulation.state_hash(), outgoing_hash);
         assert_eq!(runtime.simulation.rng_state(), outgoing_rng);
-        assert_eq!(prepared.simulation.session.current_house, Some(saved_owner));
+        assert_eq!(
+            prepared.simulation.session().current_house(),
+            Some(saved_owner)
+        );
         let _ = prepared.commit_into(&mut runtime);
-        assert_eq!(runtime.simulation.session.current_house, Some(saved_owner));
-        assert!(runtime.simulation.houses[&saved_owner].is_human);
-        assert!(runtime.simulation.houses[&saved_owner].player_control);
-        assert!(!runtime.simulation.houses[&outgoing_owner].is_human);
-        assert!(!runtime.simulation.houses[&outgoing_owner].player_control);
-        let tick = runtime.simulation.session.tick;
+        assert_eq!(
+            runtime.simulation.session().current_house(),
+            Some(saved_owner)
+        );
+        assert!(runtime.simulation.houses()[&saved_owner].is_human());
+        assert!(runtime.simulation.houses()[&saved_owner].player_control());
+        assert!(!runtime.simulation.houses()[&outgoing_owner].is_human());
+        assert!(!runtime.simulation.houses()[&outgoing_owner].player_control());
+        let tick = runtime.simulation.session().tick();
         runtime
             .advance_frame(
                 &[],
@@ -1183,8 +1388,11 @@ mod tests {
                 crate::sim::world::FrameEffects::default(),
             )
             .expect("restored current-house frame");
-        assert_eq!(runtime.simulation.session.tick, tick + 1);
-        assert_eq!(runtime.simulation.session.current_house, Some(saved_owner));
+        assert_eq!(runtime.simulation.session().tick(), tick + 1);
+        assert_eq!(
+            runtime.simulation.session().current_house(),
+            Some(saved_owner)
+        );
         std::fs::remove_dir_all(directory).expect("remove House load fixture");
     }
 
@@ -1195,7 +1403,7 @@ mod tests {
         let repository = SaveRepository::at(&directory);
         for (case_index, handle) in ["Neutral", "sPeCiAl", "COMPUTER1"].into_iter().enumerate() {
             let mut session = load_fixture_launch();
-            session.player_name = handle.to_string();
+            session.local_player_mut().name = handle.to_string();
             let launch =
                 crate::sim::scenario_bootstrap::MatchLaunchDescriptor::from_resolved(session)
                     .expect("existing display name remains admitted");
@@ -1206,10 +1414,10 @@ mod tests {
                 &rules,
                 &launch,
             );
-            let selected = saved.interner.get("Player").unwrap();
-            let neutral = saved.interner.get("Neutral").unwrap();
-            let ai = saved.interner.get("Computer1").unwrap();
-            assert_eq!(saved.session.current_house, Some(selected));
+            let selected = saved.interner().get("Player").unwrap();
+            let neutral = saved.interner().get("Neutral").unwrap();
+            let ai = saved.interner().get("Computer1").unwrap();
+            assert_eq!(saved.session().current_house(), Some(selected));
             assert_ne!(selected, neutral);
             assert_ne!(selected, ai);
             let bytes = snapshot_bytes(&saved, &rules);
@@ -1217,11 +1425,13 @@ mod tests {
                 .write_named(&format!("collision-{case_index}.bin"), &bytes)
                 .unwrap();
             let mut outgoing = GameSnapshot::load(&bytes).unwrap().sim;
-            outgoing.session.current_house = Some(ai);
+            outgoing
+                .session_mut_for_test()
+                .set_current_house_for_test(Some(ai));
             let mut runtime = crate::sim::runtime::SimRuntime::from_simulation(outgoing);
-            runtime.resources.rules = load_fixture_rules();
-            runtime.resources.overlay_registry = OverlayTypeRegistry::empty();
-            runtime.resources.terrain_template = Some(load_fixture_terrain());
+            runtime.resources_mut().rules = load_fixture_rules();
+            runtime.resources_mut().overlay_registry = OverlayTypeRegistry::empty();
+            runtime.resources_mut().terrain_template = Some(load_fixture_terrain());
             let prepared = PreparedLoad::from_repository(
                 LoadPreparationView::from_runtime(
                     &repository,
@@ -1231,16 +1441,16 @@ mod tests {
                 &path,
             )
             .expect("collision-free saved House identity prepares");
-            assert_eq!(runtime.simulation.session.current_house, Some(ai));
+            assert_eq!(runtime.simulation.session().current_house(), Some(ai));
             let _ = prepared.commit_into(&mut runtime);
-            assert_eq!(runtime.simulation.session.current_house, Some(selected));
+            assert_eq!(runtime.simulation.session().current_house(), Some(selected));
             assert!(
-                runtime.simulation.houses[&selected].is_human
-                    && runtime.simulation.houses[&selected].player_control
+                runtime.simulation.houses()[&selected].is_human()
+                    && runtime.simulation.houses()[&selected].player_control()
             );
-            assert!(!runtime.simulation.houses[&neutral].is_human);
-            assert!(!runtime.simulation.houses[&ai].is_human);
-            let tick = runtime.simulation.session.tick;
+            assert!(!runtime.simulation.houses()[&neutral].is_human());
+            assert!(!runtime.simulation.houses()[&ai].is_human());
+            let tick = runtime.simulation.session().tick();
             runtime
                 .advance_frame(
                     &[],
@@ -1249,9 +1459,9 @@ mod tests {
                     crate::sim::world::FrameEffects::default(),
                 )
                 .expect("restored collision-safe current-house frame");
-            assert_eq!(runtime.simulation.session.tick, tick + 1);
-            assert_eq!(runtime.simulation.session.current_house, Some(selected));
-            assert_eq!(launch.session().player_name, handle);
+            assert_eq!(runtime.simulation.session().tick(), tick + 1);
+            assert_eq!(runtime.simulation.session().current_house(), Some(selected));
+            assert_eq!(launch.session().local_player().name, handle);
         }
         std::fs::remove_dir_all(directory).expect("remove collision load fixture");
     }
@@ -1275,15 +1485,15 @@ mod tests {
         runtime_actual.radar_left = [31, 32, 33];
 
         let mut saved = load_fixture_simulation(false);
-        saved.overlay_grid = Some(OverlayGrid::new(1, 1));
+        *saved.overlay_grid_mut_for_test() = Some(OverlayGrid::new(1, 1));
         saved.install_resolved_terrain_for_new_map(translated_template.clone());
         saved
-            .dynamic_terrain_cells
-            .insert((0, 0), DynamicTerrainCellState::capture(&runtime_actual));
+            .dynamic_terrain_cells_mut_for_test()
+            .record(&runtime_actual);
         let bytes = snapshot_bytes(&saved, &rules);
 
         let mut current = load_fixture_simulation(false);
-        current.overlay_grid = Some(OverlayGrid::new(1, 1));
+        *current.overlay_grid_mut_for_test() = Some(OverlayGrid::new(1, 1));
         let restored = PreparedLoad::prepare_candidate(
             &bytes,
             Some(&current),
@@ -1296,8 +1506,7 @@ mod tests {
         .simulation;
 
         let restored_cell = restored
-            .resolved_terrain
-            .as_ref()
+            .resolved_terrain()
             .and_then(|terrain| terrain.cell(0, 0))
             .expect("restored dynamic terrain cell");
         assert_eq!(
@@ -1310,7 +1519,7 @@ mod tests {
         );
         assert_eq!(restored_cell.radar_left, [31, 32, 33]);
         assert_eq!(
-            restored.dynamic_terrain_cells.get(&(0, 0)),
+            restored.dynamic_terrain_cells().get(&(0, 0)),
             Some(&DynamicTerrainCellState::capture(&runtime_actual))
         );
     }
@@ -1378,7 +1587,9 @@ mod tests {
         let directory = isolated_directory("save-repository");
         let repository = SaveRepository::at(&directory);
         let mut simulation = Simulation::new();
-        simulation.session.map_name = "OFFICIAL.MAP".to_string();
+        simulation
+            .session_mut_for_test()
+            .set_map_name_for_test("OFFICIAL.MAP".to_string());
         let bytes = GameSnapshot::save_validated(&simulation, 1, 2, "Northern ridge", 3);
 
         let path = repository
@@ -1400,11 +1611,11 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 #[path = "tests/save_write_tests.rs"]
 mod save_write_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 #[path = "tests/save_browser_tests.rs"]
 mod save_browser_tests;
 

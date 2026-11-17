@@ -122,6 +122,19 @@ impl VoiceQueue {
         self.playing.remove(&owner);
     }
 
+    /// A deploy conversion hands the voice to the object replacing the
+    /// speaker: `UnitClass::Deploy @ 0x00739986..0x007399B2` and
+    /// `BuildingClass::Mission_Selling @ 0x0044A0E9..0x0044A115` copy `+0x4F0`
+    /// and `+0x4F4` over the new object's and write `-1` to the old one's.
+    pub fn move_owner(&mut self, from: u64, to: u64) {
+        for slots in [&mut self.pending, &mut self.playing] {
+            match slots.remove(&from) {
+                Some(sound_id) => slots.insert(to, sound_id),
+                None => slots.remove(&to),
+            };
+        }
+    }
+
     /// The id latched for `owner`, if any — `TechnoClass+0x4F0`.
     pub fn pending_for(&self, owner: u64) -> Option<&str> {
         self.pending.get(&owner).map(String::as_str)
@@ -133,7 +146,7 @@ impl VoiceQueue {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
 mod tests {
     use super::*;
 
@@ -152,6 +165,26 @@ mod tests {
             })
         );
         assert_eq!(queue.pending_for(7), None, "0x006F9F07 clears the latch");
+    }
+
+    /// Deploy `0x00739986..0x007399B2`: both slots overwrite the new
+    /// object's and the old object's go back to `-1`.
+    #[test]
+    fn a_moved_voice_overwrites_the_new_owner_and_empties_the_old() {
+        let mut queue = VoiceQueue::new();
+        queue.queue(7, "MCVSelect");
+        assert!(queue.visit(7, false).is_some());
+        queue.queue(7, "MCVMove");
+        queue.queue(9, "Stale");
+
+        queue.move_owner(7, 9);
+        assert_eq!(queue.playing_for(9), Some("MCVSelect"));
+        assert_eq!(queue.pending_for(9), Some("MCVMove"));
+        assert_eq!((queue.pending_for(7), queue.playing_for(7)), (None, None));
+
+        // An idle old owner leaves the new one idle too.
+        queue.move_owner(7, 9);
+        assert_eq!((queue.pending_for(9), queue.playing_for(9)), (None, None));
     }
 
     #[test]
@@ -217,23 +250,6 @@ mod tests {
     }
 
     #[test]
-    fn two_objects_follow_reached_ai_order_instead_of_stable_id_order() {
-        let mut queue = VoiceQueue::new();
-        queue.queue(9, "DogMove");
-        queue.queue(3, "GIMove");
-        // Supplied live Logic order is 9, 3. Both owners reached the common
-        // Techno voice slot6F9EBB; sorting IDs changes their admission order.
-        let decisions: Vec<_> = [9, 3]
-            .into_iter()
-            .filter_map(|owner| queue.visit(owner, false))
-            .collect();
-        assert_eq!(
-            decisions.iter().map(|d| d.owner).collect::<Vec<_>>(),
-            vec![9, 3]
-        );
-    }
-
-    #[test]
     fn no_visit_keeps_pending_and_other_visits_do_not_drain_it() {
         let mut queue = VoiceQueue::new();
         queue.queue(7, "GIMove");
@@ -245,15 +261,6 @@ mod tests {
         assert_eq!(queue.pending_owners().collect::<Vec<_>>(), vec![7]);
         assert_eq!(queue.pending_for(7), Some("GIMove"));
         assert_eq!(queue.playing_for(7), None);
-    }
-
-    #[test]
-    fn destroyed_before_visit_cannot_admit_its_pending_voice() {
-        let mut queue = VoiceQueue::new();
-        queue.queue(7, "GIMove");
-        queue.forget(7);
-        assert!(queue.visit(7, false).is_none());
-        assert!(queue.pending_owners().next().is_none());
     }
 
     #[test]

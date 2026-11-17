@@ -125,7 +125,7 @@ impl Simulation {
     /// not DoAction's interruption gate: both paths call51D6F0(32,0,0).
     /// House50C8C0 passes0; SlaveManager6B0BD1 passes1. GetMission5B3040
     /// reads the current selector, falling back to the queued selector.
-    /// Steam3e81a617..08600; tools/spatial_oracle/infantry_action_callback
+    /// Steam gamemd; tools/spatial_oracle/infantry_action_callback
     /// --cheer records admission, retained Doing/Stage and RNG boundaries.
     pub(crate) fn infantry_cheer(
         &mut self,
@@ -151,6 +151,32 @@ impl Simulation {
         }
     }
 
+    /// gamemd.exe InfantryClass::PlayIdleAnim521C60 (Foot virtual520).
+    /// Argument1 requests Idle2; every other value requests Idle1, with
+    /// force0/random-stage0. Do_Action owns admission and the retained clock.
+    /// Unit/Aircraft inherit the empty Foot41C120 receiver. No idle-action
+    /// timer rearm or VoiceComment selection belongs to this receiver.
+    pub(crate) fn foot_play_idle_animation(
+        &mut self,
+        id: u64,
+        variant: i32,
+        rules: &RuleSet,
+        effects: FrameEffects<'_>,
+    ) {
+        if !self
+            .substrate
+            .entities
+            .get(id)
+            .is_some_and(|actor| actor.category() == EntityCategory::Infantry)
+        {
+            return;
+        }
+        let action = if variant == 1 { DO_IDLE2 } else { DO_IDLE1 };
+        if let Err(cause) = self.infantry_do_action(id, action, false, rules, effects) {
+            log::debug!("infantry {id} PlayIdleAnim: {cause}");
+        }
+    }
+
     /// `InfantryClass::Do_Action` 0x0051D6F0 for `requested` with the
     /// caller's `force` and a random-frame argument 0, as the class's own
     /// receivers request it. Answers whether the action was accepted.
@@ -167,14 +193,8 @@ impl Simulation {
             .entities
             .get(id)
             .ok_or("retired Do_Action receiver")?;
-        let object = self
-            .object_type(actor.type_ref(), rules)
+        let facts = DoActionType::of(&self.interner, actor.type_ref(), rules)
             .ok_or("Do_Action requires the Infantry type")?;
-        let facts = DoActionType {
-            type_id: &object.id,
-            movement_zone: object.movement_zone,
-            crawls: object.crawls,
-        };
         self.apply_infantry_do_action(id, requested, force, &facts, rules, effects)
     }
 
@@ -216,7 +236,7 @@ impl Simulation {
         id: u64,
         requested: i32,
         force: bool,
-        facts: &DoActionType<'_>,
+        facts: &DoActionType,
         rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) -> Result<bool, String> {
@@ -232,7 +252,7 @@ impl Simulation {
         // Raw WetDie20/21 and Guard1 have native records even though the
         // presentation vocabulary has no corresponding SequenceKind.
         let kind = action_kind(requested);
-        let sequences = rules.animation_sequence(facts.type_id);
+        let sequences = rules.animation_sequence_by_handle(facts.handle);
         // The type's native records (Type `+0xE3C`), signed as the reader
         // stores them; a type without them answers from its draw layout.
         let record = |action: i32| sequences.and_then(|set| set.infantry_action(action));
@@ -305,30 +325,22 @@ impl Simulation {
                 };
             }
             let old_water_state = actor.mission_leaf.as_infantry().unwrap().water_state();
-            let sound_id =
-                rules
-                    .object(facts.type_id)
-                    .and_then(|object| match (old_water_state, on_land) {
-                        (0, true) => object.leave_water_sound.as_ref(),
-                        (1, false) => object.enter_water_sound.as_ref(),
-                        _ => None,
-                    });
+            let object = rules.object_by_handle(facts.handle);
+            let sound_id = match (old_water_state, on_land) {
+                (0, true) => object.leave_water_sound.as_ref(),
+                (1, false) => object.enter_water_sound.as_ref(),
+                _ => None,
+            };
             if let Some(sound_id) = sound_id {
                 //51D842..51D8B3: PlayAt7509E0 uses Location and context0.
                 // Queue the original request before the6E8 store/admission;
                 // the app's audio gate and playback own audible output.
-                let location =
-                    super::ground_pose::object_location(actor, self.resolved_terrain.as_ref());
                 self.sound_events
-                    .push(crate::sim::world::SimSoundEvent::VocAt {
-                        sound_id: sound_id.clone(),
-                        audible_to: None,
-                        rx: actor.position.rx(),
-                        ry: actor.position.ry(),
-                        sub_x: actor.position.sub_x(),
-                        sub_y: actor.position.sub_y(),
-                        world_z_leptons: location.z,
-                    });
+                    .emit(crate::sim::world::SimSoundEvent::voc_at_location(
+                        sound_id.clone(),
+                        actor,
+                        self.resolved_terrain.as_ref(),
+                    ));
             }
             //51D8B8 precedes both unchanged and interruptibility refusals.
             // Every other MovementZone retains its constructor/load state.
@@ -381,11 +393,24 @@ impl Simulation {
                 .frame_delay,
         );
         if matches!(requested, 9 | 10 | 18 | 19 | 23 | 32) {
-            rate = self.session.game_options.speed_normalize(rate);
+            rate = self.session.game_options().speed_normalize(rate);
         }
         //51D939/51D981: the admitted Deploy/Undeploy sound observes the
         // previous Doing and Stage. Refused actions do not emit this cue.
-        self.emit_deploy_action_sound(id, requested, rules)?;
+        let previous_sound_count = self.sound_events.len();
+        Self::emit_deploy_action_sound(
+            &mut self.interner,
+            &self.substrate,
+            self.resolved_terrain.as_ref(),
+            &mut self.sound_events,
+            id,
+            requested,
+            rules,
+        )?;
+        if self.sound_events.len() != previous_sound_count {
+            // DoAction51D94F..51D9CA submits PlayAt before the Doing store.
+            effects.flush_sound(self, rules);
+        }
         let actor = self
             .substrate
             .entities
@@ -397,7 +422,7 @@ impl Simulation {
             .map_err(|error| format!("Do_Action wrote an invalid Doing: {error:?}"))?;
         //51D9D2..51DA44: every accepted class action writes Doing and
         // restarts its stage. The sequencer and draw share this exact state.
-        actor.restart_native_stage(0, self.session.binary_frame as i32, rate);
+        actor.restart_native_stage(0, self.session.binary_frame() as i32, rate);
         // `0x0051DA96..0x0051DAA1`: an accepted action at Health exactly 0
         // re-enters Stop_Driver, whose own Do_Action finds the action it
         // just wrote. The Can_Enter_Cell it runs reads no overlay here.
@@ -417,24 +442,6 @@ impl Simulation {
             }
         }
         Ok(true)
-    }
-
-    /// `InfantryClass::AI`'s Health reset (`0x0051BC57..0x0051BC96`), before
-    /// `FootClass::AI`: an infantryman at Health 0 or below whose action is
-    /// not a death sequence ([`in_death_sequence`]) is set to Health 1. A
-    /// corpse on its death sequence and a crashing Jumpjet infantryman keep
-    /// Health 0; a death whose `Do_Action` was refused (a sequence with no
-    /// frames, `0x0051D70F`) left the previous action, and is raised here.
-    pub(crate) fn infantry_health_reset(&mut self, id: u64) {
-        let Some(actor) = self.substrate.entities.get_mut(id) else {
-            return;
-        };
-        let Some(doing) = actor.mission_leaf.as_infantry().map(|leaf| leaf.doing()) else {
-            return;
-        };
-        if actor.health.current() <= 0 && !in_death_sequence(doing) {
-            actor.health.set(1);
-        }
     }
 
     /// What `InfantryClass::AI` does with an infantryman's action after its
@@ -478,7 +485,32 @@ impl Simulation {
                 .set_foot_firing_sequence(0);
             self.infantry_do_action(id, requested, false, rules, effects)?;
         }
-        self.object_ai_post_movement_promote_one(id, Some(rules));
+        // InfantryClass::AI @0x0051BAB0, retail gamemd.exe instructions:
+        //51BE3E..51BE52 latches Team+82 from the retained playfield byte+3D5.
+        // A fresh bounds query would discard ordinary movement's hysteresis.
+        if self
+            .substrate
+            .entities
+            .get(id)
+            .is_some_and(|actor| actor.in_playfield())
+        {
+            self.team_script_vm.mark_member_team_leaving_map(id);
+        }
+        // Not ported: 51BE59..51BEBE removes a teamless infantryman on Guard
+        // whose Location fails MapClass::CoordinatesLegal 568350 (vt+0x3A0,
+        // then UnInit, returning before the thief capture). UNREACHABLE: the
+        // test is the map Size diamond that every cell lies in, as for the
+        // Unit's Guard map exit (movement/per_cell.rs), and an infantryman
+        // running AI always stands or flies over a map cell.
+        // InfantryClass::AI51BEC0 calls TryThiefVehicleCapture5202F0 before
+        // the second Ready/Commence. Success returns before Fear/Fire/Doing.
+        let capture = self.infantry_try_thief_capture(id, rules, registry, effects)?;
+        if capture.consumed {
+            let mut receipt = DamageCommitReceipt::default();
+            receipt.bridge_state_changed = capture.bridge_state_changed;
+            return Ok(receipt);
+        }
+        self.object_ai_post_movement_promote_one(id, rules);
         //51BF0B is after Process and the second Ready/Commence, including a
         // retained death sequence. Shared DoAction decides stance refusal.
         let bridge_changed = self.infantry_fear_turn(id, rules, registry, effects)?;
@@ -490,7 +522,7 @@ impl Simulation {
             registry,
             effects,
         );
-        receipt.bridge_state_changed |= bridge_changed;
+        receipt.bridge_state_changed |= bridge_changed || capture.bridge_state_changed;
         if self
             .substrate
             .entities
@@ -536,7 +568,11 @@ impl Simulation {
         let actor_type = actor.type_ref();
         let complete = if doing != -1 {
             let stage = actor.native_stage().value();
-            let sequences = rules.animation_sequence(self.interner.resolve(actor.type_ref()));
+            let sequences = self.interner.animation_sequence_in_category(
+                actor.type_ref(),
+                crate::rules::object_type::ObjectCategory::Infantry,
+                rules,
+            );
             let count = match sequences.and_then(|set| set.infantry_action(doing)) {
                 Some(record) => record.frames_per_facing,
                 None => action_kind(doing)
@@ -568,8 +604,13 @@ impl Simulation {
                 action if takes_default_arm(action) => {
                     // `0x00520CE6..0x00520D16`: a completed action (not -1) turns
                     // the body to its record's facing hint first.
-                    if let Some(facing) = rules
-                        .animation_sequence(self.interner.resolve(actor_type))
+                    if let Some(facing) = self
+                        .interner
+                        .animation_sequence_in_category(
+                            actor_type,
+                            crate::rules::object_type::ObjectCategory::Infantry,
+                            rules,
+                        )
                         .and_then(|set| set.infantry_action(action))
                         .and_then(|record| {
                             crate::rules::infantry_sequence::completion_facing(record.facing_hint)
@@ -579,7 +620,7 @@ impl Simulation {
                         crate::sim::animation::snap_completion_facing(
                             &mut actor.body_facing,
                             facing,
-                            self.session.binary_frame,
+                            self.session.binary_frame(),
                         );
                     }
                     self.infantry_default_action(id, action, rules, effects);
@@ -600,12 +641,14 @@ impl Simulation {
                     true
                 }
                 38 => {
-                    let requested = if self
-                        .substrate
-                        .entities
-                        .get(id)
-                        .is_some_and(|actor| actor.mission.current().raw() == 10)
-                    {
+                    // `0x00520B61..0x00520B84`: Get_Mission (vt+0x184,
+                    // `0x005B3040`, current or else queued) == Harvest asks
+                    // a forced Shovel; anything else takes the forced Ready
+                    // at `0x00520E42`.
+                    let requested = if self.substrate.entities.get(id).is_some_and(|actor| {
+                        actor.mission.effective().known()
+                            == Some(crate::sim::mission::MissionType::Harvest)
+                    }) {
                         38
                     } else {
                         DO_READY
@@ -632,6 +675,7 @@ impl Simulation {
         {
             log::debug!("infantry {id} Paradrop completion: {cause}");
         }
+        self.infantry_sequence_sounds(id, rules);
         // Health zero is a retained death sequence, not UnInit. Keep its
         // native count boundary distinct from ordinary AI eligibility.
         uninitialized
@@ -640,6 +684,53 @@ impl Simulation {
                 .entities
                 .get(id)
                 .is_none_or(|actor| !actor.lifecycle.object_alive())
+    }
+
+    /// The sequencer's sound tail (`0x00520E75..0x00520EF2`), after any
+    /// completion action: each sound of the current Doing's record plays
+    /// through PlayAt (`0x007509E0`, Location `+0x9C`, context 0) when this
+    /// frame's stage step passed (`+0xFC`) and the stage modulo the record's
+    /// count (at least 1) is its frame. It runs after UnInit too while the
+    /// infantryman's state remains.
+    fn infantry_sequence_sounds(&mut self, id: u64, rules: &RuleSet) {
+        let Some(actor) = self.substrate.entities.get(id) else {
+            return;
+        };
+        let Some(doing) = actor.mission_leaf.as_infantry().map(|leaf| leaf.doing()) else {
+            return;
+        };
+        if doing == -1 || !actor.native_stage().changed() {
+            return;
+        }
+        let Some(object) = self.interner.object_type_in_category(
+            actor.type_ref(),
+            crate::rules::object_type::ObjectCategory::Infantry,
+            rules,
+        ) else {
+            return;
+        };
+        let mut sounds = object.sequence_sounds(doing).peekable();
+        if sounds.peek().is_none() {
+            return;
+        }
+        let count = self
+            .interner
+            .animation_sequence_in_category(
+                actor.type_ref(),
+                crate::rules::object_type::ObjectCategory::Infantry,
+                rules,
+            )
+            .and_then(|set| set.infantry_action(doing))
+            .map_or(0, |record| record.frames_per_facing);
+        let frame = actor.native_stage().value() % count.max(1);
+        for sound in sounds.filter(|sound| sound.frame == frame) {
+            self.sound_events
+                .emit(crate::sim::world::SimSoundEvent::voc_at_location(
+                    sound.sound_id.clone(),
+                    actor,
+                    self.resolved_terrain.as_ref(),
+                ));
+        }
     }
 
     /// The Infantry `INoticeSink` answer to the Jumpjet crash impact
@@ -659,7 +750,12 @@ impl Simulation {
             return;
         };
         let crashable = self
-            .object_type(actor.type_ref(), rules)
+            .interner
+            .object_type_in_category(
+                actor.type_ref(),
+                crate::rules::object_type::ObjectCategory::Infantry,
+                rules,
+            )
             .is_some_and(|object| object.crashable);
         if !crashable {
             return;
@@ -681,13 +777,110 @@ impl Simulation {
             } else {
                 0
             },
-            Some(rules),
+            rules,
             registry,
             effects,
         );
         if let Err(cause) = self.infantry_do_action(id, DO_AIR_DEATH_FINISH, true, rules, effects) {
             log::debug!("infantry {id} AirDeathFinish: {cause}");
         }
+    }
+
+    /// `InfantryClass::Movement_Actions`' recovery (`0x00520FAF..0x00521144`),
+    /// after the stopped Move prefix. An infantryman whose NavCom (`+0x5A4`)
+    /// lies in a zone he cannot reach drops it with Assign_Destination(NULL,
+    /// 1) (vt+0x480). The NavCom's cell comes from its vt+0x4C coordinate for
+    /// him. The test is `MapClass::Can_Reach_Zone @ 0x0056D100` from his
+    /// navigation cell ([`Self::foot_can_reach_navigation_cell`]).
+    ///
+    /// He keeps the NavCom when:
+    /// - his failed-path byte (`+0x6DC`) is set and his Can_Enter_Cell
+    ///   (`0x0051BF90`) answers 7 for the cell of his navigation coordinate
+    ///   (vt+0x1C4 `0x005F6A10`), with no direction, level or source cell;
+    /// - his locomotor is moving (ILocomotion `+0x10`);
+    /// - he is tethered (`+0x418`);
+    /// - he is outside the playfield (`+0x3D5`);
+    /// - his type has `Infiltrate=` (`+0xEBE`);
+    /// - his Get_Mission is Enter.
+    ///
+    /// The arm reads in that order and draws no RNG.
+    fn infantry_drop_unreachable_nav_com(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        effects: FrameEffects<'_>,
+    ) -> Result<(), String> {
+        let Some(actor) = self.substrate.entities.get(id) else {
+            return Ok(());
+        };
+        let Some(nav_com) = actor.navigation.nav_com() else {
+            return Ok(());
+        };
+        let destination = super::navcom::nav_target_coordinate(
+            nav_com,
+            Some(id),
+            self,
+            self.resolved_terrain.as_ref(),
+            Some((rules, &self.interner)),
+        )?;
+        if actor
+            .infantry
+            .as_ref()
+            .is_some_and(|infantry| infantry.cell_entry_blocked())
+        {
+            let terrain = self
+                .resolved_terrain
+                .as_ref()
+                .ok_or("the recovery requires map cells")?;
+            let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+            let here = super::foot_path::coord_cell(self.foot_navigation_coordinate(id)?);
+            let answer = self.infantry_can_enter(
+                id,
+                cells.lookup(here),
+                super::infantry_entry::InfantryEntryArgs {
+                    direction: -1,
+                    height: -1,
+                    previous_cell: None,
+                },
+                rules,
+                registry,
+            )?;
+            if answer == super::infantry_entry::InfantryEntryClass::Impassable7 {
+                return Ok(());
+            }
+        }
+        let actor = self
+            .substrate
+            .entities
+            .get(id)
+            .ok_or("the recovery's infantryman disappeared")?;
+        if super::motion_query::is_moving(actor) != Some(false)
+            || actor.tether.partner().is_some()
+            || !actor.in_playfield()
+            || self.foot_can_reach_navigation_cell(id, destination, rules)?
+        {
+            return Ok(());
+        }
+        let actor = self
+            .substrate
+            .entities
+            .get(id)
+            .ok_or("the recovery's infantryman disappeared")?;
+        if self
+            .interner
+            .object_type_in_category(
+                actor.type_ref(),
+                crate::rules::object_type::ObjectCategory::Infantry,
+                rules,
+            )
+            .is_some_and(|object| object.infiltrate)
+            || actor.mission.effective().known() == Some(crate::sim::mission::MissionType::Enter)
+        {
+            return Ok(());
+        }
+        self.assign_null_destination(id, rules, registry, effects);
+        Ok(())
     }
 
     /// The locomotion action tail of `0x00520F40` (`0x00521144..0x0052130F`),
@@ -713,8 +906,8 @@ impl Simulation {
     ///
     /// The stopped Move prefix520F40..520FAF reuses the class destination
     /// and idle owners. Its NavNULL arm consumes the archived factory rally
-    /// after Walk has released the barracks contact. The remaining recovery
-    /// branches520FB0..521144 are separate residuals, not approximated here.
+    /// after Walk has released the barracks contact. The unreachable-NavCom
+    /// recovery follows it ([`Self::infantry_drop_unreachable_nav_com`]).
     ///
     /// Nothing here tests Health: a corpse reaches the tail, and Do_Action
     /// refuses its unforced requests for the death action
@@ -755,6 +948,9 @@ impl Simulation {
                 self.infantry_enter_idle_mode(id, rules, registry, effects);
             }
         }
+        if let Err(cause) = self.infantry_drop_unreachable_nav_com(id, rules, registry, effects) {
+            log::debug!("Infantry {id} unreachable NavCom recovery: {cause}");
+        }
         let Some(actor) = self.substrate.entities.get(id) else {
             return;
         };
@@ -766,12 +962,17 @@ impl Simulation {
         };
         let moving_now = super::motion_query::is_really_moving_now(
             actor,
-            Some(super::SpeedRules::new(rules, &self.interner, &self.houses)),
-            self.session.binary_frame,
+            super::SpeedRules::new(rules, &self.interner, &self.houses),
+            self.session.binary_frame(),
         );
         let requested = if moving_now {
             let jumpjet_type = self
-                .object_type(actor.type_ref(), rules)
+                .interner
+                .object_type_in_category(
+                    actor.type_ref(),
+                    crate::rules::object_type::ObjectCategory::Infantry,
+                    rules,
+                )
                 .is_some_and(|object| object.jumpjet);
             if jumpjet_type && uses_jumpjet_locomotor(actor) {
                 let firing = actor.mission_leaf.foot_firing_sequence_latch() != 0;
@@ -944,19 +1145,66 @@ impl Simulation {
     }
 }
 
+impl crate::sim::world::ObjectSubstrate {
+    /// `InfantryClass::AI`'s Health reset (`0x0051BC57..0x0051BC96`), before
+    /// `FootClass::AI`: an infantryman at Health 0 or below whose action is
+    /// not a death sequence ([`in_death_sequence`]) is set to Health 1. A
+    /// corpse on its death sequence and a crashing Jumpjet infantryman keep
+    /// Health 0; a death whose `Do_Action` was refused (a sequence with no
+    /// frames, `0x0051D70F`) left the previous action, and is raised here.
+    pub(crate) fn infantry_health_reset(&mut self, id: u64) {
+        if let Some(actor) = self.entities.get_mut_if(id, |actor| {
+            actor.health.current() <= 0
+                && actor
+                    .mission_leaf
+                    .as_infantry()
+                    .is_some_and(|leaf| !in_death_sequence(leaf.doing()))
+        }) {
+            actor.health.set(1);
+        }
+    }
+}
+
 /// The type facts `Do_Action` reads besides its sequence records.
-pub(super) struct DoActionType<'a> {
-    pub(super) type_id: &'a str,
+pub(super) struct DoActionType {
+    /// The type, whose sequence records and water sounds `Do_Action` reads.
+    pub(super) handle: crate::rules::ruleset::TypeHandle,
     /// Type `+0x5B4`.
     pub(super) movement_zone: MovementZone,
     /// `Crawls=`, Type `+0xEBD`.
     pub(super) crawls: bool,
 }
 
-#[cfg(test)]
+impl DoActionType {
+    /// The facts of the type `type_ref` names, which the receiver's object
+    /// type lookup answers.
+    pub(super) fn of(
+        interner: &crate::sim::intern::StringInterner,
+        type_ref: crate::sim::intern::InternedId,
+        rules: &RuleSet,
+    ) -> Option<Self> {
+        let handle = interner.type_handle_in_category(
+            type_ref,
+            crate::rules::object_type::ObjectCategory::Infantry,
+            rules,
+        )?;
+        let object = rules.object_by_handle(handle);
+        Some(Self {
+            handle,
+            movement_zone: object.movement_zone,
+            crawls: object.crawls,
+        })
+    }
+}
+
+#[cfg(all(test, tests_sim_movement))]
 #[path = "infantry_action_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "infantry_water_action_tests.rs"]
 mod water_tests;
+
+#[cfg(all(test, tests_sim_movement))]
+#[path = "infantry_unreachable_navcom_tests.rs"]
+mod unreachable_navcom_tests;

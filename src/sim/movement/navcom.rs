@@ -10,7 +10,8 @@ use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::entity_store::EntityStore;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::world::FrameEffects;
-use crate::util::fixed_math::{SIM_ZERO, SimFixed};
+#[cfg(test)]
+use crate::util::fixed_math::SimFixed;
 
 /// FootClass-style owner navigation fields, owned by this module: NavCom
 /// (`Foot+0x5A4`), its auxiliary slot (`Foot+0x5A0`), SuspendedNavCom
@@ -25,15 +26,15 @@ use crate::util::fixed_math::{SIM_ZERO, SimFixed};
 pub struct NavigationState {
     /// Foot+55C is retained lifecycle history, not current occupancy.
     #[serde(default)]
-    pub(crate) neighbor_state: crate::sim::cell_neighbors::FootNeighborState,
+    neighbor_state: crate::sim::cell_neighbors::FootNeighborState,
     /// Foot timers, retry count and blockage latch survive path retirement.
     #[serde(default)]
-    pub path_runtime: crate::sim::components::FootPathRuntime,
+    path_runtime: crate::sim::components::FootPathRuntime,
     /// Foot-owned direction replay and reference cell (+5E0/+558), shared by
     /// every locomotor instance. Retirement must not discard the owner queue.
     /// Native chain tails reload the owner at Drive4B1DF7 / Ship6A143A.
     #[serde(default)]
-    pub path_replay: crate::sim::components::FootPathQueue,
+    path_replay: crate::sim::components::FootPathQueue,
     /// `Foot+0x5A0`, NavCom's auxiliary slot, cleared whenever NavCom is
     /// published or stopped.
     #[serde(default)]
@@ -82,6 +83,63 @@ impl Default for NavigationState {
 }
 
 impl NavigationState {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_neighbor_state_for_test(
+        &mut self,
+        value: crate::sim::cell_neighbors::FootNeighborState,
+    ) {
+        self.neighbor_state = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_path_replay_for_test(&mut self, value: crate::sim::components::FootPathQueue) {
+        self.path_replay = value;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_path_runtime_for_test(&mut self, value: crate::sim::components::FootPathRuntime) {
+        self.path_runtime = value;
+    }
+
+    /// Foot+55C neighbor history.
+    pub(crate) fn neighbor_state(&self) -> &crate::sim::cell_neighbors::FootNeighborState {
+        &self.neighbor_state
+    }
+
+    pub(crate) fn neighbor_state_mut(
+        &mut self,
+    ) -> &mut crate::sim::cell_neighbors::FootNeighborState {
+        &mut self.neighbor_state
+    }
+
+    /// The Foot path timers, retry count and blockage latch.
+    pub fn path_runtime(&self) -> &crate::sim::components::FootPathRuntime {
+        &self.path_runtime
+    }
+
+    pub(crate) fn path_runtime_mut(&mut self) -> &mut crate::sim::components::FootPathRuntime {
+        &mut self.path_runtime
+    }
+
+    /// The Foot-owned direction replay and reference cell (+5E0/+558).
+    pub fn path_replay(&self) -> &crate::sim::components::FootPathQueue {
+        &self.path_replay
+    }
+
+    pub(crate) fn path_replay_mut(&mut self) -> &mut crate::sim::components::FootPathQueue {
+        &mut self.path_replay
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn path_runtime_mut_for_test(&mut self) -> &mut crate::sim::components::FootPathRuntime {
+        &mut self.path_runtime
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn path_replay_mut_for_test(&mut self) -> &mut crate::sim::components::FootPathQueue {
+        &mut self.path_replay
+    }
+
     /// Foot constructor-owned navigation state, including its frame anchors.
     pub(crate) fn at_frame(frame: u32) -> Self {
         Self {
@@ -144,6 +202,12 @@ impl NavigationState {
         self.nav_com_aux = None;
     }
 
+    /// FootClass::Set_NavComAux 0x004D94A0 stores the pointer at +0x5A0.
+    /// EventClass::Execute calls it after Set_Destination (0x004C74BA).
+    pub(crate) fn set_nav_com_aux(&mut self, target: Option<NavTargetRef>) {
+        self.nav_com_aux = target;
+    }
+
     /// NavCom stored alone, without the setter's NavComAux clear: the null
     /// setter's re-clear after the locomotor Stop (`0x004D96BC`), a
     /// locomotor's Move_To (Jumpjet's reached cell `0x0054B44B`, Teleport's
@@ -200,15 +264,27 @@ impl NavigationState {
         self.nav_queue.clear();
     }
 
+    /// Insert at the NavQueue's front (`DynamicVectorClass` growth then a
+    /// `memmove` up and a store at index 0, `0x0074231E..0x00742374`).
+    pub(crate) fn push_nav_queue_front(&mut self, target: NavTargetRef) {
+        self.nav_queue.insert(0, target);
+    }
+
     /// Take the NavQueue's oldest entry.
     pub(crate) fn pop_nav_queue_front(&mut self) -> Option<NavTargetRef> {
         (!self.nav_queue.is_empty()).then(|| self.nav_queue.remove(0))
     }
 
+    /// Unit7447B0 appends route posts, then returns the first through the
+    /// same queue owner. Entries retain their native order and duplicates.
+    pub(crate) fn append_nav_queue(&mut self, target: NavTargetRef) {
+        self.nav_queue.push(target);
+    }
+
     /// Append to a fixture's NavQueue.
     #[cfg(any(test, feature = "test-support"))]
     pub fn push_nav_queue_for_test(&mut self, target: NavTargetRef) {
-        self.nav_queue.push(target);
+        self.append_nav_queue(target);
     }
 
     /// Keep only the NavQueue entries `keep` accepts.
@@ -224,6 +300,12 @@ impl NavigationState {
     /// `Foot+0x6B1`, the list's loop flag.
     pub(crate) fn nav_list_loops(&self) -> bool {
         self.nav_list_loops
+    }
+
+    /// Unit741F40..741FB6 prepends a moving Drive's next destination without
+    /// Queue_Navigation_List's self-reference or empty-list loop rewrites.
+    pub(crate) fn prepend_nav_list(&mut self, target: NavTargetRef) {
+        self.nav_list.insert(0, target);
     }
 
     /// Queue_Navigation_List's list writes (`0x004DA0F1..0x004DA157`): the
@@ -289,6 +371,11 @@ impl NavigationState {
         self.pending_destination_setter = false;
     }
 
+    /// Whether a call is owed for `Simulation::complete_pending_order`.
+    pub(crate) fn destination_setter_owed(&self) -> bool {
+        self.pending_destination_setter
+    }
+
     /// Take the owed call for `Simulation::complete_pending_order` to make.
     pub(crate) fn take_destination_setter(&mut self) -> bool {
         std::mem::take(&mut self.pending_destination_setter)
@@ -334,7 +421,8 @@ const WALK_BRIDGE_LIFT_PIXELS: i32 = 60;
 
 /// Drive Stop_Moving 0x4AFE00 and Ship 0x69F510 clamp the class target
 /// fraction to the float 0.3 at 0x7E6240 / 0x7F1308 (identical bodies).
-const TRACK_STOP_TARGET_FRACTION: SimFixed = SimFixed::lit("0.3");
+const TRACK_STOP_TARGET_FRACTION: crate::util::native_x87::NativeF64Bits =
+    crate::util::native_x87::NativeF64Bits::from_bits(0x3fd3_3333_4000_0000);
 
 /// Accepted Walk75ACB0 destination store. This conversion is independent of
 /// HeadTo/OnBridge's416: a bridge cell lifts the destination by
@@ -390,33 +478,28 @@ fn is_ship_locomotor(entity: &GameEntity) -> bool {
         .is_some_and(|loco| matches!(loco.active_kind(), LocomotorKind::Ship))
 }
 
+/// The Foot's Locomotor (`+0x674`) is a `HoverLocomotionClass` (CLSID `0x007E9A40`).
+fn is_hover_locomotor(entity: &GameEntity) -> bool {
+    entity
+        .locomotor
+        .as_ref()
+        .is_some_and(|loco| matches!(loco.active_kind(), LocomotorKind::Hover))
+}
+
+/// `CellClass::GetCoords` (`0x00486840`) of the cell `MapClass::Get_CellClass`
+/// (`0x005657A0`) gives for `(rx, ry)` through `cells`, which stamps the
+/// query's fallback CellClass on a miss. Z 0 for an unsupported slope
+/// ([`CellRef::get_coords`]).
+///
+/// [`CellRef::get_coords`]: crate::sim::cell_rect::CellRef::get_coords
 pub(crate) fn target_cell_coord(
     rx: u16,
     ry: u16,
     cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
 ) -> DriveCoord {
     if let Some(cells) = cells {
-        let identity = cells.lookup((rx as i16, ry as i16));
-        let (x, y, z) = crate::sim::cell_kernel::native_cell_own_coords(identity, cells)
-            .unwrap_or_else(|| {
-                // Preserve this caller's existing unsupported-slope zero-Z
-                // adapter. The receiver identity/XY still come from the same
-                // Cell and the shared center kernel.
-                let (x, y) = cells.coord(identity);
-                let point = crate::sim::cell_kernel::cell_center(
-                    crate::sim::cell_kernel::CellCoordinate {
-                        x: i32::from(x),
-                        y: i32::from(y),
-                    },
-                    0,
-                );
-                (i64::from(point.x), i64::from(point.y), 0)
-            });
-        return DriveCoord {
-            x: x as i32,
-            y: y as i32,
-            z: z as i32,
-        };
+        return crate::sim::cell_rect::native_cell_ref(cells, cells.lookup((rx as i16, ry as i16)))
+            .get_coords();
     }
     // Map-less fixtures take the centre at Z 0. Every gameplay world (app,
     // headless, replay, sim-bench) comes from a map load.
@@ -432,6 +515,24 @@ pub(crate) fn target_cell_coord(
         y: point.y,
         z: point.z,
     }
+}
+
+/// Cell486840 through an already-retained pointer (virtual+48/+4C).
+/// Recover the allocation from the original command coordinate without a Map
+/// lookup: a later miss can have moved the shared Dummy, even onto a real
+/// cell's coordinate, while its own level and slope still belong to Dummy.
+pub(crate) fn retained_cell_coord(
+    rx: u16,
+    ry: u16,
+    cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
+) -> DriveCoord {
+    let Some(cells) = cells else {
+        return target_cell_coord(rx, ry, None);
+    };
+    let identity = crate::sim::combat::TargetKind::Cell(rx, ry)
+        .cell_identity(cells.terrain())
+        .expect("Cell target has a Cell allocation identity");
+    crate::sim::cell_rect::native_cell_ref(cells, identity).get_coords()
 }
 
 /// Shared destination-setter adjustment (Drive4AFD40 / Ship69F450). Each call
@@ -544,7 +645,7 @@ pub(crate) fn nav_target_coordinate(
 ) -> Result<DriveCoord, String> {
     let id = match target {
         NavTargetRef::Cell { rx, ry } => {
-            return Ok(target_cell_coord(
+            return Ok(retained_cell_coord(
                 rx,
                 ry,
                 terrain
@@ -566,6 +667,29 @@ pub(crate) fn nav_target_coordinate(
         )
         .ok_or_else(|| format!("NavCom coordinate target {id} disappeared"));
     };
+    object_navigation_coordinate(entity, requester, terrain, rules, || {
+        let id = requester.expect("Bunker only reads a non-null requester");
+        let entity = entities
+            .get(id)
+            .ok_or_else(|| format!("Navigation requester {id} disappeared"))?;
+        Ok(super::ground_pose::object_get_coords(entity, terrain))
+    })
+}
+
+/// A live object's virtual+4C coordinate: Building `0x00447E90` (its type's
+/// dock policy, which reads the requester only for a Bunker) or Foot
+/// `0x004DBDF0` (its tube exit, else its locomotor's retained head).
+pub(crate) fn object_navigation_coordinate(
+    entity: &GameEntity,
+    requester: Option<u64>,
+    terrain: Option<&ResolvedTerrainGrid>,
+    rules: Option<(
+        &crate::rules::ruleset::RuleSet,
+        &crate::sim::intern::StringInterner,
+    )>,
+    requester_coordinate: impl FnOnce() -> Result<DriveCoord, String>,
+) -> Result<DriveCoord, String> {
+    let id = entity.stable_id();
     if entity.category() == crate::map::entities::EntityCategory::Structure {
         let (rules, interner) =
             rules.ok_or_else(|| format!("Building {id} navigation requires type data"))?;
@@ -578,13 +702,7 @@ pub(crate) fn nav_target_coordinate(
             object,
             &entity.radio_contacts,
             requester,
-            || {
-                let id = requester.expect("Bunker only reads a non-null requester");
-                let entity = entities
-                    .get(id)
-                    .ok_or_else(|| format!("Navigation requester {id} disappeared"))?;
-                Ok(super::ground_pose::object_get_coords(entity, terrain))
-            },
+            requester_coordinate,
         );
     }
     super::foot_coordinate::navigation_coordinate(entity, terrain)
@@ -613,12 +731,13 @@ impl crate::sim::world::Simulation {
 
 /// Cell callers of the shared non-null destination owner. Object callers
 /// capture their receiver's +4C through `nav_target_coordinate` instead.
+#[cfg(test)]
 pub(crate) fn set_destination_internal_cell(
     entity: &mut GameEntity,
     target: (u16, u16),
     resolved_terrain: Option<&ResolvedTerrainGrid>,
     binary_frame: u32,
-) {
+) -> bool {
     let coord = target_cell_coord(
         target.0,
         target.1,
@@ -632,36 +751,61 @@ pub(crate) fn set_destination_internal_cell(
         coord,
         resolved_terrain,
         binary_frame,
-    );
+    )
 }
 
 /// Foot4D9510/4D9628 publishes the reference and dispatches its captured +4C
 /// coordinate. Cell and object orders reach the same active locomotor owner;
-/// `binary_frame` is the locomotor Move_To paralysis clock.
+/// `binary_frame` is the locomotor Move_To paralysis clock. True when Hover's
+/// Move_To still owes `Simulation::hover_move_to_path_step`.
 pub(crate) fn set_destination_internal_coord(
     entity: &mut GameEntity,
     target: NavTargetRef,
     coord: DriveCoord,
     resolved_terrain: Option<&ResolvedTerrainGrid>,
     binary_frame: u32,
-) {
+) -> bool {
     publish_nav_com(entity, target);
 
     if is_drive_locomotor(entity) {
         drive_set_destination(entity, coord, resolved_terrain, binary_frame);
     } else if is_ship_locomotor(entity) {
         ship_set_destination(entity, coord, resolved_terrain, binary_frame);
-    } else if super::hover::hover_move_to(entity, coord, resolved_terrain, binary_frame) {
     } else {
-        set_walk_destination_coord(entity, coord, resolved_terrain);
+        use super::hover::HoverMoveTo;
+        // 0x004D95B3..0x004D9601: ahead of Hover's Move_To an expired +640
+        // restarts for one frame, so Path_And_Arrival's gate
+        // (0x00516621..0x00516645) refuses the search inside the order. The
+        // setter's tail (`DestinationTiming::accept`) zeroes the timer, and
+        // the first search is the next Process's.
+        if is_hover_locomotor(entity)
+            && entity
+                .navigation
+                .path_runtime()
+                .movement_timer()
+                .expired(binary_frame as i32)
+        {
+            entity
+                .navigation
+                .path_runtime_mut()
+                .start_movement(binary_frame, 1);
+        }
+        match super::hover::hover_move_to(entity, coord, resolved_terrain, binary_frame) {
+            HoverMoveTo::PathStepOwed => return true,
+            HoverMoveTo::Done => {}
+            HoverMoveTo::NotHover => set_walk_destination_coord(entity, coord, resolved_terrain),
+        }
     }
+    false
 }
 
 /// Foot4D94C7/4D9510: NavComAux cleared and the reference published, before
-/// the locomotor dispatch. The Foot+0x6AC skip (4D9607) stops here, and a
-/// Teleport owner's Move_To is dispatched by the Unit setter.
-pub(super) fn publish_nav_com(entity: &mut GameEntity, target: NavTargetRef) {
+/// the locomotor dispatch; a non-null destination then releases the Fire
+/// system link (`0x004D954B`). The Foot+0x6AC skip (4D9607) stops after this,
+/// and a Teleport owner's Move_To is dispatched by the Unit setter.
+pub(crate) fn publish_nav_com(entity: &mut GameEntity, target: NavTargetRef) {
     entity.navigation.publish_nav_com(Some(target));
+    entity.release_fire_particle_system();
 }
 
 /// Foot4D94C7/4D9510 NULL reference publication, before locomotor Stop.
@@ -677,7 +821,8 @@ fn drive_set_destination(
 ) -> bool {
     // Drive4AFD5E calls FootIsParalyzed4DE770 before destination/map access,
     // including a zero Move_To. Refusal retains Foot's NavCom/timer writes.
-    // Owner warp bytes follow at4AFD71/80; EMP/Unit+6D8 is still unported.
+    // Owner warp bytes follow at4AFD71/80; vt+0x37C (4AFD4B, EMP or a Unit's
+    // death counter) is still unported, as for Process_Movement (track_fresh).
     // Original whole-call comparisons: tools/spatial_oracle/track_destination.
     if entity.parasite.is_paralyzed(binary_frame)
         || super::locomotor_owner::owner_is_warping(entity)
@@ -733,23 +878,15 @@ fn drive_stop_moving(entity: &mut GameEntity) {
     // 0x4AFE00 clamps the class target fraction (+0x50), then clears only
     // the destination; the head (+0x40) may continue to its endpoint. The
     // IsTrain follower cascade has no stock type (no retail IsTrain=yes).
-    if loco
-        .track_target_fraction(TrackFamily::Drive)
-        .is_some_and(|v| v > TRACK_STOP_TARGET_FRACTION)
-    {
-        loco.store_track_target_fraction(TrackFamily::Drive, TRACK_STOP_TARGET_FRACTION);
+    if let Some(target) = loco.track_target_fraction_native(TrackFamily::Drive) {
+        loco.store_track_target_fraction_native(
+            TrackFamily::Drive,
+            stopped_target_fraction(target),
+        );
     }
     loco.store_track_destination(TrackFamily::Drive, None);
-    // OPEN Process-host timing: native Stop4AFE00 clamps only class target
-    // and clears destination. The owner zero belongs to the admitted Process
-    // rest tail4B0828, which also tests queue emptiness. Several ordinary
-    // arrival returns skip that tail. Zero it here, as before, until that
-    // tail is ported; this is not Stop parity.
-    if loco.track_head(TrackFamily::Drive).is_none()
-        && entity.foot_speed.applied_fraction() > SIM_ZERO
-    {
-        entity.foot_speed.set_speed_fraction(SIM_ZERO);
-    }
+    // Foot+578 is retained here. The common Process tail4B0828 owns its
+    // eventual zero, after the destination/head/path gates (track_turn).
 }
 
 fn ship_set_destination(
@@ -782,22 +919,12 @@ fn ship_stop_moving(entity: &mut GameEntity) {
     loco.ensure_installed_track_state();
     // Ship Stop_Moving clamps the class-owned target fraction, then clears
     // only +0x30. A committed head may continue to its track endpoint.
-    if loco
-        .track_target_fraction(TrackFamily::Ship)
-        .is_some_and(|v| v > TRACK_STOP_TARGET_FRACTION)
-    {
-        loco.store_track_target_fraction(TrackFamily::Ship, TRACK_STOP_TARGET_FRACTION);
+    if let Some(target) = loco.track_target_fraction_native(TrackFamily::Ship) {
+        loco.store_track_target_fraction_native(TrackFamily::Ship, stopped_target_fraction(target));
     }
     loco.store_track_destination(TrackFamily::Ship, None);
-
-    // OPEN Process-host correction: this preexisting adapter applies the
-    // rest speed before the native Process-tail admission. FootStop4DF0D0
-    // does NOT clear Foot+5E0; explicit abandonment is a separate owner call.
-    if loco.track_head(TrackFamily::Ship).is_none()
-        && entity.foot_speed.applied_fraction() > SIM_ZERO
-    {
-        entity.foot_speed.set_speed_fraction(SIM_ZERO);
-    }
+    // Foot+578 is retained here. The common Process tail 0x69FEF0 owns its
+    // eventual zero, after the destination/head/path gates (track_turn).
 }
 
 impl crate::sim::world::Simulation {
@@ -813,7 +940,7 @@ impl crate::sim::world::Simulation {
         &mut self,
         id: u64,
         nonnull: bool,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
@@ -845,7 +972,7 @@ impl crate::sim::world::Simulation {
     /// `0x0051B1D2` and Aircraft's at once (`0x0041AA8B` -> `0x0041ADAC`).
     /// - NavComAux (`0x004D94C7`) and NavCom (`0x004D9510`) clear.
     /// - A lifted object a Magnetron still holds loses both links and may end
-    ///   its lift (`0x004D9518..0x004D953F`, [`Self::lifted_null_destination`]).
+    ///   its lift (`0x004D9518..0x004D953F`, [`ObjectSubstrate::lifted_null_destination`](crate::sim::world::ObjectSubstrate::lifted_null_destination)).
     /// - An Aircraft (What_Am_I 2) whose current (`+0xAC`) or queued
     ///   (`+0xB4`) mission is Attack and which holds a TarCom (`+0x2B4`) skips
     ///   the locomotor Stop (`0x004D9672..0x004D969C`): its Fly flies on.
@@ -858,7 +985,7 @@ impl crate::sim::world::Simulation {
     pub(crate) fn foot_null_destination(
         &mut self,
         id: u64,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) {
@@ -867,7 +994,7 @@ impl crate::sim::world::Simulation {
             return;
         };
         publish_null_nav_com(entity);
-        self.lifted_null_destination(id);
+        self.substrate.lifted_null_destination(id);
         let Some(entity) = self.substrate.entities.get(id) else {
             return;
         };
@@ -883,7 +1010,7 @@ impl crate::sim::world::Simulation {
                 entity.navigation.store_nav_com(None);
             }
         }
-        let timing = super::DestinationTiming::from_rules(self.session.binary_frame, rules);
+        let timing = super::DestinationTiming::from_rules(self.session.binary_frame(), rules);
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             timing.accept(entity);
         }
@@ -902,7 +1029,9 @@ impl crate::sim::world::Simulation {
     ///   ([`teleport_stop_moving`](super::teleport_movement::teleport_stop_moving));
     /// - Fly `0x004CCFD0` (`Simulation::fly_stop_moving`), which re-targets a
     ///   moving aircraft through its own class setter;
-    /// - Rocket `0x006633C0`, an empty body (`RET 4`).
+    /// - Rocket `0x006633C0`, an empty body (`RET 4`);
+    /// - Tunnel `0x00728C00` (`Simulation::tunnel_stop_moving`), which
+    ///   re-targets an owner travelling underground far from its destination.
     ///
     /// The Jumpjet's needs the map and, for a failed search, the rules; the
     /// Fly's needs the rules. A world without them leaves the owner as it
@@ -910,7 +1039,7 @@ impl crate::sim::world::Simulation {
     pub(crate) fn locomotor_stop_moving(
         &mut self,
         id: u64,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> Result<(), String> {
@@ -937,11 +1066,30 @@ impl crate::sim::world::Simulation {
                 }
             }
             LocomotorKind::Rocket => {}
+            LocomotorKind::Tunnel => self.tunnel_stop_moving(id, rules, registry, frame_effects),
         }
         Ok(())
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "track_destination_tests.rs"]
 mod native_destination_tests;
+
+/// Stop4AFEA4/69F5B4 always spills the selected value. TEST AH,1 keeps
+/// Less/Unordered, and Equal/Greater selects the promoted-float floor.
+fn stopped_target_fraction(
+    target: crate::util::native_x87::NativeF64Bits,
+) -> crate::util::native_x87::NativeF64Bits {
+    use crate::util::native_x87::{
+        MaskedX87Chop53 as X,
+        MaskedX87Ordering::{Less, Unordered},
+    };
+    let target = X::load_f64(target);
+    let floor = X::load_f64(TRACK_STOP_TARGET_FRACTION);
+    X::store_f64_masked_chop(if matches!(X::compare(target, floor), Less | Unordered) {
+        target
+    } else {
+        floor
+    })
+}

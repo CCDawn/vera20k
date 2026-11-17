@@ -82,8 +82,6 @@ fn automatic_tube_shell_ground_terrain() -> ResolvedTerrainGrid {
             zone_type: zone_class::GROUND,
             has_bridge_deck: is_low_bridge,
             bridge_layer: is_low_bridge.then(|| BridgeLayer {
-                overlay_id: 0x4a,
-                overlay_name: "LOBRDG01".to_string(),
                 deck_level: 0,
                 direction: BridgeDirection::Low,
             }),
@@ -102,7 +100,7 @@ pub(super) fn terrain_from_zone_classes(
 ) -> ResolvedTerrainGrid {
     assert_eq!(classes.len(), width as usize * height as usize);
     assert_eq!(levels.len(), classes.len());
-    let prototype = water_row_terrain(1).cells.into_iter().next().unwrap();
+    let prototype = water_row_terrain(1).cells()[0].clone();
     let cells = classes
         .iter()
         .zip(levels)
@@ -155,7 +153,8 @@ fn gsi_04_01_nonbridge_getzoneid_uses_padded_square_clamps_and_raw_rows() {
         base.raw_zone_ids_by_row[MovementZone::Normal.matrix_row().unwrap()][0] = 41;
         base.raw_zone_ids_by_row[MovementZone::Normal.matrix_row().unwrap()][2] = 42;
         base.raw_zone_ids_by_row[MovementZone::Crusher.matrix_row().unwrap()][2] = 1;
-        base.raw_zone_ids_by_row[MovementZone::Destroyer.matrix_row().unwrap()][2] = u16::MAX;
+        base.raw_zone_ids_by_row[MovementZone::Destroyer.matrix_row().unwrap()][2] =
+            u16::MAX as ZoneId;
         base.raw_zone_ids_by_row[MovementZone::Amphibious.matrix_row().unwrap()][2] = 73;
     }
 
@@ -197,7 +196,7 @@ fn gsi_04_01_nonbridge_getzoneid_uses_padded_square_clamps_and_raw_rows() {
     );
     assert_eq!(
         zones.get_zone_id_nonbridge_native((0, 0), MovementZone::Destroyer),
-        Some(u16::MAX),
+        Some(u16::MAX as ZoneId),
         "raw 0xffff is not flattened"
     );
     assert_eq!(
@@ -320,6 +319,37 @@ fn gsi_04_06_class_six_boundary_bypasses_height_for_subterranean_row() {
 
     assert_eq!(subterranean.zone_at(0, 0, MovementLayer::Ground), 2);
     assert_eq!(subterranean.zone_at(1, 0, MovementLayer::Ground), 2);
+}
+
+/// Level -1 is stored as 255. With terrain deformation on, zones read it
+/// signed, so a crater one level below the ground around it zones like flat
+/// ground; off, they keep gamemd's unsigned read and split it off.
+#[test]
+fn zones_read_a_crater_below_level_zero_signed_only_with_deformation_on() {
+    let zone_ids = |centre: u8, deformation: bool| {
+        let mut levels = [0; 9];
+        levels[4] = centre;
+        let mut terrain = terrain_from_zone_classes(3, 3, &[zone_class::GROUND; 9], &levels);
+        if deformation {
+            terrain.test_install_deformation_catalog(0, 600);
+        }
+        let path_grid = PathGrid::from_resolved_terrain(&terrain);
+        let zones = ZoneGrid::build_with_terrain(&path_grid, &terrain, &[], 3, 3);
+        let normal = zones.map_for(MovementZone::Normal).unwrap();
+        let hierarchy = zones.hierarchy_for(MovementZone::Normal).unwrap();
+        let level0 = hierarchy.level(0).unwrap();
+        (0..3)
+            .flat_map(|y| (0..3).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                (
+                    normal.zone_at(x, y, MovementLayer::Ground),
+                    level0.zone_at(x, y),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(zone_ids(255, true), zone_ids(0, true));
+    assert_ne!(zone_ids(255, false), zone_ids(0, false));
 }
 
 #[test]
@@ -450,7 +480,8 @@ fn gsi_04_06_simulation_detects_class_only_change_with_identical_pathgrid() {
         ZONE_INVALID
     );
 
-    sim.resolved_terrain.as_mut().unwrap().cells[0].zone_type = zone_class::CRUSHABLE;
+    sim.resolved_terrain.as_mut().unwrap().cells_mut_for_test()[0].zone_type =
+        zone_class::CRUSHABLE;
     sim.rebuild_zone_grid(&path_grid);
 
     let zones = sim.zone_grid.as_ref().unwrap();
@@ -495,7 +526,7 @@ fn base_repair_fixture(
     let zone_count = clusters.iter().copied().max().unwrap_or(0);
     for row in &mut base.raw_zone_ids_by_row {
         row.resize(zone_count as usize + 1, 1);
-        row[0] = u16::MAX;
+        row[0] = u16::MAX as ZoneId;
         for cluster in 1..=zone_count {
             row[cluster as usize] = cluster + 1;
         }
@@ -628,7 +659,7 @@ fn gsi_04_06_base_repair_fallbacks_and_explicit_merge_provenance() {
     );
 
     let mut sentinel = terrain_from_zone_classes(1, 1, &[zone_class::OUTSIDE], &[0]);
-    sentinel.cells[0].outside_playfield = false;
+    sentinel.cells_mut_for_test()[0].outside_playfield = false;
     let sentinel_path = PathGrid::from_resolved_terrain(&sentinel);
     let mut sentinel_zones = ZoneGrid::build_with_terrain(&sentinel_path, &sentinel, &[], 1, 1);
     assert_eq!(
@@ -777,7 +808,7 @@ fn gsi_04_06_fallback_rebuilds_base_without_resetting_hierarchy_high_water() {
         }
         base.movement_classes[index(2, 2)] = zone_class::GROUND;
         base.zone_ids[index(2, 2)] = 1;
-        base.raw_zone_ids_by_row[0][0] = u16::MAX;
+        base.raw_zone_ids_by_row[0][0] = u16::MAX as ZoneId;
         base.raw_zone_ids_by_row[0][1] = 2;
         base.raw_zone_ids_by_row[0][2] = 3;
 
@@ -994,20 +1025,6 @@ fn can_reach_compares_the_two_zone_ids() {
 }
 
 #[test]
-fn water_zone_grid_uses_resolved_land_type_directly() {
-    let terrain = water_row_terrain(5);
-    let grid = PathGrid::from_resolved_terrain(&terrain);
-    let zg = ZoneGrid::build_with_terrain(&grid, &terrain, &[], 5, 1);
-    assert!(zg.can_reach(
-        MovementZone::Water,
-        (0, 0),
-        MovementLayer::Ground,
-        (4, 0),
-        MovementLayer::Ground,
-    ));
-}
-
-#[test]
 fn waterbeach_zone_grid_connects_beach_to_water_with_resolved_terrain() {
     let terrain = clear_beach_water_row_terrain();
     let grid = PathGrid::from_resolved_terrain(&terrain);
@@ -1071,49 +1088,46 @@ fn automatic_tube_shells_keep_ground_connectivity_without_bridge_records() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Height continuity tests
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Incremental zone update tests
-// ---------------------------------------------------------------------------
-
+/// A base rebuild with nothing changed since the last one keeps its result,
+/// and a write between two rebuilds makes the second one run: after a cell
+/// turns to rock the grid matches one that rebuilt only once, after the
+/// change, and the walled-off cell has left its zone.
 #[test]
-fn per_movement_zone_grids_are_separate() {
-    // Verify that the ZoneCategory collapse is truly gone —
-    // each MovementZone variant gets its own independent zone grid.
-    let terrain = terrain_from_zone_classes(5, 2, &[zone_class::GROUND; 10], &[0; 10]);
-    let grid = PathGrid::from_resolved_terrain(&terrain);
-    let zg = ZoneGrid::build_with_terrain(&grid, &terrain, &[], 5, 2);
-    // Normal and Crusher should each have their own zone map.
-    assert!(
-        zg.map_for(MovementZone::Normal).is_some(),
-        "Normal should have a zone map"
+fn a_rebuild_after_an_unchanged_one_still_follows_a_class_write() {
+    let classes = vec![zone_class::GROUND; 9];
+    let mut terrain = terrain_from_zone_classes(3, 3, &classes, &[0; 9]);
+    let path_grid = PathGrid::from_resolved_terrain(&terrain);
+    let mut twice = ZoneGrid::build_with_terrain(&path_grid, &terrain, &[], 3, 3);
+    let mut once = twice.clone();
+    // Read-only: a writable borrow would itself clear the rebuild's mark.
+    let snapshot = |zones: &ZoneGrid| {
+        let maps: Vec<Vec<ZoneId>> = MovementZone::all_ground()
+            .iter()
+            .map(|&mz| zones.map_for(mz).unwrap().zone_ids_slice().to_vec())
+            .collect();
+        let base = zones.base_topology();
+        (
+            base.zone_ids.clone(),
+            base.raw_zone_ids_by_row.clone(),
+            maps,
+        )
+    };
+
+    twice.rebuild_base_connectivity_preserving_hierarchy(&path_grid, &terrain, &[]);
+    let first = snapshot(&twice);
+    twice.rebuild_base_connectivity_preserving_hierarchy(&path_grid, &terrain, &[]);
+    assert_eq!(
+        snapshot(&twice),
+        first,
+        "an unchanged rebuild keeps its result"
     );
-    assert!(
-        zg.map_for(MovementZone::Crusher).is_some(),
-        "Crusher should have a zone map"
-    );
-    assert!(
-        zg.map_for(MovementZone::Infantry).is_some(),
-        "Infantry should have a zone map"
-    );
-    assert!(
-        zg.map_for(MovementZone::Water).is_some(),
-        "Water should have a zone map"
-    );
-    // The binary rebuild loop covers all 13 matrix rows, including Fly.
-    assert!(
-        zg.map_for(MovementZone::Fly).is_some(),
-        "Fly should have a zone map"
-    );
-    // All matrix-backed movement zones should have maps.
-    for &mz in MovementZone::all_ground() {
-        assert!(
-            zg.map_for(mz).is_some(),
-            "MovementZone {:?} should have a zone map",
-            mz
-        );
+
+    terrain.cells_mut_for_test()[4].zone_type = zone_class::IMPASSABLE;
+    for zones in [&mut twice, &mut once] {
+        assert!(zones.refresh_base_cell_attributes_at(&terrain, 1, 1));
+        zones.rebuild_base_connectivity_preserving_hierarchy(&path_grid, &terrain, &[]);
     }
+    let after = snapshot(&twice);
+    assert_eq!(after, snapshot(&once));
+    assert_ne!(after.0, first.0, "the rock cell changed the base zones");
 }

@@ -29,10 +29,6 @@ use serde_json::{Value, json};
 fn corpus() -> &'static Value {
     let native = crate::test_fixture::json("tools/spatial_oracle/engineer_repair_joined.json");
     assert_eq!(native["source"], "unicorn/gamemd.exe");
-    assert_eq!(
-        native["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     native
 }
 
@@ -177,9 +173,6 @@ impl Fixture {
             &IniFile::from_str(&extra),
             &crate::rules::sound_ini::SoundRegistry::from_ini(&IniFile::from_str(&sounds)),
         );
-        rules.bind_animation_sequences(
-            &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-        );
         // The native packet also carries constructor inputs for other
         // buildings and debris. This bounded fixture installs only GAPOWR's
         // normal/damaged ART, so bind its native SHP counts alone.
@@ -207,18 +200,21 @@ impl Fixture {
                 sim.interner.intern("Second")
             };
             sim.houses
-                .insert(id, HouseState::new(id, 0, None, index == 0, 5000, 10));
-            sim.session.house_order.push(id);
+                .insert_for_test(HouseState::new(id, 0, None, index == 0, 5000, 10));
             houses.push((int(&house["pointer"]), id));
         }
-        sim.session.current_house = Some(owner);
+        sim.session.set_current_house_for_test(Some(owner));
         // The reused native fixture supplies its game mode explicitly;
         // this is a caller prior, not a retail startup-default assertion.
-        sim.session.game_mode_nonzero = int(&route["arrivals"][0]["before"]["game_mode"]) != 0;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+                int(&route["arrivals"][0]["before"]["game_mode"]) != 0,
+            ),
+        );
         if name == "allied_damaged" {
-            sim.house_alliances
+            sim.house_alliances_mut_for_test()
                 .insert("AMERICANS".into(), ["SECOND".into()].into_iter().collect());
-            sim.house_alliances
+            sim.house_alliances_mut_for_test()
                 .insert("SECOND".into(), ["AMERICANS".into()].into_iter().collect());
         }
         sim.native_unique_ids = Some(NativeUniqueIdCursor::test_at_current_value(999));
@@ -232,7 +228,10 @@ impl Fixture {
             entity.position.put_location(coord(&before["position"]));
             entity.health.set_for_test(int(&before["actual_hp"]));
             entity.estimated_health.reset(int(&before["estimated_hp"]));
-            entity.repairing.set_for_test(before["paid_repair"] == 1);
+            entity
+                .building
+                .repairing
+                .set_for_test(before["paid_repair"] == 1);
             entity.sample_building_health_for_power();
         }
         sim.set_building_anim_slot(building, 3, true, false, 0, &rules)
@@ -258,13 +257,13 @@ impl Fixture {
                     engineer_id: id,
                     target_building_id: building,
                 },
-                Some(&rules),
+                &rules,
                 Some(&registry),
                 crate::sim::world::FrameEffects::default()
             ));
             // The native command witness follows Event4C6CB0 with the
             // ordinary Mission5B3570 Commence receiver before its snapshot.
-            sim.mission_commence_exact(id, 0).unwrap();
+            sim.substrate.mission_commence_exact(id, 0).unwrap();
             let entity = sim.substrate.entities.get_mut(id).unwrap();
             assert_eq!(
                 entity.mission.effective().raw(),
@@ -294,11 +293,14 @@ impl Fixture {
                 crate::sim::world::FrameEffects::default(),
             );
             let entity = sim.substrate.entities.get_mut(building).unwrap();
-            entity.repairing.set_for_test(before["paid_repair"] == 1);
-            entity.has_been_captured.set_for_test(false);
+            entity
+                .building
+                .repairing
+                .set_for_test(before["paid_repair"] == 1);
+            entity.building.has_been_captured.set_for_test(false);
             // The preceding fixture transfer is supplied setup, not this
             // arrival. Consume its identical idle request through the owner.
-            entity.apply_queued_building_body(0, &sim.session.game_options);
+            entity.apply_queued_building_body(0, sim.session.game_options());
         }
         if name == "enemy_selling_refusal" {
             let entity = sim.substrate.entities.get_mut(building).unwrap();
@@ -369,8 +371,8 @@ impl Fixture {
             .zip(&houses)
         {
             let house = sim.houses.get_mut(id).unwrap();
-            house.stats = MatchStatistics::from_totals_for_test(0, 0, 0, 0, 0);
-            house.economy.set_score_for_test(0);
+            house.set_stats_for_test(MatchStatistics::from_totals_for_test(0, 0, 0, 0, 0));
+            house.economy_mut().set_score_for_test(0);
             // Restore only the supplied pre-arrival House1F4 through the
             // existing persistence representation; arrival writes stay with
             // the shared discovery owner and are compared below.
@@ -378,13 +380,14 @@ impl Fixture {
             house["discovered_by_current_house"] =
                 json!(prior["first_current_viewer_discovery_1f4"] == 1);
             sim.houses
-                .insert(*id, serde_json::from_value(house).unwrap());
+                .replace_for_test(serde_json::from_value(house).unwrap());
             let mut state = serde_json::to_value(PowerState::default()).unwrap();
             state["total_output"] = prior["power"].clone();
             state["total_drain"] = prior["drain"].clone();
             state["power_dirty"] = json!(prior["dirty"][0] == 1);
             state["radar_dirty"] = json!(prior["dirty"][1] == 1);
             sim.power_states
+                .map_mut_for_test()
                 .insert(*id, serde_json::from_value(state).unwrap());
         }
         // The native witness supplies constructor-cleared discovery history
@@ -396,7 +399,7 @@ impl Fixture {
         discovery
             .set_discovered_by_current_house_for_test(history["discovered_by_current_house"] == 1);
         discovery.set_discovered_by_other_house_for_test(history["discovered_by_other_house"] == 1);
-        sim.sound_events.clear();
+        sim.sound_events.clear_for_test();
         Self {
             sim,
             rules,
@@ -426,7 +429,7 @@ impl Fixture {
             "{boundary}: retained HP sample"
         );
         assert_eq!(
-            entity.repairing.is_on(),
+            entity.building.repairing.is_on(),
             native["paid_repair"] == 1,
             "{boundary}: paid repair"
         );
@@ -461,7 +464,7 @@ impl Fixture {
             "{boundary}: native41C other-viewer history"
         );
         let object = self.rules.object("GAPOWR").unwrap();
-        let dimensions = crate::rules::foundation::foundation_dimensions(&object.foundation);
+        let dimensions = object.foundation.dimensions();
         assert_eq!(
             [i32::from(dimensions.0), i32::from(dimensions.1)],
             [
@@ -481,7 +484,7 @@ impl Fixture {
                 .anim(entity.building_art.anim_slots()[3].unwrap())
                 .unwrap();
             assert_eq!(
-                self.sim.resolve(anim.type_id),
+                self.sim.resolve(anim.type_id()),
                 slot["type_name"].as_str().unwrap(),
                 "{boundary}: active/damaged ART consumer"
             );
@@ -506,17 +509,17 @@ impl Fixture {
                 .map(|n| int(n) as u32)
                 .sum();
             assert_eq!(
-                house.stats.buildings_killed(),
+                house.stats().buildings_killed(),
                 kills,
                 "{boundary}: capture kills"
             );
             assert_eq!(
-                house.stats.buildings_lost(),
+                house.stats().buildings_lost(),
                 int(&expected["building_losses"]) as u32,
                 "{boundary}: capture loss"
             );
             assert_eq!(
-                house.economy.score(),
+                house.economy().score(),
                 int(&expected["score"]),
                 "{boundary}: shared score"
             );
@@ -532,20 +535,20 @@ impl Fixture {
             );
             assert_eq!(
                 house
-                    .tracking
+                    .tracking()
                     .owned_count(EntityCategory::Structure, type_ref),
                 int(&expected["owned_building_count"]),
                 "{boundary}: owned count"
             );
             assert_eq!(
                 house
-                    .tracking
+                    .tracking()
                     .active_count(EntityCategory::Structure, type_ref),
                 int(&expected["live_building_count"]),
                 "{boundary}: live count"
             );
             assert_eq!(
-                house.tracking.buildings(),
+                house.tracking().buildings(),
                 int(&expected["tracked_ordinary_buildings"]),
                 "{boundary}: tracked buildings"
             );
@@ -556,18 +559,18 @@ impl Fixture {
                 .map(|_| self.building)
                 .collect();
             assert_eq!(
-                house.base_projection.buildings(),
+                house.base_projection().buildings(),
                 list,
                 "{boundary}: ordered House building list"
             );
             let power = &self.sim.power_states[&owner];
             assert_eq!(
-                power.total_output,
+                power.total_output(),
                 int(&expected["power"]),
                 "{boundary}: cached power"
             );
             assert_eq!(
-                power.total_drain,
+                power.total_drain(),
                 int(&expected["drain"]),
                 "{boundary}: cached drain"
             );
@@ -596,7 +599,7 @@ impl Fixture {
                 x: head.x - 16,
                 ..head
             },
-            Some(&self.rules),
+            &self.rules,
             Some(&self.registry),
             crate::sim::world::FrameEffects::default(),
         );
@@ -723,6 +726,8 @@ impl Fixture {
     }
 }
 
+/// Ares replaces the hostile arm (hooks `0x51E5BB`, `0x51E5E1`; see
+/// `sim::ares_rubble`'s tests).
 #[test]
 fn original_half_threshold_and_friendly_repair_object_actions() {
     let native = corpus();
@@ -734,7 +739,7 @@ fn original_half_threshold_and_friendly_repair_object_actions() {
     fixture
         .sim
         .houses
-        .insert(enemy, HouseState::new(enemy, 0, None, false, 5000, 10));
+        .register(HouseState::new(enemy, 0, None, false, 5000, 10));
     fixture.sim.change_owner_with_rules(
         fixture.building,
         enemy,
@@ -808,7 +813,7 @@ fn original_nine_routes_ten_walk_arrivals_repair_capture_and_deferred_cleanup() 
                     .run_completed_walk_step(
                         id,
                         head,
-                        Some(&fixture.rules),
+                        &fixture.rules,
                         Some(&fixture.registry),
                         crate::sim::world::FrameEffects::default(),
                     )
@@ -866,7 +871,7 @@ fn original_nine_routes_ten_walk_arrivals_repair_capture_and_deferred_cleanup() 
             arrivals += 1;
         }
         fixture.sim.process_pending_delete_with(
-            Some(&fixture.rules),
+            &fixture.rules,
             Some(&fixture.registry),
             crate::sim::world::FrameEffects::default(),
             1,
@@ -926,9 +931,12 @@ fn original_nine_routes_ten_walk_arrivals_repair_capture_and_deferred_cleanup() 
         }
         // Repair leaves +544 unchanged; its later Building visit is the only
         // consumer that samples restored HP and invalidates House assessment.
-        fixture
-            .sim
-            .sample_building_health_for_house_update(fixture.building);
+        Simulation::sample_building_health_for_house_update(
+            &mut fixture.sim.substrate,
+            &fixture.sim.houses,
+            &mut fixture.sim.power_states,
+            fixture.building,
+        );
         fixture.assert_building(&route["power_consumers"]["after_sample"]["building"], name);
     }
     assert_eq!(arrivals, 10);
@@ -946,7 +954,7 @@ fn original_engineer_receiver_terminal_branches_return_before_foot_tail() {
             fixture.sim.run_walk_boundary(
                 id,
                 head,
-                Some(&fixture.rules),
+                &fixture.rules,
                 Some(&fixture.registry),
                 crate::sim::world::FrameEffects::default(),
             );

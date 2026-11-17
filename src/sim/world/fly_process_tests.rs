@@ -22,10 +22,164 @@ use crate::sim::rng::SimRng;
 use crate::sim::world::Simulation;
 use crate::sim::world::lifecycle_tests::{insert_entity, install_common_raw_terrain};
 use crate::util::fixed_math::SimFixed;
+use crate::util::native_x87::NativeF64Bits;
 
 const AIRCRAFT: u64 = 1;
 const TARGET: u64 = 2;
 const DOCK: u64 = 3;
+
+/// Original grounded ORCA MoveTo4CCC80 -> Process4CCB40 -> speed4CFE20.
+/// The native nonzero ramp pays 13 at its fourth step and reaches 35 at11.
+#[test]
+fn retail_harrier_move_preserves_native_acceleration_across_save() {
+    use crate::sim::command::{Command, CommandEnvelope};
+    use crate::sim::snapshot::GameSnapshot;
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art() else {
+        return;
+    };
+    let mut sim = crate::sim::arena_fixture::rival_arena_with_size(&rules, 17, 128);
+    let owner = sim.intern("Americans");
+    sim.session.set_current_house_for_test(Some(owner));
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+    sim.set_playfield_bounds_for_test(Some(crate::sim::cell_rect::PlayfieldBounds {
+        base: 64,
+        ..crate::sim::arena_fixture::OPEN_PLAYFIELD
+    }));
+    sim.set_playfield_size_height_for_test(Some(64));
+    sim.set_input_delay_ticks(0);
+    for (kind, house, cell) in [
+        ("GAPOWR", "Americans", (40, 48)),
+        ("NAPOWR", "Russians", (90, 80)),
+    ] {
+        sim.spawn_object(kind, house, cell.0, cell.1, 0, &rules)
+            .unwrap();
+    }
+    let plane = sim
+        .spawn_object("ORCA", "Americans", 50, 64, 0, &rules)
+        .unwrap();
+    let type_speed = crate::util::fixed_math::ra2_speed_to_leptons_per_frame(
+        rules.object("ORCA").unwrap().speed,
+    );
+    assert_eq!(type_speed, 35);
+    let mut commands = vec![CommandEnvelope::new(
+        owner,
+        sim.session.tick(),
+        Command::Move {
+            entity_id: plane,
+            target_rx: 100,
+            target_ry: 64,
+        },
+    )];
+    let native_paid = [3, 7, 10, 13, 17, 20, 24, 27, 31, 34, 35];
+    let mut step = 0;
+    let mut physical_step = 0;
+    let mut restored = None;
+    for _ in 0..160 {
+        let frame = sim.session.binary_frame();
+        let before = sim.entities().get(plane).unwrap();
+        let before_xyz = ground_pose::object_location(before, sim.resolved_terrain.as_ref());
+        let before_facing = before.body_facing.current(frame);
+        let before_fly = before.locomotor.as_ref().unwrap().fly_runtime().unwrap();
+        let before_paid = crate::sim::movement::air_movement::current_fly_speed(
+            type_speed,
+            before_fly.current_speed(),
+        );
+        if before_paid > 0 {
+            assert!(!before_fly.has_phase_callback());
+            assert!(before_xyz.z > 0);
+            assert!(before_fly.destination().x - before_xyz.x > 0x300);
+            assert_eq!(
+                before_paid,
+                native_paid[physical_step],
+                "native pre-motion payment{}",
+                physical_step + 1
+            );
+        }
+        let grid = sim.path_grid_snapshot();
+        sim.advance_tick(&commands, Some(&rules), grid.as_deref(), None, 33);
+        if let Some(restored) = restored.as_mut() {
+            let restored: &mut Simulation = restored;
+            let grid = restored.path_grid_snapshot();
+            restored.advance_tick(&commands, Some(&rules), grid.as_deref(), None, 33);
+            let continued = sim.entities().get(plane).unwrap();
+            let loaded = restored.entities().get(plane).unwrap();
+            assert_eq!(
+                ground_pose::object_location(loaded, restored.resolved_terrain.as_ref()),
+                ground_pose::object_location(continued, sim.resolved_terrain.as_ref())
+            );
+            assert_eq!(
+                loaded.locomotor.as_ref().unwrap().fly_runtime(),
+                continued.locomotor.as_ref().unwrap().fly_runtime()
+            );
+        }
+        commands = sim.take_due_commands();
+        let plane = sim.entities().get(plane).expect("moving Harrier survives");
+        if before_paid > 0 {
+            // Motion pays the retained pre-tick current before the late ramp.
+            // Use the independently recorded native budget with the live
+            // facing; the full-heading trig has its separate native corpus.
+            let expected = crate::util::native_trig::facing_step_world_xy(
+                [before_xyz.x, before_xyz.y],
+                before_facing,
+                native_paid[physical_step],
+            );
+            let actual = ground_pose::object_location(plane, sim.resolved_terrain.as_ref());
+            assert_eq!(
+                [actual.x, actual.y],
+                expected,
+                "admitted native movement{} facing{before_facing:04x}",
+                physical_step + 1
+            );
+            physical_step += 1;
+        }
+        let speed = plane
+            .locomotor
+            .as_ref()
+            .unwrap()
+            .fly_runtime()
+            .unwrap()
+            .current_speed();
+        let paid = crate::sim::movement::air_movement::current_fly_speed(type_speed, speed);
+        if step == 0 && paid == 0 {
+            continue;
+        }
+        if step < native_paid.len() {
+            assert_eq!(paid, native_paid[step], "native ramp step{}", step + 1);
+            step += 1;
+        }
+        if step == 3 && restored.is_none() {
+            // Save the live, non-dyadic acceleration state without changing it.
+            let bytes = GameSnapshot::save(&sim, 0, 0, "Fly acceleration", 0);
+            let mut loaded = GameSnapshot::load(&bytes).unwrap().sim;
+            loaded
+                .retain_process_state_for_load(crate::sim::world::SnapshotProcessState::Live(&sim));
+            loaded.resolved_terrain = sim.resolved_terrain.clone();
+            loaded.restore_after_snapshot_load().unwrap();
+            let loaded_plane = loaded.entities().get(plane.stable_id()).unwrap();
+            assert_eq!(
+                ground_pose::object_location(loaded_plane, loaded.resolved_terrain.as_ref()),
+                ground_pose::object_location(plane, sim.resolved_terrain.as_ref())
+            );
+            assert_eq!(
+                loaded
+                    .entities()
+                    .get(plane.stable_id())
+                    .unwrap()
+                    .locomotor
+                    .as_ref()
+                    .unwrap()
+                    .fly_runtime(),
+                plane.locomotor.as_ref().unwrap().fly_runtime()
+            );
+            restored = Some(loaded);
+        }
+        if step == native_paid.len() && physical_step == native_paid.len() {
+            return;
+        }
+    }
+    panic!("ordinary Move must produce the complete nonzero speed ramp");
+}
 
 fn int(input: &serde_json::Value, key: &str, default: i64) -> i64 {
     input[key].as_i64().unwrap_or(default)
@@ -120,8 +274,8 @@ fn fixture(input: &serde_json::Value) -> (Simulation, RuleSet) {
     let rules = rules_for(input);
     let frame = int(input, "frame", 1000) as u32;
     let mut sim = Simulation::with_seed(0);
-    sim.session.map_width = 128;
-    sim.session.map_height = 128;
+    sim.session.set_map_width_for_test(128);
+    sim.session.set_map_height_for_test(128);
     let [left, top, local_width, local_height] = ints(&input["local"], [0, 0, 64, 64]);
     sim.playfield_bounds = Some(PlayfieldBounds::from_normalized_local_size(
         64,
@@ -134,9 +288,9 @@ fn fixture(input: &serde_json::Value) -> (Simulation, RuleSet) {
     install_common_raw_terrain(&mut sim, 128, 128, 0, None);
     sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(128, 128));
     sim.scenario_rng = SimRng::new(31);
-    sim.session.binary_frame = frame;
+    sim.session.set_binary_frame_for_test(frame);
     let [x, y] = ints(&input["cell"], [60, 64]);
-    assert_eq!(sim.allocate_stable_id(), AIRCRAFT);
+    assert_eq!(sim.substrate.allocate_stable_id(), AIRCRAFT);
     insert_entity(&mut sim, AIRCRAFT, EntityCategory::Aircraft);
     let entity = sim.substrate.entities.get_mut(AIRCRAFT).unwrap();
     entity.lifecycle.set_object_alive_for_test(true);
@@ -211,13 +365,25 @@ fn fixture(input: &serde_json::Value) -> (Simulation, RuleSet) {
         "airport_bound": flag(input, "airport_bound", false),
     }))
     .unwrap();
-    fly.set_target_speed(SimFixed::from_num(
-        input["target_speed"].as_f64().unwrap_or(1.0),
+    // The original Process fixture packs binary64 priors directly; these
+    // inputs do not carry the Q16 restriction of the paid-step corpus.
+    fly.set_target_speed_bits_for_test(NativeF64Bits::from_bits(
+        input["target_speed"].as_f64().unwrap_or(1.0).to_bits(),
     ));
-    fly.set_current_speed(SimFixed::from_num(input["speed"].as_f64().unwrap_or(1.0)));
-    sim.aircraft_tracker_add(AIRCRAFT);
+    fly.set_current_speed_bits_for_test(NativeF64Bits::from_bits(
+        input["speed"].as_f64().unwrap_or(1.0).to_bits(),
+    ));
+    Simulation::aircraft_tracker_add(&sim.session, &mut sim.substrate, AIRCRAFT);
     sim.add_entity_occupancy(AIRCRAFT);
-    sim.submit_entity_display(AIRCRAFT, Some(&rules), None);
+    Simulation::submit_entity_display(
+        &sim.interner,
+        &sim.terrain_objects,
+        &mut sim.substrate,
+        &sim.resolved_terrain,
+        AIRCRAFT,
+        &rules,
+        None,
+    );
 
     let owner = sim.substrate.entities.get(AIRCRAFT).unwrap().owner();
     if input["target"].is_array() {
@@ -267,7 +433,7 @@ fn fixture(input: &serde_json::Value) -> (Simulation, RuleSet) {
         building.lifecycle.set_object_alive_for_test(true);
         building
             .type_facts
-            .set_foundation_for_test(format!("{width}x{height}"));
+            .set_foundation_for_test(format!("{width}x{height}").into());
         building.position.set_exact_z_leptons_for_test(Some(0));
         building
             .radio_contacts
@@ -386,7 +552,7 @@ fn stop_fixture(input: &serde_json::Value) -> (Simulation, RuleSet) {
         structure.lifecycle.set_object_alive_for_test(true);
         structure
             .type_facts
-            .set_foundation_for_test(format!("{width}x{height}"));
+            .set_foundation_for_test(format!("{width}x{height}").into());
         structure.position.set_exact_z_leptons_for_test(Some(0));
         sim.substrate.entities.insert(structure);
         if flag(building, "limbo", false) {
@@ -402,9 +568,10 @@ fn stop_fixture(input: &serde_json::Value) -> (Simulation, RuleSet) {
         list.push(id);
     }
     sim.houses
-        .entry(owner)
-        .or_insert_with(|| crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 1))
-        .base_projection
+        .get_or_register_for_test(owner, || {
+            crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 1)
+        })
+        .base_projection_mut()
         .replace_buildings_for_test(list);
     (sim, rules)
 }
@@ -444,17 +611,18 @@ fn frame_mismatch(
             return Some(format!("{key}: {value} vs native {}", expected[key]));
         }
     }
-    // The fractions are binary64 natively. VERA's SimFixed ramp step is
-    // 6554/65536, 0.4 quanta above 0.1: at most ten steps separate two clamps
-    // to a target, which with the start value's rounding keeps the current
-    // speed within 4.5 quanta. The coordinates above compare exactly.
+    // Python's saved decimal values carry the original binary64 stores.
     for (key, value) in [
         ("target_speed", fly.target_speed()),
         ("speed", fly.current_speed()),
     ] {
         let native = expected[key].as_f64()?;
-        if (value.to_num::<f64>() - native).abs() > 4.5 / 65536.0 {
-            return Some(format!("{key}: {value} vs native {native}"));
+        if value.bits() != native.to_bits() {
+            return Some(format!(
+                "{key}: {:016x} vs native {:016x} ({native})",
+                value.bits(),
+                native.to_bits()
+            ));
         }
     }
     // Begin_Landing's refusal calls Enter_Idle_Mode(0, 1), which the oracle
@@ -485,17 +653,25 @@ fn fly_process_matches_native_frames() {
     for row in rows {
         let input = &row["input"];
         let name = input["name"].as_str().unwrap();
+        // The oracle is stock gamemd. Under Ares a `HunterSeeker=` Fly takes
+        // the Ares flight instead: Process (1004D7A0, hook 0x4CCB84),
+        // UpdateTarget (1004DA90, hook 0x4CD9C8), Horizontal_Step (1004DC30,
+        // hook 0x4CF3D0) and the climb (1004D930/1004DA20, hooks 0x4CDE64/
+        // 0x4CDF54), which `sim::hunter_seeker` and `fly_height` test.
+        if crate::rules::ares_switch::ares_way() && flag(input, "hunter_seeker", false) {
+            continue;
+        }
         let (mut sim, rules) = fixture(input);
-        let start = sim.session.binary_frame;
+        let start = sim.session.binary_frame();
         let frames = row["frames"].as_array().unwrap();
         let mut failed = false;
         for (n, expected) in frames.iter().enumerate() {
             let frame = start + n as u32;
-            sim.session.binary_frame = frame;
+            sim.session.set_binary_frame_for_test(frame);
             let ((), idle_calls) = crate::sim::aircraft::record_idle_calls_for_test(|| {
                 sim.tick_air_movement_with_cell_lists_one(
                     AIRCRAFT,
-                    Some(&rules),
+                    &rules,
                     None,
                     crate::sim::world::FrameEffects::default(),
                 )
@@ -736,9 +912,9 @@ fn fly_death_stun_matches_native_rows() {
                 .set_for_test(Some(TargetKind::Entity(10 + n)));
         }
         sim.clear_lifecycle_test_events_for_test();
-        sim.techno_death_stun(
+        sim.stun(
             AIRCRAFT,
-            crate::sim::world::UninitContext::new(Some(&rules), None),
+            crate::sim::world::UninitContext::new(&rules, None),
         );
         let orders: Vec<_> = sim
             .lifecycle_test_events_for_test()

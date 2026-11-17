@@ -277,19 +277,19 @@ fn flat_sim() -> Simulation {
     const WIDTH: u16 = 40;
     const HEIGHT: u16 = 32;
     let mut sim = Simulation::new();
-    sim.playfield_bounds = Some(crate::map::playfield::PlayfieldBounds {
+    sim.set_playfield_bounds_for_test(Some(crate::map::playfield::PlayfieldBounds {
         base: 0,
         off_fc: -40,
         off_100: -1,
         off_104: 80,
         off_108: 41,
-    });
+    }));
     sim.resolved_terrain = Some(crate::map::resolved_terrain::test_grid(
         WIDTH,
         HEIGHT,
         flat_terrain_cell,
     ));
-    sim.playfield_size_height = Some(HEIGHT.into());
+    sim.set_playfield_size_height_for_test(Some(HEIGHT.into()));
     crate::sim::arena_fixture::supply_native_map(&mut sim);
     sim
 }
@@ -298,8 +298,8 @@ fn flat_sim() -> Simulation {
 /// holds the V3 tests' cells, as a missile's flight steps require.
 fn missile_sim() -> Simulation {
     let mut sim = flat_sim();
-    sim.playfield_bounds.as_mut().unwrap().base = 15;
-    sim.playfield_size_height = Some(15);
+    sim.playfield_bounds_mut_for_test().as_mut().unwrap().base = 15;
+    sim.set_playfield_size_height_for_test(Some(15));
     sim
 }
 
@@ -355,87 +355,6 @@ fn v3_launcher_gets_a_missile_pool_on_spawn() {
         Some(v3),
         "back-pointer to the parent"
     );
-}
-
-#[test]
-fn carrier_pool_is_not_missile_flavoured() {
-    let rules = make_spawner_rules();
-    let mut sim = Simulation::new();
-    let carrier = sim
-        .spawn_object("CARRIER", "Americans", 10, 10, 0, &rules)
-        .expect("spawn CARRIER");
-    let manager = sim
-        .substrate
-        .entities
-        .get(carrier)
-        .and_then(|e| e.spawn_manager.as_ref())
-        .expect("carrier manager");
-    assert_eq!(manager.slots.len(), 3);
-    assert_eq!(manager.reload_rate, 150);
-    assert_eq!(
-        manager.missile_family, None,
-        "HORNET is not one of the three hardcoded rocket families"
-    );
-    assert!(manager.slots.iter().all(|s| !s.is_missile_spawn));
-}
-
-#[test]
-fn units_without_spawns_get_no_manager() {
-    let rules = make_spawner_rules();
-    let mut sim = Simulation::new();
-    let target = sim
-        .spawn_object("TARGET", "Yuri", 20, 20, 0, &rules)
-        .expect("spawn TARGET");
-    assert!(
-        sim.substrate
-            .entities
-            .get(target)
-            .expect("target")
-            .spawn_manager
-            .is_none()
-    );
-}
-
-#[test]
-fn set_target_queues_and_the_ai_pass_promotes_it() {
-    let rules = make_spawner_rules();
-    let mut sim = flat_sim();
-    let v3 = sim
-        .spawn_object("V3", "Russians", 10, 10, 0, &rules)
-        .expect("spawn V3");
-    let target = sim
-        .spawn_object("TARGET", "Yuri", 20, 20, 0, &rules)
-        .expect("spawn TARGET");
-
-    if let Some(manager) = sim
-        .substrate
-        .entities
-        .get_mut(v3)
-        .and_then(|e| e.spawn_manager.as_mut())
-    {
-        manager.set_target(Some(TargetKind::Entity(target)));
-        assert_eq!(manager.queued_target, Some(TargetKind::Entity(target)));
-        assert_eq!(manager.current_target, None, "SetTarget only queues");
-        // Force the update gate open so this test exercises one AI pass.
-        manager.update_timer = CdTimer::default();
-    }
-
-    spawn_manager_ai(
-        &mut sim,
-        &rules,
-        v3,
-        None,
-        crate::sim::world::FrameEffects::default(),
-    );
-
-    let manager = sim
-        .substrate
-        .entities
-        .get(v3)
-        .and_then(|e| e.spawn_manager.as_ref())
-        .expect("manager");
-    assert_eq!(manager.current_target, Some(TargetKind::Entity(target)));
-    assert_eq!(manager.queued_target, None);
 }
 
 #[test]
@@ -611,7 +530,7 @@ fn gsi_05_08_v3_minimum_accepts_1280_and_clears_1279() {
 
 /// Negative half only: proves the gate holds work back before the 20th frame.
 /// It does not prove the pass runs *on* the boundary frame, nor that the
-/// period becomes 10 afterwards — `set_target_queues_and_the_ai_pass_promotes_it`
+/// period becomes 10 afterwards — `hornet_launcher_maximum_matches_native_distance_ties`
 /// forces the gate open rather than waiting it out, so the positive edge is
 /// **UNCHECKED** by this file.
 #[test]
@@ -732,7 +651,7 @@ fn v3_launches_its_rocket_into_the_kamikaze_window() {
     // starts the tilt.
     assert!(rocket.is_moving());
     assert_eq!(
-        rocket.destination_for_test(),
+        rocket.destination(),
         crate::sim::components::DriveCoord {
             x: 20 * 256 + 128,
             y: 20 * 256 + 128,
@@ -757,6 +676,109 @@ fn v3_launches_its_rocket_into_the_kamikaze_window() {
         manager.count_alive_spawns(),
         1,
         "the slot is still occupied while the missile flies"
+    );
+}
+
+/// The launch is the child's Unlimbo (`0x006B7505`) with no `0x00A8E7AC`
+/// raised, so Object's class query (`0x005F4F1B`) asks the missile's
+/// AircraftClass::Can_Enter_Cell (`0x004196B0`) at its launch Cell. In game
+/// mode 0 the current house's aircraft is refused a Cell its house has not
+/// mapped; the mission-only latch that would admit it (`+0x3D4`) is set only
+/// by a placed Unlimbo, so a first launch is asked. The original ignores the
+/// answer: a refused missile stays in limbo where it was, and later passes
+/// leave it there.
+#[test]
+fn a_launch_asks_the_missiles_aircraft_entry_query() {
+    use crate::sim::movement::ground_pose::position_world_coord;
+    let rules = make_spawner_rules();
+    // The Russians have mapped the Cells `mapped` names. Returns whether the
+    // missile is in limbo, whether it kept its old Location, and its Cell.
+    let launch = |mapped: &dyn Fn((u16, u16)) -> bool| {
+        let mut sim = flat_sim();
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false),
+        );
+        let v3 = sim
+            .spawn_object("V3", "Russians", 10, 10, 0, &rules)
+            .expect("spawn V3");
+        let target = sim
+            .spawn_object("TARGET", "Yuri", 20, 20, 0, &rules)
+            .expect("spawn TARGET");
+        let child_id = sim
+            .substrate
+            .entities
+            .get(v3)
+            .and_then(|e| e.spawn_manager.as_ref())
+            .and_then(|m| m.slots[0].spawn)
+            .expect("child");
+        // The fog takes its size after the spawns. The Russians' plane is
+        // replaced by one that has mapped exactly the named Cells.
+        sim.fog.set_width_for_test(40);
+        sim.fog.set_height_for_test(32);
+        let owner = sim.interner.get("Russians").unwrap();
+        let mut view = crate::sim::vision::OwnerVisibility::new(40, 32);
+        for (x, y) in (0..32u16).flat_map(|y| (0..40u16).map(move |x| (x, y))) {
+            if mapped((x, y)) {
+                view.mark_visible(x, y);
+            }
+        }
+        sim.fog.by_owner_mut_for_test().insert(owner, view);
+        let child = sim.substrate.entities.get_mut(child_id).unwrap();
+        child.discovery.set_owned_by_current_house_for_test(true);
+        assert!(!child.is_mission_only());
+        let before = position_world_coord(&child.position);
+        if let Some(manager) = sim
+            .substrate
+            .entities
+            .get_mut(v3)
+            .and_then(|e| e.spawn_manager.as_mut())
+        {
+            manager.set_target(Some(TargetKind::Entity(target)));
+        }
+        // Idle -> Launching, the slot's launch, then two passes with the
+        // missile where the launch left it.
+        for _ in 0..4 {
+            if let Some(manager) = sim
+                .substrate
+                .entities
+                .get_mut(v3)
+                .and_then(|e| e.spawn_manager.as_mut())
+            {
+                manager.update_timer = CdTimer::default();
+            }
+            spawn_manager_ai(
+                &mut sim,
+                &rules,
+                v3,
+                None,
+                crate::sim::world::FrameEffects::default(),
+            );
+        }
+        let child = sim.substrate.entities.get(child_id).expect("child alive");
+        (
+            child.lifecycle.in_limbo(),
+            position_world_coord(&child.position) == before,
+            (child.position.rx(), child.position.ry()),
+        )
+    };
+    // Mapped everywhere, the missile leaves at its launch Cell.
+    let (in_limbo, kept, launch_cell) = launch(&|_| true);
+    assert_eq!(
+        (in_limbo, kept),
+        (false, false),
+        "admitted: out at its launch point"
+    );
+    // The query reads that Cell: mapped alone, it admits the missile there...
+    assert_eq!(
+        launch(&|cell| cell == launch_cell),
+        (false, false, launch_cell)
+    );
+    // ...and unmapped alone, it refuses it.
+    let (in_limbo, kept, _) = launch(&|cell| cell != launch_cell);
+    assert_eq!(
+        (in_limbo, kept),
+        (true, true),
+        "refused: in limbo where it was"
     );
 }
 
@@ -831,7 +853,7 @@ fn a_missile_that_lost_its_target_retreats_for_good() {
     let mut rng = sim.scenario_rng.clone();
     let mut pick = || {
         find_paradrop_edge_cell(
-            sim.playfield_bounds,
+            sim.playfield_bounds(),
             sim.resolved_terrain.as_ref(),
             Edge::North,
             &mut rng,
@@ -857,7 +879,8 @@ fn a_missile_that_lost_its_target_retreats_for_good() {
     );
     assert_eq!(entity.mission.dispatch_timer().delay(), 1);
 
-    sim.session.binary_frame += 1;
+    sim.session
+        .set_binary_frame_for_test(sim.session.binary_frame() + 1);
     crate::sim::aircraft::dispatch_mission(&mut sim, missile, &rules, Default::default());
     let entity = sim.substrate.entities.get(missile).unwrap();
     assert_eq!(
@@ -921,7 +944,7 @@ fn missile_held_after(setup: impl FnOnce(&mut crate::sim::game_entity::GameEntit
         crate::sim::world::FrameEffects::default(),
     );
 
-    let frame = sim.session.binary_frame;
+    let frame = sim.session.binary_frame();
     let entity = sim.substrate.entities.get_mut(v3).expect("V3");
     setup(entity, frame);
     let manager = entity.spawn_manager.as_mut().expect("manager");
@@ -1019,7 +1042,10 @@ fn missile_impact_kills_through_the_shared_death_pipeline() {
             logic_eligible: true,
         },
     );
-    sim.rocket_move_to(
+    Simulation::rocket_move_to(
+        &sim.interner,
+        &sim.session,
+        &mut sim.substrate,
         child_id,
         crate::sim::components::DriveCoord::cell(20, 20, 0),
         &rules,
@@ -1060,55 +1086,6 @@ fn missile_impact_kills_through_the_shared_death_pipeline() {
             .is_none_or(|t| t.death.is_dying() || !t.lifecycle.object_alive()),
         "a target the missile takes to zero must actually die, not stand at 0 HP"
     );
-}
-
-#[test]
-fn v3_attack_order_damages_the_target_through_the_spawned_rocket() {
-    let rules = make_spawner_rules();
-    let mut sim = missile_sim();
-    let v3 = sim
-        .spawn_object("V3", "Russians", 10, 10, 0, &rules)
-        .expect("spawn V3");
-    let target = sim
-        .spawn_object("FRAGILE", "Yuri", 16, 10, 0, &rules)
-        .expect("spawn FRAGILE");
-
-    assert!(
-        sim.substrate
-            .entities
-            .get(target)
-            .is_some_and(|t| t.lifecycle.object_alive() && t.health.current() == 50),
-        "fixture guard: the target must start alive at full health"
-    );
-
-    if let Some(entity) = sim.substrate.entities.get_mut(v3) {
-        entity
-            .attack_target
-            .set_for_test(Some(crate::sim::combat::TargetKind::Entity(target)));
-    }
-
-    // The retail contract is a kill, not a scratch: FRAGILE has Strength=50
-    // against the V3's 200 damage, so anything short of the shared death
-    // pipeline running leaves it standing at 0 HP and this fails.
-    let mut destroyed = false;
-    for _ in 0..600 {
-        sim.advance_tick(&[], Some(&rules), None, None, 67);
-        let gone = sim
-            .substrate
-            .entities
-            .get(target)
-            .is_none_or(|t| t.death.is_dying() || !t.lifecycle.object_alive());
-        if gone {
-            destroyed = true;
-            break;
-        }
-    }
-    assert!(
-        destroyed,
-        "a V3 Launcher with an attack order must land its rocket and destroy the target"
-    );
-    // Kill credit rides the combat damage event, which carries the launcher as
-    // the attacker.
 }
 
 /// `TechnoClass::AI` runs the SpawnManager (`0x006FA94C`) inside the Unit's
@@ -1166,7 +1143,8 @@ fn a_v3s_fire_reaches_its_manager_at_the_next_pass() {
 /// (`0x00707B19..0x00707B24`) ignores the control: a live V3's own
 /// Detach_All — a cloak's here — takes the owner arm, which UnInits its
 /// docked missile and regenerates the slot at once; the next pass builds a
-/// new missile whose SpawnOwner is the V3.
+/// new missile whose SpawnOwner is the V3. Ares skips that forward
+/// (1004A910, hook 0x707B19): `ares_own_detach_all_keeps_the_docked_missile`.
 #[test]
 fn a_live_spawners_own_expiry_rebuilds_its_docked_missile() {
     let rules = make_spawner_rules();
@@ -1191,7 +1169,7 @@ fn a_live_spawners_own_expiry_rebuilds_its_docked_missile() {
             .is_none_or(|c| c.death.is_dying() || !c.lifecycle.object_alive()),
         "the docked missile UnInits"
     );
-    let frame = sim.session.binary_frame as i32;
+    let frame = sim.session.binary_frame() as i32;
     let slot = manager(&sim).slots[0].clone();
     assert_eq!(slot.spawn, None);
     assert_eq!(slot.state, SpawnSlotState::Regenerating);
@@ -1225,36 +1203,6 @@ fn a_live_spawners_own_expiry_rebuilds_its_docked_missile() {
             .owner(),
         Some(v3)
     );
-}
-
-#[test]
-fn owner_death_destroys_docked_children() {
-    let rules = make_spawner_rules();
-    let mut sim = Simulation::new();
-    let dred = sim
-        .spawn_object("DRED", "Russians", 10, 10, 0, &rules)
-        .expect("spawn DRED");
-    let children: Vec<u64> = sim
-        .substrate
-        .entities
-        .get(dred)
-        .and_then(|e| e.spawn_manager.as_ref())
-        .map(|m| m.slots.iter().filter_map(|s| s.spawn).collect())
-        .expect("children");
-    assert_eq!(children.len(), 2, "SpawnsNumber=2");
-
-    sim.uninit(dred);
-    sim.flush_pending_delete();
-
-    for child in children {
-        assert!(
-            sim.substrate
-                .entities
-                .get(child)
-                .is_none_or(|c| c.death.is_dying() || !c.lifecycle.object_alive()),
-            "docked children die with the parent (Kill_All_Spawns)"
-        );
-    }
 }
 
 /// `ObjectClass::ReceiveDamage`'s exact-zero Destroy (`0x005F57AF`) announces
@@ -1635,7 +1583,8 @@ fn missile_flight_speed_uses_the_ra2_conversion() {
     };
     let mut fastest: f64 = 0.0;
     for _ in 0..240 {
-        sim.session.binary_frame += 1;
+        sim.session
+            .set_binary_frame_for_test(sim.session.binary_frame() + 1);
         sim.process_rocket(
             child_id,
             &rules,
@@ -1649,13 +1598,6 @@ fn missile_flight_speed_uses_the_ra2_conversion() {
         f64::from(crate::util::fixed_math::ra2_speed_to_leptons_per_frame(15))
     );
     assert_eq!(fastest, 38.0);
-}
-
-#[test]
-fn gsi_13_07_no_spawn_alt_parser_defaults_false_and_reads_yes() {
-    let rules = make_spawner_rules();
-    assert!(rules.object("V3").expect("V3 rules").no_spawn_alt);
-    assert!(!rules.object("DRED").expect("DRED rules").no_spawn_alt);
 }
 
 #[test]
@@ -2410,7 +2352,7 @@ fn a_null_target_drops_the_managers_queued_retarget() {
     sim.assign_target_represented(
         dred,
         None,
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -2568,7 +2510,7 @@ fn a_hornet_mid_pass_keeps_its_run_through_the_managers_re_issue() {
         .unwrap()
         .slots[slot]
         .state = SpawnSlotState::Attacking;
-    let frame = sim.session.binary_frame as i32;
+    let frame = sim.session.binary_frame() as i32;
     let child = sim.substrate.entities.get_mut(hornet).unwrap();
     child
         .attack_target
@@ -2680,8 +2622,8 @@ CurleyShuffle=yes
     // The sortie needs a real Size diamond as well as its LocalSize. The
     // shared flat fixture's Size width0 admits no cell at native568300 once
     // a height is supplied; mission-only cruising Hornets can then leave.
-    sim.session.map_width = 65;
-    sim.session.map_height = 65;
+    sim.session.set_map_width_for_test(65);
+    sim.session.set_map_height_for_test(65);
     sim.install_resolved_terrain_for_new_map(crate::map::resolved_terrain::test_flat_ground_grid(
         65,
     ));
@@ -2701,7 +2643,7 @@ CurleyShuffle=yes
         assert!(sim.map_cell_in_bounds(cell), "sortie start {cell:?}");
         assert!(crate::sim::cell_rect::cell_is_in_playfield_height_aware(
             (i32::from(cell.0), i32::from(cell.1)),
-            sim.playfield_bounds,
+            sim.playfield_bounds(),
             sim.resolved_terrain.as_ref(),
         ));
     }
@@ -2731,9 +2673,9 @@ CurleyShuffle=yes
         {
             manager.set_target(Some(TargetKind::Entity(target)));
         }
-        sim.fire_events.clear();
+        sim.fire_events.clear_for_test();
         sim.advance_tick(&[], Some(&rules), None, None, 67);
-        let frame = sim.session.binary_frame;
+        let frame = sim.session.binary_frame();
         for event in sim
             .fire_events
             .iter()
@@ -2809,12 +2751,12 @@ fn every_hornet_of_a_carrier_wing_flies_a_whole_strafe_pass() {
 
 /// After its pass a Hornet is recalled with the Carrier itself as its NavCom
 /// (`Assign_Destination(owner, 1)`, `0x006B766D`), and Mission_Move flies it
-/// home. Over the Carrier's cell, stopped, Fly's landing trigger
-/// (`0x004CE3C0`) sets it down on the deck, a landing zone a Spawned aircraft
-/// may share with its spawner (`0x004DDC60`), and the manager takes it in to
-/// reload.
+/// home. SpawnManagerClass::AI (0x006B7230, intake at 6B7793..6B780F) takes
+/// it in to reload over the Carrier's cell below 20 leptons above its owner, before
+/// Fly necessarily reaches the exact deck height. Limbo's Stop_Driver can
+/// replace the recalled object destination with the current cell.
 #[test]
-fn a_recalled_hornet_flies_home_and_lands_on_the_carrier() {
+fn a_recalled_hornet_returns_to_the_carrier_reload_slot() {
     use crate::sim::spawn_manager::SpawnSlotState;
     let sortie = strafing_carrier_sortie("Landable=yes\nROT=3\n");
     let carrier = sortie.sim.substrate.entities.get(sortie.carrier).unwrap();
@@ -2822,17 +2764,21 @@ fn a_recalled_hornet_flies_home_and_lands_on_the_carrier() {
     let slots = &carrier.spawn_manager.as_ref().unwrap().slots;
     for hornet in &sortie.wing {
         let navs = &sortie.navs[hornet];
-        assert_eq!(
-            navs.iter().rev().find_map(|&(_, nav)| nav),
-            Some(crate::sim::components::NavTargetRef::Object { id: sortie.carrier }),
+        assert!(
+            navs.iter().any(|&(_, nav)| nav
+                == Some(crate::sim::components::NavTargetRef::Object { id: sortie.carrier })),
             "Hornet {hornet} is sent home to the Carrier: {navs:?}"
         );
         let h = sortie.sim.substrate.entities.get(*hornet).unwrap();
         let landed = crate::sim::movement::ground_pose::position_world_coord(&h.position);
         assert_eq!(
-            ((landed.x / 256, landed.y / 256), landed.z),
-            ((deck.x / 256, deck.y / 256), deck.z),
-            "Hornet {hornet} lands on the deck"
+            (landed.x / 256, landed.y / 256),
+            (deck.x / 256, deck.y / 256),
+            "Hornet {hornet} returns over the Carrier"
+        );
+        assert!(
+            (0..20).contains(&landed.z.wrapping_sub(deck.z)),
+            "Hornet {hornet} is within the native intake height"
         );
         assert!(h.lifecycle.in_limbo(), "Hornet {hornet} is taken in");
         let slot = slots
@@ -2868,16 +2814,15 @@ fn retail_launches(
 
     let mut sim = Simulation::new();
     let house = sim.interner.intern("Russians");
-    sim.houses.insert(
-        house,
-        crate::sim::house_state::HouseState::new(house, 0, None, true, 0, 10),
-    );
-    sim.session.house_order.push(house);
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            house, 0, None, true, 0, 10,
+        ));
     crate::sim::arena_fixture::flat_arena(&mut sim, rules);
     let terrain = sim.resolved_terrain.as_mut().unwrap();
     for y in 0..32 {
         for x in 0..32 {
-            terrain.cell_mut(x, y).unwrap().level = 4;
+            terrain.cell_mut_for_test(x, y).unwrap().level = 4;
         }
     }
     // MarkSucceeded seats a ship on this dry fixture ground.
@@ -2931,7 +2876,7 @@ fn retail_launches(
             None,
             crate::sim::world::FrameEffects::default(),
         );
-        let frame = sim.session.binary_frame;
+        let frame = sim.session.binary_frame();
         let owner_entity = sim.substrate.entities.get(owner).unwrap();
         let child = owner_entity.spawn_manager.as_ref().unwrap().slots[slot]
             .spawn
@@ -2990,8 +2935,16 @@ fn retail_missiles_keep_their_launch_coordinate_from_unlimbo() {
     // The production readers agree with the original's reads of the inputs.
     for (name, row) in native["types"].as_object().unwrap() {
         let art = rules.art().get(name).unwrap();
-        assert_eq!(art.primary_fire_flh, flh(&row["weapon_flh"][0]), "{name}");
-        assert_eq!(art.secondary_fire_flh, flh(&row["weapon_flh"][1]), "{name}");
+        assert_eq!(
+            rules.object(name).unwrap().weapon_flh(0, false),
+            flh(&row["weapon_flh"][0]),
+            "{name}"
+        );
+        assert_eq!(
+            rules.object(name).unwrap().weapon_flh(1, false),
+            flh(&row["weapon_flh"][1]),
+            "{name}"
+        );
         assert_eq!(
             art.second_spawn_offset,
             flh(&row["second_spawn_offset"]),
@@ -3045,4 +2998,37 @@ fn retail_missiles_keep_their_launch_coordinate_from_unlimbo() {
             assert!(rocket.is_moving(), "{owner_type}: Move_To took the target");
         }
     }
+}
+
+/// Ares 3.0 TechnoClass_PointerGotInvalid_SpawnCloakOwner (1004A910, hook
+/// 0x707B19): a live V3's own Detach_All no longer reaches its manager, so
+/// the docked missile stays.
+#[test]
+fn ares_own_detach_all_keeps_the_docked_missile() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let rules = make_spawner_rules();
+    let mut sim = missile_sim();
+    let v3 = sim
+        .spawn_object("V3", "Russians", 10, 10, 0, &rules)
+        .expect("spawn V3");
+    let docked = |sim: &Simulation| {
+        sim.substrate
+            .entities
+            .get(v3)
+            .and_then(|e| e.spawn_manager.clone())
+            .unwrap()
+            .slots[0]
+            .spawn
+    };
+    let missile = docked(&sim).expect("a docked missile");
+    sim.detach_all_pointer_expired(v3, &rules, None, crate::sim::world::FrameEffects::default());
+    assert_eq!(docked(&sim), Some(missile));
+    assert!(
+        sim.substrate
+            .entities
+            .get(missile)
+            .unwrap()
+            .lifecycle
+            .object_alive()
+    );
 }

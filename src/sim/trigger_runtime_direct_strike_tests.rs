@@ -1,5 +1,4 @@
-//! Execute96/109 integration. Native96 controls execute gamemd.exe SHA256
-//! 3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600,
+//! Execute96/109 integration. Native96 controls execute gamemd.exe,
 //! reusing trigger_action_values::nuke_strike_dispatch_case's ABI transport.
 //! Edge/velocity literals below are observed native outputs, not Rust results.
 use super::*;
@@ -43,6 +42,7 @@ fn run(sim: &mut Simulation, rules: &RuleSet, kind: i32) -> bool {
         entries["CASE"].entries()[0].clone(),
         None,
         None,
+        None,
     );
     let house = sim.interner.intern("IgnoredIncomingHouse");
     sim.apply_live_trigger_action(
@@ -53,7 +53,7 @@ fn run(sim: &mut Simulation, rules: &RuleSet, kind: i32) -> bool {
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        Some(rules),
+        rules,
         None,
         FrameEffects::default(),
     )
@@ -81,13 +81,13 @@ fn chemical_strike_uses_original_edge_origins_and_fixed_unowned_launch() {
         ((17, 31), [6272, 9856, 0]),
     ] {
         let (rules, mut sim, _) = world_with(rules(false), 64, &[]);
-        sim.playfield_bounds = Some(PlayfieldBounds {
+        sim.set_playfield_bounds_for_test(Some(PlayfieldBounds {
             base: 32,
             off_fc: 2,
             off_100: 2,
             off_104: 28,
             off_108: 28,
-        });
+        }));
         waypoint(&mut sim, cell);
         let before = rng(&sim);
         assert!(run(&mut sim, &rules, 96));
@@ -96,26 +96,26 @@ fn chemical_strike_uses_original_edge_origins_and_fixed_unowned_launch() {
         let bullet = bullets[0].1;
         assert_eq!(
             [
-                bullet.launch_origin.x,
-                bullet.launch_origin.y,
-                bullet.launch_origin.z
+                bullet.launch_origin().x,
+                bullet.launch_origin().y,
+                bullet.launch_origin().z
             ],
             origin
         );
         // Original Fire468AAC..468B57 persisted values, after its ROT tail;
         // the action ABI controls separately establish the pre-Fire vector.
         assert_eq!(
-            bullet.velocity.native().map(|v| v.bits()),
+            bullet.velocity().native().map(|v| v.bits()),
             [0x3ca1a5ffffffffff, 0x3feffffffffffffe, 0]
         );
-        assert_eq!(bullet.guidance.unwrap().max_speed, 20);
-        assert_eq!(bullet.source_id, RAD_NO_ATTACKER);
+        assert_eq!(bullet.guidance().unwrap().max_speed, 20);
+        assert_eq!(bullet.source_id(), RAD_NO_ATTACKER);
         assert_eq!(bullet.firer_house(), None);
-        assert_eq!(bullet.payload.installed_weapon(), None);
-        assert!(!bullet.payload.bright());
-        assert_eq!(bullet.payload.base_damage, 100);
+        assert_eq!(bullet.payload().installed_weapon(), None);
+        assert!(!bullet.payload().bright());
+        assert_eq!(bullet.payload().base_damage, 100);
         assert_eq!(
-            bullet.target,
+            bullet.target(),
             ProjectileTarget::Cell {
                 rx: cell.0 as u16,
                 ry: cell.1 as u16
@@ -143,10 +143,11 @@ fn counted_trigger_dispatches_both_strikes_then_continues() {
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
         None,
         None,
+        None,
     );
-    sim.classify_map_triggers(None);
-    sim.session.set_started(true);
-    sim.advance_triggers(Some(&rules), None, FrameEffects::default());
+    sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
+    sim.session.publish_started();
+    sim.advance_triggers(&rules, None, FrameEffects::default());
     assert!(sim.trigger_local_is_set_for_test(0));
     assert_eq!(sim.projectiles.iter().count(), 1);
     let entity = sim.entities().get(victim).unwrap();
@@ -224,8 +225,8 @@ fn retail_chemical_weapon_requires_real_allocation_before_find() {
     waypoint(&mut sim, (40, 40));
     assert!(run(&mut sim, &rules, 96));
     let bullet = sim.projectiles.iter().next().unwrap().1;
-    assert_eq!(bullet.payload.base_damage, 100);
-    assert_eq!(bullet.payload.installed_weapon(), None);
+    assert_eq!(bullet.payload().base_damage, 100);
+    assert_eq!(bullet.payload().installed_weapon(), None);
     assert_eq!(bullet.firer_house(), None);
 }
 

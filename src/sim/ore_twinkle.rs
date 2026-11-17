@@ -42,13 +42,33 @@ pub(crate) struct OreTwinkleReceipt {
     pub(crate) particle_system_id_consumed: bool,
 }
 
+/// `DAT_00A8ED78` analogue for this fresh load: whether a post-load setup
+/// (`FUN_00684C30`) has constructed the GasCloudSys `ParticleSystemClass`
+/// since `Clear_Scene` nulled it. A generated launch constructs it inside the
+/// synthetic `Full_Init`'s setup before any generator constructor; the later
+/// post-`Post_Map_Init` setup then skips. Set once per load, never cleared.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PostLoadGasCloud {
+    constructed: bool,
+}
+
+impl PostLoadGasCloud {
+    pub(crate) fn is_constructed(self) -> bool {
+        self.constructed
+    }
+
+    fn mark_constructed(&mut self) {
+        self.constructed = true;
+    }
+}
+
 impl Simulation {
     /// Spend the GasCloudSys `ParticleSystemClass @ 0x0062DC50` native ID the
     /// first time a post-load setup runs after `Clear_Scene` nulled
     /// `DAT_00A8ED78`. Returns whether this call spent the native ID.
     /// The ordinary particle owner retains the live GasCloudSys and children.
     pub fn construct_post_load_particle_system_id(&mut self, rules: &RuleSet) -> bool {
-        if self.post_load_particle_system_constructed
+        if self.post_load_particle_system_constructed.is_constructed()
             || self.particle_systems().gas_cloud_system().is_some()
         {
             return false;
@@ -57,11 +77,12 @@ impl Simulation {
             return false;
         }
         if self.initialize_gas_cloud_system(rules).is_none() {
-            // Rules-less constructor fixtures retain their established ID
-            // reservation. Retail processing always registers GasCloudSys.
+            // Rules without GasCloudSys (constructor fixtures) still reserve
+            // its ID. Retail processing always registers GasCloudSys.
             let _ = self.native_unique_ids.as_mut().unwrap().next_id();
         }
-        self.post_load_particle_system_constructed = true;
+        self.post_load_particle_system_constructed
+            .mark_constructed();
         true
     }
 
@@ -98,7 +119,7 @@ impl Simulation {
         overlay_registry: &OverlayTypeRegistry,
         map_width: u16,
         map_height: u16,
-    ) -> OreTwinkleReceipt {
+    ) -> Result<OreTwinkleReceipt, crate::sim::crates::RuntimeOverlayError> {
         // `DAT_00A8ED78 == 0` gate at `0x00684FF0`: a generated launch already
         // constructed the object inside the synthetic `Full_Init`'s setup.
         let mut receipt = OreTwinkleReceipt {
@@ -106,7 +127,7 @@ impl Simulation {
             ..Default::default()
         };
         let Some(anim_name) = rules.general.ore_twinkle.as_deref() else {
-            return receipt;
+            return Ok(receipt);
         };
         let chance = rules.general.ore_twinkle_chance;
         let type_id = self.interner.intern(anim_name);
@@ -132,7 +153,7 @@ impl Simulation {
                 cell.overlay_data,
                 overlay_registry,
                 &rules.tiberium_types,
-            ) == 0
+            )? == 0
             {
                 continue;
             }
@@ -178,6 +199,9 @@ impl Simulation {
                 },
             ) {
                 Ok(_) => receipt.spawned += 1,
+                Err(crate::sim::anim_class::AnimSpawnError::Tiberium(error)) => {
+                    return Err(error.into());
+                }
                 Err(error) => {
                     receipt.spawn_failures += 1;
                     log::error!(
@@ -186,11 +210,11 @@ impl Simulation {
                 }
             }
         }
-        receipt
+        Ok(receipt)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -201,14 +225,21 @@ mod tests {
             "[Tiberiums]\n0=Riparius\n[Riparius]\nImage=1\nValue=2147483647\n\
              [OverlayTypes]\n0=ORE\n1=ROCK\n[ORE]\nTiberium=yes\n[ROCK]\nIsARock=yes\n",
         );
+        let ini = crate::rules::tiberium_type::with_tiberium_image_slots(&ini);
         let overlays = OverlayTypeRegistry::from_ini(&ini, None);
         let tiberiums = TiberiumTypeRegistry::from_ini(&ini);
 
-        assert_eq!(tiberium_value(None, 5, &overlays, &tiberiums), 0);
-        assert_eq!(tiberium_value(Some(1), 5, &overlays, &tiberiums), 0);
-        assert_eq!(tiberium_value(Some(0), 0, &overlays, &tiberiums), i32::MAX);
+        assert_eq!(tiberium_value(None, 5, &overlays, &tiberiums).unwrap(), 0);
         assert_eq!(
-            tiberium_value(Some(0), 1, &overlays, &tiberiums),
+            tiberium_value(Some(1), 5, &overlays, &tiberiums).unwrap(),
+            0
+        );
+        assert_eq!(
+            tiberium_value(Some(0), 0, &overlays, &tiberiums).unwrap(),
+            i32::MAX
+        );
+        assert_eq!(
+            tiberium_value(Some(0), 1, &overlays, &tiberiums).unwrap(),
             i32::MAX.wrapping_mul(2),
             "native imul wraps the signed product"
         );

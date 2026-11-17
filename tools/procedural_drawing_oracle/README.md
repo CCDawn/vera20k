@@ -33,8 +33,8 @@ context so the next independent control cannot inherit a pending exception.
 `unit_heal_to_full` executes the original bounded House-heal AI arm before
 rendering and records the resulting Health; whole native tick scheduling,
 natural damage/capture/grant/revoke, smoke cleanup and full-game frames remain
-outside this supplied-state corpus. Binary identity and the replay command
-are in its sidecar; implementation validation belongs in the PR/checkpoint.
+outside this supplied-state corpus. The replay command
+is in its sidecar; implementation validation belongs in the PR/checkpoint.
 
 ## Selected ground Unit Attack
 
@@ -97,13 +97,6 @@ One selected source costs0.00530ms to build. Expired timers skip construction;
 an unselected20k actor scan costs0.153ms. These are component measurements with
 repeated overlapping positions, not a dispersed20k game or FPS claim.
 
-Production archives identify the native image and the exact case set they
-consume. The original whole-payload hash remains historical provenance at
-record time. The Move archive's case set was checked byte-for-byte against
-its original commit before migrating that identity, so appending Attack rows
-does not invalidate unchanged Move evidence. All compressed Move captures
-remain untouched.
-
 ## Selected ground Unit Move
 
 [`action_lines.md`](action_lines.md) records the native route, initialized state,
@@ -132,26 +125,8 @@ compare directly with original native pixels. The optimized focused run passed
 88 tests on the integrated main candidate, including downstream radar/map, input, destination and capture-schema
 checks. Full-candidate validation is recorded in the checkpoint.
 
-The [portable production archive](unit-move-production-validation/receipt.json)
-contains 12 normal release XMP03T4 scenes and their12 final release replays on Apple M4/Metal. Real local mouse
-gestures exercise selection, Move, last-active/expired frames, reselection and
-empty bands. Ordinary Stop and arrival exercise NavCom cleanup. Every native
-opaque store matches the final frame. The matched-time Move, Stop and reselection
-pairs compare all 480000 pixels, changing only 165, 165 and 151 native stores.
-After arrival, reselection leaves all 358976 tactical pixels identical; its click
-resets the separate sidebar tooltip. These are prepared native inputs bound to
-captured state, not native whole-Scenario or whole-frame emulation.
-The final executable (`776a416b…`, clean source `d5b667327`) reproduces all
-5760000 captured frame pixels and385 observed boundaries. The observation
-owner independently checks sealed input bytes, diagnostic clock and atlas;
-portable rechecks validate the retained bytes and scoped pixel/state results.
-`record` keeps text with the home directory spelled `~` and re-pins every identity
-of a file it rewrites, so `capture_sha256` binds the retained capture, not the live file.
-
 ```sh
 python -m tools.procedural_drawing_oracle.action_lines --check
-python -m tools.procedural_drawing_oracle.rally_production check \
-  --archive tools/procedural_drawing_oracle/unit-move-production-validation
 ```
 
 The rally consumer check compared the
@@ -190,8 +165,7 @@ planning, range/selection rasters and the remaining whole-scope families stay op
 
 ## Original executable
 
-All original execution uses active-retail `gamemd.exe`, SHA-256
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
+All original execution uses active-retail `gamemd.exe`.
 Use the shared [native runner](../native_oracle.md), Unicorn2.1.4 and the explicit
 FPCW0E7F/RGB565 fixture. Original bytes and prepared boundaries are recorded in
 `rally.meta.json`.

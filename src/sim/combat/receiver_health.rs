@@ -24,6 +24,10 @@ pub(super) struct ReceiverHealthCommit {
     /// TechnoClass's own tail: only the Foot, Infantry and Unit receivers'
     /// tails follow, and they read the result, not `*damage`.
     pub(super) psychedelic: bool,
+    /// `*pDamage` after Object's body (`0x00701DF8`), when Techno reached it:
+    /// what Phobos' `0x701E18` hook reflects and counts.
+    #[cfg(feature = "phobos")]
+    pub(super) object_packet: Option<i32>,
 }
 
 /// World access for the one Object5F5390 port. Observation-only callers use
@@ -58,16 +62,67 @@ impl super::object_health::ObjectHealthHost for ReceiverHealthHost<'_, '_, '_> {
         )
     }
 
+    fn write_damage(&mut self, damage: i32) {
+        if self.execute_world_callbacks
+            && let Some(writeback) = self.event.damage_writeback
+        {
+            writeback.write(self.world, self.rules, damage);
+        }
+    }
+
+    /// 10053A10 culls only without ignoreDefenses, with a warhead and an
+    /// attacker object; it passes the attacker without a Techno check. An
+    /// observation-only commit never draws, and neither does a game without
+    /// Ares, which never culls: the switch is asked before the warhead.
+    fn culls(&mut self) -> bool {
+        let event = self.event;
+        if !self.rules.ares()
+            || !self.execute_world_callbacks
+            || event.receiver_flags.ignore_defenses
+            || event.attacker_id == RAD_NO_ATTACKER
+        {
+            return false;
+        }
+        let rules = self.rules;
+        let Some(warhead) = self.world.interner.warhead_type(event.warhead_ref, rules) else {
+            return false;
+        };
+        let (Some(attacker), Some(victim), Some(strength)) = (
+            self.world.substrate.entities.get(event.attacker_id),
+            self.world.substrate.entities.get(event.target_id),
+            self.current_strength(),
+        ) else {
+            return false;
+        };
+        let (veterancy, health) = (attacker.veterancy.raw(), victim.health);
+        super::object_health::ares_can_cull(
+            warhead,
+            veterancy,
+            health,
+            strength,
+            rules.general.condition_red,
+            rules.general.condition_yellow,
+            &mut self.world.scenario_rng,
+        )
+    }
+
     fn invoke(&mut self, callback: super::object_health::HealthCallback) {
         use super::object_health::HealthCallback;
         let id = self.event.target_id;
-        let context =
-            UninitContext::new(Some(self.rules), self.registry).with_effects(self.effects);
+        let context = UninitContext::new(self.rules, self.registry).with_effects(self.effects);
         match callback {
             //5F5486: a heal that changed Strength calls vt+148 Flash(7).
             HealthCallback::Changed => {
                 if self.execute_world_callbacks {
-                    self.world.flash_object(id, 7);
+                    Simulation::flash_object(
+                        &self.world.interner,
+                        &self.world.session,
+                        &self.world.fog,
+                        &self.world.house_alliances,
+                        &mut self.world.substrate,
+                        id,
+                        7,
+                    );
                 }
             }
             HealthCallback::Tag { kind, with_source } => {
@@ -91,7 +146,7 @@ impl super::object_health::ObjectHealthHost for ReceiverHealthHost<'_, '_, '_> {
                 if !self.execute_world_callbacks {
                     return;
                 }
-                self.world.begin_receiver_kill_record(id);
+                self.world.substrate.begin_receiver_kill_record(id);
                 //5F5772..579A: the supplied source-House ABI pointer stays
                 //fixed, but comparison against the source Techno's Owner is live.
                 let attacker = self.event.attacker_id;
@@ -116,12 +171,12 @@ impl super::object_health::ObjectHealthHost for ReceiverHealthHost<'_, '_, '_> {
             }
             HealthCallback::Destroy => {
                 if self.execute_world_callbacks {
-                    //The existing fallback never books a loss a real Kill
-                    //already booked. Both ordinary and delayed death use the
-                    //same Destroy here, before Techno's PostMortem branch.
-                    self.world.record_destruction_once(id);
+                    // Both ordinary and delayed death use the same Destroy
+                    // here, before Techno's PostMortem branch. It books no
+                    // loss: the Kill above already called RecordKill.
+                    Simulation::close_kill_record(&mut self.world.substrate, id);
                     if super::world_receiver::callbacks_enabled(self.world) {
-                        self.world.object_destroy_callback(id, context);
+                        self.world.detach_all(id, true, context);
                     }
                 }
             }
@@ -141,7 +196,7 @@ pub(super) fn commit_receiver_health(
     let target_id = event.target_id;
     let attacker_id = event.attacker_id;
     let receive_outcome = receiver_outcome?.outcome;
-    let binary_frame = world.session.binary_frame;
+    let binary_frame = world.session.binary_frame();
     let mut building_entry_frame = None;
     let mut fatal_category = EntityCategory::Unit;
     let live_source_owner = (attacker_id != RAD_NO_ATTACKER)
@@ -156,15 +211,11 @@ pub(super) fn commit_receiver_health(
     let attacker_owner = event.source_house.or(live_source_owner);
     let hostile_source = |target: &GameEntity,
                           source_owner: Option<InternedId>,
-                          alliances: &HouseAllianceMap,
+                          alliances: &HouseAlliances,
                           interner: &StringInterner| {
         attacker_id != RAD_NO_ATTACKER
             && source_owner.is_some_and(|source_owner| {
-                !crate::map::houses::is_allied_with(
-                    alliances,
-                    interner.resolve(target.owner()),
-                    interner.resolve(source_owner),
-                )
+                !alliances.is_allied(interner, target.owner(), source_owner)
             })
     };
     if let Some(value) = receive_outcome.psychedelic_value {
@@ -197,6 +248,8 @@ pub(super) fn commit_receiver_health(
             uncloak_after_damage: false,
             house_threat_delta: None,
             psychedelic: true,
+            #[cfg(feature = "phobos")]
+            object_packet: None,
         });
     }
     let (strength, building_no_c4) = {
@@ -234,6 +287,7 @@ pub(super) fn commit_receiver_health(
         building_no_c4,
         rules.general.condition_red,
         attacker_id != RAD_NO_ATTACKER,
+        rules.ares(),
     );
     #[cfg(any(test, feature = "test-support"))]
     let reached_exact_zero = host.reached_exact_zero;
@@ -255,7 +309,7 @@ pub(super) fn commit_receiver_health(
         })
         .flatten();
     let attacker_owner = event.source_house.or(live_source_owner);
-    //Steam3e81a617: Object701DF8 returns before701E12/701E32's live Type
+    //Steam gamemd: Object701DF8 returns before701E12/701E32's live Type
     //reads,701E23/701E61's live Owners and701E68's immediate anger update.
     //This precedes result5/PostMortem exits, feedback sounds and Uncloak.
     //Control-flow evidence: original701DF8..701E71; arithmetic retains the
@@ -270,12 +324,14 @@ pub(super) fn commit_receiver_health(
         if execute_world_callbacks {
             update_anger_nodes(
                 &mut world.houses,
-                &world.session.house_order,
                 &world.house_alliances,
                 &world.interner,
                 victim_owner,
                 source_owner,
                 delta,
+                world.session.game_mode_nonzero(),
+                rules.ares_form(),
+                rules.general.ai_nearest_enemy,
             );
         }
         Some(delta)
@@ -306,12 +362,11 @@ pub(super) fn commit_receiver_health(
             && !ty.perma_disguise
         {
             let category = target.category();
-            target
-                .disguise
-                .get_or_insert_with(|| {
-                    crate::sim::cloak_disguise::DisguiseRuntime::new(binary_frame)
-                })
-                .receive_damage_reveal(binary_frame, final_packet, category);
+            target.disguise_mut(binary_frame).receive_damage_reveal(
+                binary_frame,
+                final_packet,
+                category,
+            );
         }
         //Object5's early return skips Techno70202E's independent HP override.
         entered_techno_death |=
@@ -379,6 +434,8 @@ pub(super) fn commit_receiver_health(
         uncloak_after_damage,
         house_threat_delta,
         psychedelic: false,
+        #[cfg(feature = "phobos")]
+        object_packet: reached_survivor_postlude.then_some(final_packet),
     })
 }
 

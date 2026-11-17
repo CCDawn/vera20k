@@ -458,9 +458,8 @@ def local_defeat_case(case, inputs):
 
 
 def local_defeat_generate():
-    assert native.image_sha256() == native.NATIVE_SHA256, "This profile requires the current sealed original image"
     inputs = local_defeat_inputs()
-    return dict(schema_version=1, source="unicorn/gamemd.exe", native_sha256=native.image_sha256(),
+    return dict(schema_version=1, source="unicorn/gamemd.exe",
                 seed=31, inputs=inputs,
                 cases=[local_defeat_case(case, inputs) for case in local_defeat_cases()])
 

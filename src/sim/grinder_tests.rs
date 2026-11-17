@@ -130,10 +130,7 @@ fn grinder_seek_keeps_the_last_registered_building_on_distance_ties() {
             .nav_com(),
         Some(NavTargetRef::object(last))
     );
-    sim.uninit_with_context(
-        last,
-        crate::sim::world::UninitContext::new(Some(&rules), None),
-    );
+    sim.uninit_with_context(last, crate::sim::world::UninitContext::new(&rules, None));
     assert!(sim.foot_enter_grinder(civ, &rules, None, FrameEffects::default()));
     assert_eq!(
         sim.substrate
@@ -152,7 +149,7 @@ fn vehicle_eaten_walk_reaches_the_grinder_and_refunds_once() {
     let owner = sim.interner.get("Russians").unwrap();
     let grinder = spawn(&mut sim, &rules, "GRINDER", "Russians", 18, 10);
     let tank = spawn(&mut sim, &rules, "TANK", "Russians", 10, 10);
-    let credits = sim.houses[&owner].economy.credits();
+    let credits = sim.houses[&owner].economy().credits();
     assert!(sim.foot_enter_grinder(tank, &rules, None, FrameEffects::default()));
     for _ in 0..500 {
         sim.advance_tick(&[], Some(&rules), None, None, 67);
@@ -164,7 +161,7 @@ fn vehicle_eaten_walk_reaches_the_grinder_and_refunds_once() {
         sim.entities().get(tank).is_none(),
         "Drive/Eaten must complete arrival and deferred removal"
     );
-    assert_eq!(sim.houses[&owner].economy.credits(), credits + 300);
+    assert_eq!(sim.houses[&owner].economy().credits(), credits + 300);
     assert!(
         sim.entities()
             .get(grinder)
@@ -175,7 +172,7 @@ fn vehicle_eaten_walk_reaches_the_grinder_and_refunds_once() {
     for _ in 0..10 {
         sim.advance_tick(&[], Some(&rules), None, None, 67);
     }
-    assert_eq!(sim.houses[&owner].economy.credits(), credits + 300);
+    assert_eq!(sim.houses[&owner].economy().credits(), credits + 300);
 }
 
 #[test]
@@ -186,7 +183,7 @@ fn vehicle_grinding_refunds_both_cargo_levels_and_removes_each_passenger() {
     let outer = spawn(&mut sim, &rules, "TANK", "Russians", 11, 10);
     let nested = spawn(&mut sim, &rules, "CIV", "Russians", 12, 10);
     let sibling = spawn(&mut sim, &rules, "CIV", "Russians", 13, 10);
-    let context = crate::sim::world::UninitContext::new(Some(&rules), None);
+    let context = crate::sim::world::UninitContext::new(&rules, None);
     assert!(sim.add_cargo_passenger_chain(outer, &[(nested, 1.0)], context));
     assert!(sim.add_cargo_passenger_chain(tank, &[(sibling, 1.0)], context));
     assert!(sim.add_cargo_passenger_chain(tank, &[(outer, 1.0)], context));
@@ -206,17 +203,17 @@ fn vehicle_grinding_refunds_both_cargo_levels_and_removes_each_passenger() {
         .navigation
         .set_nav_com_for_test(Some(NavTargetRef::object(grinder)));
     let beneficiary = sim.interner.get("Americans").unwrap();
-    let credits = sim.houses[&beneficiary].economy.credits();
+    let credits = sim.houses[&beneficiary].economy().credits();
     sim.per_cell_process(
         tank,
         PerCellReason::Arrival,
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default(),
     )
     .unwrap();
     // Unit73A0A5 first refunds itself, then nested75 + outer300 + sibling75.
-    assert_eq!(sim.houses[&beneficiary].economy.credits(), credits + 750);
+    assert_eq!(sim.houses[&beneficiary].economy().credits(), credits + 750);
     for id in [tank, outer, nested, sibling] {
         let victim = sim.entities().get(id).unwrap();
         assert!(!victim.lifecycle.object_alive(), "{id} must be UnInit");
@@ -276,13 +273,13 @@ fn eaten_arrival_uses_effective_mission_and_attack_or_navigation_identity() {
                 .set_for_test(Some(TargetKind::Entity(building)));
         }
         let owner = sim.interner.get("Americans").unwrap();
-        let before = sim.houses[&owner].economy.credits();
+        let before = sim.houses[&owner].economy().credits();
         assert_eq!(
             sim.foot_per_cell_eaten(civ, &rules, None, FrameEffects::default()),
             consumed
         );
         assert_eq!(
-            sim.houses[&owner].economy.credits() - before,
+            sim.houses[&owner].economy().credits() - before,
             if consumed { 75 } else { 0 }
         );
         if consumed {
@@ -313,7 +310,7 @@ fn script60_walks_to_the_grinder_refunds_once_and_resumes_after_save() {
     let grinder = spawn(&mut sim, &rules, "GRINDER", "Russians", 18, 10);
     let civ = spawn(&mut sim, &rules, "CIV", "Russians", 10, 10);
     let owner = sim.interner.get("Russians").unwrap();
-    let credits = sim.houses[&owner].economy.credits();
+    let credits = sim.houses[&owner].economy().credits();
     team(&mut sim, vec![civ]);
     sim.run_team_ai_pass(&rules, None, FrameEffects::default());
     for _ in 0..12 {
@@ -344,11 +341,11 @@ fn script60_walks_to_the_grinder_refunds_once_and_resumes_after_save() {
         "ordinary Walk must reach PerCell and deferred deletion"
     );
     assert!(restored.substrate.entities.get(civ).is_none());
-    assert_eq!(sim.houses[&owner].economy.credits(), credits + 75);
+    assert_eq!(sim.houses[&owner].economy().credits(), credits + 75);
     for _ in 0..30 {
         sim.advance_tick(&[], Some(&rules), None, None, 67);
     }
-    assert_eq!(sim.houses[&owner].economy.credits(), credits + 75);
+    assert_eq!(sim.houses[&owner].economy().credits(), credits + 75);
     assert!(
         sim.substrate
             .entities
@@ -365,6 +362,11 @@ fn sov03_authored_trigger80_teams_walk_and_recycle_all_four_civilian_types() {
     use crate::rules::process_owner::NativeScenarioRulesPrefix;
     use crate::rules::team_ai_ini::TeamAiIniRegistry;
     use crate::sim::house_state::HouseState;
+
+    // Keep the declared flat crop's source building and waypoints inside
+    // its native Size diamond, preserving the original fixture's spacing.
+    const CROP_X: u16 = 14;
+    const CROP_Y: u16 = 12;
 
     let Some((_, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
         return;
@@ -386,6 +388,17 @@ fn sov03_authored_trigger80_teams_walk_and_recycle_all_four_civilian_types() {
     rules.install_art_data(ArtRegistry::from_ini(&art));
     let aimd = crate::rules::retail_sources::select_ini(&assets, "AIMD.INI").unwrap();
     let teams = TeamAiIniRegistry::from_sources(&aimd.ini, &authored.ini, true);
+    // The actual AA civilian origin is beside this Neutral building. Keep
+    // that relationship in the flat crop so Action80 must also exercise
+    // reinforcement65D8E0's generic building ExitObject path.
+    let source_origin = authored.waypoints[&26];
+    assert_eq!((source_origin.rx, source_origin.ry), (131, 84));
+    let source_building = authored
+        .entities
+        .iter()
+        .find(|entity| entity.type_id == "CAPARS07" && (entity.cell_x, entity.cell_y) == (130, 85))
+        .expect("physical SOV03 civilian source building");
+    assert_eq!(source_building.owner, "Neutral");
     assert!(rules.object("YAGRND").unwrap().grinding);
     assert_eq!(
         rules.object("YAGRND").unwrap().power,
@@ -427,7 +440,12 @@ fn sov03_authored_trigger80_teams_walk_and_recycle_all_four_civilian_types() {
             }
         }
         let waypoints: String = (26..=32)
-            .map(|index| format!("{index}={}\n", (index - 18) * 1000 + 10))
+            .map(|index| {
+                format!(
+                    "{index}={}\n",
+                    (index - 26 + u32::from(CROP_Y)) * 1000 + u32::from(CROP_X)
+                )
+            })
             .collect();
         // Original trigger/event/action/Tag records and Team definitions;
         //the declared flat crop relocates all seven AA..AG reinforcement cells.
@@ -454,17 +472,39 @@ fn sov03_authored_trigger80_teams_walk_and_recycle_all_four_civilian_types() {
         let country = sim.interner.intern("Civie3Country");
         let mut state = HouseState::new(house, 2, Some(country), false, 0, 1);
         state.project_country_mults(&rules, &sim.interner);
-        sim.houses.insert(house, state);
-        sim.session.house_order.push(house);
-        sim.install_team_ai_registry(&teams, &rules).unwrap();
+        sim.houses.register(state);
+        let neutral = sim.interner.intern(&source_building.owner);
+        let neutral_country = sim.interner.intern("Neutral");
+        let mut neutral_state = HouseState::new(neutral, 1, Some(neutral_country), false, 0, 1);
+        neutral_state.project_country_mults(&rules, &sim.interner);
+        neutral_state.resolve_multiplay_passive(&rules, Some("Neutral"));
+        assert!(
+            neutral_state.multiplay_passive(),
+            "retail Neutral country is passive"
+        );
+        sim.houses.register(neutral_state);
+        sim.install_team_ai_registry(&teams, &rules);
         sim.session.install_waypoints(&cropped.waypoints);
-        spawn(&mut sim, &rules, "YAGRND", "Civie3", 18, 10);
-        sim.initialize_trigger_definitions(&cropped, &teams, None, None);
-        sim.classify_map_triggers(Some(&rules));
+        spawn(&mut sim, &rules, "YAGRND", "Civie3", CROP_X + 8, CROP_Y + 2);
+        let cropped_origin = cropped.waypoints[&26];
+        let source_x = i32::from(cropped_origin.rx) + i32::from(source_building.cell_x)
+            - i32::from(source_origin.rx);
+        let source_y = i32::from(cropped_origin.ry) + i32::from(source_building.cell_y)
+            - i32::from(source_origin.ry);
+        spawn(
+            &mut sim,
+            &rules,
+            &source_building.type_id,
+            &source_building.owner,
+            u16::try_from(source_x).unwrap(),
+            u16::try_from(source_y).unwrap(),
+        );
+        sim.initialize_trigger_definitions(&cropped, &teams, None, None, None);
+        sim.classify_map_triggers(&rules);
         let frame = |sim: &mut Simulation| {
             sim.advance_app_frame(
                 &[],
-                Some(&rules),
+                &rules,
                 None,
                 67,
                 crate::sim::world::TickLane::Ordinary,
@@ -476,9 +516,22 @@ fn sov03_authored_trigger80_teams_walk_and_recycle_all_four_civilian_types() {
         assert_eq!(sim.team_script_vm.teams_in_order().count(), 0);
         // Reach the authored elapsed-time threshold without simulating an
         //unrelated campaign. The real Event13 timer and Action80 run here.
-        sim.session.tick = 1600;
-        sim.session.binary_frame = 1600;
+        sim.session.set_tick_for_test(1600);
+        sim.session.set_binary_frame_for_test(1600);
+        // Only the Neutral source building's ExitObject clears this House's
+        // pending Infantry choice; ordinary waypoint placement leaves it.
+        let infantry_choice = crate::sim::ai_unit_choice::UnitChoiceKind::Infantry;
+        sim.houses
+            .get_mut(&neutral)
+            .unwrap()
+            .ai_unit_choices_mut()
+            .set(infantry_choice, 0);
         frame(&mut sim);
+        assert_eq!(
+            sim.houses[&neutral].ai_unit_choices().get(infantry_choice),
+            -1,
+            "{type_id}: the authored source building must run ExitObject"
+        );
         let members: Vec<_> = sim
             .substrate
             .entities
@@ -495,7 +548,7 @@ fn sov03_authored_trigger80_teams_walk_and_recycle_all_four_civilian_types() {
             7,
             "{tag_id} must run all seven actual Action80/{team_type} records"
         );
-        let before = sim.houses[&house].economy.credits();
+        let before = sim.houses[&house].economy().credits();
         let mut approached = std::collections::BTreeSet::new();
         for _ in 0..600 {
             frame(&mut sim);
@@ -504,7 +557,7 @@ fn sov03_authored_trigger80_teams_walk_and_recycle_all_four_civilian_types() {
                     .substrate
                     .entities
                     .get(civilian)
-                    .is_some_and(|actor| actor.position.rx() > 10)
+                    .is_some_and(|actor| actor.position.rx() > CROP_X)
                 {
                     approached.insert(civilian);
                 }
@@ -524,7 +577,7 @@ fn sov03_authored_trigger80_teams_walk_and_recycle_all_four_civilian_types() {
             "all seven {type_id} must be recycled"
         );
         assert_eq!(
-            sim.houses[&house].economy.credits(),
+            sim.houses[&house].economy().credits(),
             before + 700,
             "{type_id} Soylent"
         );
@@ -593,7 +646,7 @@ fn infantry_arrival_switches_active_to_special_without_a_foot_tail() {
     sim.per_cell_process(
         civ,
         PerCellReason::Arrival,
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default(),
     )
@@ -627,10 +680,7 @@ fn eaten_idles_when_its_grinder_expires_without_falling_back_to_hunt() {
     let civ = spawn(&mut sim, &rules, "CIV", "Russians", 10, 10);
     assert!(sim.foot_enter_grinder(civ, &rules, None, FrameEffects::default()));
     mission(&mut sim, civ, MissionType::Eaten, MissionId::NONE);
-    sim.uninit_with_context(
-        grinder,
-        crate::sim::world::UninitContext::new(Some(&rules), None),
-    );
+    sim.uninit_with_context(grinder, crate::sim::world::UninitContext::new(&rules, None));
     assert_eq!(
         sim.substrate
             .entities
@@ -645,7 +695,8 @@ fn eaten_idles_when_its_grinder_expires_without_falling_back_to_hunt() {
         civ,
         &rules,
         crate::sim::world::ObjectAiCtx::default(),
-    );
+    )
+    .unwrap();
     assert_eq!(
         sim.substrate
             .entities
@@ -665,7 +716,7 @@ fn eaten_idles_when_its_grinder_expires_without_falling_back_to_hunt() {
             .object_alive()
     );
     let owner = sim.interner.get("Russians").unwrap();
-    assert_eq!(sim.houses[&owner].economy.credits(), 0);
+    assert_eq!(sim.houses[&owner].economy().credits(), 0);
 }
 
 #[test]
@@ -694,7 +745,7 @@ fn arrival_callbacks_precede_refund_and_playback_precedes_the_next_main_draw() {
                     "playback must occur before selecting the next death list"
                 );
                 assert_eq!(
-                    sim.houses[&owner].economy.credits(),
+                    sim.houses[&owner].economy().credits(),
                     if grinder { 75 } else { 0 }
                 );
                 assert_eq!(
@@ -714,9 +765,10 @@ fn arrival_callbacks_precede_refund_and_playback_precedes_the_next_main_draw() {
     }
 
     let (mut sim, rules) = fixture();
-    sim.session.game_mode_nonzero = false;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false));
     for house in sim.houses.values_mut() {
-        house.country = Some(house.name);
+        house.set_country_for_test(Some(house.name()));
     }
     let grinder = spawn(&mut sim, &rules, "GRINDER", "Russians", 14, 10);
     let civ = spawn(&mut sim, &rules, "CIV", "Americans", 10, 10);
@@ -745,12 +797,12 @@ fn arrival_callbacks_precede_refund_and_playback_precedes_the_next_main_draw() {
     )
     .unwrap();
     let teams = TeamAiIniRegistry::from_sources(&IniFile::from_str(""), &map.ini, false);
-    sim.initialize_trigger_definitions(&map, &teams, None, None);
-    sim.classify_map_triggers(Some(&rules));
+    sim.initialize_trigger_definitions(&map, &teams, None, None, None);
+    sim.classify_map_triggers(&rules);
     sim.attach_object_trigger_tag(grinder, Some("OWNER_TAG"));
     sim.attach_object_trigger_tag(civ, Some("DONE_TAG"));
     sim.clear_tag_dispatch_trace_for_test();
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     sim.main_rng = crate::sim::rng::MainRng::new(60);
     let mut expected = crate::sim::rng::SimRng::new(60);
     let voice = ["VoiceA", "VoiceB"][(expected.next_u32() % 2) as usize];
@@ -775,7 +827,7 @@ fn arrival_callbacks_precede_refund_and_playback_precedes_the_next_main_draw() {
         owner,
         "building Tag1 changes ownership before refund"
     );
-    assert_eq!(sim.houses[&owner].economy.credits(), 75);
+    assert_eq!(sim.houses[&owner].economy().credits(), 75);
     let dispatches: Vec<_> = sim
         .tag_dispatch_trace_for_test()
         .iter()
@@ -798,4 +850,43 @@ fn arrival_callbacks_precede_refund_and_playback_precedes_the_next_main_draw() {
             .lifecycle
             .object_alive()
     );
+}
+
+/// Retail YAGRND answers CAN_LOAD with ROGER (`0x0043C4F8`), but carries no
+/// one: the Infantry Enter row asks only a carrier with `Passengers=` above 0
+/// (`0x0051ED7C..0x0051ED96`), so a GI is not offered transport entry. A Bio
+/// Reactor (`Passengers=5`) still is.
+#[test]
+fn a_retail_grinder_answers_roger_without_offering_transport_entry() {
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = &retail.rules;
+    let mut sim = crate::sim::arena_fixture::rival_arena(rules, 60);
+    sim.intern_rule_type_ids(rules);
+    sim.resolve_type_handles(rules);
+    let grinder = sim
+        .spawn_object("YAGRND", "Americans", 20, 10, 0, rules)
+        .unwrap();
+    let reactor = sim
+        .spawn_object("YAPOWR", "Americans", 20, 18, 0, rules)
+        .unwrap();
+    let gi = sim
+        .spawn_object("E1", "Americans", 12, 10, 0, rules)
+        .unwrap();
+    let tank = sim
+        .spawn_object("MTNK", "Americans", 12, 14, 0, rules)
+        .unwrap();
+    for carried in [gi, tank] {
+        assert_eq!(
+            crate::sim::radio::receive::can_load_query(&sim, grinder, carried, rules),
+            crate::sim::radio::RadioResponse::Roger
+        );
+    }
+    assert!(!crate::sim::passenger::can_enter_transport(
+        &sim, rules, gi, grinder
+    ));
+    assert!(crate::sim::passenger::can_enter_transport(
+        &sim, rules, gi, reactor
+    ));
 }

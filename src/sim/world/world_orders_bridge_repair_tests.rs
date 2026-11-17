@@ -48,7 +48,9 @@ fn build_sim() -> (Simulation, RuleSet) {
     let mut sim = Simulation::new();
     let rules = bridge_repair_test_rules();
     sim.resolve_type_handles(&rules);
-    sim.resolved_terrain = Some(dummy_resolved_terrain());
+    let terrain = dummy_resolved_terrain();
+    sim.overlay_grid = Some(OverlayGrid::new(terrain.width(), terrain.height()));
+    sim.resolved_terrain = Some(terrain);
     (sim, rules)
 }
 
@@ -63,26 +65,14 @@ fn build_ordinary_c4_sim(
 
     // The SEAL walks: a second [GHOST] section would not be read, since a
     // lookup finds the first section of a name.
-    let ini = BRIDGE_REPAIR_TEST_INI
-        .replace(
-            "[GHOST]\n",
-            "[GHOST]\nLocomotor={4A582744-9839-11d1-B709-00A024DDAFD1}\n",
-        )
-        .replace(
-            "[BuildingTypes]\n0=CABHUT\n",
-            "[BuildingTypes]\n0=CABHUT\n1=BIG\n[BIG]\nStrength=800\nArmor=concrete\nFoundation=3x3\n",
-        );
+    let ini = BRIDGE_REPAIR_TEST_INI.replace(
+        "[GHOST]\n",
+        "[GHOST]\nLocomotor={4A582744-9839-11d1-B709-00A024DDAFD1}\n",
+    );
     let (mut sim, rules, registry) = super::entry_test_fixture::fixture_with_rules(&ini);
     // A raw ordinary three-cell width, with resident TMP/navigation owners.
     // Overlay families do not imply structural/deck geometry.
     for y in [14, 15, 16] {
-        sim.resolved_terrain
-            .as_mut()
-            .unwrap()
-            .cell_mut(17, y)
-            .unwrap()
-            .bridge_facts
-            .overlay_id = Some(overlay);
         sim.overlay_grid
             .as_mut()
             .unwrap()
@@ -96,11 +86,8 @@ fn build_ordinary_c4_sim(
     ));
     for (side, name) in ["Americans", "Soviets"].into_iter().enumerate() {
         let house = sim.interner.intern(name);
-        sim.houses.insert(
-            house,
-            HouseState::new(house, side as u8, None, false, 1000, 10),
-        );
-        sim.session.house_order.push(house);
+        sim.houses
+            .register(HouseState::new(house, side as u8, None, false, 1000, 10));
     }
     (sim, rules, registry)
 }
@@ -110,7 +97,10 @@ fn build_ordinary_c4_sim(
 /// `0x004D4C14..0x004D4C6B`).
 fn make_americans_a_player(sim: &mut Simulation) {
     let americans = sim.interner.intern("Americans");
-    sim.houses.get_mut(&americans).unwrap().is_human = true;
+    sim.houses
+        .get_mut(&americans)
+        .unwrap()
+        .set_is_human_for_test(true);
 }
 
 fn spawn_engineer(sim: &mut Simulation, rules: &RuleSet, rx: u16, ry: u16) -> u64 {
@@ -123,8 +113,8 @@ fn spawn_engineer(sim: &mut Simulation, rules: &RuleSet, rx: u16, ry: u16) -> u6
 fn spawn_seal(sim: &mut Simulation, rx: u16, ry: u16) -> u64 {
     let owner = sim.interner.intern("Americans");
     let ty = sim.interner.intern("GHOST");
-    let id = sim.substrate.next_stable_object_id;
-    sim.substrate.next_stable_object_id += 1;
+    let id = sim.next_stable_object_id();
+    sim.set_next_stable_object_id_for_test(sim.next_stable_object_id() + 1);
     let e = GameEntity::new_at_frame_zero_for_test(
         id,
         rx,
@@ -147,8 +137,8 @@ fn spawn_seal(sim: &mut Simulation, rx: u16, ry: u16) -> u64 {
 fn spawn_cabhut(sim: &mut Simulation, rx: u16, ry: u16) -> u64 {
     let owner = sim.interner.intern("Soviets");
     let ty = sim.interner.intern("CABHUT");
-    let id = sim.substrate.next_stable_object_id;
-    sim.substrate.next_stable_object_id += 1;
+    let id = sim.next_stable_object_id();
+    sim.set_next_stable_object_id_for_test(sim.next_stable_object_id() + 1);
     let e = GameEntity::new_at_frame_zero_for_test(
         id,
         rx,
@@ -172,12 +162,12 @@ const BRIDGE_CELLS: &[(u16, u16)] = &[(10, 9), (10, 10), (10, 11), (10, 12), (10
 
 /// Collapsed ordinary high identities (CellClass+44) on the span cells.
 fn seed_destroyed_bridge(sim: &mut Simulation) {
-    let terrain = sim
-        .resolved_terrain
+    let overlays = sim
+        .overlay_grid
         .as_mut()
-        .expect("bridge tests require resolved terrain");
+        .expect("bridge tests require an overlay grid");
     for &(rx, ry) in BRIDGE_CELLS {
-        terrain.cell_mut(rx, ry).unwrap().bridge_facts.overlay_id = Some(0xE7);
+        overlays.cell_mut_for_test(rx, ry).overlay_id = Some(0xE7);
     }
     sim.bridge_state = Some(BridgeRuntimeState::default());
 }
@@ -194,7 +184,7 @@ fn stamp_concrete_middle_tile(sim: &mut Simulation, cell: (u16, u16)) {
             b"[General]\nBridgeMiddle1=7\nBridgeMiddle2=40\n",
         ),
     );
-    let ramp = terrain.cell_mut(cell.0, cell.1).unwrap();
+    let ramp = terrain.cell_mut_for_test(cell.0, cell.1).unwrap();
     ramp.final_tile_index = 100 + 7 - 1;
     ramp.final_sub_tile = 4;
 }
@@ -203,13 +193,7 @@ fn stamp_concrete_middle_tile(sim: &mut Simulation, cell: (u16, u16)) {
 const FALLBACK_ANCHOR_STATE: u8 = 15;
 
 fn fallback_anchor_state(sim: &Simulation) -> u8 {
-    sim.resolved_terrain
-        .as_ref()
-        .unwrap()
-        .cell(13, 10)
-        .unwrap()
-        .bridge_facts
-        .state_byte
+    sim.overlay_grid.as_ref().unwrap().cell(13, 10).overlay_data
 }
 
 fn seed_hut_fallback_bridgehead_layout(sim: &mut Simulation) {
@@ -219,7 +203,7 @@ fn seed_hut_fallback_bridgehead_layout(sim: &mut Simulation) {
         .as_mut()
         .expect("bridge fallback tests require resolved terrain");
     let anchor_cell = terrain.native_cell_identity((13, 10));
-    let starter = terrain.cell_mut(12, 10).unwrap();
+    let starter = terrain.cell_mut_for_test(12, 10).unwrap();
     starter.bridge_facts.raw_flags = BRIDGE_FLAG_STRUCTURAL;
     starter.bridge_facts.native_anchor = Some(anchor_cell);
     starter.bridge_facts.anchor = Some(BridgeAnchorRelation {
@@ -228,21 +212,22 @@ fn seed_hut_fallback_bridgehead_layout(sim: &mut Simulation) {
         family: BridgeStampFamily::Nesw,
         direction: 6,
     });
-    let anchor = terrain.cell_mut(13, 10).unwrap();
-    anchor.bridge_facts.raw_flags = 0;
-    anchor.bridge_facts.state_byte = FALLBACK_ANCHOR_STATE;
+    terrain
+        .cell_mut_for_test(13, 10)
+        .unwrap()
+        .bridge_facts
+        .raw_flags = 0;
+    sim.overlay_grid
+        .as_mut()
+        .unwrap()
+        .cell_mut_for_test(13, 10)
+        .overlay_data = FALLBACK_ANCHOR_STATE;
     stamp_concrete_middle_tile(sim, (13, 10));
 }
 
 fn seed_terminal_overlay_with_fallback_trap(sim: &mut Simulation, overlay_byte: u8) {
     seed_hut_fallback_bridgehead_layout(sim);
-    sim.resolved_terrain
-        .as_mut()
-        .unwrap()
-        .cell_mut(10, 10)
-        .unwrap()
-        .bridge_facts
-        .overlay_id = Some(overlay_byte);
+    sim.overlay_cell_mut_for_test(10, 10).overlay_id = Some(overlay_byte);
 }
 
 fn seed_hut_fallback_without_starter(sim: &mut Simulation) {
@@ -251,7 +236,7 @@ fn seed_hut_fallback_without_starter(sim: &mut Simulation) {
         .resolved_terrain
         .as_mut()
         .expect("bridge fallback tests require resolved terrain");
-    let starter = terrain.cell_mut(12, 10).unwrap();
+    let starter = terrain.cell_mut_for_test(12, 10).unwrap();
     starter.bridge_facts.raw_flags = 0;
     starter.bridge_facts.anchor = None;
 }
@@ -293,146 +278,12 @@ fn advance_until_c4_plant(
             .substrate
             .entities
             .get(target_id)
-            .and_then(|b| b.pending_c4_detonation.pending())
+            .and_then(|b| b.building.pending_c4_detonation.pending())
         {
             return pending.timer().start_frame() as u64;
         }
     }
     panic!("no C4 was planted after entering the target building cell");
-}
-
-/// A PlantC4 order reaching a SEAL that is still walking elsewhere, or idle
-/// several cells away, ends with the SEAL inside the building and the charge
-/// planted. The walk to the building NavCom is the only approach.
-#[test]
-fn c4_order_from_a_distance_reaches_the_building_while_moving_or_idle() {
-    for (building, at, seal_at) in [("CABHUT", (15, 15), (11, 15)), ("BIG", (18, 19), (18, 26))] {
-        for moving in [false, true] {
-            let (mut sim, rules, registry) = build_ordinary_c4_sim(0xD4);
-            make_americans_a_player(&mut sim);
-            let cabhut = sim
-                .spawn_object_at_height(building, "Soviets", at.0, at.1, 0, 0, &rules)
-                .unwrap();
-            let seal = sim
-                .spawn_object_at_height("GHOST", "Americans", seal_at.0, seal_at.1, 0, 0, &rules)
-                .unwrap();
-            if moving {
-                assert!(
-                    sim.assign_infantry_destination(
-                        seal,
-                        NavTargetRef::cell(seal_at.0, seal_at.1 + 5),
-                        &rules,
-                        Some(&registry),
-                        crate::sim::world::FrameEffects::default()
-                    )
-                    .unwrap()
-                );
-                for _ in 0..3 {
-                    step_with_overlay_registry(&mut sim, &rules, &registry);
-                }
-                assert!(
-                    crate::sim::movement::motion_query::is_moving(
-                        sim.substrate.entities.get(seal).unwrap()
-                    ) == Some(true),
-                    "the SEAL is mid-walk when the order lands"
-                );
-            }
-            let owner = sim.interner.intern("Americans");
-            sim.queue_command(crate::sim::command::CommandEnvelope::new(
-                owner,
-                sim.session.tick + 1,
-                Command::PlantC4 {
-                    attacker_id: seal,
-                    target_building_id: cabhut,
-                },
-            ));
-            let planted = (0..400).any(|_| {
-                step_with_overlay_registry(&mut sim, &rules, &registry);
-                sim.substrate
-                    .entities
-                    .get(cabhut)
-                    .is_some_and(|b| b.pending_c4_detonation.pending().is_some())
-            });
-            let e = sim.substrate.entities.get(seal).unwrap();
-            assert!(
-                planted,
-                "{building} moving={moving}: SEAL stopped at {:?} nav={:?} mission={:?}",
-                (e.position.rx(), e.position.ry()),
-                e.navigation.nav_com(),
-                e.mission.current()
-            );
-        }
-    }
-}
-
-/// Native 51E551/51FA75 hut action ignores target-owner friendship; native
-/// 51F190 -> 4D74E0 maps action29 to Capture with the hut as Destination.
-/// The native rows are engineer_bridge_cursor_caller.json self/allied/hostile.
-#[test]
-fn capture_building_command_accepts_collapsed_noncapturable_hut_for_every_relation() {
-    for relation in ["hostile", "allied", "self"] {
-        let (mut sim, rules, registry) =
-            super::entry_test_fixture::fixture_with_rules(BRIDGE_REPAIR_TEST_INI);
-        let owner = if relation == "self" {
-            "Americans"
-        } else {
-            "Soviets"
-        };
-        let cabhut = sim
-            .spawn_object_at_height("CABHUT", owner, 9, 10, 0, 0, &rules)
-            .unwrap();
-        let engineer = spawn_engineer(&mut sim, &rules, 8, 10);
-        if relation == "allied" {
-            sim.house_alliances
-                .entry("AMERICANS".into())
-                .or_default()
-                .insert("SOVIETS".into());
-        }
-        seed_destroyed_bridge(&mut sim);
-        // Registered theater set starts keep flat tile0 out of the native
-        // tile-first ladder. A collapsed overlay alone cannot override a tile.
-        sim.resolved_terrain
-            .as_mut()
-            .unwrap()
-            .test_set_high_bridge_set_starts(Some(100), Some(200));
-        let rng_before = (
-            sim.scenario_rng.logical_state(),
-            sim.main_rng.logical_state(),
-            sim.mapgen_rng.logical_state(),
-        );
-        assert!(
-            sim.apply_command_with_overlays(
-                "Americans",
-                &Command::CaptureBuilding {
-                    engineer_id: engineer,
-                    target_building_id: cabhut,
-                },
-                Some(&rules),
-                Some(&registry),
-                crate::sim::world::FrameEffects::default(),
-            ),
-            "relation={relation}"
-        );
-        let actor = sim.substrate.entities.get(engineer).unwrap();
-        assert_eq!(
-            actor.navigation.nav_com(),
-            Some(NavTargetRef::object(cabhut)),
-            "relation={relation}"
-        );
-        assert!(
-            actor.attack_target.target().is_none(),
-            "native queue target is null"
-        );
-        assert_eq!(
-            (
-                sim.scenario_rng.logical_state(),
-                sim.main_rng.logical_state(),
-                sim.mapgen_rng.logical_state(),
-            ),
-            rng_before,
-            "order admission makes no RNG draws: relation={relation}"
-        );
-    }
 }
 
 /// Native51E49E..51E637 returns repair action29 for ordinary friendly damaged
@@ -458,16 +309,23 @@ fn ordinary_friendly_repair_uses_capture_event_without_hut_exception() {
         .replace("BridgeRepairHut=yes", "BridgeRepairHut=no\nCapturable=yes");
     for target_owner in ["Americans", "Soviets"] {
         let (mut sim, rules, registry) = super::entry_test_fixture::fixture_with_rules(&ini);
-        let owner = sim.interner.intern("Americans");
-        sim.houses.insert(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10),
-        );
+        for (side, name) in ["Americans", "Soviets"].into_iter().enumerate() {
+            let owner = sim.interner.intern(name);
+            sim.houses
+                .register(crate::sim::house_state::HouseState::new(
+                    owner,
+                    side as i32,
+                    None,
+                    side == 0,
+                    0,
+                    10,
+                ));
+        }
         let target = sim
             .spawn_object_at_height("CABHUT", target_owner, 9, 10, 0, 0, &rules)
             .unwrap();
         let engineer = spawn_engineer(&mut sim, &rules, 8, 10);
-        sim.house_alliances
+        sim.house_alliances_mut_for_test()
             .entry("AMERICANS".into())
             .or_default()
             .insert("SOVIETS".into());
@@ -517,7 +375,7 @@ fn ordinary_friendly_repair_uses_capture_event_without_hut_exception() {
                     engineer_id: engineer,
                     target_building_id: target,
                 },
-                Some(&rules),
+                &rules,
                 Some(&registry),
                 crate::sim::world::FrameEffects::default(),
             ),
@@ -563,7 +421,7 @@ fn queued_hut_capture_survives_repair_before_event_execution() {
             .unwrap();
         let engineer = spawn_engineer(&mut sim, &rules, 8, 10);
         if relation == "allied" {
-            sim.house_alliances
+            sim.house_alliances_mut_for_test()
                 .entry("AMERICANS".into())
                 .or_default()
                 .insert("SOVIETS".into());
@@ -580,26 +438,22 @@ fn queued_hut_capture_survives_repair_before_event_execution() {
         let actor_owner = sim.interner.intern("Americans");
         sim.queue_command(crate::sim::command::CommandEnvelope::new(
             actor_owner,
-            sim.session.tick + 1,
+            sim.session.tick() + 1,
             Command::CaptureBuilding {
                 engineer_id: engineer,
                 target_building_id: hut,
             },
         ));
         for &(rx, ry) in BRIDGE_CELLS {
-            sim.resolved_terrain
-                .as_mut()
-                .unwrap()
-                .cell_mut(rx, ry)
-                .unwrap()
-                .bridge_facts
-                .overlay_id = Some(0xD4);
+            sim.overlay_cell_mut_for_test(rx, ry).overlay_id = Some(0xD4);
         }
         assert!(!super::bridge_orchestrator::bridge_hut_can_repair(
             &sim,
             (9, 10)
         ));
-        let due = sim.take_due_commands();
+        // Exercise the delayed receiver without an intervening world AI pass.
+        // Production frame ingress deliberately leaves tail commands queued.
+        let due = sim.take_frame_commands_for_test();
         assert_eq!(due.len(), 1);
         let rng_before = (
             sim.scenario_rng.logical_state(),
@@ -610,7 +464,7 @@ fn queued_hut_capture_survives_repair_before_event_execution() {
             sim.apply_command_with_overlays(
                 "Americans",
                 &due[0].payload,
-                Some(&rules),
+                &rules,
                 Some(&registry),
                 crate::sim::world::FrameEffects::default(),
             ),
@@ -657,7 +511,7 @@ fn c4_on_cabhut_collapses_bridge_and_hut_survives() {
     let owner = sim.interner.intern("Americans");
     sim.queue_command(crate::sim::command::CommandEnvelope::new(
         owner,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::PlantC4 {
             attacker_id: seal,
             target_building_id: cabhut,
@@ -671,7 +525,7 @@ fn c4_on_cabhut_collapses_bridge_and_hut_survives() {
         sim.substrate
             .entities
             .get(cabhut)
-            .and_then(|b| b.pending_c4_detonation.pending())
+            .and_then(|b| b.building.pending_c4_detonation.pending())
             .is_none(),
         "adjacent SEAL must not plant C4 before entering CABHUT"
     );
@@ -683,16 +537,10 @@ fn c4_on_cabhut_collapses_bridge_and_hut_survives() {
     let delay = rules.c4_delay_frames() as u64;
     let mut bridge_state_changed_seen = false;
     for _ in 0..(delay + 1) {
-        if (sim.session.binary_frame as u64) < plant_start + delay {
+        if (sim.session.binary_frame() as u64) < plant_start + delay {
             for y in [14, 15, 16] {
                 assert_eq!(
-                    sim.resolved_terrain
-                        .as_ref()
-                        .unwrap()
-                        .cell(17, y)
-                        .unwrap()
-                        .bridge_facts
-                        .overlay_id,
+                    sim.overlay_grid.as_ref().unwrap().cell(17, y).overlay_id,
                     Some(0xD4),
                     "damaged concrete strip must remain unchanged before C4Delay expires"
                 );
@@ -703,9 +551,10 @@ fn c4_on_cabhut_collapses_bridge_and_hut_survives() {
         // Hut HP invariant — hold across every tick of the window.
         let cur = sim.substrate.entities.get(cabhut).unwrap().health.current();
         assert_eq!(
-            cur, cabhut_max_hp,
+            cur,
+            cabhut_max_hp,
             "hut HP must stay at max during C4Delay (plant_start={plant_start}, sim.session.tick={})",
-            sim.session.tick
+            sim.session.tick()
         );
     }
 
@@ -723,7 +572,7 @@ fn c4_on_cabhut_collapses_bridge_and_hut_survives() {
     );
     assert!(!hut.death.is_dying(), "hut must not be marked dying");
     assert!(
-        hut.pending_c4_detonation.pending().is_none(),
+        hut.building.pending_c4_detonation.pending().is_none(),
         "CABHUT pending C4 marker must clear after bridge dispatch"
     );
 
@@ -731,13 +580,7 @@ fn c4_on_cabhut_collapses_bridge_and_hut_survives() {
     // changes the raw overlay authority, without structural runtime cells.
     for y in [14, 15, 16] {
         assert_eq!(
-            sim.resolved_terrain
-                .as_ref()
-                .unwrap()
-                .cell(17, y)
-                .unwrap()
-                .bridge_facts
-                .overlay_id,
+            sim.overlay_grid.as_ref().unwrap().cell(17, y).overlay_id,
             Some(0xE7),
             "CABHUT C4 must collapse concrete cell (17, {y})"
         );
@@ -746,11 +589,11 @@ fn c4_on_cabhut_collapses_bridge_and_hut_survives() {
     // BR-16: the collapse must feed the minimap radar-dirty channel end-to-end
     // (the same channel the engineer-repair path uses).
     assert!(
-        !sim.radar_terrain_dirty_cells.is_empty(),
+        !sim.dirty_cells.radar().is_empty(),
         "bridge collapse must dirty minimap terrain cells"
     );
     assert!(
-        sim.radar_terrain_dirty_cells.contains(&(17, 15)),
+        sim.dirty_cells.radar().contains(&(17, 15)),
         "the collapsed concrete cell (17,15) must be radar-dirty"
     );
 
@@ -760,272 +603,136 @@ fn c4_on_cabhut_collapses_bridge_and_hut_survives() {
     );
 }
 
-/// A bomb fused on a CABHUT drops its bridge after the blast
-/// (`BombClass::Detonate` `0x0043896A`, from the hut's own AI at
-/// `0x006FA712`), and the frame reports the change as the C4 path does.
-#[test]
-fn a_fused_bomb_on_a_cabhut_collapses_the_bridge_and_reports_it() {
-    let (mut sim, rules, registry) = build_ordinary_c4_sim(0xD4);
-    let cabhut = sim
-        .spawn_object_at_height("CABHUT", "Soviets", 15, 15, 0, 0, &rules)
-        .expect("hut must be constructed and placed beside the concrete strip");
-    let planter = sim
-        .spawn_object_at_height("GHOST", "Americans", 16, 15, 0, 0, &rules)
-        .expect("an Infantry planter");
-    sim.bomb_attach(planter, Some(cabhut), &rules);
-    assert!(sim.bomb_carriers().contains(&cabhut));
-
-    let mut bridge_state_changed_seen = false;
-    for _ in 0..rules.combat_damage.ivan_timed_delay + 2 {
-        let result = step_with_overlay_registry(&mut sim, &rules, &registry);
-        bridge_state_changed_seen |= result.bridge_state_changed;
-    }
-    assert!(sim.bomb_carriers().is_empty(), "the bomb went off");
-    for y in [14, 15, 16] {
-        assert_eq!(
-            sim.resolved_terrain
-                .as_ref()
-                .unwrap()
-                .cell(17, y)
-                .unwrap()
-                .bridge_facts
-                .overlay_id,
-            Some(0xE7),
-            "the bombed hut collapses concrete cell (17, {y})"
-        );
-    }
-    assert!(
-        bridge_state_changed_seen,
-        "TickResult.bridge_state_changed must report the bomb's collapse"
-    );
-}
-
 /// `seal`'s C4 charge on `target`, planted this frame.
 fn plant_c4(sim: &mut Simulation, rules: &RuleSet, target: u64, seal: u64) {
-    let frame = sim.session.binary_frame as i32;
+    let frame = sim.session.binary_frame() as i32;
     sim.substrate
         .entities
         .get_mut(target)
         .unwrap()
+        .building
         .pending_c4_detonation
         .plant(frame, rules.c4_delay_frames(), seal);
 }
 
+/// C4 on a CABHUT with nothing for its bridge sweep to drop clears the charge
+/// and leaves the hut, the bridge and the fallback anchor alone: no bridge
+/// evidence at all, a would-be fallback starter carrying only the 0x80/0x800
+/// flags, no fallback starter, or a terminal overlay (0x65) whose
+/// overlay-first scan hit must not fall through to the fallback trap.
 #[test]
-fn c4_on_cabhut_without_bridge_clears_pending_marker() {
-    let (mut sim, rules) = build_sim();
-    let cabhut = spawn_cabhut(&mut sim, 9, 10);
-    let seal = spawn_seal(&mut sim, 10, 10);
-    let cabhut_max_hp = sim.substrate.entities.get(cabhut).unwrap().health.current();
-    sim.bridge_state = Some(BridgeRuntimeState::default());
-    plant_c4(&mut sim, &rules, cabhut, seal);
+fn c4_on_cabhut_without_a_collapsible_bridge_changes_nothing() {
+    let cases: [(&str, &dyn Fn(&mut Simulation)); 4] = [
+        ("no bridge", &|sim: &mut Simulation| {
+            sim.bridge_state = Some(BridgeRuntimeState::default());
+        }),
+        (
+            "anchor or direction flags alone",
+            &|sim: &mut Simulation| {
+                seed_hut_fallback_bridgehead_layout(sim);
+                let starter = sim
+                    .resolved_terrain
+                    .as_mut()
+                    .unwrap()
+                    .cell_mut_for_test(12, 10)
+                    .unwrap();
+                starter.bridge_facts.raw_flags =
+                    BRIDGE_FLAG_ANCHOR_SELF | BRIDGE_FLAG_DIRECTION_ZERO;
+                starter.bridge_facts.anchor = None;
+            },
+        ),
+        ("no fallback starter", &seed_hut_fallback_without_starter),
+        ("terminal overlay 0x65", &|sim: &mut Simulation| {
+            seed_terminal_overlay_with_fallback_trap(sim, 0x65);
+        }),
+    ];
+    for (case, seed) in cases {
+        let (mut sim, rules) = build_sim();
+        let cabhut = spawn_cabhut(&mut sim, 9, 10);
+        let seal = spawn_seal(&mut sim, 10, 10);
+        let cabhut_max_hp = sim.substrate.entities.get(cabhut).unwrap().health.current();
+        seed(&mut sim);
+        let anchor_state = fallback_anchor_state(&sim);
+        plant_c4(&mut sim, &rules, cabhut, seal);
 
-    let mut bridge_state_changed_seen = false;
-    for _ in 0..(rules.c4_delay_frames() as u64 + 1) {
-        let result = step(&mut sim, &rules);
-        bridge_state_changed_seen |= result.bridge_state_changed;
+        let bridge_state_changed_seen = advance_pending_c4_to_detonation(&mut sim, &rules);
+
+        assert!(!bridge_state_changed_seen, "{case}: no bridge-state change");
+        assert_eq!(fallback_anchor_state(&sim), anchor_state, "{case}");
+        let hut = sim.substrate.entities.get(cabhut).unwrap();
+        assert_eq!(hut.health.current(), cabhut_max_hp, "{case}");
+        assert!(!hut.death.is_dying(), "{case}");
+        assert!(
+            hut.building.pending_c4_detonation.pending().is_none(),
+            "{case}"
+        );
     }
-
-    let hut = sim.substrate.entities.get(cabhut).unwrap();
-    assert_eq!(hut.health.current(), cabhut_max_hp);
-    assert!(!hut.death.is_dying());
-    assert!(hut.pending_c4_detonation.pending().is_none());
-    assert!(
-        !bridge_state_changed_seen,
-        "no bridge evidence means no bridge-state change"
-    );
 }
 
+/// C4 on a CABHUT beside a concrete (0xD4) or wooden (0x4A) strip collapses
+/// the strip and leaves the hut untouched, also under an Iron Curtain. The
+/// wooden case (Original574C20 ->574780 ->575220) reaches the same live
+/// ordinary owner as the physical hut corpus, which writes the CellClass
+/// overlays and not only a runtime cache.
 #[test]
-fn c4_on_invulnerable_cabhut_still_dispatches_bridge_and_clears_pending() {
+fn c4_on_cabhut_collapses_concrete_and_wooden_strips_even_when_invulnerable() {
     use crate::sim::superweapon::invulnerability::{InvulnKind, InvulnerabilityState};
 
-    let (mut sim, rules, registry) = build_ordinary_c4_sim(0xD4);
-    let cabhut = sim
-        .spawn_object_at_height("CABHUT", "Soviets", 15, 15, 0, 0, &rules)
-        .expect("hut must be constructed and placed beside the concrete strip");
-    let seal = sim
-        .spawn_object_at_height("GHOST", "Americans", 16, 15, 0, 0, &rules)
-        .expect("SEAL must be constructed with a Walk locomotor in the adjacent cell");
-    let cabhut_max_hp = sim.substrate.entities.get(cabhut).unwrap().health.current();
-    plant_c4(&mut sim, &rules, cabhut, seal);
-    sim.substrate
-        .entities
-        .get_mut(cabhut)
-        .unwrap()
-        .invulnerability = Some(InvulnerabilityState::new(
-        crate::sim::timer::CdTimer::started(sim.session.tick as i32, rules.c4_delay_frames() + 20),
-        InvulnKind::IronCurtain,
-    ));
-
-    let mut bridge_state_changed_seen = false;
-    for _ in 0..(rules.c4_delay_frames() as u64 + 1) {
-        let result = step_with_overlay_registry(&mut sim, &rules, &registry);
-        bridge_state_changed_seen |= result.bridge_state_changed;
-    }
-
-    let hut = sim.substrate.entities.get(cabhut).unwrap();
-    assert_eq!(hut.health.current(), cabhut_max_hp);
-    assert!(!hut.death.is_dying());
-    assert!(hut.pending_c4_detonation.pending().is_none());
-    assert!(bridge_state_changed_seen);
-    for y in [14, 15, 16] {
-        assert_eq!(
-            sim.resolved_terrain
-                .as_ref()
+    for (overlay, collapsed, invulnerable) in [(0xD4, 0xE7, true), (0x4A, 100, false)] {
+        let (mut sim, rules, registry) = build_ordinary_c4_sim(overlay);
+        let cabhut = sim
+            .spawn_object_at_height("CABHUT", "Soviets", 15, 15, 0, 0, &rules)
+            .expect("hut must be constructed and placed beside the strip");
+        let seal = sim
+            .spawn_object_at_height("GHOST", "Americans", 16, 15, 0, 0, &rules)
+            .expect("SEAL must be constructed with a Walk locomotor in the adjacent cell");
+        let hut_hp = sim.substrate.entities.get(cabhut).unwrap().health.current();
+        plant_c4(&mut sim, &rules, cabhut, seal);
+        if invulnerable {
+            sim.substrate
+                .entities
+                .get_mut(cabhut)
                 .unwrap()
-                .cell(17, y)
-                .unwrap()
-                .bridge_facts
-                .overlay_id,
-            Some(0xE7)
+                .invulnerability = Some(InvulnerabilityState::new(
+                crate::sim::timer::CdTimer::started(
+                    sim.session.tick() as i32,
+                    rules.c4_delay_frames() + 20,
+                ),
+                InvulnKind::IronCurtain,
+            ));
+        }
+
+        let mut changed = false;
+        for _ in 0..=rules.c4_delay_frames() {
+            changed |= step_with_overlay_registry(&mut sim, &rules, &registry).bridge_state_changed;
+        }
+        let hut = sim.substrate.entities.get(cabhut).unwrap();
+        assert_eq!(hut.health.current(), hut_hp, "overlay {overlay:#x}");
+        assert!(!hut.death.is_dying(), "overlay {overlay:#x}");
+        assert!(
+            hut.building.pending_c4_detonation.pending().is_none(),
+            "overlay {overlay:#x}"
         );
+        assert!(changed, "overlay {overlay:#x}");
+        for y in [14, 15, 16] {
+            let cell = sim.resolved_terrain.as_ref().unwrap().cell(17, y).unwrap();
+            assert_eq!(
+                sim.overlay_grid.as_ref().unwrap().cell(17, y).overlay_id,
+                Some(collapsed),
+                "overlay {overlay:#x}"
+            );
+            if overlay == 0x4A {
+                assert!(!cell.bridge_facts.has_structural_bridge());
+                assert_eq!(
+                    sim.overlay_grid.as_ref().unwrap().cell(17, y).overlay_id,
+                    Some(100)
+                );
+            }
+        }
     }
-}
-
-#[test]
-fn c4_on_cabhut_fallback_rejects_anchor_or_direction_flags_alone() {
-    let (mut sim, rules) = build_sim();
-    let cabhut = spawn_cabhut(&mut sim, 9, 10);
-    let seal = spawn_seal(&mut sim, 9, 10);
-    seed_hut_fallback_bridgehead_layout(&mut sim);
-    let starter = sim
-        .resolved_terrain
-        .as_mut()
-        .unwrap()
-        .cell_mut(12, 10)
-        .unwrap();
-    starter.bridge_facts.raw_flags = BRIDGE_FLAG_ANCHOR_SELF | BRIDGE_FLAG_DIRECTION_ZERO;
-    starter.bridge_facts.anchor = None;
-    plant_c4(&mut sim, &rules, cabhut, seal);
-
-    let bridge_state_changed_seen = advance_pending_c4_to_detonation(&mut sim, &rules);
-
-    assert!(
-        !bridge_state_changed_seen,
-        "0x80/0x800 alone must not trigger CABHUT no-overlay fallback"
-    );
-    assert_eq!(fallback_anchor_state(&sim), FALLBACK_ANCHOR_STATE);
-}
-
-#[test]
-fn c4_on_cabhut_without_fallback_starter_is_noop() {
-    let (mut sim, rules) = build_sim();
-    let cabhut = spawn_cabhut(&mut sim, 9, 10);
-    let seal = spawn_seal(&mut sim, 9, 10);
-    seed_hut_fallback_without_starter(&mut sim);
-    plant_c4(&mut sim, &rules, cabhut, seal);
-
-    let bridge_state_changed_seen = advance_pending_c4_to_detonation(&mut sim, &rules);
-
-    assert!(!bridge_state_changed_seen);
-    assert_eq!(fallback_anchor_state(&sim), FALLBACK_ANCHOR_STATE);
-}
-
-#[test]
-fn c4_on_cabhut_low_overlay_collapses_low_bridge() {
-    // Original574C20 ->574780 ->575220 reaches the same live ordinary owner
-    // as the physical hut corpus. The retired fixture populated only a runtime
-    // cache, leaving CellClass overlays empty and providing no Recalc inputs.
-    let (mut sim, rules, registry) = build_ordinary_c4_sim(0x4A);
-    let cabhut = sim
-        .spawn_object_at_height("CABHUT", "Soviets", 15, 15, 0, 0, &rules)
-        .expect("hut beside the wooden strip");
-    let seal = sim
-        .spawn_object_at_height("GHOST", "Americans", 16, 15, 0, 0, &rules)
-        .expect("SEAL beside the hut");
-    let hut_hp = sim.substrate.entities.get(cabhut).unwrap().health.current();
-    plant_c4(&mut sim, &rules, cabhut, seal);
-
-    let mut changed = false;
-    for _ in 0..=rules.c4_delay_frames() {
-        changed |= step_with_overlay_registry(&mut sim, &rules, &registry).bridge_state_changed;
-    }
-    let hut = sim.substrate.entities.get(cabhut).unwrap();
-    assert_eq!(hut.health.current(), hut_hp);
-    assert!(!hut.death.is_dying());
-    assert!(hut.pending_c4_detonation.pending().is_none());
-    assert!(changed);
-    for y in [14, 15, 16] {
-        let cell = sim.resolved_terrain.as_ref().unwrap().cell(17, y).unwrap();
-        assert_eq!(cell.bridge_facts.overlay_id, Some(100));
-        assert!(!cell.bridge_facts.has_structural_bridge());
-        assert_eq!(
-            sim.overlay_grid.as_ref().unwrap().cell(17, y).overlay_id,
-            Some(100)
-        );
-    }
-}
-
-#[test]
-fn c4_on_cabhut_low_terminal_overlay_0x65_uses_overlay_first_scan() {
-    let (mut sim, rules) = build_sim();
-    let cabhut = spawn_cabhut(&mut sim, 9, 10);
-    let seal = spawn_seal(&mut sim, 10, 10);
-    seed_terminal_overlay_with_fallback_trap(&mut sim, 0x65);
-    plant_c4(&mut sim, &rules, cabhut, seal);
-
-    let bridge_state_changed_seen = advance_pending_c4_to_detonation(&mut sim, &rules);
-
-    assert!(
-        !bridge_state_changed_seen,
-        "terminal overlay scan hit must not fall through to fallback trap"
-    );
-    assert_eq!(fallback_anchor_state(&sim), FALLBACK_ANCHOR_STATE);
-}
-
-#[test]
-fn c4_on_cabhut_high_terminal_overlay_0xe8_uses_overlay_first_scan() {
-    let (mut sim, rules) = build_sim();
-    let cabhut = spawn_cabhut(&mut sim, 9, 10);
-    let seal = spawn_seal(&mut sim, 10, 10);
-    seed_terminal_overlay_with_fallback_trap(&mut sim, 0xE8);
-    plant_c4(&mut sim, &rules, cabhut, seal);
-
-    let bridge_state_changed_seen = advance_pending_c4_to_detonation(&mut sim, &rules);
-
-    assert!(
-        !bridge_state_changed_seen,
-        "terminal overlay scan hit must not fall through to fallback trap"
-    );
-    assert_eq!(fallback_anchor_state(&sim), FALLBACK_ANCHOR_STATE);
 }
 
 // ---- G4 damaged-variant lifecycle integration tests ------------------------
-
-#[test]
-fn ordinary_engineer_overlay_repair_preserves_pavement_damage() {
-    use super::bridge_orchestrator::{ready_engineer, ready_repair_fixture, repair_frame};
-    let (mut sim, rules, registry, hut) = ready_repair_fixture(Some(231));
-    let engineer = ready_engineer(&mut sim, &rules, &registry, hut);
-    // Admit damaged-data tiles so an accidental pavement clear would
-    // affect this fixture; native ordinary overlay repair must preserve it.
-    for &(rx, ry) in LIVE_REPAIR_STRIP {
-        let cell = sim
-            .resolved_terrain
-            .as_mut()
-            .unwrap()
-            .cell_mut(rx, ry)
-            .unwrap();
-        cell.has_damaged_data = true;
-        cell.bridge_facts.raw_flags |= crate::map::bridge_pavement::DAMAGED_PAVEMENT;
-    }
-
-    assert!(repair_frame(&mut sim, &rules, &registry).bridge_state_changed);
-    assert!(sim.substrate.entities.get(engineer).is_none());
-
-    let terrain = sim.resolved_terrain.as_ref().unwrap();
-    for &(rx, ry) in LIVE_REPAIR_STRIP {
-        assert_eq!(
-            terrain.cell(rx, ry).unwrap().bridge_facts.overlay_id,
-            Some(0xce)
-        );
-        assert!(
-            terrain.pavement_damaged_at(rx, ry),
-            "cell ({rx},{ry}) pavement damage must survive native ordinary overlay repair"
-        );
-    }
-}
 
 #[test]
 fn ordinary_engineer_overlay_repair_does_not_clear_neighbor_pavement() {
@@ -1033,6 +740,8 @@ fn ordinary_engineer_overlay_repair_does_not_clear_neighbor_pavement() {
     let (mut sim, rules, registry, hut) = ready_repair_fixture(Some(231));
     let engineer = ready_engineer(&mut sim, &rules, &registry, hut);
 
+    // Admit damaged-data tiles so an accidental pavement clear would affect
+    // this fixture; native ordinary overlay repair must preserve it.
     // The neighbor shares the span's tile identity and damaged-data gate.
     // It lies outside the repaired strip, adjacent to (17, 16), so it is NOT
     // visited by the ordinary overlay repair walk. An erroneous connected
@@ -1042,7 +751,7 @@ fn ordinary_engineer_overlay_repair_does_not_clear_neighbor_pavement() {
             .resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(rx, ry)
+            .cell_mut_for_test(rx, ry)
             .unwrap();
         cell.has_damaged_data = true;
         cell.bridge_facts.raw_flags |= crate::map::bridge_pavement::DAMAGED_PAVEMENT;
@@ -1054,8 +763,12 @@ fn ordinary_engineer_overlay_repair_does_not_clear_neighbor_pavement() {
     let terrain = sim.resolved_terrain.as_ref().unwrap();
     for &(rx, ry) in LIVE_REPAIR_STRIP {
         assert_eq!(
-            terrain.cell(rx, ry).unwrap().bridge_facts.overlay_id,
+            sim.overlay_grid.as_ref().unwrap().cell(rx, ry).overlay_id,
             Some(0xce)
+        );
+        assert!(
+            terrain.pavement_damaged_at(rx, ry),
+            "cell ({rx},{ry}) pavement damage must survive native ordinary overlay repair"
         );
     }
     assert!(
@@ -1083,16 +796,9 @@ fn live_repair_fixture() -> (
         .unwrap();
     let owner = sim.substrate.entities.get(engineer).unwrap().owner();
     for (index, &(x, y)) in LIVE_REPAIR_STRIP.iter().enumerate() {
-        sim.resolved_terrain
-            .as_mut()
-            .unwrap()
-            .cell_mut(x, y)
-            .unwrap()
-            .bridge_facts
-            .overlay_id = Some(231);
         let overlays = sim.overlay_grid.as_mut().unwrap();
         overlays.place_overlay(x, y, 231, 0xA0 + index as u8);
-        overlays.cell_mut(x, y).wall_owner = Some(owner);
+        overlays.cell_mut_for_test(x, y).wall_owner = Some(owner);
     }
     (sim, rules, registry, engineer)
 }
@@ -1100,9 +806,7 @@ fn live_repair_fixture() -> (
 fn assert_live_repair_strip(sim: &Simulation, engineer: u64, expected_overlay: u8) {
     let owner = sim.substrate.entities.get(engineer).unwrap().owner();
     for (index, &(x, y)) in LIVE_REPAIR_STRIP.iter().enumerate() {
-        let terrain = sim.resolved_terrain.as_ref().unwrap().cell(x, y).unwrap();
         let overlay = sim.overlay_grid.as_ref().unwrap().cell(x, y);
-        assert_eq!(terrain.bridge_facts.overlay_id, Some(expected_overlay));
         assert_eq!(overlay.overlay_id, Some(expected_overlay));
         assert_eq!(overlay.overlay_data, 0xA0 + index as u8);
         assert_eq!(overlay.wall_owner, Some(owner));

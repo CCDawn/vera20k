@@ -3,8 +3,6 @@
 //! These are client-local presentation predicates: they read the current
 //! player, that player's shroud/sensor plane, and fresh mutable MapClass bounds.
 
-use std::collections::BTreeMap;
-
 use crate::map::entities::EntityCategory;
 use crate::rules::object_type::Ability;
 use crate::rules::ruleset::RuleSet;
@@ -18,7 +16,7 @@ use super::tracker::{RadarObjectUpdate, RadarProjectionFacts};
 pub(super) fn radar_owner_is_human_player(
     owner: InternedId,
     local_owner: InternedId,
-    houses: &BTreeMap<InternedId, crate::sim::house_state::HouseState>,
+    houses: &crate::sim::houses::Houses,
     game_mode_nonzero: bool,
 ) -> bool {
     if game_mode_nonzero {
@@ -26,7 +24,7 @@ pub(super) fn radar_owner_is_human_player(
     } else {
         houses
             .get(&owner)
-            .is_some_and(|house| house.is_human || house.player_control)
+            .is_some_and(|house| house.is_human() || house.player_control())
     }
 }
 
@@ -54,7 +52,7 @@ fn enemy_sensed_prefilter(entity: &crate::sim::game_entity::GameEntity) -> bool 
 }
 
 fn radar_fresh_mode_one_membership(
-    entity: &crate::sim::game_entity::GameEntity,
+    entity: &impl crate::render::snapshot::SnapshotObject,
     playfield_bounds: Option<crate::map::playfield::PlayfieldBounds>,
     resolved_terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
 ) -> bool {
@@ -69,7 +67,7 @@ fn radar_fresh_mode_one_membership(
         return false;
     };
     // ObjectClass virtual `GetCoords`.
-    let [x, y] = crate::sim::movement::ground_pose::object_center_xy(entity);
+    let [x, y] = entity.center_xy();
     crate::sim::cell_rect::cell_is_in_playfield_leptons(
         (x, y, 0),
         Some(bounds),
@@ -78,11 +76,11 @@ fn radar_fresh_mode_one_membership(
 }
 
 fn radar_get_height_leptons(
-    entity: &crate::sim::game_entity::GameEntity,
+    entity: &impl crate::render::snapshot::SnapshotObject,
     resolved_terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
 ) -> i32 {
     // ObjectClass virtual `GetCoords`.
-    let [x, y] = crate::sim::movement::ground_pose::object_center_xy(entity);
+    let [x, y] = entity.center_xy();
     let (rx, ry) = radar_packed_cell_from_leptons(x, y);
     let ground = resolved_terrain
         .and_then(|terrain| {
@@ -94,30 +92,71 @@ fn radar_get_height_leptons(
             crate::util::lepton::ground_height_leptons(cell.level, cell.slope_type, x, y).ok()
         })
         .unwrap_or_else(|| {
-            i32::from(entity.position.z() as i8)
+            i32::from(entity.position().z() as i8)
                 .wrapping_mul(crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS)
         });
-    let mut height = crate::sim::movement::ground_pose::object_world_z_leptons(entity, None)
-        .wrapping_sub(ground);
+    // `object_world_z_leptons(entity, None)`.
+    let mut height = entity.world_z_leptons_off_map().wrapping_sub(ground);
     if entity.on_bridge() {
         height = height.wrapping_sub(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
     }
     height
 }
 
+/// `MapClass::IsShrouded @ 0x00586360` for `viewer` at `point`
+/// ([`crate::sim::vision::point_is_shrouded`]), which raises the point by
+/// its height before testing the shroud lattice. A fixture without terrain
+/// tests the flat cell.
+fn radar_point_shrouded(
+    fog: &FogState,
+    cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
+    viewer: InternedId,
+    point: crate::sim::components::DriveCoord,
+) -> bool {
+    match cells {
+        Some(cells) => crate::sim::vision::point_is_shrouded(fog, cells, viewer, point),
+        None => radar_fog_cell_from_leptons(point.x, point.y)
+            .is_none_or(|(rx, ry)| !fog.is_cell_revealed(viewer, rx, ry)),
+    }
+}
+
+/// RenderCellPixel's shroud test (`0x00655D06..0x00655D5B`): IsShrouded
+/// at a radar Cell's centre raised to its floor (`0x00578080`), which is
+/// [`crate::sim::vision::cell_is_shrouded`]. A fixture without terrain
+/// tests the flat cell.
+pub(super) fn radar_cell_shrouded(
+    fog: &FogState,
+    cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
+    viewer: InternedId,
+    cell: (u16, u16),
+) -> bool {
+    match cells {
+        Some(cells) => crate::sim::vision::cell_is_shrouded(fog, cells, viewer, cell),
+        None => !fog.is_cell_revealed(viewer, cell.0, cell.1),
+    }
+}
+
+/// `0x00457117..0x0045714B`: IsShrouded at the Location (`+0x9C`), then at
+/// the Location plus `(dimension - 1)` cells along each foundation axis
+/// (`0x0045EC90` width, `0x0045ECA0` height), at the Location's Z.
 fn radar_building_both_corners_shrouded(
     fog: &FogState,
+    cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
     local_owner: InternedId,
-    entity: &crate::sim::game_entity::GameEntity,
+    location: crate::sim::components::DriveCoord,
     foundation: (u32, u32),
 ) -> bool {
-    let origin_shrouded =
-        !fog.is_cell_revealed(local_owner, entity.position.rx(), entity.position.ry());
-    let far_x = i32::from(entity.position.rx()).wrapping_add((foundation.0 as i32).wrapping_sub(1));
-    let far_y = i32::from(entity.position.ry()).wrapping_add((foundation.1 as i32).wrapping_sub(1));
-    let far_shrouded =
-        far_x < 0 || far_y < 0 || !fog.is_cell_revealed(local_owner, far_x as u16, far_y as u16);
-    origin_shrouded && far_shrouded
+    let far = crate::sim::components::DriveCoord {
+        x: location
+            .x
+            .wrapping_add((foundation.0 as i32).wrapping_sub(1).wrapping_mul(256)),
+        y: location
+            .y
+            .wrapping_add((foundation.1 as i32).wrapping_sub(1).wrapping_mul(256)),
+        z: location.z,
+    };
+    radar_point_shrouded(fog, cells, local_owner, location)
+        && radar_point_shrouded(fog, cells, local_owner, far)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,12 +187,17 @@ pub(super) struct RadarMobileVisibilityFacts {
     pub shrouded: bool,
     pub cloak_state: i32,
     pub has_sensor: bool,
+    /// The current player's house asks (`PlayerPtr->IsAlliedWith(Owner)`,
+    /// `0x0070D394`, `HouseClass::IsAlliedWith @ 0x004F9A50`).
     pub allied_with_current_player: bool,
     pub height_leptons: i32,
     pub veteran_radar_invisible: bool,
 }
 
-/// Mobile virtual +0x324 @ 0x0070D1D0, in native branch order.
+/// Mobile virtual +0x324 @ 0x0070D1D0, in native branch order. Its Fog of
+/// War arm (`0x0070D350..0x0070D384`: scenario flag `0x1000` and a fogged
+/// Location) never applies: the fog test it calls, `0x005865E0`, is
+/// `xor al, al; ret 4` in YR, so no fact stands for it here.
 pub(super) fn radar_mobile_registration_visibility(
     facts: RadarMobileVisibilityFacts,
     discovered: bool,
@@ -200,11 +244,15 @@ pub(super) struct RadarBuildingVisibilityFacts {
     pub fresh_in_playfield: bool,
     pub both_corners_shrouded: bool,
     pub cloak_state: i32,
-    /// BuildingClass+0x6ED. No Rust production writer exists yet.
+    /// BuildingClass+0x6ED, the fade stage.
     pub building_cloak_stage: u8,
-    /// BuildingClass+0x6E7. No Rust production writer exists yet.
-    pub building_cloak_flag: bool,
+    /// BuildingClass+0x6E7, the FogOfWar freeze flag set by the fogged-object
+    /// constructor (`0x004D10D5`): `freeze_building_in_fog` and `clean_fog`
+    /// keep it as `FogState::is_object_fogged` for the local player.
+    pub fogged: bool,
     pub has_sensor: bool,
+    /// The current player's house asks (`PlayerPtr->IsAlliedWith(Owner)`,
+    /// `0x00457196`, `HouseClass::IsAlliedWith @ 0x004F9A50`).
     pub allied_with_current_player: bool,
 }
 
@@ -227,7 +275,7 @@ pub(super) fn radar_building_registration_visibility(
     }
     if facts.cloak_state != 2
         && facts.building_cloak_stage != 15
-        && !facts.building_cloak_flag
+        && !facts.fogged
         && !facts.both_corners_shrouded
     {
         return RadarVisibilityResult::VISIBLE;
@@ -236,9 +284,7 @@ pub(super) fn radar_building_registration_visibility(
         return RadarVisibilityResult::HIDDEN;
     }
     let out_code = u8::from(
-        !facts.allied_with_current_player
-            && !facts.building_cloak_flag
-            && !facts.both_corners_shrouded,
+        !facts.allied_with_current_player && !facts.fogged && !facts.both_corners_shrouded,
     );
     RadarVisibilityResult {
         visible: true,
@@ -262,25 +308,27 @@ impl RadarRegistrationVisibilityFacts {
 }
 
 pub(super) fn build_radar_object_update(
-    entity: &crate::sim::game_entity::GameEntity,
-    houses: &BTreeMap<InternedId, crate::sim::house_state::HouseState>,
+    entity: &impl crate::render::snapshot::SnapshotObject,
+    houses: &crate::sim::houses::Houses,
     local_owner: Option<InternedId>,
     fog: &FogState,
-    alliances: &crate::map::houses::HouseAllianceMap,
+    alliances: &crate::sim::house_diplomacy::HouseAlliances,
     full_visibility: bool,
     game_mode_nonzero: bool,
     rules: Option<&RuleSet>,
     interner: Option<&crate::sim::intern::StringInterner>,
     projection: RadarProjectionFacts,
     playfield_bounds: Option<crate::map::playfield::PlayfieldBounds>,
-    resolved_terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
+    cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
 ) -> RadarObjectUpdate {
-    let type_str = interner.map_or("", |i| i.resolve(entity.type_ref()));
-    let object = rules.and_then(|rules| rules.object(type_str));
-    let [raw_x, raw_y] = crate::sim::movement::ground_pose::position_world_xy(&entity.position);
+    let resolved_terrain = cells.map(crate::map::resolved_terrain::NativeCellQuery::terrain);
+    let object = rules
+        .zip(interner)
+        .and_then(|(rules, interner)| interner.object_type(entity.type_ref(), rules));
+    let [raw_x, raw_y] = crate::sim::movement::ground_pose::position_world_xy(entity.position());
     let origin = projection.native_surface.map_or_else(
         || {
-            let (screen_x, screen_y) = crate::render::locomotor_visual::screen_position(entity);
+            let (screen_x, screen_y) = entity.screen_position();
             let screen_y = screen_y - crate::map::terrain::TILE_HEIGHT / 2.0;
             let (x, y) = world_to_minimap_pixel(
                 screen_x,
@@ -299,12 +347,12 @@ pub(super) fn build_radar_object_update(
         // TechnoClass+0x4A0 passes clamp=0 to FUN_006557F0.
         |surface| surface.world_to_surface_pixel(raw_x, raw_y, false),
     );
-    let foundation = (entity.category() == EntityCategory::Structure)
-        .then(|| parse_foundation_size(entity.type_facts.foundation()));
+    let facts = entity.radar();
+    let foundation = facts.foundation;
     let owner_is_human_player = local_owner.is_none_or(|local_owner| {
         radar_owner_is_human_player(entity.owner(), local_owner, houses, game_mode_nonzero)
     });
-    let [coord_x, coord_y] = crate::sim::movement::ground_pose::object_center_xy(entity);
+    let [coord_x, coord_y] = entity.center_xy();
     let current_cell = radar_fog_cell_from_leptons(coord_x, coord_y);
     // The type-5 call at `0x0070DA95..0x0070DAD7` converts raw Object+0x9C,
     // not BuildingClass's centre-adjusted +0x324 coordinate.
@@ -314,20 +362,22 @@ pub(super) fn build_radar_object_update(
     // Unit/Infantry that byte is the active TubeClass index; Aircraft uses the
     // same inherited byte as its finite current-ammo value. Buildings do not
     // carry the FootClass flag and bypass this prefilter.
-    let enemy_sensed_prefilter = enemy_sensed_prefilter(entity);
+    let enemy_sensed_prefilter = facts.enemy_sensed_prefilter;
     let discovery_observed = full_visibility
         || local_owner.is_none()
         || local_owner.is_some_and(|local_owner| {
             current_cell.is_some_and(|(rx, ry)| fog.is_cell_revealed(local_owner, rx, ry))
         });
+    // Both bodies test the Location (`+0x9C`), not GetCoords: mobile
+    // `0x0070D30E..0x0070D34B`, Building `0x00457117..0x0045714B`.
+    let location = facts.location();
     let shrouded = !full_visibility
-        && local_owner.is_some_and(|local_owner| {
-            current_cell.is_none_or(|(rx, ry)| !fog.is_cell_revealed(local_owner, rx, ry))
-        });
+        && local_owner
+            .is_some_and(|local_owner| radar_point_shrouded(fog, cells, local_owner, location));
     let both_corners_shrouded = !full_visibility
         && local_owner.is_some_and(|local_owner| {
             foundation.is_some_and(|foundation| {
-                radar_building_both_corners_shrouded(fog, local_owner, entity, foundation)
+                radar_building_both_corners_shrouded(fog, cells, local_owner, location, foundation)
             })
         });
     let has_sensor = full_visibility
@@ -340,21 +390,17 @@ pub(super) fn build_radar_object_update(
         || local_owner.is_some_and(|local_owner| {
             entity.owner() == local_owner
                 || interner.is_some_and(|interner| {
-                    crate::map::houses::are_houses_friendly(
-                        alliances,
-                        interner.resolve(local_owner),
-                        interner.resolve(entity.owner()),
-                    )
+                    alliances.is_allied(interner, local_owner, entity.owner())
                 })
         });
     let effective_type_invisible =
         object.is_some_and(|object| object.invisible || object.invisible_in_game);
     let fresh_in_playfield =
         radar_fresh_mode_one_membership(entity, playfield_bounds, resolved_terrain);
-    let cloak_state = entity.cloak.as_ref().map_or(0, |cloak| cloak.state());
+    let cloak_state = entity.cloak_state();
     let veteran_radar_invisible = object.is_some_and(|object| {
         has_weapon_ability(
-            entity.veterancy.rank_kind(),
+            entity.veterancy().rank_kind(),
             object,
             Ability::RadarInvisible,
         )
@@ -362,24 +408,23 @@ pub(super) fn build_radar_object_update(
     let visibility = if foundation.is_some() {
         RadarRegistrationVisibilityFacts::Building(RadarBuildingVisibilityFacts {
             type_invisible: effective_type_invisible,
-            in_limbo: entity.lifecycle.in_limbo(),
+            in_limbo: entity.lifecycle().in_limbo(),
             owner_is_human_player,
             fresh_in_playfield,
             both_corners_shrouded,
             cloak_state,
-            // Exact predicate fields are explicit; neutral production facts do
-            // not pretend the absent BuildingClass cloak writers are closed.
-            building_cloak_stage: 0,
-            building_cloak_flag: false,
+            building_cloak_stage: entity.building_cloak_stage(),
+            fogged: !full_visibility
+                && local_owner.is_some_and(|local| fog.is_object_fogged(local, entity.stable_id())),
             has_sensor,
             allied_with_current_player,
         })
     } else {
         RadarRegistrationVisibilityFacts::Mobile(RadarMobileVisibilityFacts {
             type_invisible: effective_type_invisible,
-            sinking: entity.sinking.is_active(),
-            object_alive: entity.lifecycle.object_alive(),
-            in_limbo: entity.lifecycle.in_limbo(),
+            sinking: entity.sinking(),
+            object_alive: entity.lifecycle().object_alive(),
+            in_limbo: entity.lifecycle().in_limbo(),
             owner_is_human_player,
             fresh_in_playfield,
             shrouded,
@@ -397,6 +442,7 @@ pub(super) fn build_radar_object_update(
         origin,
         event_source_cell,
         enemy_sensed_prefilter,
+        sensor_array_warn: object.is_none_or(|object| object.sensor_array_warn()),
         foundation,
         radar_scale: projection.cell_axis_scale(),
         discovery_observed,
@@ -404,10 +450,38 @@ pub(super) fn build_radar_object_update(
         // AddObjectToTracker @ 0x00655560 compares directly to g_PlayerPtr,
         // narrower than IsHumanPlayer's single-player shroud exception.
         local_front: local_owner == Some(entity.owner()),
+        surface_edge: projection.native_surface.map(|surface| {
+            let mut edge = super::tracker::RadarSurfaceEdge {
+                size: surface.generated_size(),
+                in_playfield_origin: None,
+            };
+            if (!edge.contains(origin) || foundation.is_some())
+                && radar_edge_cell_in_playfield(facts, cells, playfield_bounds)
+            {
+                edge.in_playfield_origin = Some(surface.world_to_surface_pixel(raw_x, raw_y, true));
+            }
+            edge
+        }),
     }
 }
 
-#[cfg(test)]
+/// `0x0070DB0A..0x0070DB21`: `MapClass::Is_Cell_In_Playfield @ 0x00578540`
+/// (mode 1) on the object's GetCell (vt+0x1C4,
+/// [`crate::sim::movement::ground_pose::entity_navigation_cell_identity`]). Without
+/// the map the object stays off the radar, as it did before this step.
+fn radar_edge_cell_in_playfield(
+    facts: &RadarFacts,
+    cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
+    bounds: Option<crate::map::playfield::PlayfieldBounds>,
+) -> bool {
+    cells.is_some_and(|cells| {
+        facts.navigation_cell.is_some_and(|cell| {
+            crate::sim::cell_rect::retained_cell_is_in_playfield(cell, bounds, cells)
+        })
+    })
+}
+
+#[cfg(all(test, tests_render_a_r))]
 mod tests {
     use super::*;
     use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid};
@@ -442,7 +516,7 @@ mod tests {
             both_corners_shrouded: false,
             cloak_state: 0,
             building_cloak_stage: 0,
-            building_cloak_flag: false,
+            fogged: false,
             has_sensor: false,
             allied_with_current_player: false,
         }
@@ -483,7 +557,9 @@ mod tests {
         let mut entity =
             crate::sim::game_entity::GameEntity::test_default(1, "BLDG", "Enemy", 4, 5);
         entity.set_category_for_test(EntityCategory::Structure);
-        entity.type_facts.set_foundation_for_test("3x2".to_string());
+        entity
+            .type_facts
+            .set_foundation_for_test("3x2".to_string().into());
         let raw = crate::sim::movement::ground_pose::position_world_xy(&entity.position);
         let visibility = crate::sim::movement::ground_pose::object_center_xy(&entity);
         assert_eq!(radar_fog_cell_from_leptons(raw[0], raw[1]), Some((4, 5)));
@@ -511,8 +587,8 @@ mod tests {
         let mut projection = visibility_projection();
         projection.native_surface = Some(surface);
         let update = build_radar_object_update(
-            &entity,
-            &BTreeMap::new(),
+            &crate::app::presentation::frame::ObjectRecord::of_test(&entity),
+            &crate::sim::houses::Houses::default(),
             None,
             &FogState::default(),
             &Default::default(),
@@ -541,25 +617,27 @@ mod tests {
         ))
         .unwrap();
         let mut sim = crate::sim::world::Simulation::new();
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate_mut_for_test().allocate_stable_id();
         let mut entity =
             crate::sim::game_entity::GameEntity::test_default(id, "TEST", "Americans", 4, 5);
-        entity.set_type_ref_for_test(sim.interner.intern("TEST"));
-        entity.set_owner_for_test(sim.interner.intern("Americans"));
+        entity.set_type_ref_for_test(sim.intern("TEST"));
+        entity.set_owner_for_test(sim.intern("Americans"));
         entity.set_category_for_test(EntityCategory::Unit);
         entity.lifecycle.set_in_limbo_for_test(false);
-        sim.substrate.entities.insert(entity);
+        sim.entities_mut_for_test().insert(entity);
         let update = |sim: &crate::sim::world::Simulation| {
             build_radar_object_update(
-                sim.entities().get(id).unwrap(),
-                &sim.houses,
+                crate::app::presentation::frame::PresentationFrame::of_test(sim, &rules)
+                    .object(id)
+                    .unwrap(),
+                sim.houses(),
                 None,
-                &sim.fog,
-                &sim.house_alliances,
+                sim.fog(),
+                sim.house_alliances(),
                 true,
                 false,
                 Some(&rules),
-                Some(&sim.interner),
+                Some(sim.interner()),
                 visibility_projection(),
                 None,
                 None,
@@ -825,7 +903,7 @@ mod tests {
             crate::sim::game_entity::GameEntity::test_default(1, "DOT", "Enemy", 12, 10);
         entity.set_in_playfield(false);
         assert!(radar_fresh_mode_one_membership(
-            &entity,
+            &crate::app::presentation::frame::ObjectRecord::of_test(&entity),
             Some(bounds),
             Some(&terrain),
         ));
@@ -833,15 +911,83 @@ mod tests {
         entity.position.set_rx_for_test(2);
         entity.position.set_ry_for_test(2);
         assert!(!radar_fresh_mode_one_membership(
-            &entity,
+            &crate::app::presentation::frame::ObjectRecord::of_test(&entity),
             Some(bounds),
             Some(&terrain),
         ));
         assert!(!radar_fresh_mode_one_membership(
-            &entity,
+            &crate::app::presentation::frame::ObjectRecord::of_test(&entity),
             Some(bounds),
             None,
         ));
+    }
+
+    /// A unit centred on the playfield's bottom row projects one pixel past
+    /// the generated surface (`0x006557F0`, clamp 0). TechnoClass+0x4A0
+    /// re-projects it with clamping while its cell is in the playfield
+    /// (`0x0070DADC..0x0070DB64`), so its dot sits on the surface edge.
+    #[test]
+    fn a_unit_on_the_bottom_playfield_row_keeps_its_radar_dot_on_the_edge() {
+        let bounds = crate::map::playfield::PlayfieldBounds {
+            base: 16,
+            off_fc: 2,
+            off_100: 2,
+            off_104: 12,
+            off_108: 8,
+        };
+        let terrain = flat_terrain(32);
+        let cells = crate::map::resolved_terrain::NativeCellQuery::isolated(&terrain);
+        let surface = crate::render::radar::geometry::NativeRadarSurfaceGeometry::from_playfield(
+            &terrain, bounds,
+        )
+        .expect("flat playfield surface");
+        let (rx, ry) = terrain
+            .iter()
+            .filter(|cell| {
+                bounds.contains_height_aware_packed(
+                    i32::from(cell.rx),
+                    i32::from(cell.ry),
+                    cell.level as i8,
+                    cell.slope_type,
+                )
+            })
+            .map(|cell| (cell.rx, cell.ry))
+            .max_by_key(|&(rx, ry)| (rx + ry, rx))
+            .expect("a playfield cell");
+        let mut entity =
+            crate::sim::game_entity::GameEntity::test_default(1, "MTNK", "Enemy", rx, ry);
+        entity.lifecycle.set_in_limbo_for_test(false);
+        entity.locomotor = Some(
+            crate::sim::movement::locomotor::LocomotorState::for_test_kind(
+                crate::rules::locomotor_type::LocomotorKind::Drive,
+            ),
+        );
+        let mut projection = visibility_projection();
+        projection.native_surface = Some(surface);
+        let update = build_radar_object_update(
+            &crate::app::presentation::frame::ObjectRecord::of_test_in(
+                &entity,
+                Some(&terrain),
+                crate::rules::ruleset::RuleSet::empty_for_test(),
+            ),
+            &crate::sim::houses::Houses::default(),
+            None,
+            &FogState::default(),
+            &Default::default(),
+            true,
+            false,
+            None,
+            None,
+            projection,
+            Some(bounds),
+            Some(&cells),
+        );
+        let (width, height) = surface.generated_size();
+        assert_eq!(update.origin.1, height, "one pixel past the surface");
+        assert!((0..width).contains(&update.origin.0));
+        let mut tracker = super::super::tracker::RetainedRadarTracker::default();
+        tracker.update_object(update, false);
+        assert_eq!(tracker.entries_at(update.origin.0, height - 1), vec![1]);
     }
 
     #[test]
@@ -849,22 +995,176 @@ mod tests {
         let local = crate::sim::intern::test_intern("Local");
         let mut entity =
             crate::sim::game_entity::GameEntity::test_default(1, "BLDG", "Enemy", 4, 4);
-        entity.type_facts.set_foundation_for_test("3x2".to_string());
+        entity
+            .type_facts
+            .set_foundation_for_test("3x2".to_string().into());
+        let location = crate::sim::movement::ground_pose::object_location(&entity, None);
         let mut fog = FogState::default();
         fog.mark_visible_for_owner(local, 6, 5);
         assert!(!radar_building_both_corners_shrouded(
             &fog,
+            None,
             local,
-            &entity,
+            location,
             (3, 2),
         ));
         let fog = FogState::default();
         assert!(radar_building_both_corners_shrouded(
             &fog,
+            None,
             local,
-            &entity,
+            location,
             (3, 2),
         ));
+    }
+
+    /// `0x00457170`: an AI building the local player sees only as a fogged
+    /// image (+0x6E7, set by the fogged-object constructor `0x004D10D5`)
+    /// needs a sensor to register on the radar, like a shrouded one.
+    #[test]
+    fn radar_visibility_a_fogged_ai_building_needs_a_sensor() {
+        let local = crate::sim::intern::test_intern("Local");
+        let mut building =
+            crate::sim::game_entity::GameEntity::test_default(2, "BLDG", "Enemy", 10, 10);
+        building.set_category_for_test(EntityCategory::Structure);
+        building
+            .type_facts
+            .set_foundation_for_test("2x2".to_string().into());
+        building.lifecycle.set_in_limbo_for_test(false);
+        let mut fog = FogState::default();
+        fog.mark_visible_for_owner(local, 10, 10);
+        let visible = |fog: &FogState| {
+            build_radar_object_update(
+                &crate::app::presentation::frame::ObjectRecord::of_test(&building),
+                &crate::sim::houses::Houses::default(),
+                Some(local),
+                fog,
+                &Default::default(),
+                false,
+                true,
+                None,
+                None,
+                visibility_projection(),
+                None,
+                None,
+            )
+            .visibility
+            .evaluate(false)
+            .visible
+        };
+        assert!(visible(&fog));
+        fog.set_object_fogged_for_test(local, 2, true);
+        assert!(!visible(&fog));
+    }
+
+    /// `0x0070D30E..0x0070D34B` and `0x00457117..0x0045714B` ask
+    /// `MapClass::IsShrouded @ 0x00586360` at the Location, which raises the
+    /// point by its height. On level-4 ground an enemy at (10, 10) is tested
+    /// at (8, 8), and a 2x2 building's far corner (11, 11) at (9, 9).
+    #[test]
+    fn radar_shroud_is_tested_at_the_height_raised_location() {
+        let local = crate::sim::intern::test_intern("Local");
+        let terrain =
+            crate::map::resolved_terrain::test_grid(32, 32, |rx, ry| ResolvedTerrainCell {
+                level: 4,
+                ..flat_cell(rx, ry)
+            });
+        let cells = crate::map::resolved_terrain::NativeCellQuery::isolated(&terrain);
+        let visible = |entity: &crate::sim::game_entity::GameEntity, revealed: &[(u16, u16)]| {
+            let mut fog = FogState::default();
+            for &(rx, ry) in revealed {
+                fog.mark_visible_for_owner(local, rx, ry);
+            }
+            build_radar_object_update(
+                &crate::app::presentation::frame::ObjectRecord::of_test_in(
+                    entity,
+                    Some(&terrain),
+                    crate::rules::ruleset::RuleSet::empty_for_test(),
+                ),
+                &crate::sim::houses::Houses::default(),
+                Some(local),
+                &fog,
+                &Default::default(),
+                false,
+                true,
+                None,
+                None,
+                visibility_projection(),
+                None,
+                Some(&cells),
+            )
+            .visibility
+            .evaluate(false)
+            .visible
+        };
+
+        let mut unit = crate::sim::game_entity::GameEntity::test_default(1, "DOT", "Enemy", 10, 10);
+        // Standing on its ground: GetHeight (`vt+0x1C8`) is zero.
+        unit.position.set_z_for_test(4);
+        unit.lifecycle.set_in_limbo_for_test(false);
+        assert!(
+            !visible(&unit, &[(10, 10)]),
+            "mapping its own cell leaves a raised unit shrouded"
+        );
+        assert!(visible(&unit, &[(8, 8)]));
+
+        let mut building =
+            crate::sim::game_entity::GameEntity::test_default(2, "BLDG", "Enemy", 10, 10);
+        building.set_category_for_test(EntityCategory::Structure);
+        building
+            .type_facts
+            .set_foundation_for_test("2x2".to_string().into());
+        building.lifecycle.set_in_limbo_for_test(false);
+        assert!(!visible(&building, &[(10, 10), (11, 11)]));
+        assert!(visible(&building, &[(9, 9)]), "the raised far corner");
+    }
+
+    /// The radar asks from the current player's house whether an object's
+    /// owner is its ally (`0x0070D394`): the owner's own one-way alliance with
+    /// the player does not count.
+    #[test]
+    fn radar_alliance_is_the_current_players_ask() {
+        let local = crate::sim::intern::test_intern("Local");
+        let enemy = crate::sim::intern::test_intern("Enemy");
+        crate::sim::intern::test_intern("DOT");
+        let interner = crate::sim::intern::test_interner();
+        let rules = RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+            "[VehicleTypes]\n0=DOT\n[DOT]\nStrength=100\n",
+        ))
+        .expect("visibility fixture rules");
+        let mut houses = crate::sim::houses::Houses::default();
+        houses.register(crate::sim::house_state::HouseState::new(
+            enemy, 0, None, false, 0, 10,
+        ));
+        let fog = FogState::default();
+        let mut entity = crate::sim::game_entity::GameEntity::test_default(1, "DOT", "Enemy", 5, 5);
+        entity.lifecycle.set_in_limbo_for_test(false);
+        let allied = |asker: &str, other: &str| {
+            let alliances = crate::map::houses::HouseAllianceMap::from([(
+                asker.to_ascii_uppercase(),
+                [other.to_ascii_uppercase()].into(),
+            )]);
+            let update = build_radar_object_update(
+                &crate::app::presentation::frame::ObjectRecord::of_test(&entity),
+                &houses,
+                Some(local),
+                &fog,
+                &super::super::helpers::test_alliances(alliances),
+                false,
+                true,
+                Some(&rules),
+                Some(&interner),
+                visibility_projection(),
+                None,
+                None,
+            );
+            match update.visibility {
+                RadarRegistrationVisibilityFacts::Mobile(facts) => facts.allied_with_current_player,
+                RadarRegistrationVisibilityFacts::Building(_) => unreachable!("DOT is a vehicle"),
+            }
+        };
+        assert!(allied("Local", "Enemy"));
+        assert!(!allied("Enemy", "Local"));
     }
 
     #[test]
@@ -877,17 +1177,16 @@ mod tests {
             "[VehicleTypes]\n0=DOT\n[DOT]\nStrength=100\nInvisibleInGame=yes\n",
         ))
         .expect("visibility fixture rules");
-        let mut houses = BTreeMap::new();
-        houses.insert(
-            enemy,
-            crate::sim::house_state::HouseState::new(enemy, 0, None, false, 0, 10),
-        );
+        let mut houses = crate::sim::houses::Houses::default();
+        houses.register(crate::sim::house_state::HouseState::new(
+            enemy, 0, None, false, 0, 10,
+        ));
         let mut fog = FogState::default();
         fog.mark_visible_for_owner(local, 5, 5);
         let mut entity = crate::sim::game_entity::GameEntity::test_default(1, "DOT", "Enemy", 5, 5);
         entity.lifecycle.set_in_limbo_for_test(false);
         let update = build_radar_object_update(
-            &entity,
+            &crate::app::presentation::frame::ObjectRecord::of_test(&entity),
             &houses,
             Some(local),
             &fog,
@@ -901,5 +1200,81 @@ mod tests {
             None,
         );
         assert!(!update.visibility.evaluate(false).visible);
+    }
+}
+
+/// What the radar reads of one object that its record does not carry,
+/// captured into the record (`app::presentation::frame_scene::SceneFacts`)
+/// by the functions the radar asked of the object.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RadarFacts {
+    /// [`enemy_sensed_prefilter`].
+    enemy_sensed_prefilter: bool,
+    /// A Structure's [`parse_foundation_size`] of its type's Foundation.
+    foundation: Option<(u32, u32)>,
+    /// `ground_pose::object_location` (Location `+0x9C`) on the map.
+    location: [i32; 3],
+    /// `ground_pose::entity_navigation_cell_identity` (GetCell, vt+0x1C4) on
+    /// the map; `None` without the map or when it fails.
+    navigation_cell: Option<crate::map::cell_index::NativeCellIdentity>,
+    /// `radar_combat_flash.remaining` at the committed binary frame.
+    pub(super) combat_flash_remaining: i32,
+    /// `GameEntity::disguise_house(false, local player, allied)` for
+    /// `allied` false and true.
+    pub(super) disguise_house: [Option<InternedId>; 2],
+    /// A radar click's cell words for it (`0x006567EF..0x00656828`):
+    /// `Simulation::navigation_target_coordinate` with no requester,
+    /// truncated and packed.
+    pub(super) click_cell: Option<(i16, i16)>,
+}
+
+impl RadarFacts {
+    /// Captured with the live world: `location` is
+    /// `ground_pose::object_location` on the map, `cells` the capture's
+    /// isolated query of the map, `observer` the local player.
+    pub(crate) fn capture(
+        entity: &crate::sim::game_entity::GameEntity,
+        location: crate::sim::components::DriveCoord,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
+        binary_frame: u32,
+        observer: Option<InternedId>,
+    ) -> Self {
+        Self {
+            enemy_sensed_prefilter: enemy_sensed_prefilter(entity),
+            foundation: (entity.category() == EntityCategory::Structure)
+                .then(|| parse_foundation_size(entity.type_facts.foundation())),
+            location: [location.x, location.y, location.z],
+            navigation_cell: cells.and_then(|cells| {
+                crate::sim::movement::ground_pose::entity_navigation_cell_identity(
+                    entity,
+                    cells,
+                    Some((rules, sim.interner())),
+                )
+                .ok()
+            }),
+            combat_flash_remaining: entity.radar_combat_flash.remaining(binary_frame as i32),
+            disguise_house: [false, true]
+                .map(|allied| entity.disguise_house(false, observer, allied)),
+            click_cell: sim
+                .navigation_target_coordinate(
+                    crate::sim::components::NavTargetRef::object(entity.stable_id()),
+                    None,
+                    rules,
+                )
+                .ok()
+                .map(|point| {
+                    (
+                        crate::util::lepton::lepton_to_cell_packed(point.x),
+                        crate::util::lepton::lepton_to_cell_packed(point.y),
+                    )
+                }),
+        }
+    }
+
+    fn location(&self) -> crate::sim::components::DriveCoord {
+        let [x, y, z] = self.location;
+        crate::sim::components::DriveCoord { x, y, z }
     }
 }

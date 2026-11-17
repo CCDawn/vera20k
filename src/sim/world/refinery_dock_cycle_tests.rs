@@ -29,7 +29,7 @@ fn sample(s: &Scene, id: u64) -> Sample {
         contact: miner.radio_contacts.slot(0),
         tethered: miner.tether.partner().is_some(),
         unloading: state.unload_active(),
-        facing: miner.body_facing_current(s.sim.session.binary_frame),
+        facing: miner.body_facing_current(s.sim.session.binary_frame()),
         ore: state
             .cargo()
             .iter()
@@ -51,16 +51,49 @@ fn run_until_unloading(s: &mut Scene) {
 
 fn credits(s: &Scene) -> i32 {
     let owner = s.sim.interner.get("Americans").unwrap();
-    s.sim.houses[&owner].economy.credits()
+    s.sim.houses[&owner].economy().credits()
 }
 
 /// Advance one production frame; returns the owner's credits after it.
 fn frame(s: &mut Scene) -> i32 {
+    frame_with_effects(s, &[], crate::sim::world::FrameEffects::default())
+}
+
+/// Same fixture frame as `advance_tick`, with caller-owned frame effects.
+fn frame_with_effects(
+    s: &mut Scene,
+    commands: &[crate::sim::command::CommandEnvelope],
+    effects: crate::sim::world::FrameEffects<'_>,
+) -> i32 {
     let overlay = crate::sim::tiberium::test_support::overlay_registry();
     let grid = s.sim.path_grid_snapshot();
+    s.sim.install_fixture_path_grid(grid.as_deref());
     s.sim
-        .advance_tick(&[], Some(&s.rules), grid.as_deref(), Some(overlay), 67);
+        .advance_master_frame(
+            commands,
+            &s.rules,
+            Some(overlay),
+            67,
+            crate::sim::world::TickLane::Ordinary,
+            false,
+            effects,
+        )
+        .expect("fixture frame must complete")
+        .into_tick();
     credits(s)
+}
+
+/// Run the headless fixture frame with the owner's retained sidebar visits.
+fn frame_with_production_strip(s: &mut Scene, owner: crate::sim::intern::InternedId) -> i32 {
+    let previous_house = s.sim.session.current_house();
+    s.sim.session.set_current_house_for_test(Some(owner));
+    let due = s.sim.take_due_commands();
+    let visits = s.sim.production.factories().strip_visits_for_test(owner);
+    let effects =
+        crate::sim::world::FrameEffects::default().with_production_strip(&visits, &|_| {});
+    let balance = frame_with_effects(s, &due, effects);
+    s.sim.session.set_current_house_for_test(previous_house);
+    balance
 }
 
 /// A second full War Miner in Mission_Harvest's FINDING_HOME state.
@@ -69,8 +102,9 @@ fn spawn_returning_miner(s: &mut Scene, cell: (u16, u16)) -> u64 {
         .sim
         .spawn_object("HARV", "Americans", cell.0, cell.1, 0, &s.rules)
         .expect("second miner");
-    let now = s.sim.session.binary_frame;
+    let now = s.sim.session.binary_frame();
     s.sim
+        .substrate
         .mission_assign_exact(id, MissionId::from_known(MissionType::Harvest), now)
         .unwrap();
     let entity = s.sim.substrate.entities.get_mut(id).unwrap();
@@ -79,6 +113,7 @@ fn spawn_returning_miner(s: &mut Scene, cell: (u16, u16)) -> u64 {
         .set_handler_state(MinerState::ReturnToRefinery.cursor());
     entity.miner.as_mut().unwrap().set_cargo_for_test(vec![
         CargoBale {
+            tiberium_type: crate::rules::tiberium_type::TiberiumTypeId(0),
             resource_type: ResourceType::Ore,
             value: 25,
         };
@@ -120,7 +155,7 @@ fn admission_owner_uses_actual_sparse_contact_slots() {
             s.refinery,
             crate::sim::radio::RadioMessage::CanEnter,
             crate::sim::radio::RadioPayload::default(),
-            Some(&s.rules),
+            &s.rules,
             crate::sim::world::FrameEffects::default(),
         ),
         crate::sim::radio::RadioResponse::Roger,
@@ -131,6 +166,7 @@ fn admission_owner_uses_actual_sparse_contact_slots() {
             &mut s.sim,
             &s.rules,
             s.miner,
+            &s.rules.object("HARV").unwrap().dock,
             false,
             false,
             crate::sim::world::FrameEffects::default(),
@@ -262,7 +298,11 @@ fn retail_ore_deposit_funds_the_retained_cash_stalled_build() {
         input["unlimbo_at_cell"] = true.into();
         let mut s = scene_with(&input, retail.rules.clone(), &ini);
         let owner = s.sim.interner.get("Americans").unwrap();
-        s.sim.houses.get_mut(&owner).unwrap().country = Some(owner);
+        s.sim
+            .houses
+            .get_mut(&owner)
+            .unwrap()
+            .set_country_for_test(Some(owner));
         for (name, x, y) in [("GACNST", 20, 12), ("GAPILE", 20, 6), ("GAPOWR", 20, 3)] {
             s.sim
                 .spawn_object(name, "Americans", x, y, 0, &s.rules)
@@ -284,65 +324,69 @@ fn retail_ore_deposit_funds_the_retained_cash_stalled_build() {
         let factory = |s: &Scene| {
             s.sim
                 .production
-                .factories
+                .factories()
                 .iter_insertion_ordered()
                 .into_iter()
-                .find(|f| f.owner == owner && f.category == ProductionCategory::Infantry)
+                .find(|f| f.owner() == owner && f.category() == ProductionCategory::Infantry)
                 .unwrap()
                 .clone()
         };
         let first = factory(&s);
-        let head = first.object.as_ref().unwrap().entity_id.unwrap();
+        let head = first.object().unwrap().entity_id.unwrap();
         let mut stalled = false;
         let mut deposited = false;
         for _ in 0..1500 {
             let before = factory(&s);
-            let now = s.sim.session.binary_frame;
-            let spent_before = s.sim.houses[&owner].economy.spent_credits();
+            let now = s.sim.session.binary_frame();
+            let spent_before = s.sim.houses[&owner].economy().spent_credits();
             let cash_before = credits(&s);
             let cargo_before = sample(&s, s.miner).ore;
             frame(&mut s);
             let after = factory(&s);
-            let spent = s.sim.houses[&owner].economy.spent_credits() - spent_before;
+            let spent = s.sim.houses[&owner].economy().spent_credits() - spent_before;
             if sample(&s, s.miner).ore < cargo_before {
                 assert!(stalled, "the paid head stalled before the unload");
                 assert_eq!(cargo_before, 40);
                 assert_eq!(credits(&s), cash_before + payout - spent);
-                assert_eq!(s.sim.houses[&owner].economy.score(), score);
-                assert_eq!(after.object, before.object);
-                assert_eq!(after.queue, first.queue);
-                assert_eq!(after.insertion_seq, first.insertion_seq);
-                assert_eq!(after.balance, before.balance - spent);
-                let due = before.step_timer.expired(now as i32);
+                // Ares' DepositTiberium (10044230, hook 0x73E4A2) adds no
+                // score.
+                if !s.rules.ares() {
+                    assert_eq!(s.sim.houses[&owner].economy().score(), score);
+                }
+                assert_eq!(after.object(), before.object());
+                assert_eq!(after.queue(), first.queue());
+                assert_eq!(after.insertion_seq(), first.insertion_seq());
+                assert_eq!(after.balance(), before.balance() - spent);
+                let due = before.step_timer().expired(now as i32);
                 phases[usize::from(due)] = true;
-                assert_eq!(after.progress, before.progress + u16::from(due));
+                assert_eq!(after.progress(), before.progress() + u16::from(due));
                 assert_eq!(
                     spent > 0,
                     due,
                     "income is available to this frame's due sweep"
                 );
                 if !due {
-                    assert_eq!(after.step_timer, before.step_timer);
+                    assert_eq!(after.step_timer(), before.step_timer());
                 }
                 deposited = true;
                 break;
             }
-            if after.on_hold {
+            if after.on_hold() {
                 stalled = true;
-                assert!(after.progress > 0, "some of the paid head was funded");
+                assert!(after.progress() > 0, "some of the paid head was funded");
                 let view = s
                     .sim
                     .production
-                    .factories
+                    .factories()
                     .view(owner, ProductionCategory::Infantry)
                     .unwrap();
                 assert!(view.is_running());
-                assert!(!after.suspended);
-                assert_eq!(after.object, first.object);
-                assert_eq!(after.queue, first.queue);
+                assert!(!after.suspended());
+                assert_eq!(after.object(), first.object());
+                assert_eq!(after.queue(), first.queue());
                 assert_eq!(spent, 0, "failed due visits cannot debit cash");
-                assert_eq!(after.progress, before.progress);
-                assert_eq!(after.balance, before.balance);
+                assert_eq!(after.progress(), before.progress());
+                assert_eq!(after.balance(), before.balance());
                 assert_eq!(view.cameo_state(), BuildQueueState::Building);
             }
         }
@@ -350,10 +394,10 @@ fn retail_ore_deposit_funds_the_retained_cash_stalled_build() {
         // No Resume or replacement enqueue: the same paid head leaves, then
         // the queued successor is constructed and delivered through ExitObject.
         for _ in 0..1500 {
-            frame(&mut s);
+            frame_with_production_strip(&mut s, owner);
             if s.sim
                 .production
-                .factories
+                .factories()
                 .view(owner, ProductionCategory::Infantry)
                 .is_some_and(|f| f.object.is_none() && f.queue.is_empty())
             {
@@ -370,9 +414,12 @@ fn retail_ore_deposit_funds_the_retained_cash_stalled_build() {
         assert_eq!(products.len(), 2);
         assert!(products.iter().any(|e| e.stable_id() == head));
         let spent = 2 * s.rules.object("E1").unwrap().cost;
-        assert_eq!(s.sim.houses[&owner].economy.spent_credits(), spent);
+        assert_eq!(s.sim.houses[&owner].economy().spent_credits(), spent);
         assert_eq!(credits(&s), 50 + payout - spent);
-        assert_eq!(s.sim.houses[&owner].economy.score(), score);
+        // Ares' DepositTiberium (10044230, hook 0x73E4A2) adds no score.
+        if !s.rules.ares() {
+            assert_eq!(s.sim.houses[&owner].economy().score(), score);
+        }
         assert!(!sample(&s, s.miner).tethered);
     }
     assert_eq!(phases, [true, true]);
@@ -445,7 +492,7 @@ fn mixed_cargo_dumps_ore_then_gems_fifteen_frames_apart() {
     assert_eq!(paid[1].0 - paid[0].0, 15);
 }
 
-/// A player refinery order in the middle of an unload (`Command::MinerReturn`):
+/// A player refinery order in the middle of an unload (MEGAMISSION Enter):
 /// the MEGAMISSION breaks the link and tether (`0x004C72E8..0x004C7342`), and
 /// the Enter arm's DOCKING (`0x00741DDA`) links the refinery again, whose pad
 /// arm finds the miner already there and tethers it (`0x0043CA71..`). The
@@ -458,10 +505,11 @@ fn a_refinery_order_mid_unload_redocks_and_pays() {
     run_until_unloading(&mut s);
     assert!(s.sim.apply_command(
         "Americans",
-        &crate::sim::command::Command::MinerReturn {
-            entity_id: s.miner,
-            target_refinery_id: Some(s.refinery),
-        },
+        &crate::sim::command::Command::clicked_mission(
+            s.miner,
+            MissionType::Enter,
+            crate::sim::combat::TargetKind::Entity(s.refinery)
+        ),
         Some(&s.rules),
     ));
     let after_order = sample(&s, s.miner);
@@ -489,8 +537,12 @@ fn a_busy_refinery_leaves_a_second_miners_click_on_select() {
     run_until_unloading(&mut s);
     let second = spawn_returning_miner(&mut s, (15, 15));
     // What_Action admits only a human player's Unit (House `0x0050B6F0`).
-    s.sim.session.game_mode_nonzero = true;
-    s.sim.session.current_house = Some(s.sim.substrate.entities.get(s.miner).unwrap().owner());
+    s.sim
+        .session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    s.sim
+        .session
+        .set_current_house_for_test(Some(s.sim.substrate.entities.get(s.miner).unwrap().owner()));
     assert_eq!(
         s.sim
             .unit_building_click_action(second, s.refinery, &s.rules),
@@ -499,7 +551,7 @@ fn a_busy_refinery_leaves_a_second_miners_click_on_select() {
     assert_eq!(
         s.sim
             .unit_building_click_action(s.miner, s.refinery, &s.rules),
-        Some(crate::sim::world::BuildingClickAction::Enter)
+        Some(crate::sim::world::EntryClickAction::Enter)
     );
 }
 
@@ -515,16 +567,18 @@ fn an_order_to_a_busy_refinery_waits_nearby_and_docks_on_enter_after_it_frees() 
     run_until_unloading(&mut s);
     let second = spawn_returning_miner(&mut s, (15, 15));
     // Idle, so Harvest's own return cannot be what brings it home.
-    let now = s.sim.session.binary_frame;
+    let now = s.sim.session.binary_frame();
     s.sim
+        .substrate
         .mission_assign_exact(second, MissionId::from_known(MissionType::Guard), now)
         .unwrap();
     assert!(s.sim.apply_command(
         "Americans",
-        &crate::sim::command::Command::MinerReturn {
-            entity_id: second,
-            target_refinery_id: Some(s.refinery),
-        },
+        &crate::sim::command::Command::clicked_mission(
+            second,
+            MissionType::Enter,
+            crate::sim::combat::TargetKind::Entity(s.refinery)
+        ),
         Some(&s.rules),
     ));
     let waiter = s.sim.substrate.entities.get(second).unwrap();
@@ -575,8 +629,9 @@ fn an_order_to_a_busy_refinery_waits_nearby_and_docks_on_enter_after_it_frees() 
 #[test]
 fn a_guarding_miner_sent_to_a_free_refinery_queues_enter_without_a_destination() {
     let mut s = returning_scene();
-    let now = s.sim.session.binary_frame;
+    let now = s.sim.session.binary_frame();
     s.sim
+        .substrate
         .mission_assign_exact(s.miner, MissionId::from_known(MissionType::Guard), now)
         .unwrap();
     s.sim.set_unit_destination(
@@ -610,7 +665,7 @@ fn selling_the_refinery_mid_unload_hands_the_miner_to_harvest() {
     s.rules.set_buildup_control_for_test(&type_id, [0, 25, 2]);
     let sale_order = crate::sim::command::CommandEnvelope::new(
         s.sim.substrate.entities.get(refinery).unwrap().owner(),
-        s.sim.session.tick + 1,
+        s.sim.session.tick() + 1,
         crate::sim::command::Command::SellBuilding {
             entity_id: refinery,
         },
@@ -670,11 +725,11 @@ fn capturing_the_refinery_mid_unload_sends_the_miner_off() {
     run_until_unloading(&mut s);
     let owner = s.sim.substrate.entities.get(s.miner).unwrap().owner();
     let russians = s.sim.interner.intern("Russians");
-    s.sim.houses.insert(
-        russians,
-        crate::sim::house_state::HouseState::new(russians, 1, None, false, 0, 10),
-    );
-    s.sim.session.house_order.push(russians);
+    s.sim
+        .houses
+        .register(crate::sim::house_state::HouseState::new(
+            russians, 1, None, false, 0, 10,
+        ));
     s.sim.change_owner_with_rules(
         s.refinery,
         russians,
@@ -717,6 +772,7 @@ fn a_refinery_destroyed_mid_unload_hands_the_miner_to_harvest() {
          [Warheads]\n0=C4\n[C4]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
         super::refinery_dock_oracle_tests::RULES,
     ));
+    let ini = crate::rules::tiberium_type::with_tiberium_image_slots(&ini);
     let art = IniFile::from_str(
         "[GAREFN]\nFoundation=4x3\nQueueingCell=4,1\n\
          [GAREFX]\nFoundation=4x3\nQueueingCell=4,1\n[GAOREP]\nFoundation=2x2\n",

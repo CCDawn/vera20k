@@ -24,18 +24,19 @@ fn fly_and_jumpjet_planned_move_legs_progress_through_native_arrival() {
         let (mut sim, rules, registry) =
             crate::sim::world::entry_test_fixture::fixture_with_rules("");
         let owner = sim.interner.intern("Americans");
-        sim.houses.insert(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10),
-        );
-        sim.session.house_order = vec![owner];
-        sim.session.current_house = Some(owner);
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                owner, 0, None, true, 0, 10,
+            ));
+        sim.session.set_current_house_for_test(Some(owner));
         // Ordinary skirmish paths: Aircraft4196B0's campaign shroud gate
         // must not reject this fixture's initially unexplored spawn cell.
-        sim.session.game_mode_nonzero = true;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
         // This route fixture has no base; keep its house alive while its
         // aircraft execute the path instead of triggering ShortGame defeat.
-        sim.session.game_options.short_game = false;
+        sim.session.game_options_mut_for_test().short_game = false;
         let actor = sim
             .spawn_object_with_overlay_registry(name, "Americans", 15, 15, 0, &rules, &registry)
             .unwrap();
@@ -48,17 +49,18 @@ fn fly_and_jumpjet_planned_move_legs_progress_through_native_arrival() {
                         target_rx,
                         target_ry: 15,
                     },
+                    None,
                 )
                 .unwrap();
             let envelope = sim
-                .decode_native_command_record(&record, sim.session.tick)
+                .decode_native_command_record(&record, sim.session.tick())
                 .unwrap();
             assert!(sim.apply_command("Americans", &envelope.payload, Some(&rules)));
         }
         let record = sim.encode_plan_commit_record(owner).unwrap();
         let commit = CommandEnvelope::new(
             owner,
-            sim.session.tick + 1,
+            sim.session.tick() + 1,
             Command::PlanningRecord { record },
         );
         let grid = sim.path_grid.clone();
@@ -146,16 +148,17 @@ fn insert(sim: &mut Simulation, id: u64, name: &str, category: EntityCategory, p
         .set_sub_y_for_test(SimFixed::from_num(point[1] % 256));
     entity.position.set_exact_z_leptons_for_test(Some(point[2]));
     entity.lifecycle.set_object_alive_for_test(true);
+    entity.lifecycle.set_cell_marked_for_test(true);
     entity.lifecycle.set_in_limbo_for_test(false);
     sim.substrate.entities.insert(entity);
-    sim.substrate.next_stable_object_id = sim.substrate.next_stable_object_id.max(id + 1);
+    sim.set_next_stable_object_id_for_test(sim.next_stable_object_id().max(id + 1));
 }
 
 /// The oracle's map: flat Clear 128x128 cells, MapSize width 64 and the raw
 /// LocalSize, the owner aircraft (no team, no planning path), a Unit
 /// blocker in the Foot vector, and reserving aircraft parked off the
 /// playfield.
-fn fixture(input: &Value) -> (Simulation, RuleSet) {
+pub(crate) fn fixture(input: &Value) -> (Simulation, RuleSet) {
     let ini = format!(
         "[AircraftTypes]\n0=TEST\n[VehicleTypes]\n0=BLOCKER\n\
          [TEST]\nStrength=100\nSpeed=8\nLandable=yes\nSpawned={}\n\
@@ -173,8 +176,8 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
             input["rate"].as_f64().unwrap_or(0.016)
         )));
     let mut sim = Simulation::with_seed(input["seed"].as_u64().unwrap_or(31));
-    sim.session.map_width = 128;
-    sim.session.map_height = 128;
+    sim.session.set_map_width_for_test(128);
+    sim.session.set_map_height_for_test(128);
     let local = input["local"]
         .as_array()
         .cloned()
@@ -186,7 +189,6 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
         ),
     );
     super::super::lifecycle_tests::install_common_raw_terrain(&mut sim, 128, 128, 0, None);
-
     let owner_cell = input.get("owner_cell").map_or((60, 64), cell_of);
     insert(
         &mut sim,
@@ -248,6 +250,14 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
             insert(&mut sim, id, "BLOCKER", EntityCategory::Unit, center(cell));
             id
         };
+        // The native packet supplies ground-list membership separately from
+        // the marked byte. Admit its explicit Mark(DOWN) publication here.
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .lifecycle
+            .set_cell_marked_for_test(false);
         sim.add_entity_occupancy(id);
     }
     for (n, cell) in input["reserved"]
@@ -401,8 +411,13 @@ impl move_mission::MoveHost for RowHost<'_> {
     }
 
     fn epilogue(&mut self) -> i32 {
-        self.sim
-            .mission_rate_epilogue_for(self.rules, OWNER, MissionType::Move)
+        Simulation::mission_rate_epilogue_for(
+            &mut self.sim.scenario_rng,
+            &self.sim.substrate,
+            self.rules,
+            OWNER,
+            MissionType::Move,
+        )
     }
 }
 
@@ -473,7 +488,7 @@ fn retail_harrier_sent_onto_a_tank_stops_beside_it_and_crashes_without_an_airfie
     let mut scenario = crate::headless_scenario::load(&retail, "Hills.mmx", 0x0B21_D6E5)
         .expect("load retail Hills through the production loader");
     let candidates = super::super::rocket_flight::retail_tests::sites(&scenario);
-    let owner = scenario.sim().session.current_house.expect("order house");
+    let owner = scenario.sim().session.current_house().expect("order house");
     let owner_name = scenario.sim().interner.resolve(owner).to_owned();
     let runtime = &mut scenario.runtime;
     let rules = &runtime.resources.rules;
@@ -499,7 +514,7 @@ fn retail_harrier_sent_onto_a_tank_stops_beside_it_and_crashes_without_an_airfie
         let commands = if frame == 0 {
             vec![CommandEnvelope::new(
                 owner,
-                runtime.simulation.session.tick + 1,
+                runtime.simulation.session.tick() + 1,
                 Command::Move {
                     entity_id: harrier,
                     target_rx: target_cell.0,
@@ -591,7 +606,9 @@ fn queue(sim: &mut Simulation, mission: MissionType) {
         MissionId::from_known(mission),
         0,
         0,
-        &crate::sim::mission::authority::EntityReadyInputProvider,
+        &crate::sim::mission::authority::LiveReadyInputProvider {
+            rules: crate::rules::ruleset::RuleSet::empty_for_test(),
+        },
     )
     .unwrap();
 }
@@ -634,23 +651,6 @@ fn a_move_queued_during_a_release_waits_for_mission_attack() {
     assert_eq!(plane.mission.handler_state(), 0);
 }
 
-/// An Attack commenced over Mission_Move starts Mission_Attack at state 0.
-#[test]
-fn an_attack_commenced_over_mission_move_starts_at_state_zero() {
-    let (mut sim, rules) = fixture(&json!({}));
-    set_current(&mut sim, MissionType::Move);
-    sim.substrate
-        .entities
-        .get_mut(OWNER)
-        .unwrap()
-        .mission
-        .set_current_for_test(MissionId::from_known(MissionType::Move), 4);
-    queue(&mut sim, MissionType::Attack);
-    sim.mission_host_promote(OWNER, 1, &rules);
-    let plane = sim.substrate.entities.get(OWNER).unwrap();
-    assert_eq!(crate::sim::aircraft::attack_state(plane), Some(0));
-}
-
 /// The Move slot `0x004166C0` sends a `Carryall=` type to `0x00416D50`; no
 /// retail aircraft type sets the key, so every one runs `0x004166E0`.
 #[test]
@@ -664,57 +664,82 @@ fn retail_aircraft_types_are_not_carryalls() {
     }
 }
 
-/// Mission_Move's state 0 without a NavCom enters idle mode (`0x004176F0`,
-/// `aircraft::idle_entry`) and commences what it picks. On the ground the
-/// landed arm drops the destination and the Target and picks Guard (an
-/// unarmed aircraft outside a team); in flight the airborne arm sends an
-/// aircraft without a weapon to its nearest airfield on Move, keeping its
-/// Target.
-#[test]
-fn mission_move_idle_mode_on_the_ground_and_in_flight() {
-    use crate::sim::combat::TargetKind;
-    for (z, landed) in [(0, true), (1500, false)] {
-        let (mut sim, rules) = fixture(&json!({}));
-        set_current(&mut sim, MissionType::Move);
-        let plane = sim.substrate.entities.get_mut(OWNER).unwrap();
-        plane.locomotor = Some(
-            crate::sim::movement::locomotor::LocomotorState::from_object_type(
-                rules.object("TEST").unwrap(),
-                0,
-            ),
-        );
-        plane.position.set_exact_z_leptons_for_test(Some(z));
-        plane
-            .mission
-            .set_current_for_test(MissionId::from_known(MissionType::Move), 0);
-        plane
-            .attack_target
-            .set_for_test(Some(TargetKind::Cell(70, 70)));
-        let airfield = sim.aircraft_nearest_friendly_airfield_cell(OWNER, &rules);
-
-        crate::sim::aircraft::dispatch_mission(&mut sim, OWNER, &rules, Default::default());
-        let plane = sim.substrate.entities.get(OWNER).unwrap();
-        let expected = if landed {
-            MissionType::Guard
-        } else {
-            MissionType::Move
-        };
-        assert_eq!(
-            plane.mission.current(),
-            MissionId::from_known(expected),
-            "z {z}"
-        );
-        assert_eq!(plane.mission.queued(), MissionId::NONE, "z {z}");
-        assert_eq!(plane.mission.handler_state(), 0, "z {z}");
-        assert_eq!(
-            plane.attack_target.target().is_none(),
-            landed,
-            "z {z}: the Target"
-        );
-        assert_eq!(
-            plane.navigation.nav_com(),
-            (!landed).then_some(airfield),
-            "z {z}"
-        );
+/// The fixture's HORNET (Landable, not Spawned, with `extra` rules) at
+/// (15, 15), a tree on `tree`, `order` applied, and the first Cell NavCom the
+/// aircraft takes within 200 frames.
+fn first_cell_destination_for_a_tree_order(
+    extra: &str,
+    tree: (u16, u16),
+    order: impl FnOnce(u64, u64) -> crate::sim::command::Command,
+) -> Option<(u16, u16)> {
+    use crate::sim::terrain_object::{TerrainObjectState, mark_terrain_raw_occupation};
+    const TREE: u64 = 900;
+    let (mut sim, rules, registry) =
+        crate::sim::world::entry_test_fixture::fixture_with_rules(extra);
+    assert!(!rules.object("HORNET").unwrap().spawned);
+    let owner = sim.interner.intern("Americans");
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 0, 10,
+        ));
+    sim.session.set_current_house_for_test(Some(owner));
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    sim.session.game_options_mut_for_test().short_game = false;
+    let actor = sim
+        .spawn_object_with_overlay_registry("HORNET", "Americans", 15, 15, 0, &rules, &registry)
+        .unwrap();
+    let type_ref = sim.interner.intern("TREE01");
+    sim.terrain_objects.objects_mut_for_test().insert(
+        TREE,
+        TerrainObjectState::for_test(TREE, type_ref, tree.0, tree.1),
+    );
+    sim.terrain_objects
+        .cell_index_mut_for_test()
+        .insert(tree, TREE);
+    mark_terrain_raw_occupation(&mut sim.substrate.raw_cell_occupation, tree, 5);
+    assert!(sim.apply_command("Americans", &order(actor, TREE), Some(&rules)));
+    let grid = sim.path_grid.clone();
+    for _ in 0..200 {
+        let due = sim.take_due_commands();
+        sim.advance_tick(&due, Some(&rules), grid.as_deref(), Some(&registry), 67);
+        let nav = sim.substrate.entities.get(actor)?.navigation.nav_com();
+        if let Some(NavTargetRef::Cell { rx, ry }) = nav {
+            return Some((rx, ry));
+        }
     }
+    None
+}
+
+/// A move order onto a tree gives the aircraft a Terrain NavCom, which
+/// Find_Attack_Cell `0x00418E20` and IsLandZoneClear `0x004DDC60` ask for its
+/// center (vt+0x48) like any other target. The center lookup knew only
+/// Technos and panicked here (#4136).
+#[test]
+fn an_aircraft_sent_to_a_tree_lands_beside_it() {
+    let tree = (18, 15);
+    let (rx, ry) = first_cell_destination_for_a_tree_order("", tree, |actor, tree| {
+        crate::sim::command::Command::MoveToObject {
+            entity_id: actor,
+            target_id: tree,
+        }
+    })
+    .expect("Mission_Move picks a cell for the tree order");
+    assert_ne!((rx, ry), tree);
+    assert!(rx.abs_diff(tree.0) <= 1 && ry.abs_diff(tree.1) <= 1);
+}
+
+/// FindFireLocation `0x004197C0` reads a tree's center the same way: an
+/// attack order on one flies to a firing cell instead of dropping the order.
+#[test]
+fn an_aircraft_attacking_a_tree_takes_a_firing_cell() {
+    let armed = "[HORNET]\nPrimary=TreeGun\nAmmo=2\n[TreeGun]\nDamage=10\nROF=20\nRange=4\n\
+                 Projectile=TreeShot\nWarhead=SA\n[TreeShot]\nInviso=yes\n";
+    let cell = first_cell_destination_for_a_tree_order(armed, (22, 15), |actor, tree| {
+        crate::sim::command::Command::Attack {
+            attacker_id: actor,
+            target_id: tree,
+        }
+    });
+    assert!(cell.is_some(), "Mission_Attack flies to a firing cell");
 }

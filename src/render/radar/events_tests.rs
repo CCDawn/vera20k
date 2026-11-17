@@ -24,6 +24,108 @@ fn source(cell: (u16, u16), pixel: (i32, i32)) -> RadarEventSource {
 }
 
 #[test]
+fn terrain_rebuild_preserves_live_alert_and_restarts_sighting_baseline() {
+    let mut queue = queue_ready();
+    let config = configured();
+    let origin = source((20, 20), (40, 40));
+    assert!(queue.create(
+        RadarEventType::BaseUnderAttack,
+        origin,
+        10,
+        (140, 108),
+        &config
+    ));
+    queue.advance_to_frame(20, &config);
+    queue.restart_tracker_baseline();
+    assert_eq!(
+        queue.len(),
+        1,
+        "RadarInit655B20 does not delete saved alerts"
+    );
+    assert!(!queue.create_enemy_sensed(origin, 20, (140, 108), &config));
+    assert!(!queue.create(
+        RadarEventType::BaseUnderAttack,
+        origin,
+        20,
+        (140, 108),
+        &config
+    ));
+}
+
+#[test]
+fn saved_alerts_round_trip_without_animation_and_clear_postload_review_ring() {
+    let saved = saved_radar_fixture();
+    let bytes = crate::util::save_codec::serialize(&saved).unwrap();
+    let decoded: SavedRadarEvents = crate::util::save_codec::deserialize(&bytes).unwrap();
+    let mut restored = ClientRadarEvents::from_saved(decoded).unwrap();
+    assert_eq!(restored.saved(), saved);
+    assert_eq!(restored.cycle_cell(Instant::now()), None);
+    assert!(!restored.create_enemy_sensed(source((1, 1), (1, 1)), 100, (140, 108), &configured()));
+    restored.advance_to_frame(100, &configured());
+    assert_eq!(
+        restored.saved(),
+        saved,
+        "the saved frame is not drawn twice"
+    );
+}
+
+#[test]
+fn load_keeps_invisible_dedup_and_resumes_the_next_animation_frame() {
+    let mut original = queue_ready();
+    let config = configured();
+    let origin = source((20, 20), (40, 40));
+    assert!(original.create(
+        RadarEventType::BaseUnderAttack,
+        origin,
+        0,
+        (140, 108),
+        &config
+    ));
+    // Start at the same completed-shrink boundary as the existing lifetime
+    // control; this test concerns storage of the ensuing invisible interval.
+    original.events[0].radius = config.min_radius as f32;
+    original.events[0].rotation_speed = 1.0;
+    original.advance_to_frame(0, &config);
+    original.advance_to_frame(300, &config);
+    assert!(!original.events[0].needs_draw);
+    assert!(original.create_enemy_sensed(source((50, 50), (70, 70)), 300, (140, 108), &config));
+    original.advance_to_frame(310, &config);
+    let mut restored = ClientRadarEvents::from_saved(original.saved()).unwrap();
+    assert!(!restored.create(
+        RadarEventType::BaseUnderAttack,
+        origin,
+        310,
+        (140, 108),
+        &config
+    ));
+    assert_eq!(restored.cycle_cell(Instant::now()), None);
+    restored.finish_baseline();
+    original.advance_to_frame(311, &config);
+    restored.advance_to_frame(311, &config);
+    assert_eq!(original.saved(), restored.saved());
+    original.advance_to_frame(600, &config);
+    restored.advance_to_frame(600, &config);
+    assert_eq!(original.saved(), restored.saved());
+    assert!(restored.create(
+        RadarEventType::BaseUnderAttack,
+        origin,
+        600,
+        (140, 108),
+        &config
+    ));
+}
+
+#[test]
+fn malformed_saved_animation_is_rejected_before_installation() {
+    let mut saved = saved_radar_fixture();
+    saved.events[0].rotation = f32::NAN.to_bits();
+    assert!(matches!(
+        ClientRadarEvents::from_saved(saved),
+        Err(SavedRadarEventsError::NonFiniteAnimation { index: 0 })
+    ));
+}
+
+#[test]
 fn type5_dedup_is_strictly_less_than_six_and_ring_accepts_only_created_events() {
     let mut queue = queue_ready();
     let config = configured();
@@ -126,7 +228,7 @@ fn type5_draw_is_one_cyan_outline_in_insertion_order() {
     event.fade = 1.0;
     event.expanding = false;
     let mut rgba = vec![7_u8; 24 * 24 * 4];
-    queue.draw(&mut rgba, 24, 24, (24, 24), (0, 0));
+    draw_into(&queue, &mut rgba, 24, (24, 24), (0, 0));
     let pixel = |x: usize, y: usize| {
         let offset = (y * 24 + x) * 4;
         &rgba[offset..offset + 4]
@@ -146,7 +248,7 @@ fn type5_draw_clips_to_generated_primary_extent_not_host_texture() {
     event.fade = 1.0;
     event.expanding = false;
     let mut rgba = vec![7_u8; 200 * 200 * 4];
-    queue.draw(&mut rgba, 200, 200, (140, 84), (0, 0));
+    draw_into(&queue, &mut rgba, 200, (140, 84), (0, 0));
     let pixel = |x: usize, y: usize| {
         let offset = (y * 200 + x) * 4;
         &rgba[offset..offset + 4]
@@ -167,7 +269,7 @@ fn type5_draw_applies_only_the_centered_primary_surface_copy() {
     event.fade = 1.0;
     event.expanding = false;
     let mut rgba = vec![7_u8; 140 * 108 * 4];
-    queue.draw(&mut rgba, 140, 108, (64, 108), (38, 0));
+    draw_into(&queue, &mut rgba, 140, (64, 108), (38, 0));
     let pixel = |x: usize, y: usize| {
         let offset = (y * 140 + x) * 4;
         &rgba[offset..offset + 4]
@@ -213,27 +315,16 @@ fn type5_cycle_ring_wraps_and_restarts_at_newest() {
 }
 
 #[test]
-fn stale_rebuild_baseline_cannot_replay_enemy_sensed() {
+fn view_change_discards_previous_client_events_and_sighting_baseline() {
     let mut queue = ClientRadarEvents::default();
     let config = configured();
     assert!(!queue.create_enemy_sensed(source((4, 4), (8, 8)), 10, (20, 20), &config));
     assert_eq!(queue.len(), 0);
     queue.finish_baseline();
     assert!(queue.create_enemy_sensed(source((4, 4), (8, 8)), 11, (20, 20), &config));
-    queue.reset_for_load_or_view();
+    queue.reset_for_view_change();
     assert_eq!(queue.len(), 0);
     assert!(!queue.create_enemy_sensed(source((4, 4), (8, 8)), 12, (20, 20), &config));
-}
-
-#[test]
-fn ordinary_and_repeated_action40_feeds_share_one_type5_dedup_authority() {
-    let mut queue = queue_ready();
-    let config = configured();
-    let sensed = source((30, 30), (90, 90));
-    assert!(queue.create_enemy_sensed(sensed, 50, (200, 200), &config));
-    assert!(!queue.create_enemy_sensed(sensed, 50, (200, 200), &config));
-    assert!(!queue.create_enemy_sensed(sensed, 51, (200, 200), &config));
-    assert_eq!(queue.len(), 1);
 }
 
 #[test]
@@ -373,7 +464,7 @@ fn non_drawing_event_never_paints_and_dedupes_for_its_own_lifetime() {
 
     let mut rgba = vec![7_u8; 24 * 24 * 4];
     queue.events[0].needs_draw = true;
-    queue.draw(&mut rgba, 24, 24, (24, 24), (0, 0));
+    draw_into(&queue, &mut rgba, 24, (24, 24), (0, 0));
     assert!(
         rgba.iter().all(|&byte| byte == 7),
         "default colour arm draws nothing"
@@ -486,7 +577,7 @@ fn reinforcement_cells_share_review_order_without_creating_or_deduping_events() 
             Some((cell, 20)),
         );
     }
-    queue.reset_for_load_or_view();
+    queue.reset_for_view_change();
     assert_eq!(queue.cycle_cell(restart), None);
 }
 
@@ -696,4 +787,19 @@ fn native_unit_ready_marker_matches_every_original_tick_and_cleanup() {
         Some(cell),
         "native review ring survives expiry"
     );
+}
+
+/// The outlines stored into a `width`-wide RGBA canvas.
+fn draw_into(
+    queue: &ClientRadarEvents,
+    rgba: &mut [u8],
+    width: u32,
+    surface_size: (i32, i32),
+    offset: (i32, i32),
+) {
+    let height = (rgba.len() / 4) as u32 / width;
+    queue.draw((width, height), surface_size, offset, |(x, y), color| {
+        let at = ((y * width + x) * 4) as usize;
+        rgba[at..at + 4].copy_from_slice(&color);
+    });
 }

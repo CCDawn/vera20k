@@ -28,10 +28,13 @@ Instruction/caller evidence establishes the common stock-building route:
   destination after drawing.
 - Shadow497390 reads the existing destination, shifts it at49742C and masks
   it at49742F before storing color/Z. It does not read A.
-- Tactical6D4648 executes rally pass0 before the body loop6D465F. The native
-  4C0750 line stores raw packed color when its A admission passes. A partial
-  value must therefore shade an overlapping body while preserving uncovered
-  line pixels. A framebuffer multiply cannot implement that ordering.
+- Building6D9920/43CEA0/43D290 paints base color/Z before Tactical6D4648
+  rally pass0. Display6D916C then passes1 to43CEA0 and draws only43DA80's
+  dynamic voxel turret, without replaying the base. Mobile bodies and
+  independently registered Anim slots still follow the first rally.
+  Native4C0750 stores raw packed color when its A admission passes. A partial
+  value shades an overlapping later body while preserving uncovered line
+  pixels. A framebuffer multiply cannot implement that ordering.
 
 `ShroudBuffer` remains the sole source of CPU and GPU A bytes. Its retained
 texture view identifies the derived Batch binding cache; resize/map replacement
@@ -62,11 +65,6 @@ The focused GPU tests are `render::shroud_gpu_tests::` (explicit `--ignored`):
 - Batch/TMP/VXL world paths compare A at fractional positive/negative scroll
   and zoom0.75/1/1.5/2 with the authoritative CPU source and native colors.
   Source replacement, binding reuse and disabled/sandbox state are included.
-- `production_a_blitter_workload_timing` measures 1000/20000 world sources at
-  1280x720, two warmups and20 measured frames. It reports CPU encode, GPU pass
-  timestamps when valid, and submit-to-completion wall time independently.
-  Zero, sentinel and nonincreasing GPU intervals are unavailable, never free.
-  Run optimized; this is synthetic source-overdraw cost, not whole-game timing.
 
 Native fixture replay, the focused Rust/GPU checks and optimized timing passed.
 The [shared validation report](README.md#measured-rendering-cost) links preserved

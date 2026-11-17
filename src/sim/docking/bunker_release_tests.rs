@@ -69,7 +69,7 @@ fn release_fixture() -> Simulation {
     let building = sim.substrate.entities.get_mut(2).unwrap();
     building
         .type_facts
-        .set_foundation_for_test("2x3".to_owned());
+        .set_foundation_for_test("2x3".to_owned().into());
     building.position.set_sub_x_for_test(SimFixed::from_num(64));
     building
         .position
@@ -123,7 +123,12 @@ fn release_head() -> DriveCoord {
 fn sell_release_uses_building_center_preserves_pose_and_orders_links_after_speed() {
     let mut sim = release_fixture();
     let pose = position_world_coord(&sim.substrate.entities.get(1).unwrap().position);
-    release_sell_destroy(&mut sim, 2, crate::sim::world::FrameEffects::default());
+    release_sell_destroy(
+        &mut sim,
+        2,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        crate::sim::world::FrameEffects::default(),
+    );
     let trace = take_trace();
     assert_eq!(
         trace.iter().map(|b| b.name).collect::<Vec<_>>(),
@@ -194,6 +199,74 @@ fn sell_release_uses_building_center_preserves_pose_and_orders_links_after_speed
     );
 }
 
+/// The forced head reaches `CellClass::PickupCrate` through `Force_Track`
+/// (`0x004B0D1B`) with the frame's OverlayType table, so a crate on the
+/// bunker's exit cell is picked up there.
+#[test]
+fn sell_release_picks_up_a_crate_on_the_forced_head_cell() {
+    let mut sim = release_fixture();
+    let registry = crate::sim::crates::tests::crate_registry();
+    let wood = registry.id_for_name("WOOD").unwrap();
+    let mut overlays = crate::sim::overlay_grid::OverlayGrid::new(64, 64);
+    overlays.place_overlay(10, 12, wood, 0);
+    sim.overlay_grid = Some(overlays);
+    release_sell_destroy(
+        &mut sim,
+        2,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        crate::sim::world::FrameEffects::default().with_overlay_registry(Some(&registry)),
+    );
+    let trace = take_trace();
+    assert_eq!(trace[1].name, "force");
+    assert_eq!(
+        trace[1].head,
+        Some(release_head()),
+        "a money crate keeps the head"
+    );
+    assert_eq!(
+        sim.overlay_grid.as_ref().unwrap().cell(10, 12).overlay_id,
+        None,
+        "the crate is picked up"
+    );
+}
+
+/// `EmptyBunker`'s destination (`0x004597FA`) is the Unit setter, so the Foot
+/// setter's tail (`0x004D96C2..0x004D9707`) restarts both path timers.
+#[test]
+fn normal_release_runs_the_foot_setters_timer_tail() {
+    let mut sim = release_fixture();
+    let rules = super::tests::rules();
+    let frame = sim.session.binary_frame();
+    sim.substrate
+        .entities
+        .get_mut(1)
+        .unwrap()
+        .navigation
+        .path_runtime_mut()
+        .start_movement(frame, 99);
+
+    release_normal(
+        &mut sim,
+        2,
+        &rules,
+        crate::sim::world::FrameEffects::default(),
+    );
+    let _ = take_trace();
+
+    let path = sim
+        .substrate
+        .entities
+        .get(1)
+        .unwrap()
+        .navigation
+        .path_runtime();
+    assert_eq!(path.movement_timer().remaining(frame as i32), 0);
+    assert_eq!(
+        path.blocked_timer().remaining(frame as i32),
+        rules.general.blockage_path_delay_ticks
+    );
+}
+
 #[test]
 fn normal_release_clears_unit_first_and_assigns_destination_without_teleport() {
     let mut sim = release_fixture();
@@ -237,7 +310,10 @@ fn normal_release_clears_unit_first_and_assigns_destination_without_teleport() {
         building.mission.queued(),
         MissionId::from_known(MissionType::Guard)
     );
-    assert_eq!(building.bunker_runtime.unwrap().state(), BunkerState::Idle);
+    assert_eq!(
+        building.building.bunker_runtime.unwrap().state(),
+        BunkerState::Idle
+    );
 }
 
 #[test]
@@ -251,7 +327,12 @@ fn force_limbo_early_return_does_not_skip_caller_speed_links_or_break() {
         .unwrap()
         .lifecycle
         .set_in_limbo_for_test(true);
-    release_sell_destroy(&mut sim, 2, crate::sim::world::FrameEffects::default());
+    release_sell_destroy(
+        &mut sim,
+        2,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        crate::sim::world::FrameEffects::default(),
+    );
     let unit = sim.substrate.entities.get(1).unwrap();
     assert!(
         unit.lifecycle.in_limbo(),
@@ -286,7 +367,12 @@ fn break_targets_slot_zero_even_when_it_is_not_the_released_unit() {
     building.radio_contacts = Contacts::with_capacity(2);
     building.radio_contacts.insert(3);
     building.radio_contacts.insert(1);
-    release_sell_destroy(&mut sim, 2, crate::sim::world::FrameEffects::default());
+    release_sell_destroy(
+        &mut sim,
+        2,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        crate::sim::world::FrameEffects::default(),
+    );
     assert!(
         !sim.substrate
             .entities
@@ -321,7 +407,12 @@ fn empty_slot_zero_does_not_scan_later_contacts() {
     building.radio_contacts.insert(3);
     building.radio_contacts.insert(1);
     building.radio_contacts.remove(3);
-    release_sell_destroy(&mut sim, 2, crate::sim::world::FrameEffects::default());
+    release_sell_destroy(
+        &mut sim,
+        2,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        crate::sim::world::FrameEffects::default(),
+    );
     assert!(
         sim.substrate
             .entities
@@ -358,7 +449,12 @@ fn nonunit_link_does_not_release_or_reset_bunker() {
                 crate::sim::world::FrameEffects::default(),
             );
         } else {
-            release_sell_destroy(&mut sim, 2, crate::sim::world::FrameEffects::default());
+            release_sell_destroy(
+                &mut sim,
+                2,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
+                crate::sim::world::FrameEffects::default(),
+            );
         }
         assert!(take_trace().is_empty());
         let unit = sim.substrate.entities.get(1).unwrap();
@@ -368,7 +464,7 @@ fn nonunit_link_does_not_release_or_reset_bunker() {
         let building = sim.substrate.entities.get(2).unwrap();
         assert_eq!(building.bunker.occupant(), Some(1));
         assert_eq!(
-            building.bunker_runtime.unwrap().state(),
+            building.building.bunker_runtime.unwrap().state(),
             BunkerState::Occupied
         );
     }

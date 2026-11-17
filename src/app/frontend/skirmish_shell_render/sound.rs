@@ -62,6 +62,8 @@ pub(crate) fn render_sound_shell(
                 rect,
                 thumb_left: dialog.thumb_left(id, rect),
                 plaque: true,
+                // B8 opens only with an output device ([`SoundState`]).
+                disabled: false,
             },
             ShellScale::RETAIL,
         );
@@ -129,7 +131,7 @@ pub(crate) fn render_sound_shell(
     text(
         &localized_label(state, "GUI:SoundOptions", "Sound Options"),
         layout.title,
-        ShellAlign::H_CENTER,
+        ShellAlign::PANEL_TITLE,
     );
     for (id, key, fallback) in [
         (SoundButton::Back, "GUI:Back", "Back"),

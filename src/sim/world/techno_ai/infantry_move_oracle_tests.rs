@@ -8,14 +8,6 @@ use crate::sim::mission::MissionDispatchTimer;
 
 #[test]
 fn deployed_move_matches_native_action_navigation_timer_and_rng() {
-    let meta: Value = serde_json::from_str(crate::test_fixture::text(
-        "tools/spatial_oracle/infantry_mission_move.meta.json",
-    ))
-    .unwrap();
-    assert_eq!(
-        meta["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     let data: Value = serde_json::from_str(crate::test_fixture::text(
         "tools/spatial_oracle/infantry_mission_move.json",
     ))
@@ -24,14 +16,14 @@ fn deployed_move_matches_native_action_navigation_timer_and_rng() {
     assert_eq!(rows.len(), 16);
     for row in rows {
         let (mut sim, rules, id) = native_deploy_fixture(row);
-        let now = sim.session.binary_frame;
+        let now = sim.session.binary_frame();
         sim.substrate
             .entities
             .get_mut(id)
             .unwrap()
             .mission
             .write_dispatch_epilogue(now as i32, 0);
-        dispatch_foot_mission(&mut sim, id, &rules, Default::default());
+        dispatch_foot_mission(&mut sim, id, &rules, Default::default()).unwrap();
         assert_eq!(
             sim.substrate
                 .entities

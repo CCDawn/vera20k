@@ -1,59 +1,215 @@
-//! Deterministic lockstep command staging and dispatch.
+//! Lockstep session timing, the network send policy and the shared
+//! `sim::command_queue` types.
 //!
-//! Local commands retain their issue frame until transfer. Single-player
-//! transfer admits that frame unchanged; network transfer overwrites every
-//! staged record with the send frame plus the negotiated ahead window.
+//! Live play stages and dispatches commands through the simulation's own
+//! `LocalCommandStage`/`DoList`; `net::command_exchange` owns the packets.
+//!
+//! The native-byte adapter (`SynchronizedCommand`, `SynchronizedCommandQueue`,
+//! `LockstepScheduler`) is test-support only. It drives that same dispatcher
+//! with raw records and carries most of its late-record, FRAMEINFO and
+//! house-order coverage. Bytes stay authoritative there; decoding happens only
+//! after the dispatcher admits an event. Its local commands retain their issue
+//! frame until transfer. Single-player transfer admits that frame unchanged;
+//! network transfer overwrites every staged record with the send frame plus the
+//! negotiated ahead window.
 //!
 //! Network rescheduling and physical packetization/compression are later
 //! transport-owner boundaries. Opcode `0x13` local-vs-remote EXIT routing and
 //! player removal are session-owner boundaries: due `0x13` records reach the
 //! generic execute callback, but this module does not claim that callback alone
 //! reproduces the native EXIT path.
-//!
-//! Production does not run this queue yet. Matches schedule commands through
-//! `Simulation::queue_command` (`sim/world/command_schedule.rs`) and share only
-//! [`SynchronizedCommand::decode_for_simulation`] with it. The queue, the
-//! scheduler, the send policy and the dispatch house are kept for the native
-//! multiplayer transport.
 
-use std::collections::VecDeque;
-use std::mem::size_of;
 #[cfg(any(test, feature = "test-support"))]
 use std::num::NonZeroU8;
 use std::num::NonZeroU32;
 
+use crate::sim::game_options::GAME_SPEED_90_TPS;
+
+#[cfg(any(test, feature = "test-support"))]
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use crate::sim::command::MEGAMISSION_STAGE_CAPACITY;
+#[cfg(any(test, feature = "test-support"))]
 use crate::sim::command::{CommandRecord, CommandRecordError};
+pub use crate::sim::command_queue::{
+    CHECKSUM_HISTORY_LEN, ChecksumMismatch, CommandDispatchHouse, DO_LIST_CAPACITY,
+    DispatchSummary, FRAMEINFO_EVENT_OPCODE, FrameInfo, FrameInfoCompareGate,
+    MultiplayerChecksumHistory, NETWORK_LOCAL_MIRROR_LIMIT, OUT_LIST_CAPACITY,
+};
+#[cfg(any(test, feature = "test-support"))]
+use crate::sim::command_queue::{
+    CommandDispatchClock, CommandDispatchMode, DoList, DoListEvent, DoListHost, DoListRetimeWindow,
+    LocalCommandEvent, LocalCommandStage, SemanticEventHeader,
+};
+#[cfg(any(test, feature = "test-support"))]
 use crate::sim::intern::InternedId;
 
-pub const FRAMEINFO_EVENT_OPCODE: u8 = 0x1c;
-pub const CHECKSUM_HISTORY_LEN: usize = 0x100;
-pub const OUT_LIST_CAPACITY: usize = 0x80;
-pub const DO_LIST_CAPACITY: usize = 0x4000;
-pub const NETWORK_LOCAL_MIRROR_LIMIT: usize = 0x2000;
-pub const MEGAMISSION_STAGE_CAPACITY: usize = 0x100;
-
-const FRAMEINFO_CHECKSUM_PAYLOAD_OFFSET: usize = 0;
-const FRAMEINFO_TIMING_WORD_PAYLOAD_OFFSET: usize = 4;
-const FRAMEINFO_DELAY_PAYLOAD_OFFSET: usize = 6;
-#[cfg(any(test, feature = "test-support"))]
-const QUEUE_ONLY_EVENT_OPCODE_0C: u8 = 0x0c;
-#[cfg(any(test, feature = "test-support"))]
-const QUEUE_ONLY_EVENT_OPCODE_22: u8 = 0x22;
-
-#[cfg(any(test, feature = "test-support"))]
-#[inline]
-const fn queue_consumes_without_execute(opcode: u8) -> bool {
-    matches!(
-        opcode,
-        QUEUE_ONLY_EVENT_OPCODE_0C | QUEUE_ONLY_EVENT_OPCODE_22
-    )
+/// Initial LAN host5DD48D / guest5DD2CD MaxAhead calculation. Native
+/// IPX response getter5424C0 is observed twice only when the first calculation
+/// exceeds its protocol floor; a changed second result is not clamped again.
+/// Original gamemd.exe controls: tools/storage_oracle/lan_lobby.py, timing.
+pub fn initial_multiplayer_max_ahead(protocol: i32, mut response_time: impl FnMut() -> u32) -> i32 {
+    if protocol == 2 {
+        let round = |response: u32| ((response >> 3) + 4) / 5 * 5;
+        if round(response_time()) <= 10 {
+            10
+        } else {
+            round(response_time()) as i32
+        }
+    } else if (response_time() as i32) / 8 <= 2 {
+        2
+    } else {
+        (response_time() as i32) / 8
+    }
 }
 
-/// The two verified network send-frame policies.
+/// Arguments of the IPX `SetTiming` call (`0x540C60`, thiscall on the IPX
+/// manager `0xA8E9C0`) issued by the WOL start-timing block: retry delta,
+/// max retries (`-1`), timeout (`retry_delta * 8`) and the bool that makes the
+/// manager forward the timing to every connection (always 1 here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WolIpxTiming {
+    pub retry_delta: i32,
+    pub max_retries: i32,
+    pub timeout: i32,
+    pub apply_to_connections: bool,
+}
+
+/// Network timing globals written by the WOL start-timing block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WolStartTiming {
+    /// MaxAhead `0xA8B550`.
+    pub max_ahead: i32,
+    /// FrameSendRate `0xA8B554`.
+    pub frame_send_rate: i32,
+    /// PreCalcMaxAhead `0xA8B56C`.
+    pub precalc_max_ahead: i32,
+    /// PreCalcFrameRate `0xA8B570`.
+    pub precalc_frame_rate: i32,
+    /// MaxMaxAhead `0xA8B568`.
+    pub max_max_ahead: i32,
+    /// LatencyFudge `0xA8DB9C`.
+    pub latency_fudge: i32,
+    /// `None` when the highest ping is 0 or exactly 1000 (no call).
+    pub set_timing: Option<WolIpxTiming>,
+}
+
+/// WOL "Start Game Now" `0x794BA0` timing block `0x794F6F..0x79523E`, run by
+/// host and guest alike after the server's StartGame echo.
+///
+/// `game_speed` is `[0xA8B268]` (unsigned bound: anything outside 0..=5,
+/// negatives included, takes the slowest row); `pings` are the eight dwords
+/// at `0xB7790C` (all admitted peers in VERA's extended roster), reduced to a signed maximum starting from 0 so negative
+/// (unknown) pings are ignored. `channel_owner` is true when the first channel
+/// user row with flag bit 0 (`0xB77908` rows, +0) has a nickname (+0x24)
+/// equal to the local one under ASCII case-insensitive `_stricmp 0x7C8D20`;
+/// no flagged row means false. The ping-to-retry conversion uses the native
+/// signed magic divisions `0x10624DD3>>6` (/1000) and `0x51EB851F>>5` (/100)
+/// after a wrapping `ping * 60`. The command-line debug byte `0xA8E2C8`
+/// (+20 MaxAhead, doubled ping) is dormant and not ported. Not ported here:
+/// the clear of `0xA8B574[0xD0]`, current speed `0xA8EB60 = game_speed`,
+/// the `0x841F30..3C` writes and `0xA8ED84 = 0`.
+/// Original gamemd.exe controls: tools/storage_oracle/wol_shell.py, timing.
+pub fn wol_start_timing(
+    game_speed: i32,
+    pings: impl IntoIterator<Item = i32>,
+    channel_owner: bool,
+) -> WolStartTiming {
+    // Jump table 0x79561C; `ja` at 0x794F8B is unsigned.
+    let (max_ahead, owner_frame_rate) = speed_frame_budget(game_speed);
+    let frame_send_rate =
+        if matches!(game_speed, 0 | 1) || game_speed == i32::from(GAME_SPEED_90_TPS) {
+            10
+        } else {
+            5
+        };
+    let ping = pings.into_iter().fold(0, i32::max);
+    let mut timing = WolStartTiming {
+        max_ahead,
+        frame_send_rate,
+        precalc_max_ahead: 0,
+        precalc_frame_rate: if channel_owner { owner_frame_rate } else { 0 },
+        max_max_ahead: max_ahead,
+        latency_fudge: 1,
+        set_timing: None,
+    };
+    let round_down = |value: i32| (value as u32 / 10 * 10) as i32;
+    if ping == 0 || ping == 1000 {
+        // 0x7953BB: every player, floor 10 (unsigned `ja`).
+        timing.precalc_max_ahead = round_down(max_ahead).max(10);
+        return timing;
+    }
+    if ping > 1000 {
+        timing.latency_fudge = 2;
+    }
+    let frames = ping.wrapping_mul(60) / 1000;
+    let retry_delta = frames.wrapping_add(frames.wrapping_mul(120) / 100);
+    timing.set_timing = Some(WolIpxTiming {
+        retry_delta,
+        max_retries: -1,
+        timeout: retry_delta.wrapping_mul(8),
+        apply_to_connections: true,
+    });
+    if channel_owner {
+        // 0x79536C jump table 0x795634: fudge 0/1 -> MaxAhead, 2 -> x1.5.
+        let base = if timing.latency_fudge == 2 {
+            max_ahead + ((max_ahead as u32) >> 1) as i32
+        } else {
+            max_ahead
+        };
+        timing.precalc_max_ahead = round_down(base);
+    }
+    timing
+}
+
+/// The game-speed rows both network timing blocks share: MaxAhead
+/// `[0xA8B550]` and PreCalcFrameRate. Anything outside 0..=5, negatives
+/// included, takes the slowest row (both jumps are unsigned `ja`).
+/// VERA's 90-tick preset adds its own row, retaining the fastest native
+/// row's two-thirds of a second of lookahead (40/60, here 60/90).
+fn speed_frame_budget(game_speed: i32) -> (i32, i32) {
+    match game_speed as u32 {
+        speed if speed == u32::from(GAME_SPEED_90_TPS) => (60, 90),
+        0 => (40, 60),
+        1 => (40, 45),
+        2 => (30, 30),
+        3 => (20, 20),
+        4 => (20, 15),
+        5 => (20, 12),
+        _ => (10, 10),
+    }
+}
+
+/// The launch speed whose PreCalcFrameRate row is `frames_per_second`: the
+/// inverse of [`speed_frame_budget`] over selectable speeds. The VERA
+/// lobby signs this rate into relay ordering certificates
+/// (docs/lobby-protocol.md, retail rows plus VERA's 90-tick preset).
+pub fn game_speed_for_frame_rate(frames_per_second: u16) -> Option<i32> {
+    (0..=i32::from(crate::sim::game_options::IN_GAME_OPTIONS_MAX_SPEED))
+        .chain([i32::from(GAME_SPEED_90_TPS)])
+        .find(|&speed| speed_frame_budget(speed).1 == i32::from(frames_per_second))
+}
+
+/// The timing block of Cooperative `+0xAC` (`0x005C49A2..0x005C4ABC`),
+/// which every peer runs before the next co-op mission: MaxAhead from the
+/// game speed, and LatencyFudge 1, or 2 when the highest of `pings`
+/// (`0xB7790C`, over the live nodes, signed maximum from 0) exceeds 1000.
+/// Returns `(max_ahead, latency_fudge)`; the PreCalc values, FrameSendRate
+/// and the IPX retry timing are transport and not returned.
+pub fn cooperative_continuation_timing(game_speed: i32, pings: &[i32]) -> (i32, i32) {
+    let (max_ahead, _) = speed_frame_budget(game_speed);
+    let ping = pings.iter().copied().fold(0, i32::max);
+    let latency_fudge = if ping > 1000 { 2 } else { 1 };
+    (max_ahead, latency_fudge)
+}
+
+/// Transfer cadence and the execution frame assigned to local commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkSendPolicy {
+    /// VERA solo online play: no other human needs a synchronization window.
+    /// Keep the shared command dispatcher, with only frame0's priming delay.
+    Local,
     /// Send every frame and stamp `current_frame + max_ahead`.
     EveryFrame,
     /// Mode 2 sends only on `frame_send_rate` boundaries and rounds the
@@ -65,7 +221,7 @@ impl NetworkSendPolicy {
     /// Whether the network path transfers its local queue on this frame.
     pub fn should_send(self, current_frame: u32) -> bool {
         match self {
-            Self::EveryFrame => true,
+            Self::Local | Self::EveryFrame => true,
             Self::FrameSendRate2 { frame_send_rate } => {
                 let rate = frame_send_rate.get();
                 let boundary = current_frame
@@ -80,6 +236,7 @@ impl NetworkSendPolicy {
     /// Frame written into each record at network transfer time.
     pub fn execute_frame(self, current_frame: u32, max_ahead: u32) -> u32 {
         match self {
+            Self::Local => current_frame.max(1),
             Self::EveryFrame => current_frame.wrapping_add(max_ahead),
             Self::FrameSendRate2 { frame_send_rate } => {
                 let rate = frame_send_rate.get();
@@ -91,186 +248,17 @@ impl NetworkSendPolicy {
             }
         }
     }
-}
 
-/// Payload carried by the leading FRAMEINFO record of a multiplayer packet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameInfo {
-    pub house_id: i8,
-    pub event_frame: i32,
-    pub checksum: u32,
-    pub timing_word: u16,
-    pub delay: u8,
-}
-
-impl FrameInfo {
-    pub fn encode(self) -> CommandRecord {
-        assert!(
-            self.house_id >= 0,
-            "outgoing FRAMEINFO requires a registered house id"
-        );
-        let mut record = CommandRecord::encode(
-            FRAMEINFO_EVENT_OPCODE,
-            i32::from(self.house_id),
-            self.event_frame,
-            &[],
-        )
-        .expect("FRAMEINFO has a fixed in-record payload");
-        self.write_to(&mut record);
-        record
-    }
-
-    /// Overwrite only the verified FRAMEINFO fields. Flags and every unknown
-    /// payload byte remain untouched.
-    pub fn write_to(self, record: &mut CommandRecord) {
-        assert!(
-            self.house_id >= 0,
-            "outgoing FRAMEINFO requires a registered house id"
-        );
-        record.set_issue_header(
-            FRAMEINFO_EVENT_OPCODE,
-            i32::from(self.house_id),
-            self.event_frame,
-        );
-        let payload = record.payload_mut();
-        payload[FRAMEINFO_CHECKSUM_PAYLOAD_OFFSET
-            ..FRAMEINFO_CHECKSUM_PAYLOAD_OFFSET + size_of::<u32>()]
-            .copy_from_slice(&self.checksum.to_le_bytes());
-        payload[FRAMEINFO_TIMING_WORD_PAYLOAD_OFFSET
-            ..FRAMEINFO_TIMING_WORD_PAYLOAD_OFFSET + size_of::<u16>()]
-            .copy_from_slice(&self.timing_word.to_le_bytes());
-        payload[FRAMEINFO_DELAY_PAYLOAD_OFFSET] = self.delay;
-    }
-
-    pub fn decode(record: &CommandRecord) -> Option<Self> {
-        if record.opcode() != FRAMEINFO_EVENT_OPCODE {
-            return None;
-        }
-        let payload = record.payload();
-        Some(Self {
-            house_id: record.house_id(),
-            event_frame: record.frame_stamp(),
-            checksum: u32::from_le_bytes(
-                payload[FRAMEINFO_CHECKSUM_PAYLOAD_OFFSET
-                    ..FRAMEINFO_CHECKSUM_PAYLOAD_OFFSET + size_of::<u32>()]
-                    .try_into()
-                    .expect("FRAMEINFO checksum is four bytes"),
-            ),
-            timing_word: u16::from_le_bytes(
-                payload[FRAMEINFO_TIMING_WORD_PAYLOAD_OFFSET
-                    ..FRAMEINFO_TIMING_WORD_PAYLOAD_OFFSET + size_of::<u16>()]
-                    .try_into()
-                    .expect("FRAMEINFO timing word is two bytes"),
-            ),
-            delay: payload[FRAMEINFO_DELAY_PAYLOAD_OFFSET],
-        })
-    }
-
-    #[inline]
-    pub fn history_index(self) -> usize {
-        ((self.event_frame as u32).wrapping_sub(u32::from(self.delay)) & 0xff) as usize
-    }
-}
-
-/// The two live fields read from the network timing gate before retail compares
-/// a due FRAMEINFO checksum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameInfoCompareGate {
-    /// Native timing-window start frame. `-1` means no elapsed-frame subtraction.
-    pub base_frame: i32,
-    /// Native `param_2[2]`, tested against elapsed frames.
-    pub remaining_frames: i32,
-}
-
-impl FrameInfoCompareGate {
-    /// An already-open gate.
-    pub const OPEN: Self = Self {
-        base_frame: -1,
-        remaining_frames: 0,
-    };
-
-    pub const fn new(base_frame: i32, remaining_frames: i32) -> Self {
-        Self {
-            base_frame,
-            remaining_frames,
+    /// FRAMEINFO reports the source frame as execute-frame minus delay.
+    /// Native policies retain MaxAhead's low byte, independent of rounding.
+    pub fn delay(self, current_frame: u32, max_ahead: u32) -> u8 {
+        match self {
+            Self::Local => self
+                .execute_frame(current_frame, max_ahead)
+                .wrapping_sub(current_frame) as u8,
+            Self::EveryFrame | Self::FrameSendRate2 { .. } => max_ahead as u8,
         }
     }
-
-    /// Retail compares when the no-base remainder is zero, or when elapsed
-    /// frames have reached the stored remainder.
-    #[inline]
-    pub fn allows_compare(self, current_frame: i32) -> bool {
-        if self.base_frame == -1 {
-            self.remaining_frames == 0
-        } else {
-            self.remaining_frames <= current_frame.wrapping_sub(self.base_frame)
-        }
-    }
-}
-
-/// The active 256-frame checksum ring.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultiplayerChecksumHistory {
-    values: [u32; CHECKSUM_HISTORY_LEN],
-}
-
-impl MultiplayerChecksumHistory {
-    pub const fn new() -> Self {
-        Self {
-            values: [0; CHECKSUM_HISTORY_LEN],
-        }
-    }
-
-    #[inline]
-    pub fn record(&mut self, frame: u32, checksum: u32) {
-        self.values[(frame & 0xff) as usize] = checksum;
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    #[inline]
-    pub fn get(&self, frame: u32) -> u32 {
-        self.values[(frame & 0xff) as usize]
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn compare(&self, frame_info: FrameInfo) -> Result<(), ChecksumMismatch> {
-        let history_index = frame_info.history_index();
-        let local_checksum = self.values[history_index];
-        if local_checksum == frame_info.checksum {
-            Ok(())
-        } else {
-            Err(ChecksumMismatch {
-                house_id: frame_info.house_id,
-                event_frame: frame_info.event_frame,
-                delay: frame_info.delay,
-                history_index: history_index as u8,
-                local_checksum,
-                remote_checksum: frame_info.checksum,
-            })
-        }
-    }
-}
-
-impl Default for MultiplayerChecksumHistory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Exact diagnostic facts available when one due FRAMEINFO comparison fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "multiplayer checksum mismatch for house {house_id} at frame {event_frame}: \
-     local {local_checksum:#010x}, remote {remote_checksum:#010x}, \
-     history[{history_index}] with delay {delay}"
-)]
-pub struct ChecksumMismatch {
-    pub house_id: i8,
-    pub event_frame: i32,
-    pub delay: u8,
-    pub history_index: u8,
-    pub local_checksum: u32,
-    pub remote_checksum: u32,
 }
 
 /// One byte-exact native synchronized command.
@@ -279,11 +267,51 @@ pub struct ChecksumMismatch {
 /// may be serialized to replay or copied to the wire, so accepting a semantic
 /// sidecar whose bytes do not decode to that same command would make the record
 /// non-authoritative.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynchronizedCommand {
     record: CommandRecord,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl LocalCommandEvent for SynchronizedCommand {
+    fn consumes_native_outlist_slot(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl DoListEvent for SynchronizedCommand {
+    fn native_record(&self) -> Option<&CommandRecord> {
+        Some(&self.record)
+    }
+
+    fn native_record_mut(&mut self) -> Option<&mut CommandRecord> {
+        Some(&mut self.record)
+    }
+
+    fn semantic_header(&self) -> Option<SemanticEventHeader> {
+        None
+    }
+
+    fn consumes_native_dolist_slot(&self) -> bool {
+        true
+    }
+
+    fn is_processed(&self) -> bool {
+        self.record.is_processed()
+    }
+
+    fn mark_processed(&mut self) {
+        self.record.mark_processed();
+    }
+
+    fn clear_processed(&mut self) {
+        self.record.clear_processed();
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 impl SynchronizedCommand {
     pub fn opaque(record: CommandRecord) -> Self {
         Self { record }
@@ -302,7 +330,6 @@ impl SynchronizedCommand {
         self.record.payload_mut()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn into_record(self) -> CommandRecord {
         self.record
     }
@@ -316,37 +343,6 @@ impl SynchronizedCommand {
     ) -> Option<crate::sim::command::CommandEnvelope> {
         sim.decode_native_command_record(&self.record, execute_tick)
     }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn stages_as_megamission(&self) -> bool {
-        self.record.opcode() == crate::sim::command::MEGAMISSION_OPCODE
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn stamp_for_network(&mut self, house_id: i8, execute_frame: u32) {
-        self.record.set_house_id(house_id);
-        self.record.set_frame_stamp(execute_frame as i32);
-        self.record.clear_processed();
-    }
-}
-
-/// Result counters from one native-order DoList scan.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DispatchSummary {
-    /// Records forwarded to the command executor.
-    pub executed: usize,
-    /// Due timing records consumed without command execution.
-    pub timing_consumed: usize,
-    /// Due-on-this-frame timing records compared with local history.
-    pub frame_info_compared: usize,
-    /// Executed non-timing records whose frame was already past.
-    pub late_executed: usize,
-    /// Late non-FRAMEINFO records skipped by network-mode dispatch.
-    pub late_skipped: usize,
-    /// Due MegaMission records dropped because the native staging ring was full.
-    pub megamission_dropped: usize,
-    /// Contiguous processed/expired records retired from the DoList head.
-    pub retired: usize,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -359,64 +355,37 @@ enum DispatchMode<'a> {
     },
 }
 
-/// One registered HouseClass slot presented to command dispatch.
-///
-/// `house_id` remains the native signed byte carried by command records.
-/// `dispatch_eligible` is the caller-owned `IsHuman || PlayerControl` result;
-/// keeping it explicit prevents skipped AI-only houses from compressing later
-/// house ids.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CommandDispatchHouse {
-    pub owner: InternedId,
-    pub house_id: i8,
-    pub dispatch_eligible: bool,
-}
-
-impl CommandDispatchHouse {
-    pub const fn new(owner: InternedId, house_id: i8, dispatch_eligible: bool) -> Self {
-        Self {
-            owner,
-            house_id,
-            dispatch_eligible,
-        }
-    }
-}
-
 /// Local issue queue and synchronized received-command list.
 ///
 /// `VecDeque` preserves the two native FIFO scans while admission methods
 /// enforce the retail OutList and DoList capacities.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynchronizedCommandQueue {
-    local: VecDeque<SynchronizedCommand>,
-    do_list: VecDeque<SynchronizedCommand>,
-    retime_window_start: i32,
-    retime_window_end: i32,
+    local: LocalCommandStage<SynchronizedCommand>,
+    do_list: DoList<SynchronizedCommand>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl SynchronizedCommandQueue {
     pub fn new() -> Self {
         Self::default()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     #[inline]
     pub fn local_len(&self) -> usize {
         self.local.len()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     #[inline]
     pub fn do_list_len(&self) -> usize {
         self.do_list.len()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn local_records(&self) -> impl Iterator<Item = &SynchronizedCommand> {
         self.local.iter()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn synchronized_records(&self) -> impl Iterator<Item = &SynchronizedCommand> {
         self.do_list.iter()
     }
@@ -428,9 +397,7 @@ impl SynchronizedCommandQueue {
     /// adjustment, which is the value the session owner must commit. A timing
     /// update that widens neither unsigned negotiated value clears the window.
     ///
-    /// VERIFIED: gamemd.exe `EventClass__Execute @ 0x004C7600` case `0x20`
-    /// publishes the adjusted window consumed by `FUN_0064C380 @ 0x0064C380`.
-    #[cfg(any(test, feature = "test-support"))]
+    /// Uses the production EventClass4C800C / Execute_DoList64C380 owner.
     pub fn apply_timing_update(
         &mut self,
         event_frame: i32,
@@ -440,68 +407,44 @@ impl SynchronizedCommandQueue {
         proposed_frame_send_rate: NonZeroU8,
         scenario_subtracts_ten: bool,
     ) -> u16 {
-        let adjusted_max_ahead = if scenario_subtracts_ten {
-            proposed_max_ahead.wrapping_sub(10)
-        } else {
-            proposed_max_ahead
-        };
-
-        if adjusted_max_ahead > previous_max_ahead
-            || proposed_frame_send_rate > previous_frame_send_rate
-        {
-            let rate = i32::from(proposed_frame_send_rate.get());
-            self.retime_window_start = event_frame;
-            self.retime_window_end = event_frame
-                .wrapping_add(i32::from(adjusted_max_ahead))
-                .wrapping_add(rate.wrapping_sub(1))
-                .wrapping_div(rate)
-                .wrapping_mul(rate);
-        } else {
-            self.retime_window_start = 0;
-            self.retime_window_end = 0;
-        }
-
-        adjusted_max_ahead
+        let mut window = self.do_list.retime_window();
+        let adjusted = window.apply_timing_update(
+            event_frame,
+            previous_max_ahead,
+            previous_frame_send_rate,
+            proposed_max_ahead,
+            proposed_frame_send_rate,
+            scenario_subtracts_ten,
+        );
+        let (start, end) = window.bounds();
+        self.do_list.set_retime_window(start, end);
+        adjusted
     }
 
     /// Append one locally issued command in issue order. Retail silently drops
     /// the 129th record while the 128-slot OutList is full.
     pub fn issue(&mut self, command: SynchronizedCommand) -> bool {
-        if self.local.len() >= OUT_LIST_CAPACITY {
-            return false;
-        }
-        self.local.push_back(command);
-        true
+        self.local.try_push(command)
     }
 
     /// Admit one received/replay command in arrival order. A record received
     /// while the native DoList's 0x4000-entry admission cap is full is consumed
     /// but not retained.
-    pub fn admit(&mut self, mut command: SynchronizedCommand) -> bool {
-        if self.do_list.len() >= DO_LIST_CAPACITY {
-            return false;
-        }
-        command.record.clear_processed();
-        self.do_list.push_back(command);
-        true
+    pub fn admit(&mut self, command: SynchronizedCommand) -> bool {
+        self.do_list.admit(command)
     }
 
     /// Admit an unknown fixed-width record without interpreting its payload.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn admit_bytes(&mut self, bytes: &[u8]) -> Result<bool, CommandRecordError> {
         let record = CommandRecord::admit_exact(bytes)?;
         Ok(self.admit(SynchronizedCommand::opaque(record)))
     }
 
     /// Single-player transfer: preserve the issue-frame and house bytes.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn transfer_single_player(&mut self) -> usize {
         let drained = self.local.len();
-        while let Some(mut command) = self.local.pop_front() {
-            command.record.clear_processed();
-            if self.do_list.len() < DO_LIST_CAPACITY {
-                self.do_list.push_back(command);
-            }
+        for command in self.local.take_prefix(drained) {
+            self.do_list.admit(command);
         }
         drained
     }
@@ -509,12 +452,13 @@ impl SynchronizedCommandQueue {
     /// Build one logical network-transfer batch.
     ///
     /// The transport owner supplies how many FIFO command records it selected
-    /// for this send. This queue layer prepends FRAMEINFO, stamps and mirrors at
-    /// most that many records, and enforces the native
-    /// `0x2000 - DoListCount` local-mirror allowance. Physical packet sizing,
-    /// packet splitting, compression, and extended payload ownership remain
-    /// transport-layer work.
-    #[cfg(any(test, feature = "test-support"))]
+    /// for this send. This queue layer prepends FRAMEINFO and enforces the
+    /// native `0x2000 - DoListCount` local-mirror allowance; the production
+    /// send step `EventPacketCodec::encode_packet` (SendOutList `64B97A..64BA6A`)
+    /// stamps the mirrors and stops before a record it cannot send. Physical
+    /// packet sizing and the compression cache stay with the transport owner,
+    /// so this batch uses an unbounded packet and a fresh codec. Panics for a
+    /// negative house, which the send step rejects.
     pub fn transfer_network(
         &mut self,
         current_frame: u32,
@@ -535,26 +479,30 @@ impl SynchronizedCommandQueue {
             .len()
             .min(NETWORK_LOCAL_MIRROR_LIMIT.saturating_sub(self.do_list.len()))
             .min(selected_command_limit);
-        let mut transfer = Vec::with_capacity(transfer_count + 1);
-        transfer.push(
-            FrameInfo {
-                house_id: local_house_id,
-                event_frame: execute_frame as i32,
-                checksum: current_checksum,
-                timing_word,
-                delay: max_ahead as u8,
-            }
-            .encode(),
-        );
+        let header = FrameInfo {
+            house_id: local_house_id,
+            event_frame: execute_frame as i32,
+            checksum: current_checksum,
+            timing_word,
+            delay: policy.delay(current_frame, max_ahead),
+        };
+        let selected: Vec<&CommandRecord> = self
+            .local
+            .iter()
+            .take(transfer_count)
+            .map(SynchronizedCommand::record)
+            .collect();
+        let encoded = crate::net::event_packet::EventPacketCodec::default()
+            .encode_packet(&selected, header, current_frame as i32, usize::MAX)
+            .expect("transfer house is a registered nonnegative source");
 
-        for _ in 0..transfer_count {
-            let mut command = self
-                .local
-                .pop_front()
-                .expect("transfer count was bounded by the local queue");
-            command.stamp_for_network(local_house_id, execute_frame);
-            transfer.push(command.record.clone());
-            self.do_list.push_back(command);
+        let mut transfer = Vec::with_capacity(encoded.mirrors.len() + 1);
+        transfer.push(header.encode());
+        // The mirrors replace their sent sources.
+        self.local.take_prefix(encoded.mirrors.len()).for_each(drop);
+        for mirror in encoded.mirrors {
+            transfer.push(mirror.clone());
+            self.do_list.admit(SynchronizedCommand::opaque(mirror));
         }
         transfer
     }
@@ -566,7 +514,6 @@ impl SynchronizedCommandQueue {
     /// member executes. The execute callback runs before bit 0 is marked.
     /// House ids and native dispatch eligibility are supplied explicitly by
     /// the session owner.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn dispatch_due_offline<A, F>(
         &mut self,
         current_frame: i32,
@@ -594,7 +541,6 @@ impl SynchronizedCommandQueue {
     /// without acknowledgement. Expired records are still retired when the
     /// contiguous DoList head reaches them. Current-frame FRAMEINFO is compared
     /// only when the supplied native timing gate is open.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn dispatch_due_network<L, A, F>(
         &mut self,
         current_frame: i32,
@@ -623,7 +569,6 @@ impl SynchronizedCommandQueue {
         )
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     fn dispatch_due_inner<L, A, F>(
         &mut self,
         current_frame: i32,
@@ -638,116 +583,98 @@ impl SynchronizedCommandQueue {
         A: FnMut(InternedId, &mut [SynchronizedCommand]),
         F: FnMut(InternedId, &SynchronizedCommand, bool),
     {
-        let mut summary = DispatchSummary::default();
-        let scan_len = self.do_list.len();
+        let dispatch_mode = match mode {
+            DispatchMode::Offline => CommandDispatchMode::Offline,
+            DispatchMode::Network { .. } => CommandDispatchMode::Network,
+        };
+        let mut host = RawDispatchHost {
+            current_frame,
+            mode,
+            handle_late_record: &mut handle_late_record,
+            adjust_megamissions: &mut adjust_megamissions,
+            execute: &mut execute,
+        };
+        self.do_list.dispatch(
+            CommandDispatchClock {
+                native_frame: current_frame,
+                execute_tick: 0,
+            },
+            houses,
+            dispatch_mode,
+            &mut host,
+        )
+    }
+}
 
-        // VERIFIED: gamemd.exe `FUN_0064C380 @ 0x0064C380` scans the complete
-        // entry-count snapshot before house eligibility and keeps this window
-        // active until a later timing update replaces or clears it.
-        for record_index in 0..scan_len {
-            let command = self
-                .do_list
-                .get_mut(record_index)
-                .expect("retime scan is bounded by the DoList snapshot");
-            let frame = command.record.frame_stamp();
-            if command.record.opcode() != FRAMEINFO_EVENT_OPCODE
-                && self.retime_window_start < frame
-                && frame < self.retime_window_end
-            {
-                command.record.set_frame_stamp(self.retime_window_end);
-            }
+#[cfg(any(test, feature = "test-support"))]
+struct RawDispatchHost<'a, L, A, F> {
+    current_frame: i32,
+    mode: DispatchMode<'a>,
+    handle_late_record: &'a mut L,
+    adjust_megamissions: &'a mut A,
+    execute: &'a mut F,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<L, A, F> DoListHost<SynchronizedCommand> for RawDispatchHost<'_, L, A, F>
+where
+    L: FnMut(InternedId, &SynchronizedCommand),
+    A: FnMut(InternedId, &mut [SynchronizedCommand]),
+    F: FnMut(InternedId, &SynchronizedCommand, bool),
+{
+    type Error = ChecksumMismatch;
+
+    fn late_entry(&mut self, house: CommandDispatchHouse, entry: &SynchronizedCommand) {
+        (self.handle_late_record)(house.owner, entry);
+    }
+
+    fn frame_info(
+        &mut self,
+        _house: CommandDispatchHouse,
+        entry: &SynchronizedCommand,
+    ) -> Result<bool, Self::Error> {
+        let DispatchMode::Network {
+            checksum_history,
+            frame_info_gate,
+        } = self.mode
+        else {
+            return Ok(false);
+        };
+        if !frame_info_gate.allows_compare(self.current_frame) {
+            return Ok(false);
         }
+        let frame_info =
+            FrameInfo::decode(&entry.record).expect("dispatch checked FRAMEINFO opcode");
+        checksum_history.compare(frame_info)?;
+        Ok(true)
+    }
 
-        for house in houses.iter().copied() {
-            if !house.dispatch_eligible {
-                continue;
-            }
-            let owner = house.owner;
-            let house_id = house.house_id;
-            let mut staged_megamissions = Vec::new();
-            let mut staged_late = Vec::new();
-            for record_index in 0..scan_len {
-                let Some(command) = self.do_list.get_mut(record_index) else {
-                    break;
-                };
-                if command.record.house_id() != house_id
-                    || command.record.frame_stamp() > current_frame
-                    || command.record.is_processed()
-                {
-                    continue;
-                }
+    fn adjust_megamissions(
+        &mut self,
+        house: CommandDispatchHouse,
+        entries: &mut [SynchronizedCommand],
+    ) {
+        (self.adjust_megamissions)(house.owner, entries);
+    }
 
-                let is_late = command.record.frame_stamp() < current_frame;
-                if is_late
-                    && command.record.opcode() != FRAMEINFO_EVENT_OPCODE
-                    && matches!(mode, DispatchMode::Network { .. })
-                {
-                    handle_late_record(owner, command);
-                    summary.late_skipped += 1;
-                    continue;
-                }
-                match command.record.opcode() {
-                    FRAMEINFO_EVENT_OPCODE => {
-                        if command.record.frame_stamp() == current_frame
-                            && let DispatchMode::Network {
-                                checksum_history,
-                                frame_info_gate,
-                            } = mode
-                        {
-                            if !frame_info_gate.allows_compare(current_frame) {
-                                summary.timing_consumed += 1;
-                                command.record.mark_processed();
-                                continue;
-                            }
-                            let frame_info = FrameInfo::decode(&command.record)
-                                .expect("opcode was checked above");
-                            checksum_history.compare(frame_info)?;
-                            summary.frame_info_compared += 1;
-                        }
-                        summary.timing_consumed += 1;
-                    }
-                    opcode if queue_consumes_without_execute(opcode) => {}
-                    _ if command.stages_as_megamission() => {
-                        if staged_megamissions.len() < MEGAMISSION_STAGE_CAPACITY {
-                            staged_megamissions.push(command.clone());
-                            staged_late.push(is_late);
-                        } else {
-                            summary.megamission_dropped += 1;
-                        }
-                    }
-                    _ => {
-                        execute(owner, command, is_late);
-                        summary.executed += 1;
-                        summary.late_executed += usize::from(is_late);
-                    }
-                }
-                command.record.mark_processed();
-            }
-            if !staged_megamissions.is_empty() {
-                adjust_megamissions(owner, &mut staged_megamissions);
-            }
-            for (command, is_late) in staged_megamissions.into_iter().zip(staged_late) {
-                execute(owner, &command, is_late);
-                summary.executed += 1;
-                summary.late_executed += usize::from(is_late);
-            }
-        }
-
-        while self.do_list.front().is_some_and(|command| {
-            command.record.is_processed() || command.record.frame_stamp() < current_frame
-        }) {
-            self.do_list.pop_front();
-            summary.retired += 1;
-        }
-        Ok(summary)
+    fn execute(
+        &mut self,
+        house: CommandDispatchHouse,
+        entry: &SynchronizedCommand,
+        is_late: bool,
+        _retime_window: &mut DoListRetimeWindow,
+    ) {
+        (self.execute)(house.owner, entry, is_late);
     }
 }
 
 /// Builds one byte-exact local issue record. Network delay is deliberately not
 /// applied here; transfer owns stamping.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LockstepScheduler;
 
+#[cfg(any(test, feature = "test-support"))]
 impl LockstepScheduler {
     pub fn new() -> Self {
         Self
@@ -765,7 +692,7 @@ impl LockstepScheduler {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_net))]
 mod tests {
     use std::num::{NonZeroU8, NonZeroU32};
 
@@ -776,6 +703,127 @@ mod tests {
     };
     use crate::sim::command::{COMMAND_RECORD_LEN, CommandRecord};
     use crate::sim::intern::InternedId;
+
+    #[test]
+    fn initial_network_timing_matches_original_host_and_guest_blocks() {
+        let corpus = crate::test_fixture::json("tools/storage_oracle/lan_lobby.json");
+        let cases = corpus["timing"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let responses = case["responses"].as_array().unwrap();
+            let connected = case["connected"].as_bool().unwrap();
+            let mut reads = 0;
+            let result = super::initial_multiplayer_max_ahead(
+                case["protocol"].as_u64().unwrap() as i32,
+                || {
+                    let response =
+                        responses[reads.min(responses.len() - 1)].as_u64().unwrap() as u32;
+                    reads += 1;
+                    if connected { response } else { 0 }
+                },
+            );
+            assert_eq!(
+                result,
+                case["max_ahead"].as_u64().unwrap() as i32,
+                "{} {}",
+                case["name"],
+                case["role"]
+            );
+            assert_eq!(
+                reads,
+                case["calls"].as_array().unwrap().len(),
+                "{} {}",
+                case["name"],
+                case["role"]
+            );
+        }
+    }
+
+    #[test]
+    fn cooperative_continuation_timing_follows_the_speed_table_and_ping() {
+        let speeds: Vec<i32> = [0, 1, 2, 3, 4, 5, 6, -1]
+            .into_iter()
+            .map(|speed| super::cooperative_continuation_timing(speed, &[]).0)
+            .collect();
+        assert_eq!(speeds, [40, 40, 30, 20, 20, 20, 10, 10]);
+        assert_eq!(
+            super::cooperative_continuation_timing(2, &[0, 1000]),
+            (30, 1)
+        );
+        assert_eq!(
+            super::cooperative_continuation_timing(2, &[999, -5]),
+            (30, 1)
+        );
+        assert_eq!(
+            super::cooperative_continuation_timing(2, &[200, 1001]),
+            (30, 2)
+        );
+    }
+
+    #[test]
+    fn online_timing_includes_the_thirtieth_peer_measurement() {
+        let mut pings = vec![0; 30];
+        pings[29] = 1001;
+        let timing = super::wol_start_timing(2, pings, true);
+        assert_eq!(timing.latency_fudge, 2);
+        assert!(timing.set_timing.is_some());
+        assert_eq!(timing.max_ahead, 30);
+    }
+
+    #[test]
+    fn ninety_tick_preset_seeds_network_timing_and_keeps_existing_speed_ids() {
+        let speed = i32::from(super::GAME_SPEED_90_TPS);
+        let timing = super::wol_start_timing(speed, [0; 2], true);
+        assert_eq!(timing.precalc_frame_rate, 90);
+        assert_eq!(timing.frame_send_rate, 10);
+        assert_eq!((timing.max_ahead, timing.precalc_max_ahead), (60, 60));
+        assert_eq!(super::game_speed_for_frame_rate(90), Some(speed));
+        assert_eq!(super::game_speed_for_frame_rate(60), Some(0));
+        assert_eq!(super::game_speed_for_frame_rate(45), Some(1));
+        assert_eq!(super::speed_frame_budget(7), (10, 10));
+    }
+
+    #[test]
+    fn wol_start_timing_matches_original_start_game_now_block() {
+        let corpus = crate::test_fixture::json("tools/storage_oracle/wol_shell.json");
+        let cases = corpus["timing"].as_array().unwrap();
+        let int = |value: &serde_json::Value| i32::try_from(value.as_i64().unwrap()).unwrap();
+        let mut checked = 0;
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            // The command-line debug byte 0xA8E2C8 is dormant; its controls
+            // only document the native +20/x2 branch.
+            if case["debug"].as_bool().unwrap() {
+                continue;
+            }
+            let pings: Vec<i32> = case["pings"].as_array().unwrap().iter().map(int).collect();
+            let result = super::wol_start_timing(
+                int(&case["game_speed"]),
+                pings,
+                case["channel_owner"].as_bool().unwrap(),
+            );
+            let set_timing = case["set_timing"]
+                .as_array()
+                .map(|args| super::WolIpxTiming {
+                    retry_delta: int(&args[0]),
+                    max_retries: int(&args[1]),
+                    timeout: int(&args[2]),
+                    apply_to_connections: int(&args[3]) != 0,
+                });
+            let expected = super::WolStartTiming {
+                max_ahead: int(&case["max_ahead"]),
+                frame_send_rate: int(&case["frame_send_rate"]),
+                precalc_max_ahead: int(&case["precalc_max_ahead"]),
+                precalc_frame_rate: int(&case["precalc_frame_rate"]),
+                max_max_ahead: int(&case["max_max_ahead"]),
+                latency_fudge: int(&case["latency_fudge"]),
+                set_timing,
+            };
+            assert_eq!(result, expected, "{name}");
+            checked += 1;
+        }
+        assert_eq!(checked, cases.len() - 3, "three dormant debug controls");
+    }
 
     fn opaque(opcode: u8, house: i32, frame: i32, payload: &[u8]) -> SynchronizedCommand {
         SynchronizedCommand::opaque(CommandRecord::encode(opcode, house, frame, payload).unwrap())
@@ -845,7 +893,13 @@ mod tests {
         ] {
             assert!(queue.admit(opaque(opcode, 0, frame, &[payload])));
         }
-        queue.do_list[3].record.mark_processed();
+        queue
+            .do_list
+            .iter_mut()
+            .nth(3)
+            .unwrap()
+            .record
+            .mark_processed();
         let unchanged_parts = queue
             .synchronized_records()
             .map(|command| {
@@ -938,14 +992,13 @@ mod tests {
     #[test]
     fn gsi_16_02_timing_update_applies_scenario_adjustment_and_clears_on_nonincrease() {
         let mut queue = SynchronizedCommandQueue::new();
-        queue.retime_window_start = 1;
-        queue.retime_window_end = 2;
+        queue.do_list.set_retime_window(1, 2);
 
         assert_eq!(
             queue.apply_timing_update(100, 15, nonzero_u8(5), 20, nonzero_u8(5), true,),
             10
         );
-        assert_eq!((queue.retime_window_start, queue.retime_window_end), (0, 0));
+        assert_eq!(queue.do_list.retime_window().bounds(), (0, 0));
     }
 
     #[test]
@@ -1422,7 +1475,31 @@ mod tests {
     }
 
     #[test]
-    fn opcode_0c_is_marked_without_event_execute() {
+    fn options_reaches_only_the_current_players_executor() {
+        // Execute_DoList64C8D8..64C911 dispatches local OPTIONS, while
+        // remote OPTIONS is marked without entering EventClass::Execute.
+        let local = InternedId::from_index(1);
+        let peer = InternedId::from_index(2);
+        let mut queue = SynchronizedCommandQueue::new();
+        queue.admit(opaque(0x0c, 0, 10, &[]));
+        queue.admit(opaque(0x0c, 1, 10, &[]));
+        let mut observed = Vec::new();
+        let summary = queue.dispatch_due_offline(
+            10,
+            &[
+                eligible(local, 0).with_current_player(true),
+                eligible(peer, 1),
+            ],
+            |_, _| {},
+            |owner, event, _| observed.push((owner, event.record().opcode())),
+        );
+        assert_eq!(observed, [(local, 0x0c)]);
+        assert_eq!(summary.executed, 1);
+        assert_eq!(summary.retired, 2);
+    }
+
+    #[test]
+    fn remote_opcode_0c_is_marked_without_event_execute() {
         assert_queue_only_opcode_is_marked_without_execute(0x0c);
     }
 

@@ -105,22 +105,22 @@ fn rngs(sim: &Simulation) -> Value {
 }
 
 fn anim_state(sim: &Simulation, anim: &AnimObject) -> Value {
-    let p = anim.world_coord;
+    let p = anim.world_coord();
     json!({
-        "native_id": anim.native_unique_id,
-        "alive": !sim.substrate.pending_delete.contains_object(&anim.stable_id),
+        "native_id": anim.native_unique_id(),
+        "alive": !sim.substrate.pending_delete.contains_object(&anim.stable_id()),
         "position": [p.x,p.y,p.z],
-        "stage": anim.runtime.current_frame,
-        "timer": [anim.runtime.frame_timer.start_frame(), anim.runtime.frame_timer.duration()],
-        "rate": anim.runtime.rate_reload,
-        "step": anim.runtime.frame_step,
-        "owner_object": anim.owner_entity.unwrap_or(0),
+        "stage": anim.runtime().current_frame,
+        "timer": [anim.runtime().frame_timer.start_frame(), anim.runtime().frame_timer.duration()],
+        "rate": anim.runtime().rate_reload,
+        "step": anim.runtime().frame_step,
+        "owner_object": anim.owner_entity().unwrap_or(0),
         "bullet": anim.attached_bullet().unwrap_or(0),
-        "z_adjust": anim.z_adjust,
-        "delay": anim.runtime.delay_remaining,
-        "draw_flags": anim.draw_flags,
-        "loops": anim.runtime.loop_remaining,
-        "brand_new": anim.runtime.first_ai_guard,
+        "z_adjust": anim.z_adjust(),
+        "delay": anim.runtime().delay_remaining,
+        "draw_flags": anim.draw_flags(),
+        "loops": anim.runtime().loop_remaining,
+        "brand_new": anim.runtime().first_ai_guard,
     })
 }
 
@@ -133,7 +133,8 @@ fn scene(row: &Value, terminal: bool, rules: &RuleSet) -> (Simulation, u64) {
     let mut sim = Simulation::with_seed(31);
     sim.main_rng = SimRng::new(31).into();
     sim.scenario_rng = SimRng::new(31);
-    sim.session.binary_frame = row["supplied"]["frame"].as_i64().unwrap() as u32;
+    sim.session
+        .set_binary_frame_for_test(row["supplied"]["frame"].as_i64().unwrap() as u32);
     sim.native_unique_ids = Some(NativeUniqueIdCursor::test_at_current_value(
         row["before_native_id"].as_u64().unwrap() as u32,
     ));
@@ -183,7 +184,7 @@ fn scene(row: &Value, terminal: bool, rules: &RuleSet) -> (Simulation, u64) {
         target_expiry: TargetExpiryPolicy::Expire,
         collision: ProjectileCollisionPolicy::NONE,
     };
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     sim.admit_projectile(id, spawn);
     (sim, id)
 }
@@ -193,7 +194,9 @@ fn only_bubble(sim: &Simulation) -> u64 {
         .substrate
         .anims
         .iter()
-        .filter_map(|(id, anim)| (sim.interner.resolve(anim.type_id) == "BBBLELRG").then_some(*id))
+        .filter_map(|(id, anim)| {
+            (sim.interner.resolve(anim.type_id()) == "BBBLELRG").then_some(*id)
+        })
         .collect();
     assert_eq!(ids.len(), 1);
     ids[0]
@@ -237,7 +240,7 @@ fn scalable_unit_scene(shots: usize) -> Option<(Simulation, RuleSet, u64, u64)> 
     sim.assign_target_represented(
         tank,
         Some(crate::sim::combat::TargetKind::Entity(target)),
-        Some(&rules),
+        &rules,
         None,
         super::FrameEffects::default(),
     )
@@ -264,7 +267,7 @@ fn scalable_unit_scene(shots: usize) -> Option<(Simulation, RuleSet, u64, u64)> 
         sim.substrate
             .anims
             .iter()
-            .all(|(_, anim)| { sim.interner.resolve(anim.type_id) != "BBBLELRG" })
+            .all(|(_, anim)| { sim.interner.resolve(anim.type_id()) != "BBBLELRG" })
     );
     Some((sim, rules, tank, target))
 }
@@ -279,18 +282,18 @@ fn scalable_unit_shots_emit_a_real_trailer_on_the_shared_eighth_member_cadence()
     let kind = sim.interner.get("Cannon").unwrap();
     assert_eq!(sim.projectiles.scaled_spawn_delay(kind), 4);
     let (&bullet, projectile) = sim.projectiles.iter().next().unwrap();
-    let origin = projectile.position;
-    sim.session.binary_frame = 4;
-    sim.object_ai_visit_one_with_effects(bullet, Some(&rules), ObjectAiCtx::default());
+    let origin = projectile.position();
+    sim.session.set_binary_frame_for_test(4);
+    sim.object_ai_visit_one_with_effects(bullet, &rules, ObjectAiCtx::default());
     let bubble = only_bubble(&sim);
-    let position = sim.anim(bubble).unwrap().world_coord;
+    let position = sim.anim(bubble).unwrap().world_coord();
     assert_eq!(
         [position.x, position.y, position.z],
         [origin.x, origin.y, origin.z],
         "the real Anim constructor receives pre-flight Location"
     );
     assert!(sim.substrate.logic.as_slice().contains(&bubble));
-    assert_ne!(sim.projectiles.get(bullet).unwrap().position, origin);
+    assert_ne!(sim.projectiles.get(bullet).unwrap().position(), origin);
 }
 
 #[test]
@@ -303,7 +306,7 @@ fn projectile_trailer_retail_constructor_rng_and_complete_lifetime_match_native(
             return;
         };
         let (mut sim, bullet) = scene(row, false, &rules);
-        sim.object_ai_visit_one_with_effects(bullet, Some(&rules), ObjectAiCtx::default());
+        sim.object_ai_visit_one_with_effects(bullet, &rules, ObjectAiCtx::default());
         let bubble = only_bubble(&sim);
         assert_eq!(
             anim_state(&sim, sim.anim(bubble).unwrap()),
@@ -316,7 +319,7 @@ fn projectile_trailer_retail_constructor_rng_and_complete_lifetime_match_native(
             row["after_native_id"].as_u64().unwrap() as u32
         );
         assert_ne!(
-            sim.projectiles.get(bullet).unwrap().position,
+            sim.projectiles.get(bullet).unwrap().position(),
             coord(&row["emissions"][0]["position"]),
             "trail stands at pre-flight Location"
         );
@@ -329,7 +332,7 @@ fn projectile_trailer_retail_constructor_rng_and_complete_lifetime_match_native(
             row["after_bullet_uninit"]["anim"]
         );
         sim.process_pending_delete_with(
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default(),
             1,
@@ -341,13 +344,15 @@ fn projectile_trailer_retail_constructor_rng_and_complete_lifetime_match_native(
             row["after_bullet_drain"]["anim"]
         );
         for frame in row["anim_frames"].as_array().unwrap() {
-            sim.session.binary_frame = frame["frame"].as_u64().unwrap() as u32;
+            sim.session
+                .set_binary_frame_for_test(frame["frame"].as_u64().unwrap() as u32);
             sim.visit_anim(
                 bubble,
                 &rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
-            );
+            )
+            .unwrap();
             assert_eq!(
                 anim_state(&sim, sim.anim(bubble).unwrap()),
                 frame["anim"],
@@ -361,7 +366,7 @@ fn projectile_trailer_retail_constructor_rng_and_complete_lifetime_match_native(
                 frame["frame"]
             );
             sim.process_pending_delete_with(
-                Some(&rules),
+                &rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
                 1,
@@ -394,7 +399,7 @@ fn projectile_trailer_is_registered_before_terminal_logic_compaction() {
         );
         let bubble = only_bubble(&sim);
         assert_eq!(
-            sim.anim(bubble).unwrap().runtime.first_ai_guard,
+            sim.anim(bubble).unwrap().runtime().first_ai_guard,
             terminal,
             "a terminal Bullet's removal shifts its new Anim behind the cursor"
         );
@@ -403,7 +408,7 @@ fn projectile_trailer_is_registered_before_terminal_logic_compaction() {
             terminal
         );
         assert_eq!(
-            sim.anim(bubble).unwrap().world_coord.x,
+            sim.anim(bubble).unwrap().world_coord().x,
             coord(&row["supplied"]["position"]).x
         );
         assert_eq!(rngs(&sim), row["after_rng"]);
@@ -432,7 +437,7 @@ fn projectile_trailer_save_load_preserves_live_and_pending_cleanup_boundaries() 
     let corpus = native();
     let row = case(&corpus, "stock_lifetime");
     let (mut sim, bullet) = scene(row, false, &rules);
-    sim.object_ai_visit_one_with_effects(bullet, Some(&rules), ObjectAiCtx::default());
+    sim.object_ai_visit_one_with_effects(bullet, &rules, ObjectAiCtx::default());
     let bubble = only_bubble(&sim);
     // Persist both live, then a Bullet already UnInit but not yet drained.
     for pending in [false, true] {
@@ -469,7 +474,7 @@ fn projectile_trailer_save_load_preserves_live_and_pending_cleanup_boundaries() 
                 );
             }
             loaded.process_pending_delete_with(
-                Some(&rules),
+                &rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
                 1,
@@ -478,19 +483,23 @@ fn projectile_trailer_save_load_preserves_live_and_pending_cleanup_boundaries() 
         }
         for frame in row["anim_frames"].as_array().unwrap() {
             for loaded in [&mut first, &mut second] {
-                loaded.session.binary_frame = frame["frame"].as_u64().unwrap() as u32;
-                loaded.visit_anim(
-                    bubble,
-                    &rules,
-                    None,
-                    crate::sim::world::FrameEffects::default(),
-                );
+                loaded
+                    .session
+                    .set_binary_frame_for_test(frame["frame"].as_u64().unwrap() as u32);
+                loaded
+                    .visit_anim(
+                        bubble,
+                        &rules,
+                        None,
+                        crate::sim::world::FrameEffects::default(),
+                    )
+                    .unwrap();
                 assert_eq!(
                     anim_state(loaded, loaded.anim(bubble).unwrap()),
                     frame["anim"]
                 );
                 loaded.process_pending_delete_with(
-                    Some(&rules),
+                    &rules,
                     None,
                     crate::sim::world::FrameEffects::default(),
                     1,
@@ -527,14 +536,8 @@ fn scalable_unit_target_and_direct_share_enrollment_but_failed_launch_does_not()
     assert_eq!(sim.projectiles.scalable_members(), ids);
     //70BCB0's null TarCom aim is zero, independently of Direct's target;
     // this exact supplied history previously demonstrated failed arc launch.
-    sim.assign_target_represented(
-        tank,
-        None,
-        Some(&rules),
-        None,
-        super::FrameEffects::default(),
-    )
-    .unwrap();
+    sim.assign_target_represented(tank, None, &rules, None, super::FrameEffects::default())
+        .unwrap();
     sim.commit_fire_visit(
         crate::sim::combat::world_fire::FireVisit::Direct {
             id: tank,
@@ -563,7 +566,7 @@ fn scalable_uninit_self_callback_removes_before_drain_and_keeps_type_override() 
         .projectiles
         .get(id)
         .unwrap()
-        .payload
+        .payload()
         .projectile_type()
         .unwrap();
     let corpus = native();
@@ -587,7 +590,7 @@ fn scalable_uninit_self_callback_removes_before_drain_and_keeps_type_override() 
     );
     assert_eq!(sim.projectiles.scaled_spawn_delay(type_id), 3);
     assert!(sim.substrate.pending_delete.contains_object(&id));
-    sim.process_pending_delete_with(Some(&rules), None, super::FrameEffects::default(), 1, false);
+    sim.process_pending_delete_with(&rules, None, super::FrameEffects::default(), 1, false);
     assert!(sim.projectiles.get(id).is_none());
     assert_eq!(
         sim.projectiles.scalable_members().len() as u64,
@@ -648,8 +651,8 @@ fn scalable_snapshot_mechanical_state_and_native_load_have_distinct_membership()
     // until another Unit shot overwrites it, through the same AI/Anim owner.
     let bullet = *loaded.projectiles.iter().next().unwrap().0;
     for world in [&mut loaded, &mut control] {
-        world.session.binary_frame = 4;
-        world.object_ai_visit_one_with_effects(bullet, Some(&rules), ObjectAiCtx::default());
+        world.session.set_binary_frame_for_test(4);
+        world.object_ai_visit_one_with_effects(bullet, &rules, ObjectAiCtx::default());
         only_bubble(world);
     }
     assert_eq!(loaded.state_hash(), control.state_hash());

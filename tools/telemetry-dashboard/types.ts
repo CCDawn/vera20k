@@ -1,8 +1,8 @@
 /**
- * Schema mirror of `src/sim/telemetry.rs` (v23); keep both in step.
+ * Schema mirror of `src/sim/telemetry.rs` (v31); keep both in step.
  */
 
-export const SCHEMA_VERSION = 23;
+export const SCHEMA_VERSION = 32;
 
 export type EntityCategory = "Unit" | "Infantry" | "Aircraft" | "Structure";
 
@@ -102,6 +102,36 @@ export interface EntitySpot {
   z: number;
   category: EntityCategory;
   owner_index: number;
+}
+
+/** The map's elevation grid, sent once per map (schema v28). Every grid is the
+ *  engine's own per-cell byte, row-major, lowercase hex with two characters per
+ *  cell; the dashboard decodes each into a `width*height` byte array.
+ *
+ *  - `levels`: ground elevation, the height the terraces stack on.
+ *  - `land_types`: `CellClass+0xEC` land type (`2` = Water), so water paints
+ *    apart from land.
+ *  - `slope_types`: TMP slope type, `0` flat, `1..=16` a ramp tile whose
+ *    surface tilts toward its lower neighbour.
+ *  - `deck_rises`: extra levels a structural bridge deck sits above the cell's
+ *    ground (`0` = none, which includes low ground-level bridges). */
+export interface TerrainGrid {
+  width: number;
+  height: number;
+  levels: string;
+  land_types: string;
+  slope_types: string;
+  deck_rises: string;
+}
+
+export interface NetworkSample {
+  /** Frames the relay has sealed past the local simulation. */
+  backlog_frames: number;
+  catching_up: boolean;
+  /** Draws skipped while catching up, this match. */
+  skipped_draws: number;
+  /** The relay seals slower than the match's own rate. */
+  relay_slowed: boolean;
 }
 
 export interface TimingSample {
@@ -250,7 +280,65 @@ export interface FrameProfileReport {
   phases_ms: number[];
 }
 
-/** Per-phase means of one in-game render, in milliseconds (schema v14). */
+/** One 1 Hz whole-match sample (schema v25). Render and ledger readings are
+ *  absent by design: those are only measured while a client is attached. */
+export interface MatchHistorySample {
+  tick: number;
+  tick_ms: number;
+  peak_ms: number;
+  entities: number;
+  houses: number;
+  path_batch: PathBatchStats | null;
+}
+
+/** One house row of a report-grade sample. */
+export interface ReportHouseRow {
+  name: string;
+  is_human: boolean;
+  passive: boolean;
+  structures: number;
+  credits: number;
+  score: number;
+}
+
+/** A report-grade sample (schema v26): exactly what the match report reads. */
+export interface ReportPoint {
+  tick: number;
+  entities_total: number;
+  map_width: number;
+  map_height: number;
+  houses: ReportHouseRow[];
+  timing: TimingSample | null;
+  profile: FrameProfileReport | null;
+  render: RenderTimingReport | null;
+  path_batch: PathBatchStats | null;
+}
+
+/** The path batch pass's own accounting (schema v24). `null` while the
+ *  simulation searches serially, since then no pass runs. */
+export interface PathBatchStats {
+  /** Registrations waiting when the latest pass started. */
+  waiting: number;
+  /** Registrations it searched: after the per-pass cap, before the re-path budgets' cuts. */
+  searched: number;
+  /** Registrations it answered. */
+  answered: number;
+  /** Registrations the cap, a re-path turn or a re-path budget left for a later pass. */
+  left_out: number;
+  /** Cells every search of the latest pass expanded. */
+  steps: number;
+  /** Of those, the urgency-2 re-paths' share. */
+  urgency2_steps: number;
+  /** Of those, the urgency-1 re-paths' share. */
+  urgency1_steps: number;
+  last_ms: number;
+  mean_ms: number;
+  peak_ms: number;
+  /** Passes the mean and peak cover. */
+  samples: number;
+}
+
+/** Per-phase means of one in-game render, in milliseconds (schema v31). */
 export interface RenderTimingReport {
   frames: number;
   world_ms: number;
@@ -259,6 +347,10 @@ export interface RenderTimingReport {
   ui_ms: number;
   sidebar_ms: number;
   upload_ms: number;
+  lights_ms: number;
+  effects_ms: number;
+  draw_calls_ms: number;
+  handoff_ms: number;
   other_ms: number;
 }
 
@@ -279,12 +371,30 @@ export interface LogBatch {
   lines: LogRecord[];
 }
 
+/** Which match a stream belongs to (schema v29); app-filled, null until it is. */
+export interface SessionContext {
+  map_name: string;
+  /** `GameMode` as the engine spells it: campaign | lan | wol | skirmish | other. */
+  game_mode: string;
+  /** The scenario speed, clamped the way the frame pacer clamps it. */
+  game_speed: number;
+  /** The pinned local player's house; null when the scenario names none. */
+  local_owner: string | null;
+  /** The local player's accepted result, null until its SavourDelay expired. */
+  local_outcome: "Victory" | "Defeat" | null;
+  /** The running binary's version stamp. */
+  build_stamp: string;
+}
+
 export interface TelemetrySnapshot {
   version: number;
   tick: number;
   binary_frame: number;
   map_width: number;
   map_height: number;
+  session: SessionContext | null;
+  /** Elevation grid, sent once per map (schema v28); null on other snapshots. */
+  terrain: TerrainGrid | null;
   entities_total: number;
   houses: HousePopulation[];
   spots: EntitySpot[];
@@ -292,8 +402,18 @@ export interface TelemetrySnapshot {
   debug: DebugPanel | null;
   process: ProcessStats | null;
   profile: FrameProfileReport | null;
+  path_batch: PathBatchStats | null;
+  /** Whole-match 1 Hz samples; sent once, to a client that attached since the
+   *  last publish. `null` on every other snapshot. */
+  history: MatchHistorySample[] | null;
+  /** Report-grade samples; the whole ring once, on the same first publish. */
+  report_points: ReportPoint[] | null;
+  /** The newest report-grade sample, on every snapshot. */
+  report_point: ReportPoint | null;
   render: RenderTimingReport | null;
   logs: LogBatch | null;
+  /** Online relay matches only (schema v30). */
+  network: NetworkSample | null;
   /** Absent in ordinary builds, including the read-only telemetry dashboard. */
   debug_tools?: DebugToolsReport | null;
 }

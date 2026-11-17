@@ -80,12 +80,23 @@ impl LineTrails {
         self.segments.clear();
     }
 
+    /// Whether no trail is attached or still fading.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.trails.is_empty()
+    }
+
+    /// The last composite's segments, in world coordinates.
+    pub(crate) fn shown(&self) -> &[LineTrailSegment] {
+        &self.segments
+    }
+
     /// Exactly one call per tactical composite, even when no sim frame passed.
     /// Owner absence also detaches, covering a presentation handoff after removal.
     /// Registry compaction is stable and linear; reverse visit order is retained.
     pub(crate) fn composite(
         &mut self,
         mut coordinate: impl FnMut(u64) -> Option<ProjectileCoord>,
+        mut visible: impl FnMut(Option<u64>, ProjectileCoord) -> bool,
     ) -> &[LineTrailSegment] {
         self.segments.clear();
         let mut compact = false;
@@ -122,12 +133,17 @@ impl LineTrails {
                 {
                     break;
                 }
-                self.segments.push(LineTrailSegment {
-                    from: newer.coord,
-                    to: older.coord,
-                    color: trail.color,
-                    strength: newer.strength,
-                });
+                // LineTrailMgr::UpdateAndDrawAll556D40 updates556B70 before
+                // drawing556C00. Fog conceals output, never owner sampling,
+                // ring advancement or the normal556B30 detach lifecycle.
+                if visible(trail.owner, newer.coord) {
+                    self.segments.push(LineTrailSegment {
+                        from: newer.coord,
+                        to: older.coord,
+                        color: trail.color,
+                        strength: newer.strength,
+                    });
+                }
             }
         }
         if compact {
@@ -143,6 +159,6 @@ impl LineTrails {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation))]
 #[path = "line_trail_tests.rs"]
 mod tests;

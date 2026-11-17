@@ -1,4 +1,4 @@
-//! Infantry animation sequence definitions parsed from art.ini.
+//! Infantry animation sequence definitions read from fixed ARTMD.INI.
 //!
 //! RA2 art.ini assigns each infantry type a `Sequence=` key (e.g., `Sequence=ConSequence`)
 //! pointing to a `[ConSequence]` section that defines the SHP frame layout for every
@@ -242,6 +242,107 @@ pub struct InfantrySequenceEntry {
     pub facing_hint: Option<FacingHint>,
 }
 
+/// InfantryType's one 42-record bank. Constructor52392C..52396E initializes
+/// the signed frame fields/facing and empty sound slots; ReadSequenceData523D00
+/// mutates this bank in place. Save524C3C/Load524B10 retain it without an ART read.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) struct InfantrySequenceBank {
+    records: Vec<InfantrySequenceEntry>,
+    sounds: Vec<Vec<SequenceSoundIndex>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+struct SequenceSoundIndex {
+    frame: i32,
+    index: i32,
+}
+
+impl Default for InfantrySequenceBank {
+    fn default() -> Self {
+        Self {
+            records: vec![InfantrySequenceEntry::default(); 42],
+            sounds: vec![Vec::new(); 42],
+        }
+    }
+}
+
+impl InfantrySequenceBank {
+    pub(crate) fn read_pass(
+        &mut self,
+        art: &IniFile,
+        image: &str,
+        sounds: &crate::rules::sound_ini::SoundRegistry,
+    ) {
+        let name = art
+            .section_or_empty(image)
+            .read_string("Sequence", "", 0x20);
+        if name.is_empty() {
+            return;
+        }
+        let section = art.section_or_empty(&name);
+        for (action, key) in NATIVE_SEQUENCE_NAMES.iter().enumerate() {
+            self.records[action] = read_sequence(section, key, self.records[action]);
+            // 523FB9..524079: ReadString32, strtok(" ,\t"), atoi and fixed
+            // VocFind7514D0. Unknown pairs take no slot; valid pairs append
+            // until this record has two. No read clears a prior sound slot.
+            let value = section.read_string(&format!("{key}Sounds"), "", 0x20);
+            let mut tokens = crate::rules::ini_value::strtok(&value, &[' ', ',', '\t']);
+            while let Some(frame) = tokens.next() {
+                let Some(name) = tokens.next() else { break };
+                let frame = crate::rules::ini_value::crt_atoi(frame);
+                if let Some(index) = sounds.index_of(name)
+                    && self.sounds[action].len() < 2
+                {
+                    self.sounds[action].push(SequenceSoundIndex { frame, index });
+                }
+            }
+        }
+    }
+
+    pub(crate) fn sequence_set(&self) -> SequenceSet {
+        if self
+            .records
+            .iter()
+            .all(|record| *record == InfantrySequenceEntry::default())
+        {
+            // Retain the existing generic SHP presentation fallback. It still
+            // carries all-zero signed records, so it cannot grant a DoAction.
+            return crate::rules::animation_sequence::default_infantry_sequences();
+        }
+        build_sequence_set_from_records(&self.records)
+    }
+
+    /// Presentation names are a derived view of saved fixed-catalog ordinals.
+    /// Rebinding after load never repeats the INI read or sound-slot admission.
+    pub(crate) fn bound_sounds(
+        &self,
+        catalog: &crate::rules::sound_ini::SoundRegistry,
+    ) -> Vec<SequenceSound> {
+        self.sounds
+            .iter()
+            .enumerate()
+            .flat_map(|(action, slots)| {
+                slots.iter().filter_map(move |slot| {
+                    Some(SequenceSound {
+                        action: action as u8,
+                        frame: slot.frame,
+                        sound_id: catalog.entry_by_index(slot.index)?.id.clone(),
+                    })
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn valid_saved_state(&self) -> bool {
+        self.records.len() == 42
+            && self.sounds.len() == 42
+            && self
+                .sounds
+                .iter()
+                .all(|slots| slots.len() <= 2 && slots.iter().all(|slot| slot.index >= 0))
+    }
+}
+
 /// Original action-name table8255C8..825670. Guard is its own action1.
 pub(crate) const NATIVE_SEQUENCE_NAMES: [&str; 42] = [
     "Ready",
@@ -355,6 +456,15 @@ pub(crate) fn read_sequence(
         }
         record
     })
+}
+
+/// One bound sequence sound: record `+0x14 + 8k` (frame) and `+0x18 + 8k`
+/// (Voc index, here its canonical ID) of the DoType's record.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SequenceSound {
+    pub action: u8,
+    pub frame: i32,
+    pub sound_id: String,
 }
 
 /// Parse a facing direction hint string (e.g., "S", "NE", "W").
@@ -634,26 +744,26 @@ const INFANTRY_FACINGS: u8 = 8;
 /// facing count. For directional sequences the actual facing count is always 8
 /// (standard infantry). For non-directional sequences (multiplier=0), facings=1.
 pub fn build_sequence_set(def: &InfantrySequenceDef) -> SequenceSet {
+    let records: Vec<_> = NATIVE_SEQUENCE_NAMES
+        .iter()
+        .map(|name| {
+            def.entries
+                .get(&name.to_ascii_uppercase())
+                .copied()
+                .unwrap_or_default()
+        })
+        .collect();
+    build_sequence_set_from_records(&records)
+}
+
+fn build_sequence_set_from_records(records: &[InfantrySequenceEntry]) -> SequenceSet {
     let mut set: SequenceSet = SequenceSet::new();
     // One signed bank supplies gameplay admission/completion. The generic
     // SequenceDef map below is a derived projection for existing SHP consumers.
-    set.set_infantry_actions(
-        NATIVE_SEQUENCE_NAMES
-            .iter()
-            .map(|name| {
-                def.entries
-                    .get(&name.to_ascii_uppercase())
-                    .copied()
-                    .unwrap_or_default()
-            })
-            .collect(),
-    );
-    let mut entries: Vec<(&String, &InfantrySequenceEntry)> = def.entries.iter().collect();
-    entries.sort_unstable_by_key(|(left, _)| *left);
-
-    for (key, entry) in entries {
+    set.set_infantry_actions(records.to_vec());
+    for (key, entry) in NATIVE_SEQUENCE_NAMES.iter().zip(records) {
         // Stand projects Ready0. Guard1 remains independent in the signed bank.
-        if key == "GUARD" {
+        if *key == "Guard" {
             continue;
         }
         let kind: SequenceKind = match sequence_kind_from_ini_key(key) {
@@ -706,7 +816,7 @@ pub fn build_sequence_set(def: &InfantrySequenceDef) -> SequenceSet {
     set
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_a_n))]
 #[path = "infantry_sequence_tests.rs"]
 mod tests;
 

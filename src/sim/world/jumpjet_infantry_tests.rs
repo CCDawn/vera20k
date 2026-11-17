@@ -63,12 +63,14 @@ pub(super) fn retail_dustbowl_rocketeer()
     } = &mut scenario.runtime;
     for (name, side, human) in [("Americans", 0, true), ("Russians", 1, false)] {
         let house = sim.interner.intern(name);
-        sim.houses
-            .entry(house)
-            .or_insert_with(|| HouseState::new(house, side, None, human, 10_000, 10));
-        if !sim.session.house_order.contains(&house) {
-            sim.session.house_order.push(house);
-        }
+        sim.houses.get_or_register_for_test(house, || {
+            let mut state = HouseState::new(house, side, None, human, 10_000, 10);
+            // These additional fixture Houses join an already admitted
+            // scenario, so they need the same bounded native name as every
+            // launch House before the mixed world can be saved/restored.
+            state.initialize_scenario_name(name);
+            state
+        });
     }
     let (rocketeer, x, y) = (40..100_u16)
         .flat_map(|y| (40..100_u16).map(move |x| (x, y)))
@@ -83,7 +85,8 @@ pub(super) fn retail_dustbowl_rocketeer()
                         sim.playfield_bounds,
                         Some(terrain),
                     ) && terrain.cell(cx, cy).is_some_and(|cell| {
-                        cell.level == level && cell.speed_costs.foot.is_some_and(|cost| cost > 0)
+                        cell.level == level
+                            && cell.speed_costs.foot.is_some_and(|cost| !cost.is_zero())
                     }) && grid.cell(cx, cy).is_some_and(|cell| cell.ground_walkable)
                         && sim.substrate.raw_cell_occupation.ground_bits(cx, cy) == 0
                 })
@@ -122,6 +125,7 @@ pub(super) fn retail_dustbowl_rocketeer()
                     (px as i16, py as i16),
                     Some(owner_id),
                     None,
+                    None,
                 )
                 .then(|| sim.spawn_object(plant, owner, px, py, 0, &resources.rules))
                 .flatten()
@@ -134,7 +138,7 @@ pub(super) fn retail_dustbowl_rocketeer()
         ("RUSSIANS", "PLAYER"),
         ("PLAYER", "RUSSIANS"),
     ] {
-        sim.house_alliances
+        sim.house_alliances_mut_for_test()
             .entry(house.to_string())
             .or_default()
             .insert(ally.to_string());
@@ -159,6 +163,161 @@ pub(super) fn retail_frame(
         .expect("retail frame")
 }
 
+/// Foot4DA7B0..4DA806 is independent of the Jumpjet's arrival notification:
+/// the holding infantryman continues raising only59 at the absolute cadence.
+#[test]
+#[ignore = "requires a retail RA2/YR install (RA2_DIR or config.toml)"]
+fn retail_rocketeer_hover_raises_its_cell_tag_on_absolute_frames_after_restore() {
+    use crate::sim::command::{Command, CommandEnvelope};
+    use crate::sim::snapshot::GameSnapshot;
+    use crate::sim::trigger_runtime::TriggerEffect;
+
+    let (mut scenario, actor, x, y) = retail_dustbowl_rocketeer();
+    let target = (x + 8, y);
+    let sim = &mut scenario.runtime.simulation;
+    let map_text = format!(
+        "[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
+             [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n\
+             [Basic]\nNewINIFormat=4\n\
+             [Triggers]\nAIR=Americans,<none>,Airborne cell,0,1,1,1,0\n\
+             [Events]\nAIR=1,59,0,-1\n\
+             [Actions]\nAIR=1,11,4,Name:JUMPJET,0,0,0,0,A\n\
+             [Tags]\nAIR_TAG=2,Airborne cell,AIR\n[CellTags]\n{}=AIR_TAG\n",
+        u32::from(target.1) * 1000 + u32::from(target.0)
+    );
+    let map = crate::map::map_file::MapFile::from_bytes(map_text.as_bytes()).unwrap();
+    sim.initialize_trigger_definitions(
+        &map,
+        &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
+        None,
+        None,
+        None,
+    );
+    sim.install_authored_cell_trigger_tags(&map);
+    sim.classify_map_triggers(&scenario.runtime.resources.rules);
+    let americans = sim.interner.intern("Americans");
+    let mut orders = vec![CommandEnvelope::new(
+        americans,
+        sim.session.tick() + 1,
+        Command::Move {
+            entity_id: actor,
+            target_rx: target.0,
+            target_ry: target.1,
+        },
+    )];
+    // Retail rules, physical construction, command admission, ascent and hold
+    // are the same production path as the adjacent flight regression.
+    for _ in 0..240 {
+        assert!(
+            retail_frame(&mut scenario, std::mem::take(&mut orders))
+                .tick
+                .frame_committed
+        );
+    }
+    let sim = &scenario.runtime.simulation;
+    let entity = sim.substrate.entities.get(actor).unwrap();
+    assert_eq!((entity.position.rx(), entity.position.ry()), target);
+    assert_eq!(pose(sim, actor).phase, 2, "the real Move finishes in hold");
+    assert!(entity.lifecycle.cell_marked());
+    assert!(crate::sim::movement::air_movement::is_high_flying(
+        entity,
+        sim.resolved_terrain.as_ref(),
+        Some((&scenario.runtime.resources.rules, &sim.interner)),
+    ));
+    let saved = GameSnapshot::save(sim, 0, 0, "Airborne cell", 0);
+    let mut histories = Vec::new();
+    for restore in [false, true] {
+        if restore {
+            let mut loaded = GameSnapshot::load(&saved).unwrap().sim;
+            loaded.bind_shared_cell_dummy(crate::map::resolved_terrain::SharedCellDummy::fresh());
+            loaded.reconstruct_cellclass_dummy_for_map_resize();
+            loaded.restore_after_snapshot_load().unwrap();
+            let resources = &scenario.runtime.resources;
+            loaded.rebuild_caches_after_load(
+                scenario
+                    .runtime
+                    .simulation
+                    .resolved_terrain
+                    .as_ref()
+                    .unwrap()
+                    .clone(),
+                crate::sim::pathfinding::terrain_speed::TerrainSpeedConfig::default(),
+                &resources.rules,
+            );
+            loaded
+                .restore_map_authority_after_snapshot_load(
+                    &resources.rules,
+                    &resources.overlay_registry,
+                    None,
+                )
+                .unwrap();
+            loaded.resolve_type_handles(&resources.rules);
+            scenario.runtime.replace_simulation(loaded);
+        }
+        let mut messages = Vec::new();
+        for _ in 0..64 {
+            let frame = scenario.runtime.simulation.session.binary_frame();
+            let output = retail_frame(&mut scenario, Vec::new());
+            assert!(output.tick.frame_committed);
+            for effect in output.trigger_effects {
+                if let TriggerEffect::LocalizedMessage { csf_label } = effect {
+                    assert_eq!(csf_label, "Name:JUMPJET");
+                    messages.push(frame);
+                }
+            }
+        }
+        assert_eq!(
+            messages.len(),
+            4,
+            "a holding Rocketeer raises its cell every sixteen frames"
+        );
+        assert!(messages.iter().all(|frame| frame % 16 == 0));
+        histories.push(messages);
+    }
+    assert_eq!(histories[0], histories[1]);
+    // Attach a fresh authored one-shot under the same naturally holding
+    // Rocketeer. The repeated later visits must observe immediate detach
+    // and the ordinary frame tail's shared Tag/Trigger deferred cleanup.
+    let once = crate::map::map_file::MapFile::from_bytes(
+        map_text
+            .replace("AIR_TAG=2,Airborne cell,AIR", "AIR_TAG=0,Airborne cell,AIR")
+            .as_bytes(),
+    )
+    .unwrap();
+    let sim = &mut scenario.runtime.simulation;
+    sim.initialize_trigger_definitions(
+        &once,
+        &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
+        None,
+        None,
+        None,
+    );
+    sim.install_authored_cell_trigger_tags(&once);
+    sim.classify_map_triggers(&scenario.runtime.resources.rules);
+    let cell = sim
+        .resolved_terrain
+        .as_ref()
+        .unwrap()
+        .native_cell_identity((target.0 as i16, target.1 as i16));
+    assert!(sim.cell_trigger_tag_for_test(cell).is_some());
+    let mut count = 0;
+    for _ in 0..64 {
+        let output = retail_frame(&mut scenario, Vec::new());
+        assert!(output.tick.frame_committed);
+        count += output.trigger_effects.into_iter().filter(|effect| {
+            matches!(effect, TriggerEffect::LocalizedMessage { csf_label } if csf_label == "Name:JUMPJET")
+        }).count();
+    }
+    assert_eq!(count, 1);
+    assert!(
+        scenario
+            .runtime
+            .simulation
+            .cell_trigger_tag_for_test(cell)
+            .is_none()
+    );
+}
+
 /// A Rocketeer on Dustbowl flies to a cell eight cells away and holds there,
 /// then is ordered to attack a conscript eight cells beyond, which it closes
 /// on. At cruise speed it takes Fly, in the hold Hover and at each shot
@@ -177,7 +336,7 @@ fn retail_dustbowl_rocketeer_flies_hovers_and_fires_in_its_airborne_poses() {
     let americans = sim.interner.intern("Americans");
     let order = CommandEnvelope::new(
         americans,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::Move {
             entity_id: rocketeer,
             target_rx: x + 8,
@@ -237,7 +396,7 @@ fn retail_dustbowl_rocketeer_flies_hovers_and_fires_in_its_airborne_poses() {
     sim.resolve_type_handles(&resources.rules);
     let attack = CommandEnvelope::new(
         americans,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::Attack {
             attacker_id: rocketeer,
             target_id: conscript,
@@ -340,7 +499,7 @@ fn retail_dustbowl_parked_rocketeer_engages_nearby_enemies() {
     let americans = sim.interner.intern("Americans");
     let park = CommandEnvelope::new(
         americans,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::Move {
             entity_id: rocketeer,
             target_rx: x + 8,
@@ -436,11 +595,13 @@ fn a_parked_rocketeer_scans_and_fires_on_move() {
     let row = serde_json::json!({"doing": DO_HOVER, "fraction": 0.0, "armed": true,
         "owner": {"phase": 2, "moving": false}});
     let (mut sim, rules, shooter) = rocketeer_crash_fixture(&row);
+    // The player has seen the enemy: the campaign scan gate needs +0x41B.
+    crate::sim::arena_fixture::discover(&mut sim, shooter);
     let grid = crate::sim::pathfinding::PathGrid::test_all_passable(70, 70);
     let americans = sim.interner.intern("Americans");
     let order = CommandEnvelope::new(
         americans,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::Move {
             entity_id: 1,
             target_rx: 56,
@@ -556,7 +717,7 @@ fn a_grounded_rocketeer_fidgets_and_turns_to_the_fidgets_facing() {
             (Some(action), DO_READY) => {
                 fidgets.push((
                     action,
-                    entity.body_facing_byte(sim.session.binary_frame - 1),
+                    entity.body_facing_byte(sim.session.binary_frame() - 1),
                 ));
                 playing = None;
             }
@@ -603,7 +764,7 @@ fn retail_dustbowl_shot_down_rocketeer_falls_and_leaves_no_body() {
     let americans = sim.interner.intern("Americans");
     let hold = CommandEnvelope::new(
         americans,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::Move {
             entity_id: rocketeer,
             target_rx: x + 8,
@@ -628,7 +789,7 @@ fn retail_dustbowl_shot_down_rocketeer_falls_and_leaves_no_body() {
     let russians = sim.interner.intern("Russians");
     let attack = CommandEnvelope::new(
         russians,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::Attack {
             attacker_id: flak,
             target_id: rocketeer,
@@ -647,7 +808,7 @@ fn retail_dustbowl_shot_down_rocketeer_falls_and_leaves_no_body() {
             .anims
             .iter()
             .filter(|(id, _)| seen.insert(**id))
-            .map(|(_, anim)| sim.interner.resolve(anim.type_id).to_string())
+            .map(|(_, anim)| sim.interner.resolve(anim.type_id()).to_string())
             .collect();
         let crash_sounds = output
             .sound_events
@@ -766,9 +927,24 @@ fn retail_dustbowl_shot_down_rocketeer_falls_and_leaves_no_body() {
 /// and `[RocketeerSequence]`) and an area warhead to shoot it down with;
 /// `armed` gives the Rocketeer the shooter's gun.
 fn rocketeer_rules_armed(armed: bool) -> crate::rules::ruleset::RuleSet {
+    rocketeer_rules(if armed { "Primary=CrashGun\n" } else { "" })
+}
+
+/// [`rocketeer_rules_armed`] with `extra` as more `[JUMPJET]` keys.
+fn rocketeer_rules(extra: &str) -> crate::rules::ruleset::RuleSet {
     use crate::rules::ini_parser::IniFile;
-    let mut rules = crate::rules::ruleset::RuleSet::from_ini(&IniFile::from_str(&format!(
-        "[General]\nConditionRed=0.25\n\
+    let art = IniFile::from_str(
+        "[ROCK]\nSequence=RocketeerSequence\nFireUp=2\n\
+         [RocketeerSequence]\nReady=0,1,1\nGuard=0,1,1\nProne=86,1,6\nWalk=8,6,6\n\
+         FireUp=164,6,6\nDown=260,2,2\nCrawl=86,6,6\nUp=276,2,2\nFireProne=212,6,6\n\
+         Idle1=56,15,0,S\nIdle2=71,15,0,E\nDie1=134,15,0\nDie2=149,15,0\nDie3=0,0,0\n\
+         Die4=0,0,0\nDie5=0,0,0\nFly=292,6,6\nHover=292,6,6\nFireFly=370,6,6\n\
+         Tumble=340,15,0\nAirDeathStart=340,8,0\nAirDeathFalling=348,1,0\n\
+         AirDeathFinish=349,6,0\nParadrop=418,1,0\nCheer=419,8,0,E\nPanic=8,6,6\n",
+    );
+    let mut rules = crate::rules::ruleset::RuleSet::from_ini_with_fixed_art_for_test(
+        &IniFile::from_str(&format!(
+            "[General]\nConditionRed=0.25\n\
          [InfantryTypes]\n0=JUMPJET\n\
          [VehicleTypes]\n0=SHOOTER\n\
          [JUMPJET]\nStrength=125\nArmor=flak\nImage=ROCK\nJumpJet=yes\nCrashable=yes\n\
@@ -779,23 +955,12 @@ fn rocketeer_rules_armed(armed: bool) -> crate::rules::ruleset::RuleSet {
          [SHOOTER]\nStrength=100\nPrimary=CrashGun\n\
          [CrashGun]\nDamage=150\nRange=6\nWarhead=CrashWH\n\
          [CrashWH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
-        if armed { "Primary=CrashGun\n" } else { "" }
-    )))
+            extra
+        )),
+        &art,
+    )
     .unwrap();
-    let art = IniFile::from_str(
-        "[ROCK]\nSequence=RocketeerSequence\nFireUp=2\n\
-         [RocketeerSequence]\nReady=0,1,1\nGuard=0,1,1\nProne=86,1,6\nWalk=8,6,6\n\
-         FireUp=164,6,6\nDown=260,2,2\nCrawl=86,6,6\nUp=276,2,2\nFireProne=212,6,6\n\
-         Idle1=56,15,0,S\nIdle2=71,15,0,E\nDie1=134,15,0\nDie2=149,15,0\nDie3=0,0,0\n\
-         Die4=0,0,0\nDie5=0,0,0\nFly=292,6,6\nHover=292,6,6\nFireFly=370,6,6\n\
-         Tumble=340,15,0\nAirDeathStart=340,8,0\nAirDeathFalling=348,1,0\n\
-         AirDeathFinish=349,6,0\nParadrop=418,1,0\nCheer=419,8,0,E\nPanic=8,6,6\n",
-    );
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-    let registry = crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art);
-    rules.replace_animation_sequences_for_test(
-        crate::rules::animation_sequence::build_animation_sequence_catalog(&rules, Some(&registry)),
-    );
     rules
 }
 
@@ -811,7 +976,19 @@ fn rocketeer_crash_fixture(
     use crate::map::entities::EntityCategory;
     use crate::sim::house_state::HouseState;
     use crate::util::fixed_math::SimFixed;
-    let rules = rocketeer_rules_armed(input["armed"].as_bool().unwrap_or(false));
+    let rules = rocketeer_rules(&format!(
+        "{}{}",
+        if input["armed"].as_bool().unwrap_or(false) {
+            "Primary=CrashGun\n"
+        } else {
+            ""
+        },
+        if input["jumpjet_turn"].as_bool().unwrap_or(false) {
+            "JumpJetTurn=yes\n"
+        } else {
+            ""
+        },
+    ));
     let mut sim = super::Simulation::with_seed(0);
     sim.scenario_rng = crate::sim::rng::SimRng::new(31);
     install_common_raw_terrain(&mut sim, 70, 70, 0, None);
@@ -823,11 +1000,13 @@ fn rocketeer_crash_fixture(
         off_108: 64,
     });
     sim.playfield_size_height = Some(64);
-    sim.session.binary_frame = 1000;
-    for (name, human) in [("Americans", true), ("Soviets", false)] {
+    sim.session.set_binary_frame_for_test(1000);
+    // Both Houses human: the native harness steps objects alone, so no
+    // computer House update draws from the Scenario stream.
+    for name in ["Americans", "Soviets"] {
         let house = sim.interner.intern(name);
         sim.houses
-            .insert(house, HouseState::new(house, 0, None, human, 0, 10));
+            .register(HouseState::new(house, 0, None, true, 0, 10));
     }
     let reveal = |sim: &mut super::Simulation, id: u64, rx: u16, ry: u16| {
         assert!(matches!(
@@ -849,7 +1028,7 @@ fn rocketeer_crash_fixture(
             RevealOutcome::Revealed { .. }
         ));
     };
-    assert_eq!(sim.allocate_stable_id(), 1);
+    assert_eq!(sim.substrate.allocate_stable_id(), 1);
     let americans = sim.interner.intern("Americans");
     let jumpjet = sim.interner.intern("JUMPJET");
     let mut rocketeer = crate::sim::game_entity::GameEntity::new_at_frame_zero_for_test(
@@ -899,7 +1078,7 @@ fn rocketeer_crash_fixture(
         flight.facing_mut().snap(0x4000, 1000);
         // The oracle's locomotor holds `JumpjetHeight=` as its target height
         // whatever the row's height (`jumpjet_infantry_actions` ROCKETEER).
-        flight.set_target_height(500);
+        flight.set_target_height_for_test(500);
         *runtime = runtime
             .clone()
             .with_phase_for_test(input["owner"]["phase"].as_i64().unwrap() as i32)
@@ -911,8 +1090,8 @@ fn rocketeer_crash_fixture(
     if height > 0 {
         // This oracle midpoint is already airborne: native takeoff has added
         // its tracker entry before the held-cell slot is established.
-        sim.aircraft_tracker_add(1);
-        assert!(sim.set_cell_air_slot((52, 52), Some(1)));
+        crate::sim::world::Simulation::aircraft_tracker_add(&sim.session, &mut sim.substrate, 1);
+        assert!(sim.substrate.set_cell_air_slot((52, 52), Some(1)));
     }
     // The row's action, started by Do_Action (forced) as the oracle starts it.
     let doing = input["doing"].as_i64().unwrap() as i32;
@@ -930,7 +1109,7 @@ fn rocketeer_crash_fixture(
     }
     let shooter_type = sim.interner.intern("SHOOTER");
     let soviets = sim.interner.intern("Soviets");
-    let shooter = sim.allocate_stable_id();
+    let shooter = sim.substrate.allocate_stable_id();
     let mut entity = crate::sim::game_entity::GameEntity::new_at_frame_zero_for_test(
         shooter,
         40,
@@ -950,6 +1129,59 @@ fn rocketeer_crash_fixture(
     reveal(&mut sim, shooter, 40, 40);
     sim.resolve_type_handles(&rules);
     (sim, rules, shooter)
+}
+
+/// Update's facing tail (`0x0054D60D..0x0054D692`): hovering in state 2 with a
+/// TarCom, a `JumpJetTurn=` infantryman's locomotor Facing takes the direction
+/// to it (`0x005F3DB0`) and PrimaryFacing keeps its own. Without the key the
+/// locomotor Facing keeps its heading, which PrimaryFacing copies.
+#[test]
+fn a_hovering_jumpjet_turn_infantryman_aims_his_locomotor_at_his_target() {
+    for jumpjet_turn in [true, false] {
+        let input = serde_json::json!({
+            "doing": 0,
+            "jumpjet_turn": jumpjet_turn,
+            "owner": {"phase": 2, "moving": true},
+        });
+        let (mut sim, rules, shooter) = rocketeer_crash_fixture(&input);
+        let entity = sim.substrate.entities.get_mut(1).unwrap();
+        entity
+            .attack_target
+            .set_for_test(Some(crate::sim::combat::TargetKind::Entity(shooter)));
+        // Holding over its own coordinate: a destination elsewhere re-opens
+        // the cruise (`0x0054BEE7`) and starts a turn.
+        let here = crate::sim::movement::ground_pose::position_world_coord(&entity.position);
+        let runtime = entity
+            .locomotor
+            .as_mut()
+            .unwrap()
+            .jumpjet_runtime_mut()
+            .unwrap();
+        *runtime = runtime.clone().with_destination_for_test(here);
+        sim.tick_jumpjet_cruise_one(1, &rules, None, crate::sim::world::FrameEffects::default())
+            .unwrap();
+        let frame = sim.session.binary_frame();
+        let entity = sim.substrate.entities.get(1).unwrap();
+        let toward = crate::sim::movement::turret::facing_toward_target(
+            entity,
+            &crate::sim::combat::TargetKind::Entity(shooter),
+            &sim,
+        )
+        .unwrap();
+        assert_ne!(toward, 0x4000);
+        let flight = entity
+            .locomotor
+            .as_ref()
+            .unwrap()
+            .jumpjet_runtime()
+            .unwrap()
+            .flight();
+        assert_eq!(
+            flight.facing().current(frame),
+            if jumpjet_turn { toward } else { 0x4000 }
+        );
+        assert_eq!(entity.body_facing_current(frame), 0x4000);
+    }
 }
 
 /// Kill Rocketeer 1 through the production receiver: one lethal direct hit.
@@ -1077,12 +1309,12 @@ fn a_shot_down_rocketeer_falls_like_the_native_crash() {
             // The native harness kills between visits, then increments its
             // absolute frame before frame_step. advance_tick commits its
             // frame after the visit; align inputs rather than retiming Stage.
-            sim.session.binary_frame = 1000 + index as u32;
+            sim.session.set_binary_frame_for_test(1000 + index as u32);
             if second == Some(index) {
                 kill(&mut sim, &output["kills"][1], "second kill");
                 native_before = index_after(&output["kills"][1]);
             }
-            sim.session.binary_frame = 1001 + index as u32;
+            sim.session.set_binary_frame_for_test(1001 + index as u32);
             let before = sim.scenario_rng.logical_view().index_a;
             sim.advance_tick(&[], Some(&rules), Some(&grid), None, 67);
             let native_after = expected["scenario_rng"][0].as_i64().unwrap() as i32;
@@ -1144,7 +1376,7 @@ fn a_shot_down_rocketeer_falls_like_the_native_crash() {
             assert_eq!(
                 crate::sim::mission::concrete_effects::assign_target_commits(
                     &sim.substrate.entities,
-                    &sim.production.terrain_objects,
+                    sim.terrain_objects.objects(),
                     Some(crate::sim::combat::TargetKind::Entity(1)),
                 ),
                 expected["health"].as_i64() != Some(0)
@@ -1217,7 +1449,7 @@ fn a_rocketeer_lifting_off_leaves_his_cell_list_at_two_levels() {
             rocketeer,
             sim.resolved_terrain.as_ref(),
         );
-        let layer = sim.entity_display_layer(1, Some(&rules)).unwrap();
+        let layer = sim.entity_display_layer(1, &rules).unwrap();
         let listed = sim
             .substrate
             .occupancy
@@ -1261,7 +1493,7 @@ fn grounded_rocketeer() -> (super::Simulation, crate::rules::ruleset::RuleSet, u
         .locomotor
         .as_mut()
         .unwrap()
-        .set_layer(crate::sim::movement::locomotor::MovementLayer::Ground);
+        .set_layer_for_test(crate::sim::movement::locomotor::MovementLayer::Ground);
     (sim, rules, shooter)
 }
 
@@ -1278,7 +1510,7 @@ fn a_ground_route_order_gives_a_rocketeer_his_navcom_and_move_to() {
     sim.assign_destination_represented(
         1,
         Some(crate::sim::components::NavTargetRef::cell(60, 52)),
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -1356,7 +1588,7 @@ fn an_object_order_flies_a_rocketeer_with_the_order() {
     sim.assign_destination_represented(
         1,
         Some(crate::sim::components::NavTargetRef::object(shooter)),
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -1396,7 +1628,7 @@ fn the_mission_destination_setter_flies_a_rocketeer() {
     sim.assign_destination_represented(
         1,
         Some(crate::sim::components::NavTargetRef::cell(60, 52)),
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -1469,7 +1701,8 @@ fn give_cells_hover_costs(sim: &mut super::Simulation) {
     let terrain = sim.resolved_terrain.as_mut().unwrap();
     for y in 0..70 {
         for x in 0..70 {
-            terrain.cell_mut(x, y).unwrap().speed_costs.hover = Some(100);
+            terrain.cell_mut_for_test(x, y).unwrap().speed_costs.hover =
+                Some(crate::util::native_x87::NativeF32Bits::ONE);
         }
     }
 }
@@ -1485,7 +1718,7 @@ fn the_mission_destination_setter_reorders_a_moving_rocketeer() {
         sim.assign_destination_represented(
             1,
             Some(crate::sim::components::NavTargetRef::cell(cell.0, cell.1)),
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -1621,7 +1854,7 @@ fn a_grounded_rocketeers_move_order_survives_its_first_mission_visit() {
     let americans = sim.interner.intern("Americans");
     let order = CommandEnvelope::new(
         americans,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::Move {
             entity_id: 1,
             target_rx: 60,

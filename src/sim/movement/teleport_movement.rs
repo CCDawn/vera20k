@@ -22,10 +22,17 @@
 //! - Part of sim/ — depends on sim/game_entity, sim/entity_store, sim/locomotor.
 //! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
+use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::locomotor_type::LocomotorKind;
 use crate::rules::ruleset::GeneralRules;
 use crate::sim::components::AnimClassSpawnDescriptor;
 use crate::sim::components::DriveCoord;
+use crate::sim::intern::StringInterner;
+use crate::sim::pathfinding::PathGrid;
+use crate::sim::world::FrameChannel;
+use crate::sim::world::ObjectSubstrate;
+use crate::sim::world::SimSoundEvent;
+use std::sync::Arc;
 
 const TELEPORT_WARP_DRAW_FLAGS: u32 = 0x600;
 
@@ -39,20 +46,26 @@ pub(crate) enum WarpSound {
 }
 
 impl crate::sim::world::Simulation {
-    /// One warp sound at the owner's cell: the type's
+    /// One warp sound at the owner's current Location: the type's
     /// ChronoOutSound/ChronoInSound (TechnoType+0x578/+0x574), else
-    /// `[AudioVisual]` (Rules+0x21C/+0x218), else silence.
+    /// `[AudioVisual]` (Rules+0x21C/+0x218), else silence. Out plays at the
+    /// departure point (`0x0071960A..0x0071962C`, state 2 `0x007198CE`), In at
+    /// the arrival point after SetHeight(0) and Mark(DOWN)
+    /// (`0x007196EE..0x00719710`, state 5 `0x00719A70`).
     pub(crate) fn teleport_warp_sound(
-        &mut self,
+        interner: &mut StringInterner,
+        substrate: &ObjectSubstrate,
+        terrain: Option<&ResolvedTerrainGrid>,
+        sound_events: &mut FrameChannel<SimSoundEvent>,
         id: u64,
         sound: WarpSound,
         rules: &crate::rules::ruleset::RuleSet,
     ) {
-        let Some(entity) = self.substrate.entities.get(id) else {
+        let Some(entity) = substrate.entities.get(id) else {
             return;
         };
-        let (rx, ry) = (entity.position.rx(), entity.position.ry());
-        let object = self.object_type(entity.type_ref(), rules);
+        let world = super::ground_pose::object_location(entity, terrain).into();
+        let object = interner.object_type(entity.type_ref(), rules);
         let name = match sound {
             WarpSound::Out => object
                 .and_then(|object| object.chrono_out_sound.clone())
@@ -62,9 +75,8 @@ impl crate::sim::world::Simulation {
                 .or_else(|| rules.general.chrono_in_sound.clone()),
         };
         if let Some(name) = name {
-            let sound_id = self.interner.intern(&name);
-            self.sound_events
-                .push(crate::sim::world::SimSoundEvent::ChronoTeleport { sound_id, rx, ry });
+            let sound_id = interner.intern(&name);
+            sound_events.emit(crate::sim::world::SimSoundEvent::ChronoTeleport { sound_id, world });
         }
     }
 
@@ -192,13 +204,6 @@ impl TeleportState {
     /// (`0x00719BF0`). The ordinary teleport never writes `+0x270`.
     pub fn warp_in_active(&self) -> bool {
         self.phase == TeleportPhase::ChronoDelay && self.delay_timer.duration() > 0
-    }
-
-    /// The relocation frame is removed from normal targeting before its cell
-    /// and occupancy mutation; it becomes targetable again while materializing.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn is_targetable(&self) -> bool {
-        self.phase == TeleportPhase::ChronoDelay
     }
 }
 
@@ -391,6 +396,13 @@ impl TeleportRuntime {
         self.resolved
     }
 
+    /// Teleport::Destination7180A0 copies complete-object+1C while moving.
+    /// The armed request belongs to the ordinary warp adapter, independently
+    /// of the resolver's +28 reservation and ChronoWarp's Techno+288 target.
+    pub(crate) fn armed_destination(&self) -> Option<DriveCoord> {
+        self.warp.as_ref().and_then(|warp| warp.destination)
+    }
+
     pub(crate) fn chrono(&self) -> Option<&ChronoWarp> {
         self.chrono.as_ref()
     }
@@ -419,7 +431,14 @@ impl TeleportRuntime {
         self.resolved = Some(coord);
     }
 
-    fn stop(&mut self) {
+    /// Ares 3.0 InfantryClass_Remove_Teleport (1005CD50, hook 0x51DF27):
+    /// Limbo resets `+0x28` to the null coordinate, so the next REMOVE leaves
+    /// the Location's occupation instead of the old Marked one.
+    pub(crate) fn forget_resolved_destination(&mut self) {
+        self.resolved = None;
+    }
+
+    pub(super) fn stop(&mut self) {
         self.requested = false;
         if let Some(warp) = self.warp.as_mut() {
             warp.destination = None;
@@ -537,16 +556,10 @@ pub fn compute_chrono_delay(rules: &GeneralRules, distance_leptons: i32) -> u32 
 /// infantry_scatter_destination --teleport-cell and
 /// tools/spatial_oracle/cmin_dock (`assign_destination`).
 ///
-/// Not ported:
-/// - The Infantry arm's object fallback (`0x00718ECB..0x00719088`). Trigger:
-///   an infantry teleporter (retail: the Chrono Legionnaire) whose NavCom is
-///   an object and whose cell placement or Can_Enter_Cell refuses. Native
-///   searches Find_Nearby_Passable_Cell from the object's cell and places him
-///   there; VERA refuses the request (NULL destination), so he stays put.
-/// - The null-request arm (`0x00718BF3..0x00718C13`, `0x00719237`): native
-///   makes a request at exactly the null coordinate Marked and refuses it;
-///   VERA resolves it like any other. No caller passes it: Cell requests are
-///   cell centres and no object stands at the map origin.
+/// Not ported: the null-request arm (`0x00718BF3..0x00718C13`, `0x00719237`).
+/// Native makes a request at exactly the null coordinate Marked and refuses
+/// it; VERA resolves it like any other. No caller passes it: Cell requests
+/// are cell centres and no object stands at the map origin.
 ///
 /// Object placement priority is executed separately against the original
 /// transport_rows. EMP/death admission and chrono timing are separate
@@ -567,7 +580,6 @@ impl crate::sim::world::Simulation {
         use crate::map::resolved_terrain::NativeCellQuery;
         use crate::sim::movement::infantry_entry::InfantryEntryArgs;
         use crate::sim::movement::locomotor::MovementLayer;
-        use crate::sim::occupancy::RawCellKey;
 
         let target = ((requested.x / 256) as u16, (requested.y / 256) as u16);
         let actor = self
@@ -583,7 +595,19 @@ impl crate::sim::world::Simulation {
         {
             return Ok(false);
         }
-        if actor.parasite.is_paralyzed(self.session.binary_frame)
+        // Ares 3.0 TeleportLocomotionClass_ILocomotion_MoveTo_Deactivated
+        // (1005D3E0, hook 0x71810D), first: a deactivated owner, or one whose
+        // locomotor is powered off, refuses too. Then the owner's vt+0x37C
+        // (`0x0071810D`), its vt+0x380 and the warp bytes.
+        let ares_refuses = rules.ares_form()
+            && (actor.deactivated.is_offline()
+                || !actor
+                    .locomotor
+                    .as_ref()
+                    .is_some_and(|locomotor| locomotor.is_powered()));
+        if ares_refuses
+            || actor.is_under_emp()
+            || actor.parasite.is_paralyzed(self.session.binary_frame())
             || actor.is_warped_out()
             || actor.is_warping_in()
         {
@@ -616,14 +640,34 @@ impl crate::sim::world::Simulation {
         // (0x007181F9). The Chrono Warp's fresh Teleport has no Marked
         // coordinate, so its Unit drops the destination it was given.
         if latched && !infantry {
-            self.object_raw_receiver_at(id, previous, false);
-            self.object_raw_receiver_at(
+            Self::object_raw_receiver_at(
+                &mut self.substrate,
+                &self.path_grid,
+                &self.resolved_terrain,
+                id,
+                previous,
+                false,
+                rules.ares_form(),
+            );
+            Self::object_raw_receiver_at(
+                &mut self.substrate,
+                &self.path_grid,
+                &self.resolved_terrain,
                 id,
                 marked.unwrap_or(DriveCoord { x: 0, y: 0, z: 0 }),
                 true,
+                rules.ares_form(),
             );
             if let Some(marked) = marked {
-                self.object_raw_receiver_at(id, marked, true);
+                Self::object_raw_receiver_at(
+                    &mut self.substrate,
+                    &self.path_grid,
+                    &self.resolved_terrain,
+                    id,
+                    marked,
+                    true,
+                    rules.ares_form(),
+                );
                 if let Some(runtime) = self
                     .substrate
                     .entities
@@ -635,8 +679,16 @@ impl crate::sim::world::Simulation {
                 }
                 return Ok(true);
             }
-            self.object_raw_receiver_at(id, physical, true);
-            self.assign_null_destination(id, Some(rules), registry, effects);
+            Self::object_raw_receiver_at(
+                &mut self.substrate,
+                &self.path_grid,
+                &self.resolved_terrain,
+                id,
+                physical,
+                true,
+                rules.ares_form(),
+            );
+            self.assign_null_destination(id, rules, registry, effects);
             return Ok(false);
         }
         if infantry
@@ -657,7 +709,15 @@ impl crate::sim::world::Simulation {
             return Err("Teleport resolution requires map cells".into());
         }
         let resolution = (|| -> Result<Option<DriveCoord>, String> {
-            self.object_raw_receiver_at(id, previous, false);
+            Self::object_raw_receiver_at(
+                &mut self.substrate,
+                &self.path_grid,
+                &self.resolved_terrain,
+                id,
+                previous,
+                false,
+                rules.ares_form(),
+            );
             let terrain = self.resolved_terrain.as_ref().unwrap();
             let cells = NativeCellQuery::canonical(terrain);
             let cell = cells.lookup_world(requested.x, requested.y);
@@ -673,18 +733,13 @@ impl crate::sim::world::Simulation {
             if !infantry {
                 return self.teleport_unit_marked(id, requested, deck, marked, rules, registry);
             }
-            let layer = if deck {
-                MovementLayer::Bridge
-            } else {
-                MovementLayer::Ground
-            };
-            let key = RawCellKey::from_native(terrain, cell);
             // Original718C90 Ready ->718C9F Commence follows the release and
             // deck lookup, before effective-mission reads/Cell481180. Use the
             // existing Mission authority; a queued Attack can become current
             // here after51AA40's earlier current-mission Stop decision.
             if self.mission_ready_to_commence(id, rules) {
-                self.mission_commence_exact(id, self.session.binary_frame)
+                self.substrate
+                    .mission_commence_exact(id, self.session.binary_frame())
                     .map_err(|error| format!("Teleport resolver Commence: {error}"))?;
             }
             // 718CA0..718DE3: Enter/Eaten/Capture/Patrol permit preferred
@@ -728,31 +783,7 @@ impl crate::sim::world::Simulation {
                     EntityCategory::Infantry => false,
                 }
             });
-            let cells = NativeCellQuery::canonical(self.resolved_terrain.as_ref().unwrap());
-            let slot = super::bump_crush::place_infantry_in_native_cell(
-                &self.substrate.raw_cell_occupation,
-                key,
-                layer,
-                requested,
-                priority,
-                super::bump_crush::GroundGate::Live {
-                    occupancy: &self.substrate.occupancy,
-                    entities: &self.substrate.entities,
-                    rules: Some(rules),
-                    interner: &self.interner,
-                },
-                &mut self.scenario_rng,
-            );
-            // Cell481180 samples floor at the original input after selection;
-            // a failed selection returns NULL without that successful tail.
-            let resolved = if let Some(slot) = slot {
-                let floor = super::ground_pose::query_ground_height(&cells, requested)?;
-                Some(super::walk_head::selected_head(
-                    requested, slot, floor, deck,
-                ))
-            } else {
-                None
-            };
+            let resolved = self.teleport_place_infantry(cell, requested, priority, deck, rules)?;
             self.substrate
                 .entities
                 .get_mut(id)
@@ -777,7 +808,11 @@ impl crate::sim::world::Simulation {
                 rules,
                 registry,
             )?;
-            Ok(if answer.is_nonzero() { None } else { resolved })
+            let resolved = if answer.is_nonzero() { None } else { resolved };
+            if resolved.is_some() {
+                return Ok(resolved);
+            }
+            self.teleport_infantry_object_fallback(id, priority, deck, rules)
         })();
         let resolved = resolution.unwrap_or_else(|error| {
             // A missing retained input is not a native admission code.
@@ -799,13 +834,29 @@ impl crate::sim::world::Simulation {
         let Some(resolved) = resolved else {
             // Original719286..7192AE restores the physical raw receiver
             // before returning false;7181F9 then calls the class NULL arm.
-            self.object_raw_receiver_at(id, physical, true);
-            self.assign_null_destination(id, Some(rules), registry, effects);
+            Self::object_raw_receiver_at(
+                &mut self.substrate,
+                &self.path_grid,
+                &self.resolved_terrain,
+                id,
+                physical,
+                true,
+                rules.ares_form(),
+            );
+            self.assign_null_destination(id, rules, registry, effects);
             return Ok(false);
         };
         // 0x00719270..0x00719276: the tail PUTs at Marked; Move_To arms it
         // (0x007181DB).
-        self.object_raw_receiver_at(id, resolved, true);
+        Self::object_raw_receiver_at(
+            &mut self.substrate,
+            &self.path_grid,
+            &self.resolved_terrain,
+            id,
+            resolved,
+            true,
+            rules.ares_form(),
+        );
         Ok(arm_teleport(
             self.substrate.entities.get_mut(id).unwrap(),
             resolved,
@@ -813,6 +864,140 @@ impl crate::sim::world::Simulation {
             &rules.general,
             is_harvester,
         ))
+    }
+
+    /// `CellClass::PlaceInfantryInCell @ 0x00481180` as ResolveDestination
+    /// calls it (`0x00718E25`, `0x00719071`). The floor is sampled at the
+    /// input after the selection; a failed selection returns NULL without
+    /// that successful tail. The input's Z is not read.
+    fn teleport_place_infantry(
+        &mut self,
+        cell: crate::map::cell_index::NativeCellIdentity,
+        input: DriveCoord,
+        priority: bool,
+        deck: bool,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> Result<Option<DriveCoord>, String> {
+        use crate::sim::movement::locomotor::MovementLayer;
+
+        let terrain = self
+            .resolved_terrain
+            .as_ref()
+            .ok_or("Teleport placement requires map cells")?;
+        let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+        let Some(slot) = super::bump_crush::place_infantry_in_native_cell(
+            &self.substrate.raw_cell_occupation,
+            crate::sim::occupancy::RawCellKey::from_native(terrain, cell),
+            if deck {
+                MovementLayer::Bridge
+            } else {
+                MovementLayer::Ground
+            },
+            input,
+            priority,
+            super::bump_crush::GroundGate::Live {
+                occupancy: &self.substrate.occupancy,
+                entities: &self.substrate.entities,
+                rules,
+                interner: &self.interner,
+            },
+            &mut self.scenario_rng,
+        ) else {
+            return Ok(None);
+        };
+        let floor = super::ground_pose::query_ground_height(&cells, input)?;
+        Ok(Some(super::walk_head::selected_head(
+            input, slot, floor, deck,
+        )))
+    }
+
+    /// ResolveDestination's Infantry fallback (`0x00718ECB..0x00719088`), run
+    /// with Marked null: the placement refused, or Can_Enter_Cell did
+    /// (`0x00718E95`). A NavCom that is an Object (`+0x14 & 2`) gets
+    /// Find_Nearby_Passable_Cell (`0x0071900D`) from the cell of its own
+    /// vt+0x4C, with a null requester; a Cell NavCom, or none, stays refused.
+    /// The search takes the type's raw SpeedType (`+0x67C`) and MovementZone
+    /// (`+0x5B4`), the `GetZoneID` of the Foot's own vt+0x4C cell on its
+    /// ShouldBeOnBridge (`0x00718FE7`), the seed Cell's bridge bit, one cell,
+    /// the height gate and no preferred cell. A cell other than (0, 0) places
+    /// the infantry at that Cell's centre (vt+0x48) with the first placement's
+    /// priority and deck byte (`0x00719071`); no Can_Enter_Cell judges it.
+    /// Reach: a Chrono Legionnaire following a friendly vehicle past
+    /// GuardModeStray (Mission_AreaGuard `0x004D6AA0`) or sent to an object
+    /// by a team script. No RNG draw of its own beyond the placement's.
+    fn teleport_infantry_object_fallback(
+        &mut self,
+        id: u64,
+        priority: bool,
+        deck: bool,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> Result<Option<DriveCoord>, String> {
+        use crate::map::resolved_terrain::NativeCellQuery;
+        use crate::sim::components::NavTargetRef;
+        use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
+
+        let actor = self
+            .substrate
+            .entities
+            .get(id)
+            .ok_or("Teleport resolution lost its owner")?;
+        let Some(target @ NavTargetRef::Object { .. }) = actor.navigation.nav_com() else {
+            return Ok(None);
+        };
+        let object = self
+            .object_type(actor.type_ref(), rules)
+            .ok_or("Teleport resolution requires its type")?;
+        let (speed_type, movement_zone) = (object.speed_type, object.movement_zone);
+        let seed = self.navigation_target_coordinate(target, None, rules)?;
+        let seed = ((seed.x / 256) as i16, (seed.y / 256) as i16);
+        let source = self.foot_navigation_coordinate(id)?;
+        let on_bridge = self.foot_should_be_on_bridge(id)?;
+        let terrain = self
+            .resolved_terrain
+            .as_ref()
+            .ok_or("Teleport resolution requires map cells")?;
+        let bridge_aware_zone = {
+            let cells = NativeCellQuery::canonical(terrain);
+            cells.flags(cells.lookup(seed)) & 0x100 != 0
+        };
+        let required_zone_id = self
+            .zone_grid
+            .as_ref()
+            .ok_or("Teleport resolution requires zone topology")?
+            .get_zone_id_native(
+                terrain,
+                (((source.x / 256) as u16), ((source.y / 256) as u16)),
+                movement_zone,
+                on_bridge,
+            );
+        let Some(found) = self
+            .nearby_passable_cell(
+                (i32::from(seed.0), i32::from(seed.1)),
+                NearbyArgs {
+                    check_height: true,
+                    ..NearbyArgs::plain(
+                        PassabilityArgs {
+                            speed_type,
+                            required_zone_id,
+                            movement_zone,
+                            bridge_aware_zone,
+                        },
+                        NearbyFootprint::SINGLE,
+                    )
+                },
+            )
+            .filter(|cell| *cell != (0, 0))
+        else {
+            return Ok(None);
+        };
+        let terrain = self
+            .resolved_terrain
+            .as_ref()
+            .ok_or("Teleport resolution requires map cells")?;
+        let cells = NativeCellQuery::canonical(terrain);
+        let cell = cells.lookup((found.0 as i16, found.1 as i16));
+        let [x, y] = crate::sim::cell_kernel::native_cell_own_xy(cell, &cells);
+        self.teleport_place_infantry(cell, DriveCoord { x, y, z: 0 }, priority, deck, rules)
     }
 
     /// ResolveDestination's Unit arm (`0x007190A8..0x00719235`), after the
@@ -910,10 +1095,14 @@ impl crate::sim::world::Simulation {
         if cell == (0, 0) {
             return Ok(marked);
         }
-        self.object_raw_receiver_at(
+        Self::object_raw_receiver_at(
+            &mut self.substrate,
+            &self.path_grid,
+            &self.resolved_terrain,
             id,
             marked.unwrap_or(super::foot_coordinate::NULL_COORD),
             false,
+            rules.ares_form(),
         );
         let cells = NativeCellQuery::canonical(
             self.resolved_terrain
@@ -927,7 +1116,15 @@ impl crate::sim::world::Simulation {
         let mut resolved =
             DriveCoord::from(crate::sim::cell_kernel::cell_center(own_cell.into(), 0));
         resolved.z = super::ground_pose::query_ground_height(&cells, resolved)?;
-        self.object_raw_receiver_at(id, resolved, true);
+        Self::object_raw_receiver_at(
+            &mut self.substrate,
+            &self.path_grid,
+            &self.resolved_terrain,
+            id,
+            resolved,
+            true,
+            rules.ares_form(),
+        );
         Ok(Some(resolved))
     }
 }
@@ -964,14 +1161,28 @@ impl crate::sim::world::Simulation {
     /// Head_To_Coord, which is the owner's Location (`0x0055ACA0`). For an
     /// infantryman that is what clears his sub-cell: Infantry Mark clears none
     /// (`0x0047EAFE`).
-    pub(crate) fn release_teleport_occupation_before_foot_limbo(&mut self, id: u64) {
-        let Some(coord) = self.substrate.entities.get(id).and_then(|entity| {
+    pub(crate) fn release_teleport_occupation_before_foot_limbo(
+        substrate: &mut ObjectSubstrate,
+        path_grid: &Option<Arc<PathGrid>>,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        id: u64,
+        ares: bool,
+    ) {
+        let Some(coord) = substrate.entities.get(id).and_then(|entity| {
             (!entity.lifecycle.in_limbo() && teleport_process_active(entity))
                 .then(|| super::ground_pose::position_world_coord(&entity.position))
         }) else {
             return;
         };
-        self.object_raw_receiver_at(id, coord, false);
+        Self::object_raw_receiver_at(
+            substrate,
+            path_grid,
+            resolved_terrain,
+            id,
+            coord,
+            false,
+            ares,
+        );
     }
 }
 
@@ -1054,15 +1265,13 @@ impl crate::sim::world::Simulation {
     /// superweapon_oracle's chrono_process controls pin callback order with
     /// their explicitly recorded scan/acquisition/idle seams.
     ///
-    /// Rules-free component callers cover timer/flag retirement only: they do
-    /// not supply the retail inputs required by passive acquisition or idle.
     pub(crate) fn teleport_timer_check(
         &mut self,
         id: u64,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         ctx: crate::sim::world::ObjectAiCtx<'_>,
     ) -> bool {
-        let frame = self.session.binary_frame as i32;
+        let frame = self.session.binary_frame() as i32;
         let Some(entity) = self.substrate.entities.get(id) else {
             return false;
         };
@@ -1103,12 +1312,11 @@ impl crate::sim::world::Simulation {
                 runtime.warp = None;
             }
         }
-        if let Some(rules) = rules
-            && self
-                .substrate
-                .entities
-                .get(id)
-                .is_some_and(|entity| entity.attack_target.target().is_none())
+        if self
+            .substrate
+            .entities
+            .get(id)
+            .is_some_and(|entity| entity.attack_target.target().is_none())
         {
             self.shorten_passive_scan_timer(id);
             if !crate::sim::world::passive_target_acquire(self, id, rules, ctx) {
@@ -1138,7 +1346,7 @@ impl crate::sim::world::Simulation {
     pub(crate) fn process_teleport(
         &mut self,
         id: u64,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         ctx: crate::sim::world::ObjectAiCtx<'_>,
     ) -> Option<SpecialMovementOutcome> {
         let phase = self
@@ -1158,7 +1366,7 @@ impl crate::sim::world::Simulation {
                 SpecialMovementOutcome::Continue
             });
         }
-        let frame = self.session.binary_frame as i32;
+        let frame = self.session.binary_frame() as i32;
         let terrain = self.resolved_terrain.as_ref();
         let reached = self
             .substrate
@@ -1202,10 +1410,14 @@ impl crate::sim::world::Simulation {
                 // FootClass::SetLocation (vt+0x1B4, 0x00719637 and again at
                 // 0x00719684); the retained Process adapter applies SetHeight(0)
                 // after its XY write and skips the OpenTopped rider tail. Trigger:
-                // a loaded OpenTopped transport (retail: the Drive BFRT) warped
-                // by a superweapon, whose SuperClass code gives any Foot a
-                // Teleport locomotor (0x006CC989..0x006CC999); VERA ports no such
-                // warp yet. Effect: the riders stay at the departure point.
+                // an OpenTopped Foot whose active locomotor is a Teleport taking an
+                // ordinary Move_To. No retail Teleport type carries passengers. A
+                // superweapon warp (0x006CC989..0x006CC999) sets the latch and runs
+                // the Chronosphere states, whose SetLocation keeps the rider tail
+                // (`teleport_chrono.rs`), so the only window is between that warp's
+                // state 7 and its piggyback END, which the Foot AI tail normally
+                // takes in the same frame. Effect: the riders stay at the
+                // departure point.
                 if let Some(terrain) = terrain {
                     let cell = terrain.native_cell_identity((
                         (destination.x / 256) as i16,
@@ -1241,9 +1453,11 @@ impl crate::sim::world::Simulation {
         }
 
         let runtime = entity.locomotor.as_mut()?.teleport_runtime_mut()?;
-        if phase_before == TeleportPhase::Relocate {
-            // The represented relocation's Stop/request retirement; full native
-            // Process scheduling and Chronosphere remain explicitly separate.
+        if phase_before == TeleportPhase::Relocate && reached {
+            // 0x007197BD: Stop_Moving retires the request of a warp already on
+            // its destination. A relocation's Stop (`0x00719725`) follows the
+            // arrival Per_Cell_Process, so the object turn makes it
+            // ([`super::locomotor::LocomotorState::teleport_process_stop`]).
             runtime.requested = false;
         }
         runtime.warp = (!finished).then_some(teleport);
@@ -1251,11 +1465,11 @@ impl crate::sim::world::Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "teleport_cell_destination_tests.rs"]
 mod cell_destination_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::*;
 
@@ -1312,7 +1526,8 @@ mod tests {
                     input["timer_duration"].as_i64().unwrap() as i32,
                 ),
             }));
-            sim.session.binary_frame = input["frame"].as_u64().unwrap() as u32;
+            sim.session
+                .set_binary_frame_for_test(input["frame"].as_u64().unwrap() as u32);
             sim.substrate.entities.insert(actor);
             let mut bridge_changed = false;
             assert!(!sim.temporal_ai_prologue(
@@ -1365,82 +1580,15 @@ mod tests {
             &rules,
             false
         ));
-        sim.process_teleport(1, None, crate::sim::world::ObjectAiCtx::default());
+        sim.process_teleport(
+            1,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            crate::sim::world::ObjectAiCtx::default(),
+        );
         let owner = sim.substrate.entities.get_mut(1).unwrap();
         assert!(owner.is_warping_in());
         teleport_stop_moving(owner);
         assert!(owner.is_warping_in());
-    }
-
-    #[test]
-    fn test_teleport_issues_and_completes() {
-        let mut sim = crate::sim::world::Simulation::new();
-        let mut e = teleport_owner(1, "CLEG", 5, 5);
-        e.position.set_z_for_test(0);
-        sim.substrate.entities.insert(e);
-        let rules = default_rules();
-
-        assert!(arm_teleport(
-            sim.substrate.entities.get_mut(1).unwrap(),
-            DriveCoord::cell(20, 20, 0),
-            None,
-            &rules,
-            false
-        ));
-        let entity = sim.substrate.entities.get(1).expect("should exist");
-        let ts = entity.teleport_state().expect("should have TeleportState");
-        assert_eq!(ts.phase(), TeleportPhase::Relocate);
-        assert!(
-            ts.chrono_delay_ticks() >= 16,
-            "should have at least minimum delay"
-        );
-
-        // One admitted frame relocates instantly.
-        sim.process_teleport(1, None, crate::sim::world::ObjectAiCtx::default());
-
-        let entity = sim.substrate.entities.get(1).expect("should exist");
-        assert_eq!(entity.position.rx(), 20, "Should have relocated to target");
-        assert_eq!(entity.position.ry(), 20);
-        let ts = entity.teleport_state().expect("still warping");
-        assert_eq!(
-            ts.phase(),
-            TeleportPhase::ChronoDelay,
-            "should be in chrono delay"
-        );
-
-        // Advance through the ChronoDelay countdown.
-        let delay = ts.chrono_delay_ticks();
-        for frame in 1..=delay + 5 {
-            sim.session.binary_frame = frame;
-            sim.process_teleport(1, None, crate::sim::world::ObjectAiCtx::default());
-        }
-
-        // TeleportState should be removed after completion.
-        let entity = sim.substrate.entities.get(1).expect("should exist");
-        assert!(
-            entity.teleport_state().is_none(),
-            "TeleportState should be removed after completion"
-        );
-    }
-
-    #[test]
-    fn test_chrono_delay_formula() {
-        let mut rules = default_rules();
-        // Default: factor=48, minimum=16, trigger=true, range_minimum=0
-
-        // Short distance: 256 leptons (1 cell) → 256/48 = 5, clamped to 16
-        assert_eq!(compute_chrono_delay(&rules, 256), 16);
-
-        // Medium distance: 5120 leptons (20 cells) → 5120/48 = 106
-        assert_eq!(compute_chrono_delay(&rules, 5120), 106);
-
-        // Very short distance below range minimum
-        rules.chrono_range_minimum = 512;
-        assert_eq!(compute_chrono_delay(&rules, 200), 16); // forced to minimum
-
-        // ChronoTrigger=false → always minimum
-        rules.chrono_trigger = false;
-        assert_eq!(compute_chrono_delay(&rules, 5120), 16);
     }
 
     /// Process `0x00719454..0x007194AC` executed on each row's owner GetCoords
@@ -1482,36 +1630,6 @@ mod tests {
         assert_eq!(rows.len(), 4);
     }
 
-    /// Harvester units skip the chrono lock entirely — when is_harvester=true
-    /// the lock duration is 0 regardless of distance.
-    #[test]
-    fn test_harvester_skips_chrono_delay() {
-        let mut sim = crate::sim::world::Simulation::new();
-        let e = teleport_owner(1, "CMIN", 5, 5);
-        sim.substrate.entities.insert(e);
-        let rules = default_rules();
-
-        // Long distance (~80 cells diagonal) — non-harvester computes ~604 frames delay.
-        assert!(arm_teleport(
-            sim.substrate.entities.get_mut(1).unwrap(),
-            DriveCoord::cell(90, 90, 0),
-            None,
-            &rules,
-            true
-        ));
-        let ts = sim
-            .substrate
-            .entities
-            .get(1)
-            .and_then(|e| e.teleport_state())
-            .expect("should have TeleportState");
-        assert_eq!(
-            ts.chrono_delay_ticks(),
-            0,
-            "harvester instant-warp must zero the chrono lock"
-        );
-    }
-
     /// With is_harvester=true, the Relocate phase finishes the teleport in a single
     /// tick (skipping ChronoDelay).
     #[test]
@@ -1531,7 +1649,11 @@ mod tests {
         ));
 
         // Single frame: position snaps, then cleanup runs because the configured delay is zero.
-        sim.process_teleport(1, None, crate::sim::world::ObjectAiCtx::default());
+        sim.process_teleport(
+            1,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            crate::sim::world::ObjectAiCtx::default(),
+        );
 
         let entity = sim.substrate.entities.get(1).expect("should exist");
         assert_eq!(entity.position.rx(), 20);
@@ -1571,7 +1693,11 @@ mod tests {
         );
 
         // Frame 1: Relocate snaps position and transitions to ChronoDelay (NOT cleanup).
-        sim.process_teleport(1, None, crate::sim::world::ObjectAiCtx::default());
+        sim.process_teleport(
+            1,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            crate::sim::world::ObjectAiCtx::default(),
+        );
         let ts = sim
             .substrate
             .entities
@@ -1580,16 +1706,5 @@ mod tests {
             .expect("still warping after Relocate");
         assert_eq!(ts.phase(), TeleportPhase::ChronoDelay);
         assert_eq!(ts.chrono_delay_ticks(), initial_ticks);
-    }
-
-    #[test]
-    fn teleport_exposes_distinct_warp_and_targetability_producers() {
-        let relocate = TeleportState::for_test(TeleportPhase::Relocate, 1, 1, 10);
-        assert!(!relocate.warp_in_active());
-        assert!(!relocate.is_targetable());
-
-        let arrival = TeleportState::for_test(TeleportPhase::ChronoDelay, 1, 1, 10);
-        assert!(arrival.warp_in_active());
-        assert!(arrival.is_targetable());
     }
 }

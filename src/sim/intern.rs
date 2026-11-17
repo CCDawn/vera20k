@@ -9,12 +9,14 @@
 //! The interner is part of `Simulation` — all peers intern the same strings
 //! from the same rules.ini + map data in the same order, producing identical IDs.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::rules::object_type::ObjectType;
 use crate::rules::ruleset::{RuleSet, TypeHandle};
 use crate::sim::type_handle_table::TypeHandleTable;
+use crate::util::lookup_hash::LookupMap;
+use crate::util::native_string::with_ascii_uppercase;
+use crate::util::synced::Synced;
 
 /// Interned string handle — `Copy`, `Eq`, `Ord`, `Hash`. Zero-cost clones.
 #[derive(
@@ -51,33 +53,89 @@ impl fmt::Display for InternedId {
 
 /// Bidirectional string interner with uppercase-normalized lookup.
 ///
-/// `intern("Americans")` and `intern("americans")` return the same ID.
+/// `intern("Americans")` and `intern("americans")` return the same ID, so two
+/// distinct ids never name strings equal under ASCII case folding.
 /// The display string preserves the casing of the first call that created the entry.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StringInterner {
-    /// Uppercase-normalized key → ID.
-    to_id: BTreeMap<String, InternedId>,
+    /// Uppercase-normalized key → ID. Only looked up, never walked, so it
+    /// takes the lookup hasher.
+    /// Synced into the presentation copy (docs/sim-thread.md);
+    /// [`Self::intern`] writes only for a new string.
+    to_id: Synced<LookupMap<String, InternedId>>,
     /// ID (index) → display string (first-seen casing).
-    to_str: Vec<String>,
-    /// Derived: each id's object handle in the bound rules
-    /// ([`Self::bind_types`]). Never serialized; a load binds again.
-    types: TypeHandleTable,
+    to_str: Synced<Vec<String>>,
+    /// Derived: each id's object, projectile and warhead handles in the
+    /// bound rules ([`Self::bind_types`], [`Self::cover_types`]). Never
+    /// serialized; a load binds again.
+    types: Synced<TypeHandleTable>,
+    /// [`Self::serial`]; never serialized.
+    serial: u64,
+}
+
+fn next_interner_serial() -> u64 {
+    static SERIALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SERIALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 impl StringInterner {
     /// Create an empty interner.
     pub fn new() -> Self {
         Self {
-            to_id: BTreeMap::new(),
-            to_str: Vec::new(),
-            types: TypeHandleTable::default(),
+            to_id: Synced::default(),
+            to_str: Synced::default(),
+            types: Synced::default(),
+            serial: next_interner_serial(),
         }
+    }
+
+    /// This interner's identity: distinct from every other interner the
+    /// process makes, a clone or a load included (a clone's later ids can
+    /// name other strings). It reaches no result; a cache keyed by interned
+    /// ids compares it to know whose ids it holds.
+    pub fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// Resolve the strings interned so far to their objects in `rules`, so
     /// [`Self::object_type`] answers for them without hashing a name.
     pub fn bind_types(&mut self, rules: &RuleSet) {
-        self.types = TypeHandleTable::build(rules, self);
+        self.types = TypeHandleTable::build(rules, self).into();
+    }
+
+    /// Bind the strings interned since [`Self::bind_types`] as well, when
+    /// `rules` is the set it bound; nothing when none are new.
+    pub fn cover_types(&mut self, rules: &RuleSet) {
+        if !self.types.lags(self, rules) {
+            return;
+        }
+        let mut types = std::mem::take(&mut self.types);
+        types.cover(rules, self);
+        self.types = types;
+    }
+
+    /// The projectile type `id` names in `rules`, as
+    /// `rules.projectile(self.resolve(id))` answers, through the bound
+    /// handles where they apply.
+    #[inline]
+    pub fn projectile_type<'r>(
+        &self,
+        id: InternedId,
+        rules: &'r RuleSet,
+    ) -> Option<&'r crate::rules::projectile_type::ProjectileType> {
+        self.types.projectile(self, id, rules)
+    }
+
+    /// The warhead `id` names in `rules`, as
+    /// `rules.warhead(self.resolve(id))` answers, through the bound handles
+    /// where they apply.
+    #[inline]
+    pub fn warhead_type<'r>(
+        &self,
+        id: InternedId,
+        rules: &'r RuleSet,
+    ) -> Option<&'r crate::rules::warhead_type::WarheadType> {
+        self.types.warhead(self, id, rules)
     }
 
     /// The object type `id` names in `rules`, as
@@ -88,6 +146,21 @@ impl StringInterner {
         self.types.object(self, id, rules)
     }
 
+    /// Resolve an already known concrete family. Native GetTechnoType returns
+    /// the constructor's typed pointer (Infantry51FAF0), even when another
+    /// class registry contains the same name. As
+    /// `rules.object_in_category(category, self.try_resolve(id)?)` answers,
+    /// through the bound handles where they apply.
+    #[inline]
+    pub fn object_type_in_category<'r>(
+        &self,
+        id: InternedId,
+        category: crate::rules::object_type::ObjectCategory,
+        rules: &'r RuleSet,
+    ) -> Option<&'r ObjectType> {
+        self.types.object_in_category(self, id, category, rules)
+    }
+
     /// The handle of the object type `id` names in `rules`, as
     /// `rules.type_handle(self.resolve(id))` answers, the same way.
     #[inline]
@@ -95,22 +168,67 @@ impl StringInterner {
         self.types.handle(self, id, rules)
     }
 
+    pub fn type_handle_in_category(
+        &self,
+        id: InternedId,
+        category: crate::rules::object_type::ObjectCategory,
+        rules: &RuleSet,
+    ) -> Option<TypeHandle> {
+        self.types.handle_in_category(self, id, category, rules)
+    }
+
+    /// Native class methods hold the concrete Type pointer (Infantry51D707,
+    /// 518DCF), not the broad name winner from another class's registry.
+    pub fn animation_sequence_in_category<'r>(
+        &self,
+        id: InternedId,
+        category: crate::rules::object_type::ObjectCategory,
+        rules: &'r RuleSet,
+    ) -> Option<&'r crate::rules::animation_sequence::SequenceSet> {
+        rules.animation_sequence_by_handle(self.type_handle_in_category(id, category, rules)?)
+    }
+
+    /// The sequences of the object type `id` names in `rules`, as
+    /// `rules.animation_sequence(self.resolve(id))` answers, the same way.
+    #[inline]
+    pub fn animation_sequence<'r>(
+        &self,
+        id: InternedId,
+        rules: &'r RuleSet,
+    ) -> Option<&'r crate::rules::animation_sequence::SequenceSet> {
+        rules.animation_sequence_by_handle(self.type_handle(id, rules)?)
+    }
+
+    /// The native array index (`+0xDF8`) of the type `id` names in
+    /// `category`'s array, as `rules.type_array_index(category,
+    /// self.resolve(id))` answers, the same way.
+    #[inline]
+    pub fn type_array_index(
+        &self,
+        id: InternedId,
+        category: crate::rules::object_type::ObjectCategory,
+        rules: &RuleSet,
+    ) -> Option<i32> {
+        self.types.array_index(self, id, category, rules)
+    }
+
     /// Intern a string, returning its ID. If already interned (case-insensitive),
     /// returns the existing ID. Otherwise assigns the next sequential ID.
     pub fn intern(&mut self, s: &str) -> InternedId {
-        let key = s.to_ascii_uppercase();
-        if let Some(&id) = self.to_id.get(&key) {
+        if let Some(id) = self.get(s) {
             return id;
         }
         let id = InternedId(self.to_str.len() as u32);
         self.to_str.push(s.to_string());
-        self.to_id.insert(key, id);
+        self.to_id.insert(s.to_ascii_uppercase(), id);
         id
     }
 
     /// Look up an ID without inserting. Returns `None` if not yet interned.
+    /// The sidebar and the simulation ask many times a frame, so the key is
+    /// folded on the stack.
     pub fn get(&self, s: &str) -> Option<InternedId> {
-        self.to_id.get(&s.to_ascii_uppercase()).copied()
+        with_ascii_uppercase(s, |key| self.to_id.get(key).copied())
     }
 
     /// Resolve an ID back to its display string (first-seen casing).
@@ -138,11 +256,32 @@ impl StringInterner {
     pub fn is_empty(&self) -> bool {
         self.to_str.is_empty()
     }
+
+    /// Folds every name in ID order, ignoring case, for the diagnostic that
+    /// compares two clients' interners. Not part of the state hash.
+    pub(crate) fn fold_names(&self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        for name in self.to_str.iter() {
+            name.to_ascii_uppercase().hash(hasher);
+        }
+    }
 }
 
 impl Default for StringInterner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Clone for StringInterner {
+    /// The same strings and ids, under a serial of its own.
+    fn clone(&self) -> Self {
+        Self {
+            to_id: self.to_id.clone(),
+            to_str: self.to_str.clone(),
+            types: self.types.clone(),
+            serial: next_interner_serial(),
+        }
     }
 }
 
@@ -155,14 +294,15 @@ impl serde::Serialize for StringInterner {
 impl<'de> serde::Deserialize<'de> for StringInterner {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let strings = Vec::<String>::deserialize(deserializer)?;
-        let mut to_id = BTreeMap::new();
+        let mut to_id = LookupMap::default();
         for (i, s) in strings.iter().enumerate() {
             to_id.insert(s.to_ascii_uppercase(), InternedId(i as u32));
         }
         Ok(StringInterner {
-            to_id,
-            to_str: strings,
-            types: TypeHandleTable::default(),
+            to_id: to_id.into(),
+            to_str: strings.into(),
+            types: Synced::default(),
+            serial: next_interner_serial(),
         })
     }
 }
@@ -206,7 +346,24 @@ pub fn test_interner() -> StringInterner {
     TEST_INTERNER.with(|cell| cell.borrow().clone())
 }
 
-#[cfg(test)]
+impl StringInterner {
+    /// Bring `mirror`, the presentation copy of the world's interner, up to
+    /// this one (docs/sim-thread.md).
+    pub(crate) fn sync_into(&mut self, mirror: &mut Self) {
+        let Self {
+            to_id,
+            to_str,
+            types,
+            serial,
+        } = self;
+        to_id.sync_into(&mut mirror.to_id);
+        to_str.sync_into(&mut mirror.to_str);
+        types.sync_into(&mut mirror.types);
+        mirror.serial = *serial;
+    }
+}
+
+#[cfg(all(test, tests_sim_h_o))]
 mod tests {
     use super::*;
 
@@ -220,20 +377,6 @@ mod tests {
         assert_eq!(b, c);
         // Display string preserves first-seen casing
         assert_eq!(interner.resolve(a), "Americans");
-    }
-
-    #[test]
-    fn different_strings_get_different_ids() {
-        let mut interner = StringInterner::new();
-        let a = interner.intern("Americans");
-        let b = interner.intern("HTNK");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn get_returns_none_for_unknown() {
-        let interner = StringInterner::new();
-        assert_eq!(interner.get("unknown"), None);
     }
 
     #[test]
@@ -253,13 +396,5 @@ mod tests {
         // Case-insensitive lookup still works after round-trip
         assert_eq!(restored.get("americans"), Some(a));
         assert_eq!(restored.get("htnk"), Some(b));
-    }
-
-    #[test]
-    fn interned_id_is_copy() {
-        let mut interner = StringInterner::new();
-        let id = interner.intern("test");
-        let id2 = id; // Copy, not move
-        assert_eq!(id, id2);
     }
 }

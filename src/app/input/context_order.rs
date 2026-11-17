@@ -14,7 +14,8 @@ use crate::app::input::commands::preferred_local_owner;
 use crate::app::input::dispatch::{
     is_alt_held, is_ctrl_held, is_shift_held, selected_stable_ids_in_order,
 };
-use crate::app::input::entity_pick::{HoverTargetKindWithId, hover_target_at_point};
+use crate::app::input::entity_pick::{HoverObject, HoverTargetKindWithId, hover_object_at_point};
+use crate::app::match_runtime::sim_host::SimWrite;
 use crate::app::types::{HoverTargetKind, OrderMode};
 use crate::map::entities::EntityCategory;
 use crate::sim::combat::TargetKind;
@@ -37,7 +38,8 @@ use crate::sim::intern::InternedId;
 ///   mission to attack-move whenever the chord test passes. That test reads the
 ///   raw key state, so the chord still fires when Alt is also held — and because
 ///   the cancel has already cleared Ctrl, the Ctrl+Alt guard-area gate cannot.
-/// * **Ctrl+Alt → guard area** (patrol when the cell carries a waypoint).
+/// * **Ctrl+Alt → guard area.** Native's patrol answer for a cell holding a
+///   legacy House waypoint never fires in YR, which creates none.
 /// * **Shift alone.** On an object it returns the
 ///   add-to-selection action, which the object click handler has no case for and
 ///   therefore sends no mission; on a cell it returns the plain Move action, an
@@ -95,13 +97,26 @@ pub(crate) enum AttackAction {
     Attack,
     NoMove,
     Rally,
+    /// Move (1) over an object: an Aircraft's own Cell action under it
+    /// (`0x00417D7C`), which its ClickedAction sends to Foot's Move arm.
+    Move,
+    /// GuardArea (0x1A): a player's negative-damage Infantry turns Attack on
+    /// a Cell into this action (Infantry51F838..51F85B).
+    GuardArea,
+    /// AttackSupport (0x3B): a player's healing Unit's Attack on a Cell
+    /// (`0x007404FD..0x00740522`). SetCursorFromAction (`0x004AAE90`) has no
+    /// case for it, so it shows the arrow (row 0), and Foot's ClickedAction_Cell
+    /// (`0x004D7D50`) takes its default case (`0x004D8237`): the click is
+    /// consumed and sends nothing.
+    AttackSupport,
 }
 
-/// The allied-object part of Techno6FFEC0's unforced attack admission,
-/// 700314..7003D4. All consumers ask this through the existing action owner.
+/// Techno6FFEC0's disguise and real-owner admission,70025D..70041E.
+/// Native friendly-attack grants also override a disguise refusal.
+/// All consumers ask this through the existing action owner.
 /// IsAlly reads the real owner and the asking House's directional mask;
 /// display friendliness alone cannot decide whether to attack or select.
-fn friendly_attack_is_admitted(
+fn object_attack_is_admitted(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
     actor_id: u64,
@@ -113,8 +128,8 @@ fn friendly_attack_is_admitted(
         return false;
     };
     let Some(target) = sim.entities().get(target_id) else {
-        // House4F9A90 sees Terrain's null owner (Object4104A0), so
-        // the allied-only restrictions do not apply to a real Terrain.
+        // Terrain has no House (Object4104A0) and IsDisguisedTo426430
+        // returns false. Neither restriction applies to a real Terrain.
         return crate::sim::movement::ground_pose::target_get_coords(
             TargetKind::Entity(target_id),
             sim,
@@ -122,23 +137,43 @@ fn friendly_attack_is_admitted(
         )
         .is_some();
     };
-    if !combat_weapon::is_ally_by_object(
-        Some(&sim.house_alliances),
-        &sim.interner,
+    let allied = combat_weapon::is_ally_by_object(
+        Some(sim.house_alliances()),
+        sim.interner(),
         actor.owner(),
         target.owner(),
-    ) {
+    );
+    //70025D..70030F: this is the firing blink, not the reacquisition timer.
+    let disguise_admitted = rules.general.attack_cursor_on_disguise
+        || sim
+            .interner()
+            .object_type(target.type_ref(), rules)
+            .is_some_and(|target_type| target_type.perma_disguise)
+        || target
+            .disguise
+            .as_ref()
+            .is_some_and(|disguise| disguise.blink_remaining(sim.session().binary_frame()) != 0)
+        || !target.is_disguised_to(
+            actor.owner(),
+            Some(sim.fog()),
+            Some(sim.house_alliances()),
+            sim.interner(),
+        )
+        || (target
+            .disguise_house(true, sim.session().current_house(), false)
+            .is_none()
+            && sim.fires_at_terrain(actor_id, &TargetKind::Entity(target_id), rules, None));
+    if !allied && disguise_admitted {
         return true;
     }
-    let Some(kind) = sim.interner.object_type(actor.type_ref(), rules) else {
+    let Some(kind) = sim.interner().object_type(actor.type_ref(), rules) else {
         return false;
     };
     if kind.attacks_friendlies() {
         return true;
     }
     let cells = sim
-        .resolved_terrain
-        .as_ref()
+        .resolved_terrain()
         .map(crate::map::resolved_terrain::NativeCellQuery::isolated);
     let weapon = combat_weapon::select_weapon_against_in_query(
         rules,
@@ -147,22 +182,49 @@ fn friendly_attack_is_admitted(
         &combat_weapon::attacker_facts(actor, kind),
         Some(&TargetKind::Entity(target_id)),
         sim,
-        &sim.interner,
+        sim.interner(),
         cells.as_ref(),
-        Some(&sim.house_alliances),
+        Some(sim.house_alliances()),
     )
     .and_then(|(_, weapon)| weapon);
     let ivan_transport = weapon
         .as_ref()
         .is_some_and(|weapon| weapon.warhead.ivan_bomb)
         && sim
-            .interner
+            .interner()
             .object_type(target.type_ref(), rules)
             .is_some_and(|target| target.passengers > 0);
     (kind.attack_cursor_on_friendlies && !ivan_transport)
         || (weapon.as_ref().is_some_and(|weapon| weapon.warhead.sonic)
             && target.category() != EntityCategory::Structure
             && target.parasite.is_infested())
+}
+
+/// What_Action_OnObject's attack rung without Ctrl (`0x00700400..0x0070043E`)
+/// needs the object's type (vt+0x88) to be `LegalTarget=` (`+0x231`,
+/// `0x0070042E`) or TechnoClass vt+0x398 (asked at `0x007002EE`,
+/// [`Simulation::fires_at_terrain`]) to answer yes. For a Terrain object the
+/// type is its TerrainType (retail: only `VEINHOLE` is `LegalTarget=`); a
+/// Techno uses its own ObjectType byte.
+///
+/// [`Simulation::fires_at_terrain`]: crate::sim::world::Simulation::fires_at_terrain
+fn object_target_is_legal(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    actor_id: u64,
+    target_id: u64,
+) -> bool {
+    let legal_target = match sim.terrain_objects().get(target_id) {
+        Some(terrain) => rules
+            .terrain_object_type_case_insensitive(sim.interner().resolve(terrain.type_ref()))
+            .is_some_and(|terrain| terrain.legal_target),
+        None => sim.entities().get(target_id).is_some_and(|target| {
+            sim.interner()
+                .object_type_in_category(target.type_ref(), target.category().into(), rules)
+                .is_some_and(|kind| kind.legal_target)
+        }),
+    };
+    legal_target || sim.fires_at_terrain(actor_id, &TargetKind::Entity(target_id), rules, None)
 }
 
 /// The attack rung of the actor's What_Action and the tail it falls to.
@@ -184,30 +246,30 @@ fn friendly_attack_is_admitted(
 /// Cell target (`TechnoClass::What_Action_OnCell @ 0x00700600`): the rung is
 /// a human player's too (`0x007008A6..0x007008B3`), and the caller has asked
 /// the weapon ([`armed_action`]); control or range answers Attack
-/// (`0x007009F3..0x00700A44`), else 0. Any other house's object answers 0
-/// there (`0x00700AB7..0x00700AC4`).
+/// (`0x007009F3..0x00700A44`). A rejected rung continues at the Cell
+/// movement tail (`0x00700AB7`), which callers resolve through
+/// `cell_move_action` and `ordinary_cell_move_goal`. Any other house's object
+/// answers 0 there (`0x00700AB7..0x00700AC4`).
 ///
-/// This asks no ROF or reload. The class post-processing follows below. See
+/// Before that tail, a second rung (`0x00700A46..0x00700AA8`) answers Attack
+/// when vt+0x398 accepts the cell (an `IsARock=` overlay under a
+/// `TerrainFire=` weapon) and control or range holds; the unforced callers ask
+/// it with the first through [`Simulation::cell_attack_rung_admits`].
+///
+/// This asks no ROF or reload. Over an object a Foot's shroud rung comes
+/// next ([`shrouded_object_action`]); so far it is [`base_action`]. Then
+/// the class post-processing below. See
 /// the original DetermineAction/Unit/Foot/Techno and Display action corpus
 /// in tools/spatial_oracle/bunker_attack_action.json.
 ///
 /// The real-owner ally gate and its shared weapon/type grants are handled by
-/// [`friendly_attack_is_admitted`]. A different allied House therefore takes
+/// [`object_attack_is_admitted`]. A different allied House therefore takes
 /// the identity-sensitive tail, then the existing class postprocessing.
 ///
-/// RESIDUAL (#605): the rest of admission (`0x00700255..0x0070043E`) is not
-/// ported as one gate. Unforced, native also leaves the rung for:
-/// - an object disguised to the actor's house (vt+0xC8), unless that grant
-///   holds, `[Rules+0xD6C]` is set, its type is `PermaDisguise=` (`+0xD30`),
-///   its `+0x1EC`/`+0x1F4` timer runs, or it wears no house (vt+0xD0) and the
-///   weapon may fire at terrain (vt+0x398, `0x0070EF00`, `TerrainFire=`);
-/// - a type that is not `LegalTarget=` (`+0x231`), unless that terrain test
-///   passes.
+/// Unforced, an object target must pass [`object_target_is_legal`] and
+/// [`object_attack_is_admitted`]. Both cursor and click use that answer.
 ///
-/// Active YR Battle authors AttackCursorOnDisguise=yes, and SPY also authors
-/// PermaDisguise=yes: an ordinary stock Spy/Mirage is not evidence of a missed
-/// rejection. A layer disabling those grants or a non-LegalTarget type still
-/// requires the remaining admission. Those conditional paths remain open.
+/// [`Simulation::cell_attack_rung_admits`]: crate::sim::world::Simulation::cell_attack_rung_admits
 pub(crate) fn attack_action(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
@@ -216,49 +278,80 @@ pub(crate) fn attack_action(
     forced: bool,
     overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
 ) -> AttackAction {
+    let mut action = base_action(sim, rules, actor_id, target, forced, overlay_registry);
     let Some(actor) = sim.entities().get(actor_id) else {
-        return AttackAction::None;
+        return action;
     };
-    let Some(kind) = sim.interner.object_type(actor.type_ref(), rules) else {
-        return AttackAction::None;
+    let Some(kind) = sim.interner().object_type(actor.type_ref(), rules) else {
+        return action;
     };
     let human = sim.house_is_human_player(actor.owner());
-    let armed = crate::sim::combat::combat_weapon::is_armed(actor, kind);
+    let armed = crate::sim::combat::combat_weapon::is_armed(
+        actor,
+        kind,
+        sim.entities(),
+        rules,
+        sim.interner(),
+    );
     let infiltrator = actor.category() == EntityCategory::Infantry && kind.infiltrate;
-    let admitted = match target {
-        TargetKind::Entity(target_id) => {
-            human
-                && (armed || infiltrator)
-                && (forced || friendly_attack_is_admitted(sim, rules, actor_id, *target_id))
-        }
-        TargetKind::Cell(..) => human,
-    };
-    let mut action = if admitted
-        && (sim.techno_player_controllable(actor_id, rules)
-            || resolved_unit_in_range(
-                sim,
-                actor_id,
-                target,
-                Some(rules),
-                sim.resolved_terrain.as_ref(),
-                overlay_registry,
-                Some(target),
-            ))
-        && (forced || !shot_is_illegal(sim, rules, actor_id, target, overlay_registry))
+    let healing_weapon = human
+        && matches!(
+            actor.category(),
+            EntityCategory::Unit | EntityCategory::Infantry
+        )
+        && crate::sim::combat::combat_weapon::weapon_damage_value(
+            actor,
+            kind,
+            sim.entities(),
+            rules,
+            sim.interner(),
+        ) < 0;
+    let healing_unit = actor.category() == EntityCategory::Unit && healing_weapon;
+    // UnitClass::What_Action_OnCell 0x007404FD..0x00740522: a player's Unit
+    // whose GetWeaponDamageValue(-1) (0x006F3970) is negative, an IFV with an
+    // Engineer, turns Foot's Attack on a Cell into AttackSupport (0x3B), which
+    // every later Unit rung returns unchanged (0x0074072B..0x0074075F).
+    if action == AttackAction::Attack && healing_unit && matches!(target, TargetKind::Cell(..)) {
+        action = AttackAction::AttackSupport;
+    }
+    // gamemd.exe InfantryClass::What_Action_OnCell 0x0051F838..0x0051F85B:
+    // the same negative GetWeaponDamageValue(-1) instead answers GuardArea,
+    // before the deploy-fire rungs. Object healing has its own class ladder.
+    if action == AttackAction::Attack
+        && actor.category() == EntityCategory::Infantry
+        && healing_weapon
+        && matches!(target, TargetKind::Cell(..))
     {
-        AttackAction::Attack
-    } else if let TargetKind::Entity(target_id) = *target
-        && let Some(object) = sim.entities().get(target_id)
-        && !(armed && human && object.owner() != actor.owner())
-        && !(actor.is_mission_only() && actor.discovery.owned_by_current_house())
-        && sim.object_is_selectable(target_id, Some(rules))
-        && !object.selection.is_selected()
-        && !object.is_warped_out()
+        action = AttackAction::GuardArea;
+    }
+    // UnitClass::What_Action_OnObject's healer arm (0x0073FD7C)
+    // asks Is_Ally_ByObject (0x004F9A90), which refuses a Terrain object's
+    // null House, so the answer is 0 (0x00740115) and the Foot tail below
+    // makes it NoMove. A Techno target's healer arm is
+    // `Simulation::unit_repair_action`.
+    if healing_unit
+        && let TargetKind::Entity(target_id) = *target
+        && sim.terrain_objects().get(target_id).is_some()
     {
-        AttackAction::Select
-    } else {
-        AttackAction::None
-    };
+        action = AttackAction::None;
+    }
+    // UnitClass::What_Action_OnObject 0x0073FE48: a Unit that is not IsActive
+    // (0x007010D0; a Robot Tank without its control) turns Foot's Attack over
+    // an object into Move where it may crush it (a crusher, and
+    // Is_Crushable_By 0x005F6CD0), otherwise Select (0x0073FE3B).
+    if action == AttackAction::Attack
+        && actor.category() == EntityCategory::Unit
+        && let TargetKind::Entity(target_id) = *target
+        && !sim.techno_is_active(actor_id, rules)
+    {
+        action = if crate::sim::combat::veterancy::is_crusher(actor.veterancy.rank_kind(), kind)
+            && sim.object_crushable_by_unit(actor_id, target_id, rules)
+        {
+            AttackAction::Move
+        } else {
+            AttackAction::Select
+        };
+    }
     // Unit74077F..7407E5 /740389..7403E8: the fully deployed
     // SimpleDeployer repeats SelectWeapon(NULL), then range. This returns
     // Action2, unlike the Techno control/range Action0 branch above.
@@ -272,7 +365,31 @@ pub(crate) fn attack_action(
                 actor_id,
                 target,
                 Some(rules),
-                sim.resolved_terrain.as_ref(),
+                sim.resolved_terrain(),
+                overlay_registry,
+                None,
+            ))
+    {
+        action = AttackAction::NoMove;
+    }
+    // A player's Deployer= infantryman in Doing 27..30 (Type+0xEC8,
+    // +0x6C4) keeps Attack only for a DeployFire= type (+0x6AC) whose
+    // SelectWeapon(NULL) weapon reaches the target, else NoMove: over an
+    // object CanFireAt (vt+0x3A8, Infantry51EB81..51EC11), on a Cell
+    // IsCloseEnough3D (vt+0x164 0x6F7970, which asks CanFireAt on the Cell
+    // under the Cell's centre; Infantry51F8BB..51F94E).
+    if action == AttackAction::Attack
+        && actor.category() == EntityCategory::Infantry
+        && human
+        && kind.deployer
+        && actor.infantry_deploy_doing()
+        && (!kind.deploy_fire
+            || !resolved_unit_in_range(
+                sim,
+                actor_id,
+                target,
+                Some(rules),
+                sim.resolved_terrain(),
                 overlay_registry,
                 None,
             ))
@@ -292,12 +409,57 @@ pub(crate) fn attack_action(
     {
         action = AttackAction::None;
     }
-    // Over an object, the Unit and Infantry tails turn 0 into NoMove for a
-    // player's object it may control.
+    // Over an object, the Foot class tails turn 0 into another action: NoMove
+    // for a player's Unit or Infantry it may control, and an Aircraft's own
+    // Cell action under the object. The player's own object: its owner views.
     if action == AttackAction::None
-        && matches!(target, TargetKind::Entity(_))
-        && sim.foot_object_class_action(actor_id, crate::sim::world::MoveAction::None, rules)
-            == crate::sim::world::MoveAction::NoMove
+        && let TargetKind::Entity(target_id) = *target
+    {
+        action =
+            if aircraft_cell_attack_under_object(sim, rules, actor_id, target_id, overlay_registry)
+            {
+                AttackAction::Attack
+            } else {
+                match sim.foot_object_class_action(
+                    actor.owner(),
+                    actor_id,
+                    target_id,
+                    crate::sim::world::MoveAction::None,
+                    rules,
+                    overlay_registry,
+                ) {
+                    // Harvest is a Unit's Cell answer, never an object's.
+                    crate::sim::world::MoveAction::None
+                    | crate::sim::world::MoveAction::Harvest => AttackAction::None,
+                    crate::sim::world::MoveAction::Move => AttackAction::Move,
+                    crate::sim::world::MoveAction::NoMove => AttackAction::NoMove,
+                }
+            };
+    }
+    // Attack over an Immune= type (vt+0x88 +0x233) is NoMove at the end of
+    // the Unit (74041B..74049A) and Aircraft (417F4A..417F63) object
+    // actions. An Aircraft's ClickedAction refuses it (417C12); a Unit's
+    // moves to the object or a Cell near it (Foot4D74E0,
+    // Simulation::object_move_click). The Infantry tail (51F160..51F179)
+    // follows its C4, weapon-cursor and Ivan arms, so it is the last arm of
+    // infantry_attack_action.
+    // RESIDUAL: the Unit's Attack reaches 740486 only when vt+0x310
+    // (0x00700D10, 74041B..74042E) admits it, and is 0 otherwise. That test
+    // refuses a Unit in a tube (Foot +0x684 >= 0) whose vt+0x4E4
+    // (0x00736D50) answers yes, and a Unit whose vt+0x37C (0x00746C90)
+    // answers yes (`GameEntity::is_under_emp`): one under EMP or one counting
+    // down art `DeathFrames=`. Not ported. Stock EMP is UNREACHABLE:
+    // EMPulseClass::Apply (0x004C5718) is reached only from the unreferenced
+    // constructor 0x004C52B0. A death-counting Unit has Health 0 and cannot be
+    // selected (0x006F32D3). `DeployToFire=` is not in retail RULESMD, and
+    // for a human's Unit CanDeployNow needs it (its TickTank branch is
+    // computer-only), so that arm is DORMANT.
+    if action == AttackAction::Attack
+        && matches!(
+            actor.category(),
+            EntityCategory::Unit | EntityCategory::Aircraft
+        )
+        && target_is_immune(sim, rules, target)
     {
         action = AttackAction::NoMove;
     }
@@ -312,12 +474,10 @@ pub(crate) fn attack_action(
                 0,
                 sim.entities(),
                 rules,
-                &sim.interner,
+                sim.interner(),
             )
-            && (weapon
-                .projectile
-                .as_deref()
-                .and_then(|name| rules.projectile(name))
+            && (rules
+                .weapon_projectile(weapon)
                 .is_some_and(|projectile| !projectile.ag)
                 || kind.emp_pulse_cannon
                 || actor.mission.current().known()
@@ -325,14 +485,7 @@ pub(crate) fn attack_action(
         {
             action = AttackAction::None;
         }
-        if action == AttackAction::Attack
-            && let TargetKind::Entity(id) = *target
-            && sim
-                .entities()
-                .get(id)
-                .and_then(|target| sim.interner.object_type(target.type_ref(), rules))
-                .is_some_and(|target| target.immune)
-        {
+        if action == AttackAction::Attack && target_is_immune(sim, rules, target) {
             // Object447512..447527; the Cell wrapper has no such target.
             action = AttackAction::NoMove;
         }
@@ -346,6 +499,283 @@ pub(crate) fn attack_action(
         }
     }
     action
+}
+
+/// [`attack_action`] before the class rungs: Techno's rung and tail and,
+/// over an object, Foot's shroud rung. It is the answer each class
+/// What_Action over an object starts from (Unit `0x0073FD62`, Infantry
+/// `0x0051E44C`, Aircraft `0x00417CD3`), which Infantry's C4 and
+/// infiltration arms test for Attack (`cmp ebp,5` at `0x0051E9F1` and
+/// `0x0051EE62`, [`infantry_arm_attacks`]).
+pub(super) fn base_action(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    actor_id: u64,
+    target: &TargetKind,
+    forced: bool,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+) -> AttackAction {
+    let Some(actor) = sim.entities().get(actor_id) else {
+        return AttackAction::None;
+    };
+    // gamemd.exe TechnoClass::What_Action_OnCell @0x00700600 (700609)
+    // and What_Action_OnObject @0x006FFEC0 (6FFEC9) refuse berserk before
+    // modifier and weapon checks. The class wrappers own action 0's fallback.
+    if actor.berserk.is_active() {
+        return AttackAction::None;
+    }
+    let Some(kind) = sim.interner().object_type(actor.type_ref(), rules) else {
+        return AttackAction::None;
+    };
+    let human = sim.house_is_human_player(actor.owner());
+    let armed = crate::sim::combat::combat_weapon::is_armed(
+        actor,
+        kind,
+        sim.entities(),
+        rules,
+        sim.interner(),
+    );
+    let infiltrator = actor.category() == EntityCategory::Infantry && kind.infiltrate;
+    let admitted = match target {
+        TargetKind::Entity(target_id) => {
+            human
+                && (armed || infiltrator)
+                && (forced
+                    || (object_attack_is_admitted(sim, rules, actor_id, *target_id)
+                        && object_target_is_legal(sim, rules, actor_id, *target_id)))
+        }
+        TargetKind::Cell(..) => human,
+    };
+    // TechnoClass::What_Action_OnObject's tail (`0x0070056C..0x007005E6`):
+    // Select over an object the player may select that is not selected,
+    // unless an armed player's object points at another House's, or at its
+    // own loaner. The warp arm (`0x006FFF03..0x006FFF8A`) asks the same
+    // without the target's own warp test (`0x007005CD`).
+    let selects = |target_id: u64, warp_test: bool| {
+        sim.entities().get(target_id).is_some_and(|object| {
+            !(armed && human && object.owner() != actor.owner())
+                && !(actor.is_mission_only() && actor.discovery.owned_by_current_house())
+                && sim.object_is_selectable(target_id, rules)
+                && !object.selection.is_selected()
+                && !(warp_test && object.is_warped_out())
+        })
+    };
+    // An object being warped out (vt+0x1D4) answers before the attack rung:
+    // 0 on a Cell (`0x00700731`; warping in too, `0x00700743`), and over an
+    // object the tail's Select, else 0. The class tails below still run on
+    // the answer; none turns its 0 into NoMove, as the object is not
+    // controllable (vt+0xA0, `0x00700C40`), but a Building's Cell tail still
+    // answers its rally.
+    let warping =
+        actor.is_warped_out() || (actor.is_warping_in() && matches!(target, TargetKind::Cell(..)));
+    let mut action = if warping {
+        match *target {
+            TargetKind::Entity(target_id) if selects(target_id, false) => AttackAction::Select,
+            _ => AttackAction::None,
+        }
+    } else if admitted
+        && (sim.techno_player_controllable(actor_id, rules)
+            || resolved_unit_in_range(
+                sim,
+                actor_id,
+                target,
+                Some(rules),
+                sim.resolved_terrain(),
+                overlay_registry,
+                Some(target),
+            ))
+        && (forced || !shot_is_illegal(sim, rules, actor_id, target, overlay_registry))
+        // Ares3.0 hooks700536/7008D4 ->1004A460/1004A430 leave
+        // this rung for NoManualFire. Keep the original selection/Foot
+        // fallback below; a Unit's rejected object attack becomes NoMove,
+        // whose click still moves near the object. Do not gate CanFire or
+        // received simulation missions: auto-targeting/scripts bypass UI.
+        // Infantry's C4 and infiltration arms ask this Attack too
+        // ([`infantry_arm_attacks`]).
+        && !kind.no_manual_fire()
+    {
+        AttackAction::Attack
+    } else if let TargetKind::Entity(target_id) = *target
+        && selects(target_id, true)
+    {
+        AttackAction::Select
+    } else {
+        AttackAction::None
+    };
+    if action != AttackAction::None
+        && let TargetKind::Entity(target_id) = *target
+        && let Some(shrouded) =
+            shrouded_object_action(sim, rules, actor_id, target_id, overlay_registry)
+    {
+        action = match shrouded {
+            crate::sim::world::MoveAction::Move => AttackAction::Move,
+            crate::sim::world::MoveAction::NoMove => AttackAction::NoMove,
+            crate::sim::world::MoveAction::None | crate::sim::world::MoveAction::Harvest => {
+                AttackAction::None
+            }
+        };
+    }
+    action
+}
+
+/// Foot's shroud rung (`0x004DDED0`) for a nonzero answer over `object`, a
+/// Techno or Terrain object: in a campaign, where the local player's map
+/// shrouds the object's coordinate (the Map's own shroud, whoever owns the
+/// actor), Move or NoMove ([`Simulation::foot_object_shroud_action`]), which
+/// the Move-action class rungs then take
+/// ([`Simulation::foot_object_class_action`]). None where it does not apply.
+/// Techno's key answers ([`object_key_action`]) reach it as its other
+/// answers do ([`base_action`]).
+///
+/// [`Simulation::foot_object_shroud_action`]: crate::sim::world::Simulation::foot_object_shroud_action
+/// [`Simulation::foot_object_class_action`]: crate::sim::world::Simulation::foot_object_class_action
+fn shrouded_object_action(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    actor_id: u64,
+    object: u64,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+) -> Option<crate::sim::world::MoveAction> {
+    let player = sim.session().current_house()?;
+    let shrouded = sim.foot_object_shroud_action(player, actor_id, object, rules)?;
+    let owner = sim.entities().get(actor_id)?.owner();
+    Some(sim.foot_object_class_action(owner, actor_id, object, shrouded, rules, overlay_registry))
+}
+
+/// Whether Infantry's C4 and infiltration arms see Attack over `target_id`
+/// (`cmp ebp,5` at `0x0051E9F1` and `0x0051EE62`): no key rung answers
+/// ([`object_key_action`]; Ctrl+Shift+Alt's Move, as Shift clears Ctrl at
+/// `0x007000AC..0x007000B4`), and the unforced [`base_action`] is Attack, so
+/// they refuse where Techno's rung does (an ILLEGAL shot without the
+/// Infiltrate grant, `NoManualFire=`) or Foot's shroud rung answers Move or
+/// NoMove. Cursor and click ask it alike.
+pub(super) fn infantry_arm_attacks(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    actor_id: u64,
+    target_id: u64,
+    modifier: OrderModifier,
+    force_move_key: bool,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+) -> bool {
+    object_key_action(
+        sim,
+        rules,
+        actor_id,
+        target_id,
+        Some(target_id),
+        modifier,
+        force_move_key,
+    )
+    .is_none()
+        && base_action(
+            sim,
+            rules,
+            actor_id,
+            &TargetKind::Entity(target_id),
+            false,
+            overlay_registry,
+        ) == AttackAction::Attack
+}
+
+/// Whether an Aircraft's 0 over the object `target_id` becomes Attack. The
+/// Aircraft wrapper asks its own What_Action on the Cell under the object
+/// (`0x00417D7C..0x00417DCB`, [`Simulation::object_coords_cell`]): Aircraft
+/// `0x00417F80`, a human player's only, through Foot's shroud wrapper
+/// (`0x004DDDE0`) to Techno `0x00700600`, whose unforced Attack rung
+/// (`0x007008A6..0x007009F1`, [`Simulation::cell_attack_rung_admits`]) answers
+/// over a destroyable cliff or another house's Wall its `Wall=` warhead may hit
+/// (retail Harrier and Black Eagle warheads have it), and whose TerrainFire
+/// rung (`0x00700A46`) answers over an `IsARock=` overlay for a `TerrainFire=`
+/// weapon, each with the forced shot's tail at the Cell. A shrouded Cell takes
+/// the Attack back (`0x004DDE64..0x004DDEBE`). Aircraft `0x00417FB1` and
+/// `0x00417DCD` keep it only with a weapon in slot 0 (vt+0x3F8). The Immune
+/// rung then tests the object (`0x00417F4A`), and the click sends the Attack to
+/// Foot `0x004D74E0` as an attack on the object
+/// ([`object_attack_click_command`]).
+///
+/// RESIDUAL: the slot-0 test stands on the rung's current weapon. Trigger: an
+/// aircraft type with a Secondary but no Primary weapon (none in retail, whose
+/// aircraft all carry a Primary). Effect: Attack where native answers 0.
+///
+/// [`Simulation::object_coords_cell`]: crate::sim::world::Simulation::object_coords_cell
+/// [`Simulation::cell_attack_rung_admits`]: crate::sim::world::Simulation::cell_attack_rung_admits
+fn aircraft_cell_attack_under_object(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    actor_id: u64,
+    target_id: u64,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+) -> bool {
+    let Some(actor) = sim
+        .entities()
+        .get(actor_id)
+        .filter(|actor| actor.category() == EntityCategory::Aircraft)
+    else {
+        return false;
+    };
+    let Some(cell) = sim.object_coords_cell(target_id) else {
+        return false;
+    };
+    sim.clicked_cell_is_shrouded(actor.owner(), cell) == Ok(false)
+        && sim.cell_attack_rung_admits(actor_id, cell, rules, overlay_registry)
+        && attack_action(
+            sim,
+            rules,
+            actor_id,
+            &TargetKind::Cell(cell.0, cell.1),
+            true,
+            overlay_registry,
+        ) == AttackAction::Attack
+}
+
+/// Whether the cursor owner `actor_id`'s own What_Action decides a click or
+/// hover over the friendly object `target_id` ([`attack_action`]), rather
+/// than the friendly selection route. Every class's does. Over an own object
+/// that is not selected the Techno tail answers Select (7) as the selection
+/// route would. An armed human player's object over another house's object,
+/// an ally's too, answers 0 there (`0x0070056C..0x0070059B`), as it does
+/// over a selected object (`0x007005BF`). A Unit (`0x007403EB`) or an
+/// Infantryman (`0x0051F05E..0x0051F08B`) it may control turns that 0 into
+/// NoMove, an Aircraft into its Cell action (`0x00417D7C`), and a Building
+/// keeps it (`0x0044750D`), the arrow. A lone selected Aircraft over itself
+/// is Techno's Self (`0x007000B9..0x007000DF`), which an Aircraft carrying no
+/// passengers turns into 0 (`0x00417DCD..0x00417DF4`), so it keeps the
+/// selection route.
+pub(super) fn object_action_answers_friendly(
+    sim: &crate::sim::world::Simulation,
+    selected: &[u64],
+    actor_id: u64,
+    target_id: u64,
+) -> bool {
+    sim.entities().get(actor_id).is_some_and(|actor| {
+        actor.category() != EntityCategory::Aircraft || selected != [target_id]
+    })
+}
+
+/// The target is an object whose type (vt+0x88) is `Immune=` (`+0x233`),
+/// which every class's object action turns from Attack into NoMove: a
+/// Techno's, or a Terrain object's TerrainType.
+fn target_is_immune(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    target: &TargetKind,
+) -> bool {
+    let TargetKind::Entity(id) = *target else {
+        return false;
+    };
+    if let Some(target) = sim.entities().get(id) {
+        return sim
+            .interner()
+            .object_type(target.type_ref(), rules)
+            .is_some_and(|target| target.immune);
+    }
+    sim.terrain_objects()
+        .get(id)
+        .and_then(|terrain| {
+            rules.terrain_object_type_case_insensitive(sim.interner().resolve(terrain.type_ref()))
+        })
+        .is_some_and(|terrain| terrain.immune)
 }
 
 /// [`attack_action`] for an armed actor: the Ctrl branch (`forced`), and a
@@ -362,17 +792,23 @@ pub(crate) fn armed_action(
     overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
 ) -> Option<AttackAction> {
     let actor = sim.entities().get(actor_id)?;
-    let object = sim.interner.object_type(actor.type_ref(), rules)?;
+    let object = sim.interner().object_type(actor.type_ref(), rules)?;
     let armed = match target {
         TargetKind::Cell(..) => crate::sim::combat::combat_weapon::current_weapon(
             actor,
             object,
             sim.entities(),
             rules,
-            &sim.interner,
+            sim.interner(),
         )
         .is_some(),
-        TargetKind::Entity(_) => crate::sim::combat::combat_weapon::is_armed(actor, object),
+        TargetKind::Entity(_) => crate::sim::combat::combat_weapon::is_armed(
+            actor,
+            object,
+            sim.entities(),
+            rules,
+            sim.interner(),
+        ),
     };
     armed.then(|| attack_action(sim, rules, actor_id, target, forced, overlay_registry))
 }
@@ -398,25 +834,26 @@ pub(crate) fn resolved_unit_in_range(
         return crate::sim::combat::can_fire_at_target_in_query(
             sim,
             rules,
-            &sim.interner,
+            sim.interner(),
             actor_id,
             target,
             &cells,
-            Some(&sim.house_alliances),
+            Some(sim.house_alliances()),
             &crate::sim::combat::line_of_fire::LineOfFireInputs {
-                overlay_grid: sim.overlay_grid.as_ref(),
+                overlay_grid: sim.overlay_grid(),
                 overlay_registry,
-                alliances: Some(&sim.house_alliances),
+                alliances: Some(sim.house_alliances()),
+                buildings: Some(crate::sim::combat::line_of_fire::CellBuildings::of(sim)),
             },
             selection_target,
         );
     }
-    // Existing terrain-free test adapter; production maps take the native
-    // 3D owner above. No terrain-free parity is claimed.
+    // A world without resolved terrain takes the shared mapless answer;
+    // production maps take the native owner above.
     let Some(actor) = sim.entities().get(actor_id) else {
         return false;
     };
-    let Some(object) = sim.interner.object_type(actor.type_ref(), rules) else {
+    let Some(object) = sim.interner().object_type(actor.type_ref(), rules) else {
         return false;
     };
     let Some((index, _)) = crate::sim::combat::combat_weapon::select_weapon_against_in_query(
@@ -426,9 +863,9 @@ pub(crate) fn resolved_unit_in_range(
         &crate::sim::combat::combat_weapon::attacker_facts(actor, object),
         selection_target,
         sim,
-        &sim.interner,
+        sim.interner(),
         None,
-        Some(&sim.house_alliances),
+        Some(sim.house_alliances()),
     ) else {
         return false;
     };
@@ -438,31 +875,29 @@ pub(crate) fn resolved_unit_in_range(
         index,
         sim.entities(),
         rules,
-        &sim.interner,
+        sim.interner(),
     ) else {
         return false;
     };
-    let Some(point) = crate::sim::movement::ground_pose::target_get_coords(*target, sim, None)
-    else {
-        return false;
+    let techno = match *target {
+        TargetKind::Entity(id) => sim.entities().get(id),
+        TargetKind::Cell(..) => None,
     };
-    let (rx, ry, sub_x, sub_y) = (
-        (point.x / 256) as u16,
-        (point.y / 256) as u16,
-        crate::util::fixed_math::SimFixed::from_num(point.x % 256),
-        crate::util::fixed_math::SimFixed::from_num(point.y % 256),
-    );
-    let distance = crate::sim::combat::lepton_distance_sq_raw(
-        actor.position.rx(),
-        actor.position.ry(),
-        actor.position.sub_x(),
-        actor.position.sub_y(),
-        rx,
-        ry,
-        sub_x,
-        sub_y,
-    );
-    crate::sim::combat::is_within_range_leptons(distance, weapon.range_leptons)
+    let target = match techno {
+        Some(entity) => crate::sim::combat::MaplessTarget::Techno(entity),
+        None => match crate::sim::movement::ground_pose::target_get_coords(*target, sim, None) {
+            Some(point) => crate::sim::combat::MaplessTarget::Point(point),
+            None => return false,
+        },
+    };
+    crate::sim::combat::mapless_in_range(
+        actor,
+        target,
+        weapon,
+        rules,
+        sim.interner(),
+        Some(sim.entities()),
+    )
 }
 
 /// Resolved attack receiver batch. These are ephemeral input decisions;
@@ -472,6 +907,59 @@ struct AttackDispatch {
     commands: Vec<Command>,
     consumed: bool,
     select_fallback: bool,
+}
+
+/// The keys a healer's object action reads ([`crate::sim::world::HealArmKeys`]):
+/// Alt, the ForceMove binding (held for Ctrl+Alt too), and the admitted
+/// Ctrl+Alt GuardArea base action ([`object_key_action`]).
+pub(super) fn heal_arm_keys(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    actor: u64,
+    target: u64,
+    modifier: OrderModifier,
+    force_move_key: bool,
+) -> crate::sim::world::HealArmKeys {
+    crate::sim::world::HealArmKeys {
+        force_move: matches!(
+            modifier,
+            OrderModifier::ForceMove | OrderModifier::GuardArea
+        ) || (modifier == OrderModifier::AttackMove && force_move_key),
+        guard_area: object_key_action(
+            sim,
+            rules,
+            actor,
+            target,
+            Some(target),
+            modifier,
+            force_move_key,
+        ) == Some(ObjectKeyAction::GuardArea),
+    }
+}
+
+/// A healer's object action: a Unit's repair arm
+/// ([`crate::sim::world::Simulation::unit_repair_action`]) or, with `ares`,
+/// an Infantryman's Heal (`ares_infantry_heal_action`), which its
+/// ClickedAction (`0x0051F190`) sends as the same Attack.
+pub(super) fn healer_object_action(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    actor: u64,
+    target: u64,
+    issuing_house: InternedId,
+    keys: crate::sim::world::HealArmKeys,
+) -> Option<crate::sim::world::UnitRepairAction> {
+    if rules.ares()
+        && sim
+            .entities()
+            .get(actor)
+            .is_some_and(|actor| actor.category() == EntityCategory::Infantry)
+    {
+        return sim
+            .ares_infantry_heal_action(actor, target, issuing_house, keys, rules)
+            .map(|_| crate::sim::world::UnitRepairAction::Repair);
+    }
+    sim.unit_repair_action(actor, target, issuing_house, keys, rules)
 }
 
 /// Unit73FD7C's post-processing precedes the generic friendly selection and
@@ -514,14 +1002,17 @@ fn unit_repair_branch_orders(
     if friendly
         && matches!(modifier, OrderModifier::Normal | OrderModifier::AttackMove)
         && !cursor_owner(sim, rules, current_objects, target.stable_id).is_some_and(|id| {
-            sim.unit_repair_action(id, target.stable_id, issuing_house, rules)
+            let keys = heal_arm_keys(sim, rules, id, target.stable_id, modifier, force_move_key);
+            healer_object_action(sim, rules, id, target.stable_id, issuing_house, keys)
                 == Some(UnitRepairAction::Repair)
         })
     {
         return output;
     }
     for &id in receivers {
-        let Some(action) = sim.unit_repair_action(id, target.stable_id, issuing_house, rules)
+        let keys = heal_arm_keys(sim, rules, id, target.stable_id, modifier, force_move_key);
+        let Some(action) =
+            healer_object_action(sim, rules, id, target.stable_id, issuing_house, keys)
         else {
             continue;
         };
@@ -534,19 +1025,13 @@ fn unit_repair_branch_orders(
             UnitRepairAction::Repair => {
                 output.consumed = true;
                 // Repair29 replaced Ctrl+Alt's base action before the mission
-                // producer; it sends Attack1, not the legacy Guard adapter.
-                let attack_modifier = if modifier == OrderModifier::GuardArea {
-                    OrderModifier::Normal
-                } else {
-                    modifier
+                // producer; it sends Attack1, not a Guard.
+                let Some(command) =
+                    object_click_payload(sim, rules, order_mode, id, target.stable_id)
+                else {
+                    continue;
                 };
-                object_click_payload(
-                    order_mode,
-                    attack_modifier,
-                    entity_can_attack_move(sim, Some(rules), id),
-                    id,
-                    target.stable_id,
-                )
+                command
             }
             UnitRepairAction::Move => {
                 output.consumed = true;
@@ -575,48 +1060,129 @@ fn attack_branch_orders(
     selected_ids: &[u64],
     attack_target: TargetKind,
     force_fire: bool,
+    order_mode: OrderMode,
     overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
 ) -> AttackDispatch {
     let mut consumed_attack_action = false;
     let mut queued = Vec::new();
     let mut attack_receivers = std::collections::BTreeSet::new();
     let mut select_fallback = false;
+    // Over a Terrain object every receiver answers its own What_Action on
+    // the object, armed or not: there is no other object route to take.
+    let terrain =
+        matches!(attack_target, TargetKind::Entity(id) if sim.terrain_objects().get(id).is_some());
     for &id in selected_ids {
         let is_structure = sim
             .entities()
             .get(id)
             .is_some_and(|entity| entity.category() == EntityCategory::Structure);
-        if !(force_fire || is_structure) {
+        if !(force_fire || is_structure || terrain) {
             continue;
         }
-        if let TargetKind::Entity(target_id) = attack_target
+        let action = if terrain {
+            Some(attack_action(
+                sim,
+                rules,
+                id,
+                &attack_target,
+                force_fire,
+                Some(overlay_registry),
+            ))
+        } else {
+            armed_action(
+                sim,
+                rules,
+                id,
+                &attack_target,
+                force_fire,
+                Some(overlay_registry),
+            )
+        };
+        let Some(action) = action else {
+            continue;
+        };
+        if action == AttackAction::Rally {
+            continue;
+        }
+        // NoIvanBomb (`0x0051EB24`) is only reached from an Attack answer
+        // (`0x0051EA6F`, `0x0051EB33`); it orders nothing.
+        if action == AttackAction::Attack
+            && let TargetKind::Entity(target_id) = attack_target
             && ivan_cannot_bomb(sim, rules, id, target_id)
         {
             attack_receivers.insert(id);
             consumed_attack_action = true;
             continue;
         }
-        let Some(action) = armed_action(
-            sim,
-            rules,
-            id,
-            &attack_target,
-            force_fire,
-            Some(overlay_registry),
-        ) else {
-            continue;
-        };
-        if action == AttackAction::Rally {
+        if action == AttackAction::None && matches!(attack_target, TargetKind::Cell(..)) {
+            // Rejection of the attack rung still reaches Techno's Cell
+            // movement tail700AB7..700C08. Leave this receiver to the
+            // existing cell-move/harvest path below, including under Ctrl.
             continue;
         }
         attack_receivers.insert(id);
+        // Unit 0x738890, Infantry 0x51F190 and Aircraft 0x417BD0
+        // ClickedAction_Object hand an object click's 1 or 2 to Foot
+        // 0x4D74E0, which moves near the object, as the unforced click does
+        // (`object_attack_click_command`).
+        if let Some(move_action) = match action {
+            AttackAction::NoMove => Some(crate::sim::world::MoveAction::NoMove),
+            AttackAction::Move => Some(crate::sim::world::MoveAction::Move),
+            _ => None,
+        } && !is_structure
+            && let TargetKind::Entity(target_id) = attack_target
+        {
+            consumed_attack_action = true;
+            queued.extend(move_near_object(
+                sim,
+                rules,
+                order_mode,
+                id,
+                target_id,
+                move_action,
+            ));
+            continue;
+        }
         match action {
-            AttackAction::None | AttackAction::NoMove => consumed_attack_action = true,
+            AttackAction::None
+            | AttackAction::NoMove
+            | AttackAction::Move
+            | AttackAction::AttackSupport => consumed_attack_action = true,
             AttackAction::Rally => unreachable!("rally remains with its existing receiver"),
             AttackAction::Select => select_fallback = true,
+            AttackAction::GuardArea => {
+                consumed_attack_action = true;
+                // gamemd.exe FootClass::ClickedAction_Cell 0x004D7E35..0x004D7E8B:
+                // an armed Infantry's admitted GuardArea sends mission 11 with
+                // the clicked Cell as target and no destination. ClickedMission
+                // 0x006FFC09..0x006FFC23 only promotes Move/Attack, not AreaGuard.
+                if matches!(attack_target, TargetKind::Cell(..))
+                    && guard_area_admitted(sim, rules, id, None)
+                {
+                    queued.push(Command::Guard {
+                        entity_id: id,
+                        target: Some(attack_target),
+                    });
+                }
+            }
             AttackAction::Attack => {
                 consumed_attack_action = true;
                 let payload = match attack_target {
+                    // Under the attack-move chord or mode ClickedMission
+                    // promotes this Attack whatever its target
+                    // (`0x006FFC09..0x006FFC1E`): an attack-move with the
+                    // Cell as its target and no destination, the tokens Foot
+                    // ClickedAction_Cell sends (`0x004D80E9..0x004D80FF`).
+                    TargetKind::Cell(target_rx, target_ry)
+                        if order_mode == OrderMode::AttackMove
+                            && entity_can_attack_move(sim, Some(rules), id) =>
+                    {
+                        Command::AttackMove {
+                            entity_id: id,
+                            target: Some(TargetKind::Cell(target_rx, target_ry)),
+                            destination: None,
+                        }
+                    }
                     TargetKind::Cell(target_rx, target_ry) => Command::ForceAttackCell {
                         attacker_id: id,
                         target_rx,
@@ -625,21 +1191,17 @@ fn attack_branch_orders(
                     TargetKind::Entity(target_id) => {
                         match infantry_attack_action(sim, rules, id, target_id) {
                             Some(InfantryAttackAction::NoMove) => {
-                                let owner = sim.entities().get(id).expect("action actor").owner();
-                                let Some(destination) =
-                                    crate::app::input::commands::object_move_destination(
-                                        sim,
-                                        rules,
-                                        owner,
-                                        id,
-                                        target_id,
-                                        crate::sim::world::MoveAction::NoMove,
-                                        false,
-                                    )
-                                else {
+                                let Some(command) = move_near_object(
+                                    sim,
+                                    rules,
+                                    order_mode,
+                                    id,
+                                    target_id,
+                                    crate::sim::world::MoveAction::NoMove,
+                                ) else {
                                     continue;
                                 };
-                                move_click_command(sim, rules, OrderMode::Move, id, destination)
+                                command
                             }
                             Some(InfantryAttackAction::Infiltrate) => Command::CaptureBuilding {
                                 engineer_id: id,
@@ -653,10 +1215,14 @@ fn attack_branch_orders(
                                 select_fallback = true;
                                 continue;
                             }
-                            _ => Command::Attack {
-                                attacker_id: id,
-                                target_id,
-                            },
+                            _ => {
+                                let Some(command) =
+                                    object_click_payload(sim, rules, order_mode, id, target_id)
+                                else {
+                                    continue;
+                                };
+                                command
+                            }
                         }
                     }
                 };
@@ -670,6 +1236,23 @@ fn attack_branch_orders(
         consumed: consumed_attack_action,
         select_fallback,
     }
+}
+
+/// Foot `0x004D74E0` case 1 or 2 (`action`) for a forced object click: a
+/// Move near the object.
+fn move_near_object(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    order_mode: OrderMode,
+    id: u64,
+    target_id: u64,
+    action: crate::sim::world::MoveAction,
+) -> Option<Command> {
+    let owner = sim.entities().get(id)?.owner();
+    let destination = crate::app::input::commands::object_move_destination(
+        sim, rules, owner, id, target_id, action, false,
+    )?;
+    Some(move_click_command(sim, rules, order_mode, id, destination))
 }
 
 /// INI voice key for the mission a command commits.
@@ -703,7 +1286,10 @@ fn order_voice_key(command: &Command) -> Option<&'static str> {
             Some("VoiceMove")
         }
         Command::Attack { .. } | Command::ForceAttackCell { .. } => Some("VoiceAttack"),
-        Command::HarvestCell { .. } => Some("VoiceHarvest"),
+        Command::MegaMission {
+            mission: crate::sim::mission::MissionType::Harvest,
+            ..
+        } => Some("VoiceHarvest"),
         Command::MegaMission {
             mission: crate::sim::mission::MissionType::Enter,
             ..
@@ -713,11 +1299,11 @@ fn order_voice_key(command: &Command) -> Option<&'static str> {
             mission: crate::sim::mission::MissionType::Eaten,
             ..
         } => Some("VoiceSpecialAttack"),
-        Command::CaptureBuilding { .. } => Some("VoiceCapture"),
-        Command::MinerReturn { .. }
-        | Command::EnterTransport { .. }
-        | Command::RepairAtDepot { .. }
-        | Command::EnterBunker { .. } => Some("VoiceEnter"),
+        Command::CaptureBuilding { .. }
+        | Command::MegaMission {
+            mission: crate::sim::mission::MissionType::Capture,
+            ..
+        } => Some("VoiceCapture"),
         // Sabotage and area guard have no dedicated slot, so retail takes the
         // default branch and speaks a VoiceSpecialAttack line.
         Command::PlantC4 { .. } | Command::Guard { .. } => Some("VoiceSpecialAttack"),
@@ -744,18 +1330,17 @@ fn command_actor_id(command: &Command) -> Option<u64> {
         | Command::MoveToObject { entity_id, .. }
         | Command::AttackMove { entity_id, .. }
         | Command::Guard { entity_id, .. }
-        | Command::HarvestCell { entity_id, .. }
-        | Command::MinerReturn { entity_id, .. }
-        | Command::RepairAtDepot { entity_id, .. }
         | Command::ToggleInfantryDeploy { entity_id }
         | Command::DeployMcv { entity_id }
         | Command::UndeployBuilding { entity_id }
+        // BuildingClass::ClickedAction_Cell @ 0x004436F0 emits SELL16 after
+        // ARCHIVE1E; Selection @ 0x004AE750 keeps both at this actor's index.
+        | Command::SellBuilding { entity_id }
+        | Command::ArchiveObject { entity_id, .. }
         | Command::Stop { entity_id } => Some(*entity_id),
         Command::Attack { attacker_id, .. }
         | Command::ForceAttackCell { attacker_id, .. }
         | Command::PlantC4 { attacker_id, .. } => Some(*attacker_id),
-        Command::EnterTransport { passenger_id, .. } => Some(*passenger_id),
-        Command::EnterBunker { unit_id, .. } => Some(*unit_id),
         Command::CaptureBuilding { engineer_id, .. } => Some(*engineer_id),
         Command::UnloadPassengers { transport_id } => Some(*transport_id),
         Command::EjectBunker { bunker_id } => Some(*bunker_id),
@@ -769,12 +1354,13 @@ fn command_actor_id(command: &Command) -> Option<u64> {
 /// Capability batches may remove handled actors, but must not reorder their
 /// single-object events, including each prepared factory rally. Legacy aggregate
 /// commands cannot be placed at one actor's index and keep dispatcher order.
-/// This index derives from input selection.
+/// This index derives from input selection. A MoveFlash belongs to the first
+/// receiver and stays ahead of its order ([`push_move_flash`]).
 fn restore_selection_dispatch_order(queued: &mut [CommandEnvelope], selected: &[u64]) {
-    if queued
-        .iter()
-        .any(|envelope| command_actor_id(&envelope.payload).is_none())
-    {
+    if queued.iter().any(|envelope| {
+        command_actor_id(&envelope.payload).is_none()
+            && !matches!(envelope.payload, Command::MoveFlash { .. })
+    }) {
         return;
     }
     let positions: std::collections::HashMap<_, _> = selected
@@ -782,10 +1368,14 @@ fn restore_selection_dispatch_order(queued: &mut [CommandEnvelope], selected: &[
         .enumerate()
         .map(|(index, &id)| (id, index))
         .collect();
-    queued.sort_by_key(|envelope| {
-        command_actor_id(&envelope.payload)
-            .and_then(|id| positions.get(&id).copied())
-            .unwrap_or(usize::MAX)
+    queued.sort_by_key(|envelope| match envelope.payload {
+        Command::MoveFlash { .. } => (0, false),
+        _ => (
+            command_actor_id(&envelope.payload)
+                .and_then(|id| positions.get(&id).copied())
+                .unwrap_or(usize::MAX),
+            true,
+        ),
     });
 }
 
@@ -833,7 +1423,7 @@ fn emit_entity_order_voice(
     target: Option<TargetKind>,
 ) {
     if voice_field == "VoiceDeploy" {
-        if let Some(runtime) = state.match_state.sim_runtime.as_mut()
+        if let Some(runtime) = state.match_state.sim_runtime.write_sim(SimWrite::Command)
             && let Some(event) = crate::app::match_runtime::sound_dispatch::deploy_order_voice_event(
                 &mut runtime.simulation,
                 &runtime.resources.rules,
@@ -846,7 +1436,7 @@ fn emit_entity_order_voice(
         return;
     }
     if voice_field == "VoiceSpecialAttack" {
-        if let Some(runtime) = state.match_state.sim_runtime.as_mut()
+        if let Some(runtime) = state.match_state.sim_runtime.write_sim(SimWrite::Command)
             && let Some(event) =
                 crate::app::match_runtime::sound_dispatch::default_order_voice_event(
                     &mut runtime.simulation,
@@ -859,7 +1449,7 @@ fn emit_entity_order_voice(
         }
         return;
     }
-    let Some(runtime) = state.match_state.sim_runtime.as_mut() else {
+    let Some(runtime) = state.match_state.sim_runtime.write_sim(SimWrite::Command) else {
         return;
     };
     let Some(id) = runtime.simulation.order_voice_request(
@@ -902,6 +1492,8 @@ fn finish_order(
     state: &mut AppState,
     queued: Vec<CommandEnvelope>,
     speaker_id: Option<u64>,
+    rally_announce: bool,
+    clicked_cell: Option<(u16, u16)>,
 ) -> bool {
     let admitted = if state.match_state.input.planning.active() {
         let mut queued = queued;
@@ -909,66 +1501,91 @@ fn finish_order(
             state
                 .match_state
                 .sim_runtime
-                .as_ref()
+                .runtime()
                 .map(|rt| &rt.simulation),
             state.rules(),
             &state.match_state.input.selection_order,
             state.match_state.input.selection_order_pending,
         );
         restore_selection_dispatch_order(&mut queued, &selected);
-        crate::app::input::planning_mode::queue_orders(state, &selected, queued)
+        crate::app::input::planning_mode::queue_orders(state, &selected, queued, clicked_cell)
     } else {
-        let mut queued = if let Some(sim) = state
+        let mut queued = queued;
+        restore_selection_dispatch_order(
+            &mut queued,
+            &selected_stable_ids_in_order(
+                state
+                    .match_state
+                    .sim_runtime
+                    .runtime()
+                    .map(|rt| &rt.simulation),
+                state.rules(),
+                &state.match_state.input.selection_order,
+                state.match_state.input.selection_order_pending,
+            ),
+        );
+        // The local acknowledgement reads the resolved input order before
+        // encoding. Only the native record enters the gameplay queue.
+        let (encoded, feedback): (Vec<_>, Vec<_>) = if let Some(sim) = state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.simulation)
         {
             queued
                 .into_iter()
                 .filter_map(|envelope| {
-                    crate::app::input::commands::roundtrip_ordinary_local_megamission(sim, envelope)
+                    crate::app::input::commands::encode_ordinary_local_command(
+                        sim,
+                        envelope.clone(),
+                    )
+                    .map(|encoded| (encoded, envelope))
                 })
-                .collect::<Vec<_>>()
+                .unzip()
         } else {
-            queued
+            (queued.clone(), queued)
         };
-        if !queued.is_empty() {
-            restore_selection_dispatch_order(
-                &mut queued,
-                &selected_stable_ids_in_order(
-                    state
-                        .match_state
-                        .sim_runtime
-                        .as_ref()
-                        .map(|rt| &rt.simulation),
-                    state.rules(),
-                    &state.match_state.input.selection_order,
-                    state.match_state.input.selection_order_pending,
-                ),
-            );
-            if let Some(speaker_id) = speaker_id {
-                emit_resolved_order_voice(state, speaker_id, &queued);
-            }
+        let mut accepted = true;
+        if !encoded.is_empty() {
             if let Some(sim) = state
                 .match_state
                 .sim_runtime
-                .as_mut()
+                .write_sim(SimWrite::Command)
                 .map(|rt| &mut rt.simulation)
             {
-                sim.queue_commands(queued);
+                accepted = sim.issue_local_commands(encoded);
+            }
+            if accepted {
+                if let Some(speaker_id) = speaker_id {
+                    emit_resolved_order_voice(state, speaker_id, &feedback);
+                }
             }
         }
-        true
+        if !accepted {
+            super::messages::post_command_backpressure(state);
+        }
+        accepted
     };
+    // Building4437A3 passes announce=true to443860 in planning too.
+    // LeftUp4ABF78..4ABF8E refuses before dispatch; admitted clicks announce
+    // after the append attempt, including a full OutList or a missed search
+    // (4439DC/443A89 ->443A2B..443A69). Source: original gamemd.exe.
+    // Sim-scale deviation: a click VERA's larger queue refuses is not
+    // admitted, so it does not announce.
+    if admitted && rally_announce {
+        crate::app::input::dispatch::push_local_eva(
+            state,
+            crate::app::match_runtime::eva_producers::EVA_NEW_RALLY_POINT_ESTABLISHED,
+        );
+    }
     //4ABF94's admitted planning route joins the same70D150 suffix at
     //4ABFAE;4ABF8E's refusal exits4AC294 without restarting this timer.
     if admitted
         && let Some(frame) = state
             .match_state
             .sim_runtime
-            .as_ref()
-            .map(|rt| rt.simulation.session.binary_frame)
+            .runtime()
+            .map(|rt| rt.simulation.session().binary_frame())
     {
         state
             .match_state
@@ -1007,10 +1624,113 @@ pub(super) fn selection_can_attack_move(
         .all(|&sid| entity_can_attack_move(sim, rules, sid))
 }
 
+/// What Techno What_Action_OnObject's key rungs answer
+/// (`0x00700006..0x00700217`), for the cursor and the click alike, as
+/// Foot's shroud rung leaves them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ObjectKeyAction {
+    /// Shift's ToggleSelect (8, `0x00700107`). Over a Terrain object, which
+    /// cannot be selected, the release selects nothing and keeps the
+    /// selection.
+    ToggleSelect,
+    /// Ctrl+Alt's GuardArea (0x1A, `0x007001DD`, [`guard_area_admitted`]).
+    GuardArea,
+    /// Alt's Move (`0x007001E9..0x00700217`), in any chord. Foot
+    /// `0x004D74E0` moves the receiver to the object or near it.
+    Move,
+    /// Foot's shroud rung's NoMove for any of them ([`shrouded_object_action`]),
+    /// which `0x004D74E0` refuses for a type without `MoveToShroud=`
+    /// (`0x004D77BD..0x004D77EA`).
+    NoMove,
+}
+
+/// The key rungs of `actor_id`'s What_Action over `object`: `target` is the
+/// object as a Techno, or None for a Terrain object, which is no ally for the
+/// guard rung (`0x004F9A90` reads its vt+0x3C, TerrainClass's null house).
+/// They follow the berserk exit and warp arm (`0x006FFEC9`, `0x006FFF03`).
+/// Shift without Ctrl answers ToggleSelect for a player's object that is not
+/// mission-only (`0x007000EB..0x00700107`); Alt, Ctrl+Alt and Ctrl+Shift+Alt
+/// answer Move for a player's controllable object (vt+0xA0) once the guard
+/// rung refused. In a campaign a Foot's shroud rung then makes any of them
+/// Move or NoMove over an object whose coordinate the player's map shrouds
+/// ([`shrouded_object_action`]); Infantry tests for ToggleSelect only after
+/// it (`0x0051E44C`).
+/// None leaves the later rungs (for a Terrain object, plain, Ctrl and
+/// Ctrl+Shift: [`crate::app::input::cursor::terrain_object_feedback`]). A
+/// selected building's Move over a Terrain object then asks its own factory
+/// rungs (`0x004473F4..0x0044750B`, [`building_object_orders`]).
+pub(super) fn object_key_action(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    actor_id: u64,
+    object: u64,
+    target: Option<u64>,
+    modifier: OrderModifier,
+    force_move_key: bool,
+) -> Option<ObjectKeyAction> {
+    let actor = sim.entities().get(actor_id)?;
+    if actor.berserk.is_active() || actor.is_warped_out() {
+        return None;
+    }
+    let human = sim.house_is_human_player(actor.owner());
+    let alt = matches!(
+        modifier,
+        OrderModifier::ForceMove | OrderModifier::GuardArea
+    ) || (modifier == OrderModifier::AttackMove && force_move_key);
+    let action = if modifier == OrderModifier::Shift {
+        (human && !actor.is_mission_only()).then_some(ObjectKeyAction::ToggleSelect)
+    } else if modifier == OrderModifier::GuardArea
+        && target.is_some()
+        && guard_area_admitted(sim, rules, actor_id, target)
+    {
+        Some(ObjectKeyAction::GuardArea)
+    } else {
+        (alt && human && sim.techno_player_controllable(actor_id, rules))
+            .then_some(ObjectKeyAction::Move)
+    }?;
+    Some(
+        match shrouded_object_action(sim, rules, actor_id, object, None) {
+            Some(crate::sim::world::MoveAction::Move) => ObjectKeyAction::Move,
+            Some(_) => ObjectKeyAction::NoMove,
+            None => action,
+        },
+    )
+}
+
+/// Whether What_Action's later rungs over a Terrain object see Ctrl: it sets
+/// the forced flag even with Alt held (`0x00700048..0x00700072`), so Ctrl
+/// and Ctrl+Alt force, while Ctrl+Shift clears it for the Shift test
+/// (`0x007000AC..0x007000B4`).
+pub(super) fn terrain_forced(modifier: OrderModifier) -> bool {
+    matches!(
+        modifier,
+        OrderModifier::ForceFire | OrderModifier::GuardArea
+    )
+}
+
+/// The object under the click as [`object_key_action`] takes it: a Techno
+/// the player may see (`hover`; an enemy the player cannot see is no object
+/// to click) or a Terrain object, with the Techno's id as its target.
+fn object_key_target(
+    object: HoverObject,
+    hover: Option<&HoverTargetKindWithId>,
+) -> Option<(u64, Option<u64>)> {
+    match object {
+        HoverObject::Terrain(id) => Some((id, None)),
+        HoverObject::Techno(_) => hover
+            .filter(|target| target.kind != HoverTargetKind::HiddenEnemy)
+            .map(|target| (target.stable_id, Some(target.stable_id))),
+    }
+}
+
 /// Techno object700191..700217 / Cell700830..700894. The keyboard chord
-/// alone is not a Guard action. Object targets must be allied; bare ground
-/// requires IsActive7010D0. Waypoint/patrol input is not exposed by VERA.
-/// Shared by the hover and click producers; no simulation state is changed.
+/// alone is not a Guard action. Object targets must be allied and the actor
+/// no Aircraft (RTTI 2, 7001B4..7001BA); bare ground requires IsActive7010D0.
+/// The cell rung's patrol answer (0x33, `0x00700897`) needs a legacy House
+/// waypoint, which YR never creates (see `Simulation::cell_move_action`).
+/// A berserk object answers 0 before the rung (object `0x006FFEC9`, Cell
+/// `0x00700609`). Shared by the hover and click producers; no simulation
+/// state is changed.
 pub(super) fn guard_area_admitted(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
@@ -1020,24 +1740,62 @@ pub(super) fn guard_area_admitted(
     let Some(actor) = sim.entities().get(actor_id) else {
         return false;
     };
-    if !sim.house_is_human_player(actor.owner()) || !sim.techno_player_controllable(actor_id, rules)
+    if actor.berserk.is_active()
+        || !sim.house_is_human_player(actor.owner())
+        || !sim.techno_player_controllable(actor_id, rules)
     {
         return false;
     }
     match target_id {
+        // The ally test (`Is_Ally_ByObject @ 0x004F9A90`) has no identity
+        // check: in a group, Ctrl+Alt on a member guards that member.
         Some(target_id) => {
-            actor_id != target_id
-                && actor.category() != EntityCategory::Aircraft
+            actor.category() != EntityCategory::Aircraft
                 && sim.entities().get(target_id).is_some_and(|target| {
                     crate::map::houses::is_allied_with(
-                        &sim.house_alliances,
-                        sim.interner.resolve(actor.owner()),
-                        sim.interner.resolve(target.owner()),
+                        sim.house_alliances().as_map(),
+                        sim.interner().resolve(actor.owner()),
+                        sim.interner().resolve(target.owner()),
                     )
                 })
         }
         None => sim.techno_is_active(actor_id, rules),
     }
+}
+
+/// Techno What_Action on a Cell's Ctrl+Alt rung (`0x00700815..0x007008A3`):
+/// whether `actor_id` answers GuardArea (0x1A) on `cell`, ahead of the move
+/// rungs, as `viewer` sees it. The class wrappers then keep it, except:
+/// - over a shrouded Cell centre a Foot's wrapper turns it into Move or
+///   NoMove ([`Simulation::foot_cell_shroud_action`]), as the move rungs
+///   answer there;
+/// - a Building with a rally line turns it into Move (`0x0044774B`); any
+///   other Building's wrapper (`0x00447540`) keeps it, shroud or not.
+///
+/// The hover, the Foot click and the Building click all ask this.
+///
+/// [`Simulation::foot_cell_shroud_action`]: crate::sim::world::Simulation::foot_cell_shroud_action
+pub(super) fn cell_guard_area_action(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    actor_id: u64,
+    viewer: Option<InternedId>,
+    cell: (u16, u16),
+) -> bool {
+    let Some(actor) = sim.entities().get(actor_id) else {
+        return false;
+    };
+    let rewritten = if actor.category() == EntityCategory::Structure {
+        sim.interner()
+            .object_type(actor.type_ref(), rules)
+            .is_some_and(|object| object.has_rally_line())
+    } else {
+        viewer.is_some_and(|viewer| {
+            sim.foot_cell_shroud_action(viewer, actor_id, cell, rules)
+                .is_some()
+        })
+    };
+    !rewritten && guard_area_admitted(sim, rules, actor_id, None)
 }
 
 /// The order one receiver commits for a Move click's destination.
@@ -1081,61 +1839,71 @@ fn move_click_command(
 /// type predicate, and the event keeps the clicked object as its target
 /// (`0x004D76B1..0x004D76C1`). `Assign_Target_Command` stores it as MegaTarget
 /// and answers Attack, so the unit attacks it as an attack-mover; a member
-/// whose type refuses attack-move commits the plain attack.
-pub(crate) fn object_click_payload(
+/// whose type refuses attack-move commits the plain attack. A forced
+/// Attack is promoted too: in the attack-move mode (`0x00B0FE58`, set by
+/// `0x00731AF0`) `Is_Attack_Move_Chord_Active @ 0x00731BF0` passes before
+/// it reads any key, so Ctrl there attack-moves onto the object.
+fn object_click_payload(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
     order_mode: OrderMode,
-    modifier: OrderModifier,
-    can_attack_move: bool,
     attacker_id: u64,
     target_id: u64,
-) -> Command {
-    if modifier == OrderModifier::ForceFire {
-        return Command::Attack {
-            attacker_id,
-            target_id,
-        };
+) -> Option<Command> {
+    let actor = sim.entities().get(attacker_id)?;
+    // gamemd.exe InfantryClass::ClickedAction_Object 0x0051F190 (51F1C7)
+    // and UnitClass::ClickedAction_Object 0x00738890 (7388D5) reject self Attack.
+    if attacker_id == target_id
+        && matches!(
+            actor.category(),
+            EntityCategory::Infantry | EntityCategory::Unit
+        )
+    {
+        return None;
     }
-    if modifier == OrderModifier::GuardArea {
-        return Command::Guard {
-            entity_id: attacker_id,
-            target: Some(TargetKind::Entity(target_id)),
-        };
+    // gamemd.exe FootClass::ClickedAction_Object 0x004D769F..0x004D76C1:
+    // the resulting Attack5 asks IsActive7010D0 before ClickedMission.
+    // Infantry capture/sabotage return before this owner; Cell Attack4D80B1
+    // and Building44343C do not have this Foot gate. Never recheck on receipt.
+    if actor.category() != EntityCategory::Structure && !sim.techno_is_active(attacker_id, rules) {
+        return None;
     }
-    match order_mode {
-        OrderMode::AttackMove if can_attack_move => Command::AttackMove {
-            entity_id: attacker_id,
-            target: Some(TargetKind::Entity(target_id)),
-            destination: None,
-        },
+    Some(match order_mode {
+        OrderMode::AttackMove if entity_can_attack_move(sim, Some(rules), attacker_id) => {
+            Command::AttackMove {
+                entity_id: attacker_id,
+                target: Some(TargetKind::Entity(target_id)),
+                destination: None,
+            }
+        }
         _ => Command::Attack {
             attacker_id,
             target_id,
         },
-    }
+    })
 }
 
-/// The order one receiver commits for a click on another house's object:
-/// its own What_Action there, which the selection's click loop hands to its
-/// ClickedAction (`0x004AE829..0x004AE844`).
+/// The order one receiver commits for a click on another house's object,
+/// or an Alt or Ctrl+Alt click on any Techno: its own What_Action there,
+/// which the selection's click loop hands to its ClickedAction
+/// (`0x004AE829..0x004AE844`). The key rungs answer first
+/// ([`object_key_action`]).
 ///
 /// Unforced, that is [`attack_action`]'s answer. NoMove moves the receiver
 /// to the object or a Cell near it (Foot `0x004D74E0`), as an attack-move
 /// under the chord ([`Simulation::object_move_click`],
 /// [`move_click_command`]); Select and 0 order nothing.
 ///
-/// Attack, and any action under force fire, orders
-/// [`object_click_payload`]. What_Action decides Attack before
+/// Attack orders [`object_click_payload`]. What_Action decides Attack before
 /// ClickedMission promotes it to attack-move, so an unforced shot ILLEGAL to
 /// the receiver leaves no Attack to promote: its tail answers 0 or Select
 /// there ([`attack_action`]). A Crazy Ivan's Attack over an object he cannot
 /// bomb is NoIvanBomb (`0x0051EB24`), which orders nothing.
 ///
-/// RESIDUAL (#605): force fire orders the payload whatever the receiver.
-/// Trigger: Ctrl over an object with an unarmed receiver. Effect: VERA
-/// queues an Attack where native, whose attack rung admits an unarmed
-/// receiver under Ctrl too only as an `Infiltrate=` infantryman
-/// (`0x00700444..0x00700474`), selects the object or moves the receiver near
-/// it. Rare.
+/// Ctrl bypasses friendly/ILLEGAL rejection in the existing action owner,
+/// but still requires armed or Infiltrate admission (`700444..700474`).
+/// Its Select/NoMove tail remains the ordinary selection/movement path.
+/// Original controls: allied_object_action.json unarmed_object_controls.
 ///
 /// [`Simulation::object_move_click`]: crate::sim::world::Simulation::object_move_click
 fn object_attack_click_command(
@@ -1167,42 +1935,83 @@ fn object_attack_click_command(
             destination,
         ))
     };
-    if modifier == OrderModifier::GuardArea {
-        return if guard_area_admitted(sim, rules, attacker_id, Some(target_id)) {
-            Some(Command::Guard {
-                entity_id: attacker_id,
-                target: Some(TargetKind::Entity(target_id)),
-            })
-        } else {
-            move_near(crate::sim::world::MoveAction::Move)
-        };
-    }
-    if modifier != OrderModifier::ForceFire {
-        // Ordinary attack admission; Guard was classified above with hover.
-        match attack_action(
+    // The receiver's own key rungs ([`object_key_action`]) come before its
+    // attack rung: Ctrl+Alt's guard rung, else Alt's Move, which Foot's
+    // shroud rung may make NoMove. Shift's ToggleSelect belongs to the
+    // selection click, which handles it before this.
+    let key_action = if modifier == OrderModifier::Shift {
+        None
+    } else {
+        object_key_action(
             sim,
             rules,
             attacker_id,
-            &TargetKind::Entity(target_id),
-            false,
-            Some(overlay_registry),
-        ) {
-            // NoIvanBomb (`0x0051EB24`) orders nothing.
-            AttackAction::Attack if ivan_cannot_bomb(sim, rules, attacker_id, target_id) => {
-                return None;
-            }
-            AttackAction::Attack => {}
-            AttackAction::NoMove => {
-                return move_near(crate::sim::world::MoveAction::NoMove);
-            }
-            AttackAction::Select | AttackAction::None | AttackAction::Rally => return None,
+            target_id,
+            Some(target_id),
+            modifier,
+            force_move_key,
+        )
+    };
+    match key_action {
+        // Foot ClickedAction_Object's AreaGuard case (`0x004D7543`) asks
+        // IsActive (vt+0x9C, `0x007010D0`) first and orders nothing
+        // without it, so an unarmed member of the group stays put.
+        Some(ObjectKeyAction::GuardArea) => {
+            return sim
+                .techno_is_active(attacker_id, rules)
+                .then_some(Command::Guard {
+                    entity_id: attacker_id,
+                    target: Some(TargetKind::Entity(target_id)),
+                });
         }
+        Some(ObjectKeyAction::NoMove) => {
+            return move_near(crate::sim::world::MoveAction::NoMove);
+        }
+        Some(_) => return move_near(crate::sim::world::MoveAction::Move),
+        None => {}
+    }
+    // A receiver the player may not control (vt+0xA0) passes both key
+    // rungs (`0x00700191..0x00700217`) to the attack rung (`0x0070021A`),
+    // Ctrl still forcing it under Ctrl+Alt.
+    let forced = matches!(
+        modifier,
+        OrderModifier::ForceFire | OrderModifier::GuardArea
+    );
+    // Every other receiver asks its own action, including Ctrl; forcing
+    // does not invent Attack admission.
+    match attack_action(
+        sim,
+        rules,
+        attacker_id,
+        &TargetKind::Entity(target_id),
+        forced,
+        Some(overlay_registry),
+    ) {
+        // NoIvanBomb (`0x0051EB24`) orders nothing.
+        AttackAction::Attack if ivan_cannot_bomb(sim, rules, attacker_id, target_id) => {
+            return None;
+        }
+        AttackAction::Attack => {}
+        AttackAction::NoMove => {
+            return move_near(crate::sim::world::MoveAction::NoMove);
+        }
+        AttackAction::Move => return move_near(crate::sim::world::MoveAction::Move),
+        AttackAction::Select
+        | AttackAction::None
+        | AttackAction::Rally
+        | AttackAction::GuardArea
+        | AttackAction::AttackSupport => return None,
     }
     match infantry_attack_action(sim, rules, attacker_id, target_id) {
         Some(InfantryAttackAction::NoMove) => {
             return move_near(crate::sim::world::MoveAction::NoMove);
         }
         Some(InfantryAttackAction::Select) => return None,
+        // Residual (dormant): Foot's Capture and Sabotage cases
+        // (`0x004D7716`, `0x004D7788`) also refuse a receiver the player may
+        // not control (vt+0xA0); these arms do not ask. No retail Engineer,
+        // Spy or C4 infantryman can be bunkered, deactivated, paralysed or
+        // EMP'd, the states that reach the attack rung under Alt.
         Some(InfantryAttackAction::Infiltrate) => {
             return Some(Command::CaptureBuilding {
                 engineer_id: attacker_id,
@@ -1217,13 +2026,7 @@ fn object_attack_click_command(
         }
         _ => {}
     }
-    Some(object_click_payload(
-        order_mode,
-        modifier,
-        entity_can_attack_move(sim, Some(rules), attacker_id),
-        attacker_id,
-        target_id,
-    ))
+    object_click_payload(sim, rules, order_mode, attacker_id, target_id)
 }
 
 /// What `DisplayClass::BandBox_LeftUp @ 0x004AB9B0` does with the action
@@ -1254,7 +2057,12 @@ impl From<AttackAction> for ReleaseAction {
         match action {
             AttackAction::Select => Self::Select,
             AttackAction::None => Self::Zero,
-            AttackAction::Attack | AttackAction::NoMove | AttackAction::Rally => Self::Other,
+            AttackAction::Attack
+            | AttackAction::NoMove
+            | AttackAction::Rally
+            | AttackAction::Move
+            | AttackAction::GuardArea
+            | AttackAction::AttackSupport => Self::Other,
         }
     }
 }
@@ -1274,7 +2082,7 @@ fn left_release(
         ReleaseAction::Other => return LeftRelease::Dispatch,
         ReleaseAction::Select => target.is_some(),
         ReleaseAction::Zero => target.is_some_and(|id| {
-            sim.object_is_selectable(id, Some(rules))
+            sim.object_is_selectable(id, rules)
                 && sim
                     .entities()
                     .get(id)
@@ -1327,7 +2135,7 @@ fn berserk_selection_click(
         EntityCategory::Infantry => {
             hover.is_none()
                 && sim
-                    .interner
+                    .interner()
                     .object_type(best.type_ref(), rules)
                     .is_some_and(|object| object.jumpjet)
         }
@@ -1336,8 +2144,13 @@ fn berserk_selection_click(
     let action = if action_zero {
         ReleaseAction::Zero
     } else if hover.is_some_and(|target| {
-        sim.unit_repair_action(best_id, target.stable_id, issuing_house, rules)
-            == Some(crate::sim::world::UnitRepairAction::Select)
+        sim.unit_repair_action(
+            best_id,
+            target.stable_id,
+            issuing_house,
+            crate::sim::world::HealArmKeys::default(),
+            rules,
+        ) == Some(crate::sim::world::UnitRepairAction::Select)
     }) {
         ReleaseAction::Select
     } else {
@@ -1346,26 +2159,39 @@ fn berserk_selection_click(
     left_release(sim, rules, action, hover.map(|target| target.stable_id))
 }
 
-/// Attempt to issue a context-sensitive order at the given screen point.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ContextOrderTarget {
+    ScreenPoint(f32, f32),
+    Radar(crate::render::radar::NativeRadarInputTarget),
+}
+
+/// Attempt to issue a context-sensitive order at the given input target.
 ///
 /// Returns `true` when context dispatch consumed the click, including a refused
 /// event, and `false` when the click should fall through to selection handling.
 ///
 /// When `select_friendly_clicks` is true, clicks on friendly units/structures
 /// return `false` so the caller can treat them as selection clicks instead.
-pub(crate) fn try_queue_context_order_at_screen_point(
+pub(crate) fn try_queue_context_order(
     state: &mut AppState,
-    screen_x: f32,
-    screen_y: f32,
+    target: ContextOrderTarget,
     select_friendly_clicks: bool,
 ) -> bool {
-    if state.match_state.sim_runtime.is_none() {
+    if !state.match_state.sim_runtime.is_installed() {
         return false;
     }
-    let (world_x, world_y) =
-        crate::app::match_runtime::sim_tick::screen_point_to_world(state, screen_x, screen_y);
-    let (target_rx, target_ry) =
-        crate::app::match_runtime::sim_tick::screen_point_to_world_cell(state, screen_x, screen_y);
+    let (target_rx, target_ry) = match target {
+        ContextOrderTarget::ScreenPoint(x, y) => {
+            crate::app::match_runtime::sim_tick::screen_point_to_world_cell(state, x, y)
+        }
+        ContextOrderTarget::Radar(target) => target.cell,
+    };
+    let world_point = match target {
+        ContextOrderTarget::ScreenPoint(x, y) => Some(
+            crate::app::match_runtime::sim_tick::screen_point_to_world(state, x, y),
+        ),
+        ContextOrderTarget::Radar(_) => None,
+    };
     // Retail modifier map: Ctrl = force fire, Alt = force move,
     // Ctrl+Shift = attack move, Ctrl+Alt = guard area. Shift alone only makes a
     // Cell's What_Action answer Move — see `OrderModifier` for the full
@@ -1379,17 +2205,21 @@ pub(crate) fn try_queue_context_order_at_screen_point(
     // (`0x004D79EC..0x004D7A14`), whatever chord it is part of.
     let force_move_key = is_alt_held(state);
     let order_mode = state.match_state.input.queued_order_mode;
-    let owner: String = preferred_local_owner(state).unwrap_or_else(|| "Americans".to_string());
+    let Some(owner) = preferred_local_owner(state) else {
+        return false;
+    };
     let owner_id: InternedId = state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .map(|rt| &rt.simulation)
-        .and_then(|s| s.interner.get(&owner))
+        .and_then(|s| s.interner().get(&owner))
         .unwrap_or_default();
+    let translucent_viewer = state.match_state.sim_runtime.runtime().and_then(|rt| {
+        crate::app::presentation::instances::translucent_fog_viewer(state, &rt.simulation)
+    });
 
     let mut queued: Vec<CommandEnvelope> = Vec::new();
-    let mut consumed_order_mode = false;
     // The one object that speaks the order-ack line. Retail lets only the first
     // entry of the selection array speak.
     let mut speaker_id: Option<u64> = None;
@@ -1397,7 +2227,7 @@ pub(crate) fn try_queue_context_order_at_screen_point(
         state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.simulation),
         state.rules(),
         &state.match_state.input.selection_order,
@@ -1407,11 +2237,13 @@ pub(crate) fn try_queue_context_order_at_screen_point(
     // after the sim borrow below ends.
     let mut rally_announce = false;
     let mut consumed_attack_action = false;
+    let mut planning_cell = None;
+    let planning = state.match_state.input.planning.active();
 
-    if let Some(rt) = state.match_state.sim_runtime.as_mut() {
+    if let Some(rt) = state.match_state.sim_runtime.write_sim(SimWrite::Command) {
         let resources = &rt.resources;
         let sim = &mut rt.simulation;
-        let execute_tick = sim.session.tick;
+        let execute_tick = sim.session().tick();
         if selected_ids.is_empty() {
             return false;
         }
@@ -1420,10 +2252,9 @@ pub(crate) fn try_queue_context_order_at_screen_point(
         // selection's size see every selected object. Orders go only to the
         // objects whose ClickedAction can still send one.
         let current_objects = selected_ids;
-        let selected_ids = sim.click_order_receivers(&current_objects);
+        let selected_ids = sim.click_order_receivers(&current_objects, resources.rules.ares());
 
         let mut selected_units: Vec<u64> = Vec::new();
-        let mut selected_miner_ids: Vec<u64> = Vec::new();
 
         for &sid in &selected_ids {
             let Some(entity) = sim.entities().get(sid) else {
@@ -1431,42 +2262,69 @@ pub(crate) fn try_queue_context_order_at_screen_point(
             };
             if entity.category() != EntityCategory::Structure {
                 selected_units.push(sid);
-                if entity.miner.is_some() {
-                    selected_miner_ids.push(sid);
-                }
             }
         }
-        let hover = hover_target_at_point(
-            sim,
-            world_x,
-            world_y,
-            &owner,
-            state.match_state.sandbox_full_visibility,
-            Some(&resources.rules),
-            &state.match_state.match_presentation.height_map,
-            crate::app::match_runtime::sim_tick::tactical_bridge_cells(sim),
-        );
+        let hover_object = match target {
+            ContextOrderTarget::ScreenPoint(..) => {
+                let (world_x, world_y) = world_point.expect("tactical input has a world point");
+                hover_object_at_point(
+                    crate::app::input::entity_pick::PresentedWorld {
+                        sim,
+                        rules: Some(&resources.rules),
+                        translucent_viewer,
+                    },
+                    world_x,
+                    world_y,
+                    &owner,
+                    state.match_state.sandbox_full_visibility,
+                )
+            }
+            // Radar653C6A asks What_Action for the tracker identity returned
+            // by656750, never the tactical object at the camera-clamped cell.
+            ContextOrderTarget::Radar(target) => target
+                .tracker_hit
+                .and_then(|id| crate::app::input::entity_pick::hover_object_by_id(sim, id, &owner)),
+        };
+        let hover = hover_object.and_then(HoverObject::techno);
         // Techno700082 -> Action8 precedes Infantry/Unit class actions.
         // Let the selection consumer handle Shift over a visible object;
         // bare ground still reaches its immediate Move. Berserk-only groups
         // keep their native base-action-zero route below.
-        if modifier == OrderModifier::Shift
-            && !selected_ids.is_empty()
-            && hover
-                .as_ref()
-                .is_some_and(|target| target.kind != HoverTargetKind::HiddenEnemy)
-        {
+        let shift_key_action = hover_object
+            .and_then(|object| object_key_target(object, hover.as_ref()))
+            .filter(|_| modifier == OrderModifier::Shift && !selected_ids.is_empty())
+            .and_then(|(object, target)| {
+                let owner = cursor_owner(sim, &resources.rules, &current_objects, object)?;
+                object_key_action(
+                    sim,
+                    &resources.rules,
+                    owner,
+                    object,
+                    target,
+                    modifier,
+                    force_move_key,
+                )
+            });
+        if shift_key_action == Some(ObjectKeyAction::ToggleSelect) {
             return false;
         }
-        let cell_is_shrouded = crate::app::presentation::instances::cell_visibility_for_local_owner(
-            Some(owner_id),
-            Some(&sim.fog),
-            target_rx,
-            target_ry,
-            state.match_state.sandbox_full_visibility,
-            sim.resolved_terrain.as_ref(),
-        )
-            == crate::app::presentation::instances::CellVisibilityState::Shrouded;
+        // Selection__DispatchMultiUnitOrder clamps the shared Cell first
+        // (`0x004AE77E`, `Clamp_To_Playfield @ 0x00586E50`); every later
+        // receiver's What_Action and ClickedAction see it. Object hit-testing
+        // above keeps the raw screen-derived world point.
+        let (target_rx, target_ry) = sim.clamped_click_cell((target_rx, target_ry));
+        // Foot's Cell wrapper (`0x004DDDE0`): over the clicked Cell's centre,
+        // raised to a bridge deck, that the player's map shrouds, a Foot's
+        // Attack becomes Move or NoMove, which the Move rungs below answer; a
+        // Building keeps it (`0x00447540`). Nothing is shrouded under the
+        // sandbox's full visibility, as for the cursor.
+        let full_visibility = state.match_state.sandbox_full_visibility;
+        let foot_shrouded = |id: u64| {
+            !full_visibility
+                && sim
+                    .foot_cell_shroud_action(owner_id, id, (target_rx, target_ry), &resources.rules)
+                    .is_some()
+        };
         // The chord test fails — and the order resolves normally — unless every
         // selected object can accept an attack-move order. The walk covers the
         // whole selection, so a selected building or aircraft kills the chord.
@@ -1489,6 +2347,22 @@ pub(crate) fn try_queue_context_order_at_screen_point(
         {
             modifier = OrderModifier::Normal;
         }
+        // Foot's shroud rung makes Shift's answer Move or NoMove, as it does
+        // Alt's ([`object_key_action`]), and the release dispatches it: each
+        // receiver takes its own, as under Alt. Infantry's Engineer arms
+        // after the rung ignore its answer, so the Engineer prefixes below
+        // run as they do for Alt. The key rungs still see Shift
+        // (`key_modifier`): its rung admits a player's object that is no
+        // loaner, Alt's only one the player may control (vt+0xA0). A
+        // selected building's rungs read the force-move key itself
+        // ([`building_click_orders`]), so its Shift orders nothing.
+        let key_modifier = modifier;
+        if matches!(
+            shift_key_action,
+            Some(ObjectKeyAction::Move | ObjectKeyAction::NoMove)
+        ) {
+            modifier = OrderModifier::ForceMove;
+        }
         let shift_click: bool = modifier == OrderModifier::Shift;
         let force_fire: bool = modifier == OrderModifier::ForceFire;
         let force_move: bool = modifier == OrderModifier::ForceMove
@@ -1500,16 +2374,38 @@ pub(crate) fn try_queue_context_order_at_screen_point(
             modifier,
             OrderModifier::Normal | OrderModifier::Shift | OrderModifier::AttackMove
         );
-        // The ore/gem harvest action hangs off the *cell* action, which stays
-        // Move under Alt and under the cancelled chord but is replaced by force
-        // fire and guard area.
-        let cell_context_enabled: bool = !force_fire && modifier != OrderModifier::GuardArea;
         // A held chord overrides the sticky sidebar order mode for this click.
         let order_mode = match modifier {
             OrderModifier::AttackMove => OrderMode::AttackMove,
             _ => order_mode,
         };
 
+        if let Some(release) = ares_deactivated_selection_click(
+            sim,
+            &resources.rules,
+            &current_objects,
+            hover.as_ref(),
+            (target_rx, target_ry),
+        ) {
+            return match release {
+                // Detonate passes the ClickedAction refusal (0x4D74EC).
+                Err(bombed) => {
+                    if let Some(record) = sim.encode_detonate_record(bombed) {
+                        queued.push(CommandEnvelope::new(
+                            owner_id,
+                            execute_tick,
+                            Command::SynchronizedRecord { record },
+                        ));
+                    }
+                    finish_order(state, queued, None, rally_announce, None)
+                }
+                Ok(LeftRelease::Dispatch) => {
+                    finish_order(state, queued, speaker_id, rally_announce, None)
+                }
+                Ok(LeftRelease::Nothing) => true,
+                Ok(LeftRelease::Select) => false,
+            };
+        }
         if selected_ids.is_empty() {
             return match berserk_selection_click(
                 sim,
@@ -1519,7 +2415,9 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                 (target_rx, target_ry),
                 owner_id,
             ) {
-                LeftRelease::Dispatch => finish_order(state, queued, speaker_id),
+                LeftRelease::Dispatch => {
+                    finish_order(state, queued, speaker_id, rally_announce, None)
+                }
                 LeftRelease::Nothing => true,
                 LeftRelease::Select => false,
             };
@@ -1548,10 +2446,9 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                     .map(|payload| CommandEnvelope::new(owner_id, execute_tick, payload)),
             );
             selected_units.retain(|id| !repair_dispatch.receivers.contains(id));
-            selected_miner_ids.retain(|id| !repair_dispatch.receivers.contains(id));
             selected_ids.retain(|id| !repair_dispatch.receivers.contains(id));
             if selected_ids.is_empty() {
-                let sent = finish_order(state, queued, speaker_id);
+                let sent = finish_order(state, queued, speaker_id, rally_announce, None);
                 return sent || (consumed_attack_action && !repair_dispatch.select_fallback);
             }
         }
@@ -1595,7 +2492,7 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                 selected_units.retain(|id| !engineers.contains(id));
                 selected_ids.retain(|id| !engineers.contains(id));
                 if friendly || selected_units.is_empty() {
-                    return finish_order(state, queued, speaker_id);
+                    return finish_order(state, queued, speaker_id, rally_announce, None);
                 }
             }
         }
@@ -1625,7 +2522,55 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                             .is_some_and(|actor| actor.category() == EntityCategory::Structure)
                 });
                 if selected_ids.is_empty() {
-                    return finish_order(state, queued, speaker_id) || consumed_attack_action;
+                    return finish_order(state, queued, speaker_id, rally_announce, None)
+                        || consumed_attack_action;
+                }
+            }
+        }
+
+        if let Some(target) = hover.as_ref() {
+            let mut consumed = false;
+            selected_units.retain(|&id| {
+                if !vehicle_capture_action(
+                    sim,
+                    &resources.rules,
+                    id,
+                    target.stable_id,
+                    modifier,
+                    force_move_key,
+                ) {
+                    return true;
+                }
+                consumed = true;
+                // Foot4D7716 asks vt+A0 before publishing the Capture event.
+                if sim.techno_player_controllable(id, &resources.rules) {
+                    queued.push(CommandEnvelope::new(
+                        owner_id,
+                        execute_tick,
+                        Command::MegaMission {
+                            entity_id: id,
+                            mission: crate::sim::mission::MissionType::Capture,
+                            target: None,
+                            destination: Some(TargetKind::Entity(target.stable_id)),
+                        },
+                    ));
+                }
+                false
+            });
+            if consumed {
+                consumed_attack_action = true;
+                let remaining: std::collections::BTreeSet<_> =
+                    selected_units.iter().copied().collect();
+                selected_ids.retain(|id| {
+                    remaining.contains(id)
+                        || sim
+                            .entities()
+                            .get(*id)
+                            .is_some_and(|actor| actor.category() == EntityCategory::Structure)
+                });
+                if selected_ids.is_empty() {
+                    return finish_order(state, queued, speaker_id, rally_announce, None)
+                        || consumed_attack_action;
                 }
             }
         }
@@ -1633,79 +2578,119 @@ pub(crate) fn try_queue_context_order_at_screen_point(
         // Attack-capable Ctrl receivers, including fixed/occupied buildings,
         // resolve the same action as the cursor before the legacy rally/mobile
         // split. Non-attack capabilities keep their existing handlers below.
-        let attack_target = hover
-            .as_ref()
-            .map_or(TargetKind::Cell(target_rx, target_ry), |target| {
-                TargetKind::Entity(target.stable_id)
-            });
+        // Over a Terrain object the cursor owner's key rungs answer first
+        // ([`object_key_action`]): Alt's Move dispatches each receiver's own
+        // (a building's are its own orders below). When they refuse, as for
+        // a plain, Ctrl or Ctrl+Shift click, each receiver takes its
+        // What_Action on the object (`terrain_object_feedback` for the
+        // cursor).
+        let hover_terrain = match hover_object {
+            Some(HoverObject::Terrain(id)) => Some(id),
+            _ => None,
+        };
+        let terrain_target = hover_terrain.filter(|&terrain| {
+            cursor_owner(sim, &resources.rules, &current_objects, terrain).is_none_or(|owner| {
+                object_key_action(
+                    sim,
+                    &resources.rules,
+                    owner,
+                    terrain,
+                    None,
+                    key_modifier,
+                    force_move_key,
+                )
+                .is_none()
+            })
+        });
+        // Ctrl+Alt over a Terrain object whose key rungs refused still holds
+        // Ctrl for the later rungs ([`terrain_forced`]).
+        let object_forced = force_fire || (terrain_target.is_some() && terrain_forced(modifier));
+        let attack_target = match (hover_object, terrain_target) {
+            (Some(HoverObject::Techno(target)), _) => TargetKind::Entity(target.stable_id),
+            (_, Some(id)) => TargetKind::Entity(id),
+            _ => TargetKind::Cell(target_rx, target_ry),
+        };
         let enemy_object = hover.as_ref().is_some_and(|target| {
             matches!(
                 target.kind,
                 HoverTargetKind::EnemyUnit | HoverTargetKind::EnemyStructure
             )
         });
-        let cell_hidden =
-            force_fire && matches!(attack_target, TargetKind::Cell(..)) && cell_is_shrouded;
-        let attack_dispatch =
-            if !cell_hidden && (force_fire || (enemy_object && context_actions_enabled)) {
-                attack_branch_orders(
-                    sim,
-                    &resources.rules,
-                    &selected_ids,
-                    attack_target,
-                    force_fire,
-                    &resources.overlay_registry,
-                )
-            } else if let TargetKind::Cell(rx, ry) = attack_target
-                && !force_fire
-                && modifier != OrderModifier::GuardArea
-            {
-                // Each selected object's What_Action on the Cell reaches its
-                // unforced Attack rung on its own (0x004AE750's object loop);
-                // its tail is the forced shot's, and any other answer keeps
-                // the object on its Move rungs below. Foot's shroud wrapper
-                // (0x004DDE64..0x004DDEBE) takes a Foot's Attack back over a
-                // shrouded Cell; the Building wrapper keeps it.
-                let rung: Vec<u64> = selected_ids
-                    .iter()
-                    .copied()
-                    .filter(|&id| {
-                        (!cell_is_shrouded
-                            || sim.entities().get(id).is_some_and(|entity| {
-                                entity.category() == EntityCategory::Structure
-                            }))
-                            && sim.cell_attack_rung_admits(
-                                id,
-                                (rx, ry),
-                                &resources.rules,
-                                Some(&resources.overlay_registry),
-                            )
-                            && armed_action(
+        let cell_shot = force_fire && matches!(attack_target, TargetKind::Cell(..));
+        let attack_dispatch = if force_fire
+            || terrain_target.is_some()
+            || (enemy_object && context_actions_enabled)
+        {
+            // Foot's shroud wrapper takes a Foot's forced shot at a shrouded
+            // Cell back.
+            let receivers: Vec<u64> = selected_ids
+                .iter()
+                .copied()
+                .filter(|&id| !(cell_shot && foot_shrouded(id)))
+                .collect();
+            attack_branch_orders(
+                sim,
+                &resources.rules,
+                &receivers,
+                attack_target,
+                object_forced,
+                order_mode,
+                &resources.overlay_registry,
+            )
+        } else if let TargetKind::Cell(rx, ry) = attack_target
+            && !force_fire
+            && modifier != OrderModifier::GuardArea
+        {
+            // Each selected object's What_Action on the Cell reaches its
+            // unforced Attack rung on its own (0x004AE750's object loop);
+            // its tail is the forced shot's (Attack, a healing Unit's
+            // AttackSupport, or Infantry's GuardArea). Other answers keep the
+            // object on its Move rungs below, as does Foot's shroud wrapper.
+            let rung: Vec<u64> = selected_ids
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    !foot_shrouded(id)
+                        && sim.cell_attack_rung_admits(
+                            id,
+                            (rx, ry),
+                            &resources.rules,
+                            Some(&resources.overlay_registry),
+                        )
+                        && matches!(
+                            armed_action(
                                 sim,
                                 &resources.rules,
                                 id,
                                 &attack_target,
                                 true,
                                 Some(&resources.overlay_registry),
-                            ) == Some(AttackAction::Attack)
-                    })
-                    .collect();
-                attack_branch_orders(
-                    sim,
-                    &resources.rules,
-                    &rung,
-                    attack_target,
-                    true,
-                    &resources.overlay_registry,
-                )
-            } else {
-                AttackDispatch {
-                    receivers: std::collections::BTreeSet::new(),
-                    commands: Vec::new(),
-                    consumed: false,
-                    select_fallback: false,
-                }
-            };
+                            ),
+                            Some(
+                                AttackAction::Attack
+                                    | AttackAction::AttackSupport
+                                    | AttackAction::GuardArea
+                            )
+                        )
+                })
+                .collect();
+            attack_branch_orders(
+                sim,
+                &resources.rules,
+                &rung,
+                attack_target,
+                true,
+                order_mode,
+                &resources.overlay_registry,
+            )
+        } else {
+            AttackDispatch {
+                receivers: std::collections::BTreeSet::new(),
+                commands: Vec::new(),
+                consumed: false,
+                select_fallback: false,
+            }
+        };
         consumed_attack_action |= attack_dispatch.consumed;
         queued.extend(
             attack_dispatch
@@ -1715,19 +2700,35 @@ pub(crate) fn try_queue_context_order_at_screen_point(
         );
         let attack_receivers = attack_dispatch.receivers;
         let select_fallback = attack_dispatch.select_fallback;
+        if let TargetKind::Entity(target_id) = attack_target {
+            let receivers: Vec<u64> = attack_receivers.iter().copied().collect();
+            match object_click_release(
+                sim,
+                &resources.rules,
+                &current_objects,
+                &receivers,
+                target_id,
+                &resources.overlay_registry,
+                object_forced,
+            ) {
+                LeftRelease::Select => return false,
+                LeftRelease::Nothing => return true,
+                LeftRelease::Dispatch => {}
+            }
+        }
         // A blocked stationary actor cannot suppress another selected actor's
-        // accepted attack. If only Action7 remains, allow click-selection;
-        // Action0 instead consumes the click without issuing a move/attack.
+        // accepted attack. An owner this branch took has decided the release
+        // above; otherwise, with every receiver taken, Action7 alone allows
+        // click-selection and Action0 consumes the click.
         let selected_ids: Vec<_> = selected_ids
             .into_iter()
             .filter(|id| !attack_receivers.contains(id))
             .collect();
         if selected_ids.is_empty() {
-            let sent = finish_order(state, queued, speaker_id);
+            let sent = finish_order(state, queued, speaker_id, rally_announce, None);
             return sent || (consumed_attack_action && !select_fallback);
         }
         selected_units.retain(|id| !attack_receivers.contains(id));
-        selected_miner_ids.retain(|id| !attack_receivers.contains(id));
         let mobile_count = selected_units.len();
         let structure_selected = selected_ids.iter().any(|&id| {
             sim.entities()
@@ -1735,189 +2736,53 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                 .is_some_and(|entity| entity.category() == EntityCategory::Structure)
         });
 
-        let only_miners_selected = mobile_count > 0 && selected_miner_ids.len() == mobile_count;
-        let clicked_friendly_refinery_id = context_actions_enabled
-            .then(|| {
-                hover.as_ref().and_then(|target| {
-                    if target.kind != HoverTargetKind::FriendlyStructure {
-                        return None;
-                    }
-                    let rules = Some(&resources.rules)?;
-                    sim.entities().get(target.stable_id).and_then(|e| {
-                        rules
-                            .is_refinery_type(sim.interner.resolve(e.type_ref()))
-                            .then_some(target.stable_id)
-                    })
-                })
-            })
-            .flatten();
-        // Each miner's own What_Action over the refinery
-        // (`Selection__DispatchMultiUnitOrder` object loop): Enter only when
-        // the refinery's CAN_LOAD admits it (`0x0074017E`). A busy, unpowered
-        // or selling refinery leaves Select, and the click selects.
-        let entering_miners: Vec<u64> = clicked_friendly_refinery_id.map_or_else(Vec::new, |id| {
-            selected_miner_ids
-                .iter()
-                .copied()
-                .filter(|&miner| {
-                    sim.unit_building_click_action(miner, id, &resources.rules)
-                        == Some(crate::sim::world::BuildingClickAction::Enter)
-                })
-                .collect()
-        });
-        let clicked_friendly_refinery = !entering_miners.is_empty();
-
-        // Check if the clicked cell holds tiberium (ore/gems). The Unit
-        // harvest arms run only over a Cell the viewer has mapped
-        // (`0x007405DB..0x007405E6`); over shroud a miner moves. They are
-        // the Cell's What_Action, which DetermineAction asks only with no
-        // object under the cursor (`0x0069261B..0x00692655`).
-        let clicked_ore = cell_context_enabled
-            && hover
-                .as_ref()
-                .is_none_or(|target| target.kind == HoverTargetKind::HiddenEnemy)
-            && sim.clicked_cell_is_shrouded(owner_id, (target_rx, target_ry)) != Ok(true)
-            && match (
-                sim.overlay_grid.as_ref(),
+        // Each selected building answers its own What_Action in the click
+        // loops (`0x004AE829..0x004AE85A` over an object, `0x004AE95B..0x004AE990`
+        // on a Cell). Beside mobile receivers, theirs decide the release below.
+        if structure_selected && mobile_count > 0 {
+            let (orders, announce) = building_click_orders(
+                sim,
+                &resources.rules,
                 Some(&resources.overlay_registry),
-                Some(&resources.rules),
-            ) {
-                (Some(grid), Some(registry), Some(rules)) if !rules.tiberium_types.is_empty() => {
-                    crate::sim::tiberium::tiberium_cell_view(
-                        grid,
-                        registry,
-                        &rules.tiberium_types,
-                        (target_rx, target_ry),
-                    )
-                    .is_some()
-                }
-                _ => false,
-            };
+                &selected_ids,
+                owner_id,
+                hover.as_ref(),
+                hover_terrain,
+                (target_rx, target_ry),
+                modifier,
+                force_move_key,
+            );
+            queued.extend(
+                orders
+                    .into_iter()
+                    .map(|command| CommandEnvelope::new(owner_id, execute_tick, command)),
+            );
+            rally_announce |= announce;
+        }
 
-        if clicked_friendly_refinery && only_miners_selected {
-            for stable_id in entering_miners {
-                queued.push(CommandEnvelope::new(
-                    owner_id,
-                    execute_tick,
-                    Command::MinerReturn {
-                        entity_id: stable_id,
-                        target_refinery_id: clicked_friendly_refinery_id,
-                    },
-                ));
-            }
-            // The manual return order commits mission Enter, so its ack is the
-            // VoiceEnter slot (e.g. CMIN ChronoMinerReturn) — resolved from the
-            // command itself by `order_voice_key`.
-        } else if clicked_ore && !selected_miner_ids.is_empty() {
-            // Direct miners to harvest the clicked ore cell.
-            for &stable_id in &selected_miner_ids {
-                queued.push(CommandEnvelope::new(
-                    owner_id,
-                    execute_tick,
-                    Command::HarvestCell {
-                        entity_id: stable_id,
-                        target_rx,
-                        target_ry,
-                    },
-                ));
-            }
-            // The harvest order commits mission Harvest, so its ack is the
-            // VoiceHarvest slot (e.g. CMIN ChronoMinerHarvest); a non-miner in
-            // the same selection commits Move and would speak VoiceMove.
-            // Non-miner units in selection just move to that cell, through the
-            // same 4DE1D0 cell receiver as an ordinary Move click.
-            for &stable_id in &selected_units {
-                if !selected_miner_ids.contains(&stable_id) {
-                    let Some(goal) = crate::app::input::commands::ordinary_cell_move_goal(
-                        sim,
-                        &resources.rules,
-                        Some(&resources.overlay_registry),
-                        owner_id,
-                        stable_id,
-                        (target_rx, target_ry),
-                        shift_click,
-                    ) else {
-                        continue;
-                    };
-                    queued.push(CommandEnvelope::new(
-                        owner_id,
-                        execute_tick,
-                        Command::Move {
-                            entity_id: stable_id,
-                            target_rx: goal.0,
-                            target_ry: goal.1,
-                        },
-                    ));
-                }
-            }
-        } else if structure_selected {
-            let clicked_friendly = hover.as_ref().is_some_and(|target| {
-                matches!(
-                    target.kind,
-                    HoverTargetKind::FriendlyUnit | HoverTargetKind::FriendlyStructure
-                )
-            });
-            if context_actions_enabled
-                && let Some(cmd) = self_click_command(
-                    sim,
-                    &resources.rules,
-                    owner_id,
-                    &current_objects,
-                    hover.as_ref(),
-                )
-            {
-                queued.push(CommandEnvelope::new(owner_id, execute_tick, cmd));
-                return finish_order(state, queued, speaker_id);
-            }
-            if select_friendly_clicks && clicked_friendly && context_actions_enabled {
-                return if consumed_attack_action {
-                    finish_order(state, queued, speaker_id)
-                } else {
-                    false
-                };
-            }
-            {
-                let (orders, announce) = building_cell_orders(
-                    sim,
-                    &resources.rules,
-                    &selected_ids,
-                    owner_id,
-                    (target_rx, target_ry),
-                );
-                queued.extend(
-                    orders
-                        .into_iter()
-                        .map(|command| CommandEnvelope::new(owner_id, execute_tick, command)),
-                );
-                rally_announce |= announce;
-                // Also issue Move commands for any mobile units in the
-                // selection — RA2 moves units AND sets rally when both
-                // are selected.
-                if mobile_count > 0 {
-                    for &stable_id in &selected_units {
-                        // Each mobile resolves the clicked cell through its
-                        // own 4DE1D0 receiver, as for an ordinary Move click.
-                        let Some(goal) = crate::app::input::commands::ordinary_cell_move_goal(
-                            sim,
-                            &resources.rules,
-                            Some(&resources.overlay_registry),
-                            owner_id,
-                            stable_id,
-                            (target_rx, target_ry),
-                            shift_click,
-                        ) else {
-                            continue;
-                        };
-                        queued.push(CommandEnvelope::new(
-                            owner_id,
-                            execute_tick,
-                            Command::Move {
-                                entity_id: stable_id,
-                                target_rx: goal.0,
-                                target_ry: goal.1,
-                            },
-                        ));
-                    }
+        if structure_selected && mobile_count == 0 {
+            match building_selection_click(
+                sim,
+                &resources.rules,
+                &resources.overlay_registry,
+                &current_objects,
+                &selected_ids,
+                owner_id,
+                hover.as_ref(),
+                hover_terrain,
+                (target_rx, target_ry),
+                modifier,
+                force_move_key,
+            ) {
+                BuildingClick::Select => return false,
+                BuildingClick::Nothing => return true,
+                BuildingClick::Orders(orders, announce) => {
+                    queued.extend(
+                        orders
+                            .into_iter()
+                            .map(|command| CommandEnvelope::new(owner_id, execute_tick, command)),
+                    );
+                    rally_announce |= announce;
                 }
             }
         } else {
@@ -1925,9 +2790,15 @@ pub(crate) fn try_queue_context_order_at_screen_point(
             // Forced Attack uses the same suffix in attack_branch_orders.
             let mut consumed_building_action = false;
             if context_actions_enabled && let Some(target) = hover.as_ref() {
-                if let Some(orders) =
-                    infiltrator_capture_orders(sim, &resources.rules, &mut selected_units, target)
-                {
+                if let Some(orders) = infiltrator_capture_orders(
+                    sim,
+                    &resources.rules,
+                    Some(&resources.overlay_registry),
+                    &mut selected_units,
+                    target,
+                    key_modifier,
+                    force_move_key,
+                ) {
                     consumed_building_action = true;
                     queued.extend(
                         orders
@@ -1936,24 +2807,64 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                     );
                 }
                 if consumed_building_action && selected_units.is_empty() {
-                    return finish_order(state, queued, speaker_id);
+                    return finish_order(state, queued, speaker_id, rally_announce, None);
                 }
             }
 
-            if context_actions_enabled && let Some(target) = hover.as_ref() {
-                let orders = transport_entry_orders(
+            // The passenger rows take Alt's Move too, and Ctrl's tail for an
+            // unarmed receiver; the objects they leave take the force-move or
+            // the forced click below.
+            let mut consumed_entry_action = false;
+            if (context_actions_enabled || force_move || force_fire)
+                && let Some(target) = hover.as_ref()
+                && let Some(orders) = entry_orders(
+                    sim,
+                    &resources.rules,
+                    &current_objects,
+                    &mut selected_units,
+                    target,
+                    key_modifier,
+                    force_move_key,
+                    Some(&resources.overlay_registry),
+                )
+            {
+                consumed_building_action = true;
+                consumed_entry_action = true;
+                queued.extend(
+                    orders
+                        .into_iter()
+                        .map(|command| CommandEnvelope::new(owner_id, execute_tick, command)),
+                );
+                if selected_units.is_empty() {
+                    return finish_order(state, queued, speaker_id, rally_announce, None);
+                }
+            }
+
+            // The garrison arm runs under Alt too ([`infantry_garrisons`]);
+            // there the other receivers take Alt's Move below.
+            if let Some(target) = hover.as_ref() {
+                let orders = garrison_entry_orders(
                     sim,
                     &resources.rules,
                     &selected_units,
                     target.stable_id,
+                    key_modifier,
+                    force_move_key,
                 );
                 if !orders.is_empty() {
+                    selected_units.retain(|&id| {
+                        !orders.iter().any(|order| {
+                            matches!(order, Command::CaptureBuilding { engineer_id, .. } if *engineer_id == id)
+                        })
+                    });
                     queued.extend(
                         orders
                             .into_iter()
                             .map(|command| CommandEnvelope::new(owner_id, execute_tick, command)),
                     );
-                    return finish_order(state, queued, speaker_id);
+                    if !force_move || selected_units.is_empty() {
+                        return finish_order(state, queued, speaker_id, rally_announce, None);
+                    }
                 }
             }
 
@@ -1963,7 +2874,16 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                     .iter()
                     .copied()
                     .filter(|&id| {
-                        infantry_c4_action(sim, &resources.rules, id, target, false)
+                        let attacks = infantry_arm_attacks(
+                            sim,
+                            &resources.rules,
+                            id,
+                            target.stable_id,
+                            key_modifier,
+                            force_move_key,
+                            Some(&resources.overlay_registry),
+                        );
+                        infantry_c4_action(sim, &resources.rules, id, target, attacks)
                             == Some(InfantryC4Action::Sabotage)
                     })
                     .collect();
@@ -1978,84 +2898,7 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                             },
                         ));
                     }
-                    return finish_order(state, queued, speaker_id);
-                }
-            }
-
-            // Service depot: damaged own vehicles clicking an own UnitRepair
-            // building drive to the depot and auto-repair. Ordered before the
-            // friendly-fallthrough so the click isn't consumed as re-selection.
-            if context_actions_enabled {
-                let depot_target = hover.as_ref().and_then(|target| {
-                    if !matches!(target.kind, HoverTargetKind::FriendlyStructure) {
-                        return None;
-                    }
-                    let rules = Some(&resources.rules)?;
-                    let building = sim.entities().get(target.stable_id)?;
-                    let obj = sim.interner.object_type(building.type_ref(), rules)?;
-                    obj.unit_repair.then_some(target.stable_id)
-                });
-                if let Some(depot_id) = depot_target {
-                    let repair_ids: Vec<u64> = selected_units
-                        .iter()
-                        .copied()
-                        .filter(|&sid| {
-                            sim.entities().get(sid).is_some_and(|e| {
-                                e.category() == EntityCategory::Unit
-                                    && sim
-                                        .interner
-                                        .object_type(e.type_ref(), &resources.rules)
-                                        .is_some_and(|obj| e.health.current() < obj.strength)
-                                    && !e.is_deployed()
-                            })
-                        })
-                        .collect();
-                    if !repair_ids.is_empty() {
-                        for unit_id in repair_ids {
-                            queued.push(CommandEnvelope::new(
-                                owner_id,
-                                execute_tick,
-                                Command::RepairAtDepot {
-                                    entity_id: unit_id,
-                                    depot_id,
-                                },
-                            ));
-                        }
-                        return finish_order(state, queued, speaker_id);
-                    }
-                }
-            }
-
-            // Tank bunker: an own bunkerable vehicle clicking an own EMPTY tank
-            // bunker installs into it. The bunker holds one unit, so only the
-            // first eligible vehicle is sent. Occupied bunkers are ejected via
-            // the self-click path below.
-            if context_actions_enabled {
-                let bunker_target = hover.as_ref().and_then(|target| {
-                    if !matches!(target.kind, HoverTargetKind::FriendlyStructure) {
-                        return None;
-                    }
-                    let building = sim.entities().get(target.stable_id)?;
-                    (building.bunker_runtime.is_some() && building.bunker.occupant().is_none())
-                        .then_some(target.stable_id)
-                });
-                if let Some(bunker_id) = bunker_target {
-                    let unit_id = selected_units.iter().copied().find(|&sid| {
-                        sim.entities().get(sid).is_some_and(|e| !e.is_deployed())
-                            && Some(&resources.rules).is_some_and(|rules| {
-                                crate::sim::docking::bunker_link::can_auto_deploy_here(
-                                    sim, sid, rules,
-                                )
-                            })
-                    });
-                    if let Some(unit_id) = unit_id {
-                        queued.push(CommandEnvelope::new(
-                            owner_id,
-                            execute_tick,
-                            Command::EnterBunker { unit_id, bunker_id },
-                        ));
-                        return finish_order(state, queued, speaker_id);
-                    }
+                    return finish_order(state, queued, speaker_id, rally_announce, None);
                 }
             }
 
@@ -2065,17 +2908,67 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                     HoverTargetKind::FriendlyUnit | HoverTargetKind::FriendlyStructure
                 )
             });
+            if let Some(target) = hover.as_ref()
+                && self_detonates(sim, &resources.rules, &current_objects, target.stable_id)
+                && let Some(record) = sim.encode_detonate_record(target.stable_id)
+            {
+                queued.push(CommandEnvelope::new(
+                    owner_id,
+                    execute_tick,
+                    Command::SynchronizedRecord { record },
+                ));
+                return finish_order(state, queued, None, rally_announce, None);
+            }
             if context_actions_enabled
                 && let Some(cmd) = self_click_command(
                     sim,
                     &resources.rules,
+                    Some(&resources.overlay_registry),
                     owner_id,
                     &current_objects,
                     hover.as_ref(),
+                    planning,
                 )
             {
                 queued.push(CommandEnvelope::new(owner_id, execute_tick, cmd));
-                return finish_order(state, queued, speaker_id);
+                return finish_order(state, queued, speaker_id, rally_announce, None);
+            }
+            if context_actions_enabled
+                && hover.as_ref().is_some_and(|target| {
+                    self_answers_no_deploy(
+                        sim,
+                        &resources.rules,
+                        Some(&resources.overlay_registry),
+                        owner_id,
+                        &current_objects,
+                        target,
+                        planning,
+                    )
+                })
+            {
+                return finish_order(state, queued, speaker_id, rally_announce, None);
+            }
+            if context_actions_enabled
+                && let Some(target) = hover.as_ref()
+                && let Some(release) = lone_self_foot_release(
+                    sim,
+                    &resources.rules,
+                    owner_id,
+                    &current_objects,
+                    target.stable_id,
+                    order_mode,
+                    force_move_key,
+                )
+            {
+                return match release {
+                    (LeftRelease::Dispatch, order) => {
+                        queued.extend(
+                            order.map(|order| CommandEnvelope::new(owner_id, execute_tick, order)),
+                        );
+                        finish_order(state, queued, speaker_id, rally_announce, None)
+                    }
+                    _ => true,
+                };
             }
             // A Crazy Ivan bombs a friend by a plain click, when the object that
             // owns the cursor is one of the bombing Ivans.
@@ -2105,19 +2998,24 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                             },
                         ));
                     }
-                    return finish_order(state, queued, speaker_id);
+                    return finish_order(state, queued, speaker_id, rally_announce, None);
                 }
             }
-            // Ordinary Unit What_Action distinguishes a different allied
+            // The cursor owner's What_Action distinguishes a different allied
             // House from an own object. Preserve Shift's earlier toggle-select
-            // answer and the existing other-class capability routes. The
-            // shared release below, not display friendliness, decides Select
-            // versus dispatch for this Unit route.
+            // answer and the capability routes above. The shared release
+            // below, not display friendliness, decides Select versus dispatch.
             let friendly_unit_action = clicked_friendly
                 && hover.as_ref().is_some_and(|target| {
                     cursor_owner(sim, &resources.rules, &current_objects, target.stable_id)
-                        .and_then(|id| sim.entities().get(id))
-                        .is_some_and(|actor| actor.category() == EntityCategory::Unit)
+                        .is_some_and(|id| {
+                            object_action_answers_friendly(
+                                sim,
+                                &current_objects,
+                                id,
+                                target.stable_id,
+                            )
+                        })
                 });
             if select_friendly_clicks
                 && clicked_friendly
@@ -2128,7 +3026,7 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                     || consumed_attack_action)
             {
                 return if consumed_building_action || consumed_attack_action {
-                    finish_order(state, queued, speaker_id)
+                    finish_order(state, queued, speaker_id, rally_announce, None)
                 } else {
                     false
                 };
@@ -2139,15 +3037,57 @@ pub(crate) fn try_queue_context_order_at_screen_point(
             // nothing under the cursor is a target, and the object receiver
             // 4D74E0 orders the object or a Cell near it
             // ([`Simulation::object_move_click`]). Rungs that answer first
-            // (Self, handled above) or rewrite it are not asked here (#605):
-            // the class rungs noted above, and Foot's shroud rung
-            // (`0x004DDF45..0x004DDF82`), which only GameMode 0 reaches. An
-            // enemy the player cannot see is no object to click, as for the
-            // cursor: the Cell under it takes the click.
-            let force_move_target = hover
-                .as_ref()
-                .filter(|target| force_move && target.kind != HoverTargetKind::HiddenEnemy)
-                .map(|target| target.stable_id);
+            // (Self) or rewrite it (the passenger rows, [`entry_orders`]) are
+            // handled above. The class rungs noted above are not asked here
+            // (#605). In a campaign Foot's shroud rung makes the answer Move
+            // or NoMove, Shift's too ([`object_key_action`]); each receiver
+            // takes its own, and the release dispatches either, so it selects
+            // nothing (`0x004ABE88`). An enemy the player cannot see is no
+            // object to click, as for the cursor: the Cell under it takes the
+            // click.
+            let force_move_object = hover_object
+                .and_then(|object| object_key_target(object, hover.as_ref()))
+                .filter(|&(object, target)| {
+                    // A Techno's Ctrl+Alt Move goes through its guard click.
+                    (force_move || target.is_none())
+                        && cursor_owner(sim, &resources.rules, &current_objects, object)
+                            .is_some_and(|owner| {
+                                matches!(
+                                    object_key_action(
+                                        sim,
+                                        &resources.rules,
+                                        owner,
+                                        object,
+                                        target,
+                                        key_modifier,
+                                        force_move_key,
+                                    ),
+                                    Some(ObjectKeyAction::Move | ObjectKeyAction::NoMove)
+                                )
+                            })
+                });
+            let force_move_target = force_move_object.map(|(object, _)| object);
+            consumed_attack_action |= force_move_target.is_some();
+            // When the cursor owner's key rungs refuse the Techno (vt+0xA0,
+            // `0x00700191..0x00700217`), its What_Action takes the attack
+            // rung (`0x0070021A`), Ctrl still forcing it under Ctrl+Alt, and
+            // that answer decides the release, as for a plain click.
+            let owner_key_refused = |target_id| {
+                cursor_owner(sim, &resources.rules, &current_objects, target_id).is_some_and(
+                    |owner| {
+                        object_key_action(
+                            sim,
+                            &resources.rules,
+                            owner,
+                            target_id,
+                            Some(target_id),
+                            key_modifier,
+                            force_move_key,
+                        )
+                        .is_none()
+                    },
+                )
+            };
 
             // Scroll693271..69328B gives the same picked object to action
             // and release. Re-picking with an empty viewer for Ctrl lost the
@@ -2168,22 +3108,40 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                                 target.kind,
                                 HoverTargetKind::EnemyUnit | HoverTargetKind::EnemyStructure
                             ))
+                        || (force_move
+                            && key_modifier != OrderModifier::Shift
+                            && force_move_object.is_none()
+                            && target.kind != HoverTargetKind::HiddenEnemy
+                            && owner_key_refused(target.stable_id))
                 })
                 .map(|target| target.stable_id);
             // Foot4DDDE0's hidden-cell wrapper rewrites a nonzero action
-            // except GuardArea0x33 to Move when MoveToShroud and the playfield
+            // except the planning action 0x33 to Move when MoveToShroud and the playfield
             // admit it, otherwise NoMove (4DDE8F..4DDEB0). It does not preserve
             // Attack5. The ordinary MTNK fall-through below takes Move; other
             // class/shroud combinations remain part of the shared-cell audit.
             if let Some(target_id) = attack_target {
-                if matches!(modifier, OrderModifier::Normal | OrderModifier::AttackMove) {
+                // The cursor owner's attack rung, forced or not, decides
+                // the release; its guard or Alt Move rung dispatches.
+                let release_forced = match modifier {
+                    OrderModifier::Normal | OrderModifier::AttackMove => Some(false),
+                    OrderModifier::ForceFire => Some(true),
+                    OrderModifier::GuardArea => owner_key_refused(target_id).then_some(true),
+                    OrderModifier::ForceMove => Some(false),
+                    OrderModifier::Shift => None,
+                };
+                // Entries already dispatched the release.
+                if !consumed_entry_action && let Some(forced) = release_forced {
+                    // A selected building is a receiver as well: when it
+                    // owns the cursor, its own answer decides the release.
                     match object_click_release(
                         sim,
                         &resources.rules,
                         &current_objects,
-                        &selected_units,
+                        &selected_ids,
                         target_id,
                         &resources.overlay_registry,
+                        forced,
                     ) {
                         LeftRelease::Select => return false,
                         LeftRelease::Nothing => return true,
@@ -2194,6 +3152,25 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                 // receiver sends (`0x004ABE88`).
                 consumed_attack_action = true;
             }
+            if attack_target.is_none() && force_move_target.is_none() {
+                planning_cell = Some((target_rx, target_ry));
+            }
+            // VERA formation lock: a ground move, queued and forced ones
+            // too, sends each locked unit to its own place around the
+            // clicked Cell.
+            let locked_cells = (!planning
+                && attack_target.is_none()
+                && force_move_target.is_none()
+                && force_move_object.is_none())
+            .then(|| {
+                locked_move_cells(
+                    sim,
+                    &state.match_state.input.formation_locks,
+                    &selected_units,
+                    (target_rx, target_ry),
+                )
+            })
+            .flatten();
             for stable_id in selected_units {
                 let payload = if let Some(target_id) = attack_target {
                     let Some(payload) = object_attack_click_command(
@@ -2210,9 +3187,71 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                         continue;
                     };
                     payload
-                } else if force_fire && !cell_is_shrouded {
+                } else if let Some((_, Some(target_id))) = force_move_object
+                    && key_modifier != OrderModifier::Shift
+                {
+                    // Alt over a Techno: each receiver's own key rungs, and
+                    // the attack rung for one whose rungs refuse
+                    // ([`object_attack_click_command`]).
+                    let Some(payload) = object_attack_click_command(
+                        sim,
+                        &resources.rules,
+                        &resources.overlay_registry,
+                        owner_id,
+                        order_mode,
+                        key_modifier,
+                        force_move_key,
+                        stable_id,
+                        target_id,
+                    ) else {
+                        continue;
+                    };
+                    payload
+                } else if modifier == OrderModifier::GuardArea
+                    && force_move_target.is_none()
+                    && cell_guard_area_action(
+                        sim,
+                        &resources.rules,
+                        stable_id,
+                        Some(owner_id),
+                        (target_rx, target_ry),
+                    )
+                {
+                    // Ctrl+Alt over bare ground uses the same rung as hover;
+                    // a Foot over shroud takes the Move path below.
+                    Command::Guard {
+                        entity_id: stable_id,
+                        target: Some(TargetKind::Cell(target_rx, target_ry)),
+                    }
+                } else if force_move_target.is_none()
+                    && let Some(order) = cell_harvest_order(
+                        sim,
+                        &resources.rules,
+                        Some(&resources.overlay_registry),
+                        owner_id,
+                        stable_id,
+                        (target_rx, target_ry),
+                        shift_click,
+                    )
+                {
+                    // The receiver's own Cell action; under Ctrl too once it
+                    // has no weapon to force-fire (`0x007008C5`).
+                    order
+                } else if force_fire && !foot_shrouded(stable_id) {
                     // Unarmed Cell-click fall-through resolves the original
                     // clicked Cell before committing its Move event.
+                    push_move_flash(
+                        &mut queued,
+                        sim,
+                        &resources.rules,
+                        Some(&resources.overlay_registry),
+                        owner_id,
+                        execute_tick,
+                        &current_objects,
+                        stable_id,
+                        (target_rx, target_ry),
+                        shift_click,
+                    );
                     let Some(goal) = crate::app::input::commands::ordinary_cell_move_goal(
                         sim,
                         &resources.rules,
@@ -2229,26 +3268,47 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                         target_rx: goal.0,
                         target_ry: goal.1,
                     }
-                } else if modifier == OrderModifier::GuardArea
-                    && guard_area_admitted(sim, &resources.rules, stable_id, None)
-                {
-                    // Ctrl+Alt over bare ground uses the same admission as hover.
-                    Command::Guard {
-                        entity_id: stable_id,
-                        target: Some(TargetKind::Cell(target_rx, target_ry)),
-                    }
                 } else {
                     match order_mode {
                         OrderMode::Move | OrderMode::AttackMove => {
-                            let destination = match force_move_target {
-                                Some(target_id) => {
+                            if force_move_target.is_none() {
+                                push_move_flash(
+                                    &mut queued,
+                                    sim,
+                                    &resources.rules,
+                                    Some(&resources.overlay_registry),
+                                    owner_id,
+                                    execute_tick,
+                                    &current_objects,
+                                    stable_id,
+                                    (target_rx, target_ry),
+                                    shift_click,
+                                );
+                            }
+                            let destination = match force_move_object {
+                                Some((object, target)) => {
+                                    // The receiver's own key answer.
+                                    let action = match object_key_action(
+                                        sim,
+                                        &resources.rules,
+                                        stable_id,
+                                        object,
+                                        target,
+                                        key_modifier,
+                                        force_move_key,
+                                    ) {
+                                        Some(ObjectKeyAction::NoMove) => {
+                                            crate::sim::world::MoveAction::NoMove
+                                        }
+                                        _ => crate::sim::world::MoveAction::Move,
+                                    };
                                     crate::app::input::commands::object_move_destination(
                                         sim,
                                         &resources.rules,
                                         owner_id,
                                         stable_id,
-                                        target_id,
-                                        crate::sim::world::MoveAction::Move,
+                                        object,
+                                        action,
                                         force_move_key,
                                     )
                                 }
@@ -2258,7 +3318,11 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                                     Some(&resources.overlay_registry),
                                     owner_id,
                                     stable_id,
-                                    (target_rx, target_ry),
+                                    locked_cells
+                                        .as_ref()
+                                        .and_then(|cells| cells.get(&stable_id))
+                                        .copied()
+                                        .unwrap_or((target_rx, target_ry)),
                                     shift_click,
                                 )
                                 .map(|(rx, ry)| TargetKind::Cell(rx, ry)),
@@ -2278,25 +3342,318 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                 };
                 queued.push(CommandEnvelope::new(owner_id, execute_tick, payload));
             }
-            if !queued.is_empty() {
-                consumed_order_mode = true;
-            }
         }
     }
 
-    if !queued.is_empty()
-        && consumed_order_mode
-        && state.match_state.input.queued_order_mode != OrderMode::Move
-    {
-        state.match_state.input.queued_order_mode = OrderMode::Move;
+    finish_order(state, queued, speaker_id, rally_announce, planning_cell) || consumed_attack_action
+}
+
+/// The selection's units that take a place in a VERA formation, in selection
+/// order: the click's receivers but buildings, each with the cell from
+/// `place`.
+fn formation_units(
+    sim: &crate::sim::world::Simulation,
+    current_objects: &[u64],
+    place: impl Fn(&crate::sim::game_entity::GameEntity) -> (i32, i32),
+    ares: bool,
+) -> Vec<(u64, (i32, i32))> {
+    sim.click_order_receivers(current_objects, ares)
+        .into_iter()
+        .filter_map(|id| {
+            let entity = sim.entities().get(id)?;
+            (entity.category() != EntityCategory::Structure).then(|| (id, place(entity)))
+        })
+        .collect()
+}
+
+/// How many of the selection's units a VERA formation line or block would
+/// order: one dot each.
+pub(crate) fn formation_unit_count(state: &AppState) -> usize {
+    let Some(rt) = state.match_state.sim_runtime.runtime() else {
+        return 0;
+    };
+    let current_objects = selected_stable_ids_in_order(
+        Some(&rt.simulation),
+        state.rules(),
+        &state.match_state.input.selection_order,
+        state.match_state.input.selection_order_pending,
+    );
+    formation_units(
+        &rt.simulation,
+        &current_objects,
+        standing_cell,
+        rt.resources.rules.ares(),
+    )
+    .len()
+}
+
+/// The cell a unit stands on.
+fn standing_cell(entity: &crate::sim::game_entity::GameEntity) -> (i32, i32) {
+    (
+        i32::from(entity.position.rx()),
+        i32::from(entity.position.ry()),
+    )
+}
+
+/// The cell a unit is heading for, its last queued destination first; the
+/// cell it stands on when it has none or is heading for an object.
+fn heading_cell(entity: &crate::sim::game_entity::GameEntity) -> (i32, i32) {
+    let heading = entity
+        .navigation
+        .nav_queue()
+        .last()
+        .copied()
+        .or(entity.navigation.nav_com());
+    match heading {
+        Some(crate::sim::components::NavTargetRef::Cell { rx, ry }) => {
+            (i32::from(rx), i32::from(ry))
+        }
+        _ => standing_cell(entity),
     }
-    if rally_announce && !state.match_state.input.planning.active() {
-        crate::app::input::dispatch::push_local_eva(
-            state,
-            crate::app::match_runtime::eva_producers::EVA_NEW_RALLY_POINT_ESTABLISHED,
+}
+
+/// VERA formation line (`input::formation_line`), not gamemd: the selection's
+/// units each take their own point on the drawn line or in the dragged block;
+/// [`crate::app::input::formation_line::assign`] decides who takes which.
+///
+/// Every order is the plain Cell click's own, as if that unit had been
+/// clicked there alone: its destination from
+/// [`crate::app::input::commands::ordinary_cell_move_goal`] and its Move, or
+/// attack-move in that mode, from [`move_click_command`]. Buildings take no
+/// point. The first selected object flashes and speaks, as for one click.
+///
+/// Returns `false`, having ordered nothing, in Planning Mode and when fewer
+/// than two units can take a point; the release is then an ordinary click.
+pub(crate) fn queue_formation_line(
+    state: &mut AppState,
+    path: &crate::app::input::formation_line::FormationPath,
+) -> bool {
+    let order_mode = state.match_state.input.queued_order_mode;
+    let Some(owner) = preferred_local_owner(state) else {
+        return false;
+    };
+    let current_objects = selected_stable_ids_in_order(
+        state
+            .match_state
+            .sim_runtime
+            .runtime()
+            .map(|rt| &rt.simulation),
+        state.rules(),
+        &state.match_state.input.selection_order,
+        state.match_state.input.selection_order_pending,
+    );
+    if state.match_state.input.planning.active() {
+        return false;
+    }
+    let Some(rt) = state.match_state.sim_runtime.runtime() else {
+        return false;
+    };
+    let resources = &rt.resources;
+    let sim = &rt.simulation;
+    let owner_id: InternedId = sim.interner().get(&owner).unwrap_or_default();
+    let execute_tick = sim.session().tick();
+    let units = formation_units(sim, &current_objects, standing_cell, resources.rules.ares());
+    if units.len() < 2 {
+        return false;
+    }
+    let cells = crate::app::match_runtime::sim_tick::tactical_cells(sim);
+    let points: Vec<(i32, i32)> = path
+        .points(units.len())
+        .into_iter()
+        .map(|(x, y)| {
+            let cell = sim.clamped_click_cell(
+                crate::app::match_runtime::sim_tick::world_point_to_cell(x, y, cells),
+            );
+            (i32::from(cell.0), i32::from(cell.1))
+        })
+        .collect();
+    let mut queued: Vec<CommandEnvelope> = Vec::new();
+    for (stable_id, cell) in crate::app::input::formation_line::assign(&units, &points) {
+        let (Ok(rx), Ok(ry)) = (u16::try_from(cell.0), u16::try_from(cell.1)) else {
+            continue;
+        };
+        push_move_flash(
+            &mut queued,
+            sim,
+            &resources.rules,
+            Some(&resources.overlay_registry),
+            owner_id,
+            execute_tick,
+            &current_objects,
+            stable_id,
+            (rx, ry),
+            false,
         );
+        let Some(goal) = crate::app::input::commands::ordinary_cell_move_goal(
+            sim,
+            &resources.rules,
+            Some(&resources.overlay_registry),
+            owner_id,
+            stable_id,
+            (rx, ry),
+            false,
+        ) else {
+            continue;
+        };
+        queued.push(CommandEnvelope::new(
+            owner_id,
+            execute_tick,
+            move_click_command(
+                sim,
+                &resources.rules,
+                order_mode,
+                stable_id,
+                TargetKind::Cell(goal.0, goal.1),
+            ),
+        ));
     }
-    finish_order(state, queued, speaker_id) || consumed_attack_action
+    if queued.is_empty() {
+        return false;
+    }
+    finish_order(state, queued, current_objects.first().copied(), false, None)
+}
+
+/// A locked unit's place as a map cell: one off the map's low edges becomes the
+/// edge cell, for [`crate::sim::world::Simulation::clamped_click_cell`] to
+/// bring into the playfield.
+fn clamp_to_cell(cell: (i32, i32)) -> (u16, u16) {
+    let edge = |value: i32| value.clamp(0, i32::from(i16::MAX)) as u16;
+    (edge(cell.0), edge(cell.1))
+}
+
+/// VERA formation lock (`input::formation_lock`), not gamemd: lock the
+/// selection's units into one formation, each at the cell it stands on or is
+/// heading for; pressed on units that are one locked formation already, it
+/// unlocks them. Says which happened in the message list. Fewer than two
+/// units cannot be locked.
+pub(crate) fn toggle_formation_lock(state: &mut AppState) {
+    let current_objects = selected_stable_ids_in_order(
+        state
+            .match_state
+            .sim_runtime
+            .runtime()
+            .map(|rt| &rt.simulation),
+        state.rules(),
+        &state.match_state.input.selection_order,
+        state.match_state.input.selection_order_pending,
+    );
+    let Some(rt) = state.match_state.sim_runtime.runtime() else {
+        return;
+    };
+    let sim = &rt.simulation;
+    let units = formation_units(
+        sim,
+        &current_objects,
+        heading_cell,
+        rt.resources.rules.ares(),
+    );
+    let ids: Vec<u64> = units.iter().map(|&(id, _)| id).collect();
+    let locks = &mut state.match_state.input.formation_locks;
+    locks.retain(|id| sim.entities().get(id).is_some());
+    let locked = if locks.is_one_formation(&ids) {
+        locks.unlock(&ids);
+        false
+    } else if units.len() >= 2 {
+        locks.lock(&units);
+        true
+    } else {
+        return;
+    };
+    crate::app::input::messages::post_formation_lock(state, locked, units.len());
+}
+
+/// VERA formation lock: each receiver's own cell for a plain move click on
+/// `click`, or `None` for an ordinary click
+/// ([`crate::app::input::formation_lock::FormationLocks::move_cells`]).
+fn locked_move_cells(
+    sim: &crate::sim::world::Simulation,
+    locks: &crate::app::input::formation_lock::FormationLocks,
+    receivers: &[u64],
+    click: (u16, u16),
+) -> Option<std::collections::HashMap<u64, (u16, u16)>> {
+    let units: Vec<(u64, (i32, i32))> = receivers
+        .iter()
+        .map(|&id| Some((id, standing_cell(sim.entities().get(id)?))))
+        .collect::<Option<_>>()?;
+    let cells = locks.move_cells(&units, (i32::from(click.0), i32::from(click.1)))?;
+    Some(
+        cells
+            .into_iter()
+            .map(|(id, cell)| (id, sim.clamped_click_cell(clamp_to_cell(cell))))
+            .collect(),
+    )
+}
+
+/// A receiver's order when its ClickedAction on a Cell re-asks its What_Action
+/// with mouse-over 0 (`0x004D7DA1`) and gets Harvest
+/// ([`crate::sim::world::Simulation::cell_move_action`]): case 6 sends
+/// ClickedMission Harvest with the Cell as Destination and no Target
+/// (`0x004D7E8E`), before the MoveFlash. The class wrapper answers 0 for a
+/// House that is not the player's (`0x007404BF`); the MEGAMISSION event
+/// itself tests no owner (`0x004C71F6..0x004C721F`).
+fn cell_harvest_order(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    viewer: InternedId,
+    receiver: u64,
+    cell: (u16, u16),
+    shift: bool,
+) -> Option<Command> {
+    let query = crate::sim::world::CellActionQuery {
+        mouse_over: false,
+        shift,
+    };
+    (sim.cell_move_action(viewer, receiver, cell, query, rules, registry)
+        == Ok(crate::sim::world::MoveAction::Harvest))
+    .then(|| {
+        Command::clicked_mission(
+            receiver,
+            crate::sim::mission::MissionType::Harvest,
+            TargetKind::Cell(cell.0, cell.1),
+        )
+    })
+}
+
+/// `FootClass::ClickedAction_Cell`'s MoveFlash (`0x004D7EB5..0x004D8065`)
+/// for one receiver of a Cell click: only the selection's first object asks
+/// ([`crate::sim::world::Simulation::cell_click_flashes_move`]), and its
+/// flash is queued before its own order, as native constructs it before the
+/// receiver's destination resolves. Planning Mode clicks reach the same
+/// receiver loop (`0x004ABF94`), so they flash too; a plan's execution clears
+/// the latch around its own ClickedAction (`0x004DC96F..0x004DC984`).
+#[allow(clippy::too_many_arguments)]
+fn push_move_flash(
+    queued: &mut Vec<CommandEnvelope>,
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    owner_id: InternedId,
+    execute_tick: u64,
+    current_objects: &[u64],
+    receiver: u64,
+    cell: (u16, u16),
+    shift: bool,
+) {
+    if current_objects.first() != Some(&receiver) {
+        return;
+    }
+    let flashes = sim
+        .cell_click_flashes_move(owner_id, receiver, cell, shift, rules, registry)
+        .unwrap_or_else(|cause| {
+            log::warn!("MoveFlash click input: {cause}");
+            false
+        });
+    if flashes {
+        queued.push(CommandEnvelope::new(
+            owner_id,
+            execute_tick,
+            Command::MoveFlash {
+                rx: cell.0,
+                ry: cell.1,
+            },
+        ));
+    }
 }
 
 /// The data capability shared by self-click, self-hover and the deploy key.
@@ -2311,26 +3668,163 @@ pub(super) fn is_simple_deploy_unit(
     entity.category() == EntityCategory::Unit && object.is_simple_deployer
 }
 
-/// Infantry51EC14..51EC9F and Unit740015..74003F produce NoDeploy30,
-/// rather than a self action: deployed/transitioning infantry with a deploy
-/// weapon, or an empty mobile transport. The D-key's receiver is separate.
-pub(super) fn self_deploy_is_blocked(
+/// Infantry51EC14..51EC9F blocks Doing27..31 only when Type+6C4
+/// (UndeployDelay) > -1; Type+6A8 (DeployFireWeapon) is unrelated.
+/// Unit740015..74003F blocks an empty mobile transport outside a tank bunker
+/// (`+0x2E4`, `0x00740023`). Both answer NoDeploy30 rather than a self
+/// action. The D-key's receiver is separate.
+fn self_deploy_is_blocked(
     entity: &crate::sim::game_entity::GameEntity,
     object: &crate::rules::object_type::ObjectType,
 ) -> bool {
     (entity.category() == EntityCategory::Infantry
         && object.deployer
-        && object.deploy_fire_weapon >= 0
+        && object.undeploy_delay > -1
         && entity
             .infantry_sprite_pose()
             .is_some_and(|(doing, _)| (27..=31).contains(&doing)))
         || (entity.category() == EntityCategory::Unit
             && object.passengers > 0
             && !object.is_simple_deployer
+            && entity.bunker.link().installed_in().is_none()
+            && !object.no_manual_unload()
             && entity
                 .passenger_role
                 .cargo()
                 .is_none_or(|cargo| cargo.is_empty()))
+}
+
+/// Techno What_Action's Detonate rung (`0x006FFF8D..0x00700003`) for the
+/// lone selected (`[0xA8ECC8] == 1`) `target` over itself, past the berserk
+/// and warp exits (`0x006FFEC9`, `0x006FFF03`): its bomb may go off on a
+/// click ([`crate::sim::world::Simulation::bomb_detonate_action`]). The
+/// carrier's owner is not asked: a player may set off a bomb on a selected
+/// enemy. Cursor and click share it; both ask an Engineer's DisarmBomb
+/// first (Infantry `0x0051E462`). The click sends the DETONATE event
+/// (`Simulation::encode_detonate_record`), with no voice.
+///
+/// RESIDUALS: only Infantry and Units are represented. Native also answers
+/// it for an Aircraft or Building carrier, whose class ladders VERA does not
+/// route through this rung, and a player's healer Unit (negative weapon
+/// damage) over itself answers Select first (`0x0073FDF0..0x0073FE3B`).
+/// Shift's ToggleSelect, which native asks after this rung, is asked first.
+pub(super) fn self_detonates(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    selected_ids: &[u64],
+    target: u64,
+) -> bool {
+    // Ares 3.0 IvanBombsA (10056D30, hook 0x6FFEC0) answers before the
+    // berserk and warp exits; the click's berserk and deactivation refusals
+    // let Detonate through (0x51F1D8, 0x7388EB, 0x4D74EC: 10056BF0,
+    // 10056DA0, 1004CBC0).
+    let exits = |entity: &crate::sim::game_entity::GameEntity| {
+        !rules.ares() && (entity.berserk.is_active() || entity.is_warped_out())
+    };
+    selected_ids == [target]
+        && sim.entities().get(target).is_some_and(|entity| {
+            matches!(
+                entity.category(),
+                EntityCategory::Infantry | EntityCategory::Unit
+            ) && !exits(entity)
+        })
+        && sim.bomb_detonate_action(target, rules)
+}
+
+/// What a Deactivated (`+0x1C8`) object answers over an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AresDeactivatedAction {
+    Detonate,
+    Select,
+    None,
+}
+
+/// Ares hooks at the head of each class What_Action over an object (Unit
+/// `0x73FD5A`, Infantry `0x51E440`, Aircraft `0x417CCB`, Building
+/// `0x447218`; Ares.dll `1004CF50`, `1004CC30`, `1004CB00`, `1004CB70`):
+/// a Deactivated `actor` answers `TechnoExt::GetDeactivatedAction @
+/// 10044AD0` alone, None when it is not Deactivated. Detonate over itself as
+/// the lone selection when its bomb may be set off ([`self_detonates`]),
+/// Select over an allied (`HouseClass::IsAlliedWith`) selectable object,
+/// else 0. None without Ares.
+pub(super) fn ares_deactivated_action(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    selected: &[u64],
+    actor: u64,
+    target: u64,
+) -> Option<AresDeactivatedAction> {
+    if !rules.ares() {
+        return None;
+    }
+    let actor = sim
+        .entities()
+        .get(actor)
+        .filter(|actor| actor.deactivated.is_offline())?;
+    Some(if self_detonates(sim, rules, selected, target) {
+        AresDeactivatedAction::Detonate
+    } else if sim.entities().get(target).is_some_and(|target| {
+        sim.house_alliances()
+            .is_allied(sim.interner(), actor.owner(), target.owner())
+    }) && sim.object_is_selectable(target, rules)
+    {
+        AresDeactivatedAction::Select
+    } else {
+        AresDeactivatedAction::None
+    })
+}
+
+/// The left release when the selection's cursor owner
+/// ([`crate::app::input::cursor::select_best_for_action`]) is Deactivated:
+/// DetermineAction takes its action for the whole selection (`0x00692634`,
+/// `0x00692655`), which is [`ares_deactivated_action`] over an object and 0
+/// over a Cell (`Simulation::cell_move_action`). Detonate is the caller's;
+/// the other two reach [`left_release`], so no object receives an order.
+/// None without Ares.
+fn ares_deactivated_selection_click(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    current_objects: &[u64],
+    hover: Option<&HoverTargetKindWithId>,
+    cell: (u16, u16),
+) -> Option<Result<LeftRelease, u64>> {
+    use crate::app::input::cursor::ActionDistanceTarget;
+    if !rules.ares() {
+        return None;
+    }
+    let target = hover.map_or(ActionDistanceTarget::CellCentre(cell.0, cell.1), |target| {
+        ActionDistanceTarget::Object(target.stable_id)
+    });
+    let best = crate::app::input::cursor::select_best_for_action(
+        sim,
+        current_objects,
+        target,
+        Some(rules),
+    )?;
+    let Some(target) = hover else {
+        return sim
+            .entities()
+            .get(best)
+            .is_some_and(|best| best.deactivated.is_offline())
+            .then_some(Ok(LeftRelease::Nothing));
+    };
+    Some(
+        match ares_deactivated_action(sim, rules, current_objects, best, target.stable_id)? {
+            AresDeactivatedAction::Detonate => Err(target.stable_id),
+            AresDeactivatedAction::Select => Ok(left_release(
+                sim,
+                rules,
+                ReleaseAction::Select,
+                Some(target.stable_id),
+            )),
+            AresDeactivatedAction::None => Ok(left_release(
+                sim,
+                rules,
+                ReleaseAction::Zero,
+                Some(target.stable_id),
+            )),
+        },
+    )
 }
 
 /// The command a click on the one selected object issues when it clicks
@@ -2338,59 +3832,212 @@ pub(super) fn self_deploy_is_blocked(
 /// the target is the acting object, exactly one object is selected
 /// (`[0xA8ECC8] == 1`, `0x007000C1`) and its owner is the current player
 /// (`0x007000B9..0x007000DF`). With more selected, a click on one of them
-/// resolves to ACTION_SELECT, which the left-up handler turns into a fresh
-/// selection of the clicked object (`0x004ABE18..`); the caller's friendly-click
-/// path does that.
+/// takes the tail (`0x0070056C..0x007005E6`), whose 0 over a selected object
+/// (`0x007005BF`) a player's Unit or Infantryman turns into NoMove
+/// (`0x007403EB`, `0x0051F05E`), as the cursor shows. NoMove dispatches
+/// (`0x004ABE88`): each receiver asks its own What_Action, the others move
+/// near the clicked one and a Unit refuses itself (`0x007388D5..0x007388E8`),
+/// so the click selects nothing ([`object_click_release`]).
 ///
 /// Shared self-action admission for click and hover. Transport cargo,
 /// factory primary and simple deployment keep their existing owners; the
 /// blocked Infantry/empty-transport suffix is self_deploy_is_blocked.
 ///
-/// A Unit's deploy or unload self action also needs CanDeploySlashUnload
-/// (`0x0073FFEA`); its refusal answers NoDeploy ([`self_deploy_is_refused`]).
-///
-/// RESIDUAL: Unit What_Action's other NoDeploy tests are not ported: a
-/// DeploysInto unit's placement check (`0x0073FEAD..0x0073FFA6`) and a
-/// loaded transport's first-passenger land-speed and height checks
-/// (`0x00740078..0x007400EB`). Trigger: hovering such a unit over itself on
-/// a site it cannot use. Effect: the cursor offers Deploy, the click speaks
-/// `VoiceDeploy=` (native NoDeploy never reaches ClickedMission, so it is
-/// silent), and the order is then refused by its receiver. Retail: only the
-/// Slave Miner has a `VoiceDeploy=`.
+/// A Unit's self action answers NoDeploy where Unit What_Action's site
+/// tests refuse it (`Simulation::unit_self_deploy_site_refused`: a
+/// DeploysInto unit's placement, a loaded transport's first-passenger land
+/// and height) or CanDeploySlashUnload does (`0x0073FFEA`)
+/// ([`self_deploy_is_refused`]). In Planning Mode (`0x00AC4CF4`) a Unit's or
+/// Infantryman's every self action answers NoDeploy
+/// (`Planning__AllowsAction 0x00637DB0`, called at `0x0073FEA0`,
+/// `0x0051EC1B`, `0x0051ECA4`); a building's or aircraft's is unaffected.
+/// NoDeploy orders nothing.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn self_click_command(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     local_owner: InternedId,
     selected_ids: &[u64],
     hover: Option<&HoverTargetKindWithId>,
+    planning: bool,
 ) -> Option<Command> {
     let target = hover?;
+    if planning_refuses_self(sim, local_owner, selected_ids, target, planning)
+        || self_is_warped_out(sim, target)
+    {
+        return None;
+    }
+    // Ares hooks 0x73FD5A, 0x51E440, 0x417CCB and 0x447218 answer a
+    // Deactivated object's What_Action over itself with GetDeactivatedAction
+    // 10044AD0 (Detonate or Select), never Self, so it neither deploys nor
+    // repacks.
+    if rules.ares()
+        && sim
+            .entities()
+            .get(target.stable_id)
+            .is_some_and(|entity| entity.deactivated.is_offline())
+    {
+        return None;
+    }
     self_action(sim, rules, local_owner, selected_ids, target)
-        .filter(|_| !unit_refuses_deploy(sim, rules, target.stable_id))
+        .filter(|_| !unit_refuses_deploy(sim, rules, registry, target.stable_id))
 }
 
-/// Unit What_Action's NoDeploy answer (`0x0073FFF4`) for a self action that
-/// CanDeploySlashUnload refuses.
-pub(super) fn self_deploy_is_refused(
+/// The lone selected object's NoDeploy (0x1E) over itself: a refused self
+/// action ([`self_deploy_is_refused`]), or one blocked before it
+/// ([`self_deploy_is_blocked`], [`is_simple_deploy_unit`]). Cursor and click
+/// share it. The release dispatches NoDeploy, so a click on it orders and
+/// selects nothing (`0x004ABE88`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn self_answers_no_deploy(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     local_owner: InternedId,
     selected_ids: &[u64],
     target: &HoverTargetKindWithId,
+    planning: bool,
 ) -> bool {
-    unit_refuses_deploy(sim, rules, target.stable_id)
-        && self_action(sim, rules, local_owner, selected_ids, target).is_some()
+    !self_is_warped_out(sim, target)
+        && (self_deploy_is_refused(
+            sim,
+            rules,
+            registry,
+            local_owner,
+            selected_ids,
+            target,
+            planning,
+        ) || (selected_ids == [target.stable_id]
+            && sim.entities().get(target.stable_id).is_some_and(|entity| {
+                entity.owner() == local_owner
+                    && sim
+                        .interner()
+                        .object_type(entity.type_ref(), rules)
+                        .is_some_and(|object| {
+                            self_deploy_is_blocked(entity, object)
+                                || is_simple_deploy_unit(entity, object)
+                        })
+            })))
+}
+
+/// Techno's warp arm (`0x006FFF03..0x006FFF8A`) precedes the self rung
+/// (`0x007000B9`): an object being warped out (a Chronosphere's warp-out,
+/// which leaves it selected) answers 0 over itself, as it is selected, so it
+/// neither deploys nor answers NoDeploy.
+fn self_is_warped_out(sim: &crate::sim::world::Simulation, target: &HoverTargetKindWithId) -> bool {
+    sim.entities()
+        .get(target.stable_id)
+        .is_some_and(|entity| entity.is_warped_out())
+}
+
+/// The release of the lone selected Unit or Infantryman `target` clicked by
+/// its owner `owner`, once its self action has been neither sent
+/// ([`self_click_command`]) nor refused ([`self_answers_no_deploy`]); `None`
+/// for any other click. Techno What_Action's self rung
+/// (`0x007000B9..0x007000DF`) answers before the attack rung, so no attack
+/// grant applies: a Crazy Ivan clicking himself bombs nothing. What is left
+/// of the class's self arm is 0 (Unit `0x00740115`, Infantry `0x0051ECFC`),
+/// which the class tail turns into NoMove for an object the player may order
+/// ([`Simulation::foot_object_class_action`]). NoMove dispatches
+/// ([`LeftRelease::Dispatch`]): the receiver's ClickedAction asks the same and sends the
+/// order [`Simulation::object_move_click`] gives, which a Unit refuses over
+/// itself (`0x007388D5..0x007388E8`) and an Infantryman does not. A 0 over
+/// the selected object itself does nothing ([`LeftRelease::Nothing`]).
+///
+/// [`Simulation::foot_object_class_action`]: crate::sim::world::Simulation::foot_object_class_action
+/// [`Simulation::object_move_click`]: crate::sim::world::Simulation::object_move_click
+fn lone_self_foot_release(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    owner: InternedId,
+    selected_ids: &[u64],
+    target: u64,
+    order_mode: OrderMode,
+    force_move_key: bool,
+) -> Option<(LeftRelease, Option<Command>)> {
+    let entity = sim.entities().get(target).filter(|entity| {
+        selected_ids == [target]
+            && entity.owner() == owner
+            && matches!(
+                entity.category(),
+                EntityCategory::Unit | EntityCategory::Infantry
+            )
+    })?;
+    let action = sim.foot_object_class_action(
+        entity.owner(),
+        target,
+        target,
+        crate::sim::world::MoveAction::None,
+        rules,
+        None,
+    );
+    if action == crate::sim::world::MoveAction::None {
+        return Some((LeftRelease::Nothing, None));
+    }
+    Some((
+        LeftRelease::Dispatch,
+        crate::app::input::commands::object_move_destination(
+            sim,
+            rules,
+            owner,
+            target,
+            target,
+            action,
+            force_move_key,
+        )
+        .map(|destination| move_click_command(sim, rules, order_mode, target, destination)),
+    ))
+}
+
+/// Unit What_Action's NoDeploy answer (`0x0073FFF4`) for a self action its
+/// site tests or CanDeploySlashUnload refuse, and Planning Mode's for any
+/// Unit or Infantry self action.
+fn self_deploy_is_refused(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    local_owner: InternedId,
+    selected_ids: &[u64],
+    target: &HoverTargetKindWithId,
+    planning: bool,
+) -> bool {
+    planning_refuses_self(sim, local_owner, selected_ids, target, planning)
+        || (unit_refuses_deploy(sim, rules, registry, target.stable_id)
+            && self_action(sim, rules, local_owner, selected_ids, target).is_some())
+}
+
+/// `Planning__AllowsAction(4)` (`0x00637DB0`) refuses a Unit's or
+/// Infantryman's own Self action while Planning Mode is on.
+fn planning_refuses_self(
+    sim: &crate::sim::world::Simulation,
+    local_owner: InternedId,
+    selected_ids: &[u64],
+    target: &HoverTargetKindWithId,
+    planning: bool,
+) -> bool {
+    planning
+        && selected_ids == [target.stable_id]
+        && sim.entities().get(target.stable_id).is_some_and(|entity| {
+            entity.owner() == local_owner
+                && matches!(
+                    entity.category(),
+                    EntityCategory::Unit | EntityCategory::Infantry
+                )
+        })
 }
 
 fn unit_refuses_deploy(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     id: u64,
 ) -> bool {
     sim.entities()
         .get(id)
         .is_some_and(|entity| entity.category() == EntityCategory::Unit)
-        && !sim.can_deploy_slash_unload(id, rules)
+        && (sim.unit_self_deploy_site_refused(id, rules, registry)
+            || !sim.can_deploy_slash_unload(id, rules))
 }
 
 fn self_action(
@@ -2407,21 +4054,58 @@ fn self_action(
         .entities()
         .get(target.stable_id)
         .filter(|entity| entity.owner() == local_owner)?;
-    let obj = sim.interner.object_type(entity.type_ref(), rules);
+    let obj = sim.interner().object_type(entity.type_ref(), rules);
     if obj.is_some_and(|object| self_deploy_is_blocked(entity, object)) {
         return None;
+    }
+    // Unit740023/740107: a unit in a tank bunker skips the transport arm
+    // and offers Deploy whenever CanDeploySlashUnload admits it; its normal
+    // Unload mission releases the installed tank from the bunker.
+    if entity.category() == EntityCategory::Unit && entity.bunker.link().installed_in().is_some() {
+        return Some(Command::DeployMcv {
+            entity_id: target.stable_id,
+        });
+    }
+    // Ares 3.0 `NoManualUnload`: Unit What_Action leaves an unbunkered
+    // transport's self arm with action 0 (1004BEF0, hook 0x740031 ->
+    // 0x740115) ahead of its empty-hold NoDeploy (`self_deploy_is_blocked`),
+    // and Aircraft What_Action its Self (10048A90, hook 0x417DD2 -> 0x417DF4).
+    if obj.is_some_and(|object| {
+        object.no_manual_unload()
+            && match entity.category() {
+                EntityCategory::Unit => object.passengers > 0 && !object.is_simple_deployer,
+                EntityCategory::Aircraft => true,
+                _ => false,
+            }
+    }) {
+        return None;
+    }
+    // Building447286..4472E7's gap rung precedes its cargo rungs; its Self
+    // click queues Unload443514, which toggles the super-charge. Residual:
+    // a type both GapGenerator= and a factory would also take the primary
+    // tail4472EC and Event17 (44345F); no retail type is both.
+    if let Some(offered) = sim.gap_generator_self_action(target.stable_id, rules) {
+        return offered.then_some(Command::UnloadPassengers {
+            transport_id: target.stable_id,
+        });
+    }
+    // Ares 3.0 100173A0 (hook 0x44731C): a tunnel entrance with its
+    // owner's network loaded offers the unload action. Only the Ares-form sim
+    // fills a network, so this runs in every game.
+    if sim.ares_tunnel_offers_unload(target.stable_id, rules) {
+        return Some(Command::UnloadPassengers {
+            transport_id: target.stable_id,
+        });
     }
     if let Some(command) = super::transport_orders::unload_command(entity, obj, Some(local_owner)) {
         return Some(command);
     }
     if entity.category() == EntityCategory::Structure {
         // Building44731C..447358 keeps self action for cargo/garrisons or
-        // factory primary selection. Repacking is a cell-targeted order.
-        return if entity.bunker.occupant().is_some() {
-            Some(Command::EjectBunker {
-                bunker_id: target.stable_id,
-            })
-        } else if crate::sim::production::can_select_factory_primary(sim, rules, target.stable_id) {
+        // factory primary selection. The tank-bunker link is separate from
+        // those containers and does not grant the Building a self action.
+        // Repacking is a cell-targeted order.
+        return if crate::sim::production::can_select_factory_primary(sim, rules, target.stable_id) {
             // Building4472EC preserves Action4 only for a nonprimary
             // factory; Click443450..443494 queues this target's Event17.
             Some(Command::TogglePrimaryFactory {
@@ -2451,41 +4135,278 @@ fn self_action(
     })
 }
 
-/// Object entry orders use the same admission owner as the hover cursor.
-/// Infantry What_Action51E668..51E6B1 answers action9 for an admitted
-/// garrison; Foot ClickedAction4D7716..4D773A sends Capture8 with NULL
-/// Target and the building as Destination. Actual arrival belongs to the
-/// existing Capture/PerCell owners, as for computer occupiers (#1400).
-fn transport_entry_orders(
+/// Infantry's garrison arm (`0x0051E668..0x0051E6B1`): `actor_id` may
+/// occupy the `CanBeOccupied=` building `building_id`
+/// ([`crate::sim::passenger::can_enter_transport`]). It ignores Foot's
+/// answer, save Shift's ToggleSelect, which returns first (`0x0051E453`),
+/// and only Ctrl without Shift refuses it (`0x0051E3B0..0x0051E42A`): Alt
+/// and Ctrl+Shift+Alt garrison, Ctrl and Ctrl+Alt do not. Cursor and click
+/// ask it alike.
+pub(super) fn infantry_garrisons(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    actor_id: u64,
+    building_id: u64,
+    modifier: OrderModifier,
+    force_move_key: bool,
+) -> bool {
+    !matches!(
+        modifier,
+        OrderModifier::ForceFire | OrderModifier::GuardArea
+    ) && sim
+        .entities()
+        .get(building_id)
+        .filter(|target| target.category() == EntityCategory::Structure)
+        .and_then(|target| sim.interner().object_type(target.type_ref(), rules))
+        .is_some_and(|object| object.can_be_occupied)
+        && object_key_action(
+            sim,
+            rules,
+            actor_id,
+            building_id,
+            Some(building_id),
+            modifier,
+            force_move_key,
+        ) != Some(ObjectKeyAction::ToggleSelect)
+        && crate::sim::passenger::can_enter_transport(sim, rules, actor_id, building_id)
+}
+
+/// The garrison orders of the `selected` objects [`infantry_garrisons`]
+/// admits: Infantry What_Action answers action 9, and Foot ClickedAction
+/// (`0x004D7716..0x004D773A`) sends Capture8 with NULL Target and the
+/// building as Destination. Actual arrival belongs to the existing
+/// Capture/PerCell owners, as for computer occupiers (#1400). Passenger
+/// carriers take [`entry_orders`].
+fn garrison_entry_orders(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
     selected: &[u64],
-    transport_id: u64,
+    building_id: u64,
+    modifier: OrderModifier,
+    force_move_key: bool,
 ) -> Vec<Command> {
-    let garrison = sim
-        .entities()
-        .get(transport_id)
-        .filter(|target| target.category() == EntityCategory::Structure)
-        .and_then(|target| sim.interner.object_type(target.type_ref(), rules))
-        .is_some_and(|object| object.can_be_occupied);
     selected
         .iter()
         .copied()
-        .filter(|&id| crate::sim::passenger::can_enter_transport(sim, rules, id, transport_id))
-        .map(|passenger_id| {
-            if garrison {
-                Command::CaptureBuilding {
-                    engineer_id: passenger_id,
-                    target_building_id: transport_id,
-                }
-            } else {
-                Command::EnterTransport {
-                    passenger_id,
-                    transport_id,
-                }
-            }
+        .filter(|&id| infantry_garrisons(sim, rules, id, building_id, modifier, force_move_key))
+        .map(|engineer_id| Command::CaptureBuilding {
+            engineer_id,
+            target_building_id: building_id,
         })
         .collect()
+}
+
+/// [`Simulation::entry_click_action`] under the base action the key rungs
+/// ([`object_key_action`]) and [`attack_action`] give:
+/// - Shift's ToggleSelect (8) returns first (`0x0051E453`), and Ctrl+Alt's
+///   GuardArea (0x1A) skips every entry row;
+/// - Alt answers Move (1) first (`0x007001E9`), in the Ctrl+Shift+Alt chord
+///   too, which only the passenger rows take, as they take the Move or
+///   NoMove Foot's shroud rung makes of Shift's or Alt's answer in a
+///   campaign;
+/// - otherwise [`attack_action`], forced under Ctrl: Select (7) takes every
+///   row, and Attack (5) none. Every other answer takes only the passenger
+///   rows: an armed player's object over another house's object (0,
+///   `0x0070056C`) or a selected one. Ctrl leaves the attack rung to the
+///   tail for an actor neither armed nor `Infiltrate=`
+///   (`0x00700444..0x00700474`), so an Engineer's Ctrl over a carrier still
+///   asks it.
+///
+/// A player's deployed `Deployer=` infantryman (Doing 27..30) answers NoMove
+/// (2) for a Move before the rows (`0x0051EB81..0x0051EBD7`).
+///
+/// RESIDUAL: Ctrl+Alt skips the rows also where its guard rung refuses (an
+/// Aircraft, `0x007001B4..0x007001BA`) and Alt's Move answers, or where the
+/// campaign shroud rung rewrites it; natively the rows that take Alt's Move
+/// take those. Cursor and click skip them alike. Trigger: Ctrl+Alt by an
+/// Aircraft over a friendly object it may enter, or over a shrouded carrier
+/// in a campaign; rare.
+///
+/// [`Simulation::entry_click_action`]: crate::sim::world::Simulation::entry_click_action
+pub(super) fn entry_action(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    actor_id: u64,
+    target_id: u64,
+    modifier: OrderModifier,
+    force_move_key: bool,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+) -> Option<crate::sim::world::EntryClickAction> {
+    use crate::sim::world::EntryBaseAction;
+    if modifier == OrderModifier::GuardArea {
+        return None;
+    }
+    let key = object_key_action(
+        sim,
+        rules,
+        actor_id,
+        target_id,
+        Some(target_id),
+        modifier,
+        force_move_key,
+    );
+    let (base, moves) = match key {
+        Some(ObjectKeyAction::ToggleSelect | ObjectKeyAction::GuardArea) => return None,
+        Some(ObjectKeyAction::Move) => (EntryBaseAction::Other, true),
+        Some(ObjectKeyAction::NoMove) => (EntryBaseAction::Other, false),
+        None => match attack_action(
+            sim,
+            rules,
+            actor_id,
+            &TargetKind::Entity(target_id),
+            modifier == OrderModifier::ForceFire,
+            overlay_registry,
+        ) {
+            AttackAction::Select => (EntryBaseAction::Select, false),
+            AttackAction::Attack => return None,
+            action => (EntryBaseAction::Other, action == AttackAction::Move),
+        },
+    };
+    if moves
+        && sim.entities().get(actor_id).is_some_and(|actor| {
+            actor.category() == EntityCategory::Infantry
+                && sim.house_is_human_player(actor.owner())
+                && actor.infantry_deploy_doing()
+                && sim
+                    .interner()
+                    .object_type(actor.type_ref(), rules)
+                    .is_some_and(|object| object.deployer)
+        })
+    {
+        return None;
+    }
+    sim.entry_click_action(actor_id, target_id, base, rules)
+}
+
+/// The selected objects whose action over a friendly object is Enter, Grind
+/// or NoEnter ([`entry_action`]) leave `selected`, each on its own
+/// What_Action as `Selection__DispatchMultiUnitOrder`'s object loop
+/// (`0x004AE829..0x004AE85A`) asks it. Foot ClickedAction (`0x004D74E0`)
+/// sends a controllable (vt+0xA0) one mission Enter (case 3) or Eaten (case
+/// 0xB) with NULL Target and the object as Destination; NoEnter has no case
+/// and orders nothing. Without Alt the loop runs only when the action of the
+/// object that owns the cursor ([`cursor_owner`] of `current_objects`) is an
+/// order: one of these, or its [`attack_action`] when the [`left_release`]
+/// of that dispatches. For its Select, or a 0 over an object the player may
+/// select, BandBox_LeftUp selects the object instead (`0x004AB9B0` ->
+/// `0x004ABE18`) and never reaches the dispatcher. A selected carrier that
+/// owns the cursor over itself answers NoMove (its rung skips itself at
+/// `0x00740312`, and `0x007403EB` turns the 0 into NoMove), so the passengers
+/// selected with it still enter. Alt's Move is an order, so the loop always
+/// runs, and the objects it leaves take the force-move. None when no
+/// selected object takes an entry action.
+fn entry_orders(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    current_objects: &[u64],
+    selected: &mut Vec<u64>,
+    hover: &HoverTargetKindWithId,
+    modifier: OrderModifier,
+    force_move_key: bool,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+) -> Option<Vec<Command>> {
+    if !matches!(
+        hover.kind,
+        HoverTargetKind::FriendlyStructure | HoverTargetKind::FriendlyUnit
+    ) {
+        return None;
+    }
+    let action = |id| {
+        entry_action(
+            sim,
+            rules,
+            id,
+            hover.stable_id,
+            modifier,
+            force_move_key,
+            overlay_registry,
+        )
+    };
+    let force_move = modifier == OrderModifier::ForceMove
+        || (modifier == OrderModifier::AttackMove && force_move_key);
+    if !force_move {
+        let owner = cursor_owner(sim, rules, current_objects, hover.stable_id)?;
+        if action(owner).is_none()
+            && left_release(
+                sim,
+                rules,
+                attack_action(
+                    sim,
+                    rules,
+                    owner,
+                    &TargetKind::Entity(hover.stable_id),
+                    modifier == OrderModifier::ForceFire,
+                    overlay_registry,
+                )
+                .into(),
+                Some(hover.stable_id),
+            ) != LeftRelease::Dispatch
+        {
+            return None;
+        }
+    }
+    let mut consumed = false;
+    let mut orders = Vec::new();
+    selected.retain(|&id| {
+        let Some(action) = action(id) else {
+            return true;
+        };
+        consumed = true;
+        let mission = match action {
+            crate::sim::world::EntryClickAction::Enter => crate::sim::mission::MissionType::Enter,
+            crate::sim::world::EntryClickAction::Grind => crate::sim::mission::MissionType::Eaten,
+            crate::sim::world::EntryClickAction::NoEnter
+            | crate::sim::world::EntryClickAction::Nothing => return false,
+            // Aircraft ClickedAction (`0x00417BD0`) case 0x11:
+            // Player_Assign_Mission(Move, NULL, unit).
+            crate::sim::world::EntryClickAction::Tote => {
+                if sim.techno_player_controllable(id, rules) {
+                    orders.push(Command::MoveToObject {
+                        entity_id: id,
+                        target_id: hover.stable_id,
+                    });
+                }
+                return false;
+            }
+        };
+        if sim.techno_player_controllable(id, rules) {
+            orders.push(Command::MegaMission {
+                entity_id: id,
+                mission,
+                target: None,
+                destination: Some(TargetKind::Entity(hover.stable_id)),
+            });
+        }
+        false
+    });
+    consumed.then_some(orders)
+}
+
+/// Ares 3.0 `10049690` (hook `0x51E7BF`): whether `actor` captures the
+/// vehicle `target`, for the cursor and the click alike, while Ares plays.
+pub(super) fn vehicle_capture_action(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    actor: u64,
+    target: u64,
+    modifier: OrderModifier,
+    force_move_key: bool,
+) -> bool {
+    // Shift and the admitted Ctrl+Alt GuardArea return before51E7A6.
+    rules.ares()
+        && !matches!(
+            object_key_action(
+                sim,
+                rules,
+                actor,
+                target,
+                Some(target),
+                modifier,
+                force_move_key
+            ),
+            Some(ObjectKeyAction::ToggleSelect | ObjectKeyAction::GuardArea)
+        )
+        && sim.ares_vehicle_capture_action(actor, target, rules)
 }
 
 /// Engineer object actions before event enqueue. No duplicate geometry query.
@@ -2510,7 +4431,7 @@ fn engineer_capture_orders(
         };
         if actor.category() != EntityCategory::Infantry
             || !sim
-                .interner
+                .interner()
                 .object_type(actor.type_ref(), rules)
                 .is_some_and(|o| o.engineer)
         {
@@ -2544,7 +4465,8 @@ fn engineer_capture_orders(
                         destination: Some(TargetKind::Entity(hover.stable_id)),
                     });
                 }
-                EngineerBuildingAction::Repair(false) => {}
+                // Ares NoEnter (10025220) gives no order either.
+                EngineerBuildingAction::Repair(false) | EngineerBuildingAction::NoEnter => {}
             }
         }
         false
@@ -2576,30 +4498,36 @@ pub(super) fn infantry_attack_action(
     if actor.category() != EntityCategory::Infantry {
         return None;
     }
-    let object = sim.interner.object_type(actor.type_ref(), rules)?;
+    let object = sim.interner().object_type(actor.type_ref(), rules)?;
     // Infantry51E6B4..51E6D5 refuses any Attack left after the Engineer
     // building/disarm prefixes. Ctrl cannot turn DefuseKit into a gun.
     if object.engineer {
         return Some(InfantryAttackAction::NoMove);
     }
-    let target = sim.entities().get(target_id)?;
-    let hover = HoverTargetKindWithId {
-        stable_id: target_id,
-        kind: if target.category() == EntityCategory::Structure {
-            HoverTargetKind::EnemyStructure
-        } else {
-            HoverTargetKind::EnemyUnit
-        },
-    };
-    if let Some(c4) = infantry_c4_action(sim, rules, actor_id, &hover, true) {
-        return Some(match c4 {
-            InfantryC4Action::Sabotage => InfantryAttackAction::Sabotage,
-            InfantryC4Action::Attack => InfantryAttackAction::Attack,
-        });
+    // The target is a Techno or, under Ctrl, a Terrain object, which the C4
+    // and weapon-cursor arms below read as no building and no Unit.
+    let target = sim.entities().get(target_id);
+    if target.is_none() && sim.terrain_objects().get(target_id).is_none() {
+        return None;
+    }
+    if let Some(target) = target {
+        let hover = HoverTargetKindWithId {
+            stable_id: target_id,
+            kind: if target.category() == EntityCategory::Structure {
+                HoverTargetKind::EnemyStructure
+            } else {
+                HoverTargetKind::EnemyUnit
+            },
+        };
+        if let Some(c4) = infantry_c4_action(sim, rules, actor_id, &hover, true) {
+            return Some(match c4 {
+                InfantryC4Action::Sabotage => InfantryAttackAction::Sabotage,
+                InfantryC4Action::Attack => InfantryAttackAction::Attack,
+            });
+        }
     }
     let cells = sim
-        .resolved_terrain
-        .as_ref()
+        .resolved_terrain()
         .map(crate::map::resolved_terrain::NativeCellQuery::isolated);
     let (_, weapon) = combat_weapon::select_weapon_against_in_query(
         rules,
@@ -2608,25 +4536,48 @@ pub(super) fn infantry_attack_action(
         &combat_weapon::attacker_facts(actor, object),
         Some(&TargetKind::Entity(target_id)),
         sim,
-        &sim.interner,
+        sim.interner(),
         cells.as_ref(),
-        Some(&sim.house_alliances),
+        Some(sim.house_alliances()),
     )?;
     let weapon = weapon?.weapon;
     if weapon.sabotage_cursor {
         return Some(
-            if target.category() == EntityCategory::Unit
-                && target.bunker.link().installed_in().is_some()
-            {
+            if target.is_some_and(|target| {
+                target.category() == EntityCategory::Unit
+                    && target.bunker.link().installed_in().is_some()
+            }) {
                 InfantryAttackAction::Select
             } else {
                 InfantryAttackAction::WeaponDemolish
             },
         );
     }
-    if weapon.mig_attack_cursor && target.category() == EntityCategory::Structure {
-        let building = sim.interner.object_type(target.type_ref(), rules)?;
-        return Some(if building.can_c4 && !building.invisible_in_game {
+    // Infantry51EAD2..51EB21: anything the airstrike arm accepts keeps Attack
+    // and returns before the tail below. Phobos
+    // `TechnoClass_WhatAction_AllowAirstrike` (`0x51EAE0`) replaces the
+    // building-only `CanC4` test: `AllowAirstrike` decides, defaulting to
+    // `CanC4` for a building and to targetable for every other kind, while
+    // `InvisibleInGame` still refuses a building.
+    if weapon.mig_attack_cursor {
+        #[cfg(feature = "phobos")]
+        let air_strike = target.is_some_and(|target| {
+            sim.interner()
+                .object_type(target.type_ref(), rules)
+                .is_some_and(|object| {
+                    let building = target.category() == EntityCategory::Structure;
+                    object.allows_airstrike(building) && !(building && object.invisible_in_game)
+                })
+        });
+        #[cfg(not(feature = "phobos"))]
+        let air_strike = target.is_some_and(|target| {
+            target.category() == EntityCategory::Structure
+                && sim
+                    .interner()
+                    .object_type(target.type_ref(), rules)
+                    .is_some_and(|building| building.can_c4 && !building.invisible_in_game)
+        });
+        return Some(if air_strike {
             InfantryAttackAction::AirStrike
         } else {
             InfantryAttackAction::Attack
@@ -2637,6 +4588,14 @@ pub(super) fn infantry_attack_action(
     if sim.infiltrator_building_action(actor_id, target_id, rules) {
         return Some(InfantryAttackAction::Infiltrate);
     }
+    // Infantry51F160..51F179: the Attack left is NoMove over an Immune=
+    // type. A player's Crazy Ivan has returned at his bomb arm
+    // (51EB24..51EB7E) before it.
+    if !(object.ivan && sim.house_is_human_player(actor.owner()))
+        && target_is_immune(sim, rules, &TargetKind::Entity(target_id))
+    {
+        return Some(InfantryAttackAction::NoMove);
+    }
     None
 }
 
@@ -2646,8 +4605,9 @@ pub(super) enum InfantryC4Action {
     Sabotage,
 }
 
-/// The type-C4 arm of Infantry What_Action51E9C1..51EB21, after the
-/// ordinary enemy-building hover admission. A non-vehicle building
+/// The type-C4 arm of Infantry What_Action51E9C1..51EB21, which needs the
+/// Attack it is handed (`admitted_attack`, `cmp ebp,5` at `0x0051E9F1`):
+/// unforced, [`infantry_arm_attacks`]. A non-vehicle building
 /// terminates this arm even when CanC4/InvisibleInGame leave action Attack;
 /// it must not fall through to the later infiltration arm (51EE54).
 /// Shared by click dispatch and cursor feedback. Rank-granted C4 remains
@@ -2659,7 +4619,7 @@ pub(super) fn infantry_c4_action(
     hover: &HoverTargetKindWithId,
     admitted_attack: bool,
 ) -> Option<InfantryC4Action> {
-    if !admitted_attack && hover.kind != HoverTargetKind::EnemyStructure {
+    if !admitted_attack {
         return None;
     }
     let actor = sim.entities().get(actor_id)?;
@@ -2667,11 +4627,11 @@ pub(super) fn infantry_c4_action(
     if actor.category() != EntityCategory::Infantry
         || target.category() != EntityCategory::Structure
         || !sim.house_is_human_player(actor.owner())
-        || !sim.interner.object_type(actor.type_ref(), rules)?.c4
+        || !sim.interner().object_type(actor.type_ref(), rules)?.c4
     {
         return None;
     }
-    let building = sim.interner.object_type(target.type_ref(), rules)?;
+    let building = sim.interner().object_type(target.type_ref(), rules)?;
     // Building virtual+80: 457620 -> BuildingType465D40, not invulnerability.
     if building.is_1x1_with_undeploy() {
         return None;
@@ -2684,15 +4644,19 @@ pub(super) fn infantry_c4_action(
 }
 
 /// The selected spies whose action over `hover` is Capture
-/// (`Simulation::infiltrator_building_action`): `ClickedAction_Object`
+/// (`Simulation::infiltrator_building_action`), which needs their Attack
+/// there ([`infantry_arm_attacks`]): `ClickedAction_Object`
 /// (0x0051F190) keeps action 9, and `FootClass::ClickedAction_Object`
 /// (0x004D74E0) queues it as it does an Engineer's capture. None when no
 /// selected object takes the arm.
 fn infiltrator_capture_orders(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     selected: &mut Vec<u64>,
     hover: &HoverTargetKindWithId,
+    modifier: OrderModifier,
+    force_move_key: bool,
 ) -> Option<Vec<Command>> {
     if !matches!(
         hover.kind,
@@ -2703,7 +4667,17 @@ fn infiltrator_capture_orders(
     let mut consumed = false;
     let mut orders = Vec::new();
     selected.retain(|&id| {
-        if infantry_c4_action(sim, rules, id, hover, false).is_some()
+        let attacks = infantry_arm_attacks(
+            sim,
+            rules,
+            id,
+            hover.stable_id,
+            modifier,
+            force_move_key,
+            overlay_registry,
+        );
+        if !attacks
+            || infantry_c4_action(sim, rules, id, hover, attacks).is_some()
             || crate::sim::passenger::can_enter_transport(sim, rules, id, hover.stable_id)
             || !sim.infiltrator_building_action(id, hover.stable_id, rules)
         {
@@ -2738,7 +4712,9 @@ fn disarm_bomb_engineers(
         .entities()
         .get(target)
         .is_some_and(|entity| entity.bomb.is_some());
-    if !bombed || !sim.bomb_seen_by(target, player) {
+    // Ares InfantryClass_GetActionOnObject2 (10056C00, hook 0x51E488) skips
+    // a bomb that is not `IvanBomb.Detachable`.
+    if !bombed || !sim.bomb_detachable(target, rules) || !sim.bomb_seen_by(target, player) {
         return Vec::new();
     }
     selected
@@ -2749,7 +4725,7 @@ fn disarm_bomb_engineers(
                 && sim.entities().get(id).is_some_and(|e| {
                     e.category() == EntityCategory::Infantry
                         && sim
-                            .interner
+                            .interner()
                             .object_type(e.type_ref(), rules)
                             .is_some_and(|o| o.engineer)
                 })
@@ -2774,28 +4750,35 @@ fn cursor_owner(
     )
 }
 
-/// The left release over another house's object: [`left_release`] of the
-/// [`attack_action`] of the object that owns the cursor ([`cursor_owner`]),
-/// when it is one of the `receivers` the capability arms left. An owner
-/// those arms took answered there, receiver by receiver, so the release
-/// dispatches.
+/// The left release over another house's object or a Terrain object:
+/// [`left_release`] of the [`attack_action`] of the object that owns the
+/// cursor ([`cursor_owner`]), when it is one of the `receivers`; any other
+/// owner answered in an earlier arm, whose release dispatches. The click asks it twice: for the attack
+/// branch's receivers right after that branch, where an armed owner's 0 over
+/// another house's object out of its range (Techno `0x0070056C..0x007005E6`,
+/// kept by Building `0x0044750D`) selects the object and sends nothing, the
+/// other receivers' orders included (`0x004ABE18`, `0x004ABE88`); then for
+/// the receivers left.
 ///
-/// RESIDUAL (#605): `attack_branch_orders` decides each receiver's release
-/// itself, and consumes a 0 where native selects an object the player may
-/// select and has not. Trigger: a selected armed building alone, over
-/// another house's object out of its range. Effect: VERA does nothing where
-/// native selects the object. Rare.
+/// Over a Terrain object the owner decides the same way: its 0 (an unarmed
+/// building's, or an armed one's out of range) does nothing
+/// (`0x004AC294`), since no retail TerrainType is selectable (vt+0x138 at
+/// `0x004ABDF5` reads `+0x230`, which the constructor clears at
+/// `0x0071DB18`), and the other receivers' orders are dropped.
 ///
-/// RESIDUAL: a release that selects hands the click to the selection
-/// picker, which picks again. Both pickers admit what
-/// `Tactical::PickObjectAtScreenPoint` admits
-/// ([`crate::app::input::entity_pick::pick_admits_object`]), but they break
-/// ties apart. Both use ProcessClickCoords' floor-projected shroud gate
-/// (692480, spatial_oracle/click_shroud.json).
-/// Trigger: two objects under the click point.
-/// Effect: the selection takes the other object, or is cleared,
-/// where native selects the object DetermineAction saw (one pick for both,
-/// `0x00693271` → `0x0069328B`). Rare.
+/// DORMANT: a `Selectable=yes` TerrainType (ObjectType ReadINI `0x005F948C`)
+/// would let that 0 select the tree; VERA never selects a Terrain object.
+/// Neither RULESMD nor any of the 177 stock skirmish maps sets the key on a
+/// TerrainType (census through the production map loader).
+///
+/// A release that selects hands the click to the selection's click pick,
+/// which asks the same `Tactical::PickObjectAtScreenPoint` port
+/// ([`crate::app::input::entity_pick::pick_object_at_point`]) with the same
+/// Display order, presented positions, fog and viewer, and nothing changes
+/// between the two calls. So it selects the object DetermineAction saw, as
+/// native's one pick does (`0x00692515` → `0x00693271` / `0x0069328B`);
+/// `hover_and_click_match_original_weighted_pick_and_encounter_ties` pins
+/// both against the native tie corpus (spatial_oracle/pointer_pick.json).
 fn object_click_release(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
@@ -2803,6 +4786,7 @@ fn object_click_release(
     receivers: &[u64],
     target_id: u64,
     overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    forced: bool,
 ) -> LeftRelease {
     let Some(best) = cursor_owner(sim, rules, current_objects, target_id)
         .filter(|best| receivers.contains(best))
@@ -2814,7 +4798,7 @@ fn object_click_release(
         rules,
         best,
         &TargetKind::Entity(target_id),
-        false,
+        forced,
         Some(overlay_registry),
     );
     if action == AttackAction::Attack
@@ -2844,7 +4828,7 @@ fn friendly_bomb_ivans(
     overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
 ) -> Vec<u64> {
     let bombable = sim.entities().get(target).is_some_and(|entity| {
-        let obj = sim.interner.object_type(entity.type_ref(), rules);
+        let obj = sim.interner().object_type(entity.type_ref(), rules);
         !ivan_bomb_refused(entity, obj)
     });
     if !bombable {
@@ -2856,7 +4840,7 @@ fn friendly_bomb_ivans(
         .filter(|&id| {
             (id != target || selection_count > 1)
                 && sim.entities().get(id).is_some_and(|e| {
-                    sim.interner
+                    sim.interner()
                         .object_type(e.type_ref(), rules)
                         .is_some_and(|o| o.ivan)
                 })
@@ -2883,6 +4867,26 @@ pub(crate) fn ivan_bomb_refused(
     target.bomb.is_some() || !target_obj.is_some_and(|o| o.bombable)
 }
 
+/// [`ivan_bomb_refused`] for any object under the cursor, a Terrain object
+/// included: one never carries a bomb, since BombListClass::Attach gets a
+/// null target for anything that is not a Techno (AbstractFlags bit 1,
+/// `0x0046934D..0x00469361`), so only its type's `Bombable=` refuses it.
+/// The Ivan still answers IvanBomb, and his shot at a tree plants nothing.
+pub(crate) fn ivan_bomb_object_refused(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    target_id: u64,
+) -> bool {
+    if let Some(target) = sim.entities().get(target_id) {
+        return ivan_bomb_refused(target, sim.interner().object_type(target.type_ref(), rules));
+    }
+    !sim.terrain_objects().get(target_id).is_some_and(|terrain| {
+        rules
+            .terrain_object_type_case_insensitive(sim.interner().resolve(terrain.type_ref()))
+            .is_some_and(|terrain| terrain.bombable)
+    })
+}
+
 /// Whether `actor_id` is a Crazy Ivan whose Attack over `target_id` is
 /// NoIvanBomb ([`ivan_bomb_refused`]), which
 /// `FootClass::ClickedAction_Object` (0x004D74E0) ignores. An unforced click
@@ -2898,12 +4902,9 @@ fn ivan_cannot_bomb(
     let is_ivan = sim
         .entities()
         .get(actor_id)
-        .and_then(|e| sim.interner.object_type(e.type_ref(), rules))
+        .and_then(|e| sim.interner().object_type(e.type_ref(), rules))
         .is_some_and(|o| o.ivan);
-    is_ivan
-        && sim.entities().get(target_id).is_some_and(|target| {
-            ivan_bomb_refused(target, sim.interner.object_type(target.type_ref(), rules))
-        })
+    is_ivan && ivan_bomb_object_refused(sim, rules, target_id)
 }
 
 /// The ILLEGAL test of `TechnoClass::What_Action_OnObject`'s attack rung
@@ -2937,20 +4938,27 @@ fn shot_is_illegal(
         .entities()
         .get(actor_id)
         .filter(|actor| actor.category() == EntityCategory::Infantry)
-        .and_then(|actor| sim.interner.object_type(actor.type_ref(), rules))
+        .and_then(|actor| sim.interner().object_type(actor.type_ref(), rules))
         .filter(|infantry| infantry.infiltrate)
         .zip(
             sim.entities()
                 .get(target_id)
                 .filter(|object| object.category() == EntityCategory::Structure)
-                .and_then(|object| sim.interner.object_type(object.type_ref(), rules)),
+                .and_then(|object| sim.interner().object_type(object.type_ref(), rules)),
         )
         .is_some_and(|(infantry, building)| {
-            (if infantry.agent {
-                building.spyable
+            // Ares 3.0 100261F0 (hook 0x007004AD): any action of the shared
+            // classification keeps the rung.
+            if rules.ares() {
+                sim.infiltrate_action(actor_id, target_id, rules)
+                    != crate::sim::world::InfiltrateAction::None
             } else {
-                building.capturable
-            }) || (infantry.c4 && building.can_c4)
+                (if infantry.agent {
+                    building.spyable
+                } else {
+                    building.capturable
+                }) || (infantry.c4 && building.can_c4)
+            }
         });
     !infiltrate_arm
         && sim.effective_shared_cell_dummy().detached(|| {
@@ -2960,34 +4968,69 @@ fn shot_is_illegal(
 
 /// Building4436F0(1/6, cell): prepare archive event1E, then SELL16 for an
 /// UndeploysInto type. A failed FNPC emits no archive but still queues SELL,
-/// retaining an earlier archive. A factory announces only its queued rally.
-fn building_cell_orders(
+/// retaining an earlier archive, except that a Construction Yard archives its
+/// own Cell ([`crate::sim::world::Simulation::factory_rally_cell_input`]). A
+/// factory announces its rally click whether or not the search found a Cell
+/// (`0x00443A7B..0x00443A89` jumps to the announcement at `0x00443A2B`).
+///
+/// The click loop clamps the Cell to the playfield first
+/// ([`crate::sim::world::Simulation::clamped_click_cell`]), then asks each
+/// building's own What_Action on it (`0x004AE974`,
+/// [`crate::sim::world::Simulation::cell_move_action`]). Active_Click_With_Cell
+/// has no arm for NoMove or for the Ctrl+Alt guard rung's 0x1A
+/// (`0x0044372F..0x00443737`): a Construction Yard over a Cell it may not
+/// stand on neither archives nor packs up, nor does an active building
+/// without a rally line under `guard_area` ([`cell_guard_area_action`]).
+/// A query the sim cannot answer (no map cells) keeps Move: VERA-internal, as
+/// a live gamemd session always has a map.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn building_cell_orders(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     selected: &[u64],
     owner: InternedId,
     cell: (u16, u16),
+    shift: bool,
+    guard_area: bool,
 ) -> (Vec<Command>, bool) {
+    let cell = sim.clamped_click_cell(cell);
+    let query = crate::sim::world::CellActionQuery {
+        mouse_over: false,
+        shift,
+    };
     let mut orders = Vec::new();
     let mut announce = false;
     for id in selected_rally_producer_ids(sim, rules, selected, owner) {
         let Some(object) = sim
             .entities()
             .get(id)
-            .and_then(|entity| sim.interner.object_type(entity.type_ref(), rules))
+            .and_then(|entity| sim.interner().object_type(entity.type_ref(), rules))
         else {
             continue;
         };
+        if guard_area && cell_guard_area_action(sim, rules, id, Some(owner), cell) {
+            continue;
+        }
+        let action = sim
+            .cell_move_action(owner, id, cell, query, rules, registry)
+            .unwrap_or(crate::sim::world::MoveAction::Move);
+        if action != crate::sim::world::MoveAction::Move {
+            continue;
+        }
         match sim.factory_rally_cell_input(id, cell, rules) {
-            Ok(Some((rx, ry))) => {
-                orders.push(Command::SetRally {
-                    rx,
-                    ry,
-                    producer_ids: vec![id],
-                });
+            Ok(found) => {
+                if let Some((rx, ry)) = found {
+                    orders.push(Command::SetRally {
+                        rx,
+                        ry,
+                        producer_ids: vec![id],
+                    });
+                }
+                // A missed search still reaches the announcement
+                // (`0x00443977` -> `0x00443A7B` -> `0x00443A2B`).
                 announce |= crate::app::match_runtime::eva_producers::rally_point_announces(object);
             }
-            Ok(None) => {}
             Err(error) => log::warn!("building cell input: {error}"),
         }
         if object.undeploys_into.is_some() {
@@ -2997,13 +5040,310 @@ fn building_cell_orders(
     (orders, announce)
 }
 
+/// What a left click does for a selection of buildings only.
+#[derive(Debug, Clone, PartialEq)]
+enum BuildingClick {
+    /// The ordinary selection click on the object under the cursor.
+    Select,
+    /// The click is consumed with no order.
+    Nothing,
+    /// The click dispatches these orders; `true` announces a new rally point.
+    Orders(Vec<Command>, bool),
+}
+
+/// A left click for a selection of buildings only, after the attack
+/// receivers have been taken out of `receivers`: a lone building's self
+/// action, the release over an object ([`building_object_release`]), then
+/// each building's own orders ([`building_click_orders`]). Over the player's
+/// own or an allied object the cursor owner's What_Action decides the
+/// release too ([`object_action_answers_friendly`]): Select or 0 selects an
+/// object the player may select and has not, and nothing else happens.
+/// Shift over an object never reaches here: the caller hands it to the
+/// selection consumer first.
+#[allow(clippy::too_many_arguments)]
+fn building_selection_click(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    current_objects: &[u64],
+    receivers: &[u64],
+    owner: InternedId,
+    hover: Option<&HoverTargetKindWithId>,
+    terrain: Option<u64>,
+    cell: (u16, u16),
+    modifier: OrderModifier,
+    force_move_key: bool,
+) -> BuildingClick {
+    let context_actions_enabled = matches!(
+        modifier,
+        OrderModifier::Normal | OrderModifier::Shift | OrderModifier::AttackMove
+    );
+    if context_actions_enabled
+        // Building What_Action's self rows have no planning test.
+        && let Some(command) = self_click_command(
+            sim,
+            rules,
+            Some(overlay_registry),
+            owner,
+            current_objects,
+            hover,
+            false,
+        )
+    {
+        return BuildingClick::Orders(vec![command], false);
+    }
+    if let Some(target) = hover.filter(|target| target.kind != HoverTargetKind::HiddenEnemy) {
+        match building_object_release(
+            sim,
+            rules,
+            overlay_registry,
+            current_objects,
+            receivers,
+            target.stable_id,
+            modifier == OrderModifier::ForceFire,
+            force_move_key,
+        ) {
+            LeftRelease::Select => return BuildingClick::Select,
+            LeftRelease::Nothing => return BuildingClick::Nothing,
+            LeftRelease::Dispatch => {}
+        }
+    }
+    let (orders, announce) = building_click_orders(
+        sim,
+        rules,
+        Some(overlay_registry),
+        receivers,
+        owner,
+        hover,
+        terrain,
+        cell,
+        modifier,
+        force_move_key,
+    );
+    // Over a Terrain object a building that does not answer Move answers 0,
+    // which selects nothing (a tree is no object to select).
+    if terrain.is_some() && orders.is_empty() {
+        return BuildingClick::Nothing;
+    }
+    BuildingClick::Orders(orders, announce)
+}
+
+/// The selected buildings' own orders for a left click: over a visible
+/// object or a Terrain object (`terrain`) ([`building_object_orders`]; an
+/// enemy the player cannot see is no object, and its Cell takes the click)
+/// or on a Cell ([`building_cell_orders`]). Ctrl+Alt over the player's own
+/// or an allied object answers 0x1A, which has no Building ClickedAction
+/// arm; a Terrain object is no ally, so there it answers Alt's Move
+/// ([`object_key_action`]).
+#[allow(clippy::too_many_arguments)]
+fn building_click_orders(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    selected: &[u64],
+    owner: InternedId,
+    hover: Option<&HoverTargetKindWithId>,
+    terrain: Option<u64>,
+    cell: (u16, u16),
+    modifier: OrderModifier,
+    force_move_key: bool,
+) -> (Vec<Command>, bool) {
+    let guard_area = modifier == OrderModifier::GuardArea;
+    match hover.filter(|target| target.kind != HoverTargetKind::HiddenEnemy) {
+        Some(target)
+            if guard_area
+                && matches!(
+                    target.kind,
+                    HoverTargetKind::FriendlyUnit | HoverTargetKind::FriendlyStructure
+                ) =>
+        {
+            (Vec::new(), false)
+        }
+        Some(target) => {
+            building_object_orders(sim, rules, selected, target.stable_id, force_move_key)
+        }
+        None if let Some(terrain) = terrain => {
+            building_object_orders(sim, rules, selected, terrain, force_move_key)
+        }
+        None => building_cell_orders(
+            sim,
+            rules,
+            registry,
+            selected,
+            owner,
+            cell,
+            modifier == OrderModifier::Shift,
+            guard_area,
+        ),
+    }
+}
+
+/// Whether Techno What_Action over an object (`0x006FFEC0`) answers on its
+/// force-move rungs for the selected building `id`: the force-move key held
+/// (`0x0070000E..0x0070003D`), a human player's building, and one the player
+/// may order (vt+0xA0). Over the player's own or an allied object Ctrl+Alt
+/// answers 0x1A (`0x00700191..0x007001E7`), otherwise Move
+/// (`0x007001E9..0x00700217`). Without them Building What_Action_OnObject
+/// (`0x00447210`) is left with the attack rung or the Techno tail's Select
+/// or 0 ([`attack_action`]), so a plain click over an object never rallies
+/// or packs a building up: Building ClickedAction_Object (`0x00443410`)
+/// sends neither for those.
+fn building_moves_over_object(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    id: u64,
+    force_move_key: bool,
+) -> bool {
+    force_move_key
+        && sim
+            .entities()
+            .get(id)
+            .is_some_and(|building| sim.house_is_human_player(building.owner()))
+        && sim.techno_player_controllable(id, rules)
+}
+
+/// The left release over an object for a selection of buildings only: the
+/// action of the object that owns the cursor ([`cursor_owner`]). A force-move
+/// rung dispatches ([`building_moves_over_object`]); any other answer is
+/// [`object_click_release`]'s, so an unarmed factory or Construction Yard
+/// selects the object as DisplayClass does for Select (`0x004ABDD3`).
+#[allow(clippy::too_many_arguments)]
+fn building_object_release(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    current_objects: &[u64],
+    receivers: &[u64],
+    target_id: u64,
+    forced: bool,
+    force_move_key: bool,
+) -> LeftRelease {
+    if cursor_owner(sim, rules, current_objects, target_id).is_some_and(|best| {
+        receivers.contains(&best)
+            && (building_moves_over_object(sim, rules, best, force_move_key)
+                // Ares 3.0 100171B0 (hook 0x44725F): the trench Enter.
+                || ares_trench_enter(sim, rules, best, target_id))
+    }) {
+        return LeftRelease::Dispatch;
+    }
+    object_click_release(
+        sim,
+        rules,
+        current_objects,
+        receivers,
+        target_id,
+        overlay_registry,
+        forced,
+    )
+}
+
+/// Building ClickedAction_Object (`0x00443410`) for each selected building
+/// whose action over `target` is Move: the force-move rung
+/// ([`building_moves_over_object`]) and the building's own factory rungs
+/// ([`Simulation::building_object_move_action`]); a NoMove sends nothing. An
+/// Infantry, Unit or Aircraft factory (Type+0xEB8, `0x0044361B..0x0044363A`)
+/// sets its rally point from the Cell under the object's GetCoords
+/// (`0x0044368D..0x004436D8`, Building443860, [`Simulation::factory_rally_cell_input`]).
+/// Any other building, a Construction Yard among them, archives the object
+/// itself (event 0x1E, `0x0044363C..0x00443688`, [`Command::ArchiveObject`])
+/// and never packs up: a depot then releases repaired units toward it,
+/// Cloning Vats hand it to their clones, and a yard's later pack-up that does
+/// not archive again sends its MCV or Slave Miner to the object.
+///
+/// [`Simulation::factory_rally_cell_input`]: crate::sim::world::Simulation::factory_rally_cell_input
+/// [`Simulation::building_object_move_action`]: crate::sim::world::Simulation::building_object_move_action
+fn building_object_orders(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    selected: &[u64],
+    target: u64,
+    force_move_key: bool,
+) -> (Vec<Command>, bool) {
+    use crate::rules::object_type::FactoryType;
+    let Some(cell) = sim.object_coords_cell(target) else {
+        return (Vec::new(), false);
+    };
+    let mut orders = Vec::new();
+    let mut announce = false;
+    for &id in selected {
+        let Some(object) = sim
+            .entities()
+            .get(id)
+            .filter(|building| building.category() == EntityCategory::Structure)
+            .and_then(|building| sim.interner().object_type(building.type_ref(), rules))
+        else {
+            continue;
+        };
+        // Ares 3.0 10016F60 (hook 0x443414): a building whose action over
+        // the building is the trench Enter (100171B0, hook 0x44725F) raises
+        // TrenchRedirectClick (0x60, RaiseTrenchRedirectClick 1006A170)
+        // with that building's Cell, and sends nothing else.
+        if ares_trench_enter(sim, rules, id, target) {
+            if let Some(record) = sim.encode_ares_trench_redirect_record(id, cell) {
+                orders.push(Command::SynchronizedRecord { record });
+            }
+            continue;
+        }
+        if !building_moves_over_object(sim, rules, id, force_move_key) {
+            continue;
+        }
+        if !matches!(
+            object.factory_type(),
+            Some(FactoryType::InfantryType | FactoryType::UnitType | FactoryType::AircraftType)
+        ) {
+            orders.push(Command::ArchiveObject {
+                entity_id: id,
+                target_id: target,
+            });
+            continue;
+        }
+        match sim.building_object_move_action(id, target, rules) {
+            Ok(crate::sim::world::MoveAction::Move) => {}
+            Ok(_) => continue,
+            Err(error) => {
+                log::warn!("building object input: {error}");
+                continue;
+            }
+        }
+        match sim.factory_rally_cell_input(id, cell, rules) {
+            Ok(found) => {
+                if let Some((rx, ry)) = found {
+                    orders.push(Command::SetRally {
+                        rx,
+                        ry,
+                        producer_ids: vec![id],
+                    });
+                }
+                // A missed search still reaches the announcement
+                // (`0x00443977` -> `0x00443A7B` -> `0x00443A2B`).
+                announce |= crate::app::match_runtime::eva_producers::rally_point_announces(object);
+            }
+            Err(error) => log::warn!("building object input: {error}"),
+        }
+    }
+    (orders, announce)
+}
+
+/// Ares 3.0 BuildingClass_GetActionOnObject_TargetABuilding (`100171B0`,
+/// hook `0x44725F`): the building `id` answers Enter over the building
+/// `target` when its occupants may traverse there (canTraverseTo
+/// `10011690`), while Ares plays. The cursor asks it too.
+pub(super) fn ares_trench_enter(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    id: u64,
+    target: u64,
+) -> bool {
+    rules.ares() && sim.ares_can_traverse_to(id, target, rules)
+}
+
 fn selected_rally_producer_ids(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
     selected_ids: &[u64],
     owner: InternedId,
 ) -> Vec<u64> {
-    let owner = sim.interner.resolve(owner);
+    let owner = sim.interner().resolve(owner);
     let mut seen = std::collections::HashSet::with_capacity(selected_ids.len());
     selected_ids
         .iter()
@@ -3014,16 +5354,251 @@ fn selected_rally_producer_ids(
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_a_c))]
 #[path = "building_redeploy_tests.rs"]
 mod building_redeploy_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_a_c))]
 mod tests {
     use super::*;
     use crate::sim::combat::Health;
     use crate::sim::game_entity::GameEntity;
     use crate::sim::world::Simulation;
+
+    #[test]
+    fn ordinary_attack_click_honors_techno_legal_target_but_ctrl_bypasses_it() {
+        let Some((_, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let (rules, _, _, _) = crate::rules::retail_ini_fixture::retail_rules_owner(&assets)
+            .load_scenario(
+                crate::rules::process_owner::NativeScenarioRulesPrefix::Campaign(None),
+                &crate::rules::ini_parser::IniFile::from_str("[HTNK]\nLegalTarget=no\n"),
+            )
+            .unwrap()
+            .into_parts();
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 1);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        let tank = sim
+            .spawn_object("MTNK", "Americans", 10, 10, 64, &rules)
+            .unwrap();
+        let target = sim
+            .spawn_object("HTNK", "Russians", 12, 10, 64, &rules)
+            .unwrap();
+        let ordinary = sim
+            .spawn_object("MTNK", "Russians", 12, 12, 64, &rules)
+            .unwrap();
+        let action = |target, forced| {
+            attack_action(
+                &sim,
+                &rules,
+                tank,
+                &TargetKind::Entity(target),
+                forced,
+                None,
+            )
+        };
+        assert_ne!(action(target, false), AttackAction::Attack);
+        assert_eq!(action(target, true), AttackAction::Attack);
+        assert_eq!(action(ordinary, false), AttackAction::Attack);
+    }
+
+    /// Without resolved terrain the attack cursor asks the shared mapless
+    /// range (`sim::combat::mapless_in_range`), as the fire gate and the
+    /// threat scan do: `Range=-2` reaches across the map, and MinimumRange
+    /// refuses a target inside it.
+    #[test]
+    fn a_mapless_attack_cursor_takes_the_shared_range_answer() {
+        let rules =
+            crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+                "[InfantryTypes]\n[VehicleTypes]\n0=ASW\n1=ART\n2=MTNK\n\
+                 [AircraftTypes]\n[BuildingTypes]\n\
+                 [ASW]\nStrength=300\nPrimary=Depth\n[ART]\nStrength=300\nPrimary=Shell\n\
+                 [MTNK]\nStrength=300\n\
+                 [Depth]\nDamage=10\nROF=30\nRange=-2\nWarhead=WH\n\
+                 [Shell]\nDamage=10\nROF=30\nRange=8\nMinimumRange=3\nWarhead=WH\n\
+                 [WH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
+            ))
+            .unwrap();
+        let mut sim = Simulation::new();
+        let mut spawn = |kind: &str, owner: &str, rx: u16, ry: u16| {
+            sim.spawn_object(kind, owner, rx, ry, 0, &rules).unwrap()
+        };
+        let asw = spawn("ASW", "Americans", 5, 5);
+        let art = spawn("ART", "Americans", 5, 7);
+        let near = spawn("MTNK", "Russians", 6, 7);
+        let mid = spawn("MTNK", "Russians", 10, 7);
+        let far = spawn("MTNK", "Russians", 40, 5);
+        assert!(sim.resolved_terrain().is_none());
+        let in_range = |actor, target| {
+            resolved_unit_in_range(
+                &sim,
+                actor,
+                &TargetKind::Entity(target),
+                Some(&rules),
+                None,
+                None,
+                None,
+            )
+        };
+        assert!(in_range(asw, far), "35 cells away");
+        assert!(!in_range(art, near), "inside MinimumRange");
+        assert!(in_range(art, mid), "5 cells away");
+        assert!(!in_range(art, far), "beyond Range");
+    }
+
+    /// A Cell click asks each receiver's own What_Action ([`cell_harvest_order`]).
+    /// Over revealed ore the player's War Miner sends MEGAMISSION Harvest with
+    /// the Cell as Destination. Another player's War Miner, though selected,
+    /// answers None and sends nothing: the event itself would run it, testing
+    /// no owner. A Grizzly has no harvest rung. Where a tank holds the ore
+    /// Cell, the player's War Miner answers NoMove, and its ClickedAction
+    /// resolves a Cell to move to instead (`0x004D8065`).
+    #[test]
+    fn retail_ore_click_harvests_where_the_receivers_cell_action_does() {
+        use crate::sim::house_state::HouseState;
+        use crate::sim::world::{CellActionQuery, MoveAction};
+
+        let Some(battle) =
+            crate::rules::retail_ini_fixture::retail_battle_rules_for_map("XMP03T4.MAP")
+        else {
+            return;
+        };
+        let rules = &battle.rules;
+        let registry = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(
+            &battle.processed_rules,
+            Some(&battle.fixed_art),
+        );
+        let mut sim = Simulation::with_seed(0);
+        sim.intern_rule_type_ids(rules);
+        sim.resolve_type_handles(rules);
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        for name in ["Americans", "Russians"] {
+            let owner = sim.intern(name);
+            let side = rules
+                .country_side_index(name)
+                .expect("stock country Side")
+                .0;
+            sim.houses_mut_for_test().register(HouseState::new(
+                owner,
+                side,
+                Some(owner),
+                true,
+                0,
+                10,
+            ));
+        }
+        let owner = sim.interner().get("Americans").unwrap();
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
+        crate::sim::arena_fixture::flat_ground(&mut sim, rules);
+        *sim.fog_mut_for_test() = crate::sim::vision::FogState::new(32, 32);
+        sim.fog_mut_for_test().reveal_all_for_owner(owner);
+        let (open, taken) = ((12, 14), (16, 14));
+        let ore = registry.id_for_name("TIB01").unwrap();
+        for cell in [open, taken] {
+            sim.place_overlay_for_test(cell, ore, 6, &registry);
+        }
+        let own = sim
+            .spawn_object("HARV", "Americans", 10, 10, 0, rules)
+            .expect("the player's War Miner");
+        let other = sim
+            .spawn_object("HARV", "Russians", 14, 10, 0, rules)
+            .expect("another player's War Miner");
+        let tank = sim
+            .spawn_object_with_overlay_registry(
+                "MTNK",
+                "Americans",
+                taken.0,
+                taken.1,
+                0,
+                rules,
+                &registry,
+            )
+            .expect("the player's Grizzly on the ore");
+        sim.resolve_type_handles(rules);
+
+        let harvest =
+            |id, cell| cell_harvest_order(&sim, rules, Some(&registry), owner, id, cell, false);
+        assert_eq!(
+            harvest(own, open),
+            Some(Command::clicked_mission(
+                own,
+                crate::sim::mission::MissionType::Harvest,
+                TargetKind::Cell(open.0, open.1),
+            ))
+        );
+        assert_eq!(harvest(other, open), None);
+        assert_eq!(harvest(tank, open), None);
+
+        let click = CellActionQuery {
+            mouse_over: false,
+            shift: false,
+        };
+        assert_eq!(
+            sim.cell_move_action(owner, own, taken, click, rules, Some(&registry)),
+            Ok(MoveAction::NoMove)
+        );
+        assert_eq!(harvest(own, taken), None);
+        assert!(
+            crate::app::input::commands::ordinary_cell_move_goal(
+                &sim,
+                rules,
+                Some(&registry),
+                owner,
+                own,
+                taken,
+                false,
+            )
+            .is_some()
+        );
+    }
+
+    /// The native selection dispatcher clamps its shared Cell before asking
+    /// receivers' What_Action and ClickedAction (`0x004AE77E`), then each Foot
+    /// resolves from that same Cell (`0x004AE8BA`, `0x004AE921`, `0x004AE976`).
+    /// At these retail edge clicks the raw Cell answers NoMove while the
+    /// clamped one answers the receiver's real action; an interior Cell is
+    /// unchanged. The click path's call site itself is not driven here.
+    #[test]
+    fn mobile_cell_dispatch_clamps_before_action_and_goal_resolution() {
+        use crate::sim::world::{CellActionQuery, MoveAction};
+
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let (mut sim, rules, _) = Simulation::walk_cell_input_test_scene_with(retail.rules, false);
+        let owner = sim.interner().get("Local").unwrap();
+        let tank = sim
+            .spawn_object("MTNK", "Local", 12, 4, 0, &rules)
+            .expect("retail tank spawns");
+        sim.resolve_type_handles(&rules);
+        let action = |cell| {
+            sim.cell_move_action(
+                owner,
+                tank,
+                cell,
+                CellActionQuery {
+                    mouse_over: false,
+                    shift: false,
+                },
+                &rules,
+                None,
+            )
+            .unwrap()
+        };
+
+        for (raw, expected_action) in [((7, 0), MoveAction::NoMove), ((16, 0), MoveAction::Move)] {
+            let clamped = sim.clamped_click_cell(raw);
+            assert_ne!(clamped, raw, "fixed edge input {raw:?} must clamp");
+            assert_eq!(action(raw), MoveAction::NoMove, "raw edge {raw:?}");
+            assert_eq!(action(clamped), expected_action, "clamped edge {raw:?}");
+        }
+        assert_eq!(sim.clamped_click_cell((9, 5)), (9, 5));
+    }
 
     /// An all-berserk selection's left release follows the best object's
     /// class rung: Infantry NoMove (`0x0051F05E`, cell `0x0051FAAB`), Unit
@@ -3042,12 +5617,12 @@ mod tests {
             ))
             .unwrap();
         let mut sim = Simulation::new();
-        let owner = sim.interner.intern("Americans");
+        let owner = sim.intern("Americans");
         let mut spawn = |kind: &str, rx: u16, berserk: bool| {
             let id = sim
                 .spawn_object(kind, "Americans", rx, 5, 0, &rules)
                 .unwrap();
-            sim.entities_mut()
+            sim.entities_mut_for_test()
                 .get_mut(id)
                 .unwrap()
                 .berserk
@@ -3078,7 +5653,7 @@ mod tests {
         assert_eq!(click(&[tank, gi], None, (3, 5)), Dispatch);
         assert_eq!(click(&[gi, tank], None, (6, 5)), Nothing);
         // 0 over an object already selected does nothing (`0x004ABE0B`).
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(friend)
             .unwrap()
             .selection
@@ -3104,11 +5679,17 @@ mod tests {
             .unwrap();
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
-        let americans = sim.interner.intern("Americans");
-        sim.session.house_order.push(americans);
+        let americans = sim.intern("Americans");
+        sim.houses_mut_for_test()
+            .register(crate::sim::house_state::HouseState::new(
+                americans, 0, None, false, 0, 10,
+            ));
         // The rung is a human player's (`0x007003ED`).
-        sim.session.game_mode_nonzero = true;
-        sim.session.current_house = Some(americans);
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(americans));
         let ivan = sim
             .spawn_object("IVAN", "Americans", 3, 5, 0, &rules)
             .unwrap();
@@ -3140,15 +5721,17 @@ mod tests {
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
         for (name, human) in [("Americans", true), ("Soviets", false)] {
-            let owner = sim.interner.intern(name);
-            sim.houses.insert(
-                owner,
-                crate::sim::house_state::HouseState::new(owner, 0, None, human, 0, 10),
-            );
-            sim.session.house_order.push(owner);
+            let owner = sim.intern(name);
+            sim.houses_mut_for_test()
+                .register(crate::sim::house_state::HouseState::new(
+                    owner, 0, None, human, 0, 10,
+                ));
         }
-        sim.session.game_mode_nonzero = true;
-        sim.session.current_house = sim.interner.get("Americans");
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        let house = sim.interner().get("Americans");
+        sim.session_mut_for_test().set_current_house_for_test(house);
         let seal = sim
             .spawn_object("GHOST", "Americans", 3, 5, 0, &rules)
             .unwrap();
@@ -3185,7 +5768,15 @@ mod tests {
             assert!(sim.infiltrator_building_action(seal, target, &rules));
             let mut selected = vec![seal, spy];
             assert_eq!(
-                infiltrator_capture_orders(&sim, &rules, &mut selected, &hover),
+                infiltrator_capture_orders(
+                    &sim,
+                    &rules,
+                    None,
+                    &mut selected,
+                    &hover,
+                    OrderModifier::Normal,
+                    false,
+                ),
                 Some(vec![Command::CaptureBuilding {
                     engineer_id: spy,
                     target_building_id: target
@@ -3193,7 +5784,21 @@ mod tests {
             );
             assert_eq!(selected, [seal]);
             assert_eq!(
-                infantry_c4_action(&sim, &rules, seal, &hover, false),
+                infantry_c4_action(
+                    &sim,
+                    &rules,
+                    seal,
+                    &hover,
+                    infantry_arm_attacks(
+                        &sim,
+                        &rules,
+                        seal,
+                        target,
+                        OrderModifier::Normal,
+                        false,
+                        None
+                    )
+                ),
                 Some(expected_action)
             );
             assert_eq!(
@@ -3206,6 +5811,7 @@ mod tests {
                     None,
                     crate::app::input::context_order::OrderModifier::Normal,
                     false,
+                    false,
                 ),
                 expected_cursor
             );
@@ -3215,9 +5821,26 @@ mod tests {
             stable_id: fold,
         };
         assert!(rules.object("FOLD").unwrap().is_1x1_with_undeploy());
-        assert_eq!(infantry_c4_action(&sim, &rules, seal, &hover, false), None);
+        assert!(infantry_arm_attacks(
+            &sim,
+            &rules,
+            seal,
+            fold,
+            OrderModifier::Normal,
+            false,
+            None
+        ));
+        assert_eq!(infantry_c4_action(&sim, &rules, seal, &hover, true), None);
         assert_eq!(
-            infiltrator_capture_orders(&sim, &rules, &mut vec![seal], &hover),
+            infiltrator_capture_orders(
+                &sim,
+                &rules,
+                None,
+                &mut vec![seal],
+                &hover,
+                OrderModifier::Normal,
+                false,
+            ),
             Some(vec![Command::CaptureBuilding {
                 engineer_id: seal,
                 target_building_id: fold
@@ -3233,63 +5856,10 @@ mod tests {
                 None,
                 crate::app::input::context_order::OrderModifier::Normal,
                 false,
+                false,
             ),
             crate::app::types::CursorFeedbackKind::Enter
         );
-    }
-
-    /// A spy's click takes its Capture order and leaves the other selected
-    /// actors for their own actions. An inadmissible building consumes none.
-    #[test]
-    fn a_spy_click_on_a_building_it_may_enter_captures() {
-        let rules =
-            crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
-                "[InfantryTypes]\n0=SPY\n1=GI\n[BuildingTypes]\n0=PLANT\n1=DEPOT\n\
-                 [SPY]\nStrength=100\nInfiltrate=yes\nAgent=yes\n\
-                 [GI]\nStrength=125\n\
-                 [PLANT]\nStrength=750\nSpyable=yes\n[DEPOT]\nStrength=750\nCapturable=yes\n",
-            ))
-            .unwrap();
-        let mut sim = Simulation::new();
-        sim.resolve_type_handles(&rules);
-        for (house, human) in [("Americans", true), ("Russians", false)] {
-            let id = sim.interner.intern(house);
-            sim.houses.insert(
-                id,
-                crate::sim::house_state::HouseState::new(id, 0, None, human, 0, 10),
-            );
-            sim.session.house_order.push(id);
-        }
-        sim.session.game_mode_nonzero = true;
-        sim.session.current_house = sim.interner.get("Americans");
-        let mut spawn = |kind: &str, owner: &str, rx: u16| {
-            sim.spawn_object(kind, owner, rx, 5, 0, &rules).unwrap()
-        };
-        let spy = spawn("SPY", "Americans", 3);
-        let gi = spawn("GI", "Americans", 4);
-        let plant = spawn("PLANT", "Russians", 10);
-        let depot = spawn("DEPOT", "Russians", 14);
-        let hover = |stable_id| HoverTargetKindWithId {
-            kind: HoverTargetKind::EnemyStructure,
-            stable_id,
-        };
-
-        let mut selected = vec![gi, spy];
-        assert_eq!(
-            infiltrator_capture_orders(&sim, &rules, &mut selected, &hover(plant)),
-            Some(vec![Command::CaptureBuilding {
-                engineer_id: spy,
-                target_building_id: plant,
-            }])
-        );
-        assert_eq!(selected, [gi]);
-        let mut selected = vec![spy];
-        assert_eq!(
-            infiltrator_capture_orders(&sim, &rules, &mut selected, &hover(depot)),
-            None,
-            "a building that is not Spyable="
-        );
-        assert_eq!(selected, [spy]);
     }
 
     /// `TechnoClass::What_Action_OnObject @ 0x00700548`: unforced, the
@@ -3321,12 +5891,18 @@ mod tests {
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
         for house in ["Americans", "Soviets"] {
-            let id = sim.interner.intern(house);
-            sim.session.house_order.push(id);
+            let id = sim.intern(house);
+            sim.houses_mut_for_test()
+                .register(crate::sim::house_state::HouseState::new(
+                    id, 0, None, false, 0, 10,
+                ));
         }
         // The attack rung is a human player's (`0x007003ED`).
-        sim.session.game_mode_nonzero = true;
-        sim.session.current_house = sim.interner.get("Americans");
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        let house = sim.interner().get("Americans");
+        sim.session_mut_for_test().set_current_house_for_test(house);
         let mut spawn = |kind: &str, owner: &str, rx: u16| {
             sim.spawn_object(kind, owner, rx, 5, 0, &rules).unwrap()
         };
@@ -3360,7 +5936,7 @@ mod tests {
             "out of range"
         );
         assert_eq!(action(&sim, ivan, near, false), AttackAction::Attack);
-        let americans = sim.interner.get("Americans").unwrap();
+        let americans = sim.interner().get("Americans").unwrap();
         assert_eq!(
             object_attack_click_command(
                 &sim,
@@ -3380,8 +5956,8 @@ mod tests {
             })
         );
 
-        sim.bomb_attach(ivan, Some(near), &rules);
-        sim.bomb_attach(ivan, Some(far), &rules);
+        sim.bomb_attach_for_test(ivan, Some(near), &rules);
+        sim.bomb_attach_for_test(ivan, Some(far), &rules);
         assert_eq!(
             action(&sim, ivan, near, false),
             AttackAction::NoMove,
@@ -3420,15 +5996,17 @@ mod tests {
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
         for (house, human) in [("Americans", true), ("Soviets", false)] {
-            let id = sim.interner.intern(house);
-            sim.houses.insert(
-                id,
-                crate::sim::house_state::HouseState::new(id, 0, None, human, 0, 10),
-            );
-            sim.session.house_order.push(id);
+            let id = sim.intern(house);
+            sim.houses_mut_for_test()
+                .register(crate::sim::house_state::HouseState::new(
+                    id, 0, None, human, 0, 10,
+                ));
         }
-        sim.session.game_mode_nonzero = true;
-        sim.session.current_house = sim.interner.get("Americans");
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        let house = sim.interner().get("Americans");
+        sim.session_mut_for_test().set_current_house_for_test(house);
         let mut spawn = |kind: &str, owner: &str, rx: u16, ry: u16| {
             sim.spawn_object(kind, owner, rx, ry, 0, &rules).unwrap()
         };
@@ -3470,15 +6048,15 @@ mod tests {
             return;
         };
         let (mut sim, rules, _) = Simulation::walk_cell_input_test_scene_with(retail.rules, false);
-        let owner = sim.interner.get("Local").unwrap();
+        let owner = sim.interner().get("Local").unwrap();
         let ivan = sim.spawn_object("IVAN", "Local", 6, 4, 0, &rules).unwrap();
         let dog = sim.spawn_object("DOG", "Local", 5, 4, 0, &rules).unwrap();
         let tank = sim.spawn_object("MTNK", "Enemy", 6, 6, 0, &rules).unwrap();
         sim.resolve_type_handles(&rules);
-        sim.fog = crate::sim::vision::FogState::new(16, 16);
-        sim.fog
+        *sim.fog_mut_for_test() = crate::sim::vision::FogState::new(16, 16);
+        sim.fog_mut_for_test()
             .reveal_cells_for_owner(owner, (0..16).flat_map(|y| (0..16).map(move |x| (x, y))));
-        sim.bomb_attach(ivan, Some(tank), &rules);
+        sim.bomb_attach_for_test(ivan, Some(tank), &rules);
         let overlays = crate::rules::overlay_types::OverlayTypeRegistry::empty();
         for actor in [ivan, dog] {
             assert_eq!(
@@ -3505,6 +6083,7 @@ mod tests {
                     Some(&rules),
                     None,
                     crate::app::input::context_order::OrderModifier::Normal,
+                    false,
                     false,
                 ),
                 crate::app::types::CursorFeedbackKind::Invalid
@@ -3571,21 +6150,21 @@ mod tests {
             return;
         };
         let (mut sim, rules, _) = Simulation::walk_cell_input_test_scene_with(retail.rules, false);
-        let owner = sim.interner.get("Local").unwrap();
+        let owner = sim.interner().get("Local").unwrap();
         let miner = sim.spawn_object("CMIN", "Local", 2, 4, 0, &rules).unwrap();
         let mcv = sim.spawn_object("AMCV", "Local", 2, 6, 0, &rules).unwrap();
         let tank = sim.spawn_object("MTNK", "Local", 4, 4, 0, &rules).unwrap();
         let enemy = sim.spawn_object("MTNK", "Enemy", 6, 5, 0, &rules).unwrap();
         sim.resolve_type_handles(&rules);
-        sim.fog = crate::sim::vision::FogState::new(16, 16);
-        sim.fog
+        *sim.fog_mut_for_test() = crate::sim::vision::FogState::new(16, 16);
+        sim.fog_mut_for_test()
             .reveal_cells_for_owner(owner, (0..16).flat_map(|y| (0..16).map(move |x| (x, y))));
         let overlays = crate::rules::overlay_types::OverlayTypeRegistry::empty();
         let action = |sim: &Simulation, actor| {
             attack_action(sim, &rules, actor, &TargetKind::Entity(enemy), false, None)
         };
         let release = |sim: &Simulation, selection: &[u64]| {
-            object_click_release(sim, &rules, selection, selection, enemy, &overlays)
+            object_click_release(sim, &rules, selection, selection, enemy, &overlays, false)
         };
         let click = |sim: &Simulation, actor| {
             object_attack_click_command(
@@ -3613,6 +6192,7 @@ mod tests {
                 None,
                 crate::app::input::context_order::OrderModifier::Normal,
                 false,
+                false,
             )
         };
 
@@ -3630,13 +6210,13 @@ mod tests {
             "the armed tank owns the cursor"
         );
         assert_eq!(
-            object_click_release(&sim, &rules, &[mcv], &[], enemy, &overlays),
+            object_click_release(&sim, &rules, &[mcv], &[], enemy, &overlays, false),
             LeftRelease::Dispatch,
             "a capability arm took the object that owns the cursor"
         );
         assert_eq!(click(&sim, mcv), None);
 
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(enemy)
             .unwrap()
             .selection
@@ -3667,13 +6247,13 @@ mod tests {
                 target_ry,
             })
         );
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(enemy)
             .unwrap()
             .selection
             .set_selected_for_test(false);
 
-        let loaner = sim.entities_mut().get_mut(mcv).unwrap();
+        let loaner = sim.entities_mut_for_test().get_mut(mcv).unwrap();
         loaner.mission_only.mark();
         loaner.discovery.set_owned_by_current_house_for_test(true);
         assert_eq!(action(&sim, mcv), AttackAction::NoMove);
@@ -3682,6 +6262,955 @@ mod tests {
             attack_action(&sim, &rules, enemy, &TargetKind::Entity(tank), false, None),
             AttackAction::Select
         );
+    }
+
+    /// `AircraftClass::What_Action` over an object (`0x00417CC0`): the Foot
+    /// base's 0 becomes the aircraft's own What_Action on the Cell under the
+    /// object (`0x00417D7C..0x00417DCB`). A retail Harrier (`ORCA`) over an
+    /// enemy Kirov in flight, which its `AirToGroundMissile` cannot hit, and
+    /// over an allied Rocketeer, answers Move: the Move cursor, a dispatched
+    /// release and a Move order towards the object. Attack over an `Immune=`
+    /// type is NoMove (`0x00417F4A..0x00417F63`), which the click refuses
+    /// (`0x00417C12`).
+    #[test]
+    fn a_harrier_moves_to_an_object_it_may_not_attack() {
+        use crate::app::types::CursorFeedbackKind;
+        let patch = crate::rules::ini_parser::IniFile::from_str("[MTNK]\nImmune=yes\n");
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules_for_map_with_patch(
+            "Hills.mmx",
+            &patch,
+        ) else {
+            return;
+        };
+        let (mut sim, rules, _) = Simulation::walk_cell_input_test_scene_with(retail.rules, false);
+        let owner = sim.interner().get("Local").unwrap();
+        let harrier = sim.spawn_object("ORCA", "Local", 5, 4, 0, &rules).unwrap();
+        let kirov = sim.spawn_object("ZEP", "Enemy", 7, 6, 0, &rules).unwrap();
+        let rocketeer = sim
+            .spawn_object("JUMPJET", "Ally", 6, 8, 0, &rules)
+            .unwrap();
+        let tank = sim
+            .spawn_object("MTNK", "Enemy", 12, 10, 0, &rules)
+            .unwrap();
+        let own_tank = sim.spawn_object("MTNK", "Local", 6, 4, 0, &rules).unwrap();
+        let wingman = sim.spawn_object("ORCA", "Local", 6, 5, 0, &rules).unwrap();
+        sim.entities_mut_for_test()
+            .get_mut(wingman)
+            .unwrap()
+            .selection
+            .set_selected_for_test(true);
+        for flier in [kirov, rocketeer] {
+            sim.entities_mut_for_test()
+                .get_mut(flier)
+                .unwrap()
+                .position
+                .set_exact_z_leptons_for_test(Some(700));
+        }
+        for (asker, other) in [("LOCAL", "ALLY"), ("ALLY", "LOCAL")] {
+            sim.house_alliances_mut_for_test()
+                .entry(asker.to_string())
+                .or_default()
+                .insert(other.to_string());
+        }
+        sim.resolve_type_handles(&rules);
+        *sim.fog_mut_for_test() = crate::sim::vision::FogState::new(16, 16);
+        sim.fog_mut_for_test()
+            .reveal_cells_for_owner(owner, (0..16).flat_map(|y| (0..16).map(move |x| (x, y))));
+        let overlays = crate::rules::overlay_types::OverlayTypeRegistry::empty();
+        let action = |target| {
+            attack_action(
+                &sim,
+                &rules,
+                harrier,
+                &TargetKind::Entity(target),
+                false,
+                None,
+            )
+        };
+        let cursor = |target, kind| {
+            crate::app::input::cursor::capability_cursor_for_hover(
+                &sim,
+                &[harrier],
+                Some(harrier),
+                &HoverTargetKindWithId {
+                    kind,
+                    stable_id: target,
+                },
+                Some(&rules),
+                None,
+                OrderModifier::Normal,
+                false,
+                false,
+            )
+        };
+        let click = |target| {
+            object_attack_click_command(
+                &sim,
+                &rules,
+                &overlays,
+                owner,
+                OrderMode::Move,
+                OrderModifier::Normal,
+                false,
+                harrier,
+                target,
+            )
+        };
+
+        for (target, kind) in [
+            (kirov, HoverTargetKind::EnemyUnit),
+            (rocketeer, HoverTargetKind::FriendlyUnit),
+        ] {
+            assert_eq!(action(target), AttackAction::Move);
+            assert_eq!(cursor(target, kind), CursorFeedbackKind::Move);
+            assert_eq!(
+                object_click_release(
+                    &sim,
+                    &rules,
+                    &[harrier],
+                    &[harrier],
+                    target,
+                    &overlays,
+                    false
+                ),
+                LeftRelease::Dispatch
+            );
+            assert!(
+                matches!(
+                    click(target),
+                    Some(Command::Move { entity_id, .. } | Command::MoveToObject { entity_id, .. })
+                        if entity_id == harrier
+                ),
+                "{:?}",
+                click(target)
+            );
+        }
+        assert_eq!(action(tank), AttackAction::NoMove);
+        assert_eq!(
+            cursor(tank, HoverTargetKind::EnemyUnit),
+            CursorFeedbackKind::Invalid
+        );
+        assert_eq!(click(tank), None);
+
+        // Own objects: one not selected is Techno's Select (7); a selected
+        // one in a larger selection is 0, so the Cell action, Move; a lone
+        // Harrier over itself is Self, which 417DCD turns into 0 (the arrow).
+        assert_eq!(action(own_tank), AttackAction::Select);
+        assert_eq!(
+            cursor(own_tank, HoverTargetKind::FriendlyUnit),
+            CursorFeedbackKind::FriendlyUnit
+        );
+        assert_eq!(
+            crate::app::input::cursor::capability_cursor_for_hover(
+                &sim,
+                &[harrier, wingman],
+                Some(harrier),
+                &HoverTargetKindWithId {
+                    kind: HoverTargetKind::FriendlyUnit,
+                    stable_id: wingman,
+                },
+                Some(&rules),
+                None,
+                OrderModifier::Normal,
+                false,
+                false,
+            ),
+            CursorFeedbackKind::Move
+        );
+        assert_eq!(
+            cursor(harrier, HoverTargetKind::FriendlyUnit),
+            CursorFeedbackKind::Default
+        );
+    }
+
+    /// Foot What_Action's shroud rung (`0x004DDED0`): in a campaign, Techno's
+    /// Attack over an enemy Tesla Reactor whose coordinate the player's map
+    /// shrouds becomes Move for a Grizzly (`MoveToShroud=` defaults to yes),
+    /// so the Move cursor and a move to it, and NoMove for a Chrono
+    /// Legionnaire (`MoveToShroud=no`), whose click Foot `0x004D74E0`
+    /// refuses there. Outside a campaign both keep Attack.
+    #[test]
+    fn campaign_shroud_over_an_object_answers_move_or_no_move() {
+        use crate::app::types::CursorFeedbackKind;
+        use crate::sim::scenario_session::ScenarioGameMode;
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let rules = retail.rules;
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x4DDED0);
+        let owner = sim.interner().get("Americans").unwrap();
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
+        let tank = sim
+            .spawn_object("MTNK", "Americans", 5, 5, 0, &rules)
+            .unwrap();
+        let legionnaire = sim
+            .spawn_object("CLEG", "Americans", 5, 6, 0, &rules)
+            .unwrap();
+        let reactor = sim
+            .spawn_object("NAPOWR", "Russians", 10, 10, 0, &rules)
+            .unwrap();
+        let centre = sim.object_coords_cell(reactor).unwrap();
+        *sim.fog_mut_for_test() = crate::sim::vision::FogState::new(32, 32);
+        sim.fog_mut_for_test().reveal_cells_for_owner(
+            owner,
+            (0..32)
+                .flat_map(|y| (0..32).map(move |x| (x, y)))
+                .filter(|&cell| cell != centre),
+        );
+        let overlays = crate::rules::overlay_types::OverlayTypeRegistry::empty();
+        let action = |sim: &Simulation, actor| {
+            attack_action(
+                sim,
+                &rules,
+                actor,
+                &TargetKind::Entity(reactor),
+                false,
+                None,
+            )
+        };
+        let click = |sim: &Simulation, actor| {
+            object_attack_click_command(
+                sim,
+                &rules,
+                &overlays,
+                owner,
+                OrderMode::Move,
+                OrderModifier::Normal,
+                false,
+                actor,
+                reactor,
+            )
+        };
+
+        sim.session_mut_for_test()
+            .set_game_mode(ScenarioGameMode::Skirmish);
+        for actor in [tank, legionnaire] {
+            assert_eq!(action(&sim, actor), AttackAction::Attack);
+        }
+        assert!(matches!(click(&sim, tank), Some(Command::Attack { .. })));
+
+        sim.session_mut_for_test()
+            .set_game_mode(ScenarioGameMode::Campaign);
+        assert_eq!(action(&sim, tank), AttackAction::Move);
+        assert_eq!(action(&sim, legionnaire), AttackAction::NoMove);
+        for (actor, cursor) in [
+            (tank, CursorFeedbackKind::Move),
+            (legionnaire, CursorFeedbackKind::Invalid),
+        ] {
+            assert_eq!(
+                crate::app::input::cursor::capability_cursor_for_hover(
+                    &sim,
+                    &[actor],
+                    Some(actor),
+                    &HoverTargetKindWithId {
+                        kind: HoverTargetKind::EnemyStructure,
+                        stable_id: reactor,
+                    },
+                    Some(&rules),
+                    None,
+                    OrderModifier::Normal,
+                    false,
+                    false,
+                ),
+                cursor
+            );
+        }
+        assert!(
+            matches!(
+                click(&sim, tank),
+                Some(Command::Move { entity_id, .. } | Command::MoveToObject { entity_id, .. })
+                    if entity_id == tank
+            ),
+            "{:?}",
+            click(&sim, tank)
+        );
+        assert_eq!(click(&sim, legionnaire), None);
+    }
+
+    /// The campaign arena of the test above, with the player's map shrouding
+    /// the coordinate of `target`.
+    fn shrouded_campaign_arena(
+        rules: &crate::rules::ruleset::RuleSet,
+        seed: u64,
+        actors: &[&str],
+        target: (&str, &str),
+    ) -> (Simulation, InternedId, Vec<u64>, u64) {
+        let mut sim = crate::sim::arena_fixture::rival_arena(rules, seed);
+        let owner = sim.interner().get("Americans").unwrap();
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
+        let actors = (0..)
+            .zip(actors)
+            .map(|(dy, kind)| sim.spawn_object(kind, "Americans", 5, 5 + dy, 0, rules))
+            .collect::<Option<Vec<_>>>()
+            .unwrap();
+        let target = sim
+            .spawn_object(target.0, target.1, 10, 10, 0, rules)
+            .unwrap();
+        let centre = sim.object_coords_cell(target).unwrap();
+        *sim.fog_mut_for_test() = crate::sim::vision::FogState::new(32, 32);
+        sim.fog_mut_for_test().reveal_cells_for_owner(
+            owner,
+            (0..32)
+                .flat_map(|y| (0..32).map(move |x| (x, y)))
+                .filter(|&cell| cell != centre),
+        );
+        (sim, owner, actors, target)
+    }
+
+    /// Foot's shroud rung (`0x004DDED0`) rewrites Techno's key answers too.
+    /// Over the player's own Power Plant whose coordinate the map shrouds,
+    /// Shift's ToggleSelect (`0x00700107`), Alt's Move (`0x007001E9`) and
+    /// Ctrl+Alt's GuardArea (`0x007001DD`) become Move for a Grizzly and
+    /// NoMove for a Chrono Legionnaire (`MoveToShroud=no`) in a campaign,
+    /// cursor and click alike: the Ctrl+Alt click moves the Grizzly and the
+    /// Legionnaire's is refused (`0x004D77BD..0x004D77EA`). Outside a
+    /// campaign each chord keeps its own answer.
+    #[test]
+    fn campaign_shroud_rewrites_the_key_chords_over_an_object() {
+        use crate::app::types::CursorFeedbackKind;
+        use crate::sim::scenario_session::ScenarioGameMode;
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let rules = retail.rules;
+        let (mut sim, owner, actors, plant) =
+            shrouded_campaign_arena(&rules, 0x4DDED0, &["MTNK", "CLEG"], ("GAPOWR", "Americans"));
+        let [tank, legionnaire] = actors[..] else {
+            unreachable!()
+        };
+        let overlays = crate::rules::overlay_types::OverlayTypeRegistry::empty();
+        let key = |sim: &Simulation, actor, modifier| {
+            object_key_action(sim, &rules, actor, plant, Some(plant), modifier, false)
+        };
+        let cursor = |sim: &Simulation, actor, modifier| {
+            crate::app::input::cursor::capability_cursor_for_hover(
+                sim,
+                &[actor],
+                Some(actor),
+                &HoverTargetKindWithId {
+                    kind: HoverTargetKind::FriendlyStructure,
+                    stable_id: plant,
+                },
+                Some(&rules),
+                None,
+                modifier,
+                false,
+                false,
+            )
+        };
+        let guard_click = |sim: &Simulation, actor| {
+            object_attack_click_command(
+                sim,
+                &rules,
+                &overlays,
+                owner,
+                OrderMode::Move,
+                OrderModifier::GuardArea,
+                false,
+                actor,
+                plant,
+            )
+        };
+        let chords = [
+            OrderModifier::Shift,
+            OrderModifier::ForceMove,
+            OrderModifier::GuardArea,
+        ];
+
+        sim.session_mut_for_test()
+            .set_game_mode(ScenarioGameMode::Skirmish);
+        for (modifier, action, feedback) in [
+            (
+                OrderModifier::Shift,
+                ObjectKeyAction::ToggleSelect,
+                CursorFeedbackKind::Select,
+            ),
+            (
+                OrderModifier::ForceMove,
+                ObjectKeyAction::Move,
+                CursorFeedbackKind::Move,
+            ),
+            (
+                OrderModifier::GuardArea,
+                ObjectKeyAction::GuardArea,
+                CursorFeedbackKind::GuardArea,
+            ),
+        ] {
+            assert_eq!(key(&sim, tank, modifier), Some(action));
+            assert_eq!(cursor(&sim, tank, modifier), feedback);
+        }
+        assert!(matches!(
+            guard_click(&sim, tank),
+            Some(Command::Guard { .. })
+        ));
+
+        sim.session_mut_for_test()
+            .set_game_mode(ScenarioGameMode::Campaign);
+        for modifier in chords {
+            assert_eq!(key(&sim, tank, modifier), Some(ObjectKeyAction::Move));
+            assert_eq!(cursor(&sim, tank, modifier), CursorFeedbackKind::Move);
+            assert_eq!(
+                key(&sim, legionnaire, modifier),
+                Some(ObjectKeyAction::NoMove)
+            );
+            assert_eq!(
+                cursor(&sim, legionnaire, modifier),
+                CursorFeedbackKind::Invalid
+            );
+        }
+        assert!(
+            matches!(
+                guard_click(&sim, tank),
+                Some(Command::Move { entity_id, .. } | Command::MoveToObject { entity_id, .. })
+                    if entity_id == tank
+            ),
+            "{:?}",
+            guard_click(&sim, tank)
+        );
+        assert_eq!(guard_click(&sim, legionnaire), None);
+    }
+
+    /// The passenger rows take the Move Foot's shroud rung (`0x004DDED0`)
+    /// makes of Shift's ToggleSelect (`0x00700107`), which otherwise returns
+    /// first (`0x0051E453`): in a campaign a GI's Shift over the player's own
+    /// IFV whose coordinate the map shrouds enters it, cursor and click
+    /// alike. In a skirmish Shift toggles the selection.
+    #[test]
+    fn campaign_shroud_shift_takes_the_passenger_rows() {
+        use crate::app::types::CursorFeedbackKind;
+        use crate::sim::scenario_session::ScenarioGameMode;
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let rules = retail.rules;
+        let (mut sim, _, actors, ifv) =
+            shrouded_campaign_arena(&rules, 0x0051_E453, &["E1"], ("FV", "Americans"));
+        let gi = actors[0];
+        let hover = HoverTargetKindWithId {
+            kind: HoverTargetKind::FriendlyUnit,
+            stable_id: ifv,
+        };
+        let cursor = |sim: &Simulation| {
+            crate::app::input::cursor::capability_cursor_for_hover(
+                sim,
+                &[gi],
+                Some(gi),
+                &hover,
+                Some(&rules),
+                None,
+                OrderModifier::Shift,
+                false,
+                false,
+            )
+        };
+        let click = |sim: &Simulation| {
+            entry_orders(
+                sim,
+                &rules,
+                &[gi],
+                &mut vec![gi],
+                &hover,
+                OrderModifier::Shift,
+                false,
+                None,
+            )
+        };
+
+        sim.session_mut_for_test()
+            .set_game_mode(ScenarioGameMode::Skirmish);
+        assert_eq!(cursor(&sim), CursorFeedbackKind::Select);
+        assert_eq!(click(&sim), None);
+        sim.session_mut_for_test()
+            .set_game_mode(ScenarioGameMode::Campaign);
+        assert_eq!(cursor(&sim), CursorFeedbackKind::Enter);
+        assert_eq!(
+            click(&sim),
+            Some(vec![Command::MegaMission {
+                entity_id: gi,
+                mission: crate::sim::mission::MissionType::Enter,
+                target: None,
+                destination: Some(TargetKind::Entity(ifv)),
+            }])
+        );
+    }
+
+    /// Infantry's C4 and infiltration arms need the Attack Foot's What_Action
+    /// hands them (`cmp ebp,5` at `0x0051E9F1` and `0x0051EE62`). Over an
+    /// enemy Tesla Reactor Ctrl+Shift+Alt answers Move (Shift clears Ctrl at
+    /// `0x007000AC..0x007000B4`, Alt's rung `0x007001E9..0x00700217`), and in
+    /// a campaign the shroud rung (`0x004DDED0`) makes a plain click's Attack
+    /// Move where the map shrouds the reactor's coordinate. Then Tanya
+    /// neither shows Demolish nor plants C4, and the Spy neither shows Enter
+    /// nor infiltrates: both show Move. A plain skirmish click takes both.
+    #[test]
+    fn c4_and_infiltration_need_the_attack_foot_hands_them() {
+        use crate::app::types::CursorFeedbackKind;
+        use crate::sim::scenario_session::ScenarioGameMode;
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let rules = retail.rules;
+        let (mut sim, _, actors, reactor) =
+            shrouded_campaign_arena(&rules, 0x51E9F1, &["TANY", "SPY"], ("NAPOWR", "Russians"));
+        let [tanya, spy] = actors[..] else {
+            unreachable!()
+        };
+        let hover = HoverTargetKindWithId {
+            kind: HoverTargetKind::EnemyStructure,
+            stable_id: reactor,
+        };
+        let check = |sim: &Simulation, modifier, alt, takes_arms| {
+            let cursor = |actor| {
+                crate::app::input::cursor::capability_cursor_for_hover(
+                    sim,
+                    &[actor],
+                    Some(actor),
+                    &hover,
+                    Some(&rules),
+                    None,
+                    modifier,
+                    alt,
+                    false,
+                )
+            };
+            let attacks = infantry_arm_attacks(sim, &rules, tanya, reactor, modifier, alt, None);
+            let c4 = infantry_c4_action(sim, &rules, tanya, &hover, attacks);
+            let infiltrate = infiltrator_capture_orders(
+                sim,
+                &rules,
+                None,
+                &mut vec![spy],
+                &hover,
+                modifier,
+                alt,
+            );
+            if takes_arms {
+                assert_eq!(cursor(tanya), CursorFeedbackKind::Demolish);
+                assert_eq!(c4, Some(InfantryC4Action::Sabotage));
+                assert_eq!(cursor(spy), CursorFeedbackKind::Enter);
+                assert_eq!(
+                    infiltrate,
+                    Some(vec![Command::CaptureBuilding {
+                        engineer_id: spy,
+                        target_building_id: reactor,
+                    }])
+                );
+            } else {
+                for actor in [tanya, spy] {
+                    assert_eq!(cursor(actor), CursorFeedbackKind::Move, "{modifier:?}");
+                }
+                assert_eq!(c4, None, "{modifier:?}");
+                assert_eq!(infiltrate, None, "{modifier:?}");
+            }
+        };
+
+        sim.session_mut_for_test()
+            .set_game_mode(ScenarioGameMode::Skirmish);
+        check(&sim, OrderModifier::Normal, false, true);
+        check(&sim, OrderModifier::AttackMove, true, false);
+        sim.session_mut_for_test()
+            .set_game_mode(ScenarioGameMode::Campaign);
+        check(&sim, OrderModifier::Normal, false, false);
+    }
+
+    /// One of several selected own tanks under the cursor: Techno's self rung
+    /// needs one selected object (`0x007000C1`), so its tail answers 0 over
+    /// the selected tank (`0x007005BF`), which Unit turns into NoMove
+    /// (`0x007403EB`). The cursor is NoMove, and the click dispatches it
+    /// rather than selecting (`0x004ABE88`): the other tank moves near the
+    /// clicked one, which refuses itself (`0x007388D5..0x007388E8`).
+    #[test]
+    fn a_self_click_in_a_larger_selection_dispatches_no_move() {
+        use crate::app::input::cursor::{
+            ActionDistanceTarget, capability_cursor_for_hover, cursor_id_for_feedback,
+            select_best_for_action,
+        };
+        use crate::app::types::CursorId;
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let rules = retail.rules;
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x0070_05BF);
+        let owner = sim.interner().get("Americans").unwrap();
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
+        *sim.fog_mut_for_test() = crate::sim::vision::FogState::new(32, 32);
+        sim.fog_mut_for_test()
+            .reveal_cells_for_owner(owner, (0..32).flat_map(|y| (0..32).map(move |x| (x, y))));
+        let other = sim
+            .spawn_object("MTNK", "Americans", 5, 5, 0, &rules)
+            .unwrap();
+        let clicked = sim
+            .spawn_object("MTNK", "Americans", 9, 5, 0, &rules)
+            .unwrap();
+        let selected = [other, clicked];
+        for id in selected {
+            sim.entities_mut_for_test()
+                .get_mut(id)
+                .unwrap()
+                .selection
+                .set_selected_for_test(true);
+        }
+        let overlays = crate::rules::overlay_types::OverlayTypeRegistry::empty();
+        let best = select_best_for_action(
+            &sim,
+            &selected,
+            ActionDistanceTarget::Object(clicked),
+            Some(&rules),
+        );
+        let cursor = capability_cursor_for_hover(
+            &sim,
+            &selected,
+            best,
+            &HoverTargetKindWithId {
+                kind: HoverTargetKind::FriendlyUnit,
+                stable_id: clicked,
+            },
+            Some(&rules),
+            None,
+            OrderModifier::Normal,
+            false,
+            false,
+        );
+        assert_eq!(cursor_id_for_feedback(cursor), Some(CursorId::NoMove));
+        assert_eq!(
+            object_click_release(
+                &sim, &rules, &selected, &selected, clicked, &overlays, false
+            ),
+            LeftRelease::Dispatch
+        );
+        let click = |actor| {
+            object_attack_click_command(
+                &sim,
+                &rules,
+                &overlays,
+                owner,
+                OrderMode::Move,
+                OrderModifier::Normal,
+                false,
+                actor,
+                clicked,
+            )
+        };
+        assert!(
+            matches!(
+                click(other),
+                Some(Command::Move { entity_id, .. } | Command::MoveToObject { entity_id, .. })
+                    if entity_id == other
+            ),
+            "{:?}",
+            click(other)
+        );
+        assert_eq!(click(clicked), None);
+    }
+
+    /// The Harrier's Cell query under the object (`0x00417D7C..0x00417DCB`)
+    /// reaches Techno's unforced Cell Attack rung (`0x007008A6..0x007009F1`):
+    /// over an enemy Kirov in flight above another house's GAWALL, which the
+    /// Harrier's `ORCAAP` (`Wall=yes`) may hit, the answer is Attack, not
+    /// Move: the attack cursor, and the click attacks the Kirov (Aircraft
+    /// `0x00417BD0` -> Foot `0x004D74E0`). The allied Rocketeer over such a
+    /// wall answers Attack too. Over the player's own wall it stays Move.
+    #[test]
+    fn a_harrier_over_a_flier_above_an_enemy_wall_answers_attack() {
+        use crate::app::types::CursorFeedbackKind;
+        let patch = crate::rules::ini_parser::IniFile::from_str("[DISK]\nImmune=yes\n");
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules_for_map_with_patch(
+            "Hills.mmx",
+            &patch,
+        ) else {
+            return;
+        };
+        let overlays = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(
+            &retail.processed_rules,
+            Some(retail.fixed_art.as_ref()),
+        );
+        let wall = overlays.id_for_name("GAWALL").expect("retail GAWALL");
+        let (mut sim, rules, _) = Simulation::walk_cell_input_test_scene_with(retail.rules, false);
+        let owner = sim.interner().get("Local").unwrap();
+        let harrier = sim.spawn_object("ORCA", "Local", 5, 4, 0, &rules).unwrap();
+        let kirov = sim.spawn_object("ZEP", "Enemy", 7, 6, 0, &rules).unwrap();
+        let rocketeer = sim
+            .spawn_object("JUMPJET", "Ally", 6, 8, 0, &rules)
+            .unwrap();
+        let own_wall_kirov = sim.spawn_object("ZEP", "Enemy", 10, 6, 0, &rules).unwrap();
+        let shrouded_kirov = sim.spawn_object("ZEP", "Enemy", 12, 6, 0, &rules).unwrap();
+        let disc = sim.spawn_object("DISK", "Enemy", 9, 9, 0, &rules).unwrap();
+        for flier in [kirov, rocketeer, own_wall_kirov, shrouded_kirov, disc] {
+            sim.entities_mut_for_test()
+                .get_mut(flier)
+                .unwrap()
+                .position
+                .set_exact_z_leptons_for_test(Some(700));
+        }
+        for (asker, other) in [("LOCAL", "ALLY"), ("ALLY", "LOCAL")] {
+            sim.house_alliances_mut_for_test()
+                .entry(asker.to_string())
+                .or_default()
+                .insert(other.to_string());
+        }
+        let enemy = sim.interner().get("Enemy").unwrap();
+        let (width, height) = {
+            let terrain = sim.resolved_terrain().unwrap();
+            (terrain.width(), terrain.height())
+        };
+        let mut grid = crate::sim::overlay_grid::OverlayGrid::new(width, height);
+        for cell in [(7, 6), (6, 8), (12, 6), (9, 9)] {
+            grid.place_owned_wall(cell.0, cell.1, wall, 0, enemy);
+        }
+        grid.place_owned_wall(10, 6, wall, 0, owner);
+        *sim.overlay_grid_mut_for_test() = Some(grid);
+        sim.resolve_type_handles(&rules);
+        *sim.fog_mut_for_test() = crate::sim::vision::FogState::new(16, 16);
+        sim.fog_mut_for_test().reveal_cells_for_owner(
+            owner,
+            (0..16)
+                .flat_map(|y| (0..16).map(move |x| (x, y)))
+                .filter(|&cell| cell != (12, 6)),
+        );
+        let action = |target| {
+            attack_action(
+                &sim,
+                &rules,
+                harrier,
+                &TargetKind::Entity(target),
+                false,
+                Some(&overlays),
+            )
+        };
+        let cursor = |target, kind| {
+            crate::app::input::cursor::capability_cursor_for_hover(
+                &sim,
+                &[harrier],
+                Some(harrier),
+                &HoverTargetKindWithId {
+                    kind,
+                    stable_id: target,
+                },
+                Some(&rules),
+                Some(&overlays),
+                OrderModifier::Normal,
+                false,
+                false,
+            )
+        };
+        let click = |target| {
+            object_attack_click_command(
+                &sim,
+                &rules,
+                &overlays,
+                owner,
+                OrderMode::Move,
+                OrderModifier::Normal,
+                false,
+                harrier,
+                target,
+            )
+        };
+        // The ally's Rocketeer is a friend: without the wall it would be the
+        // Move of `a_harrier_moves_to_an_object_it_may_not_attack`.
+        for (target, kind) in [
+            (kirov, HoverTargetKind::EnemyUnit),
+            (rocketeer, HoverTargetKind::FriendlyUnit),
+        ] {
+            assert_eq!(action(target), AttackAction::Attack);
+            assert!(
+                matches!(
+                    cursor(target, kind),
+                    CursorFeedbackKind::EnemyUnit | CursorFeedbackKind::EnemyOutOfRange
+                ),
+                "{:?}",
+                cursor(target, kind)
+            );
+            assert_eq!(
+                object_click_release(
+                    &sim,
+                    &rules,
+                    &[harrier],
+                    &[harrier],
+                    target,
+                    &overlays,
+                    false
+                ),
+                LeftRelease::Dispatch
+            );
+            assert_eq!(
+                click(target),
+                Some(Command::Attack {
+                    attacker_id: harrier,
+                    target_id: target,
+                })
+            );
+        }
+        // The player's own wall admits no rung; the shroud wrapper takes the
+        // Attack back over a shrouded Cell; Attack over an `Immune=` object is
+        // NoMove (`0x00417F4A`).
+        assert_eq!(action(own_wall_kirov), AttackAction::Move);
+        assert_ne!(action(shrouded_kirov), AttackAction::Attack);
+        assert_eq!(action(disc), AttackAction::NoMove);
+    }
+
+    /// Unit (`0x0074041B..0x0074049A`) and Infantry
+    /// (`0x0051F160..0x0051F179`) What_Action over an object turn a final
+    /// Attack over an `Immune=` type (`+0x233`) into NoMove, with or without
+    /// Ctrl: the NoMove cursor, and the click is Foot ClickedAction's Move
+    /// (`0x004D74E0`), not an Attack. Retail's `Immune=yes` object is the
+    /// bridge repair hut (`CABHUT`); the patched Grizzly shows the same answer
+    /// over a unit. A Rhino and a GI keep Attack over another enemy tank.
+    /// Infantry's C4 (`0x0051E9C1..0x0051EA56`) and Crazy Ivan
+    /// (`0x0051EB24..0x0051EB7E`) arms return before its Immune tail, so
+    /// Tanya still sabotages the hut and an Ivan still bombs it.
+    #[test]
+    fn a_tank_and_a_gi_refuse_to_attack_an_immune_object() {
+        use crate::app::types::CursorFeedbackKind;
+        let patch = crate::rules::ini_parser::IniFile::from_str("[MTNK]\nImmune=yes\n");
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules_for_map_with_patch(
+            "Hills.mmx",
+            &patch,
+        ) else {
+            return;
+        };
+        let (mut sim, rules, _) = Simulation::walk_cell_input_test_scene_with(retail.rules, false);
+        assert!(rules.object("CABHUT").is_some_and(|hut| hut.immune));
+        let owner = sim.interner().get("Local").unwrap();
+        let rhino = sim.spawn_object("HTNK", "Local", 5, 4, 0, &rules).unwrap();
+        let gi = sim.spawn_object("E1", "Local", 5, 6, 0, &rules).unwrap();
+        let grizzly = sim.spawn_object("MTNK", "Enemy", 4, 11, 0, &rules).unwrap();
+        let enemy_rhino = sim.spawn_object("HTNK", "Enemy", 6, 8, 0, &rules).unwrap();
+        let hut = sim
+            .spawn_object("CABHUT", "Enemy", 13, 13, 0, &rules)
+            .unwrap();
+        let ivan = sim.spawn_object("IVAN", "Local", 4, 6, 0, &rules).unwrap();
+        let tanya = sim.spawn_object("TANY", "Local", 4, 4, 0, &rules).unwrap();
+        sim.resolve_type_handles(&rules);
+        *sim.fog_mut_for_test() = crate::sim::vision::FogState::new(16, 16);
+        sim.fog_mut_for_test()
+            .reveal_cells_for_owner(owner, (0..16).flat_map(|y| (0..16).map(move |x| (x, y))));
+        let overlays = crate::rules::overlay_types::OverlayTypeRegistry::empty();
+        for actor in [rhino, gi] {
+            let action = |target, forced| {
+                attack_action(
+                    &sim,
+                    &rules,
+                    actor,
+                    &TargetKind::Entity(target),
+                    forced,
+                    None,
+                )
+            };
+            let cursor = |target, kind| {
+                crate::app::input::cursor::capability_cursor_for_hover(
+                    &sim,
+                    &[actor],
+                    Some(actor),
+                    &HoverTargetKindWithId {
+                        kind,
+                        stable_id: target,
+                    },
+                    Some(&rules),
+                    None,
+                    OrderModifier::Normal,
+                    false,
+                    false,
+                )
+            };
+            let click = |target| {
+                object_attack_click_command(
+                    &sim,
+                    &rules,
+                    &overlays,
+                    owner,
+                    OrderMode::Move,
+                    OrderModifier::Normal,
+                    false,
+                    actor,
+                    target,
+                )
+            };
+            assert_eq!(action(enemy_rhino, false), AttackAction::Attack);
+            assert_eq!(
+                cursor(enemy_rhino, HoverTargetKind::EnemyUnit),
+                CursorFeedbackKind::EnemyUnit
+            );
+            assert!(matches!(
+                click(enemy_rhino),
+                Some(Command::Attack { .. } | Command::AttackMove { .. })
+            ));
+            for (target, kind) in [
+                (grizzly, HoverTargetKind::EnemyUnit),
+                (hut, HoverTargetKind::EnemyStructure),
+            ] {
+                if actor == gi {
+                    // The Infantry tail is infantry_attack_action's last arm.
+                    assert_eq!(action(target, true), AttackAction::Attack, "{target}");
+                    assert_eq!(
+                        infantry_attack_action(&sim, &rules, gi, target),
+                        Some(InfantryAttackAction::NoMove),
+                        "{target}"
+                    );
+                } else {
+                    assert_eq!(action(target, false), AttackAction::NoMove, "{target}");
+                    assert_eq!(action(target, true), AttackAction::NoMove, "{target}");
+                }
+                assert_eq!(
+                    cursor(target, kind),
+                    CursorFeedbackKind::Invalid,
+                    "{target}"
+                );
+                assert!(
+                    matches!(
+                        click(target),
+                        Some(Command::Move { entity_id, .. } | Command::MoveToObject { entity_id, .. })
+                            if entity_id == actor
+                    ),
+                    "{target}: {:?}",
+                    click(target)
+                );
+            }
+        }
+
+        assert_eq!(
+            attack_action(&sim, &rules, ivan, &TargetKind::Entity(hut), false, None),
+            AttackAction::Attack
+        );
+        assert_eq!(infantry_attack_action(&sim, &rules, ivan, hut), None);
+        assert_eq!(
+            crate::app::input::cursor::capability_cursor_for_hover(
+                &sim,
+                &[ivan],
+                Some(ivan),
+                &HoverTargetKindWithId {
+                    kind: HoverTargetKind::EnemyStructure,
+                    stable_id: hut,
+                },
+                Some(&rules),
+                None,
+                OrderModifier::Normal,
+                false,
+                false,
+            ),
+            CursorFeedbackKind::IvanBomb
+        );
+        assert_eq!(
+            infantry_attack_action(&sim, &rules, tanya, hut),
+            Some(InfantryAttackAction::Sabotage)
+        );
+        assert!(matches!(
+            object_attack_click_command(
+                &sim,
+                &rules,
+                &overlays,
+                owner,
+                OrderMode::Move,
+                OrderModifier::ForceFire,
+                false,
+                tanya,
+                hut,
+            ),
+            Some(Command::PlantC4 { attacker_id, .. }) if attacker_id == tanya
+        ));
     }
 
     /// What_Action_OnCell's force-fire rung is a human player's too
@@ -3719,15 +7248,17 @@ mod tests {
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
         for (house, human) in [("Americans", true), ("Russians", false)] {
-            let id = sim.interner.intern(house);
-            sim.houses.insert(
-                id,
-                crate::sim::house_state::HouseState::new(id, 0, None, human, 0, 10),
-            );
-            sim.session.house_order.push(id);
+            let id = sim.intern(house);
+            sim.houses_mut_for_test()
+                .register(crate::sim::house_state::HouseState::new(
+                    id, 0, None, human, 0, 10,
+                ));
         }
-        sim.session.game_mode_nonzero = true;
-        sim.session.current_house = sim.interner.get("Americans");
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        let house = sim.interner().get("Americans");
+        sim.session_mut_for_test().set_current_house_for_test(house);
         let agent = sim
             .spawn_object("AGENT", "Americans", 3, 5, 0, &rules)
             .unwrap();
@@ -3751,11 +7282,11 @@ mod tests {
             ))
             .unwrap();
         let mut sim = Simulation::new();
-        let owner = sim.interner.intern("Americans");
-        let other = sim.interner.intern("Russians");
-        let factory_type = sim.interner.intern("GAWEAP");
-        let power_type = sim.interner.intern("GAPOWR");
-        let tank_type = sim.interner.intern("MTNK");
+        let owner = sim.intern("Americans");
+        let other = sim.intern("Russians");
+        let factory_type = sim.intern("GAWEAP");
+        let power_type = sim.intern("GAPOWR");
+        let tank_type = sim.intern("MTNK");
         for (id, rx, house, kind, category) in [
             (1, 10, owner, factory_type, EntityCategory::Structure),
             (2, 11, owner, tank_type, EntityCategory::Unit),
@@ -3763,7 +7294,7 @@ mod tests {
             (4, 13, other, factory_type, EntityCategory::Structure),
             (5, 14, owner, factory_type, EntityCategory::Structure),
         ] {
-            sim.entities_mut()
+            sim.entities_mut_for_test()
                 .insert(GameEntity::new_at_frame_zero_for_test(
                     id,
                     rx,
@@ -3802,9 +7333,17 @@ mod tests {
         let enemy = sim
             .spawn_object("REFN", "Russians", 17, 15, 0, &rules)
             .unwrap();
-        let owner = sim.interner.get("Americans").unwrap();
-        let (orders, announce) =
-            building_cell_orders(&sim, &rules, &[refinery, enemy, refinery], owner, (17, 16));
+        let owner = sim.interner().get("Americans").unwrap();
+        let (orders, announce) = building_cell_orders(
+            &sim,
+            &rules,
+            None,
+            &[refinery, enemy, refinery],
+            owner,
+            (17, 16),
+            false,
+            false,
+        );
         assert!(
             matches!(orders.as_slice(), [Command::SetRally { producer_ids, .. },
             Command::SellBuilding { entity_id }] if producer_ids == &[refinery] && *entity_id == refinery)
@@ -3818,12 +7357,21 @@ mod tests {
             stable_id: refinery,
         };
         assert_eq!(
-            self_click_command(&sim, &rules, owner, &[refinery], Some(&hover)),
+            self_click_command(&sim, &rules, None, owner, &[refinery], Some(&hover), false),
             None
         );
         // A missing input map cannot produce an archive;4437AD still queues SELL.
-        sim.resolved_terrain = None;
-        let (orders, _) = building_cell_orders(&sim, &rules, &[refinery], owner, (17, 16));
+        *sim.resolved_terrain_mut_for_test() = None;
+        let (orders, _) = building_cell_orders(
+            &sim,
+            &rules,
+            None,
+            &[refinery],
+            owner,
+            (17, 16),
+            false,
+            false,
+        );
         assert_eq!(
             orders,
             [Command::SellBuilding {
@@ -3861,23 +7409,12 @@ mod tests {
             resolve_order_modifiers(false, true, false),
             OrderModifier::Shift
         );
-    }
-
-    /// The chord test reads the raw key state, so Alt does not defeat it — and
-    /// because Shift and Ctrl have already cancelled each other by the time the
-    /// guard-area gate is evaluated, Ctrl+Shift+Alt is attack move, not guard.
-    #[test]
-    fn attack_move_chord_survives_a_held_alt() {
+        // The chord test reads the raw key state, so a held Alt does not defeat
+        // attack move, and Shift outranks Alt without Ctrl.
         assert_eq!(
             resolve_order_modifiers(true, true, true),
             OrderModifier::AttackMove
         );
-    }
-
-    /// Shift outranks Alt: the cell path returns on Shift before it reaches the
-    /// Alt test, and the object path returns the add-to-selection action first.
-    #[test]
-    fn shift_outranks_alt_without_ctrl() {
         assert_eq!(
             resolve_order_modifiers(false, true, true),
             OrderModifier::Shift
@@ -3921,19 +7458,27 @@ mod tests {
             Some("VoiceAttack")
         );
         assert_eq!(
-            order_voice_key(&Command::HarvestCell {
-                entity_id: 1,
-                target_rx: 0,
-                target_ry: 0,
-            }),
+            order_voice_key(&Command::clicked_mission(
+                1,
+                crate::sim::mission::MissionType::Harvest,
+                TargetKind::Cell(0, 0)
+            )),
             Some("VoiceHarvest")
         );
         assert_eq!(
-            order_voice_key(&Command::EnterTransport {
-                passenger_id: 1,
-                transport_id: 2,
-            }),
+            order_voice_key(&Command::clicked_mission(
+                1,
+                crate::sim::mission::MissionType::Enter,
+                TargetKind::Entity(2)
+            )),
             Some("VoiceEnter")
+        );
+        assert_eq!(
+            order_voice_key(&Command::CaptureBuilding {
+                engineer_id: 1,
+                target_building_id: 2,
+            }),
+            Some("VoiceCapture")
         );
         // Area guard and sabotage have no slot of their own.
         assert_eq!(
@@ -3949,17 +7494,6 @@ mod tests {
                 target_building_id: 2,
             }),
             Some("VoiceSpecialAttack")
-        );
-    }
-
-    #[test]
-    fn capture_orders_dispatch_the_capture_voice_key() {
-        assert_eq!(
-            order_voice_key(&Command::CaptureBuilding {
-                engineer_id: 1,
-                target_building_id: 2,
-            }),
-            Some("VoiceCapture")
         );
     }
 
@@ -4023,9 +7557,9 @@ mod tests {
         type_name: &str,
         category: EntityCategory,
     ) -> u64 {
-        let owner = sim.interner.intern("Americans");
-        let type_ref = sim.interner.intern(type_name);
-        sim.entities_mut()
+        let owner = sim.intern("Americans");
+        let type_ref = sim.intern(type_name);
+        sim.entities_mut_for_test()
             .insert(GameEntity::new_at_frame_zero_for_test(
                 stable_id,
                 5,
@@ -4186,42 +7720,45 @@ mod tests {
     /// plain attack.
     #[test]
     fn chorded_click_on_an_enemy_object_attack_moves() {
+        let Some((retail, _)) = retail_entry_tests::retail() else {
+            return;
+        };
+        let rules = &retail.rules;
+        let mut sim = retail_entry_tests::arena(rules);
+        let tank = sim
+            .spawn_object("MTNK", "Americans", 16, 16, 0, rules)
+            .unwrap();
+        let target = sim
+            .spawn_object("E1", "Russians", 20, 16, 0, rules)
+            .unwrap();
+        let helicopter = sim
+            .spawn_object("SHAD", "Americans", 16, 20, 0, rules)
+            .unwrap();
+        let click = |mode, actor| object_click_payload(&sim, rules, mode, actor, target);
         assert_eq!(
-            object_click_payload(OrderMode::AttackMove, OrderModifier::Normal, true, 1, 2),
-            Command::AttackMove {
-                entity_id: 1,
-                target: Some(TargetKind::Entity(2)),
+            click(OrderMode::AttackMove, tank),
+            Some(Command::AttackMove {
+                entity_id: tank,
+                target: Some(TargetKind::Entity(target)),
                 destination: None,
-            }
+            })
         );
         assert_eq!(
-            object_click_payload(OrderMode::AttackMove, OrderModifier::Normal, false, 1, 2),
-            Command::Attack {
-                attacker_id: 1,
-                target_id: 2,
-            }
+            click(OrderMode::AttackMove, helicopter),
+            Some(Command::Attack {
+                attacker_id: helicopter,
+                target_id: target,
+            })
         );
-        // Plain click, force fire and guard area are untouched by the promotion.
+        // Outside the attack-move mode the Attack stays plain, forced or
+        // not: the mode's chord test passes before any key read
+        // (`0x00731BF0`).
         assert_eq!(
-            object_click_payload(OrderMode::Move, OrderModifier::Normal, true, 1, 2),
-            Command::Attack {
-                attacker_id: 1,
-                target_id: 2,
-            }
-        );
-        assert_eq!(
-            object_click_payload(OrderMode::AttackMove, OrderModifier::ForceFire, true, 1, 2),
-            Command::Attack {
-                attacker_id: 1,
-                target_id: 2,
-            }
-        );
-        assert_eq!(
-            object_click_payload(OrderMode::Move, OrderModifier::GuardArea, true, 1, 2),
-            Command::Guard {
-                entity_id: 1,
-                target: Some(TargetKind::Entity(2)),
-            }
+            click(OrderMode::Move, tank),
+            Some(Command::Attack {
+                attacker_id: tank,
+                target_id: target,
+            })
         );
     }
 
@@ -4278,7 +7815,8 @@ mod tests {
     /// A click on the selected object itself is its self action only while it
     /// is the one selected object and the local player's
     /// (`TechnoClass::What_Action_OnObject`, `0x007000B9..0x007000DF`); a click
-    /// on one of several selected objects is a plain selection click.
+    /// on one of several selected objects takes the tail instead
+    /// (`a_self_click_in_a_larger_selection_dispatches_no_move`).
     #[test]
     fn self_click_needs_the_one_selected_own_object() {
         let rules =
@@ -4287,16 +7825,22 @@ mod tests {
                  [BuildingTypes]\n0=GACNST\n\
                  [E1]\nStrength=125\nDeployFire=yes\nDeployer=yes\n\
                  [AMCV]\nStrength=1000\nDeploysInto=GACNST\n\
-                 [GACNST]\nStrength=1000\n",
+                 [GACNST]\nStrength=1000\n[Clear]\nBuildable=yes\n",
             ))
             .unwrap();
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
+        // Ground the MCV's yard may stand on (Unit What_Action's placement
+        // test, `0x0073FF9C`).
+        crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
         for house in ["Americans", "Soviets"] {
-            let id = sim.interner.intern(house);
-            sim.session.house_order.push(id);
+            let id = sim.intern(house);
+            sim.houses_mut_for_test()
+                .register(crate::sim::house_state::HouseState::new(
+                    id, 0, None, false, 0, 10,
+                ));
         }
-        let americans = sim.interner.get("Americans").unwrap();
+        let americans = sim.interner().get("Americans").unwrap();
         let mut spawn = |kind: &str, owner: &str, rx: u16| {
             sim.spawn_object(kind, owner, rx, 5, 0, &rules).unwrap()
         };
@@ -4309,7 +7853,15 @@ mod tests {
             stable_id,
         };
         let click = |selected: &[u64], target: u64| {
-            self_click_command(&sim, &rules, americans, selected, Some(&hover(target)))
+            self_click_command(
+                &sim,
+                &rules,
+                None,
+                americans,
+                selected,
+                Some(&hover(target)),
+                false,
+            )
         };
 
         assert_eq!(
@@ -4320,8 +7872,12 @@ mod tests {
             click(&[mcv], mcv),
             Some(Command::DeployMcv { entity_id: mcv })
         );
-        assert_eq!(click(&[gi, other_gi], gi), None, "a group click selects");
-        assert_eq!(click(&[mcv, gi], mcv), None, "a group click selects");
+        assert_eq!(
+            click(&[gi, other_gi], gi),
+            None,
+            "a group click takes the tail"
+        );
+        assert_eq!(click(&[mcv, gi], mcv), None, "a group click takes the tail");
         assert_eq!(click(&[gi], other_gi), None, "not the selected object");
         assert_eq!(click(&[enemy_mcv], enemy_mcv), None, "not the player's");
     }
@@ -4347,7 +7903,9 @@ mod tests {
         let mut sim = Simulation::with_seed(0x0044_8160);
         sim.intern_rule_type_ids(rules);
         sim.resolve_type_handles(rules);
-        sim.session.game_mode_nonzero = true;
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
         for name in ["Americans", "Russians"] {
             let owner = sim.intern(name);
             let side = rules
@@ -4355,12 +7913,12 @@ mod tests {
                 .expect("stock country Side")
                 .0;
             let mut house = HouseState::new(owner, side, Some(owner), true, 50_000, 10);
-            house.project_country_mults(rules, &sim.interner);
-            sim.houses.insert(owner, house);
-            sim.session.house_order.push(owner);
+            house.project_country_mults(rules, sim.interner());
+            sim.houses_mut_for_test().register(house);
         }
-        let owner = sim.interner.get("Americans").unwrap();
-        sim.session.current_house = Some(owner);
+        let owner = sim.interner().get("Americans").unwrap();
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
         crate::sim::arena_fixture::flat_ground(&mut sim, rules);
         let first = sim
             .spawn_object("GAWEAP", "Americans", 6, 6, 0, rules)
@@ -4390,10 +7948,22 @@ mod tests {
             stable_id,
         };
         let click = |selected: &[u64], target| {
-            self_click_command(&sim, rules, owner, selected, Some(&hover(target)))
+            self_click_command(
+                &sim,
+                rules,
+                None,
+                owner,
+                selected,
+                Some(&hover(target)),
+                false,
+            )
         };
         assert_eq!(click(&[first], first), None, "already primary is Action0");
-        assert_eq!(click(&[first, second], second), None, "a group selects");
+        assert_eq!(
+            click(&[first, second], second),
+            None,
+            "a group takes the tail"
+        );
         assert_eq!(click(&[first], second), None, "not the selected object");
         assert_eq!(
             click(&[foreign], foreign),
@@ -4422,6 +7992,7 @@ mod tests {
                 None,
                 crate::app::input::context_order::OrderModifier::Normal,
                 false,
+                false,
             )
         };
         let nonprimary_cursor = cursor(&[second], second);
@@ -4439,19 +8010,41 @@ mod tests {
             "already-primary Action0 uses row0"
         );
         assert_eq!(
-            cursor(&[first, second], second),
-            CursorFeedbackKind::FriendlyStructure,
-            "a group hover selects instead of choosing a primary"
-        );
-        assert_eq!(
-            cursor(&[first], second),
-            CursorFeedbackKind::FriendlyStructure,
+            cursor_id_for_feedback(cursor(&[first], second)),
+            Some(CursorId::Select),
             "the hovered factory must be the selected object"
         );
         assert_ne!(
             cursor(&[foreign], foreign),
             CursorFeedbackKind::Deploy,
             "a foreign nonprimary must not offer the local self action"
+        );
+        // DetermineAction692610 asks the best object alone; with two
+        // selected, Techno's self rung (0x007000C1) is closed and its tail
+        // answers 0 over a selected object (0x007005BF), which Building
+        // keeps (0x0044750D).
+        for id in [first, second] {
+            sim.entities_mut_for_test()
+                .get_mut(id)
+                .unwrap()
+                .selection
+                .set_selected_for_test(true);
+        }
+        let group = capability_cursor_for_hover(
+            &sim,
+            &[first, second],
+            Some(first),
+            &hover(second),
+            Some(rules),
+            None,
+            crate::app::input::context_order::OrderModifier::Normal,
+            false,
+            false,
+        );
+        assert_eq!(
+            cursor_id_for_feedback(group),
+            Some(CursorId::Default),
+            "a group hover over a selected factory is the arrow"
         );
     }
 
@@ -4465,21 +8058,25 @@ mod tests {
             .expect("Bio Reactor input rules");
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
-        let owner = sim.interner.intern("Americans");
-        sim.session.current_house = Some(owner);
+        let owner = sim.intern("Americans");
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
         let reactor = sim
             .spawn_object_limbo_at_height("YAPOWR", "Americans", 10, 10, 0, 0, &rules)
             .expect("Bio Reactor builds");
         let mut cargo = crate::sim::passenger::PassengerCargo::new(5, 0.0);
         cargo.board_forced_chain(&[(99, 1.0)]);
-        sim.entities_mut().get_mut(reactor).unwrap().passenger_role =
-            crate::sim::passenger::PassengerRole::transport(cargo);
+        sim.entities_mut_for_test()
+            .get_mut(reactor)
+            .unwrap()
+            .passenger_role = crate::sim::passenger::PassengerRole::transport(cargo);
         let hover = HoverTargetKindWithId {
             kind: HoverTargetKind::FriendlyStructure,
             stable_id: reactor,
         };
 
-        let command = self_click_command(&sim, &rules, owner, &[reactor], Some(&hover));
+        let command =
+            self_click_command(&sim, &rules, None, owner, &[reactor], Some(&hover), false);
         let cursor = crate::app::input::cursor::capability_cursor_for_hover(
             &sim,
             &[reactor],
@@ -4488,6 +8085,7 @@ mod tests {
             Some(&rules),
             None,
             crate::app::input::context_order::OrderModifier::Normal,
+            false,
             false,
         );
 
@@ -4512,22 +8110,25 @@ mod tests {
             .expect("transport input rules");
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
-        let owner = sim.interner.intern("Americans");
-        sim.session.current_house = Some(owner);
+        let owner = sim.intern("Americans");
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
         let ifv = sim
             .spawn_object_limbo_at_height("IFV", "Americans", 10, 10, 0, 0, &rules)
             .expect("transport builds");
         let mut cargo = crate::sim::passenger::PassengerCargo::new(1, 0.0);
         cargo.board_forced_chain(&[(99, 1.0)]);
-        sim.entities_mut().get_mut(ifv).unwrap().passenger_role =
-            crate::sim::passenger::PassengerRole::transport(cargo);
+        sim.entities_mut_for_test()
+            .get_mut(ifv)
+            .unwrap()
+            .passenger_role = crate::sim::passenger::PassengerRole::transport(cargo);
         let hover = HoverTargetKindWithId {
             kind: HoverTargetKind::FriendlyUnit,
             stable_id: ifv,
         };
         let probe = |sim: &Simulation| {
             (
-                self_click_command(sim, &rules, owner, &[ifv], Some(&hover)),
+                self_click_command(sim, &rules, None, owner, &[ifv], Some(&hover), false),
                 crate::app::input::cursor::capability_cursor_for_hover(
                     sim,
                     &[ifv],
@@ -4536,6 +8137,7 @@ mod tests {
                     Some(&rules),
                     None,
                     crate::app::input::context_order::OrderModifier::Normal,
+                    false,
                     false,
                 ),
             )
@@ -4547,7 +8149,10 @@ mod tests {
                 crate::app::types::CursorFeedbackKind::Deploy
             )
         );
-        sim.entities_mut().get_mut(ifv).unwrap().set_on_bridge(true);
+        sim.entities_mut_for_test()
+            .get_mut(ifv)
+            .unwrap()
+            .set_on_bridge(true);
         assert_eq!(
             probe(&sim),
             (None, crate::app::types::CursorFeedbackKind::NoDeploy)
@@ -4571,8 +8176,9 @@ mod tests {
         let id = sim
             .spawn_object_limbo_at_height("SCHP", "Americans", 10, 10, 0, 0, rules)
             .expect("retail Siege Chopper builds");
-        let owner = sim.interner.get("Americans").unwrap();
-        sim.session.current_house = Some(owner);
+        let owner = sim.interner().get("Americans").unwrap();
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
         let hover = HoverTargetKindWithId {
             kind: HoverTargetKind::FriendlyUnit,
             stable_id: id,
@@ -4583,12 +8189,12 @@ mod tests {
             (true, false, false),
             (true, false, true),
         ] {
-            sim.entities_mut()
+            sim.entities_mut_for_test()
                 .get_mut(id)
                 .unwrap()
                 .set_unit_simple_deploy_for_test(deployed, begin, reverse);
             assert_eq!(
-                self_click_command(&sim, rules, owner, &[id], Some(&hover)),
+                self_click_command(&sim, rules, None, owner, &[id], Some(&hover), false),
                 Some(Command::DeployMcv { entity_id: id }),
             );
             assert_eq!(
@@ -4601,16 +8207,17 @@ mod tests {
                     None,
                     crate::app::input::context_order::OrderModifier::Normal,
                     false,
+                    false,
                 ),
                 crate::app::types::CursorFeedbackKind::Deploy,
             );
         }
         assert_eq!(
-            self_click_command(&sim, rules, owner, &[id, id + 1], Some(&hover)),
+            self_click_command(&sim, rules, None, owner, &[id, id + 1], Some(&hover), false),
             None,
             "a group self-click remains selection"
         );
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(id)
             .unwrap()
             .low_bridge_tube_state = Some(
@@ -4621,7 +8228,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            self_click_command(&sim, rules, owner, &[id], Some(&hover)),
+            self_click_command(&sim, rules, None, owner, &[id], Some(&hover), false),
             None
         );
         let feedback = crate::app::input::cursor::capability_cursor_for_hover(
@@ -4632,6 +8239,7 @@ mod tests {
             Some(rules),
             None,
             crate::app::input::context_order::OrderModifier::Normal,
+            false,
             false,
         );
         assert_eq!(feedback, crate::app::types::CursorFeedbackKind::NoDeploy);
@@ -4664,7 +8272,7 @@ mod tests {
         crate::sim::arena_fixture::flat_ground(&mut sim, rules);
         // Successful Unlimbo now publishes sight immediately; establish the
         // viewer-plane dimensions before creating any sources.
-        sim.fog = crate::sim::vision::FogState::new(32, 32);
+        *sim.fog_mut_for_test() = crate::sim::vision::FogState::new(32, 32);
         let chopper = sim
             .spawn_object("SCHP", "Americans", 10, 10, 0, rules)
             .expect("retail Siege Chopper spawns");
@@ -4674,10 +8282,13 @@ mod tests {
         let tank = sim
             .spawn_object("MTNK", "Americans", 14, 10, 0, rules)
             .expect("retail tank spawns");
-        let owner = sim.interner.get("Americans").unwrap();
-        sim.fog.reveal_all_for_owner(owner);
-        sim.session.game_mode_nonzero = true;
-        sim.session.current_house = Some(owner);
+        let owner = sim.interner().get("Americans").unwrap();
+        sim.fog_mut_for_test().reveal_all_for_owner(owner);
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
         let goals = |sim: &Simulation, id| {
             (
                 ordinary_cell_move_goal(sim, rules, None, owner, id, (14, 12), false),
@@ -4693,7 +8304,7 @@ mod tests {
             (true, false, false),
             (true, false, true),
         ] {
-            sim.entities_mut()
+            sim.entities_mut_for_test()
                 .get_mut(chopper)
                 .unwrap()
                 .set_unit_simple_deploy_for_test(deployed, begin, reverse);
@@ -4710,7 +8321,7 @@ mod tests {
             }
         }
         assert!(rules.object("E1").unwrap().deployer);
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(gi)
             .unwrap()
             .mission_leaf
@@ -4722,13 +8333,13 @@ mod tests {
             matches!(over_object, Some(TargetKind::Cell(..))),
             "{over_object:?}"
         );
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(gi)
             .unwrap()
             .mission_leaf
             .set_infantry_doing_verified(0)
             .unwrap();
-        sim.session.current_house = None;
+        sim.session_mut_for_test().set_current_house_for_test(None);
         assert_eq!(goals(&sim, gi), (None, None));
     }
 
@@ -4756,13 +8367,19 @@ mod tests {
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
         for house in ["Americans", "Soviets"] {
-            let id = sim.interner.intern(house);
-            sim.session.house_order.push(id);
+            let id = sim.intern(house);
+            sim.houses_mut_for_test()
+                .register(crate::sim::house_state::HouseState::new(
+                    id, 0, None, false, 0, 10,
+                ));
         }
-        let americans = sim.interner.get("Americans").unwrap();
+        let americans = sim.interner().get("Americans").unwrap();
         // The rung is a human player's (`0x007003ED`).
-        sim.session.game_mode_nonzero = true;
-        sim.session.current_house = Some(americans);
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(americans));
         let mut spawn = |kind: &str, owner: &str, rx: u16| {
             sim.spawn_object(kind, owner, rx, 5, 0, &rules).unwrap()
         };
@@ -4798,6 +8415,7 @@ mod tests {
                     None,
                     crate::app::input::context_order::OrderModifier::Normal,
                     false,
+                    false,
                 )
             };
             assert_eq!(
@@ -4812,10 +8430,10 @@ mod tests {
         assert!(disarm_bomb_engineers(&sim, &rules, &selected, own_tank, americans).is_empty());
         assert!(!ivan_cannot_bomb(&sim, &rules, ivan, own_tank));
 
-        sim.bomb_attach(ivan, Some(own_tank), &rules);
-        sim.bomb_attach(enemy_ivan, Some(far_tank), &rules);
-        sim.bomb_list_update(&rules);
-        sim.bomb_list_update(&rules);
+        sim.bomb_attach_for_test(ivan, Some(own_tank), &rules);
+        sim.bomb_attach_for_test(enemy_ivan, Some(far_tank), &rules);
+        sim.bomb_list_update_for_test(&rules);
+        sim.bomb_list_update_for_test(&rules);
 
         assert_eq!(
             disarm_bomb_engineers(&sim, &rules, &selected, own_tank, americans),
@@ -4837,9 +8455,9 @@ mod tests {
         assert!(!ivan_cannot_bomb(&sim, &rules, engineer, own_tank));
 
         // The Engineer carrying a bomb itself is no target of its own click.
-        sim.bomb_attach(ivan, Some(engineer), &rules);
-        sim.bomb_list_update(&rules);
-        sim.bomb_list_update(&rules);
+        sim.bomb_attach_for_test(ivan, Some(engineer), &rules);
+        sim.bomb_list_update_for_test(&rules);
+        sim.bomb_list_update_for_test(&rules);
         assert!(disarm_bomb_engineers(&sim, &rules, &[engineer], engineer, americans).is_empty());
     }
     /// Supplies the ordinary object-route prerequisites, through production
@@ -4871,8 +8489,11 @@ mod tests {
         ).unwrap();
         let mut sim = Simulation::with_seed(0x587410);
         sim.resolve_type_handles(&rules);
-        sim.session.game_mode_nonzero = true;
-        sim.session.current_house = Some(sim.interner.intern("Americans"));
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        let house = Some(sim.intern("Americans"));
+        sim.session_mut_for_test().set_current_house_for_test(house);
         let mut terrain = crate::map::resolved_terrain::test_grid(20, 20, |rx, ry| {
             crate::map::resolved_terrain::ResolvedTerrainCell {
                 speed_costs: crate::map::resolved_terrain::TEST_OPEN_SPEED_COSTS,
@@ -4881,12 +8502,13 @@ mod tests {
             }
         });
         terrain.test_set_high_bridge_set_starts(Some(100), Some(200));
+        sim.install_resolved_terrain_for_new_map(terrain);
         for y in 9..=11 {
-            terrain.cell_mut(12, y).unwrap().bridge_facts.overlay_id =
+            sim.overlay_cell_mut_for_test(12, y).overlay_id =
                 Some(if collapsed { 0xE7 } else { 0xD4 });
         }
-        sim.install_resolved_terrain_for_new_map(terrain);
-        sim.bridge_state = Some(crate::sim::bridge_state::BridgeRuntimeState::default());
+        *sim.bridge_state_mut_for_test() =
+            Some(crate::sim::bridge_state::BridgeRuntimeState::default());
         crate::sim::arena_fixture::supply_native_map(&mut sim);
         let owner = if relation == "self" {
             "Americans"
@@ -4899,13 +8521,13 @@ mod tests {
         let hut = sim
             .spawn_object("CABHUT", owner, 10, 10, 0, &rules)
             .unwrap();
-        sim.entities_mut()
+        sim.entities_mut_for_test()
             .get_mut(hut)
             .unwrap()
             .health
             .set_for_test(150);
         if relation == "allied" {
-            sim.house_alliances
+            sim.house_alliances_mut_for_test()
                 .entry("AMERICANS".into())
                 .or_default()
                 .insert("SOVIETS".into());
@@ -4942,9 +8564,9 @@ mod tests {
                 let before = sim.state_hash();
                 let actor = serde_json::to_value(sim.entities().get(engineer).unwrap()).unwrap();
                 let rng = (
-                    sim.scenario_rng.logical_state(),
-                    sim.main_rng.logical_state(),
-                    sim.mapgen_rng.logical_state(),
+                    sim.scenario_rng().logical_state(),
+                    sim.main_rng().logical_state(),
+                    sim.mapgen_rng().logical_state(),
                 );
                 let commands = engineer_capture_orders(&sim, &rules, &mut vec![engineer], &hover)
                     .expect("an admitted hut arm always consumes the click, including false query");
@@ -4985,9 +8607,9 @@ mod tests {
                 );
                 assert_eq!(
                     (
-                        sim.scenario_rng.logical_state(),
-                        sim.main_rng.logical_state(),
-                        sim.mapgen_rng.logical_state()
+                        sim.scenario_rng().logical_state(),
+                        sim.main_rng().logical_state(),
+                        sim.mapgen_rng().logical_state()
                     ),
                     rng
                 );
@@ -5019,9 +8641,9 @@ mod tests {
             let before = sim.state_hash();
             let actor = serde_json::to_value(sim.entities().get(engineer).unwrap()).unwrap();
             let rng = (
-                sim.scenario_rng.logical_state(),
-                sim.main_rng.logical_state(),
-                sim.mapgen_rng.logical_state(),
+                sim.scenario_rng().logical_state(),
+                sim.main_rng().logical_state(),
+                sim.mapgen_rng().logical_state(),
             );
             assert_eq!(
                 sim.engineer_building_action(engineer, hover.stable_id, &rules),
@@ -5038,9 +8660,9 @@ mod tests {
             );
             assert_eq!(
                 (
-                    sim.scenario_rng.logical_state(),
-                    sim.main_rng.logical_state(),
-                    sim.mapgen_rng.logical_state()
+                    sim.scenario_rng().logical_state(),
+                    sim.main_rng().logical_state(),
+                    sim.mapgen_rng().logical_state()
                 ),
                 rng
             );
@@ -5064,7 +8686,8 @@ mod tests {
             let (mut sim, rules, engineer, hover) =
                 engineer_hut_click_fixture("hostile", true, true, false, flags, "");
             if gate == "nonlocal" {
-                sim.session.current_house = Some(sim.interner.intern("Soviets"));
+                let house = Some(sim.intern("Soviets"));
+                sim.session_mut_for_test().set_current_house_for_test(house);
             } else {
                 assert!(rules.object("CABHUT").unwrap().is_1x1_with_undeploy());
             }
@@ -5094,9 +8717,9 @@ mod tests {
             let before = sim.state_hash();
             let actor = serde_json::to_value(sim.entities().get(engineer).unwrap()).unwrap();
             let rng = (
-                sim.scenario_rng.logical_state(),
-                sim.main_rng.logical_state(),
-                sim.mapgen_rng.logical_state(),
+                sim.scenario_rng().logical_state(),
+                sim.main_rng().logical_state(),
+                sim.mapgen_rng().logical_state(),
             );
             assert_eq!(
                 sim.engineer_building_action(engineer, hover.stable_id, &rules),
@@ -5115,9 +8738,9 @@ mod tests {
             );
             assert_eq!(
                 (
-                    sim.scenario_rng.logical_state(),
-                    sim.main_rng.logical_state(),
-                    sim.mapgen_rng.logical_state()
+                    sim.scenario_rng().logical_state(),
+                    sim.main_rng().logical_state(),
+                    sim.mapgen_rng().logical_state()
                 ),
                 rng
             );
@@ -5160,11 +8783,12 @@ mod tests {
             );
             let (mut sim, rules, engineer, hover) =
                 engineer_hut_click_fixture("hostile", true, true, false, "", &actor_flags);
-            sim.session.binary_frame = gates["frame"].as_u64().unwrap_or(0) as u32;
+            sim.session_mut_for_test()
+                .set_binary_frame_for_test(gates["frame"].as_u64().unwrap_or(0) as u32);
             if gates["bunker"] == true {
                 // Typed existing owner state: positive native pointer control,
                 // not an assertion of ordinary Infantry bunker installation.
-                sim.entities_mut()
+                sim.entities_mut_for_test()
                     .get_mut(engineer)
                     .unwrap()
                     .bunker
@@ -5173,7 +8797,7 @@ mod tests {
                     );
             }
             if gates["paralysis_start"].is_number() {
-                sim.entities_mut()
+                sim.entities_mut_for_test()
                     .get_mut(engineer)
                     .unwrap()
                     .parasite
@@ -5183,7 +8807,7 @@ mod tests {
                     ));
             }
             if gates["warp_out"] == true {
-                sim.entities_mut()
+                sim.entities_mut_for_test()
                     .get_mut(engineer)
                     .unwrap()
                     .set_temporal_for_test(
@@ -5191,7 +8815,7 @@ mod tests {
                     );
             }
             if gates["warp_in"] == true {
-                sim.entities_mut()
+                sim.entities_mut_for_test()
                     .get_mut(engineer)
                     .unwrap()
                     .install_teleport_state_for_test(Some(
@@ -5204,7 +8828,7 @@ mod tests {
                     ));
             }
             if gates["slave_owner"] == true {
-                sim.entities_mut().get_mut(engineer).unwrap().slave =
+                sim.entities_mut_for_test().get_mut(engineer).unwrap().slave =
                     crate::sim::slave_manager::SlaveLink::for_test(Some(hover.stable_id), vec![]);
             }
             if let Some(native_slots) = gates["spawn_slots"].as_array() {
@@ -5214,7 +8838,7 @@ mod tests {
                         let child = sim
                             .spawn_object("ENGINEER", "Americans", 5 + index as u16, 12, 0, &rules)
                             .unwrap();
-                        sim.entities_mut()
+                        sim.entities_mut_for_test()
                             .get_mut(child)
                             .unwrap()
                             .lifecycle
@@ -5235,16 +8859,18 @@ mod tests {
                         false,
                     ));
                 }
-                let spawn_type = sim.interner.intern("ENGINEER");
-                sim.entities_mut().get_mut(engineer).unwrap().spawn_manager =
-                    Some(SpawnManagerState::for_test(spawn_type, slots));
+                let spawn_type = sim.intern("ENGINEER");
+                sim.entities_mut_for_test()
+                    .get_mut(engineer)
+                    .unwrap()
+                    .spawn_manager = Some(Box::new(SpawnManagerState::for_test(spawn_type, slots)));
             }
             let before = sim.state_hash();
             let actor = serde_json::to_value(sim.entities().get(engineer).unwrap()).unwrap();
             let rng = (
-                sim.scenario_rng.logical_state(),
-                sim.main_rng.logical_state(),
-                sim.mapgen_rng.logical_state(),
+                sim.scenario_rng().logical_state(),
+                sim.main_rng().logical_state(),
+                sim.mapgen_rng().logical_state(),
             );
             assert_eq!(
                 sim.techno_player_controllable(engineer, &rules),
@@ -5288,9 +8914,9 @@ mod tests {
             );
             assert_eq!(
                 (
-                    sim.scenario_rng.logical_state(),
-                    sim.main_rng.logical_state(),
-                    sim.mapgen_rng.logical_state()
+                    sim.scenario_rng().logical_state(),
+                    sim.main_rng().logical_state(),
+                    sim.mapgen_rng().logical_state()
                 ),
                 rng,
                 "{name}"
@@ -5317,7 +8943,7 @@ mod tests {
                 engineer_hut_click_fixture("hostile", collapsed, true, true, "", "C4=yes");
             // Unit Unlimbo requires configured playfield bounds; the hut
             // action fixture otherwise only constructs Infantry/Buildings.
-            sim.playfield_bounds = Some(crate::map::playfield::PlayfieldBounds {
+            *sim.playfield_bounds_mut_for_test() = Some(crate::map::playfield::PlayfieldBounds {
                 base: 0,
                 off_fc: -100,
                 off_100: -100,
@@ -5366,27 +8992,62 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_a_c))]
 #[path = "context_order_selection_tests.rs"]
 mod selection_dispatch_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_a_c))]
+#[path = "context_order_move_flash_tests.rs"]
+mod move_flash_tests;
+
+#[cfg(all(test, tests_app_input_a_c))]
 #[path = "context_order_retail_bridge_tests.rs"]
 mod retail_bridge_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_a_c))]
 #[path = "context_order_retail_engineer_tests.rs"]
 mod retail_engineer_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_a_c))]
 #[path = "context_order_retail_garrison_tests.rs"]
 mod retail_garrison_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_a_c))]
+#[path = "context_order_retail_entry_tests.rs"]
+mod retail_entry_tests;
+
+#[cfg(all(test, tests_app_input_a_c))]
+#[path = "disguise_cursor_tests.rs"]
+mod disguise_cursor_tests;
+
+#[cfg(all(test, tests_app_input_a_c))]
+#[path = "context_order_retail_terrain_tests.rs"]
+mod retail_terrain_tests;
+
+#[cfg(all(test, tests_app_input_a_c))]
+#[path = "context_order_retail_inactive_unit_tests.rs"]
+mod retail_inactive_unit_tests;
+
+#[cfg(all(test, tests_app_input_a_c))]
+#[path = "context_order_retail_self_deploy_tests.rs"]
+mod retail_self_deploy_tests;
+
+#[cfg(all(test, tests_app_input_a_c))]
+#[path = "building_bunker_self_click_tests.rs"]
+mod building_bunker_self_click_tests;
+
+#[cfg(all(
+    test,
+    any(
+        tests_app_input_a_c,
+        tests_app_presentation_instances,
+        tests_app_presentation_render
+    )
+))]
 #[path = "context_order_retail_ifv_repair_tests.rs"]
 pub(in crate::app) mod retail_ifv_repair_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_a_c))]
 mod stationary_attack_dispatch_tests {
     use super::*;
     use crate::map::resolved_terrain::ResolvedTerrainGrid;
@@ -5438,9 +9099,12 @@ Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%
         let enemy = sim
             .spawn_object("TANK", "Soviets", 20, 4, 0, &rules)
             .unwrap();
-        sim.session.game_mode_nonzero = true;
-        sim.session.current_house = Some(sim.entities().get(stationary).unwrap().owner());
-        sim.entities_mut()
+        sim.session_mut_for_test().set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        let house = Some(sim.entities().get(stationary).unwrap().owner());
+        sim.session_mut_for_test().set_current_house_for_test(house);
+        sim.entities_mut_for_test()
             .get_mut(stationary)
             .unwrap()
             .bunker
@@ -5461,11 +9125,25 @@ Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%
             &[stationary, mobile],
             TargetKind::Cell(20, 2),
             true,
+            OrderMode::Move,
             &registry,
         );
         assert!(mixed.consumed);
         assert!(!mixed.select_fallback);
-        assert_eq!(mixed.receivers, [stationary, mobile].into_iter().collect());
+        assert_eq!(mixed.receivers, [mobile].into_iter().collect());
+        assert_eq!(
+            crate::app::input::commands::ordinary_cell_move_goal(
+                &sim,
+                &rules,
+                Some(&registry),
+                house.unwrap(),
+                stationary,
+                (20, 2),
+                false,
+            ),
+            None,
+            "the remaining stationary receiver cannot commit a Cell move"
+        );
         assert_eq!(mixed.commands.len(), 1);
         assert!(
             matches!(mixed.commands[0], Command::ForceAttackCell { attacker_id, .. } if attacker_id==mobile)
@@ -5476,6 +9154,7 @@ Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%
             &[stationary],
             TargetKind::Entity(enemy),
             true,
+            OrderMode::Move,
             &registry,
         );
         assert!(none.commands.is_empty());
@@ -5489,6 +9168,7 @@ Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%
             &[stationary],
             TargetKind::Entity(friend),
             true,
+            OrderMode::Move,
             &registry,
         );
         assert!(select.commands.is_empty());
@@ -5502,6 +9182,7 @@ Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%
             &[stationary],
             TargetKind::Cell(4, 2),
             true,
+            OrderMode::Move,
             &registry,
         );
         assert_eq!(near.commands.len(), 1);
@@ -5511,14 +9192,22 @@ Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_a_c))]
 #[path = "allied_object_action_tests.rs"]
 mod allied_object_action_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_a_c))]
 #[path = "context_order_cursor_contract_tests.rs"]
 mod cursor_contract_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_a_c))]
 #[path = "engineer_special_entry_tests.rs"]
 mod engineer_special_entry_tests;
+
+#[cfg(all(test, tests_app_input_a_c))]
+#[path = "foot_unarmed_ctrl_tests.rs"]
+mod foot_unarmed_ctrl_tests;
+
+#[cfg(all(test, tests_app_input_a_c))]
+#[path = "infantry_healer_cell_tests.rs"]
+mod infantry_healer_cell_tests;

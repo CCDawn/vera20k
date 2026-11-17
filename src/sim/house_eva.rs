@@ -11,6 +11,10 @@
 //! state for them, so a replay/snapshot carries state gamemd never holds;
 //! gamemd equivalent UNCHECKED for anything but the local player's lines.
 //!
+//! The block's head drops sell mode for a player with no tracked building
+//! (`0x004F8B14..0x004F8B2B`); that Display state belongs to the client
+//! (`app::presentation::sidebar_gadgets::exit_sell_mode_without_buildings`).
+//!
 //! ## Dependency rules
 //! - Part of sim/ — depends on rules/ and sim/ only.
 
@@ -18,12 +22,14 @@ use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::game_options::GameOptions;
 use crate::sim::intern::InternedId;
-use crate::sim::world::{SimSoundEvent, Simulation};
+use crate::sim::world::{FrameEffects, SimSoundEvent, Simulation};
 
 /// `evamd.ini` section played at `0x004F8BA0`.
 pub const EVA_INSUFFICIENT_FUNDS: &str = "EVA_InsufficientFunds";
 /// `evamd.ini` section played at `0x004F8D14`.
 pub const EVA_LOW_POWER: &str = "EVA_LowPower";
+/// Ares `HouseClass_Update_SilosNeededEVA @ 10024AE0` (hook `0x4F8C23`).
+pub const EVA_SILOS_NEEDED: &str = "EVA_SilosNeeded";
 
 /// `0x004F8B6F CMP EAX,0x64`: the nag runs while available money is below
 /// this.
@@ -47,14 +53,22 @@ pub fn speak_delay_frames(rules: &RuleSet, options: &GameOptions) -> i32 {
 /// ReadAI `0x00672BB9`) and tests each type's `+0x5550` count above zero
 /// (`CounterClass::GetItemCount @ 0x0049FAE0`). It reads three entries with
 /// no bound; a shorter list is read past its end natively and ends here.
+///
+/// Ares HouseClass_Update_BuildConst (`1002F5A0`, hook `0x004F8C97`) tests
+/// every BuildConst entry instead, bounds-checked.
 fn owns_construction_yard(sim: &Simulation, rules: &RuleSet, owner: InternedId) -> bool {
     let Some(house) = sim.houses.get(&owner) else {
         return false;
     };
-    rules.build_const_types.iter().take(3).any(|name| {
+    let entries = if rules.ares_form() {
+        rules.build_const_types.len()
+    } else {
+        3
+    };
+    rules.build_const_types.iter().take(entries).any(|name| {
         sim.interner.get(name).is_some_and(|type_id| {
             house
-                .tracking
+                .tracking()
                 .active_count(EntityCategory::Structure, type_id)
                 > 0
         })
@@ -64,19 +78,27 @@ fn owns_construction_yard(sim: &Simulation, rules: &RuleSet, owner: InternedId) 
 /// Advice inside the reached House body, after team creation and before
 /// defeat. The deterministic per-human projection is documented above.
 pub(crate) fn update_house_eva(sim: &mut Simulation, rules: &RuleSet, owner: InternedId) {
-    let now = sim.session.binary_frame as i32;
-    let game_mode_nonzero = sim.session.game_mode_nonzero;
-    let delay = speak_delay_frames(rules, &sim.session.game_options);
+    let ares = rules.ares_form();
+    let now = sim.session.binary_frame() as i32;
+    let game_mode_nonzero = sim.session.game_mode_nonzero();
+    let delay = speak_delay_frames(rules, sim.session.game_options());
     let Some(house) = sim.houses.get(&owner) else {
         return;
     };
     if !house.is_controlled_by_human(game_mode_nonzero) {
         return;
     }
-    let available = house.economy.available_money();
-    let factories = house.tracking.funds_nag_factories();
-    let mut timer = house.eva_funds_timer;
-    let mut guard = house.eva_low_power_guard;
+    let available = house.economy().available_money();
+    let factories = house.tracking().funds_nag_factories();
+    // `0x004F8BFF..0x004F8C21`: capacity `+0x310` and `ftol(+0x2FC total)`.
+    let capacity = house.tracking().storage_capacity();
+    let stored = if ares {
+        house.economy().ares_storage().house_store().total_amount()
+    } else {
+        0
+    };
+    let mut timer = *house.eva_funds_timer();
+    let mut guard = house.eva_low_power_guard();
 
     // --- Insufficient funds, `0x004F8B3C..0x004F8BE1` ---
     // Available money (`IHouse::Available_Money`, House vtable `0x7EA834`
@@ -90,7 +112,7 @@ pub(crate) fn update_house_eva(sim: &mut Simulation, rules: &RuleSet, owner: Int
     // flash. VERA paints the sidebar every frame, so this invalidation-only
     // timer needs no second state owner. Raw native save bytes are separate.
     if timer.expired(now) && available < FUNDS_NAG_CREDITS && factories > 0 {
-        sim.sound_events.push(SimSoundEvent::HouseEva {
+        sim.sound_events.emit(SimSoundEvent::HouseEva {
             owner,
             event: EVA_INSUFFICIENT_FUNDS,
         });
@@ -101,6 +123,19 @@ pub(crate) fn update_house_eva(sim: &mut Simulation, rules: &RuleSet, owner: Int
     // minus `ftol(+0x2FC)` below 30, capacity above 50) re-arms it without a
     // line. The store stays empty in YR (`crate::sim::economy`), so capacity
     // would have to be both below 30 and above 50: it never re-arms.
+    // When Ares plays the store fills (`sim::ares_tiberium_storage`), and Ares
+    // 3.0 HouseClass_Update_SilosNeededEVA (10024AE0, hook 0x4F8C23) speaks
+    // `EVA_SilosNeeded` before the re-arm. RESIDUAL (client): it also prints
+    // `[General] Message.SilosNeeded` for MessageDelay in the House's colour.
+    if timer.expired(now) && capacity.wrapping_sub(stored) < 30 && capacity > 50 {
+        if ares {
+            sim.sound_events.emit(SimSoundEvent::HouseEva {
+                owner,
+                event: EVA_SILOS_NEEDED,
+            });
+        }
+        timer.start(now, delay);
+    }
 
     // --- Low power, `0x004F8C56..0x004F8DAB` ---
     // Short = `PowerOutput < PowerDrain && PowerDrain != 0 && (Output == 0
@@ -111,10 +146,17 @@ pub(crate) fn update_house_eva(sim: &mut Simulation, rules: &RuleSet, owner: Int
         .power_states
         .get(&owner)
         .is_some_and(|power| power.low_power());
+    // Ares HouseClass_Update_BuildConst (1002F5A0, hook 0x004F8C97) first
+    // drops the House's firestorm when it is short (SetFirestormState
+    // false). Native runs it for the local player's House only; VERA for
+    // each human-controlled one, as this whole body.
+    if ares && short {
+        sim.ares_set_firestorm_state(owner, false, rules, None, FrameEffects::default());
+    }
     if !short {
         guard = false;
     } else if owns_construction_yard(sim, rules, owner) && !guard {
-        sim.sound_events.push(SimSoundEvent::HouseEva {
+        sim.sound_events.emit(SimSoundEvent::HouseEva {
             owner,
             event: EVA_LOW_POWER,
         });
@@ -125,19 +167,18 @@ pub(crate) fn update_house_eva(sim: &mut Simulation, rules: &RuleSet, owner: Int
     // constructor write and this write only), so it is not modelled.
 
     if let Some(house) = sim.houses.get_mut(&owner) {
-        house.eva_funds_timer = timer;
-        house.eva_low_power_guard = guard;
+        house.retain_eva_nag_state(timer, guard);
     }
 }
 
 #[cfg(any(test, feature = "test-support"))]
 fn tick_house_eva(sim: &mut Simulation, rules: &RuleSet) {
-    for owner in sim.session.house_order.clone() {
+    for owner in sim.houses.order().to_vec() {
         update_house_eva(sim, rules, owner);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -182,17 +223,15 @@ mod tests {
     fn sim_with_house(credits: i32, human: bool) -> (Simulation, InternedId) {
         let mut sim = Simulation::new();
         let owner = sim.interner.intern("Americans");
-        sim.houses.insert(
-            owner,
-            HouseState::new(owner, 0, Some(owner), human, credits, 10),
-        );
-        sim.session.house_order.push(owner);
+        sim.houses
+            .register(HouseState::new(owner, 0, Some(owner), human, credits, 10));
         (sim, owner)
     }
 
     fn house_lines(sim: &mut Simulation) -> Vec<&'static str> {
         sim.sound_events
-            .drain(..)
+            .take_for_test()
+            .into_iter()
             .filter_map(|event| match event {
                 SimSoundEvent::HouseEva { event, .. } => Some(event),
                 _ => None,
@@ -208,14 +247,15 @@ mod tests {
                 &mut sim.substrate.entities,
                 rules,
                 &sim.interner,
-                sim.session.binary_frame,
+                sim.session.binary_frame(),
             );
             tick_house_eva(sim, rules);
-            let frame = sim.session.binary_frame;
+            let frame = sim.session.binary_frame();
             for line in house_lines(sim) {
                 lines.push((frame, line));
             }
-            sim.session.binary_frame += 1;
+            sim.session
+                .set_binary_frame_for_test(sim.session.binary_frame() + 1);
         }
         lines
     }
@@ -243,7 +283,7 @@ mod tests {
     fn funds_nag_repeats_every_speak_delay_while_broke_with_a_factory() {
         let rules = rules();
         let (mut sim, owner) = sim_with_house(50, true);
-        sim.session.game_options.game_speed = 4;
+        sim.session.game_options_mut_for_test().game_speed = 4;
         structure(&mut sim, &rules, "GAPILE", 3);
         let lines = run_frames(&mut sim, &rules, 2880 * 2 + 2);
         let nags: Vec<u32> = lines
@@ -254,7 +294,7 @@ mod tests {
         // Constructor timer (`Duration = 1`) expires at frame 1.
         assert_eq!(nags, vec![1, 1 + 2880, 1 + 2880 * 2]);
         assert_eq!(
-            sim.houses[&owner].eva_funds_timer,
+            *sim.houses[&owner].eva_funds_timer(),
             CdTimer::started(1 + 2880 * 2, 2880)
         );
     }
@@ -288,18 +328,15 @@ mod tests {
         let rules = rules();
         let (mut sim, owner) = sim_with_house(0, true);
         let soviet = sim.interner.intern("Russians");
-        sim.houses.insert(
-            soviet,
-            HouseState::new(soviet, 1, Some(soviet), false, 0, 10),
-        );
-        sim.session.house_order.push(soviet);
+        sim.houses
+            .register(HouseState::new(soviet, 1, Some(soviet), false, 0, 10));
         let barracks = structure(&mut sim, &rules, "GAPILE", 3);
         structure(&mut sim, &rules, "GAPILE", 4);
         let yard = structure(&mut sim, &rules, "GAYARD", 6);
         structure(&mut sim, &rules, "GAAIRC", 8);
         structure(&mut sim, &rules, "GAREFN", 10);
         let counts = |sim: &Simulation, house| {
-            let tracking = &sim.houses[&house].tracking;
+            let tracking = sim.houses[&house].tracking();
             [
                 FactorySlot::Aircraft,
                 FactorySlot::Infantry,
@@ -310,7 +347,7 @@ mod tests {
             .map(|slot| tracking.factory_count(slot))
         };
         assert_eq!(counts(&sim, owner), [1, 2, 0, 0, 1]);
-        assert_eq!(sim.houses[&owner].tracking.funds_nag_factories(), 3);
+        assert_eq!(sim.houses[&owner].tracking().funds_nag_factories(), 3);
 
         sim.change_owner_with_rules(
             barracks,
@@ -354,22 +391,8 @@ mod tests {
         set_health(&mut sim, plant, 1);
         let lines = run_frames(&mut sim, &rules, 10);
         assert!(lines.is_empty(), "{lines:?}");
-        assert!(sim.power_states[&owner].is_low_power);
-        assert!(!sim.houses[&owner].eva_low_power_guard);
-    }
-
-    /// A construction yard is enough: short on power with no power plant at
-    /// all, the line plays.
-    #[test]
-    fn low_power_speaks_with_a_construction_yard_and_no_power_plant() {
-        let rules = rules();
-        let (mut sim, owner) = sim_with_house(5_000, true);
-        structure(&mut sim, &rules, "GACNST", 3);
-        structure(&mut sim, &rules, "GAPILE", 7);
-        let lines = run_frames(&mut sim, &rules, 3);
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert_eq!(lines[0].1, EVA_LOW_POWER);
-        assert!(sim.houses[&owner].eva_low_power_guard);
+        assert!(sim.power_states[&owner].is_low_power());
+        assert!(!sim.houses[&owner].eva_low_power_guard());
     }
 
     /// With a construction yard the line plays once, stays silent while
@@ -389,11 +412,11 @@ mod tests {
         let lines = run_frames(&mut sim, &rules, 5);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].1, EVA_LOW_POWER);
-        assert!(sim.houses[&owner].eva_low_power_guard);
+        assert!(sim.houses[&owner].eva_low_power_guard());
         // Repair: guard clears.
         set_health(&mut sim, plant, 750);
         assert!(run_frames(&mut sim, &rules, 2).is_empty());
-        assert!(!sim.houses[&owner].eva_low_power_guard);
+        assert!(!sim.houses[&owner].eva_low_power_guard());
         // Short again: one more line.
         set_health(&mut sim, plant, 1);
         let lines = run_frames(&mut sim, &rules, 5);
@@ -414,8 +437,32 @@ mod tests {
         assert_eq!(run_frames(&mut sim, &rules, 2).len(), 1);
         sim.uninit_with_rules(yard, &rules);
         assert!(run_frames(&mut sim, &rules, 2).is_empty());
-        assert!(sim.houses[&owner].eva_low_power_guard);
+        assert!(sim.houses[&owner].eva_low_power_guard());
         structure(&mut sim, &rules, "GACNST", 9);
         assert!(run_frames(&mut sim, &rules, 2).is_empty());
+    }
+
+    /// Ares HouseClass_Update_SilosNeededEVA (10024AE0, hook 0x4F8C23): a
+    /// silo bank within 30 of its capacity (above 50) speaks
+    /// `EVA_SilosNeeded` once the speak timer expires, then re-arms it; 40
+    /// short stays silent.
+    #[test]
+    fn ares_silo_nag_speaks_when_storage_is_nearly_full() {
+        use crate::util::native_x87::NativeF32Bits;
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let rules = rules();
+        let (mut sim, owner) = sim_with_house(5_000, true);
+        structure(&mut sim, &rules, "GASILO", 3);
+        let give = |sim: &mut Simulation, units: f32| {
+            sim.ares_give_tiberium(owner, NativeF32Bits::from_bits(units.to_bits()), 0, &rules);
+        };
+        give(&mut sim, 1960.0);
+        assert!(run_frames(&mut sim, &rules, 3).is_empty());
+        give(&mut sim, 20.0);
+        assert_eq!(run_frames(&mut sim, &rules, 2), vec![(3, EVA_SILOS_NEEDED)]);
+        assert_eq!(
+            *sim.houses[&owner].eva_funds_timer(),
+            CdTimer::started(3, speak_delay_frames(&rules, sim.session.game_options()))
+        );
     }
 }

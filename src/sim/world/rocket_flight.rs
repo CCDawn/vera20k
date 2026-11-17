@@ -16,10 +16,13 @@ use crate::rules::ruleset::RuleSet;
 use crate::sim::anim_class::AnimWorldCoord;
 use crate::sim::components::DriveCoord;
 use crate::sim::game_entity::GameEntity;
+use crate::sim::intern::StringInterner;
 use crate::sim::movement::ground_pose::position_world_coord;
 use crate::sim::movement::rocket_movement::{self, RocketHost};
 use crate::sim::projectile::ProjectileCoord;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::world::FrameEffects;
+use crate::sim::world::ObjectSubstrate;
 use crate::util::retail_trig::TrigTable;
 
 struct RocketProcessHost<'a> {
@@ -84,7 +87,7 @@ impl RocketHost for RocketProcessHost<'_> {
         self.sim.foot_set_location_marked(
             self.id,
             DriveCoord { x, y, z },
-            Some(self.rules),
+            self.rules,
             self.registry,
             self.frame_effects,
         );
@@ -110,27 +113,39 @@ impl RocketHost for RocketProcessHost<'_> {
     fn mark(&mut self, put: bool) {
         if put {
             self.sim
-                .foot_mark_put(self.id, Some(self.rules), self.registry, self.frame_effects);
+                .foot_mark_put(self.id, self.rules, self.registry, self.frame_effects);
         } else {
             self.sim
-                .foot_mark_remove(self.id, Some(self.rules), self.registry, self.frame_effects);
+                .foot_mark_remove(self.id, self.rules, self.registry, self.frame_effects);
         }
     }
     fn submit_display(&mut self) {
-        self.sim
-            .submit_entity_display(self.id, Some(self.rules), None);
+        Simulation::submit_entity_display(
+            &self.sim.interner,
+            &self.sim.terrain_objects,
+            &mut self.sim.substrate,
+            &self.sim.resolved_terrain,
+            self.id,
+            self.rules,
+            None,
+        );
     }
     fn tracker_cell(&self) -> (i16, i16) {
         self.owner().air_tracker_cell()
     }
     fn tracker_add(&mut self) {
-        self.sim.aircraft_tracker_add(self.id);
+        Simulation::aircraft_tracker_add(&self.sim.session, &mut self.sim.substrate, self.id);
     }
     fn tracker_update(&mut self, cell: (i16, i16)) {
-        self.sim.aircraft_tracker_update_cell(self.id, cell);
+        Simulation::aircraft_tracker_update_cell(
+            &self.sim.session,
+            &mut self.sim.substrate,
+            self.id,
+            cell,
+        );
     }
     fn tracker_remove(&mut self) {
-        self.sim.aircraft_tracker_remove(self.id);
+        self.sim.substrate.aircraft_tracker_remove(self.id);
     }
     fn is_alive(&self) -> bool {
         self.owner().is_object_alive()
@@ -145,7 +160,7 @@ impl RocketHost for RocketProcessHost<'_> {
         let frame = self.frame;
         self.owner_mut().body_facing.set(facing, frame);
     }
-    fn anim(&mut self, name: &'static str, coord: [i32; 3], delay: i32, z_adjust: i32) {
+    fn anim(&mut self, name: &str, coord: [i32; 3], delay: i32, z_adjust: i32) {
         let [x, y, z] = coord;
         self.sim.spawn_named_anim(
             self.rules,
@@ -169,7 +184,7 @@ impl RocketHost for RocketProcessHost<'_> {
             return;
         };
         let event = super::SimSoundEvent::voc_at(sound, &owner.position);
-        self.sim.sound_events.push(event);
+        self.sim.sound_events.emit(event);
     }
     fn structural_bridge_floor(&self) -> Option<i32> {
         let terrain = self.sim.resolved_terrain.as_ref()?;
@@ -188,7 +203,7 @@ impl RocketHost for RocketProcessHost<'_> {
         let coordinate = ProjectileCoord::new(coord[0], coord[1], coord[2]);
         let land = crate::sim::combat::detonation_anim::land_at(self.sim, coordinate);
         if let Some(effect) = crate::sim::combat::detonation_anim::effect(
-            self.sim, self.rules, warhead, damage, land, coordinate, coordinate,
+            self.sim, self.rules, warhead, damage, land, coordinate, coordinate, false,
         ) {
             super::damage_consequences::admit_explosion_effect(self.sim, self.rules, effect);
         }
@@ -200,7 +215,7 @@ impl RocketHost for RocketProcessHost<'_> {
         let warhead_ref = self.sim.interner.intern(warhead);
         self.sim
             .combat_light_requests
-            .push(crate::sim::combat::CombatLightRequest::Impact {
+            .emit(crate::sim::combat::CombatLightRequest::Impact {
                 target_id: None,
                 damage,
                 warhead_ref,
@@ -221,14 +236,71 @@ impl RocketHost for RocketProcessHost<'_> {
             ProjectileCoord::new(coord[0], coord[1], coord[2]),
             damage,
             warhead_type,
+            true,
             (self.id, None, warhead_ref),
+            self.frame_effects,
+        )
+        .bridge_state_changed;
+    }
+    fn weapon_detonation(&mut self, weapon: &str, coord: [i32; 3]) {
+        use crate::sim::projectile::{
+            ProjectileDetonation, ProjectileDetonationReason, ProjectilePayload, ProjectileTarget,
+        };
+        let rules = self.rules;
+        let Some(kind) = rules.weapon(weapon) else {
+            return;
+        };
+        let Some(warhead) = kind.warhead.as_deref() else {
+            return;
+        };
+        let interner = &mut self.sim.interner;
+        let payload = ProjectilePayload::new(
+            kind.damage,
+            interner.intern(warhead),
+            kind.projectile.as_deref().map(|name| interner.intern(name)),
+            kind.bright,
+        )
+        .with_installed_weapon(Some(interner.intern(&kind.id)));
+        // CreateBullet(owner, owner, ...) without Fire, then Remove: the
+        // Bullet stays at its constructor coordinate and detonates once at
+        // the impact, without the cluster loop.
+        let bullet_id = self.sim.construct_projectile(
+            self.id,
+            ProjectileTarget::Entity(self.id),
+            payload,
+            self.rules,
+        );
+        let bullet = self
+            .sim
+            .projectiles
+            .get(bullet_id)
+            .expect("constructed Missile.Weapon Bullet");
+        let detonation = ProjectileDetonation {
+            projectile_id: bullet_id,
+            source_id: bullet.source_id(),
+            target: bullet.target(),
+            impact: ProjectileCoord::new(coord[0], coord[1], coord[2]),
+            payload: bullet.payload(),
+            reason: ProjectileDetonationReason::DeathWeapon,
+        };
+        self.bridge_state_changed |= self.sim.commit_logic_projectile_detonations(
+            self.rules,
+            self.registry,
+            &[detonation],
+            self.frame_effects,
+        );
+        // UnInit (vtable +0xF8) of the never-Fired Bullet.
+        self.sim.destroy_unfired_projectile(
+            bullet_id,
+            self.rules,
+            self.registry,
             self.frame_effects,
         );
     }
     fn uninit(&mut self) {
         self.sim.uninit_with_context(
             self.id,
-            UninitContext::new(Some(self.rules), self.registry).with_effects(self.frame_effects),
+            UninitContext::new(self.rules, self.registry).with_effects(self.frame_effects),
         );
     }
 }
@@ -243,14 +315,19 @@ pub(crate) struct RocketProcessOutcome {
 impl Simulation {
     /// Rocket Move_To (`0x006632E0`) for the Foot destination setter's
     /// locomotor dispatch.
-    pub(crate) fn rocket_move_to(&mut self, id: u64, to: DriveCoord, rules: &RuleSet) {
-        let frame = self.session.binary_frame;
-        let Some(entity) = self.substrate.entities.get_mut(id) else {
+    pub(crate) fn rocket_move_to(
+        interner: &StringInterner,
+        session: &ScenarioSession,
+        substrate: &mut ObjectSubstrate,
+        id: u64,
+        to: DriveCoord,
+        rules: &RuleSet,
+    ) {
+        let frame = session.binary_frame();
+        let Some(entity) = substrate.entities.get_mut(id) else {
             return;
         };
-        let (block, _) = rules
-            .missile_spawn
-            .rocket_block(self.interner.resolve(entity.type_ref()));
+        let (block, _) = rules.rocket_block(interner.resolve(entity.type_ref()));
         if let Some(rocket) = entity
             .locomotor
             .as_mut()
@@ -280,11 +357,11 @@ impl Simulation {
         else {
             return RocketProcessOutcome::default();
         };
-        let (block, cmisl) = rules
-            .missile_spawn
-            .rocket_block(self.interner.resolve(entity.type_ref()));
+        let type_name = self.interner.resolve(entity.type_ref());
+        let (block, cmisl) = rules.rocket_block(type_name);
+        let ext = rules.rocket_type_ext(type_name);
         let trig = TrigTable::embedded();
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         let mut host = RocketProcessHost {
             sim: self,
             rules,
@@ -295,7 +372,7 @@ impl Simulation {
             bridge_state_changed: false,
             frame_effects,
         };
-        rocket_movement::process(&mut rocket, block, cmisl, &mut host);
+        rocket_movement::process(&mut rocket, block, cmisl, &ext, &mut host);
         let outcome = RocketProcessOutcome {
             bridge_state_changed: host.bridge_state_changed,
         };
@@ -312,7 +389,7 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 pub(super) mod retail_tests {
     //! Production composition witnesses: a stock V3 Launcher on retail Hills
     //! and a Dreadnought on retail Lost Lake force-attack a target through an
@@ -395,7 +472,11 @@ pub(super) mod retail_tests {
             let mut scenario = crate::headless_scenario::load(&retail, "Hills.mmx", 0x0B21_D6E5)
                 .expect("load retail Hills through the production loader");
             let candidates = sites(&scenario);
-            let owner = scenario.sim().session.current_house.expect("launch house");
+            let owner = scenario
+                .sim()
+                .session
+                .current_house()
+                .expect("launch house");
             let owner_name = scenario.sim().interner.resolve(owner).to_owned();
             let runtime = &mut scenario.runtime;
             let rules = &runtime.resources.rules;
@@ -441,7 +522,7 @@ pub(super) mod retail_tests {
                 let commands = if frame == order_frame {
                     vec![CommandEnvelope::new(
                         owner,
-                        runtime.simulation.session.tick + 1,
+                        runtime.simulation.session.tick() + 1,
                         Command::Attack {
                             attacker_id: v3,
                             target_id: target,
@@ -456,7 +537,7 @@ pub(super) mod retail_tests {
                 let sim = &runtime.simulation;
                 for (&id, anim) in sim.anims() {
                     if seen_anims.insert(id) {
-                        anim_names.insert(sim.interner.resolve(anim.type_id).to_owned());
+                        anim_names.insert(sim.interner.resolve(anim.type_id()).to_owned());
                     }
                 }
                 // Detonate's UnInit leaves the frame's pending-delete flush.
@@ -705,7 +786,11 @@ pub(super) mod retail_tests {
         let mut scenario = crate::headless_scenario::load(&retail, "Lostlake.mmx", 0x0B21_D6E5)
             .expect("load retail Lost Lake through the production loader");
         let candidates = naval_sites(&scenario, 15);
-        let owner = scenario.sim().session.current_house.expect("launch house");
+        let owner = scenario
+            .sim()
+            .session
+            .current_house()
+            .expect("launch house");
         let owner_name = scenario.sim().interner.resolve(owner).to_owned();
         let runtime = &mut scenario.runtime;
         let rules = &runtime.resources.rules;
@@ -737,7 +822,7 @@ pub(super) mod retail_tests {
             let commands = if frame == 0 {
                 vec![CommandEnvelope::new(
                     owner,
-                    runtime.simulation.session.tick + 1,
+                    runtime.simulation.session.tick() + 1,
                     Command::Attack {
                         attacker_id: dred,
                         target_id: target,
@@ -867,7 +952,7 @@ pub(super) mod retail_tests {
         let mut scenario = crate::headless_scenario::load(&retail, "Lostlake.mmx", 0x0B21_D6E5)
             .expect("load retail Lost Lake through the production loader");
         let candidates = naval_sites(&scenario, 12);
-        let owner = scenario.sim().session.current_house.expect("order house");
+        let owner = scenario.sim().session.current_house().expect("order house");
         let owner_name = scenario.sim().interner.resolve(owner).to_owned();
         let runtime = &mut scenario.runtime;
         let rules = &runtime.resources.rules;
@@ -902,7 +987,7 @@ pub(super) mod retail_tests {
             let commands = if frame == 0 {
                 vec![CommandEnvelope::new(
                     owner,
-                    runtime.simulation.session.tick + 1,
+                    runtime.simulation.session.tick() + 1,
                     Command::Attack {
                         attacker_id: carrier,
                         target_id: target,
@@ -934,13 +1019,13 @@ pub(super) mod retail_tests {
                 i32::from(target_cell.1) * 256 + 128,
             ];
             for (&id, bomb) in sim.projectiles.iter() {
-                if hornets.contains(&bomb.source_id) && !bombs.contains_key(&id) {
-                    let [x, y, z] = bomb.velocity.native().map(|v| f64::from_bits(v.bits()));
-                    let toward = [goal[0] - bomb.position.x, goal[1] - bomb.position.y];
+                if hornets.contains(&bomb.source_id()) && !bombs.contains_key(&id) {
+                    let [x, y, z] = bomb.velocity().native().map(|v| f64::from_bits(v.bits()));
+                    let toward = [goal[0] - bomb.position().x, goal[1] - bomb.position().y];
                     let aim = x * f64::from(toward[0]) + y * f64::from(toward[1]);
                     bombs.insert(
                         id,
-                        (frame, bomb.source_id, (x * x + y * y + z * z).sqrt(), aim),
+                        (frame, bomb.source_id(), (x * x + y * y + z * z).sqrt(), aim),
                     );
                 }
             }
@@ -993,8 +1078,11 @@ pub(super) mod retail_tests {
     }
 
     /// Two enemy Flak Tracks beside a V3 Launcher on retail Hills shoot its
-    /// rocket down in flight, through an ordinary command and bound runtime
-    /// frames. The rocket is a target only once the climb has put it in the
+    /// rocket down in flight, through bound runtime frames. The launcher is
+    /// the computer's and the Flak Tracks are the player's: a human House's
+    /// idle Flak Track guards, taking only what it can fire at, where a
+    /// computer's Area Guard would go for the launcher. The rocket is a
+    /// target only once the climb has put it in the
     /// AircraftTracker. The killing hit plays its `Explosion=` anim, and
     /// Crash keeps the rocket alive with no Health and drops it from every
     /// Flak Track (`AircraftClass::ReceiveDamage @ 0x004165C0`). The next
@@ -1022,16 +1110,41 @@ pub(super) mod retail_tests {
         let mut scenario =
             crate::headless_scenario::load_session(&retail, "Hills.mmx", 0x0B21_D6E5, session)
                 .expect("load retail Hills with a computer opponent");
-        let candidates = sites(&scenario);
-        let owner = scenario.sim().session.current_house.expect("launch house");
+        let owner = scenario
+            .sim()
+            .session
+            .current_house()
+            .expect("launch house");
         let owner_name = scenario.sim().interner.resolve(owner).to_owned();
-        let enemy_name = scenario
+        let enemy = scenario
             .sim()
             .houses
             .iter()
-            .find(|(name, house)| **name != owner && !house.multiplay_passive)
-            .map(|(name, _)| scenario.sim().interner.resolve(*name).to_owned())
+            .find(|(name, house)| **name != owner && !house.multiplay_passive())
+            .map(|(name, _)| *name)
             .expect("the computer house");
+        let enemy_name = scenario.sim().interner.resolve(enemy).to_owned();
+        // The computer deploys its MCV in the first frames, and its new
+        // Construction Yard sends every ground Techno it owns to its base
+        // (`UnitClass::Deploy` -> `HouseClass::MoveGroundForcesToBase` at
+        // `0x00739926`), so the launcher arrives after it.
+        let has_yard = |scenario: &crate::headless_scenario::HeadlessScenario| {
+            scenario.sim().substrate.entities.values().any(|entity| {
+                entity.owner() == enemy
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+            })
+        };
+        for _ in 0..300 {
+            if has_yard(&scenario) {
+                break;
+            }
+            scenario
+                .runtime
+                .advance_frame_for_tooling(&[], SIM_TICK_MS)
+                .expect("advance production frame");
+        }
+        assert!(has_yard(&scenario), "the computer deploys its MCV");
+        let candidates = sites(&scenario);
         let runtime = &mut scenario.runtime;
         let rules = &runtime.resources.rules;
         let regen_rate = rules.object("V3").expect("[V3]").spawn_regen_rate as u64;
@@ -1049,14 +1162,14 @@ pub(super) mod retail_tests {
             .into_iter()
             .find_map(|(launcher, target)| {
                 let mut placed = Vec::new();
-                let tank = sim.spawn_object("MTNK", &enemy_name, target.0, target.1, 0, rules);
+                let tank = sim.spawn_object("MTNK", &owner_name, target.0, target.1, 0, rules);
                 placed.extend(tank);
-                let v3 = sim.spawn_object("V3", &owner_name, launcher.0, launcher.1, 0, rules);
+                let v3 = sim.spawn_object("V3", &enemy_name, launcher.0, launcher.1, 0, rules);
                 placed.extend(v3);
                 let flak: Vec<_> = [launcher.1 - 2, launcher.1 + 2]
                     .into_iter()
                     .filter_map(|y| {
-                        sim.spawn_object("HTK", &enemy_name, launcher.0 + 5, y, 0, rules)
+                        sim.spawn_object("HTK", &owner_name, launcher.0 + 5, y, 0, rules)
                     })
                     .collect();
                 placed.extend(flak.iter().copied());
@@ -1072,6 +1185,23 @@ pub(super) mod retail_tests {
             })
             .expect("Hills admits a V3, its target and two Flak Tracks");
         sim.resolve_type_handles(rules);
+        // An Attack command from the computer House does not reach its V3
+        // here, so it takes its target and Attack through their owners.
+        sim.assign_target_represented(
+            v3,
+            Some(crate::sim::combat::TargetKind::Entity(target)),
+            rules,
+            None,
+            crate::sim::world::FrameEffects::default(),
+        )
+        .expect("the V3 takes the tank as its target");
+        let now = sim.session.binary_frame();
+        let attack =
+            crate::sim::mission::MissionId::from_known(crate::sim::mission::MissionType::Attack);
+        sim.substrate
+            .mission_assign_exact(v3, attack, now)
+            .expect("the V3 takes Attack");
+        let _ = sim.substrate.mission_commence_exact(v3, now);
         let strength = sim.substrate.entities.get(target).unwrap().health.current();
         let target_z =
             position_world_coord(&sim.substrate.entities.get(target).unwrap().position).z;
@@ -1093,20 +1223,8 @@ pub(super) mod retail_tests {
         let mut detonation_anims = Vec::new();
         let mut last_location = None;
         for frame in 0..1500u64 {
-            let commands = if frame == 0 {
-                vec![CommandEnvelope::new(
-                    owner,
-                    runtime.simulation.session.tick + 1,
-                    Command::Attack {
-                        attacker_id: v3,
-                        target_id: target,
-                    },
-                )]
-            } else {
-                Vec::new()
-            };
             runtime
-                .advance_frame_for_tooling(&commands, SIM_TICK_MS)
+                .advance_frame_for_tooling(&[], SIM_TICK_MS)
                 .expect("advance production frame");
             let sim = &runtime.simulation;
             let new_anims: Vec<(String, crate::sim::anim_class::AnimWorldCoord)> = sim
@@ -1114,8 +1232,8 @@ pub(super) mod retail_tests {
                 .filter(|(id, _)| !seen_anims.contains(*id))
                 .map(|(_, anim)| {
                     (
-                        sim.interner.resolve(anim.type_id).to_ascii_uppercase(),
-                        anim.world_coord,
+                        sim.interner.resolve(anim.type_id()).to_ascii_uppercase(),
+                        anim.world_coord(),
                     )
                 })
                 .collect();

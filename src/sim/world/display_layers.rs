@@ -3,7 +3,8 @@
 //! Display membership is independent of Logic membership and cell occupation.
 //! Crate effects read Ground directly, so rebuilding or fully sorting these
 //! lists in presentation changes simulation state. Only the ordered vectors
-//! are serialized/hashed; the ID-to-layer index is derived and never iterated
+//! are serialized/hashed, without the local anims only this game draws (a
+//! LAN or online MoveFlash); the ID-to-layer index is derived and never iterated
 //! to decide gameplay. The Ground members' kept sort keys (`ground_keys`) are
 //! derived too. Native comparisons: crate_ground_membership.json.
 
@@ -19,6 +20,9 @@ use crate::util::lookup_hash::LookupMap;
 pub struct DisplayLayer(u8);
 
 impl DisplayLayer {
+    /// Layer 0, below the ground: a Tunnel locomotor travelling between
+    /// cells (`TunnelLocomotionClass::In_Which_Layer @ 0x0072A1A0`).
+    pub const UNDERGROUND: Self = Self(0);
     pub const SURFACE: Self = Self(1);
     pub const GROUND: Self = Self(2);
     pub const AIR: Self = Self(3);
@@ -76,6 +80,15 @@ impl DisplayLayers {
         self.layers.iter().flatten()
     }
 
+    /// [`Self::ordered_ids`] with each member's layer, for a caller that
+    /// would otherwise look every member up in [`Self::layer_of`].
+    pub fn members_in_order(&self) -> impl Iterator<Item = (DisplayLayer, u64)> + '_ {
+        self.layers.iter().enumerate().flat_map(|(index, members)| {
+            let layer = DisplayLayer(index as u8);
+            members.iter().map(move |&id| (layer, id))
+        })
+    }
+
     /// Display4A9720 removes any old registration before querying/inserting the
     /// selected layer. Ground551A90 inserts before the first strictly greater
     /// key; equal keys stay ahead of a newly submitted object. Other layers
@@ -125,14 +138,14 @@ impl DisplayLayers {
         };
         let cached = usize::from(layer.0);
         let ground = usize::from(DisplayLayer::GROUND.0);
-        if let Some(index) = self.layers[cached].iter().position(|&member| member == id) {
+        if let Some(index) = position_of(&self.layers[cached], id) {
             self.layers[cached].remove(index);
             if cached == ground {
                 self.ground_keys.remove(index, id);
             }
         } else {
             for (layer, members) in self.layers.iter_mut().enumerate() {
-                if let Some(index) = members.iter().position(|&member| member == id) {
+                if let Some(index) = position_of(members, id) {
                     members.remove(index);
                     if layer == ground {
                         self.ground_keys.remove(index, id);
@@ -181,20 +194,55 @@ impl DisplayLayers {
             .aligned_with(&self.layers[usize::from(DisplayLayer::GROUND.0)])
     }
 
-    pub(crate) fn fold_hash(&self, hasher: &mut impl Hasher) {
-        self.layers.hash(hasher);
+    /// The layers as the hash and saves see them: without the local anims
+    /// (`crate::sim::anim_class::is_local_anim_id`), which only this game
+    /// draws. Borrowed as they are when none is a member.
+    fn shared_layers(&self) -> std::borrow::Cow<'_, [Vec<u64>; 5]> {
+        use crate::sim::anim_class::is_local_anim_id;
+        if !self.layers.iter().flatten().any(|&id| is_local_anim_id(id)) {
+            return std::borrow::Cow::Borrowed(&self.layers);
+        }
+        std::borrow::Cow::Owned(self.layers.clone().map(|mut members| {
+            members.retain(|&id| !is_local_anim_id(id));
+            members
+        }))
     }
+
+    pub(crate) fn fold_hash(&self, hasher: &mut impl Hasher) {
+        self.shared_layers().hash(hasher);
+    }
+}
+
+/// The index of `id` in `members`, the first match `iter().position` finds:
+/// blocks of 32 are compared at once, then the matching block member by
+/// member.
+fn position_of(members: &[u64], id: u64) -> Option<usize> {
+    let (blocks, tail) = members.as_chunks::<32>();
+    for (block_index, block) in blocks.iter().enumerate() {
+        if block
+            .iter()
+            .fold(false, |found, &member| found | (member == id))
+        {
+            let index = block.iter().position(|&member| member == id)?;
+            return Some(block_index * 32 + index);
+        }
+    }
+    let index = tail.iter().position(|&member| member == id)?;
+    Some(blocks.len() * 32 + index)
 }
 
 impl Serialize for DisplayLayers {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.layers.serialize(serializer)
+        self.shared_layers().serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for DisplayLayers {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let layers = <[Vec<u64>; 5]>::deserialize(deserializer)?;
+        if crate::util::save_codec::layout::describing() {
+            return Ok(Self::default());
+        }
         let mut registered = LookupMap::default();
         for (layer, members) in layers.iter().enumerate() {
             for &id in members {
@@ -214,7 +262,7 @@ impl<'de> Deserialize<'de> for DisplayLayers {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_c_o))]
 mod tests {
     use super::*;
 
@@ -293,6 +341,25 @@ mod tests {
                 assert!(display.ground_keys_aligned(), "{name}: {step}");
             }
         }
+    }
+
+    /// Removal compares 32 members at a time: members at the blocks' edges
+    /// and in the tail leave, and the rest keep their order.
+    #[test]
+    fn remove_finds_members_at_block_edges() {
+        let mut display = DisplayLayers::default();
+        for id in 1..=70 {
+            assert!(display.submit(id, Some(DisplayLayer::GROUND), &|_| 0));
+        }
+        // From the back, so each still sits at index id - 1: the tail's last
+        // and first members, then the last and first of each block.
+        let leaving = [70, 65, 64, 33, 32, 1];
+        for id in leaving {
+            assert!(display.remove(id));
+        }
+        let staying: Vec<u64> = (1..=70).filter(|id| !leaving.contains(id)).collect();
+        assert_eq!(display.members(DisplayLayer::GROUND), staying);
+        assert!(display.ground_keys_aligned());
     }
 
     #[test]

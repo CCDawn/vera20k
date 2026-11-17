@@ -20,9 +20,9 @@ fn retail_slave_miner_selling_stage_queues_its_pack_voice_before_deploy_sound() 
     for row in controls {
         let mut sim = Simulation::new();
         let owner = sim.interner.intern("YuriCountry");
-        sim.session.current_house = Some(owner);
+        sim.session.set_current_house_for_test(Some(owner));
         sim.houses
-            .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+            .register(HouseState::new(owner, 0, None, true, 0, 10));
         let type_ref = sim.interner.intern("YAREFN");
         // Original cue controls declare a Cell Archive and a centered Location.
         // Compare cue identity/order, rather than the legacy source projection.
@@ -44,14 +44,14 @@ fn retail_slave_miner_selling_stage_queues_its_pack_voice_before_deploy_sound() 
             false,
         );
         entity.set_archive_target(Some(crate::sim::combat::TargetKind::Cell(rx, ry)));
-        sim.entities_mut().insert(entity);
+        sim.substrate.entities.insert(entity);
         let mut terrain = crate::map::resolved_terrain::test_flat_ground_grid(16);
         if row["name"] == "resource_destination" {
-            terrain.cell_mut(rx, ry).unwrap().land_type =
+            terrain.cell_mut_for_test(rx, ry).unwrap().land_type =
                 crate::rules::terrain_rules::LandType::Tiberium.as_index();
         }
         sim.install_resolved_terrain_for_new_map(terrain);
-        sell_stage_zero(&mut sim, Some(&rules), 1, FrameEffects::empty());
+        sell_stage_zero(&mut sim, &rules, 1, FrameEffects::empty());
         let cues: Vec<_> = sim.sound_events.iter().filter_map(|event| match event {
             SimSoundEvent::UnitVoiceRequested { owner: 1, sound_id } =>
                 Some(json!({"kind":"QueueVoice", "sound":sound_id})),
@@ -93,4 +93,29 @@ fn deploy_voice_suppression_roundtrips_independently_of_the_audio_latch() {
         entity.deploy_voice_suppressed(),
         "restored authority is independent"
     );
+}
+
+/// A deploy click runs VoiceDeploy (`0x00708E00`) on the clicking client
+/// only, clearing its Techno+4F8; the state hash must not tell the clients
+/// apart.
+#[test]
+fn a_clients_own_deploy_click_does_not_reach_the_state_hash() {
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = retail.rules;
+    let client = |clicked: bool| {
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x708E00);
+        let miner = sim
+            .spawn_object("SMIN", "Americans", 10, 10, 0, &rules)
+            .expect("SMIN spawns");
+        let entity = sim.substrate.entities.get_mut(miner).unwrap();
+        entity.suppress_deploy_voice.suppress();
+        if clicked {
+            let _ = sim.deploy_voice_request(&rules, miner, true);
+            assert!(!sim.entities().get(miner).unwrap().deploy_voice_suppressed());
+        }
+        sim
+    };
+    assert_eq!(client(true).state_hash(), client(false).state_hash());
 }

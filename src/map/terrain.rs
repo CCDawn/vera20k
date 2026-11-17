@@ -10,15 +10,16 @@
 //! ## Dependency rules
 //! - Part of map/ — reads the normalized MapClass playfield owner.
 
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::BTreeMap;
 
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 #[path = "terrain_bridge_click_tests.rs"]
 mod bridge_click_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod plane_inverse_tests {
     #[test]
     fn plane_xyz_matches_original_tactical_body() {
@@ -58,7 +59,8 @@ pub const TILE_HEIGHT: f32 = 30.0;
 /// (Note: Tiberian Sun uses 24/2 = 12 — do NOT use TS values here.)
 pub const HEIGHT_STEP: f32 = 15.0;
 
-/// Tactical screen-to-cell inverse scan cap from gamemd.exe `0x006D6590`.
+/// Native tactical inverse scan cap (`ScreenPixelToCell @ 0x006D6590`).
+/// Higher VERA terrain extends this baseline using the live grid's level bound.
 pub const TACTICAL_INVERSE_MAX_SCAN_ATTEMPTS: usize = 180;
 
 /// Tactical bridge open-edge threshold. The binary uses strict `> 15`.
@@ -82,26 +84,50 @@ pub struct TacticalBridgeCell {
     pub direction_zero: bool,
 }
 
-/// The tactical inverse queries current CellClass flags at each candidate and
-/// neighbor, not a map-load bridge list (original6D6760..6D6888). This borrowed
-/// interface keeps the inverse independent of its real-cell storage owner.
-pub trait TacticalBridgeLookup: std::fmt::Debug {
+/// The tactical inverse reads each candidate's live Cell+11B level and
+/// Cell+140 flags, then the cardinal neighbors (original6D674C..6D6888).
+/// Keep both on the same borrowed authority across tile changes and restore.
+pub trait TacticalCellLookup: std::fmt::Debug {
+    fn cell_level(&self, rx: u16, ry: u16) -> Option<u8>;
     fn bridge_cell(&self, rx: u16, ry: u16) -> Option<TacticalBridgeCell>;
+    /// Conservative upper bound on live signed cell levels, including zero.
+    fn max_cell_level(&self) -> i8;
+    /// Conservative lower bound on live signed cell levels, including zero.
+    fn min_cell_level(&self) -> i8;
 }
 
-/// Native oracle fixtures supply literal cells; production uses the live grid.
+/// Literal inputs to the native comparisons; production borrows its live grid.
 #[cfg(any(test, feature = "test-support"))]
-impl TacticalBridgeLookup for BTreeMap<(u16, u16), TacticalBridgeCell> {
+#[derive(Debug)]
+pub struct TacticalCellFixture<'a> {
+    pub levels: &'a BTreeMap<(u16, u16), u8>,
+    pub bridges: Option<&'a BTreeMap<(u16, u16), TacticalBridgeCell>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TacticalCellLookup for TacticalCellFixture<'_> {
+    fn cell_level(&self, rx: u16, ry: u16) -> Option<u8> {
+        self.levels.get(&(rx, ry)).copied()
+    }
     fn bridge_cell(&self, rx: u16, ry: u16) -> Option<TacticalBridgeCell> {
-        self.get(&(rx, ry)).copied()
+        self.bridges?.get(&(rx, ry)).copied()
+    }
+    fn max_cell_level(&self) -> i8 {
+        self.levels
+            .values()
+            .fold(0, |max, &level| max.max(level as i8))
+    }
+    fn min_cell_level(&self) -> i8 {
+        self.levels
+            .values()
+            .fold(0, |min, &level| min.min(level as i8))
     }
 }
 
 /// Inputs for the YR-shaped tactical screen-to-cell inverse.
 #[derive(Debug, Clone, Copy)]
 pub struct TacticalInverseContext<'a> {
-    pub height_map: &'a BTreeMap<(u16, u16), u8>,
-    pub bridge_cells: Option<&'a dyn TacticalBridgeLookup>,
+    pub cells: Option<&'a dyn TacticalCellLookup>,
     pub viewport_offset_x: f32,
     pub viewport_offset_y: f32,
 }
@@ -230,6 +256,9 @@ pub struct TerrainGrid {
     /// Bridge middle tiles a live publication can write, for the atlas
     /// pre-load. None when the theater lacks BridgeMiddle1/2 or both sets.
     pub bridge_middle_tiles: Option<crate::map::theater::BridgeMiddleTiles>,
+    /// Tiles terrain deformation can write, for the atlas pre-load when the
+    /// rules switch it on ([`ResolvedTerrainGrid::deformation_atlas_tiles`]).
+    pub deformation_tiles: Vec<u16>,
 }
 
 /// Convert isometric cell coordinates to screen-space pixel position — **the
@@ -323,18 +352,42 @@ pub fn screen_to_cell_tactical_inverse(
     let input_x = (screen_x - context.viewport_offset_x).floor();
     let input_y = (screen_y - context.viewport_offset_y).floor();
     let (fallback_rx, fallback_ry) = screen_to_iso(input_x, input_y);
-    let mut scan_y = input_y + TACTICAL_INVERSE_MAX_SCAN_ATTEMPTS as f32;
+    // VERA extension: ScreenPixelToCell @ 0x006D6590 starts 180 pixels
+    // below the cursor (0x006D668E), so it cannot reach higher terrain's
+    // unprojected cell. Keep 180 pixels as the minimum, but allow the native
+    // 60-pixel bridge lift above the live level bound even when the bridge's
+    // base still fits in the original window.
+    // The grid owns this bound and widens it after native level writes.
+    let terrain_lift = context
+        .cells
+        .map_or(0, |cells| cells.max_cell_level().max(0) as usize)
+        * HEIGHT_STEP as usize;
+    let scan_attempts = TACTICAL_INVERSE_MAX_SCAN_ATTEMPTS
+        .max(terrain_lift + TACTICAL_BRIDGE_EXTRA_HEIGHT_PX as usize);
+    // VERA terrain deformation: ground below Level 0 draws lower than flat
+    // ground, so its unprojected cell lies above the cursor. With any on the
+    // map the scan carries on through the cursor's own row and up by the
+    // deepest level; without any it stops a row below the cursor as native
+    // does.
+    let below_zero_rows = context.cells.map_or(0, |cells| {
+        usize::from(cells.min_cell_level().min(0).unsigned_abs()) * HEIGHT_STEP as usize
+    });
+    let scan_rows = if below_zero_rows == 0 {
+        scan_attempts
+    } else {
+        scan_attempts + 1 + below_zero_rows
+    };
+    let mut scan_y = input_y + scan_attempts as f32;
 
-    for _ in 0..TACTICAL_INVERSE_MAX_SCAN_ATTEMPTS {
+    for _ in 0..scan_rows {
         let (candidate_rx, candidate_ry) = screen_to_iso(input_x, scan_y);
         let Some((cell_rx, cell_ry)) = rounded_lookup_cell(candidate_rx, candidate_ry) else {
             scan_y -= 1.0;
             continue;
         };
         let terrain_z = context
-            .height_map
-            .get(&(cell_rx, cell_ry))
-            .copied()
+            .cells
+            .and_then(|cells| cells.cell_level(cell_rx, cell_ry))
             .unwrap_or(0);
         let mut adjusted_scan_y = scan_y - f32::from(terrain_z as i8) * HEIGHT_STEP;
 
@@ -383,7 +436,7 @@ fn apply_tactical_bridge_inverse(
     context: TacticalInverseContext<'_>,
     adjusted_scan_y: &mut f32,
 ) -> Option<TacticalInverseResult> {
-    let bridge_cells = context.bridge_cells?;
+    let bridge_cells = context.cells?;
     let bridge = bridge_cells.bridge_cell(cell_rx, cell_ry)?;
     if !bridge.structural {
         return None;
@@ -404,8 +457,8 @@ fn apply_tactical_bridge_inverse(
     let dir0_open_edge = bridge.direction_zero && !dir0.is_some_and(|b| b.structural);
     let dir6_open_edge = !bridge.direction_zero && !dir6.is_some_and(|b| b.structural);
 
-    let dir2_height = tactical_neighbor_height(context.height_map, cell_rx, cell_ry, DIR_EAST);
-    let dir4_height = tactical_neighbor_height(context.height_map, cell_rx, cell_ry, DIR_SOUTH);
+    let dir2_height = tactical_neighbor_height(bridge_cells, cell_rx, cell_ry, DIR_EAST);
+    let dir4_height = tactical_neighbor_height(bridge_cells, cell_rx, cell_ry, DIR_SOUTH);
     let terrain_z_i16 = i16::from(terrain_z as i8);
     let direct_y = if bridge.direction_zero {
         !dir4_is_bridge
@@ -461,7 +514,7 @@ fn apply_tactical_bridge_inverse(
 }
 
 fn tactical_bridge_neighbor(
-    bridge_cells: &dyn TacticalBridgeLookup,
+    bridge_cells: &dyn TacticalCellLookup,
     rx: u16,
     ry: u16,
     direction: u8,
@@ -470,14 +523,9 @@ fn tactical_bridge_neighbor(
     bridge_cells.bridge_cell(nx, ny)
 }
 
-fn tactical_neighbor_height(
-    height_map: &BTreeMap<(u16, u16), u8>,
-    rx: u16,
-    ry: u16,
-    direction: u8,
-) -> u8 {
+fn tactical_neighbor_height(cells: &dyn TacticalCellLookup, rx: u16, ry: u16, direction: u8) -> u8 {
     tactical_cardinal_neighbor(rx, ry, direction)
-        .and_then(|pos| height_map.get(&pos).copied())
+        .and_then(|(rx, ry)| cells.cell_level(rx, ry))
         .unwrap_or(0)
 }
 
@@ -549,45 +597,81 @@ pub fn build_terrain_grid_from_resolved(
         origin_x: min_x,
         origin_y: min_y,
         bridge_middle_tiles,
+        deformation_tiles: resolved.deformation_atlas_tiles(),
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
     #[test]
-    fn test_iso_to_screen_origin() {
-        // (0,0,0) → X = 0-30 = -30, Y = 0+15 = 15
-        let (sx, sy): (f32, f32) = iso_to_screen(0, 0, 0);
-        assert!((sx - (-30.0)).abs() < f32::EPSILON);
-        assert!((sy - 15.0).abs() < f32::EPSILON);
+    fn high_terrain_picking_tracks_live_level_bound() {
+        let cells = (0..32)
+            .flat_map(|ry| {
+                (0..32).map(move |rx| {
+                    let mut cell =
+                        crate::map::resolved_terrain::ResolvedTerrainCell::clear_for_test(rx, ry);
+                    cell.level = 12;
+                    cell
+                })
+            })
+            .collect();
+        let mut terrain = ResolvedTerrainGrid::from_cells(32, 32, cells);
+        let cell = terrain.native_cell_identity((16, 16));
+        // Use the production level writer: the raised cell needs a larger
+        // bound, and lowering it leaves a conservative bound behind.
+        for level in [12, 20, 12] {
+            terrain.write_native_cell_level(cell, level);
+            let (x, y) = iso_to_screen(16, 16, level);
+            let picked = screen_to_cell_tactical_inverse(
+                x + TILE_WIDTH / 2.0,
+                y + TILE_HEIGHT / 2.0,
+                TacticalInverseContext {
+                    cells: Some(&terrain),
+                    viewport_offset_x: 0.0,
+                    viewport_offset_y: 0.0,
+                },
+            );
+            assert_eq!(picked, TacticalInverseResult::Cell { rx: 16.0, ry: 16.0 });
+        }
     }
 
     #[test]
-    fn test_iso_to_screen_positive() {
-        // rx=10, ry=0, z=0 → sx = 300-30 = 270, sy = 150+15 = 165
-        let (sx, sy): (f32, f32) = iso_to_screen(10, 0, 0);
-        assert!((sx - 270.0).abs() < f32::EPSILON);
-        assert!((sy - 165.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_iso_to_screen_diagonal() {
-        // rx=5, ry=5, z=0 → sx = 0-30 = -30, sy = 150+15 = 165
-        let (sx, sy): (f32, f32) = iso_to_screen(5, 5, 0);
-        assert!((sx - (-30.0)).abs() < f32::EPSILON);
-        assert!((sy - 165.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_iso_to_screen_elevation() {
-        // rx=0, ry=0, z=2 → sx = -30, sy = 15 - 30 = -15
-        let (sx, sy): (f32, f32) = iso_to_screen(0, 0, 2);
-        assert!((sx - (-30.0)).abs() < f32::EPSILON);
-        assert!((sy - (-15.0)).abs() < f32::EPSILON);
+    fn high_terrain_picking_reaches_the_bridge_deck() {
+        let levels = (0..32)
+            .flat_map(|ry| (0..32).map(move |rx| ((rx, ry), 12)))
+            .collect();
+        let bridges = (0..32)
+            .flat_map(|ry| {
+                (0..32).map(move |rx| {
+                    (
+                        (rx, ry),
+                        TacticalBridgeCell {
+                            structural: true,
+                            direction_zero: true,
+                        },
+                    )
+                })
+            })
+            .collect();
+        // The native bridge surface is four levels above its Cell level.
+        let (x, y) = iso_to_screen(16, 16, 16);
+        let picked = screen_to_cell_tactical_inverse(
+            x + TILE_WIDTH / 2.0,
+            y + TILE_HEIGHT / 2.0,
+            TacticalInverseContext {
+                cells: Some(&TacticalCellFixture {
+                    levels: &levels,
+                    bridges: Some(&bridges),
+                }),
+                viewport_offset_x: 0.0,
+                viewport_offset_y: 0.0,
+            },
+        );
+        assert_eq!(picked, TacticalInverseResult::Cell { rx: 16.0, ry: 16.0 });
     }
 
     #[test]
@@ -598,32 +682,16 @@ mod tests {
     }
 
     #[test]
-    fn screen_to_cell_tactical_inverse_uses_vertical_height_scan() {
-        let mut height_map = BTreeMap::new();
-        height_map.insert((10, 5), 4);
-        let result = screen_to_cell_tactical_inverse(
-            150.0,
-            180.0,
-            TacticalInverseContext {
-                height_map: &height_map,
-                bridge_cells: None,
-                viewport_offset_x: 0.0,
-                viewport_offset_y: 0.0,
-            },
-        );
-
-        assert_eq!(result, TacticalInverseResult::Cell { rx: 9.5, ry: 4.5 });
-    }
-
-    #[test]
     fn screen_to_cell_tactical_inverse_returns_initial_fallback_on_scan_cap() {
         let height_map = BTreeMap::new();
         let result = screen_to_cell_tactical_inverse(
             -500.0,
             -500.0,
             TacticalInverseContext {
-                height_map: &height_map,
-                bridge_cells: None,
+                cells: Some(&crate::map::terrain::TacticalCellFixture {
+                    levels: &height_map,
+                    bridges: None,
+                }),
                 viewport_offset_x: 0.0,
                 viewport_offset_y: 0.0,
             },
@@ -634,77 +702,40 @@ mod tests {
     }
 
     #[test]
-    fn tactical_cardinal_neighbor_rejects_direction_eight() {
-        assert_eq!(tactical_cardinal_neighbor(10, 10, 8), None);
+    fn screen_to_cell_tactical_inverse_finds_ground_below_level_zero() {
+        // A pit at Level -3.
+        let levels: BTreeMap<_, _> = (8..=13u16)
+            .flat_map(|rx| (8..=13u16).map(move |ry| ((rx, ry), -3i8 as u8)))
+            .collect();
+        let inverse = |y| {
+            screen_to_cell_tactical_inverse(
+                0.0,
+                y,
+                TacticalInverseContext {
+                    cells: Some(&crate::map::terrain::TacticalCellFixture {
+                        levels: &levels,
+                        bridges: None,
+                    }),
+                    viewport_offset_x: 0.0,
+                    viewport_offset_y: 0.0,
+                },
+            )
+        };
+        // The centre of cell (10, 10) draws 45 pixels below its flat row.
+        assert_eq!(
+            inverse(375.0),
+            TacticalInverseResult::Cell { rx: 10.0, ry: 10.0 }
+        );
+        // Flat ground behind the pit resolves on its own row.
+        assert_eq!(
+            inverse(165.0),
+            TacticalInverseResult::Cell { rx: 4.5, ry: 4.5 }
+        );
     }
 
     #[test]
-    fn tactical_bridge_edge_threshold_is_strict() {
-        let height_map = BTreeMap::from([((0, 0), 0)]);
-        let mut bridge_cells = BTreeMap::new();
-        bridge_cells.insert(
-            (0, 0),
-            TacticalBridgeCell {
-                structural: true,
-                direction_zero: true,
-            },
-        );
-        bridge_cells.insert(
-            (1, 0),
-            TacticalBridgeCell {
-                structural: true,
-                direction_zero: true,
-            },
-        );
-        bridge_cells.insert(
-            (0, 1),
-            TacticalBridgeCell {
-                structural: true,
-                direction_zero: true,
-            },
-        );
-
-        let mut adjusted = 90.0;
-        assert_eq!(
-            apply_tactical_bridge_inverse(
-                0.0,
-                30.0,
-                90.0,
-                0,
-                0,
-                0,
-                TacticalInverseContext {
-                    height_map: &height_map,
-                    bridge_cells: Some(&bridge_cells),
-                    viewport_offset_x: 0.0,
-                    viewport_offset_y: 0.0,
-                },
-                &mut adjusted,
-            ),
-            None
-        );
-        assert_eq!(adjusted, 90.0);
-
-        let mut adjusted = 90.0;
-        assert_eq!(
-            apply_tactical_bridge_inverse(
-                0.0,
-                31.0,
-                90.0,
-                0,
-                0,
-                0,
-                TacticalInverseContext {
-                    height_map: &height_map,
-                    bridge_cells: Some(&bridge_cells),
-                    viewport_offset_x: 0.0,
-                    viewport_offset_y: 0.0,
-                },
-                &mut adjusted,
-            ),
-            None
-        );
-        assert_eq!(adjusted, 30.0);
+    fn tactical_cardinal_neighbor_rejects_direction_eight() {
+        assert_eq!(tactical_cardinal_neighbor(10, 10, 8), None);
     }
 
     #[test]

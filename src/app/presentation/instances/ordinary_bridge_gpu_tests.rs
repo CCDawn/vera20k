@@ -10,7 +10,8 @@
 //! terrain painting, scene timing, shroud composition or an independent RGB oracle.
 //! The opt-in starting-MTNK test additionally consumes low_concrete_bridge_render.json
 //! for independent body/shadow/composite RGB565/Z controls and checks live A.
-use super::{CellOverlayInputs, build_cell_overlay_instances};
+use super::{CellOverlayInputs, build_cell_overlay_bodies};
+use crate::app::presentation::instances::{CellBodyDraw, submit_cell_body_sweep};
 use crate::app::presentation::lighting::MatchLighting;
 use crate::assets::asset_manager::{AssetManager, MediaArchiveMode};
 use crate::assets::pal_file::Palette;
@@ -28,7 +29,6 @@ use crate::render::terrain_draw::TerrainDrawRenderer;
 use crate::render::terrain_draw_gpu_tests::{
     Gpu, assert_native_color_and_depth, camera, clear, encoded,
 };
-use crate::rules::ini_parser::IniFile;
 use crate::rules::terrain_rules::LandType;
 use crate::util::sha256::sha256_hex;
 use serde_json::{Value, json};
@@ -147,7 +147,6 @@ struct Probe {
     atlas: OverlayAtlas,
     assets: AssetManager,
     palette: Palette,
-    rules_ini: IniFile,
     terrain: ResolvedTerrainGrid,
     entries: Vec<OverlayEntry>,
     names: BTreeMap<u8, String>,
@@ -172,13 +171,6 @@ impl Probe {
     ) -> Self {
         let root = PathBuf::from(std::env::var_os("RA2_DIR").expect("physical retail root"));
         let mut assets = AssetManager::new(&root, MediaArchiveMode::STOCK_DIGITAL).unwrap();
-        let mode = IniFile::from_bytes(assets.get_ref("MPBattleMD.ini").unwrap()).unwrap();
-        let (_, rules_ini, _, _) = crate::app::loading::init_helpers::load_rules_with_merged_ini(
-            &assets,
-            Some(&mode),
-            Some(&scene.map.ini),
-        )
-        .unwrap();
         let theater = crate::map::theater::load_theater(&mut assets, &scene.map.header.theater)
             .expect("activate the physical map's theater before name lookup");
         let center = fixture.center();
@@ -222,10 +214,7 @@ impl Probe {
             theater.extension,
             &scene.map.header.theater,
             registry,
-            &rules.tiberium_types,
-            &rules.crate_rules,
-            &rules_ini,
-            rules.art(),
+            rules,
             None,
             &[],
         )
@@ -239,12 +228,12 @@ impl Probe {
                     &gpu.device,
                     &gpu.queue,
                     size,
-                    [scene.sim().fog.width, scene.sim().fog.height],
+                    [scene.sim().fog().width(), scene.sim().fog().height()],
                     frames,
                     [width, height],
                     crate::render::shroud_buffer::SHROUD_EDGE_LUT,
                 ),
-                scene.sim().session.current_house.unwrap(),
+                scene.sim().session().current_house().unwrap(),
             )
         });
         let shadow = native.then(|| {
@@ -259,21 +248,20 @@ impl Probe {
                 theater.extension,
                 &scene.map.header.theater,
                 registry,
-                &rules_ini,
-                rules.art(),
                 &[],
             )
             .unwrap();
             let renderer = TerrainDrawRenderer::new(&gpu.device, &gpu.queue, format, &batch);
             (atlas, renderer)
         });
-        let terrain = scene.sim().resolved_terrain.as_ref().unwrap().clone();
+        let terrain = scene.sim().resolved_terrain().unwrap().clone();
         let mut lighting = MatchLighting::default();
         lighting.install(
             CellLightGrid::new(),
             parse_lighting(&scene.map.ini),
             2,
             Some((&terrain, scene.sim())),
+            None,
         );
         let palette = assets.resolve_ref(fixture.theater().3).unwrap();
         let profile = crate::map::lighting::normal_profile_units(&parse_lighting(&scene.map.ini));
@@ -287,8 +275,7 @@ impl Probe {
         });
         let level = scene
             .sim()
-            .resolved_terrain
-            .as_ref()
+            .resolved_terrain()
             .unwrap()
             .cell(center.0, center.1)
             .unwrap()
@@ -310,7 +297,6 @@ impl Probe {
             atlas,
             assets,
             palette: theater.iso_palette,
-            rules_ini,
             terrain,
             entries,
             names,
@@ -327,7 +313,7 @@ impl Probe {
         scene: &HeadlessScenario,
         entries: &[OverlayEntry],
         camera_pos: [f32; 2],
-    ) -> (Vec<SpriteInstance>, Vec<RenderZPolicy>) {
+    ) -> (Vec<SpriteInstance>, Vec<CellBodyDraw>) {
         let mut view = camera(self.size);
         view.camera_pos = camera_pos;
         view.world_origin_y = 0.0;
@@ -340,34 +326,36 @@ impl Probe {
         scene: &HeadlessScenario,
         entries: &[OverlayEntry],
         view: &CameraUniform,
-    ) -> (Vec<SpriteInstance>, Vec<RenderZPolicy>) {
-        let mut instances = Vec::new();
-        let mut policies = Vec::new();
-        let heights = self.terrain.build_height_map();
-        build_cell_overlay_instances(
+    ) -> (Vec<SpriteInstance>, Vec<CellBodyDraw>) {
+        let mut bodies = Vec::new();
+        build_cell_overlay_bodies(
             &CellOverlayInputs {
                 // Keep the initial map identities throughout; the production
                 // owner must select the live grid's changed identity and data.
                 entries,
                 atlas: &self.atlas,
                 names: &self.names,
-                live_grid: scene.sim().overlay_grid.as_ref(),
+                live_grid: scene.sim().overlay_grid(),
                 registry: Some(&scene.runtime.resources.overlay_registry),
                 rules: None,
                 interner: None,
                 tiberium_types: Some(&scene.runtime.resources.rules.tiberium_types),
                 terrain: Some(&self.terrain),
-                heights: &heights,
+
                 lighting: self.lighting.grid(),
                 camera: view.camera_pos,
                 viewport: self.size.map(|value| value as f32),
                 origin_y: view.world_origin_y,
                 world_height: view.world_height,
+                viewer: None,
+                fog: None,
+                fog_of_war: false,
             },
-            &mut instances,
-            &mut policies,
+            &mut bodies,
         );
-        (instances, policies)
+        let (mut instances, mut draws) = (Vec::new(), Vec::new());
+        submit_cell_body_sweep(bodies, &mut instances, &mut draws);
+        (instances, draws)
     }
 
     fn observe(&mut self, phase: &str, scene: &HeadlessScenario) {
@@ -391,14 +379,13 @@ impl Probe {
             .collect();
         let mut cells = Vec::new();
         for x in center.0 - 1..=center.0 + 1 {
-            let live = sim.overlay_grid.as_ref().unwrap().cell(x, row);
-            let cell = sim.resolved_terrain.as_ref().unwrap().cell(x, row).unwrap();
+            let live = sim.overlay_grid().unwrap().cell(x, row);
+            let cell = sim.resolved_terrain().unwrap().cell(x, row).unwrap();
             assert_eq!(
                 (live.overlay_id, live.overlay_data),
                 (Some(id), (x + 1 - center.0) as u8),
                 "{phase}"
             );
-            assert_eq!(cell.bridge_facts.overlay_id, live.overlay_id, "{phase}");
             assert!(
                 !cell.bridge_facts.has_structural_bridge(),
                 "ground-surface family"
@@ -423,11 +410,16 @@ impl Probe {
                 "land":cell.land_type,"raw_bridge_flags":cell.bridge_facts.raw_flags}));
         }
         let name = &self.names[&id];
-        assert_eq!(
-            rules.art().resolve_overlay_image_id(name, &self.rules_ini),
-            *name
-        );
         let filename = format!("{}.{}", name.to_ascii_lowercase(), self.fixture.theater().1);
+        let (bound_file, _) = crate::rules::effect_asset_catalog::load_overlay_shape(
+            &self.assets,
+            rules.overlay_registry(),
+            name,
+            self.fixture.theater().1,
+            self.fixture.theater().0,
+        )
+        .expect("processed overlay image binding");
+        assert!(bound_file.eq_ignore_ascii_case(&filename));
         let asset = self
             .assets
             .resolve_ref(&filename)
@@ -456,7 +448,7 @@ impl Probe {
                 self.atlas
                     .get(&OverlaySpriteKey {
                         name: name.clone(),
-                        frame: frame_index as u8
+                        frame: frame_index as i32
                     })
                     .is_none(),
                 "flank must not substitute populated body art"
@@ -499,9 +491,9 @@ impl Probe {
         }
 
         if phase == "loaded" {
-            let owner = sim.session.current_house.unwrap();
+            let owner = sim.session().current_house().unwrap();
             assert!(
-                !sim.fog.is_cell_revealed(owner, center.0, row),
+                !sim.fog().is_cell_revealed(owner, center.0, row),
                 "the physical bridge witness must begin with an unexplored anchor"
             );
         }
@@ -511,16 +503,16 @@ impl Probe {
                 .is_empty(),
             "camera rejection uses production admission"
         );
-        let (instances, policies) = self.instances(scene, &entries, self.camera);
+        let (instances, draws) = self.instances(scene, &entries, self.camera);
         assert_eq!(
             instances.len(),
             usize::from(visible),
             "{phase}: only center frame1 owns art, independently of anchor exploration"
         );
         assert!(
-            policies
+            draws
                 .iter()
-                .all(|policy| *policy == RenderZPolicy::ReadWrite)
+                .all(|draw| draw.render_z == RenderZPolicy::ReadWrite)
         );
         // Common 180x120 body canvas, centered on the cell. Keep each row at its
         // actual map offset in the shared camera rather than recentering it.
@@ -547,7 +539,7 @@ impl Probe {
         }
         let mut view = camera(SIZE);
         view.camera_pos = self.camera;
-        let output = self.render(&instances, &policies, view, None);
+        let output = self.render(&instances, &draws, view, None);
         let mut opaque = 0usize;
         for y in 0..SIZE[1] as usize {
             for x in 0..SIZE[0] as usize {
@@ -604,7 +596,7 @@ impl Probe {
             "rendering cannot mutate simulation"
         );
         let light = self.lighting.grid().cell_light_at((center.0, row)).unwrap();
-        let receipt = json!({"phase":phase,"row":row,"frame":sim.session.binary_frame,
+        let receipt = json!({"phase":phase,"row":row,"frame":sim.session().binary_frame(),
             "overlay":id,"overlay_data":[0,1,2],"source":source,
             "source_bounds":[bounds.0,bounds.1,bounds.2,bounds.3],"cells":cells,
             "cell_light":{"rgb_key":light.rgb_key,"common_scalar":light.common_scalar},
@@ -623,7 +615,7 @@ impl Probe {
     fn render(
         &mut self,
         instances: &[SpriteInstance],
-        policies: &[RenderZPolicy],
+        draws: &[CellBodyDraw],
         view: CameraUniform,
         shadows: Option<&[SpriteInstance]>,
     ) -> Vec<Vec<u8>> {
@@ -674,14 +666,16 @@ impl Probe {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
-            crate::app::presentation::render::draw_pooled_overlay_bodies(
+            crate::app::presentation::render::draw_pooled_cell_bodies(
                 &mut pass,
                 &self.batch,
                 &pool,
                 Some(&self.atlas),
+                None,
                 "overlay",
-                policies,
+                draws,
             );
         }
         if let Some(shadows) = shadows {
@@ -719,18 +713,13 @@ impl Probe {
         );
         assert_eq!(entries.len(), 1);
         assert_eq!((entries[0].rx, entries[0].ry), coord);
-        let live = scene
-            .sim()
-            .overlay_grid
-            .as_ref()
-            .unwrap()
-            .cell(coord.0, coord.1);
+        let live = scene.sim().overlay_grid().unwrap().cell(coord.0, coord.1);
         assert_eq!(live.overlay_id.map(i64::from), input["overlay_id"].as_i64());
         assert_eq!(
             u64::from(live.overlay_data),
             input["state"].as_u64().unwrap()
         );
-        let terrain = scene.sim().resolved_terrain.as_ref().unwrap();
+        let terrain = scene.sim().resolved_terrain().unwrap();
         let cell = terrain.cell(coord.0, coord.1).unwrap();
         let native = &row["native_cell"];
         assert_eq!(
@@ -788,16 +777,18 @@ impl Probe {
             point.1 - input["cell_point"][1].as_i64().unwrap() as f32,
         ];
         let (source, owner) = self.live_a.as_mut().unwrap();
-        source.rebuild_if_needed(
+        source.rebuild_submitted(
             &self.gpu.device,
             &self.gpu.queue,
-            &scene.sim().fog,
+            scene.sim().fog(),
             *owner,
             view.camera_pos[0],
             view.camera_pos[1],
             self.size[0],
             self.size[1],
             1.0,
+            None,
+            Default::default(),
         );
         let actual_a = self
             .gpu
@@ -809,14 +800,15 @@ impl Probe {
                 .all(|pixel| (pixel[0] * 255.0).round() as u8 == expected_a)
         );
         self.batch.bind_shroud(&self.gpu.device, Some(source));
-        let (instances, policies) = self.instances_in_view(scene, entries, &view);
+        let (instances, draws) = self.instances_in_view(scene, entries, &view);
         let mut shadows = Vec::new();
         crate::app::presentation::instances::bridges::build_bridge_shadow_instances_inner(
+            crate::render::cell_window::CellWindow::Whole,
             terrain,
             &self.shadow.as_ref().unwrap().0,
             &self.names,
             entries,
-            scene.sim().overlay_grid.as_ref(),
+            scene.sim().overlay_grid(),
             Some(&scene.runtime.resources.overlay_registry),
             None,
             view.world_origin_y,
@@ -838,7 +830,7 @@ impl Probe {
         ] {
             let output = self.render(
                 if body { &instances } else { &[] },
-                if body { &policies } else { &[] },
+                if body { &draws } else { &[] },
                 view,
                 shadow.then_some(shadows.as_slice()),
             );
@@ -1055,13 +1047,6 @@ fn assert_retail_cell_body_then_shadow(packet: &Value) {
     let rules = &scene.runtime.resources.rules;
     let registry = &scene.runtime.resources.overlay_registry;
     let mut assets = AssetManager::new(&root, MediaArchiveMode::STOCK_DIGITAL).unwrap();
-    let mode = IniFile::from_bytes(assets.get_ref("MPBattleMD.ini").unwrap()).unwrap();
-    let (_, rules_ini, _, _) = crate::app::loading::init_helpers::load_rules_with_merged_ini(
-        &assets,
-        Some(&mode),
-        Some(&scene.map.ini),
-    )
-    .unwrap();
     assert_eq!(scene.map.header.theater, "TEMPERATE");
     let theater = crate::map::theater::load_theater(&mut assets, &scene.map.header.theater)
         .expect("activate the physical theater before asset lookup");
@@ -1090,7 +1075,7 @@ fn assert_retail_cell_body_then_shadow(packet: &Value) {
             .expect("production scenario bound rubble art");
         assert_eq!(art.shp.to_ascii_lowercase(), "cthse05.shp");
         Some(
-            sim.interner
+            sim.interner()
                 .get(building)
                 .expect("actual map building type"),
         )
@@ -1103,7 +1088,7 @@ fn assert_retail_cell_body_then_shadow(packet: &Value) {
         assert_eq!(input["state"], 255);
         None
     };
-    let terrain = sim.resolved_terrain.as_ref().unwrap();
+    let terrain = sim.resolved_terrain().unwrap();
     let entries: Vec<_> = (coord.1..=coord.1 + u16::from(is_rubble))
         .map(|ry| {
             let cell = terrain.cell(coord.0, ry).unwrap();
@@ -1127,17 +1112,19 @@ fn assert_retail_cell_body_then_shadow(packet: &Value) {
         terrain.width(),
         terrain.height(),
     );
-    live_grid.cell_mut(coord.0, coord.1).rubble_building_type = type_id;
+    live_grid
+        .cell_mut_for_test(coord.0, coord.1)
+        .rubble_building_type = type_id;
     if is_rubble {
         assert!(
             live_grid
-                .cell_mut(coord.0, coord.1 + 1)
+                .cell_mut_for_test(coord.0, coord.1 + 1)
                 .rubble_building_type
                 .is_none()
         );
     }
     let names = crate::render::overlay_assets::render_overlay_names(registry);
-    let heights = terrain.build_height_map();
+
     let convert = &packet["inputs"]["cell_convert"];
     assert_eq!(convert["rgb"], json!([1000, 1000, 1000]));
     assert_eq!(convert["cell_brightness"], json!([1000, 1000, 1000]));
@@ -1185,10 +1172,7 @@ fn assert_retail_cell_body_then_shadow(packet: &Value) {
             theater.extension,
             &scene.map.header.theater,
             registry,
-            &rules.tiberium_types,
-            &rules.crate_rules,
-            &rules_ini,
-            rules.art(),
+            rules,
             None,
             &rubble_arts,
         )
@@ -1204,14 +1188,11 @@ fn assert_retail_cell_body_then_shadow(packet: &Value) {
             theater.extension,
             &scene.map.header.theater,
             registry,
-            &rules_ini,
-            rules.art(),
             &rubble_arts,
         )
         .expect("physical rubble shadow atlas and overlay proxy");
-        let mut instances = Vec::new();
-        let mut policies = Vec::new();
-        build_cell_overlay_instances(
+        let mut bodies = Vec::new();
+        build_cell_overlay_bodies(
             &CellOverlayInputs {
                 entries: &entries,
                 atlas: &atlas,
@@ -1219,30 +1200,35 @@ fn assert_retail_cell_body_then_shadow(packet: &Value) {
                 live_grid: Some(&live_grid),
                 registry: Some(registry),
                 rules: Some(rules),
-                interner: Some(&sim.interner),
+                interner: Some(sim.interner()),
                 tiberium_types: Some(&rules.tiberium_types),
                 terrain: Some(terrain),
-                heights: &heights,
+
                 lighting: &lighting,
                 camera: view.camera_pos,
                 viewport: size.map(|v| v as f32),
                 origin_y: view.world_origin_y,
                 world_height: view.world_height,
+                viewer: None,
+                fog: None,
+                fog_of_war: false,
             },
-            &mut instances,
-            &mut policies,
+            &mut bodies,
         );
+        let (mut instances, mut draws) = (Vec::new(), Vec::new());
+        submit_cell_body_sweep(bodies, &mut instances, &mut draws);
         assert_eq!(instances.len(), 1, "one live Cell publishes body art");
-        assert_eq!(policies, [RenderZPolicy::ReadWrite]);
+        assert_eq!(draws[0].render_z, RenderZPolicy::ReadWrite);
         let mut shadows = Vec::new();
         crate::app::presentation::instances::bridges::build_bridge_shadow_instances_inner(
+            crate::render::cell_window::CellWindow::Whole,
             terrain,
             &shadow_atlas,
             &names,
             &entries,
             Some(&live_grid),
             Some(registry),
-            is_rubble.then_some((rules, &sim.interner)),
+            is_rubble.then_some((rules, sim.interner())),
             view.world_origin_y,
             view.world_height,
             view.camera_pos[0],
@@ -1281,13 +1267,14 @@ fn assert_retail_cell_body_then_shadow(packet: &Value) {
                 &dv,
             );
             pass.set_scissor_rect(clip[0], clip[1], clip[2], clip[3]);
-            crate::app::presentation::render::draw_pooled_overlay_bodies(
+            crate::app::presentation::render::draw_pooled_cell_bodies(
                 &mut pass,
                 &batch,
                 &pool,
                 Some(&atlas),
+                None,
                 "overlay",
-                &policies,
+                &draws,
             );
         }
         // Copies are encoded before the shadow edits the SAME attachments.

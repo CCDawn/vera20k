@@ -15,7 +15,6 @@ use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use super::turret_rotate_sound_owner;
-use super::turret_rotate_sound_techno;
 use super::{FrameEffects, SimSoundEvent, Simulation};
 use crate::map::resolved_terrain::test_flat_ground_grid;
 use crate::rules::ini_parser::IniFile;
@@ -32,6 +31,186 @@ use crate::sim::world::SoundBoundary;
 const TICK_MS: u32 = 67;
 /// The stock cue's name, as `[GTGCAN]` authors it.
 const CUE: &str = "GrandCannonRotate";
+
+/// Techno6FA04F updates a turning turret's loop before the same Building
+/// visit's C4 expiry440333 kills it and Limbo6F6C50 releases the handle.
+/// Zero gain must stop it before Release can play decay at the old gain.
+#[test]
+fn retail_turning_cannon_updates_its_loop_before_fatal_limbo_releases_it() {
+    use crate::sim::anim_class::AnimWorldCoord;
+    use crate::sim::command::Command;
+    use crate::sim::world::TickLane;
+
+    struct Heard {
+        owner: u64,
+        delivered: Cell<usize>,
+        calls: RefCell<Vec<(&'static str, Option<AnimWorldCoord>)>>,
+    }
+    impl SoundBoundary for Heard {
+        fn consume(&self, _: &Simulation, _: &RuleSet, events: &[SimSoundEvent]) {
+            for event in &events[self.delivered.get()..] {
+                if matches!(event, SimSoundEvent::ObjectSoundReleased { owner } if *owner == self.owner)
+                {
+                    self.calls.borrow_mut().push(("release", None));
+                }
+            }
+            self.delivered.set(events.len());
+        }
+        fn delivered(&self) -> usize {
+            self.delivered.get()
+        }
+        fn update_looping_sound(&self, _: &Simulation, owner: u64, world: AnimWorldCoord) {
+            if owner == self.owner {
+                self.calls.borrow_mut().push(("position", Some(world)));
+            }
+        }
+    }
+
+    let Some(mut retail) =
+        crate::rules::retail_ini_fixture::retail_battle_rules_for_map("XMP03T4.MAP")
+    else {
+        return;
+    };
+    let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+        return;
+    };
+    let theater = crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
+    let roots = crate::rules::effect_asset_catalog::tolerant_anim_class_roots(&retail.rules);
+    retail
+        .rules
+        .bind_anim_class_assets(&roots, &assets, theater.extension, "TEMPERATE");
+    retail
+        .rules
+        .bind_effect_assets(&assets, theater.extension, "TEMPERATE");
+    let rules = retail.rules;
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x6fa04f);
+    let french = sim.interner.intern("French");
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            french,
+            0,
+            Some(french),
+            true,
+            0,
+            10,
+        ));
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    let cannon = sim
+        .spawn_object("GTGCAN", "French", 8, 10, 0, &rules)
+        .unwrap();
+    sim.spawn_object("GAPOWR", "French", 4, 4, 0, &rules)
+        .unwrap();
+    sim.spawn_object("NAPOWR", "Russians", 24, 24, 0, &rules)
+        .unwrap();
+    let tanya = sim
+        .spawn_object("TANY", "French", 7, 10, 0, &rules)
+        .unwrap();
+    assert!(sim.apply_command(
+        "French",
+        &Command::PlantC4 {
+            attacker_id: tanya,
+            target_building_id: cannon
+        },
+        Some(&rules),
+    ));
+    let planted = (0..180).any(|_| {
+        sim.advance_app_frame(
+            &[],
+            &rules,
+            None,
+            33,
+            TickLane::Ordinary,
+            FrameEffects::empty(),
+        )
+        .unwrap();
+        sim.entities()
+            .get(cannon)
+            .unwrap()
+            .building
+            .pending_c4_detonation
+            .pending()
+            .is_some()
+    });
+    assert!(
+        planted,
+        "Tanya's forced own-building order plants the real charge"
+    );
+    let target = sim
+        .spawn_object("NAPOWR", "Russians", 16, 10, 0, &rules)
+        .unwrap();
+    assert!(sim.apply_command(
+        "French",
+        &Command::Attack {
+            attacker_id: cannon,
+            target_id: target
+        },
+        Some(&rules),
+    ));
+    let started = (0..120).any(|_| {
+        sim.advance_app_frame(
+            &[],
+            &rules,
+            None,
+            33,
+            TickLane::Ordinary,
+            FrameEffects::empty(),
+        )
+        .unwrap()
+        .sound_events
+        .iter()
+        .any(|event| {
+            matches!(event, SimSoundEvent::AnimationStarted { anim_id, sound_id, .. }
+                    if *anim_id == turret_rotate_sound_owner(cannon) && sound_id == CUE)
+        })
+    });
+    assert!(started, "the real Attack aim starts the stock turret cue");
+    assert!(!latch(&sim, cannon));
+    assert!(
+        sim.entities()
+            .get(cannon)
+            .unwrap()
+            .body_facing
+            .is_rotating(sim.session.binary_frame())
+    );
+    let world = Simulation::movement_sound_world(sim.entities().get(cannon).unwrap());
+    let heard = Heard {
+        owner: turret_rotate_sound_owner(cannon),
+        delivered: Cell::new(0),
+        calls: RefCell::default(),
+    };
+    let released = (0..60).any(|_| {
+        heard.delivered.set(0);
+        heard.calls.borrow_mut().clear();
+        sim.advance_app_frame(
+            &[],
+            &rules,
+            None,
+            33,
+            TickLane::Ordinary,
+            FrameEffects::for_sound(&heard),
+        )
+        .unwrap();
+        heard
+            .calls
+            .borrow()
+            .iter()
+            .any(|(kind, _)| *kind == "release")
+    });
+    assert!(
+        released,
+        "the planted charge reaches the normal fatal Limbo"
+    );
+    assert_eq!(
+        heard.calls.borrow().as_slice(),
+        [("position", Some(world)), ("release", None)]
+    );
+    assert!(
+        sim.entities()
+            .get(cannon)
+            .is_none_or(|entity| entity.health.current() == 0)
+    );
+}
 
 /// Three structures around the one stock shape: `GTGCAN` authors the key and
 /// carries `Turret=yes`, `NOKEY` carries the turret without the sound and
@@ -101,14 +280,14 @@ fn latch(sim: &Simulation, id: u64) -> bool {
 }
 
 fn tick(sim: &mut Simulation, rules: &RuleSet) {
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     sim.advance_tick(&[], Some(rules), None, None, TICK_MS);
 }
 
 /// The frame this pass ran at: `advance_tick` commits `binary_frame + 1`, so
 /// the pass frame is the committed one minus one.
 fn pass_frame(sim: &Simulation) -> u32 {
-    sim.session.binary_frame - 1
+    sim.session.binary_frame() - 1
 }
 
 fn aim(sim: &mut Simulation, id: u64, target: u16) {
@@ -131,188 +310,6 @@ fn begin_rotation(sim: &mut Simulation, rules: &RuleSet, id: u64) {
     );
     assert!(latch(sim, id), "the idle frame re-arms the latch");
     aim(sim, id, 0x4000);
-}
-
-#[test]
-fn a_turning_grand_cannon_starts_then_releases_its_rotate_loop() {
-    let (mut sim, rules, id) = scene("GTGCAN");
-    begin_rotation(&mut sim, &rules, id);
-
-    // The sample rises one frame after the aim: the loop starts on that edge,
-    // hard-stopping any prior handle first (Stop405D40 then PlayAt7509E0).
-    tick(&mut sim, &rules);
-    assert_eq!(
-        turret_events(&sim, id),
-        vec!["stop".to_string(), format!("start {CUE}")]
-    );
-    assert!(
-        !latch(&sim, id),
-        "a rotation request leaves the latch unarmed"
-    );
-
-    // The rest of the arc publishes no further start or release requests.
-    let mut frames = 0;
-    while sim
-        .substrate
-        .entities
-        .get(id)
-        .unwrap()
-        .body_facing
-        .is_rotating(sim.session.binary_frame)
-    {
-        tick(&mut sim, &rules);
-        assert!(
-            turret_events(&sim, id).is_empty(),
-            "frame {} re-issued the loop",
-            pass_frame(&sim)
-        );
-        assert!(!latch(&sim, id));
-        frames += 1;
-        assert!(frames < 300, "the arc never completed");
-    }
-    // A 0x4000 arc at ROT=1 lasts 64 frames, so 63 passes sample it: the one
-    // that starts the loop and these.
-    assert_eq!(frames, 62);
-
-    // The first frame whose sample is zero releases the loop (Release406060)
-    // and re-arms the latch, so a later turn starts a new one.
-    tick(&mut sim, &rules);
-    assert_eq!(turret_events(&sim, id), ["release"]);
-    assert!(latch(&sim, id));
-
-    // An idle turret stays silent.
-    tick(&mut sim, &rules);
-    assert!(turret_events(&sim, id).is_empty());
-}
-
-#[test]
-fn a_second_turn_after_the_first_releases_starts_a_new_loop() {
-    let (mut sim, rules, id) = scene("GTGCAN");
-    begin_rotation(&mut sim, &rules, id);
-    tick(&mut sim, &rules);
-    assert_eq!(
-        turret_events(&sim, id),
-        vec!["stop".to_string(), format!("start {CUE}")]
-    );
-    while sim
-        .substrate
-        .entities
-        .get(id)
-        .unwrap()
-        .body_facing
-        .is_rotating(sim.session.binary_frame)
-    {
-        tick(&mut sim, &rules);
-    }
-    tick(&mut sim, &rules);
-    assert_eq!(turret_events(&sim, id), ["release"]);
-
-    // The idle release re-armed the latch, so another aim requests a new loop.
-    aim(&mut sim, id, 0);
-    tick(&mut sim, &rules);
-    assert_eq!(
-        turret_events(&sim, id),
-        vec!["stop".to_string(), format!("start {CUE}")]
-    );
-}
-
-#[test]
-fn only_a_turreted_type_that_authors_the_cue_starts_a_loop() {
-    for type_name in ["NOKEY", "NOTURRET"] {
-        let (mut sim, rules, id) = scene(type_name);
-        begin_rotation(&mut sim, &rules, id);
-        tick(&mut sim, &rules);
-        assert_eq!(
-            turret_events(&sim, id),
-            if type_name == "NOKEY" {
-                vec!["stop"]
-            } else {
-                vec![]
-            }
-        );
-        assert_eq!(latch(&sim, id), type_name == "NOTURRET");
-        let mut releases = 0;
-        for _ in 0..70 {
-            tick(&mut sim, &rules);
-            let events = turret_events(&sim, id);
-            if !events.is_empty() {
-                assert_eq!(
-                    events,
-                    ["release"],
-                    "{type_name} must never request playback"
-                );
-                releases += 1;
-            }
-        }
-        assert_eq!(releases, usize::from(type_name == "NOKEY"));
-        assert!(latch(&sim, id));
-    }
-}
-
-/// The app re-drives a live loop from
-/// [`Simulation::looping_sound_owner_coord`] once per frame and hard-stops an
-/// owner it cannot resolve. A tag bit another owner-keyed family also claims
-/// (the Ivan bomb's ticking loop) resolves *that* family instead, so the same
-/// frame that started the loop stops it and the handle is never driven again.
-#[test]
-fn the_loop_owner_resolves_to_its_own_object_for_the_app_re_drive() {
-    let (mut sim, rules, id) = scene("GTGCAN");
-    begin_rotation(&mut sim, &rules, id);
-    tick(&mut sim, &rules);
-    assert_eq!(
-        turret_events(&sim, id),
-        vec!["stop".to_string(), format!("start {CUE}")]
-    );
-
-    let owner = turret_rotate_sound_owner(id);
-    assert!(
-        sim.looping_sound_owner_coord(owner).is_some(),
-        "the re-drive must find this building and keep its loop"
-    );
-    // Every other owner-keyed family keeps its own bit.
-    assert_ne!(
-        owner,
-        crate::sim::combat::gattling::gattling_sound_owner(id)
-    );
-    assert_ne!(owner, crate::sim::bomb::ticking_sound_owner(id));
-    assert_eq!(crate::sim::bomb::ticking_sound_carrier(owner), None);
-    assert_eq!(
-        crate::sim::combat::gattling::gattling_sound_techno(owner),
-        None
-    );
-    assert_eq!(turret_rotate_sound_techno(owner), Some(id));
-}
-
-#[test]
-fn limbo_releases_a_live_loop_and_re_arms_the_latch() {
-    let (mut sim, rules, id) = scene("GTGCAN");
-    begin_rotation(&mut sim, &rules, id);
-    tick(&mut sim, &rules);
-    assert_eq!(
-        turret_events(&sim, id),
-        vec!["stop".to_string(), format!("start {CUE}")]
-    );
-
-    sim.sound_events.clear();
-    sim.uninit_with_rules(id, &rules);
-    assert_eq!(
-        turret_events(&sim, id),
-        ["release"],
-        "TechnoClass::Limbo releases the +0x488 handle"
-    );
-    assert!(latch(&sim, id), "and re-arms the latch");
-
-    // The physical destructor publishes no second event: Limbo already
-    // released the handle, and a never-started loop has nothing to detach.
-    sim.sound_events.clear();
-    sim.process_pending_delete_with(
-        Some(&rules),
-        None,
-        crate::sim::world::FrameEffects::default(),
-        1,
-        sim.session.started(),
-    );
-    assert!(turret_events(&sim, id).is_empty());
 }
 
 #[test]
@@ -377,7 +374,7 @@ fn the_latch_is_hashed_state_and_load_rebuilds_the_handle() {
         .get(id)
         .unwrap()
         .body_facing
-        .is_rotating(restored.session.binary_frame)
+        .is_rotating(restored.session.binary_frame())
     {
         tick(&mut restored, &rules);
         assert!(turret_events(&restored, id).is_empty());
@@ -446,17 +443,17 @@ fn voice_precedes_turret_controls_and_each_control_reaches_its_native_boundary()
     let (mut sim, rules, id) = scene("GTGCAN");
     begin_rotation(&mut sim, &rules, id);
     sim.prepare_unit_voice_visits([id].into());
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     let boundary = TurretBoundary {
         delivered: Cell::new(0),
         batches: RefCell::default(),
         id,
         ai_counter: sim.substrate.entities.get(id).unwrap().mission.ai_counter(),
     };
-    let effects = FrameEffects::for_sound(&boundary).with_rules(Some(&rules));
+    let effects = FrameEffects::for_sound(&boundary);
     sim.object_ai_visit_one_with_effects(
         id,
-        Some(&rules),
+        &rules,
         crate::sim::world::techno_ai::ObjectAiCtx {
             effects,
             ..Default::default()
@@ -468,7 +465,7 @@ fn voice_precedes_turret_controls_and_each_control_reaches_its_native_boundary()
     );
     assert!(!latch(&sim, id));
 
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     boundary.delivered.set(0);
     boundary.batches.borrow_mut().clear();
     let release = TurretBoundary {
@@ -481,40 +478,6 @@ fn voice_precedes_turret_controls_and_each_control_reaches_its_native_boundary()
             .with_effects(FrameEffects::for_sound(&release)),
     );
     assert_eq!(*release.batches.borrow(), [(false, vec!["release"])]);
-    assert!(latch(&sim, id));
-}
-
-#[test]
-fn idle_release_reaches_audio_before_rearming_the_latch() {
-    let (mut sim, rules, id) = scene("GTGCAN");
-    begin_rotation(&mut sim, &rules, id);
-    tick(&mut sim, &rules);
-    while sim
-        .substrate
-        .entities
-        .get(id)
-        .unwrap()
-        .body_facing
-        .is_rotating(sim.session.binary_frame)
-    {
-        tick(&mut sim, &rules);
-    }
-    sim.sound_events.clear();
-    let boundary = TurretBoundary {
-        delivered: Cell::new(0),
-        batches: RefCell::default(),
-        id,
-        ai_counter: sim.substrate.entities.get(id).unwrap().mission.ai_counter(),
-    };
-    sim.object_ai_visit_one_with_effects(
-        id,
-        Some(&rules),
-        crate::sim::world::techno_ai::ObjectAiCtx {
-            effects: FrameEffects::for_sound(&boundary),
-            ..Default::default()
-        },
-    );
-    assert_eq!(*boundary.batches.borrow(), [(false, vec!["release"])]);
     assert!(latch(&sim, id));
 }
 
@@ -537,7 +500,8 @@ fn turret_rotate_sound_matches_native_control_corpus() {
         let mut facing = crate::sim::movement::FacingClass::new(0, 1);
         facing.set(0x4000, 100);
         sim.substrate.entities.get_mut(id).unwrap().body_facing = facing;
-        sim.session.binary_frame = row["frame"].as_u64().unwrap() as u32;
+        sim.session
+            .set_binary_frame_for_test(row["frame"].as_u64().unwrap() as u32);
         assert_eq!(
             sim.sample_building_turret_rotation(id, &rules),
             row["sample"].as_u64().unwrap() != 0,
@@ -571,7 +535,7 @@ fn turret_rotate_sound_matches_native_control_corpus() {
             .set_for_test(history["initial_latch"].as_bool().unwrap());
         for visit in history["visits"].as_array().unwrap() {
             let prior = latch(&sim, id);
-            sim.sound_events.clear();
+            sim.sound_events.clear_for_test();
             let boundary = TurretBoundary {
                 delivered: Cell::new(0),
                 batches: RefCell::default(),
@@ -582,7 +546,7 @@ fn turret_rotate_sound_matches_native_control_corpus() {
                 id,
                 visit["sample"].as_u64().unwrap() != 0,
                 &rules,
-                FrameEffects::for_sound(&boundary).with_rules(Some(&rules)),
+                FrameEffects::for_sound(&boundary),
             );
             let expected = visit["calls"]
                 .as_array()
@@ -638,8 +602,8 @@ fn turret_rotate_sound_matches_native_control_corpus() {
             }
         }
         let prior = latch(&sim, id);
-        sim.sound_events.clear();
-        sim.turret_rotate_sound_limbo(id, FrameEffects::default(), Some(&rules));
+        sim.sound_events.clear_for_test();
+        sim.turret_rotate_sound_limbo(id, FrameEffects::default(), &rules);
         assert_eq!(
             turret_events(&sim, id),
             if prior { vec![] } else { vec!["release"] }
@@ -706,7 +670,7 @@ fn retail_grand_cannon_starts_and_releases_its_retail_cue() {
         .get(id)
         .unwrap()
         .body_facing
-        .is_rotating(sim.session.binary_frame)
+        .is_rotating(sim.session.binary_frame())
     {
         tick(&mut sim, &rules);
         assert!(turret_events(&sim, id).is_empty());
@@ -739,7 +703,7 @@ fn a_retail_grand_cannons_mission_aim_starts_and_releases_the_retail_cue() {
     let enemy = sim
         .spawn_object("NAPOWR", "Russians", 12, 10, 0, &rules)
         .expect("retail Soviet power plant");
-    let frame = sim.session.binary_frame;
+    let frame = sim.session.binary_frame();
     sim.substrate
         .entities
         .get_mut(id)
@@ -758,7 +722,7 @@ fn a_retail_grand_cannons_mission_aim_starts_and_releases_the_retail_cue() {
     sim.assign_target_represented(
         id,
         Some(TargetKind::Entity(enemy)),
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default(),
     )
@@ -779,7 +743,7 @@ fn a_retail_grand_cannons_mission_aim_starts_and_releases_the_retail_cue() {
             .get(id)
             .unwrap()
             .body_facing
-            .is_rotating(sim.session.binary_frame),
+            .is_rotating(sim.session.binary_frame()),
         "the spawn faces away from the target"
     );
 

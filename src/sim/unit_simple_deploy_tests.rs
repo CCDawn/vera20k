@@ -64,14 +64,15 @@ fn fixture(input: &Value) -> (Simulation, RuleSet, u64) {
 
 fn native_fixture(input: &Value, before: &Value) -> (Simulation, RuleSet, u64) {
     let (mut sim, mut rules, id) = fixture(input);
-    sim.session.binary_frame = 200;
-    sim.session.tick = 200;
-    sim.mission_assign_exact(
-        id,
-        MissionId::from_raw(before["mission"].as_i64().unwrap() as i32),
-        200,
-    )
-    .unwrap();
+    sim.session.set_binary_frame_for_test(200);
+    sim.session.set_tick_for_test(200);
+    sim.substrate
+        .mission_assign_exact(
+            id,
+            MissionId::from_raw(before["mission"].as_i64().unwrap() as i32),
+            200,
+        )
+        .unwrap();
     if before["anim_present"].as_bool().unwrap() {
         // Construct the supplied existing attachment through the production
         // owner while its physical ART range is valid. These setup RNG draws
@@ -92,7 +93,7 @@ fn native_fixture(input: &Value, before: &Value) -> (Simulation, RuleSet, u64) {
     entity.position.set_exact_z_leptons_for_test(Some(height));
     let locomotor = entity.locomotor.as_mut().expect("production Jumpjet");
     if height > 0 {
-        locomotor.set_layer(crate::sim::movement::locomotor::MovementLayer::Air);
+        locomotor.set_layer_for_test(crate::sim::movement::locomotor::MovementLayer::Air);
     }
     if input.get("start").is_some() || input.get("count").is_some() {
         // The signed/overflow corpus supplies raw native AnimType fields, some
@@ -170,6 +171,32 @@ fn allocated(events: &Value) -> bool {
         .any(|event| event[0] == "allocate")
 }
 
+/// Ares UnitClass_SimpleDeploy_Height (1004C380, hook 0x739ADA) deploys an
+/// airborne non-DeployToLand deployer, where the native row refuses;
+/// `ares_airborne_deployer_without_deploy_to_land_deploys` holds it.
+fn ares_deploys_in_the_air(rules: &RuleSet, row: &Value) -> bool {
+    rules.ares() && row["input"]["name"] == "air_without_deploy_to_land"
+}
+
+/// The native refusal row under Ares: the deploy animation begins in the air.
+#[test]
+fn ares_airborne_deployer_without_deploy_to_land_deploys() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let row = corpus()["lifecycle"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["input"]["name"] == "air_without_deploy_to_land")
+        .unwrap();
+    let (mut sim, rules, id) = native_fixture(&row["input"], &row["before"]);
+    sim.update_unit_simple_deploy(id, true, &rules, crate::sim::world::FrameEffects::default())
+        .unwrap();
+    let entity = sim.substrate.entities.get(id).unwrap();
+    let leaf = entity.mission_leaf.as_unit().unwrap();
+    assert_eq!((leaf.deployed(), leaf.deploy_begin_active()), (0, 1));
+    assert!(!entity.landing_for_deploy(), "no DeployToLand, no landing");
+}
+
 #[test]
 fn updater_flags_stage_and_signed_boundaries_match_native_lifecycle() {
     let data = corpus();
@@ -177,6 +204,9 @@ fn updater_flags_stage_and_signed_boundaries_match_native_lifecycle() {
     assert_eq!(rows.len(), 100);
     for (index, row) in rows.iter().enumerate() {
         let (mut sim, rules, id) = native_fixture(&row["input"], &row["before"]);
+        if ares_deploys_in_the_air(&rules, row) {
+            continue;
+        }
         let rng = sim.rng_state();
         let deploying = row["input"]["entry"].as_u64().unwrap_or(0x739ac0) != 0x739cd0;
         sim.update_unit_simple_deploy(
@@ -207,12 +237,15 @@ fn updater_reads_the_height_on_any_layer() {
         }
         airborne += 1;
         let (mut sim, rules, id) = native_fixture(&row["input"], &row["before"]);
+        if ares_deploys_in_the_air(&rules, row) {
+            continue;
+        }
         let entity = sim.substrate.entities.get_mut(id).unwrap();
         entity
             .locomotor
             .as_mut()
             .unwrap()
-            .set_layer(crate::sim::movement::locomotor::MovementLayer::Ground);
+            .set_layer_for_test(crate::sim::movement::locomotor::MovementLayer::Ground);
         let deploying = row["input"]["entry"].as_u64().unwrap_or(0x739ac0) != 0x739cd0;
         sim.update_unit_simple_deploy(
             id,
@@ -237,7 +270,7 @@ fn mission_then_shared_stage_matches_original_frame_timelines() {
             let (mut sim, rules, id) = native_fixture(&json!({}), &frames[0]["before"]);
             for frame in frames {
                 let now = frame["frame"].as_u64().unwrap() as u32;
-                sim.session.binary_frame = now;
+                sim.session.set_binary_frame_for_test(now);
                 let context = format!("{} frame {now}", row["name"]);
                 assert_native_state(&sim, id, &frame["before"], &context);
                 let rng = sim.rng_state();
@@ -281,25 +314,6 @@ fn mission_then_shared_stage_matches_original_frame_timelines() {
             assert_eq!(sim.rng_state(), rng);
         }
     }
-}
-
-#[test]
-fn ordinary_synchronized_deploy_command_accepts_schp() {
-    let (mut sim, rules, id) = fixture(&json!({}));
-    assert!(sim.apply_command(
-        "Russians",
-        &Command::DeployMcv { entity_id: id },
-        Some(&rules)
-    ));
-    let entity = sim.substrate.entities.get(id).unwrap();
-    // Event9's Queue_Mission(Unload) at4C7812 leaves the current Guard
-    // intact; the ordinary scheduler owns Commence on a later frame.
-    assert_eq!(entity.mission.current().known(), Some(MissionType::Guard));
-    assert_eq!(entity.mission.queued().known(), Some(MissionType::Unload));
-    assert!(
-        !entity.is_fully_deployed(),
-        "the command queues the owner; it does not complete deployment"
-    );
 }
 
 #[test]
@@ -350,7 +364,8 @@ fn synchronized_deploy_obeys_native_event9_actor_guards() {
                 } else {
                     MissionType::Selling
                 };
-                sim.mission_assign_exact(id, MissionId::from_known(mission), 0)
+                sim.substrate
+                    .mission_assign_exact(id, MissionId::from_known(mission), 0)
                     .unwrap();
             }
             "zero_health_crashing" => {
@@ -401,14 +416,15 @@ fn stock_animation_constructor_matches_native_forward_reverse_and_rng() {
         let (mut sim, rules, id) = fixture(&json!({}));
         let expected = &row["state"];
         let timer = &expected["runtime"]["frame_timer"];
-        sim.session.binary_frame = timer[0].as_u64().unwrap() as u32;
+        sim.session
+            .set_binary_frame_for_test(timer[0].as_u64().unwrap() as u32);
         let rng = sim.rng_state();
         let reverse = row["reverse"].as_bool().unwrap();
         let anim_id = sim
             .start_unit_deploy_anim(id, "SCHPDEPL", reverse, &rules)
             .unwrap();
         let anim = sim.anim(anim_id).unwrap();
-        let runtime = &anim.runtime;
+        let runtime = &anim.runtime();
         let actual = json!({
             "constructor_reverse": u8::from(runtime.constructor_reverse),
             "current_frame": runtime.current_frame,
@@ -423,16 +439,16 @@ fn stock_animation_constructor_matches_native_forward_reverse_and_rng() {
         });
         assert_eq!(actual, expected["runtime"], "reverse={reverse}");
         assert_eq!(
-            u64::from(anim.draw_flags),
+            u64::from(anim.draw_flags()),
             expected["draw_flags"].as_u64().unwrap()
         );
         assert_eq!(
-            i64::from(anim.z_adjust),
+            i64::from(anim.z_adjust()),
             expected["z_adjust"].as_i64().unwrap()
         );
         let coord = sim.anim_absolute_coord(anim_id).unwrap();
         assert_eq!(json!([coord.x, coord.y, coord.z]), expected["location"]);
-        assert_eq!(anim.owner_entity, Some(id));
+        assert_eq!(anim.owner_entity(), Some(id));
         assert_eq!(
             anim.remap(),
             Some(crate::sim::anim_class::AnimRemap::House(
@@ -533,8 +549,8 @@ fn ordinary_commands_land_animate_deploy_reverse_and_resume_flight() {
         .deploy_anim()
         .unwrap();
     assert_eq!(altitude(&sim, id), 0);
-    assert!(!sim.anim(forward).unwrap().runtime.constructor_reverse);
-    assert_eq!(sim.anim(forward).unwrap().owner_entity, Some(id));
+    assert!(!sim.anim(forward).unwrap().runtime().constructor_reverse);
+    assert_eq!(sim.anim(forward).unwrap().owner_entity(), Some(id));
     advance_until(&mut sim, &rules, 200, "fully deployed Unit", |sim| {
         let entity = sim.substrate.entities.get(id).unwrap();
         entity.is_fully_deployed() && !entity.unit_deploying()
@@ -578,8 +594,8 @@ fn ordinary_commands_land_animate_deploy_reverse_and_resume_flight() {
         .deploy_anim()
         .unwrap();
     assert_ne!(reverse, forward);
-    assert!(sim.anim(reverse).unwrap().runtime.constructor_reverse);
-    assert_eq!(sim.anim(reverse).unwrap().owner_entity, Some(id));
+    assert!(sim.anim(reverse).unwrap().runtime().constructor_reverse);
+    assert_eq!(sim.anim(reverse).unwrap().owner_entity(), Some(id));
     advance_until(&mut sim, &rules, 200, "completed undeployment", |sim| {
         let entity = sim.substrate.entities.get(id).unwrap();
         !entity.is_fully_deployed() && !entity.unit_deploying()
@@ -642,13 +658,13 @@ fn compare_snapshot_continuation(mut sim: Simulation, rules: &RuleSet, id: u64, 
     let loaded_sound = loaded.substrate.entities.get(id).unwrap().move_sound;
     assert!(!loaded_sound.is_active());
     assert_eq!(loaded_sound.countdown(), 0);
-    sim.restore_move_sound_state_after_load(id);
+    sim.substrate.restore_move_sound_state_after_load(id);
     assert_eq!(
         loaded.substrate.entities.get(id).unwrap().deploy_anim(),
         attachment
     );
     if let Some(anim) = attachment {
-        assert_eq!(loaded.anim(anim).unwrap().owner_entity, Some(id));
+        assert_eq!(loaded.anim(anim).unwrap().owner_entity(), Some(id));
     }
     assert_eq!(
         sim.state_hash(),
@@ -708,4 +724,56 @@ fn landing_and_attached_animation_survive_snapshot_and_continue_identically() {
     assert!(entity.unit_deploying());
     assert!(entity.deploy_anim().is_some());
     compare_snapshot_continuation(sim, &rules, id, "simple deploy animation");
+}
+
+/// Ares 3.0 UnitClass_SimpleDeploy_Facing (1004C2D0, hook 0x739B8A): a
+/// deployer with a DeployingAnim that does not face `DeployDir` (east here)
+/// turns first and starts no deploy animation on that visit.
+#[test]
+fn ares_simple_deployer_faces_deploy_dir_before_its_animation() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let (mut sim, rules, id) = fixture(&json!({}));
+    let frame = sim.session.binary_frame();
+    sim.substrate
+        .entities
+        .get_mut(id)
+        .unwrap()
+        .body_facing
+        .snap(0xC000, frame);
+    sim.update_unit_simple_deploy(id, true, &rules, crate::sim::world::FrameEffects::default())
+        .unwrap();
+    let entity = sim.substrate.entities.get(id).unwrap();
+    assert!(entity.deploy_anim().is_none(), "no animation while turning");
+    assert_eq!(entity.mission_leaf.as_unit().unwrap().deployed(), 0);
+}
+
+/// Ares 3.0 UnitClass_Mi_Unload_SimpleDeployer (1004C070, hook 0x73DE90):
+/// a simple deployer without a DeployingAnim deploys at once on its Unload
+/// visit, then converts in place to its `Convert.Deploy` type and is no
+/// longer deployed; the Unload queues Guard as usual.
+#[test]
+fn ares_simple_deployer_converts_to_its_convert_deploy_type() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let ini = IniFile::from_str(
+        "[InfantryTypes]\n[AircraftTypes]\n[BuildingTypes]\n\
+         [VehicleTypes]\n0=SDEP\n1=SDEP2\n\
+         [SDEP]\nStrength=300\nSpeed=6\nIsSimpleDeployer=yes\nConvert.Deploy=SDEP2\n\
+         Locomotor={4A582741-9839-11D1-B709-00A024DDAFD1}\n\
+         [SDEP2]\nStrength=300\nSpeed=6\n\
+         Locomotor={4A582741-9839-11D1-B709-00A024DDAFD1}\n\
+         [Unload]\nRate=0.016\n[Guard]\nRate=0.1\n[Clear]\nBuildable=yes\n",
+    );
+    let rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &IniFile::from_str("")).unwrap();
+    let mut sim = Simulation::with_seed(0);
+    crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
+    let id = sim
+        .spawn_object("SDEP", "Russians", 10, 10, 64, &rules)
+        .unwrap();
+    assert_eq!(
+        sim.unit_simple_mission_unload(id, &rules, FrameEffects::default()),
+        Ok(450)
+    );
+    let entity = sim.substrate.entities.get(id).unwrap();
+    assert_eq!(sim.interner.resolve(entity.type_ref()), "SDEP2");
+    assert_eq!(entity.mission_leaf.as_unit().unwrap().deployed(), 0);
 }

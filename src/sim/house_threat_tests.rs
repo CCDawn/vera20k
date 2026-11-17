@@ -14,6 +14,8 @@ fn signed(value: &serde_json::Value) -> i32 {
     i32::try_from(value.as_i64().unwrap()).unwrap()
 }
 
+/// Stock only: Ares 3.0 ThreatPosedEstimates_GetIndex `1005D4A0` (hook
+/// `0x0056BC54`) moves the kernel these native rows centre on.
 #[test]
 fn original_signed_indices_and_all_nine_slot_adjustments() {
     let packet = packet();
@@ -45,7 +47,7 @@ fn original_signed_indices_and_all_nine_slot_adjustments() {
         let initial = signed(&row["initial"]);
         let mut grid = HouseSpatialThreat::default();
         grid.0.fill(initial);
-        grid.adjust(cell, signed(&row["amount"])).unwrap();
+        grid.adjust(cell, signed(&row["amount"]), false).unwrap();
         let offsets = row["offsets"].as_array().unwrap();
         for (index, actual) in grid.values().iter().enumerate() {
             let native_slot = offsets
@@ -90,12 +92,13 @@ fn fixture_with_additions(
         .map(|name| {
             let owner = sim.interner.intern(name);
             sim.houses
-                .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+                .register(HouseState::new(owner, 0, None, true, 0, 10));
             owner
         })
         .collect();
-    sim.session.house_order = owners;
-    sim.session.game_mode_nonzero = true;
+    sim.houses.reorder_for_test(&owners);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     (sim, rules, registry)
 }
 
@@ -107,11 +110,15 @@ fn actor(sim: &mut Simulation, rules: &RuleSet, cell: (u16, u16)) -> u64 {
 #[test]
 fn invalid_grid_dependencies_fail_before_mutation() {
     let mut grid = HouseSpatialThreat::default();
-    grid.adjust((75, 75), 7).unwrap();
+    grid.adjust((75, 75), 7, false).unwrap();
     let before = grid.values().to_vec();
     for cell in [(i16::MIN, i16::MIN), (i16::MAX, i16::MAX), (0, -8)] {
-        assert!(grid.adjust(cell, 7).is_err());
-        assert_eq!(grid.values(), before);
+        // Ares 3.0 HouseClass_SetThreat_Bounds 1005CC10 (hook 0x004FA2E0)
+        // skips the -1 index 1005D4A0 gives these cells.
+        for ares in [false, true] {
+            assert_eq!(grid.adjust(cell, 7, ares).is_err(), !ares);
+            assert_eq!(grid.values(), before);
+        }
     }
     assert!(grid.at_padded_index(-1).is_err());
     assert!(grid.at_padded_index(LENGTH as i32).is_err());
@@ -158,7 +165,7 @@ fn retained_grid_and_initialized_zero_both_affect_simulation_hash() {
     sim.houses
         .get_mut(&russian)
         .unwrap()
-        .adjust_spatial_threat((13, 15), 7)
+        .adjust_spatial_threat((13, 15), 7, rules.ares_form())
         .unwrap();
     assert_ne!(
         sim.state_hash(),
@@ -279,7 +286,7 @@ fn real_garrison_append_and_complete_ejection_refresh_the_existing_building_cach
             engineer_id: passenger,
             target_building_id: building,
         },
-        Some(&rules),
+        &rules,
         Some(&registry),
         crate::sim::world::FrameEffects::default(),
     ));
@@ -303,8 +310,7 @@ fn real_garrison_append_and_complete_ejection_refresh_the_existing_building_cach
             .get(building)
             .unwrap()
             .passenger_role
-            .cargo()
-            .unwrap()
+            .occupants()
             .count(),
         1
     );
@@ -366,8 +372,7 @@ fn real_garrison_append_and_complete_ejection_refresh_the_existing_building_cach
             .get(building)
             .unwrap()
             .passenger_role
-            .cargo()
-            .unwrap()
+            .occupants()
             .count(),
         0
     );
@@ -378,6 +383,132 @@ fn real_garrison_append_and_complete_ejection_refresh_the_existing_building_cach
             .unwrap()
             .cached_spatial_threat(),
         Some(7),
-        "ejection tail refreshes after the complete cargo mutation"
+        "ejection tail refreshes after the complete occupant mutation"
+    );
+}
+
+/// Stock only: Ares 3.0 ThreatPosedEstimates_GetIndex `1005D4A0` (hook
+/// `0x0056BC54`) writes row 559 away from the cell read back here.
+#[test]
+fn large_map_house_threat_keeps_high_coordinate_kernel_and_cleanup() {
+    let mut grid = HouseSpatialThreat::default();
+    grid.configure(crate::map::cell_index::CellGrid::Extended);
+    grid.adjust((642, 559), 100, false).unwrap();
+    assert!(grid.at((642, 559)).unwrap() > 0);
+    assert_eq!(grid.at((130, 560)).unwrap(), 0, "no old-stride alias");
+    grid.adjust((642, 559), -100, false).unwrap();
+    assert!(grid.values().iter().all(|value| *value == 0));
+    grid.adjust((1023, 1023), 100, false).unwrap();
+    assert!(grid.at((1023, 1023)).unwrap() > 0);
+    assert!(grid.adjust((1024, 1024), 100, false).is_err());
+    let bytes = crate::util::save_codec::serialize(&grid).unwrap();
+    let restored: HouseSpatialThreat = crate::util::save_codec::deserialize(&bytes).unwrap();
+    assert_eq!(restored.values(), grid.values());
+
+    let mut interner = StringInterner::default();
+    let owner = interner.intern("Large");
+    let mut houses = Houses::default();
+    houses.configure_cell_grid(crate::map::cell_index::CellGrid::Extended);
+    houses.register(HouseState::new(owner, 0, None, false, 0, 10));
+    houses
+        .get_mut(&owner)
+        .unwrap()
+        .adjust_spatial_threat((642, 559), 100, false)
+        .unwrap();
+    let saved = crate::util::save_codec::serialize(&houses).unwrap();
+    let mut loaded: Houses = crate::util::save_codec::deserialize(&saved).unwrap();
+    loaded.configure_cell_grid(crate::map::cell_index::CellGrid::Extended);
+    assert!(loaded[&owner].spatial_threat_at((642, 559)).unwrap() > 0);
+    let late = interner.intern("Late");
+    loaded.register(HouseState::new(late, 0, None, false, 0, 10));
+    assert_eq!(loaded[&late].spatial_threat_at((642, 559)).unwrap(), 0);
+}
+
+/// Cell481870's receivers ask their own masks, one way
+/// (the index overload `HouseClass::IsAlliedWith @ 0x004F9A10`, called at
+/// `0x004818B7`), as the graph answers by name:
+/// Russians counts Americans an ally but not the reverse, no mask names
+/// Other, and Late counts Russians an ally but is interned after the ally
+/// matrix is built. Each grid holds exactly the kernels of the sources its
+/// House does not count allies.
+#[test]
+fn threat_receivers_ask_their_own_ally_masks() {
+    let mut interner = StringInterner::default();
+    let [americans, russians, other] =
+        ["Americans", "Russians", "Other"].map(|name| interner.intern(name));
+    let mut houses = Houses::default();
+    for owner in [americans, russians, other] {
+        houses.register(HouseState::new(owner, 0, None, false, 0, 10));
+    }
+    let alliances = HouseAlliances::new(crate::map::houses::HouseAllianceMap::from([
+        ("RUSSIANS".to_string(), ["AMERICANS".to_string()].into()),
+        ("LATE".to_string(), ["RUSSIANS".to_string()].into()),
+    ]));
+    let (west, east) = ((13, 15), (21, 15));
+    Simulation::cell_update_spatial_threat(
+        &interner,
+        &alliances,
+        &mut houses,
+        americans,
+        west,
+        7,
+        false,
+    );
+    let late = interner.intern("Late");
+    houses.register(HouseState::new(late, 0, None, false, 0, 10));
+    Simulation::cell_update_spatial_threat(
+        &interner,
+        &alliances,
+        &mut houses,
+        russians,
+        east,
+        7,
+        false,
+    );
+    let kernels = |cells: &[(i16, i16)]| {
+        let mut grid = HouseSpatialThreat::default();
+        for &cell in cells {
+            grid.adjust(cell, 7, false).unwrap();
+        }
+        grid
+    };
+    for (owner, sources) in [
+        (americans, &[east][..]),
+        (russians, &[]),
+        (other, &[west, east]),
+        (late, &[]),
+    ] {
+        assert_eq!(
+            houses[&owner].spatial_threat_values(),
+            kernels(sources).values(),
+            "{}",
+            interner.resolve(owner)
+        );
+    }
+}
+
+/// The presentation copy of the world holds no House threat grid, and the
+/// live world keeps its own as it was.
+#[test]
+fn the_presentation_copy_leaves_the_threat_grids_with_the_live_world() {
+    let mut sim = Simulation::new();
+    let owner = sim.interner.intern("Americans");
+    sim.houses
+        .register(HouseState::new(owner, 0, None, true, 0, 10));
+    let grid = sim
+        .houses
+        .get(&owner)
+        .unwrap()
+        .spatial_threat_values()
+        .to_vec();
+    assert!(!grid.is_empty());
+
+    let copy = sim.presentation_copy(None, None);
+
+    let copied = copy.houses.get(&owner).unwrap();
+    assert!(copied.spatial_threat_values().is_empty());
+    assert_eq!(
+        sim.houses.get(&owner).unwrap().spatial_threat_values(),
+        grid
     );
 }

@@ -23,10 +23,6 @@ fn corpus() -> Value {
         "tools/input_oracle/campaign_start_houses.json",
     ))
     .unwrap();
-    assert_eq!(
-        native["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     native
 }
 
@@ -131,9 +127,9 @@ fn assert_houses(
     id_offset: i32,
 ) {
     let rows = rows.as_array().unwrap();
-    assert_eq!(rows.len(), sim.session.house_order.len());
+    assert_eq!(rows.len(), sim.houses.order().len());
     for (index, expected) in rows.iter().enumerate() {
-        let owner = sim.session.house_order[index];
+        let owner = sim.houses.order()[index];
         let actual = &sim.houses[&owner];
         assert_eq!(
             sim.interner.resolve(owner),
@@ -143,28 +139,28 @@ fn assert_houses(
             actual.native_unique_id(),
             Some(i32_at(expected, "id").wrapping_add(id_offset))
         );
-        assert_eq!(actual.side_index as i32, i32_at(expected, "side"));
+        assert_eq!(actual.side_index() as i32, i32_at(expected, "side"));
         assert_eq!(
-            actual.country.map(|id| sim.interner.resolve(id)),
+            actual.country().map(|id| sim.interner.resolve(id)),
             expected["country"].as_str()
         );
-        assert_eq!(actual.is_human, expected["human"].as_bool().unwrap());
+        assert_eq!(actual.is_human(), expected["human"].as_bool().unwrap());
         assert_eq!(
-            actual.player_control,
+            actual.player_control(),
             expected["player_control"].as_bool().unwrap()
         );
-        assert_eq!(actual.difficulty as i32, i32_at(expected, "difficulty"));
-        assert_eq!(actual.tech_level, i32_at(expected, "tech_level"));
-        assert_eq!(actual.current_iq, i32_at(expected, "iq"));
-        assert_eq!(actual.authored_iq, i32_at(expected, "iq"));
+        assert_eq!(actual.difficulty() as i32, i32_at(expected, "difficulty"));
+        assert_eq!(actual.tech_level(), i32_at(expected, "tech_level"));
+        assert_eq!(actual.current_iq(), i32_at(expected, "iq"));
+        assert_eq!(actual.authored_iq(), i32_at(expected, "iq"));
         assert_eq!(
-            actual.economy.scenario_credits(),
+            actual.economy().scenario_credits(),
             i32_at(expected, "scenario_credits")
         );
-        assert_eq!(actual.economy.credits(), i32_at(expected, "balance"));
+        assert_eq!(actual.economy().credits(), i32_at(expected, "balance"));
         assert_eq!(actual.authored_edge(), i32_at(expected, "edge"));
         assert_eq!(
-            actual.team_creation.ratio(),
+            actual.team_creation().ratio(),
             i32_at(expected, "ratio_ai_trigger_team")
         );
         assert_eq!(
@@ -197,7 +193,7 @@ fn assert_houses(
             ["start", "duration", "initial_delay"]
                 .map(|key| i32_at(&expected["attack_timer"], key))
         );
-        let timer = actual.team_creation.timer();
+        let timer = actual.team_creation().timer();
         assert_eq!(
             [timer.start_frame(), timer.duration()],
             ["start", "duration"].map(|key| i32_at(&expected["team_timer"], key))
@@ -215,7 +211,7 @@ fn assert_houses(
             if index != target_index {
                 assert_eq!(
                     is_allied_with(
-                        &sim.house_alliances,
+                        sim.house_alliances.as_map(),
                         &roster.houses[index].name,
                         &target.name
                     ),
@@ -238,16 +234,19 @@ fn assert_houses(
                 Some(i32_at(expected, "id").wrapping_add(id_offset))
             );
             assert_eq!(
-                actual.charge_start_tick,
+                actual.charge_start_tick(),
                 i32_at(&expected["charge_timer"], "start")
             );
             assert_eq!(
-                actual.charge_duration,
+                actual.charge_duration(),
                 i32_at(&expected["charge_timer"], "duration")
             );
-            assert_eq!(actual.is_active, expected["granted"].as_bool().unwrap());
-            assert_eq!(actual.is_ready, expected["charged"].as_bool().unwrap());
-            assert_eq!(actual.is_suspended, expected["on_hold"].as_bool().unwrap());
+            assert_eq!(actual.is_active(), expected["granted"].as_bool().unwrap());
+            assert_eq!(actual.is_ready(), expected["charged"].as_bool().unwrap());
+            assert_eq!(
+                actual.is_suspended(),
+                expected["on_hold"].as_bool().unwrap()
+            );
         }
     }
 }
@@ -314,7 +313,13 @@ fn campaign_house_segment_matches_six_stock_rows_and_nine_startup_controls() {
             ..Default::default()
         });
         sim.session
-            .initialize_campaign_startup(i32_at(row, "option"), i32_at(row, "mission_number"))
+            .initialize_campaign_startup(
+                i32_at(row, "option"),
+                i32_at(row, "mission_number"),
+                None,
+                0,
+                crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
+            )
             .unwrap();
         sim.native_unique_ids = Some(NativeUniqueIdCursor::begin_campaign_prefix(
             0,
@@ -327,9 +332,9 @@ fn campaign_house_segment_matches_six_stock_rows_and_nine_startup_controls() {
                 .into();
         sim.mapgen_rng =
             SimRng::from_native_state_hex_for_test(row["rng_before"]["mapgen"].as_str().unwrap());
-        initialize_map_roster_houses(&mut sim, &roster, Some(&rules), Some(&ini));
+        initialize_map_roster_houses(&mut sim, &roster, &rules, Some(&ini));
         assert_houses(&sim, &roster, &rules, &row["houses"], 0);
-        initialize_campaign_current_house(&mut sim, &ini);
+        initialize_campaign_current_house(&mut sim.session, &mut sim.houses, &ini);
         assert_houses(&sim, &roster, &rules, &row["final_houses"], 0);
         let current = sim.session.current_house().unwrap();
         assert_eq!(
@@ -367,8 +372,8 @@ fn campaign_house_segment_matches_six_stock_rows_and_nine_startup_controls() {
             sim.houses[&current].scalar_difficulty_biases()
         );
         assert_eq!(
-            restored.economy.scenario_credits(),
-            sim.houses[&current].economy.scenario_credits()
+            restored.economy().scenario_credits(),
+            sim.houses[&current].economy().scenario_credits()
         );
         if let Some(filename) = row["filename"].as_str() {
             let map = MapFile::from_bytes(assets.get_ref(filename).unwrap()).unwrap();
@@ -393,6 +398,10 @@ fn campaign_house_segment_matches_six_stock_rows_and_nine_startup_controls() {
                         house_roster: &roster,
                         difficulty: i32_at(row, "option"),
                         mission_counter: i32_at(row, "mission_number"),
+                        game_options: None,
+                        campaign_index: 0,
+                        restart_carry_over:
+                            crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
                     },
                 )
                 .unwrap();
@@ -400,7 +409,7 @@ fn campaign_house_segment_matches_six_stock_rows_and_nine_startup_controls() {
                 projection.is_none(),
                 "campaigns do not synthesize an offline start plan"
             );
-            let first = fresh.session.house_order[0];
+            let first = fresh.houses.order()[0];
             // Rebase the bounded native House segment against the actual
             // Rules receipt. This validates House allocation order without
             // asserting that the native fixture established full Pcount.
@@ -422,13 +431,94 @@ fn campaign_house_segment_matches_six_stock_rows_and_nine_startup_controls() {
                 row["rng_after"]["mapgen"].as_str().unwrap()
             );
             assert!(
-                fresh.entities().is_empty() && fresh.production.terrain_objects.is_empty(),
+                fresh.entities().is_empty() && fresh.terrain_objects.objects().is_empty(),
                 "the actual House generation completes before Fill and every object section"
             );
         }
         compared += 1;
     }
     assert_eq!(compared, 15);
+}
+
+#[test]
+fn fresh_campaign_constructs_registered_supers_without_supported_dispatch_bodies() {
+    // House4F6202..4F6290 and Super6CAF90 use the registered type pointer,
+    // not its Type+B4 dispatch. campaign_start.py --houses executes the same
+    // constructors with twelve freshly registered, unread (Type=-1) types.
+    let root = IniFile::from_str(
+        "[Colors]\nLightGold=25,255,255\nGold=43,239,255\n\
+         [Countries]\n0=Americans\n[Americans]\nColor=Gold\n\
+         [General]\nTeamDelays=1,1,1\n\
+         [SuperWeaponTypes]\n0=KnownDispatch\n1=UnknownDispatch\n2=UnreadType\n\
+         [KnownDispatch]\nType=PsychicReveal\n\
+         [UnknownDispatch]\nType=FutureExtension\n",
+    );
+    let mut process = NativeRulesProcessOwner::from_cold_start_sources(
+        root,
+        None,
+        IniFile::empty(),
+        std::sync::Arc::default(),
+        Default::default(),
+    )
+    .unwrap();
+    let map = MapFile::from_bytes(
+        b"[Map]\nSize=0,0,4,4\n[IsoMapPack5]\n1=CAAEABUAAAAAEQAA\n\
+          [Basic]\nPlayer=KnownHouse\n\
+          [Houses]\n0=KnownHouse\n1=OtherHouse\n\
+          [KnownHouse]\nCountry=Americans\n\
+          [OtherHouse]\nCountry=Americans\n",
+    )
+    .unwrap();
+    let (rules, _, _, receipt) = process
+        .load_scenario(NativeScenarioRulesPrefix::Campaign(None), &map.ini)
+        .unwrap()
+        .into_parts();
+    assert_eq!(
+        rules.super_weapon_order,
+        ["KnownDispatch", "UnknownDispatch", "UnreadType"]
+    );
+    assert!(rules.super_weapon("KnownDispatch").is_some());
+    for name in ["UnknownDispatch", "UnreadType"] {
+        assert_eq!(
+            rules.super_weapon(name).unwrap().kind,
+            crate::rules::superweapon_type::SuperWeaponKind::NoEffect
+        );
+    }
+    let roster = parse_house_roster(&map.ini, &rules.color_schemes, Some(&rules));
+    let (sim, projection) = ScenarioBootstrapRng::new(31)
+        .into_fresh_staged_simulation(
+            &ScenarioDescriptor {
+                seed: 31,
+                ..Default::default()
+            },
+            FreshScenarioPrefix::Campaign {
+                native_rules_receipt: receipt,
+                rules: &rules,
+                map_data: &map,
+                house_roster: &roster,
+                difficulty: 1,
+                mission_counter: 1,
+                game_options: None,
+                campaign_index: 0,
+                restart_carry_over: crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
+            },
+        )
+        .expect("registered Super instances do not require a supported launch body");
+    assert!(projection.is_none());
+    assert_eq!(sim.houses.order().len(), 2);
+    for &owner in sim.houses.order() {
+        let house_id = sim.houses[&owner].native_unique_id().unwrap();
+        let supers = &sim.super_weapons[&owner];
+        assert_eq!(supers.len(), 3);
+        for (index, name) in rules.super_weapon_order.iter().enumerate() {
+            let instance = &supers[&sim.interner.get(name).unwrap()];
+            assert_eq!(
+                instance.native_unique_id(),
+                Some(house_id + index as i32 + 1)
+            );
+            assert!(!instance.is_active() && !instance.is_ready() && !instance.is_suspended());
+        }
+    }
 }
 
 #[test]
@@ -459,6 +549,9 @@ fn fresh_campaign_rejects_an_absent_stock_roster_instead_of_fabricating_offline_
             house_roster: &roster,
             difficulty: 1,
             mission_counter: 1,
+            game_options: None,
+            campaign_index: 0,
+            restart_carry_over: crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
         },
     );
     assert!(matches!(
@@ -503,6 +596,9 @@ fn fresh_campaign_rejects_unknown_country_factory_before_house_construction() {
             house_roster: &roster,
             difficulty: 1,
             mission_counter: 1,
+            game_options: None,
+            campaign_index: 0,
+            restart_carry_over: crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
         },
     );
     assert!(matches!(

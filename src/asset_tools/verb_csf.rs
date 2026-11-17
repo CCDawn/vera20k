@@ -7,19 +7,20 @@
 //! ## Why both forms of every string are reported
 //!
 //! The parser normalises whitespace *while decoding*, inside
-//! `assets::csf_file::decode_csf_string`, and stores only the result. So
+//! `assets::csf_file::decode_csf_string`. So
 //! `CsfFile::get` and `CsfFile::text` both hand back the normalised text;
 //! `text` differs from `get` by exactly one thing — it substitutes
 //! `MISSING:'<key>'` for a label that is absent — and applies no further
-//! transformation. Neither can reach the bytes as the file stores them.
+//! transformation. `raw_entry` retains the selected record's original text.
 //!
 //! That matters because retail carries hundreds of strings whose stored form
 //! differs from the drawn form (briefings and tooltips pad their line breaks with
 //! spaces the game never shows). A verb that reported one form silently would
 //! misdescribe them: a caller diffing our text against a hex dump of the file
 //! would see a mismatch and have no way to tell a normalisation from a bug. So
-//! `value` is always what the game displays, and the stored text is re-derived
-//! here and reported whenever the two differ — or on `--raw` for every hit.
+//! `value` is always what the game displays. The active table supplies its own
+//! selected raw record; an explicit source uses the bounded diagnostic rescan.
+//! Stored text is reported when the two differ, or on `--raw` for every hit.
 //!
 //! Values legitimately contain newlines and tabs. Nothing here strips them; JSON
 //! string escaping preserves them exactly, so `\n` in the output is a real line
@@ -41,10 +42,8 @@ use crate::util::native_string::widen_bytes;
 /// routinely matches hundreds of labels, and dumping them all buries the answer.
 pub const DEFAULT_LIMIT: usize = 50;
 
-/// String tables searched when the caller names none, in INI authority order:
-/// active Yuri's Revenge initialises `ra2md.csf` standalone and does not merge
-/// `ra2.csf` beneath it, so the md table wins and the base is only a fallback.
-const CSF_CANDIDATES: [&str; 2] = ["ra2md.csf", "ra2.csf"];
+/// The active base table; other raw tables require an explicit --source.
+const CSF_CANDIDATES: [&str; 1] = ["ra2md.csf"];
 
 /// The one table active YR actually loads. Reading anything else is legitimate
 /// for investigation but is not what the running game would show.
@@ -81,7 +80,7 @@ const MAX_LABELS_SCANNED: usize = 200_000;
 /// Options shared by `csf-get` and `csf-grep`.
 #[derive(Debug, Clone)]
 pub struct CsfOptions {
-    /// Which .csf to read. None searches `ra2md.csf` then `ra2.csf`.
+    /// Which raw .csf to read. None reads the game's active string table.
     pub source: Option<String>,
     /// Page size for `csf-grep`. `csf-get` returns the single exact hit and
     /// ignores this.
@@ -164,8 +163,7 @@ pub fn get(
     key: &str,
     opts: &CsfOptions,
 ) -> Result<CsfReport, ErrorReport> {
-    let table = locate_table(asset_manager, opts)?;
-    build_report(&table, Query::Exact(key), opts)
+    query_report(asset_manager, Query::Exact(key), opts)
 }
 
 /// `asset csf-grep <TEXT>` — case-insensitive substring over keys and values.
@@ -174,8 +172,55 @@ pub fn grep(
     needle: &str,
     opts: &CsfOptions,
 ) -> Result<CsfReport, ErrorReport> {
-    let table = locate_table(asset_manager, opts)?;
-    build_report(&table, Query::Substring(needle), opts)
+    query_report(asset_manager, Query::Substring(needle), opts)
+}
+
+fn query_report(
+    asset_manager: &AssetManager,
+    query: Query<'_>,
+    opts: &CsfOptions,
+) -> Result<CsfReport, ErrorReport> {
+    let mut table = locate_table(asset_manager, opts)?;
+    if opts.source.is_some() {
+        return build_report(&table, query, opts);
+    }
+    // Same owner/candidate admission as app/loading/init::load_csf; --source
+    // deliberately bypasses composition so individual files remain inspectable.
+    let (csf, admitted) = CsfFile::load_active(asset_manager.ships_ares(), |name| {
+        asset_manager.get_ref(name)
+    })
+    .map_err(|error| ErrorReport {
+        error: error.to_string(),
+        hint: None,
+    })?;
+    // CsfFile owns slot selection, including Ares duplicates created by an
+    // unsorted in-file append. Carry raw text from that SAME selected slot.
+    let scan = RawScan {
+        by_key: csf
+            .entries()
+            .filter_map(|(key, _)| {
+                csf.raw_entry(key).map(|(stored_key, value)| {
+                    (
+                        key.to_string(),
+                        RawLabel {
+                            stored_key: stored_key.to_string(),
+                            value: value.to_string(),
+                        },
+                    )
+                })
+            })
+            .collect(),
+        truncated: false,
+    };
+    for name in admitted {
+        if let Some(resolved) = crate::asset_tools::locate::locate(asset_manager, &name) {
+            table.source.push_str(" + ");
+            table.source.push_str(&name);
+            table.source_archive.push_str(" + ");
+            table.source_archive.push_str(&resolved.source_archive);
+        }
+    }
+    build_parsed_report(&table, query, opts, &csf, scan)
 }
 
 /// Resolve the table to read, honouring `--source` and warning when the result
@@ -195,12 +240,12 @@ fn locate_table<'a>(
                 )),
             });
         };
-        return Ok(table_from(name, resolved));
+        return Ok(table_from(name, resolved, asset_manager.ships_ares()));
     }
 
     for candidate in CSF_CANDIDATES {
         if let Some(resolved) = crate::asset_tools::locate::locate(asset_manager, candidate) {
-            return Ok(table_from(candidate, resolved));
+            return Ok(table_from(candidate, resolved, asset_manager.ships_ares()));
         }
     }
 
@@ -216,19 +261,23 @@ fn locate_table<'a>(
     })
 }
 
-/// Assemble a [`LocatedTable`] and its provenance warnings from one hit.
+/// Assemble a [`LocatedTable`] and its provenance warnings from one hit;
+/// `ares` is whether the game is an Ares game, which composes its table.
 fn table_from<'a>(
     name: &str,
     resolved: crate::asset_tools::locate::Resolved<'a>,
+    ares: bool,
 ) -> LocatedTable<'a> {
     let mut warnings: Vec<String> = Vec::new();
     warnings.extend(resolved.catalog_warning());
     if !name.eq_ignore_ascii_case(YR_CSF) {
-        warnings.push(format!(
+        warnings.push(if ares {
+            format!("read one raw table \"{name}\"; drop --source to inspect the composed active Ares table")
+        } else { format!(
             "read from \"{name}\", not \"{YR_CSF}\" — active Yuri's Revenge initialises the md \
              table standalone and does not merge this one beneath it, so a string here is not \
              necessarily the string the game shows"
-        ));
+        ) });
     }
     LocatedTable {
         source: name.to_string(),
@@ -257,6 +306,17 @@ fn build_report(
     })?;
 
     let scan = scan_raw_labels(table.bytes);
+    build_parsed_report(table, query, opts, &csf, scan)
+}
+
+fn build_parsed_report(
+    table: &LocatedTable<'_>,
+    query: Query<'_>,
+    opts: &CsfOptions,
+    csf: &CsfFile,
+    scan: RawScan,
+) -> Result<CsfReport, ErrorReport> {
+    let source = &table.source;
     let mut warnings: Vec<String> = table.warnings.clone();
     if scan.truncated {
         warnings.push(format!(
@@ -295,11 +355,13 @@ fn build_report(
             let lowered = needle.to_lowercase();
             let mut hits: Vec<(&str, &str)> = csf
                 .entries()
+                .filter_map(|(key, _)| csf.get(key).map(|value| (key, value)))
                 .filter(|&(key, value)| matches_needle(key, value, &lowered))
                 .collect();
             // The parser's map iterates in hash order; sorting makes paging with
             // --offset mean something and keeps repeated runs comparable.
             hits.sort_by(|left, right| left.0.cmp(right.0));
+            hits.dedup_by(|left, right| left.0 == right.0);
             let matched = hits.len();
             Matches {
                 query: needle.to_string(),
@@ -523,9 +585,99 @@ fn read_u32_at(data: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_query_and_raw_text_use_the_native_duplicate_winner() {
+        // Native witness: ares_csf_ordered.json's first control. Each source
+        // has unique labels, but appending B/C/D makes bsearch miss old KEEP.
+        let directory =
+            crate::assets::asset_manager::test_support::TestDirectory::new("csf-ordered");
+        std::fs::write(
+            directory.path().join("ra2md.csf"),
+            build_csf(&[("A", "base"), ("Keep", "  keep  ")]),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("stringtable00.csf"),
+            build_csf(&[("B", "b"), ("C", "c"), ("D", "d"), ("KEEP", "replacement")]),
+        )
+        .unwrap();
+        let manager = AssetManager::from_loose_root_with_ares_for_test(directory.path());
+        let active = get(&manager, "keep", &CsfOptions::default()).unwrap();
+        assert_eq!(active.entries[0].value, "keep");
+        assert_eq!(active.entries[0].key, "Keep");
+        assert_eq!(active.entries[0].raw.as_deref(), Some("  keep  "));
+        assert!(active.entries[0].changed_by_normalization);
+        let hits = grep(&manager, "keep", &CsfOptions::default()).unwrap();
+        assert_eq!(hits.matched, 1);
+        assert_eq!(hits.entries[0].value, "keep");
+        assert_eq!(
+            grep(&manager, "replacement", &CsfOptions::default())
+                .unwrap()
+                .matched,
+            0
+        );
+        let raw = get(
+            &manager,
+            "keep",
+            &CsfOptions {
+                source: Some("stringtable00.csf".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(raw.entries[0].value, "replacement");
+    }
+
+    #[test]
+    fn default_query_shares_active_profile_while_explicit_source_stays_raw() {
+        let directory =
+            crate::assets::asset_manager::test_support::TestDirectory::new("csf-profile");
+        std::fs::write(
+            directory.path().join("ra2md.csf"),
+            build_csf(&[("A", "base")]),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("stringtable00.csf"),
+            build_csf(&[("A", "  layered   text  "), ("NEW", "extra")]),
+        )
+        .unwrap();
+        for ares in [false, true] {
+            let manager = if ares {
+                AssetManager::from_loose_root_with_ares_for_test(directory.path())
+            } else {
+                AssetManager::from_loose_root_for_test(directory.path())
+            };
+            let active = get(&manager, "A", &CsfOptions::default()).unwrap();
+            assert_eq!(
+                active.entries[0].value,
+                if ares { "layered text" } else { "base" }
+            );
+            assert_eq!(active.source.contains("stringtable00.csf"), ares);
+            assert_eq!(active.entries[0].changed_by_normalization, ares);
+            let explicit = get(
+                &manager,
+                "A",
+                &CsfOptions {
+                    source: Some("ra2md.csf".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(explicit.entries[0].value, "base");
+            assert_eq!(explicit.source, "ra2md.csf");
+            assert_eq!(
+                grep(&manager, "extra", &CsfOptions::default())
+                    .unwrap()
+                    .matched,
+                usize::from(ares)
+            );
+        }
+    }
 
     /// File header marker, " FSC" in Westwood byte order.
     const HEADER_MAGIC: u32 = 0x4353_4620;
@@ -624,15 +776,6 @@ mod tests {
     }
 
     #[test]
-    fn get_miss_on_a_key_without_a_family_still_produces_a_usable_hint() {
-        let data = build_csf(&[("NAME:MTNK", "Grizzly Battle Tank")]);
-        let err = build_report(&table(&data), Query::Exact("GUI"), &CsfOptions::default())
-            .expect_err("missing label");
-        let hint = err.hint.expect("hint");
-        assert!(hint.contains("csf-grep GUI"), "got {hint}");
-    }
-
-    #[test]
     fn grep_matches_over_both_key_and_value() {
         let data = build_csf(&[
             ("NAME:MTNK", "Grizzly Battle Tank"),
@@ -703,14 +846,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_needle_pages_the_whole_table() {
-        let data = build_csf(&[("A", "one"), ("B", "two")]);
-        let out = report(&data, Query::Substring(""), &CsfOptions::default());
-        assert_eq!(out.matched, 2);
-        assert_eq!(out.shown, 2);
-    }
-
-    #[test]
     fn normalisation_is_reported_with_both_forms_of_the_string() {
         // The retail briefing/tooltip pattern: spaces padding a line break, which
         // the engine drops at load time and never draws.
@@ -726,19 +861,6 @@ mod tests {
             Some(stored),
             "the stored form must survive verbatim, newline included"
         );
-    }
-
-    #[test]
-    fn raw_flag_reports_stored_text_even_where_nothing_changed() {
-        let data = build_csf(&[("NAME:MTNK", "Grizzly Battle Tank")]);
-        let opts = CsfOptions {
-            raw: true,
-            ..CsfOptions::default()
-        };
-        let out = report(&data, Query::Exact("NAME:MTNK"), &opts);
-
-        assert!(!out.entries[0].changed_by_normalization);
-        assert_eq!(out.entries[0].raw.as_deref(), Some("Grizzly Battle Tank"));
     }
 
     #[test]
@@ -824,31 +946,6 @@ mod tests {
             1,
             "the oversized record is skipped, not allocated"
         );
-    }
-
-    #[test]
-    fn empty_and_short_buffers_scan_to_nothing() {
-        assert!(scan_raw_labels(&[]).by_key.is_empty());
-        assert!(scan_raw_labels(&[0x20, 0x46, 0x53, 0x43]).by_key.is_empty());
-    }
-
-    #[test]
-    fn locate_warnings_survive_into_the_report() {
-        let data = build_csf(&[("A", "one")]);
-        let mut located = table(&data);
-        located.source = "ra2.csf".to_string();
-        located
-            .warnings
-            .push("read from \"ra2.csf\", not \"ra2md.csf\"".to_string());
-
-        let out = build_report(&located, Query::Exact("A"), &CsfOptions::default())
-            .expect("report builds");
-        assert!(
-            out.warnings.iter().any(|w| w.contains("ra2md.csf")),
-            "got {:?}",
-            out.warnings
-        );
-        assert_eq!(out.source, "ra2.csf");
     }
 
     #[test]

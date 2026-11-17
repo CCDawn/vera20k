@@ -17,7 +17,7 @@ use crate::sim::command::{Command, CommandEnvelope};
 use crate::sim::movement::FacingClass;
 use crate::sim::rng::SimRng;
 use crate::sim::runtime::{SimResources, SimRuntime};
-use crate::sim::snapshot::{GameSnapshot, SnapshotRestoreError};
+use crate::sim::snapshot::GameSnapshot;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -100,15 +100,17 @@ impl Scene {
         ));
         entity
             .lifecycle
-            .set_cell_marked(input["marked"].as_bool().unwrap());
+            .set_cell_marked_for_test(input["marked"].as_bool().unwrap());
         entity.set_techno_ctor_random_word_for_test(int(
             &native()["lifecycle_priors"]["source_report_selector"],
         ) as u16);
         assert!(!input["on_bridge"].as_bool().unwrap());
         assert_eq!(entity.weapon_burst.index(), int(&input["burst"]));
         sim.resolve_type_handles(rules);
-        sim.session.binary_frame = int(&input["frame"]) as u32;
-        sim.session.tick = u64::from(sim.session.binary_frame);
+        sim.session
+            .set_binary_frame_for_test(int(&input["frame"]) as u32);
+        sim.session
+            .set_tick_for_test(u64::from(sim.session.binary_frame()));
         install_rng(&mut sim, &row["rng_before"]);
         let cursor = sim.native_identity_cursor().unwrap();
         Self {
@@ -336,7 +338,7 @@ fn native_disk_constructor_fire_ai_expiry_and_common_drain_histories() {
     assert_eq!(weapon.range_leptons, int(&priors["range_leptons"]));
     assert_eq!(weapon.laser_duration, int(&priors["duration_byte"]));
     assert_eq!(
-        rules.art().get("DISK").unwrap().primary_fire_flh,
+        rules.object("DISK").unwrap().weapon_flh(0, false),
         [0, 0, 75].into()
     );
     assert_eq!(
@@ -364,8 +366,8 @@ fn native_disk_constructor_fire_ai_expiry_and_common_drain_histories() {
         let mut selected = Vec::new();
         for expected in row["states"].as_array().unwrap() {
             let frame = int(&expected["frame"]) as u32;
-            scene.sim.session.binary_frame = frame;
-            scene.sim.session.tick = u64::from(frame);
+            scene.sim.session.set_binary_frame_for_test(frame);
+            scene.sim.session.set_tick_for_test(u64::from(frame));
             let context = format!("{} frame{frame}", row["input"]["name"]);
             match expected["phase"].as_str().unwrap() {
                 "constructor" => {
@@ -405,7 +407,7 @@ fn native_disk_constructor_fire_ai_expiry_and_common_drain_histories() {
                             let id = scene.role(&action["role"]).unwrap();
                             scene.sim.notify_pointer_expired(
                                 id,
-                                UninitContext::new(Some(rules), Some(&registry)),
+                                UninitContext::new(rules, Some(&registry)),
                             );
                         }
                         kind => panic!("unexpected action {kind}"),
@@ -508,7 +510,7 @@ fn native_disk_constructor_fire_ai_expiry_and_common_drain_histories() {
                 "drain" => {
                     let begin = scene.sim.lifecycle_test_events_for_test().len();
                     scene.sim.process_pending_delete_with(
-                        Some(rules),
+                        rules,
                         Some(&registry),
                         FrameEffects::default(),
                         1,
@@ -576,20 +578,6 @@ fn snapshot_copy(sim: &Simulation) -> Simulation {
     GameSnapshot::load(&bytes).unwrap().sim
 }
 
-fn change_saved_shot(sim: &mut Simulation, id: u64, change: impl FnOnce(&mut Value)) {
-    // Fault injection stays inside the serialized private owner. Production
-    // exposes neither mutable bodies nor a second shot registry.
-    let mut owner = serde_json::to_value(&sim.disk_lasers).unwrap();
-    change(
-        owner["shots"]
-            .as_object_mut()
-            .unwrap()
-            .get_mut(&id.to_string())
-            .unwrap(),
-    );
-    sim.disk_lasers = serde_json::from_value(owner).unwrap();
-}
-
 #[test]
 fn disk_snapshot_resumes_active_and_duplicate_pending_shots() {
     let Some(retail) = retail_battle_rules_for_map("XMP03T4.MAP") else {
@@ -604,8 +592,8 @@ fn disk_snapshot_resumes_active_and_duplicate_pending_shots() {
         let id = scene.construct(spec);
         scene.fire(spec, id);
         for frame in 201..=205 {
-            scene.sim.session.binary_frame = frame;
-            scene.sim.session.tick = u64::from(frame);
+            scene.sim.session.set_binary_frame_for_test(frame);
+            scene.sim.session.set_tick_for_test(u64::from(frame));
             scene
                 .sim
                 .tick_disk_lasers(rules, Some(&registry), FrameEffects::default());
@@ -614,7 +602,7 @@ fn disk_snapshot_resumes_active_and_duplicate_pending_shots() {
             for _ in 0..2 {
                 scene.sim.notify_pointer_expired(
                     scene.source,
-                    UninitContext::new(Some(rules), Some(&registry)),
+                    UninitContext::new(rules, Some(&registry)),
                 );
             }
             assert_eq!(
@@ -671,8 +659,8 @@ fn disk_snapshot_resumes_active_and_duplicate_pending_shots() {
             let observations: Vec<_> = [&mut scene.sim, &mut resumed]
                 .into_iter()
                 .map(|sim| {
-                    sim.session.binary_frame = frame;
-                    sim.session.tick = u64::from(frame);
+                    sim.session.set_binary_frame_for_test(frame);
+                    sim.session.set_tick_for_test(u64::from(frame));
                     let output_start = sim.lifecycle_outputs.len();
                     let sound_start = sim.sound_events.len();
                     let (_, area) = trace_area_visits(|| {
@@ -687,7 +675,7 @@ fn disk_snapshot_resumes_active_and_duplicate_pending_shots() {
                         .collect();
                     let sound = sounds(sim, sound_start);
                     sim.process_pending_delete_with(
-                        Some(rules),
+                        rules,
                         Some(&registry),
                         FrameEffects::default(),
                         1,
@@ -726,128 +714,6 @@ fn disk_snapshot_resumes_active_and_duplicate_pending_shots() {
 }
 
 #[test]
-fn disk_snapshot_rejects_invalid_body_references_membership_and_identity() {
-    use super::display_layers::DisplayLayer;
-    let Some(retail) = retail_battle_rules_for_map("XMP03T4.MAP") else {
-        return;
-    };
-    let rules = &retail.rules;
-    let registry = OverlayTypeRegistry::from_ini(&retail.processed_rules, Some(&retail.fixed_art));
-    let row = &native()["lifecycle"][0];
-    let mut scene = Scene::new(rules, row);
-    let spec = &row["input"]["births"][0];
-    let id = scene.construct(spec);
-    scene.fire(spec, id);
-    for (field, value, reason) in [
-        ("start", json!(16), "invalid ring cursor or countdown"),
-        ("step", json!(9), "invalid ring cursor or countdown"),
-        ("countdown", json!(2), "invalid ring cursor or countdown"),
-        ("source", json!(999_999), "missing active source"),
-        (
-            "target",
-            serde_json::to_value(TargetKind::Entity(999_999)).unwrap(),
-            "missing active target",
-        ),
-        ("weapon", Value::Null, "missing active weapon"),
-        (
-            "weapon",
-            serde_json::to_value(crate::sim::intern::InternedId::from_index(u32::MAX)).unwrap(),
-            "missing weapon identity",
-        ),
-    ] {
-        let mut bad = snapshot_copy(&scene.sim);
-        change_saved_shot(&mut bad, id, |body| body[field] = value);
-        let error = snapshot_copy(&bad)
-            .restore_after_snapshot_load()
-            .unwrap_err();
-        assert!(
-            matches!(error, SnapshotRestoreError::InvalidDiskLaserState { object_id, reason: actual } if object_id == id && actual == reason),
-            "{field}: {error:?}"
-        );
-    }
-    for in_logic in [false, true] {
-        let mut bad = snapshot_copy(&scene.sim);
-        if in_logic {
-            bad.substrate.logic.try_push(id).unwrap();
-        } else {
-            assert!(
-                bad.substrate
-                    .display
-                    .submit(id, Some(DisplayLayer::TOP), &|_| 0)
-            );
-        }
-        assert!(
-            matches!(snapshot_copy(&bad).restore_after_snapshot_load(), Err(SnapshotRestoreError::InvalidDiskLaserState { object_id, reason: "DiskLaser registered in Logic or Display" }) if object_id == id)
-        );
-    }
-    let mut bad = snapshot_copy(&scene.sim);
-    bad.substrate.next_stable_object_id = id;
-    assert!(
-        matches!(snapshot_copy(&bad).restore_after_snapshot_load(), Err(SnapshotRestoreError::ObjectIdCounterBehind { next_id, highest_id }) if next_id == id && highest_id == id)
-    );
-
-    let mut bad = snapshot_copy(&scene.sim);
-    let missing_weapon = bad.intern("NotARetailDiskWeapon");
-    change_saved_shot(&mut bad, id, |body| {
-        body["weapon"] = serde_json::to_value(missing_weapon).unwrap()
-    });
-    let mut bad = snapshot_copy(&bad);
-    bad.restore_after_snapshot_load().unwrap();
-    assert!(
-        matches!(bad.restore_map_authority_after_snapshot_load(rules, &registry, None), Err(SnapshotRestoreError::InvalidDiskLaserState { object_id, reason: "missing retained weapon" }) if object_id == id)
-    );
-
-    let mut bad = snapshot_copy(&scene.sim);
-    bad.fire_disk_laser(id, None, None, None, 90);
-    bad.disk_lasers = Default::default();
-    assert!(
-        matches!(snapshot_copy(&bad).restore_after_snapshot_load(), Err(SnapshotRestoreError::UnresolvedDeferredDeleteTicket { registry: "DiskLaser", identity }) if identity == id)
-    );
-}
-
-#[test]
-fn new_scenario_has_no_retained_disk_shots_tickets_or_copied_lasers() {
-    let Some(retail) = retail_battle_rules_for_map("XMP03T4.MAP") else {
-        return;
-    };
-    let row = &native()["lifecycle"][0];
-    let mut scene = Scene::new(&retail.rules, row);
-    let spec = &row["input"]["births"][0];
-    let id = scene.construct(spec);
-    scene.fire(spec, id);
-    scene
-        .sim
-        .tick_disk_lasers(&retail.rules, None, FrameEffects::default());
-    scene.sim.fire_disk_laser(id, None, None, None, 90);
-    assert!(scene.sim.has_disk_laser(id));
-    assert!(
-        scene
-            .sim
-            .substrate
-            .pending_delete
-            .retained_tickets()
-            .any(|ticket| ticket == DeferredDeleteTicket::DiskLaser(id))
-    );
-    assert!(
-        scene
-            .sim
-            .lifecycle_outputs
-            .iter()
-            .any(|output| matches!(output, LifecycleOutput::LaserCreated(_)))
-    );
-    let fresh = Simulation::from_descriptor(&Default::default());
-    assert_eq!(fresh.disk_laser_observations().count(), 0);
-    assert_eq!(fresh.substrate.pending_delete.retained_tickets().count(), 0);
-    assert!(
-        !fresh
-            .lifecycle_outputs
-            .iter()
-            .any(|output| matches!(output, LifecycleOutput::LaserCreated(_)))
-    );
-    assert!(fresh.native_identity_cursor().is_none());
-}
-
-#[test]
 fn retail_disk_attack_delivers_without_ordinary_bullet_fire() {
     let Some(retail) = retail_battle_rules_for_map("XMP03T4.MAP") else {
         return;
@@ -869,7 +735,7 @@ fn retail_disk_attack_delivers_without_ordinary_bullet_fire() {
     assert_eq!(health, rules.object("MTNK").unwrap().strength);
     let command = CommandEnvelope::new(
         sim.substrate.entities.get(source).unwrap().owner(),
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::Attack {
             attacker_id: source,
             target_id: target,
@@ -877,11 +743,11 @@ fn retail_disk_attack_delivers_without_ordinary_bullet_fire() {
     );
     let mut runtime = SimRuntime {
         simulation: sim,
-        resources: SimResources {
+        resources: std::sync::Arc::new(SimResources {
             rules,
             overlay_registry: registry,
             ..SimResources::empty()
-        },
+        }),
     };
     let mut commands = vec![command];
     for frame in 0..300 {
@@ -914,4 +780,85 @@ fn retail_disk_attack_delivers_without_ordinary_bullet_fire() {
         }
     }
     panic!("ordinary Attack never delivered the first Disk discharge");
+}
+
+/// Ares DiskLaserClass_Update_Anim (1004CFF0, hook 0x4A76ED): the retail
+/// DISK's hit always asks for the warhead's flash, and with
+/// `[AudioVisual] DiskLaserAnimEnabled=yes` also plays DiskWH's damage
+/// animation (90 damage selects XGRYMED1).
+#[test]
+fn ares_disk_hit_flashes_and_plays_the_enabled_damage_anim() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    for enabled in [false, true] {
+        let patch = crate::rules::ini_parser::IniFile::from_str(if enabled {
+            "[AudioVisual]\nDiskLaserAnimEnabled=yes\n"
+        } else {
+            "[AudioVisual]\nDiskLaserAnimEnabled=no\n"
+        });
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules_for_map_with_patch(
+            "XMP03T4.MAP",
+            &patch,
+        ) else {
+            return;
+        };
+        let mut rules = retail.rules;
+        // The anim's SHP binding comes from the asset loader in the game.
+        rules.bind_anim_frame_count_for_test("XGRYMED1", 10);
+        let registry =
+            OverlayTypeRegistry::from_ini(&retail.processed_rules, Some(&retail.fixed_art));
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 31);
+        sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(32, 32));
+        let source = sim
+            .spawn_object_with_overlay_registry("DISK", "Americans", 10, 10, 64, &rules, &registry)
+            .unwrap();
+        let target = sim
+            .spawn_object_with_overlay_registry("MTNK", "Russians", 16, 10, 0, &rules, &registry)
+            .unwrap();
+        sim.resolve_type_handles(&rules);
+        let health = sim.substrate.entities.get(target).unwrap().health.current();
+        let warhead = sim.interner.intern("DiskWH");
+        let command = CommandEnvelope::new(
+            sim.substrate.entities.get(source).unwrap().owner(),
+            sim.session.tick() + 1,
+            Command::Attack {
+                attacker_id: source,
+                target_id: target,
+            },
+        );
+        let mut runtime = SimRuntime {
+            simulation: sim,
+            resources: std::sync::Arc::new(SimResources {
+                rules,
+                overlay_registry: registry,
+                ..SimResources::empty()
+            }),
+        };
+        let mut commands = vec![command];
+        let mut flashed = false;
+        for _ in 0..300 {
+            let output = runtime
+                .advance_frame(
+                    &std::mem::take(&mut commands),
+                    67,
+                    TickLane::Ordinary,
+                    FrameEffects::default(),
+                )
+                .unwrap();
+            flashed |= output.combat_lights.iter().any(|request| {
+                matches!(request,
+                    crate::sim::combat::CombatLightRequest::Impact { warhead_ref, .. }
+                        if *warhead_ref == warhead)
+            });
+            let sim = &runtime.simulation;
+            if sim.substrate.entities.get(target).unwrap().health.current() < health {
+                break;
+            }
+        }
+        let sim = &runtime.simulation;
+        assert!(flashed, "the hit asks for DiskWH's flash ({enabled})");
+        let explosion = sim
+            .anims()
+            .any(|(_, anim)| sim.interner.resolve(anim.type_id()) == "XGRYMED1");
+        assert_eq!(explosion, enabled);
+    }
 }

@@ -43,7 +43,7 @@ use crate::sim::combat::{ScanMission, TargetKind};
 use crate::sim::mission::MissionType;
 use crate::sim::world::{ObjectAiCtx, Simulation};
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "hunt_mission_tests.rs"]
 mod tests;
 
@@ -123,7 +123,7 @@ impl Simulation {
         let facts = HuntFacts {
             ammo: entity.ammo().map_or(-1, |ammo| ammo.current()),
             team: self.team_script_vm.team_for_member(id).is_some(),
-            game_mode: self.session.game_mode_nonzero,
+            game_mode: self.session.game_mode_nonzero(),
         };
         hunt_visit(
             &facts,
@@ -145,14 +145,15 @@ struct WorldHunt<'a> {
 }
 
 impl HuntHost for WorldHunt<'_> {
-    type Threat = u64;
+    /// An object, or a wall Cell from the ring walk (a Foot-coerced mask).
+    type Threat = TargetKind;
 
     fn target(&mut self) -> bool {
         let entity = self.sim.substrate.entities.get(self.id).unwrap();
         crate::sim::combat::target_present(entity.attack_target.target(), self.sim)
     }
 
-    fn greatest_threat(&mut self, mask: u32) -> Option<u64> {
+    fn greatest_threat(&mut self, mask: u32) -> Option<TargetKind> {
         let mission = match mask {
             0 => ScanMission::Hunt,
             mask => ScanMission::Quarry {
@@ -169,12 +170,12 @@ impl HuntHost for WorldHunt<'_> {
         )
     }
 
-    fn assign_target(&mut self, threat: Option<u64>) {
+    fn assign_target(&mut self, threat: Option<TargetKind>) {
         self.sim
             .assign_target_represented(
                 self.id,
-                threat.map(TargetKind::Entity),
-                Some(self.rules),
+                threat,
+                self.rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
             )
@@ -182,7 +183,7 @@ impl HuntHost for WorldHunt<'_> {
     }
 
     fn queue(&mut self, mission: MissionType) {
-        super::queue_mission(self.sim, self.id, mission);
+        super::queue_mission(&mut self.sim.substrate, self.id, mission);
     }
 
     fn enter_idle_mode(&mut self) {
@@ -197,11 +198,16 @@ impl HuntHost for WorldHunt<'_> {
 
     fn leave_team(&mut self) {
         self.sim
-            .leave_team(self.id, false, Some(self.rules), self.ctx.effects);
+            .leave_team(self.id, false, self.rules, self.ctx.effects);
     }
 
     fn epilogue(&mut self) -> i32 {
-        self.sim
-            .mission_rate_epilogue_for(self.rules, self.id, MissionType::Hunt)
+        Simulation::mission_rate_epilogue_for(
+            &mut self.sim.scenario_rng,
+            &self.sim.substrate,
+            self.rules,
+            self.id,
+            MissionType::Hunt,
+        )
     }
 }

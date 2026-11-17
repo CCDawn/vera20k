@@ -1,6 +1,7 @@
 //! Successful saved-world adoption and its route-specific presentation state.
 
 use crate::app::AppState;
+use crate::app::match_runtime::sim_host::SimWrite;
 
 /// Apply the validated world/resources and the already-prepared asset bundle.
 /// Recoverable preparation has finished before any outgoing state is cleared.
@@ -25,7 +26,8 @@ pub(crate) fn commit_prepared_load(
     // SoundEvents; UI69BB82->7535D0 resets EVA. TechnoLoad70C231..70C240
     // reconstructs each voice handle/latch. Do this only after preparation
     // succeeded; the new FootLoad state starts silent until its next AI visit.
-    // Saved static Voc/EVA queues have separate, currently unported restoration.
+    // Ordinary Vox.Save7533B0 emits tags only, no nodes or selected voice;
+    // incoming announcements start empty. Saved static Voc returns below.
     if let Some(sfx) = state.audio.sfx_player.as_mut() {
         sfx.stop_all();
     }
@@ -41,33 +43,51 @@ pub(crate) fn commit_prepared_load(
         &state.frontend.frontend_main_rng,
         &mut state.match_state.sim_runtime,
     );
+    // Fork-only: a restored timeline reinstalls its Super-AI drivers from
+    // the saved houses' own command-driven state (`docs/superai.md`).
+    state.match_state.rebuild_super_players();
+    crate::app::audio_runtime::bind_match_eva_context(state);
     // All preparation has succeeded. Surface allocation and saved camera
     // conversion now use the tactical upscaler dimensions on either route.
     state.frontend.screen = crate::ui::game_screen::GameScreen::InGame;
     // A validated saved timeline replaces the outgoing fresh-L0 evidence and
     // remains available to the ordinary pump and exact diagnostic stepping.
-    state.match_state.startup.acknowledge_saved_load();
+    state.process_assets.refresh_campaigns_if_available();
+    let campaign = state.process_assets.campaigns().and_then(|campaigns| {
+        crate::app::match_bootstrap::PreparedCampaignStartup::from_saved_scenario(
+            campaigns,
+            &state
+                .match_state
+                .sim_runtime
+                .runtime()
+                .expect("prepared saved game installs a runtime")
+                .simulation,
+            committed.map.source(),
+        )
+    });
+    state.match_state.startup.acknowledge_saved_load(campaign);
     if from_menu {
         crate::app::loading::pump::present_game_mode_blank(state);
     }
 
-    // Saved native identity is session.current_house. Never borrow an outgoing
-    // sandbox preference or another match's human display handle.
-    state.match_state.local_owner_override = None;
     // Load_Game 0x0067E4E8 restores GameMode from the save header; VERA's
     // persisted classification rides on the restored ScenarioSession.
-    let game_mode_nonzero = state
+    let game_mode = state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .expect("prepared saved game installs a runtime")
         .simulation
-        .session
-        .game_mode_nonzero;
+        .session()
+        .game_mode();
+    if game_mode == crate::sim::scenario_session::ScenarioGameMode::Campaign {
+        // Successful ContentLoad67F7C1 suppresses a new initial save.
+        state.persistence.loaded_campaign();
+    }
     state
         .match_state
         .session
-        .restore_from_save(game_mode_nonzero, committed.map.local_player_name());
+        .restore_from_save(game_mode, committed.map.local_player_name());
     state.match_state.scenario_elapsed_clock = committed.elapsed_clock;
     #[cfg(feature = "telemetry-dashboard")]
     crate::app::telemetry_capture::reset_observation(state);
@@ -75,7 +95,7 @@ pub(crate) fn commit_prepared_load(
     let pause_effects = state
         .match_state
         .sim_runtime
-        .as_mut()
+        .write_sim(SimWrite::Lifecycle)
         .map_or_else(Vec::new, |rt| {
             crate::app::radar_movie::release_saved_scenario_hold(
                 &mut rt.simulation,
@@ -88,16 +108,13 @@ pub(crate) fn commit_prepared_load(
     let runtime = state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .expect("prepared saved game installs a runtime");
-    let terrain = runtime
-        .view()
-        .resolved_terrain()
-        .expect("prepared saved game installs resolved terrain");
-    let theater_name = runtime.simulation.session.theater.clone();
+    let theater_name = runtime.simulation.session().theater().to_owned();
     let theater_ext = crate::app::loading::init_helpers::theater_ext_for(&theater_name).to_owned();
-    let binary_frame = runtime.simulation.session.binary_frame;
+    let binary_frame = runtime.simulation.session().binary_frame();
     let map = crate::app::loading::transitions::MapPresentationInputs {
+        campaign_names: Some(committed.map.campaign_names().clone()),
         basic: committed.map.basic().clone(),
         ranking: committed.map.ranking().clone(),
         source: committed.map.source().clone(),
@@ -107,16 +124,33 @@ pub(crate) fn commit_prepared_load(
         terrain_objects: committed.map.terrain_objects().to_vec(),
         house_roster: committed.map.house_roster().clone(),
         lighting_config: committed.map.lighting().clone(),
+        lighting_events: None,
         theater_name,
         theater_ext,
-        height_map: terrain.build_height_map(),
-        bridge_height_map: terrain.build_bridge_height_map(),
     };
     crate::app::loading::transitions::install_world_presentation(
         state,
         map,
         committed.presentation,
     );
+    // MouseLoad5BE092 restores the radar as saved, TacticalMapAvailable
+    // included, so the rebuilt radar starts from the loaded House's radar.
+    state.match_state.match_presentation.has_radar =
+        crate::app::presentation::building_anim::local_has_radar(state);
+    state.match_state.match_presentation.loaded_radar_housing = committed.radar_housing;
+    // Load_Game's Set_View_Dimensions (`0x0067E7F9`): Init `0x005D3A60`
+    // deletes every row and an open edit, and SetWidth `0x005D4AD0` leaves
+    // the list tactical_w − 8 wide.
+    let tactical_w = crate::app::input::camera::tactical_viewport_size(state).0 as i32;
+    let message_list = &mut state.match_state.match_presentation.message_list;
+    *message_list = crate::ui::messages::MessageList::scenario();
+    message_list.set_width(tactical_w);
+    state
+        .match_state
+        .match_presentation
+        .voxel_images
+        .borrow_mut()
+        .load_game();
 
     // MouseLoad5BE092 restores incoming Power; SidebarNoInit6A4F89/94
     // rearms only slide. Sample after world adoption so diagnostic time uses
@@ -125,6 +159,29 @@ pub(crate) fn commit_prepared_load(
     let mut power = committed.power_bar_anim;
     power.reanchor_after_load(power_ms);
     state.match_state.match_presentation.power_bar_anim = power;
+    // The loaded world's next frame is its first Sidebar Action visit: the
+    // jump to the saved tick is not a run of missed visits.
+    if let Some(tick) = state
+        .match_state
+        .sim_runtime
+        .presentation()
+        .map(|rt| rt.simulation.session().tick())
+    {
+        state
+            .match_state
+            .match_presentation
+            .sidebar_gadget_state
+            .last_sim_tick = tick;
+    }
+
+    // VocClass::LoadStaticSounds (`0x00751710`) restarts the saved loopable
+    // coordinate sounds after its clear, which `stop_all` above performed.
+    if let (Some(sfx), Some(catalog)) = (
+        state.audio.sfx_player.as_mut(),
+        state.process_assets.audio_catalog(),
+    ) {
+        sfx.restore_static_sounds(committed.map.static_sounds(), catalog.sounds());
+    }
 
     crate::app::audio_runtime::bind_match_theme_context(state);
     let music_now_ms = crate::app::match_runtime::frame_pacer::wall_clock_ms();
@@ -152,19 +209,44 @@ pub(crate) fn commit_prepared_load(
         .sinking_waterlines
         .borrow_mut()
         .restore(committed.details.sinking_waterlines);
-    // MouseLoad5BDF70->no-init5BE9B0 preserves the saved entry lists; their
-    // display keys refresh below against incoming rules/CSF without reordering.
+    state
+        .match_state
+        .match_presentation
+        .lighting
+        .restore_anim_intensities(committed.details.anim_intensities);
+    // MouseLoad5BDF70->no-init5BE9B0 preserves the saved entry lists and the
+    // open tab; their display keys refresh below against incoming rules/CSF
+    // without reordering.
+    state.match_state.match_presentation.active_sidebar_tab =
+        crate::app::sidebar_projection::loaded_active_tab(committed.details.sidebar_order.as_ref());
+    #[cfg(feature = "phobos")]
+    let sw_sidebar_expanded = committed
+        .details
+        .sidebar_order
+        .as_ref()
+        .map(|order| order.sw_sidebar_expanded());
     state
         .match_state
         .match_presentation
         .sidebar_projection
         .restore_order(committed.details.sidebar_order);
+    #[cfg(feature = "phobos")]
+    if let Some(expanded) = sw_sidebar_expanded {
+        // `ScenarioExt::SWSidebar_Enable` survives the load like the strips.
+        state.match_state.match_presentation.sw_sidebar.expanded = expanded;
+    }
 
-    if let Some(owner) = state.match_state.local_player_owner().map(str::to_owned) {
+    let owner = state.match_state.local_player_owner().map(str::to_owned);
+    state
+        .match_state
+        .match_presentation
+        .sidebar_projection
+        .restore_credits_counter(owner.as_deref(), committed.credits_counter);
+    if let Some(owner) = owner {
         state
             .match_state
             .sim_runtime
-            .as_mut()
+            .write_sim(SimWrite::Lifecycle)
             .expect("prepared saved game installs a runtime")
             .simulation
             .prepare_fog_view_for(&owner);
@@ -174,6 +256,7 @@ pub(crate) fn commit_prepared_load(
     }
     if let Some(minimap) = state.match_state.match_presentation.minimap.as_mut() {
         minimap.mark_stale();
+        minimap.restore_radar_events(committed.radar_events);
     }
     // Replaces every outgoing cursor mode, including the targeting and
     // Repair/Sell modes, with the saved Display's.
@@ -184,7 +267,11 @@ pub(crate) fn commit_prepared_load(
     crate::app::input::camera::restore_tactical_view(state, committed.details.tactical_view);
 
     // Reset pacing, not saved simulation input delay or elapsed score time.
-    state.platform.frame_pacer.reset_for_immediate_frame();
+    state.platform.frame_pacer.reset_for_new_world();
+    state
+        .match_state
+        .network_quality
+        .reset(state.platform.frame_pacer.total_render_deferrals());
     crate::app::presentation::sidebar_render::refresh_sidebar_projection(state);
     // The incoming chrome owns the footer allowance; refresh its layout
     // before initializing derived geometry, including on a cold/different-side

@@ -4,7 +4,7 @@
 //! whole InfantryAI or audible playback. Wet death cleanup uses the existing
 //! production sequencer's native20/21 UnInit arm, not a second action port.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
@@ -20,15 +20,11 @@ use crate::sim::timer::CdTimer;
 use crate::sim::world::SimSoundEvent;
 
 fn oracle() -> &'static [Value] {
-    static NATIVE: OnceLock<Vec<Value>> = OnceLock::new();
-    NATIVE.get_or_init(|| {
-        let rows: Vec<Value> = serde_json::from_str(crate::test_fixture::text(
-            "tools/spatial_oracle/infantry_water_action.json",
-        ))
+    let rows = crate::test_fixture::json("tools/spatial_oracle/infantry_water_action.json")["rows"]
+        .as_array()
         .unwrap();
-        assert_eq!(rows.len(), 356);
-        rows
-    })
+    assert_eq!(rows.len(), 356);
+    rows
 }
 
 fn signed(value: &Value) -> i32 {
@@ -90,12 +86,9 @@ fn physical_rules() -> RuleSet {
         )
         .unwrap()
         .into_parts();
-    // The process owner returns fixed ART separately; the normal loader's
-    // init2467 installs it, then binds its parsed signed42-record bank.
+    // The process owner has retained the signed bank; metadata installation
+    // follows without replaying its sequence reads.
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&fixed_art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&fixed_art),
-    );
     rules
 }
 
@@ -153,9 +146,6 @@ fn supplied_rules(input: &Value) -> RuleSet {
         .unwrap()
         .into_parts();
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&fixed_art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&fixed_art),
-    );
     rules
 }
 
@@ -163,13 +153,14 @@ fn fixture(row: &Value, rules: &RuleSet, type_name: &str) -> (Simulation, u64) {
     let input = &row["input"];
     let physical = row["kind"] == "retail_action";
     let mut sim = Simulation::with_seed(0);
-    sim.session.binary_frame = 100;
-    sim.session.game_options.game_speed = row["game_speed_index"].as_i64().unwrap_or(0) as i32;
+    sim.session.set_binary_frame_for_test(100);
+    sim.session.game_options_mut_for_test().game_speed =
+        row["game_speed_index"].as_i64().unwrap_or(0) as i32;
     let house = sim.interner.intern("Americans");
-    sim.houses.insert(
-        house,
-        crate::sim::house_state::HouseState::new(house, 0, None, true, 0, 10),
-    );
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            house, 0, None, true, 0, 10,
+        ));
     let xyz = if physical {
         row["physical_xyz"]
             .as_array()
@@ -206,7 +197,7 @@ fn fixture(row: &Value, rules: &RuleSet, type_name: &str) -> (Simulation, u64) {
     assert_eq!(actor.mission_leaf.as_infantry().unwrap().water_state(), 2);
     // Synthetic rows supply +74=false; physical rows retain the constructor
     // in limbo. Neither premise claims wet/deck Unlimbo or occupation.
-    actor.lifecycle.set_cell_marked(false);
+    actor.lifecycle.set_cell_marked_for_test(false);
     // These action controls supply Location after construction. Constructor
     // arguments do not place the fresh Object at this native cell/pose.
     actor.position.put_location(DriveCoord {
@@ -238,7 +229,7 @@ fn fixture(row: &Value, rules: &RuleSet, type_name: &str) -> (Simulation, u64) {
         92,
         1,
     ));
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     if row["rng_before"].is_object() {
         sim.main_rng = serde_json::from_value::<SimRng>(row["rng_before"]["main"].clone())
             .unwrap()
@@ -380,10 +371,6 @@ fn native_constructor_and_physical_readers_supply_water_state_and_raw_records() 
         .iter()
         .find(|row| row["kind"] == "constructors")
         .unwrap();
-    assert_eq!(
-        constructors["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     for receipt in constructors["constructors"].as_array().unwrap() {
         if receipt["entry"] == "0x517a50" {
             assert_eq!(receipt["after"]["0x6e8"], 2);

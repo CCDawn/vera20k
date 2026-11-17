@@ -94,7 +94,7 @@ fn fixture(row: &Value) -> (Simulation, RuleSet) {
             if building {
                 target
                     .type_facts
-                    .set_foundation_for_test(foundation.name.to_owned());
+                    .set_foundation_for_test(foundation.name.to_owned().into());
                 assert_eq!(
                     serde_json::json!([foundation.width, foundation.height]),
                     row["foundation_dimensions"]
@@ -111,7 +111,7 @@ fn fixture(row: &Value) -> (Simulation, RuleSet) {
     }));
     sim.substrate.entities.insert(source);
     sim.interner = test_interner();
-    sim.substrate.next_stable_object_id = 3;
+    sim.set_next_stable_object_id_for_test(3);
     sim.set_logic_order_for_test(vec![1]);
     (sim, rules)
 }
@@ -143,7 +143,8 @@ fn selected_strafe_range_branch_matches_native_and_dispatches_when_in_range() {
         let (mut sim, rules) = fixture(&row);
         let aircraft = sim.substrate.entities.get(1).unwrap();
         let target = aircraft.attack_target.target().unwrap();
-        let distance = crate::sim::combat::object_distance_to(aircraft, &target, &sim).unwrap();
+        let distance =
+            crate::sim::combat::object_distance_to(aircraft.stable_id(), &target, &sim).unwrap();
         assert_eq!(distance, row["distance"].as_i64().unwrap() as i32, "{row}");
         let weapon = crate::sim::combat::combat_weapon::primary_for_tier(
             rules.object("ORCA").unwrap(),

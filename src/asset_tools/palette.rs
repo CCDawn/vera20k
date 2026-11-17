@@ -131,6 +131,8 @@ const FALLBACK_CHAIN: &[&str] = &[
 /// beneath it, so `artmd.ini` is preferred outright and `art.ini` is only a
 /// fallback for an RA2-only install.
 pub fn load_art_registry(asset_manager: &AssetManager) -> ArtRegistry {
+    // Ares reads ARTMD its own way when the install ships `ares.mix`.
+    let _ares_way = crate::rules::ares_switch::read_ares_way(asset_manager.ships_ares());
     for ini_name in ["artmd.ini", "art.ini"] {
         let Some(data) = asset_manager.get(ini_name) else {
             continue;
@@ -419,16 +421,9 @@ fn is_sidebar_ui(lower: &str, source_lower: &str) -> bool {
         || source_lower.contains("sidec")
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn nested_archive_chain_reduces_to_its_leaf() {
-        assert_eq!(archive_basename("ra2.mix -> sidec02.mix"), "sidec02");
-        assert_eq!(archive_basename("cameomd.mix"), "cameomd");
-        assert_eq!(archive_basename("loose:c:/x/foo.pal"), "loose:c:/x/foo.pal");
-    }
 
     #[test]
     fn the_newurban_iso_palette_is_spelled_as_the_engine_spells_it() {

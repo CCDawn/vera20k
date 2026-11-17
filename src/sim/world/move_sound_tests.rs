@@ -53,9 +53,8 @@ fn scene(input: &Value, before: &Value, rules: &RuleSet) -> (Simulation, u64) {
     sim.resolve_type_handles(rules);
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
-    sim.session.house_order.push(owner);
-    let id = sim.allocate_stable_id();
+        .register(HouseState::new(owner, 0, None, true, 0, 10));
+    let id = sim.substrate.allocate_stable_id();
     let xyz: Vec<_> = before["xyz"]
         .as_array()
         .unwrap()
@@ -86,7 +85,7 @@ fn scene(input: &Value, before: &Value, rules: &RuleSet) -> (Simulation, u64) {
     actor
         .lifecycle
         .set_object_alive_for_test(input["alive"].as_u64().unwrap_or(1) != 0);
-    actor.lifecycle.set_cell_marked(false);
+    actor.lifecycle.set_cell_marked_for_test(false);
     actor.locomotor = Some(LocomotorState::from_object_type(
         rules.object("SQD").unwrap(),
         0,
@@ -161,8 +160,9 @@ fn visit(sim: &mut Simulation, rules: &RuleSet, id: u64, step: &Value, context: 
         "{context}: entry"
     );
     assert_rng(sim, &step["before"], context);
-    sim.session.binary_frame = step["frame"].as_u64().unwrap() as u32;
-    sim.sound_events.clear();
+    sim.session
+        .set_binary_frame_for_test(step["frame"].as_u64().unwrap() as u32);
+    sim.sound_events.clear_for_test();
     let body_before = sim
         .substrate
         .entities
@@ -174,21 +174,28 @@ fn visit(sim: &mut Simulation, rules: &RuleSet, id: u64, step: &Value, context: 
     let (_, draws) = crate::sim::rng::trace_draws(|| {
         crate::sim::animation::tick_foot_body_frame_counter(
             sim.substrate.entities.get_mut(id).unwrap(),
-            Some(crate::sim::movement::SpeedRules::new(
-                rules,
-                &sim.interner,
-                &sim.houses,
-            )),
+            crate::sim::movement::SpeedRules::new(rules, &sim.interner, &sim.houses),
             crate::sim::animation::FootBodyCadence {
                 walk_rate: object.walk_rate,
                 idle_rate: object.idle_rate,
             },
             object.hover_attack,
             object.deploy_to_land,
+            0,
             None,
-            sim.session.binary_frame,
+            sim.session.binary_frame(),
         );
-        sim.tick_move_sound_after_process(id, body_before, Some(rules));
+        Simulation::tick_move_sound_after_process(
+            &sim.interner,
+            &sim.session,
+            &sim.main_rng,
+            &mut sim.substrate,
+            &mut sim.sound_events,
+            &sim.houses,
+            id,
+            body_before,
+            rules,
+        );
     });
     assert_eq!(
         actor_state(sim, id),
@@ -312,7 +319,8 @@ fn native_foot_load_reset_runs_through_snapshot_restore_then_the_next_visit() {
     for row in rows {
         let name = row["name"].as_str().unwrap();
         let (mut sim, id) = scene(&json!({"seed":31}), &row["before"], &rules);
-        sim.session.map_name = "MOVE_SOUND_TEST.MAP".to_owned();
+        sim.session
+            .set_map_name_for_test("MOVE_SOUND_TEST.MAP".to_owned());
         let bytes = GameSnapshot::save_validated(&sim, 17, 18, name, 0);
         let mut loaded = GameSnapshot::load_validated(&bytes, 17, 18, "MOVE_SOUND_TEST.MAP")
             .unwrap()
@@ -373,7 +381,7 @@ fn ordinary_uninit_then_physical_destruction_detaches_without_a_foot_hard_stop()
         let mut expected = native_effects(original_limbo, true);
         expected.extend(native_effects(original_destructor, true));
         sim.process_pending_delete_with(
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default(),
             1,
@@ -405,6 +413,130 @@ fn retail_idle_squid_production_frames_match_native_counter_and_sound_cadence() 
     }
 }
 
+/// Foot4DAA01 precedes idle Scatter4DAE59, whose Infantry receiver51D478
+/// can synchronously produce a Walk head. The next Foot visit hears it.
+#[test]
+fn retail_yuri_idle_scatter_does_not_start_move_sound_until_the_next_foot_visit() {
+    use std::cell::{Cell, RefCell};
+    #[derive(Default)]
+    struct LoopPhase {
+        delivered: Cell<usize>,
+        visits: RefCell<Vec<(u64, u32, crate::sim::anim_class::AnimWorldCoord, bool)>>,
+    }
+    impl super::SoundBoundary for LoopPhase {
+        fn consume(&self, _: &Simulation, _: &RuleSet, events: &[SimSoundEvent]) {
+            self.delivered.set(events.len());
+        }
+        fn delivered(&self) -> usize {
+            self.delivered.get()
+        }
+        fn update_looping_sound(
+            &self,
+            sim: &Simulation,
+            owner: u64,
+            world: crate::sim::anim_class::AnimWorldCoord,
+        ) {
+            self.visits.borrow_mut().push((
+                owner,
+                sim.session.binary_frame(),
+                world,
+                sim.substrate
+                    .entities
+                    .get(owner)
+                    .unwrap()
+                    .navigation
+                    .nav_com()
+                    .is_some(),
+            ));
+        }
+    }
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules_for_map("Hills.mmx")
+    else {
+        return;
+    };
+    let rules = retail.rules;
+    let kind = rules.object("YURIPR").unwrap();
+    assert_eq!((kind.walk_rate, kind.idle_rate), (1, 0));
+    assert_eq!(kind.move_sound.len(), 1);
+    assert!(kind.move_sound[0].eq_ignore_ascii_case("YuriPrimeMoveLoop"));
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 31);
+    let owner = sim.interner.get("Americans").unwrap();
+    sim.session.set_current_house_for_test(Some(owner));
+    let actor = sim
+        .spawn_object("YURIPR", "Americans", 10, 10, 0, &rules)
+        .unwrap();
+    // Supplied authored cliff, as in the original joined Foot/Scatter/Walk
+    // comparison; movement, NavCom, head and sound state are not supplied.
+    sim.resolved_terrain
+        .as_mut()
+        .unwrap()
+        .cell_mut_for_test(11, 11)
+        .unwrap()
+        .level = 4;
+    sim.session.set_binary_frame_for_test(63);
+    let main = sim.main_rng.native_state_hex();
+    let scenario = sim.scenario_rng.native_state_hex();
+    let before = Simulation::movement_sound_world(sim.substrate.entities.get(actor).unwrap());
+    let phase = LoopPhase::default();
+    let output = sim
+        .advance_app_frame(
+            &[],
+            &rules,
+            None,
+            33,
+            TickLane::Ordinary,
+            super::FrameEffects::for_sound(&phase),
+        )
+        .unwrap();
+    let entity = sim.substrate.entities.get(actor).unwrap();
+    assert!(
+        entity.navigation.nav_com().is_some(),
+        "idle Scatter admitted"
+    );
+    assert!(
+        crate::sim::movement::motion_query::is_moving_now(
+            entity,
+            crate::sim::movement::SpeedRules::new(&rules, &sim.interner, &sim.houses),
+            63,
+        ),
+        "the real synchronous Walk Process produced motion"
+    );
+    assert_ne!(sim.scenario_rng.native_state_hex(), scenario);
+    assert!(!entity.move_sound.is_active());
+    assert_eq!(sim.main_rng.native_state_hex(), main);
+    assert_eq!(
+        phase.visits.borrow().as_slice(),
+        [(actor, 63, before, false)],
+        "750D40 runs before Scatter creates NavCom, not at the final frame position"
+    );
+    assert!(!output.sound_events.iter().any(|event| matches!(event,
+        SimSoundEvent::AnimationStarted { anim_id, .. } if *anim_id == actor)));
+    phase.delivered.set(0);
+    let output = sim
+        .advance_app_frame(
+            &[],
+            &rules,
+            None,
+            33,
+            TickLane::Ordinary,
+            super::FrameEffects::for_sound(&phase),
+        )
+        .unwrap();
+    assert!(
+        sim.substrate
+            .entities
+            .get(actor)
+            .unwrap()
+            .move_sound
+            .is_active()
+    );
+    assert_ne!(sim.main_rng.native_state_hex(), main);
+    assert_eq!(phase.visits.borrow().len(), 2);
+    assert!(output.sound_events.iter().any(|event| matches!(event,
+        SimSoundEvent::AnimationStarted { anim_id, sound_id, .. }
+            if *anim_id == actor && sound_id.eq_ignore_ascii_case("YuriPrimeMoveLoop"))));
+}
+
 fn assert_retail_idle_timeline(retail_dir: &std::path::Path, row: &Value) {
     let name = row["name"].as_str().unwrap();
     let steps = row["steps"].as_array().unwrap();
@@ -416,7 +548,7 @@ fn assert_retail_idle_timeline(retail_dir: &std::path::Path, row: &Value) {
         "paid Hills/Battle",
     );
     let runtime = &mut scene.runtime;
-    let owner = runtime.simulation.session.current_house.unwrap();
+    let owner = runtime.simulation.session.current_house().unwrap();
     let owner_name = runtime.simulation.resolve(owner).to_owned();
     let water: Vec<_> = runtime
         .simulation
@@ -450,14 +582,16 @@ fn assert_retail_idle_timeline(retail_dir: &std::path::Path, row: &Value) {
     // The oracle starts from an already-live actor after setup. Align only
     // its declared frame/Main boundary; leave production movement and frame
     // dispatch intact. This is not a whole-map startup RNG comparison.
-    sim.session.binary_frame = steps[0]["frame"].as_u64().unwrap() as u32;
+    sim.session
+        .set_binary_frame_for_test(steps[0]["frame"].as_u64().unwrap() as u32);
     sim.main_rng =
         SimRng::from_native_state_hex_for_test(steps[0]["before"]["rng"]["main"].as_str().unwrap())
             .into();
     for step in steps {
         let native_frame = step["frame"].as_u64().unwrap() as u32;
         assert_eq!(
-            runtime.simulation.session.binary_frame, native_frame,
+            runtime.simulation.session.binary_frame(),
+            native_frame,
             "{name}: original entry frame"
         );
         let output = runtime
@@ -474,7 +608,7 @@ fn assert_retail_idle_timeline(retail_dir: &std::path::Path, row: &Value) {
         // Native slice frame 0 therefore supplies completed boundary 1; the
         // event/state assertions below compare the same pre-commit visit.
         assert_eq!(
-            sim.session.binary_frame,
+            sim.session.binary_frame(),
             native_frame.wrapping_add(1),
             "{name}: completed boundary after original frame {native_frame}"
         );

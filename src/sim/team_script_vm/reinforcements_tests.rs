@@ -1,6 +1,8 @@
 //! Original team_creation executions. Supplied prior state is explicit for
 //! 6EC300/script50; action7 uses real Rust constructors, TaskForce admission,
 //! class Unlimbo and scalar cleanup against the original composed executions.
+//! Building-exit regressions additionally exercise instruction-derived rules
+//! through production owners; they are not original whole-spawn goldens.
 
 use std::collections::HashMap;
 
@@ -25,6 +27,33 @@ use crate::sim::native_identity::NativeUniqueIdCursor;
 use crate::sim::rng::SimRng;
 use crate::sim::world::{FrameEffects, Simulation};
 use crate::util::save_codec;
+
+#[test]
+fn player_at_thirtieth_slot_resolves_team_owner_through_start_mapping() {
+    let rules = RuleSet::from_ini(&IniFile::from_str("[Countries]\n0=Americans\n")).unwrap();
+    let map = IniFile::from_str(
+        "[TeamTypes]\n0=TT\n[TT]\nHouse=<Player @ AD>\nScript=S\nTaskForce=F\nMax=-1\n\
+         [ScriptTypes]\n0=S\n[S]\n0=5,0\n[TaskForces]\n0=F\n",
+    );
+    let registry = TeamAiIniRegistry::from_sources(&IniFile::empty(), &map, false);
+    let mut sim = Simulation::new();
+    let owner = sim.interner.intern("LastPlayer");
+    sim.session
+        .start_slot_houses_mut_for_test()
+        .insert(29, owner);
+    let (vm, diagnostics) = TeamScriptVm::from_ini_registry(&registry, &mut sim.interner, &rules);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    sim.team_script_vm = vm;
+    let team_type = sim.interner.get("TT").unwrap();
+    assert_eq!(sim.house_by_trigger_selector(0x1198, &rules), Some(owner));
+    assert_eq!(sim.house_by_trigger_selector(0x1199, &rules), None);
+    let team = sim
+        .create_team(team_type, None, &rules)
+        .expect("slot 30 team");
+    assert_eq!(sim.team_script_vm.team(team).unwrap().owner(), owner);
+    sim.session.start_slot_houses_mut_for_test().remove(&29);
+    assert!(sim.create_team(team_type, None, &rules).is_none());
+}
 
 fn rows(kind: &str, count: usize) -> Vec<Value> {
     let corpus: Value = serde_json::from_str(crate::test_fixture::text(
@@ -210,9 +239,9 @@ fn shared_team_waypoint_predicate_matches_original_exits_and_dummy_writes() {
         });
         terrain.stamp_dummy_cell_requested_coord(-91, 77);
         sim.install_resolved_terrain_for_new_map(terrain);
-        sim.playfield_bounds = Some(PlayfieldBounds::from_normalized_local_size(
+        sim.set_playfield_bounds_for_test(Some(PlayfieldBounds::from_normalized_local_size(
             64, 0, 0, 64, 64,
-        ));
+        )));
         assert_eq!(
             sim.member_team_is_moving_outside_playfield(99),
             row["result"].as_bool().unwrap(),
@@ -283,7 +312,12 @@ fn flash_team_type_matches_original_member_writes_across_houses() {
             sim.main_rng.native_state_hex(),
             sim.mapgen_rng.native_state_hex(),
         ];
-        sim.flash_teams_of_type(types[0], int(&row["read"]["value"]));
+        Simulation::flash_teams_of_type(
+            &mut sim.substrate,
+            &sim.team_script_vm,
+            types[0],
+            int(&row["read"]["value"]),
+        );
         let actual: Vec<_> = (0..input["initial"].as_array().unwrap().len())
             .map(|member| {
                 sim.entities()
@@ -442,14 +476,15 @@ pub(crate) fn reinforcement_world(
     let path = crate::sim::pathfinding::PathGrid::from_resolved_terrain(&terrain);
     sim.install_fixture_path_grid(Some(&path));
     sim.install_resolved_terrain_for_new_map(terrain);
-    sim.session.map_width = 80;
-    sim.session.map_height = 85;
-    sim.session.binary_frame = 1;
-    sim.session.game_mode_nonzero = true;
-    sim.playfield_bounds = Some(PlayfieldBounds::from_normalized_local_size(
+    sim.session.set_map_width_for_test(80);
+    sim.session.set_map_height_for_test(85);
+    sim.session.set_binary_frame_for_test(1);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    sim.set_playfield_bounds_for_test(Some(PlayfieldBounds::from_normalized_local_size(
         80, 5, 5, 70, 73,
-    ));
-    sim.playfield_size_height = Some(85);
+    )));
+    sim.set_playfield_size_height_for_test(Some(85));
     let country = sim.interner.intern("Americans");
     let owner = sim.interner.intern("Americans");
     let enemy = sim.interner.intern("ENEMY");
@@ -466,15 +501,15 @@ pub(crate) fn reinforcement_world(
         None,
         Some(&rules.general),
     );
-    sim.houses.insert(owner, house);
+    sim.houses.register(house);
     sim.houses
-        .insert(enemy, HouseState::new(enemy, 0, Some(country), true, 0, 10));
-    sim.session.house_order = vec![owner, enemy];
-    sim.session.current_house = Some(if input["allied"].as_bool().unwrap_or(true) {
-        owner
-    } else {
-        enemy
-    });
+        .register(HouseState::new(enemy, 0, Some(country), true, 0, 10));
+    sim.session
+        .set_current_house_for_test(Some(if input["allied"].as_bool().unwrap_or(true) {
+            owner
+        } else {
+            enemy
+        }));
     let definitions_inputs = input["definitions"]
         .as_array()
         .map(Vec::as_slice)
@@ -565,8 +600,7 @@ pub(crate) fn reinforcement_world(
         &IniFile::from_str(""),
         true,
     );
-    sim.install_team_ai_registry(&registry, rules)
-        .expect("resolved native Team inputs install");
+    sim.install_team_ai_registry(&registry, rules);
     let mut waypoints = HashMap::from([(
         4,
         Waypoint {
@@ -607,6 +641,573 @@ pub(crate) fn reinforcement_world(
         "{input}: supplied native reinforcement waypoint"
     );
     sim
+}
+
+/// SpawnReinforcements65DAB6 offers every Infantry to the selected building.
+/// GAREFN's original refinery arm444EF8 scatters it and returns0, so65DB01
+/// deletes it; the building-exit branch never records a review cell.
+#[test]
+fn all_infantry_reinforcement_refinery_refusal_deletes_members_and_skips_review_cell() {
+    let Some((ini, art)) = retail_rules_and_art() else {
+        return;
+    };
+    let rules =
+        crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art().expect("retail rules");
+    assert!(rules.object("GAREFN").unwrap().refinery);
+    let overlay = OverlayTypeRegistry::from_ini(&ini, Some(&art));
+    let terrain_rules = TerrainRules::from_ini(&ini);
+    let input = serde_json::json!({"entries": [["E1", 2]], "origin": [85, 50]});
+    let mut sim = reinforcement_world(&rules, &terrain_rules, &input);
+    let refinery = sim
+        .spawn_object_at_height("GAREFN", "Americans", 86, 50, 4, 0, &rules)
+        .expect("refinery beside the requested reinforcement origin");
+    // The retail refinery's FreeUnit is already part of the world.
+    let before = sim.entities().len();
+    let team_type = sim.interner.get("TT").unwrap();
+
+    let (returned, review) = sim.spawn_team_reinforcements(
+        team_type,
+        -1,
+        &rules,
+        Some(&overlay),
+        FrameEffects::default(),
+    );
+
+    assert!(!returned, "no member leaves the refinery's refused exit");
+    assert_eq!(review, None, "building exits bypass the recent-cell ring");
+    assert_eq!(
+        sim.entities().len(),
+        before,
+        "refused members are destroyed"
+    );
+    assert!(
+        sim.entities()
+            .values()
+            .all(|entity| entity.category() != EntityCategory::Infantry)
+    );
+    assert!(sim.entities().get(refinery).unwrap().is_alive());
+}
+
+/// Original fresh517A50 -> refinery443C60 returned0 after one Scenario
+/// RandomRanged(0,4) through51D0D0, while still limbo/unmarked. This checks
+/// that bounded exit prefix; caller-owned scalar deletion is checked above.
+#[test]
+fn refinery_exit_scatters_a_fresh_limbo_infantryman_before_caller_cleanup() {
+    let Some((ini, art)) = retail_rules_and_art() else {
+        return;
+    };
+    let rules =
+        crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art().expect("retail rules");
+    let overlay = OverlayTypeRegistry::from_ini(&ini, Some(&art));
+    let terrain_rules = TerrainRules::from_ini(&ini);
+    let input = serde_json::json!({"entries": [["E1", 1]], "origin": [85, 50]});
+    let mut sim = reinforcement_world(&rules, &terrain_rules, &input);
+    let refinery = sim
+        .spawn_object_at_height("GAREFN", "Americans", 86, 50, 4, 0, &rules)
+        .unwrap();
+    let member = sim
+        .construct_object_limbo_at_height(
+            "E1",
+            "Americans",
+            0,
+            0,
+            0,
+            0,
+            &rules,
+            FrameEffects::default(),
+        )
+        .unwrap();
+    let mut expected_rng = sim.scenario_rng.clone();
+    expected_rng.next_range_i32_inclusive(0, 4);
+    let before_main = sim.main_rng.native_state_hex();
+    assert_eq!(
+        crate::sim::production::exit_produced_object(
+            &mut sim,
+            &rules,
+            refinery,
+            member,
+            (85, 50),
+            Some(&overlay),
+            FrameEffects::default(),
+        ),
+        crate::sim::ai_base_building::BuildingExit::Failed
+    );
+    assert_eq!(
+        sim.scenario_rng.native_state_hex(),
+        expected_rng.native_state_hex()
+    );
+    assert_eq!(sim.main_rng.native_state_hex(), before_main);
+    let actor = sim.entities().get(member).unwrap();
+    assert!(actor.lifecycle.in_limbo() && !actor.lifecycle.cell_marked());
+    assert!(actor.is_alive());
+}
+
+#[test]
+fn infantry_reinforcement_building_exits_release_contacts_and_skip_the_review_ring() {
+    let Some((ini, art)) = retail_rules_and_art() else {
+        return;
+    };
+    // These flags are unset on these retail types. Enable the dormant
+    // Hospital/Armory arms explicitly through the custom map reader.
+    let mut layers = crate::rules::native_processing::RulesLayerStack::new(ini.clone());
+    layers.push(
+        crate::rules::native_processing::RulesLayerKind::Scenario,
+        IniFile::from_str("[CAHOSP]\nHospital=yes\n[CAPARS07]\nArmory=yes\n"),
+    );
+    let processed = layers.process_with_fixed_art(&art).unwrap();
+    let rules = RuleSet::from_processed_rules(&processed).unwrap();
+    let overlay = OverlayTypeRegistry::from_ini(&ini, Some(&art));
+    let terrain_rules = TerrainRules::from_ini(&ini);
+    for (kind, owner, clears_choice) in [
+        ("GAPILE", "Americans", true),
+        ("GAPOWR", "ENEMY", true),
+        ("GAWEAP", "Americans", true),
+        ("GAYARD", "Americans", true),
+        ("CAHOSP", "ENEMY", false),
+        ("CAPARS07", "ENEMY", false),
+    ] {
+        let producer_type = rules.object(kind).expect("retail exit receiver");
+        assert_eq!(
+            clears_choice,
+            !producer_type.hospital && !producer_type.armory(),
+            "{kind}: native4440DD bypasses economy/choice for Hospital/Armory"
+        );
+        let input = serde_json::json!({"entries": [["E1", 1]], "origin": [85, 50]});
+        let mut sim = reinforcement_world(&rules, &terrain_rules, &input);
+        if producer_type.naval {
+            // Admit the actual yard on water, with the origin and its
+            // foundation perimeter still on land for the Infantry exit.
+            let water = terrain_rules
+                .semantics_for_land_type(crate::rules::terrain_rules::LandType::Water.as_index())
+                .unwrap();
+            let (width, height) = producer_type.foundation.dimensions();
+            let terrain = sim.resolved_terrain.as_mut().unwrap();
+            for x in 86..86 + width as u16 {
+                for y in 50..50 + height as u16 {
+                    let cell = terrain.cell_mut_for_test(x, y).unwrap();
+                    cell.land_type = crate::rules::terrain_rules::LandType::Water.as_index();
+                    cell.base_land_type = cell.land_type;
+                    cell.speed_costs = water.speed_costs.clone();
+                    cell.base_speed_costs = water.speed_costs.clone();
+                }
+            }
+            let path = crate::sim::pathfinding::PathGrid::from_resolved_terrain(terrain);
+            sim.install_fixture_path_grid(Some(&path));
+        }
+        let building = sim
+            .spawn_object_at_height(kind, owner, 86, 50, 4, 0, &rules)
+            .unwrap_or_else(|| panic!("{kind}: building beside the reinforcement origin"));
+        let choice = crate::sim::ai_unit_choice::UnitChoiceKind::Infantry;
+        for name in ["Americans", "ENEMY"] {
+            let house = sim.interner.get(name).unwrap();
+            sim.houses
+                .get_mut(&house)
+                .unwrap()
+                .ai_unit_choices_mut()
+                .set(choice, 0);
+        }
+        let team_type = sim.interner.get("TT").unwrap();
+        let (returned, review) = sim.spawn_team_reinforcements(
+            team_type,
+            -1,
+            &rules,
+            Some(&overlay),
+            FrameEffects::default(),
+        );
+        assert!(returned, "{kind}: one successful ExitObject");
+        assert_eq!(review, None, "{kind}: no ordinary placement review");
+        assert_eq!(sim.entities().len(), 2, "{kind}: retained member");
+        let member = sim
+            .entities()
+            .values()
+            .find(|entity| entity.category() == EntityCategory::Infantry)
+            .unwrap();
+        assert!(!member.lifecycle.in_limbo(), "{kind}");
+        assert!(member.radio_contacts.is_empty(), "{kind}: member BREAK");
+        assert!(
+            sim.entities()
+                .get(building)
+                .unwrap()
+                .radio_contacts
+                .is_empty(),
+            "{kind}: producer BREAK"
+        );
+        let producer_owner = sim.interner.get(owner).unwrap();
+        let member_owner = sim.interner.get("Americans").unwrap();
+        assert_eq!(
+            sim.houses[&producer_owner].ai_unit_choices().get(choice),
+            if clears_choice { -1 } else { 0 },
+            "{kind}: the producer's pending choice follows its exit prelude"
+        );
+        if producer_owner != member_owner {
+            assert_eq!(
+                sim.houses[&member_owner].ai_unit_choices().get(choice),
+                0,
+                "{kind}: the reinforcement owner's choice is retained"
+            );
+        }
+    }
+}
+
+#[test]
+fn reinforcement_exit_breaks_slot_zero_instead_of_the_new_members_contact() {
+    let Some((ini, art)) = retail_rules_and_art() else {
+        return;
+    };
+    // A custom map can retain two contacts.SpawnReinforcements65D8E0 uses
+    // building's Contacts[0], even when the new member entered slot1.
+    let mut layers = crate::rules::native_processing::RulesLayerStack::new(ini.clone());
+    layers.push(
+        crate::rules::native_processing::RulesLayerKind::Scenario,
+        IniFile::from_str("[GAPILE]\nNumberOfDocks=2\n"),
+    );
+    let processed = layers.process_with_fixed_art(&art).unwrap();
+    let rules = RuleSet::from_processed_rules(&processed).unwrap();
+    let overlay = OverlayTypeRegistry::from_ini(&ini, Some(&art));
+    let terrain_rules = TerrainRules::from_ini(&ini);
+    let input = serde_json::json!({"entries": [["E1", 2]], "origin": [85, 50]});
+    let mut sim = reinforcement_world(&rules, &terrain_rules, &input);
+    let building = sim
+        .spawn_object_at_height("GAPILE", "Americans", 86, 50, 4, 0, &rules)
+        .unwrap();
+    let old_contact = sim
+        .spawn_object_at_height("E1", "Americans", 90, 55, 4, 0, &rules)
+        .unwrap();
+    assert_eq!(
+        crate::sim::radio::transmit(
+            &mut sim,
+            building,
+            old_contact,
+            crate::sim::radio::RadioMessage::Hello,
+            crate::sim::radio::RadioPayload::default(),
+            &rules,
+            FrameEffects::default(),
+        ),
+        crate::sim::radio::RadioResponse::Roger
+    );
+    let team_type = sim.interner.get("TT").unwrap();
+    assert_eq!(
+        sim.spawn_team_reinforcements(
+            team_type,
+            -1,
+            &rules,
+            Some(&overlay),
+            FrameEffects::default(),
+        ),
+        (true, None)
+    );
+    let producer = sim.entities().get(building).unwrap();
+    assert_eq!(producer.radio_contacts.slot(0), None);
+    let retained = producer
+        .radio_contacts
+        .slot(1)
+        .expect("the first new member retains its slot1 contact");
+    assert_ne!(retained, old_contact);
+    assert_eq!(
+        sim.entities().get(retained).unwrap().radio_contacts.slot(0),
+        Some(building)
+    );
+    assert!(
+        sim.entities()
+            .get(old_contact)
+            .unwrap()
+            .radio_contacts
+            .is_empty()
+    );
+    let members: Vec<_> = sim
+        .entities()
+        .values()
+        .filter(|entity| {
+            entity.category() == EntityCategory::Infantry && entity.stable_id() != old_contact
+        })
+        .collect();
+    assert_eq!(members.len(), 2);
+    assert!(members.iter().all(|member| !member.lifecycle.in_limbo()));
+    assert!(
+        members
+            .iter()
+            .filter(|member| member.stable_id() != retained)
+            .all(|member| member.radio_contacts.is_empty())
+    );
+}
+
+#[test]
+fn mixed_reinforcements_bypass_the_building_exit_branch() {
+    let Some((ini, art)) = retail_rules_and_art() else {
+        return;
+    };
+    let rules =
+        crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art().expect("retail rules");
+    let overlay = OverlayTypeRegistry::from_ini(&ini, Some(&art));
+    let terrain_rules = TerrainRules::from_ini(&ini);
+    let input = serde_json::json!({"entries": [["MTNK", 1], ["E1", 1]], "origin": [85, 50]});
+    let mut sim = reinforcement_world(&rules, &terrain_rules, &input);
+    sim.spawn_object_at_height("GAREFN", "Americans", 86, 50, 4, 0, &rules)
+        .unwrap();
+    let before = sim.entities().len();
+    let team_type = sim.interner.get("TT").unwrap();
+    let (returned, review) = sim.spawn_team_reinforcements(
+        team_type,
+        -1,
+        &rules,
+        Some(&overlay),
+        FrameEffects::default(),
+    );
+    assert!(returned);
+    assert_eq!(review, Some((85, 50)));
+    assert_eq!(
+        sim.entities().len(),
+        before + 2,
+        "mixed members use ordinary placement"
+    );
+}
+
+#[test]
+fn reinforcement_receiver_is_the_last_healthy_building_with_a_free_exit() {
+    let Some((ini, art)) = retail_rules_and_art() else {
+        return;
+    };
+    let rules =
+        crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art().expect("retail rules");
+    let overlay = OverlayTypeRegistry::from_ini(&ini, Some(&art));
+    let terrain_rules = TerrainRules::from_ini(&ini);
+    for west_healthy in [true, false] {
+        let input = serde_json::json!({"entries": [["E1", 1]], "origin": [85, 50]});
+        let mut sim = reinforcement_world(&rules, &terrain_rules, &input);
+        sim.spawn_object_at_height("GAPOWR", "ENEMY", 86, 50, 4, 0, &rules)
+            .unwrap();
+        let west = sim
+            .spawn_object_at_height("GAPILL", "Americans", 84, 50, 4, 0, &rules)
+            .unwrap();
+        if !west_healthy {
+            sim.substrate.entities.get_mut(west).unwrap().health.set(0);
+        }
+        let american = sim.interner.get("Americans").unwrap();
+        let enemy = sim.interner.get("ENEMY").unwrap();
+        let choice = crate::sim::ai_unit_choice::UnitChoiceKind::Infantry;
+        for house in [american, enemy] {
+            sim.houses
+                .get_mut(&house)
+                .unwrap()
+                .ai_unit_choices_mut()
+                .set(choice, 0);
+        }
+        let team_type = sim.interner.get("TT").unwrap();
+        let (returned, review) = sim.spawn_team_reinforcements(
+            team_type,
+            -1,
+            &rules,
+            Some(&overlay),
+            FrameEffects::default(),
+        );
+        assert!(returned);
+        assert_eq!(review, None);
+        //65DA6C replaces the candidate on every match. West is visited
+        //after the eastern power plant; a nonpositive Health skips it.
+        let selected = if west_healthy { american } else { enemy };
+        let skipped = if west_healthy { enemy } else { american };
+        assert_eq!(sim.houses[&selected].ai_unit_choices().get(choice), -1);
+        assert_eq!(sim.houses[&skipped].ai_unit_choices().get(choice), 0);
+    }
+}
+
+#[test]
+fn reinforcement_busy_exit_deletes_the_member_without_breaking_the_existing_contact() {
+    let Some((ini, art)) = retail_rules_and_art() else {
+        return;
+    };
+    let rules =
+        crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art().expect("retail rules");
+    let overlay = OverlayTypeRegistry::from_ini(&ini, Some(&art));
+    let terrain_rules = TerrainRules::from_ini(&ini);
+    let input = serde_json::json!({"entries": [["E1", 1]], "origin": [85, 50]});
+    let mut sim = reinforcement_world(&rules, &terrain_rules, &input);
+    let building = sim
+        .spawn_object_at_height("GAPOWR", "Americans", 86, 50, 4, 0, &rules)
+        .unwrap();
+    let contact = sim
+        .spawn_object_at_height("E1", "Americans", 90, 60, 4, 0, &rules)
+        .unwrap();
+    let _ = crate::sim::radio::transmit(
+        &mut sim,
+        building,
+        contact,
+        crate::sim::radio::RadioMessage::Hello,
+        crate::sim::radio::RadioPayload::default(),
+        &rules,
+        FrameEffects::default(),
+    );
+    let before = sim.entities().len();
+    let producer_contacts = sim.entities().get(building).unwrap().radio_contacts.clone();
+    let member_contacts = sim.entities().get(contact).unwrap().radio_contacts.clone();
+    assert!(producer_contacts.first_free().is_none());
+    let team_type = sim.interner.get("TT").unwrap();
+    let (returned, review) = sim.spawn_team_reinforcements(
+        team_type,
+        -1,
+        &rules,
+        Some(&overlay),
+        FrameEffects::default(),
+    );
+    assert!(
+        !returned,
+        "ExitObject1 is not a retained factory retry here"
+    );
+    assert_eq!(review, None);
+    assert_eq!(sim.entities().len(), before);
+    assert_eq!(
+        sim.entities().get(building).unwrap().radio_contacts,
+        producer_contacts
+    );
+    assert_eq!(
+        sim.entities().get(contact).unwrap().radio_contacts,
+        member_contacts
+    );
+}
+
+#[test]
+fn a_building_without_a_clear_foundation_exit_keeps_ordinary_reinforcement_placement() {
+    let Some((ini, art)) = retail_rules_and_art() else {
+        return;
+    };
+    let rules =
+        crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art().expect("retail rules");
+    let overlay = OverlayTypeRegistry::from_ini(&ini, Some(&art));
+    let terrain_rules = TerrainRules::from_ini(&ini);
+    let input = serde_json::json!({"entries": [["E1", 1]], "origin": [85, 50]});
+    let mut sim = reinforcement_world(&rules, &terrain_rules, &input);
+    sim.spawn_object_at_height("GAPILL", "Americans", 86, 50, 4, 0, &rules)
+        .unwrap();
+    for dx in -1_i32..=1 {
+        for dy in -1_i32..=1 {
+            if (dx, dy) != (0, 0) {
+                sim.spawn_object_at_height(
+                    "E1",
+                    "Americans",
+                    (86 + dx) as u16,
+                    (50 + dy) as u16,
+                    4,
+                    0,
+                    &rules,
+                )
+                .unwrap();
+            }
+        }
+    }
+    let before = sim.entities().len();
+    let team_type = sim.interner.get("TT").unwrap();
+    let (returned, review) = sim.spawn_team_reinforcements(
+        team_type,
+        -1,
+        &rules,
+        Some(&overlay),
+        FrameEffects::default(),
+    );
+    assert!(returned);
+    assert_eq!(review, Some((85, 50)), "no qualifying building receiver");
+    assert_eq!(sim.entities().len(), before + 1);
+}
+
+#[test]
+fn droppod_reinforcements_bypass_a_nearby_refinery() {
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/team_paradrop_transport.json",
+    ))
+    .unwrap();
+    let Some((ini, art)) = retail_rules_and_art() else {
+        return;
+    };
+    let rules =
+        crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art().expect("retail rules");
+    let overlay = OverlayTypeRegistry::from_ini(&ini, Some(&art));
+    let terrain_rules = TerrainRules::from_ini(&ini);
+    for row in corpus
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["case_kind"] == "droppod_transport")
+    {
+        let input = &row["input"];
+        let mut sim = reinforcement_world(&rules, &terrain_rules, input);
+        let origin = (
+            int(&input["origin"][0]) as u16,
+            int(&input["origin"][1]) as u16,
+        );
+        sim.spawn_object_at_height("GAREFN", "Americans", origin.0 + 1, origin.1, 4, 0, &rules)
+            .unwrap();
+        let team_type = sim.interner.get("TT").unwrap();
+        assert!(
+            sim.spawn_team_reinforcements(
+                team_type,
+                -1,
+                &rules,
+                Some(&overlay),
+                FrameEffects::default(),
+            )
+            .0
+        );
+        assert_eq!(
+            sim.entities()
+                .values()
+                .filter(|entity| entity.category() == EntityCategory::Aircraft)
+                .count(),
+            1
+        );
+        let members: Vec<_> = sim
+            .entities()
+            .values()
+            .filter(|entity| entity.category() == EntityCategory::Infantry)
+            .collect();
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().all(|member| member.lifecycle.in_limbo()));
+    }
+}
+
+/// Ares 3.0 TeamTypeClass_CreateInstance_Plane (1003A340, hook 0x65DBB3):
+/// the carrier is the head owner's GetParadropPlane, here its Country's
+/// `ParaDrop.Aircraft=`, not the PDPLANE literal.
+#[test]
+fn ares_droppod_reinforcement_carrier_is_the_countrys_paradrop_plane() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/team_paradrop_transport.json",
+    ))
+    .unwrap();
+    let Some((mut ini, art)) = retail_rules_and_art() else {
+        return;
+    };
+    ini.merge(&crate::rules::ini_parser::IniFile::from_str(
+        "[Americans]\nParaDrop.Aircraft=CARGOPLANE\n",
+    ));
+    let mut rules = RuleSet::from_ini(&ini).expect("patched retail rules");
+    rules.install_art_data(crate::rules::retail_ini_fixture::art_registry(&art));
+    let overlay = OverlayTypeRegistry::from_ini(&ini, Some(&art));
+    let terrain_rules = TerrainRules::from_ini(&ini);
+    let row = corpus
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["case_kind"] == "droppod_transport")
+        .unwrap();
+    let mut sim = reinforcement_world(&rules, &terrain_rules, &row["input"]);
+    let team_type = sim.interner.get("TT").unwrap();
+    assert!(
+        sim.spawn_team_reinforcements(
+            team_type,
+            -1,
+            &rules,
+            Some(&overlay),
+            FrameEffects::default(),
+        )
+        .0
+    );
+    let planes: Vec<_> = sim
+        .entities()
+        .values()
+        .filter(|entity| entity.category() == EntityCategory::Aircraft)
+        .map(|entity| sim.interner.resolve(entity.type_ref()).to_owned())
+        .collect();
+    assert_eq!(planes, ["CARGOPLANE"]);
 }
 
 #[test]
@@ -910,7 +1511,7 @@ fn all01_full_transport_inputs_fit_the_selected_retail_cargo_chain() {
     let mut sim = Simulation::new();
     sim.intern_rule_type_ids(&rules);
     sim.resolve_type_handles(&rules);
-    sim.install_team_ai_registry(&registry, &rules).unwrap();
+    sim.install_team_ai_registry(&registry, &rules);
     // Literal identities/counts below come from the bound physical map,
     // not from a replicated native transport-selection implementation.
     for (name, expected) in [
@@ -1114,11 +1715,7 @@ fn full_reinforcement_members_cargo_and_scalar_cleanup_match_original() {
             "scalar_scope1" => {
                 sim.with_object_placement_scope(|sim| {
                     assert!(sim.object_placement_scope_active());
-                    assert!(sim.discard_constructed_limbo(
-                        head,
-                        Some(&rules),
-                        FrameEffects::default()
-                    ));
+                    assert!(sim.discard_constructed_limbo(head, &rules, FrameEffects::default()));
                 });
                 // Native row supplies the retained1 prior. The Rust caller's
                 // existing RAII scope restores its own prior after the call.
@@ -1642,4 +2239,130 @@ fn action4_recruits_real_released_members_then_script50_and_cleanup_share_owners
         ],
         rng_before
     );
+}
+
+/// Fires one `Full=yes` TeamType whose TaskForce lists `members` (TaskForce
+/// lines such as `0=1,HARV`) through its retail map trigger, returning the
+/// Simulation, the owner and the placed members.
+fn place_full_team(
+    rules: &RuleSet,
+    seed: u64,
+    members: &str,
+) -> (Simulation, crate::sim::intern::InternedId, Vec<u64>) {
+    use crate::sim::world::TickLane;
+    let mut sim = Simulation::with_seed(seed);
+    sim.intern_rule_type_ids(rules);
+    sim.resolve_type_handles(rules);
+    crate::sim::arena_fixture::flat_arena(&mut sim, rules);
+    sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(32, 32));
+    let owner = sim.interner.intern("Americans");
+    sim.houses
+        .register(HouseState::new(owner, 0, Some(owner), true, 0, 10));
+    sim.session.set_current_house_for_test(Some(owner));
+
+    let map = crate::map::map_file::MapFile::from_bytes(format!("[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
+        [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n[Basic]\nNewINIFormat=4\n\
+        [Waypoints]\n4=16016\n[TeamTypes]\n0=FULL_MINER\n\
+        [FULL_MINER]\nHouse=Americans\nScript=FULL_SCRIPT\nTaskForce=FULL_FORCE\nWaypoint=E\nFull=yes\n\
+        [ScriptTypes]\n0=FULL_SCRIPT\n[FULL_SCRIPT]\n0=50,60\n\
+        [TaskForces]\n0=FULL_FORCE\n[FULL_FORCE]\n{members}\n\
+        [Triggers]\nARRIVAL=Americans,<none>,Full miner arrives,0,1,1,1,0\n\
+        [Events]\nARRIVAL=1,13,0,0\n[Actions]\nARRIVAL=1,80,1,FULL_MINER,0,0,0,0,E\n\
+        [Tags]\nARRIVAL_TAG=0,Full arrival,ARRIVAL\n").as_bytes()).unwrap();
+    let (_, assets) = crate::rules::retail_ini_fixture::retail_assets().unwrap();
+    let teams = TeamAiIniRegistry::load_retail(&assets, &map.ini, true).unwrap();
+    sim.initialize_trigger_definitions(&map, &teams, None, None, None);
+    sim.install_team_ai_registry(&teams, rules);
+    sim.session.install_waypoints(&map.waypoints);
+    sim.classify_map_triggers(rules);
+    let team_type = sim.interner.get("FULL_MINER").unwrap();
+    for _ in 0..32 {
+        let result = sim
+            .advance_app_frame(
+                &[],
+                rules,
+                Some(rules.overlay_registry()),
+                67,
+                TickLane::Ordinary,
+                FrameEffects::default(),
+            )
+            .expect("ordinary frame");
+        assert!(result.tick.frame_committed);
+        if let Some(team) = sim.team_script_vm.first_team_of_type(team_type) {
+            let members = team.members().collect();
+            return (sim, owner, members);
+        }
+    }
+    panic!("Full=yes must place its positive-Storage members");
+}
+
+#[test]
+fn full_harvester_reinforcement_fills_its_hold_with_slot_zero_before_placement() {
+    // Native CreateMembers65DD30 fills slot0 at 65DE53..65DE80 (StorageClass
+    // AddAmount 6C9690) before veterancy and AddMember.
+    use crate::rules::tiberium_type::TiberiumTypeId;
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = &retail.rules;
+    let object = rules.object("HARV").unwrap();
+    assert_eq!(object.storage, 40, "selected retail HARV capacity");
+    assert_eq!(
+        rules.tiberium_types.get(TiberiumTypeId(0)).unwrap().section,
+        "Riparius"
+    );
+
+    let (sim, owner, members) = place_full_team(rules, 0x65DD_0030, "0=1,HARV");
+    assert_eq!(members.len(), 1);
+    let entity = sim.entities().get(members[0]).unwrap();
+    assert!(!entity.lifecycle.in_limbo() && entity.lifecycle.cell_marked());
+    assert_eq!(sim.interner.resolve(entity.type_ref()), "HARV");
+    let cargo = entity.miner.as_ref().unwrap().cargo();
+    assert_eq!(cargo.len(), 40);
+    assert!(
+        cargo
+            .iter()
+            .all(|bale| bale.tiberium_type == TiberiumTypeId(0))
+    );
+    assert_eq!(
+        entity.techno_pip_fill_level(object, rules, None),
+        object.pip_max(rules)
+    );
+    assert_eq!(
+        sim.houses[&owner].economy().credits(),
+        0,
+        "fill is not payment"
+    );
+}
+
+#[test]
+fn full_slave_miner_reinforcement_fills_the_miner_and_slave_holds() {
+    // 65DE53..65DE80 fills every member with Type.Storage > 0, not only
+    // Harvester= vehicles: retail SMIN (Storage=20) and SLAV (Storage=4).
+    use crate::rules::tiberium_type::TiberiumTypeId;
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = &retail.rules;
+    let (sim, _, members) = place_full_team(rules, 0x65DD_0031, "0=1,SMIN\n1=2,SLAV");
+    assert_eq!(members.len(), 3);
+    for member in members {
+        let entity = sim.entities().get(member).unwrap();
+        let object = sim.object_type(entity.type_ref(), rules).unwrap();
+        let bales = entity.storage_bales();
+        assert_eq!(bales.len() as i32, object.storage, "{} hold", object.id);
+        assert!(
+            bales
+                .iter()
+                .all(|bale| bale.tiberium_type == TiberiumTypeId(0))
+        );
+        if object.id == "SLAV" {
+            assert!(entity.miner.is_none());
+            assert_eq!(
+                entity.techno_pip_fill_level(object, rules, None),
+                object.pip_max(rules),
+                "SLAV PipScale=Tiberium shows the full hold"
+            );
+        }
+    }
 }

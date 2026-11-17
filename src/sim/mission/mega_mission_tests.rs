@@ -303,7 +303,7 @@ fn mega_mission_bodies_match_the_original_rows() {
                     continue;
                 }
                 match entry {
-                    "clear" => sim.foot_clear_all_tarcom(OWNER),
+                    "clear" => sim.substrate.foot_clear_all_tarcom(OWNER),
                     "has_saved_mission" | "is_attack_move" => assert_eq!(
                         sim.mega_mission(OWNER).is_attack_move(),
                         answer != 0,
@@ -312,7 +312,7 @@ fn mega_mission_bodies_match_the_original_rows() {
                     "resume" => assert_eq!(
                         sim.foot_continue_mega_mission(
                             OWNER,
-                            Some(&rules),
+                            &rules,
                             None,
                             FrameEffects::default()
                         ),
@@ -320,12 +320,7 @@ fn mega_mission_bodies_match_the_original_rows() {
                         "{context}"
                     ),
                     _ => assert_eq!(
-                        sim.foot_refresh_mega_mission(
-                            OWNER,
-                            Some(&rules),
-                            None,
-                            FrameEffects::default()
-                        ),
+                        sim.foot_refresh_mega_mission(OWNER, &rules, None, FrameEffects::default()),
                         answer != 0,
                         "{context}"
                     ),
@@ -407,7 +402,7 @@ fn mega_mission_bodies_match_the_original_rows() {
                     event_mission,
                     event_target,
                     event_destination,
-                    Some(&rules),
+                    &rules,
                 );
                 assert_eq!(i64::from(answered.id()), answer, "{context}: answer");
                 compare_after(&sim, row, unread, context);

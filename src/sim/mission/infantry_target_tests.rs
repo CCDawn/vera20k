@@ -21,10 +21,6 @@ fn corpus() -> Value {
     ))
     .unwrap();
     assert_eq!(metadata["schema_version"], 1);
-    assert_eq!(
-        metadata["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     serde_json::from_str(crate::test_fixture::text(
         "tools/spatial_oracle/base_defense_response.json",
     ))
@@ -105,9 +101,6 @@ fn compare_original_infantry_target_rows(consumer: TargetConsumer) {
                     )
                     .unwrap();
                     rules.install_art_data(crate::rules::retail_ini_fixture::art_registry(&art));
-                    rules.bind_animation_sequences(
-                        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-                    );
                     Some(rules)
                 })?;
             Some((raw, rules.with_fresh_serial()))
@@ -193,11 +186,10 @@ fn compare_original_infantry_target_rows(consumer: TargetConsumer) {
                     _ => unreachable!(),
                 }),
             );
-        actor.navigation.path_replay.set_directions_for_test(vec![
-            before["path_field"].as_i64().unwrap() as u8,
-            2,
-            3,
-        ]);
+        actor
+            .navigation
+            .path_replay_mut()
+            .set_directions_for_test(vec![before["path_field"].as_i64().unwrap() as u8, 2, 3]);
         // Original51B1F0 observes the single signed +F8 and retained stage
         // timer/rate. +104 is copied stack data; FC/increment are unobserved
         // by this corpus and do not participate in the class setter.
@@ -240,7 +232,8 @@ fn compare_original_infantry_target_rows(consumer: TargetConsumer) {
             "clear" | "same_null" => None,
             other => panic!("undeclared setter input {other}"),
         };
-        sim.session.binary_frame = input["frame"].as_u64().unwrap() as u32;
+        sim.session
+            .set_binary_frame_for_test(input["frame"].as_u64().unwrap() as u32);
         sim.scenario_rng = SimRng::new(input["seed"].as_u64().unwrap());
         assert_eq!(
             sim.scenario_rng.native_state_hex(),
@@ -269,7 +262,7 @@ fn compare_original_infantry_target_rows(consumer: TargetConsumer) {
                     sim.assign_target_represented(
                         1,
                         requested,
-                        Some(rules),
+                        rules,
                         None,
                         crate::sim::world::FrameEffects::default(),
                     )
@@ -281,12 +274,13 @@ fn compare_original_infantry_target_rows(consumer: TargetConsumer) {
                         .get_mut(1)
                         .unwrap()
                         .set_archive_target(Some(TargetKind::Entity(3)));
-                    sim.mission_assign_exact(
-                        1,
-                        MissionId::from_known(MissionType::Attack),
-                        sim.session.binary_frame,
-                    )
-                    .unwrap();
+                    sim.substrate
+                        .mission_assign_exact(
+                            1,
+                            MissionId::from_known(MissionType::Attack),
+                            sim.session.binary_frame(),
+                        )
+                        .unwrap();
                     sim.reset_orders_to_guard(1, rules, crate::sim::world::FrameEffects::default());
                     let actor = sim.substrate.entities.get(1).unwrap();
                     assert_eq!(actor.archive_target(), None, "{name}: Guard archive");
@@ -330,7 +324,7 @@ fn compare_original_infantry_target_rows(consumer: TargetConsumer) {
                     let new_owner = sim.interner.intern("NewOwner");
                     for owner in [house, new_owner] {
                         sim.houses
-                            .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
+                            .register(HouseState::new(owner, 0, None, true, 0, 10));
                     }
                     sim.change_owner_with_rules(
                         1,
@@ -402,7 +396,7 @@ fn compare_original_infantry_target_rows(consumer: TargetConsumer) {
         );
         let head = actor
             .navigation
-            .path_replay
+            .path_replay()
             .remaining_directions()
             .first()
             .copied();

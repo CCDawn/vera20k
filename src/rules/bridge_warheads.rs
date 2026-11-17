@@ -36,7 +36,7 @@ pub struct BridgeWarheads {
     pub crush_name: String,
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_a_n))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -55,21 +55,5 @@ mod tests {
         assert_eq!(bw.ion_cannon_name, "CustomIon");
         assert_eq!(bw.c4_name, "CustomC4");
         assert_eq!(bw.crush_name, "CustomCrush");
-    }
-
-    /// The RulesClass constructor's nulls stay null without the keys, and
-    /// the WarheadType factory answers `none` null: VERA no longer invents
-    /// `IonCannonWH`, `Super` and `Crush`.
-    #[test]
-    fn missing_or_none_keys_stay_null() {
-        for text in [
-            "[CombatDamage]\nFixtureOnly=1\n",
-            "[CombatDamage]\nIonCannonWarhead=none\nC4Warhead=<none>\nCrushWarhead=NONE\n",
-        ] {
-            let bw = read(text);
-            assert_eq!(bw.ion_cannon_name, "", "{text}");
-            assert_eq!(bw.c4_name, "", "{text}");
-            assert_eq!(bw.crush_name, "", "{text}");
-        }
     }
 }

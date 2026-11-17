@@ -11,13 +11,26 @@ pub(crate) enum PresentedShell {
     SinglePlayer,
     MoviesAndCredits,
     MovieList,
+    Mods,
     FullscreenMovie,
     CreditsRoll,
     Skirmish,
     Campaign,
     LoadSavedGame,
     Options,
+    LanLobby,
+    NetworkSetup,
     WolWelcome,
+    WolLogin,
+    WolLobby,
+    WolOptions,
+    WolSoundOptions,
+    WolAutoLoginQuery,
+    WolLocale,
+    WolMyInformation,
+    WolBuddyList,
+    WolQuickMatch,
+    WolAddBuddyQuery,
     Score,
 }
 
@@ -48,6 +61,8 @@ enum Phase {
     Defeating,
     /// The score page `0x108` is up after the defeat.
     Scoring,
+    /// Tab opened Diplomacy `0x73` over the running game.
+    Diplomacy,
     /// Continue was pressed on the settled score page.
     Continuing,
 }
@@ -67,6 +82,9 @@ pub(super) enum LoadingTarget {
     DefeatScore,
     /// The same, then Continue: the new `0x102` settled.
     DefeatContinue,
+    /// The game runs [`QUIT_AFTER_FRAMES`] frames, then Tab opens the
+    /// Diplomacy dialog `0x73` through the production key path; it settled.
+    Diplomacy,
 }
 
 /// In-game frames before the quit route presses Leave.
@@ -120,16 +138,16 @@ pub(super) enum RandomMapTarget {
     /// asks to eject AI players while no dialog shows or slides. Cancel slides
     /// the chooser in and it settles; OK closes it without a slide and `0x102`
     /// settles with the random map.
-    Eject(crate::ui::skirmish_shell::EjectPromptButton),
+    Eject(crate::ui::skirmish_shell::ChooseMapPromptButton),
     /// The same route's eject box, presented over no dialog.
     EjectBox,
 }
 
 /// Create Random Map on `0x6B` and Cancel on `0x105` at 800x600.
-const CREATE_RANDOM_MAP_POINT: (i32, i32) = (720, 262);
+pub(super) const CREATE_RANDOM_MAP_POINT: (i32, i32) = (720, 262);
 const RANDOM_MAP_CANCEL_POINT: (i32, i32) = (720, 556);
-const RANDOM_MAP_USE_MAP_POINT: (i32, i32) = (720, 220);
-const RANDOM_MAP_GENERATE_POINT: (i32, i32) = (432, 430);
+pub(super) const RANDOM_MAP_USE_MAP_POINT: (i32, i32) = (720, 220);
+pub(super) const RANDOM_MAP_GENERATE_POINT: (i32, i32) = (432, 430);
 /// Terrain Type's arrow, and Map Size's face below its open list, at 800x600
 /// (the retail helper's `ej-list-open.png` click and `ej-list-off.png` point).
 const RANDOM_MAP_TERRAIN_ARROW_POINT: (i32, i32) = (484, 79);
@@ -156,6 +174,9 @@ pub(super) struct SkirmishCapture {
     /// mouse move.
     hover: Option<(i32, i32)>,
     hovered: bool,
+    /// Once `0x102` settles, open VERA's Game Options through its button.
+    game_options: bool,
+    game_options_opened: bool,
     /// The random-map routes rest the pointer on Create Random Map until the
     /// chooser's help has typed in before pressing it: the retail helper's
     /// click rests 100 ms before its press and 90 ms more before its release,
@@ -175,6 +196,8 @@ pub(super) struct SkirmishCapture {
     answer_rested: bool,
     loading: Option<LoadingTarget>,
     in_game_frames: u32,
+    /// Frames Diplomacy has presented.
+    diplomacy_frames: u32,
     deploy_sent: bool,
     sell_sent: bool,
 }
@@ -257,7 +280,7 @@ fn guard(
             ) && shell
                 .choose_map_modal
                 .as_ref()
-                .is_some_and(|modal| modal.eject_prompt.is_some()))
+                .is_some_and(|modal| modal.message_box.is_some()))
             || shell.validation_modal.is_some()
             || (shell.saved_seed_browser.is_some()
                 && chooser != Some(ChooserTarget::RandomMap(RandomMapTarget::SeedBrowserReturn)))
@@ -322,7 +345,7 @@ fn selected_scene(state: &AppState) -> Result<Value> {
             "credits": shell.starting_credits, "speed": shell.game_speed, "units": shell.unit_count,
             "short_game": shell.short_game, "super_weapons": shell.super_weapons,
             "build_off_ally": shell.build_off_ally, "crates": shell.crates,
-            "mcv_redeploy": shell.mcv_redeploy, "zoom": shell.zoom_enabled
+            "mcv_redeploy": shell.mcv_redeploy
         }
     }))
 }
@@ -375,6 +398,13 @@ impl SkirmishCapture {
         }
     }
 
+    pub(super) fn game_options() -> Self {
+        Self {
+            game_options: true,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn random_map(target: RandomMapTarget) -> Self {
         Self::chooser(ChooserTarget::RandomMap(target))
     }
@@ -411,6 +441,7 @@ impl SkirmishCapture {
                     | Phase::Defeating
                     | Phase::Scoring
                     | Phase::Continuing
+                    | Phase::Diplomacy
             ),
             (rest.0 as f32, rest.1 as f32),
         )
@@ -457,7 +488,7 @@ impl SkirmishCapture {
                 .skirmish_shell_state
                 .choose_map_modal
                 .as_ref()
-                .is_some_and(|modal| modal.eject_prompt.is_some()),
+                .is_some_and(|modal| modal.message_box.is_some()),
             "Use Map on the first map did not ask to eject AI players"
         );
         self.route.push(json!({"dialog": 0x6b, "frame": frame,
@@ -479,13 +510,13 @@ impl SkirmishCapture {
         wanted: impl Fn(&crate::rules::object_type::ObjectType) -> bool,
     ) -> Option<u64> {
         let owner = crate::app::input::commands::preferred_local_owner_name(state)?;
-        let sim = &state.match_state.sim_runtime.as_ref()?.simulation;
+        let sim = &state.match_state.sim_runtime.runtime()?.simulation;
         let rules = state.rules()?;
         sim.entities()
             .values_sorted()
-            .filter(|entity| sim.interner.resolve(entity.owner()) == owner)
+            .filter(|entity| sim.interner().resolve(entity.owner()) == owner)
             .find(|entity| {
-                sim.interner
+                sim.interner()
                     .object_type(entity.type_ref(), rules)
                     .is_some_and(&wanted)
             })
@@ -573,6 +604,7 @@ impl SkirmishCapture {
                 LoadingTarget::AfterQuit
                     | LoadingTarget::DefeatScore
                     | LoadingTarget::DefeatContinue
+                    | LoadingTarget::Diplomacy
             )
         ) {
             std::time::Duration::from_secs(180)
@@ -733,10 +765,13 @@ impl SkirmishCapture {
     fn add_second_ai(&mut self, state: &mut AppState, frame: u32) -> Result<()> {
         use crate::ui::skirmish_shell::{SkirmishAiRowType, SkirmishComboId, SkirmishComboItem};
         let id = SkirmishComboId::AiType(1);
-        let layout =
-            crate::ui::skirmish_shell::compute_layout(state.render_width(), state.render_height());
-        let face = crate::ui::skirmish_shell::combo_rect(&layout, id)
-            .context("AI row 2 has no type combo")?;
+        let layout = crate::app::frontend::shell_layout::skirmish_layout(state);
+        let face = crate::ui::skirmish_shell::combo_rect(
+            &layout,
+            &state.frontend.skirmish_shell_state,
+            id,
+        )
+        .context("AI row 2 has no type combo")?;
         Self::set_pointer(
             state,
             (
@@ -778,13 +813,60 @@ impl SkirmishCapture {
         Ok(())
     }
 
+    /// The defeat routes need Short Game (`0x54E`), which the profile may
+    /// have saved off: only then does selling the last building, with no
+    /// `BaseUnit=` left, defeat the house (`HouseClass::Update`
+    /// `0x004F8EBD..0x004F8F77`); otherwise the starting units keep it alive.
+    /// The route checks the box through the production click.
+    /// VERA's Game Options through the production press and release; the
+    /// pointer then rests again.
+    fn open_game_options(&mut self, state: &mut AppState, frame: u32) -> Result<()> {
+        let button = crate::app::frontend::shell_layout::skirmish_layout(state).game_options_button;
+        Self::set_pointer(state, (button.x + button.w / 2, button.y + button.h / 2));
+        App::handle_skirmish_shell_mouse_down(state);
+        App::handle_skirmish_shell_mouse_up(state);
+        Self::set_pointer(state, self.rest_point());
+        ensure!(
+            state.frontend.skirmish_shell_state.game_options.is_some(),
+            "Game Options did not open its box"
+        );
+        self.game_options_opened = true;
+        self.route
+            .push(json!({"dialog": 0x102, "frame": frame, "action": "Game Options"}));
+        Ok(())
+    }
+
+    fn check_short_game(&mut self, state: &mut AppState, frame: u32) -> Result<()> {
+        use crate::ui::skirmish_shell::SkirmishCheckboxId;
+        let layout = crate::app::frontend::shell_layout::skirmish_layout(state);
+        let rect = layout
+            .checkboxes
+            .iter()
+            .find(|checkbox| checkbox.id == SkirmishCheckboxId::ShortGame0x54e)
+            .context("0x102 has no Short Game box")?
+            .rect;
+        let icon = crate::ui::skirmish_shell::checkbox_icon_rect(rect, layout.scale);
+        Self::set_pointer(state, (icon.x + icon.w / 2, icon.y + icon.h / 2));
+        App::handle_skirmish_shell_mouse_down(state);
+        App::handle_skirmish_shell_mouse_up(state);
+        Self::set_pointer(state, self.rest_point());
+        ensure!(
+            state.frontend.skirmish_shell_state.short_game,
+            "the Short Game box did not take the click"
+        );
+        self.selected_scene = Some(selected_scene(state)?);
+        self.route
+            .push(json!({"dialog": 0x102, "frame": frame, "action": "check Short Game"}));
+        Ok(())
+    }
+
     /// Players 2, Generate Map and Use Map; once `0x105` has slid out, the
     /// hidden chooser's eject box asks while no dialog shows or slides, and
     /// the route answers it a presented frame later (`None` leaves it up).
     fn eject_step(
         &mut self,
         state: &mut AppState,
-        answer: Option<crate::ui::skirmish_shell::EjectPromptButton>,
+        answer: Option<crate::ui::skirmish_shell::ChooseMapPromptButton>,
         frame: u32,
     ) -> Result<()> {
         let shell = &state.frontend.skirmish_shell_state;
@@ -807,7 +889,7 @@ impl SkirmishCapture {
             shell
                 .choose_map_modal
                 .as_ref()
-                .is_some_and(|modal| modal.eject_prompt.is_some()),
+                .is_some_and(|modal| modal.message_box.is_some()),
             "Use Map on the two-player random map did not ask to eject AI players"
         );
         ensure!(
@@ -830,20 +912,20 @@ impl SkirmishCapture {
             state.render_height() as i32,
         );
         let button = match answer {
-            crate::ui::skirmish_shell::EjectPromptButton::Ok => layout.ok,
-            crate::ui::skirmish_shell::EjectPromptButton::Cancel => layout.cancel,
+            crate::ui::skirmish_shell::ChooseMapPromptButton::Ok => layout.ok,
+            crate::ui::skirmish_shell::ChooseMapPromptButton::Cancel => layout.cancel,
         };
         Self::set_pointer(state, (button.x + button.w / 2, button.y + button.h / 2));
-        App::handle_choose_map_eject_mouse_down(state);
-        App::handle_choose_map_eject_mouse_up(state);
+        App::handle_choose_map_prompt_mouse_down(state);
+        App::handle_choose_map_prompt_mouse_up(state);
         Self::set_pointer(state, self.rest_point());
         let shell = &state.frontend.skirmish_shell_state;
         match answer {
-            crate::ui::skirmish_shell::EjectPromptButton::Ok => ensure!(
+            crate::ui::skirmish_shell::ChooseMapPromptButton::Ok => ensure!(
                 shell.choose_map_modal.is_none() && state.frontend.shell_exit.is_none(),
                 "OK on the eject box slid the hidden chooser out"
             ),
-            crate::ui::skirmish_shell::EjectPromptButton::Cancel => ensure!(
+            crate::ui::skirmish_shell::ChooseMapPromptButton::Cancel => ensure!(
                 shell.top_dialog()
                     == Some(crate::ui::skirmish_shell::SkirmishShellDialog::ChooseMap),
                 "Cancel on the eject box did not show the chooser"
@@ -980,6 +1062,11 @@ impl SkirmishCapture {
                     self.hovered = true;
                     self.route.push(json!({"dialog": 0x102, "frame": frame,
                         "action": "pointer rests", "point": [point.0, point.1]}));
+                } else if self.game_options
+                    && self.selected_scene.is_some()
+                    && !self.game_options_opened
+                {
+                    self.open_game_options(state, frame)?;
                 } else if self.selected_scene.is_some() && self.slide_out_tick.is_some() {
                     App::handle_skirmish_back(state);
                     ensure!(
@@ -989,6 +1076,11 @@ impl SkirmishCapture {
                     self.route
                         .push(json!({"dialog": 0x102, "frame": frame, "action": "Back"}));
                     self.phase = Phase::SlideOut;
+                } else if self.selected_scene.is_some()
+                    && self.defeat_route()
+                    && !state.frontend.skirmish_shell_state.short_game
+                {
+                    self.check_short_game(state, frame)?;
                 } else if self.selected_scene.is_some() && self.loading.is_some() {
                     // The pointer moves onto Start Game (`0x617`), whose help
                     // reaches the status line as it would before a click,
@@ -1227,10 +1319,12 @@ impl SkirmishCapture {
                 // Cancel shows the chooser, whose first paint slides it in
                 // (`0x005E6B47`); OK shows `0x102` again.
                 let kind = match answer {
-                    crate::ui::skirmish_shell::EjectPromptButton::Cancel => {
+                    crate::ui::skirmish_shell::ChooseMapPromptButton::Cancel => {
                         ShellSlideKind::ChooseMap
                     }
-                    crate::ui::skirmish_shell::EjectPromptButton::Ok => ShellSlideKind::Skirmish,
+                    crate::ui::skirmish_shell::ChooseMapPromptButton::Ok => {
+                        ShellSlideKind::Skirmish
+                    }
                 };
                 if entry_wave_tick(state, kind).is_some() {
                     self.entry_seen = true;
@@ -1272,6 +1366,54 @@ impl SkirmishCapture {
                         "action": "Leave", "in_game_frames": self.in_game_frames}));
                     self.phase = Phase::Quitting;
                 }
+            }
+            (Phase::Starting, _)
+                if self.loading == Some(LoadingTarget::Diplomacy)
+                    && state.frontend.screen == GameScreen::InGame =>
+            {
+                self.in_game_frames += 1;
+                if self.in_game_frames == QUIT_AFTER_FRAMES {
+                    press_diplomacy_tab(state)?;
+                    self.route.push(json!({"screen": "in game", "frame": frame,
+                        "action": "Tab", "dialog": 0x73, "in_game_frames": self.in_game_frames}));
+                    // Rest on row 1's name, right of its text, so the status
+                    // line shows that static's help.
+                    let shell =
+                        crate::app::frontend::skirmish_shell_render::current_in_game_shell_layout(
+                            state,
+                        )
+                        .context("Diplomacy has no loaded geometry")?;
+                    let name = crate::ui::shell::diplomacy::diplomacy_layout(
+                        shell.width,
+                        shell.height,
+                        shell.layout,
+                        shell.button_size,
+                    )
+                    .names[1];
+                    let point = (name.x + name.w - 8, name.y + name.h / 2);
+                    Self::set_pointer(state, point);
+                    crate::app::input::dispatch::handle_cursor_moved_in_game(state);
+                    ensure!(
+                        state.match_state.match_presentation.diplomacy.hovered
+                            == Some(crate::ui::shell::diplomacy::DiplomacyControl::Name(1)),
+                        "the pointer missed row 1's name"
+                    );
+                    self.route
+                        .push(json!({"frame": frame, "action": "pointer rests",
+                        "dialog": 0x73, "point": [point.0, point.1]}));
+                    self.phase = Phase::Diplomacy;
+                }
+            }
+            (Phase::Diplomacy, _) => {
+                ensure!(
+                    state.match_state.match_presentation.in_game_menu
+                        == crate::ui::pause_menu::InGameMenuState::Diplomacy
+                        && crate::app::frontend::skirmish_shell_render::native_in_game_shell_active(
+                            state
+                        ),
+                    "Diplomacy did not present with its required loaded artwork"
+                );
+                self.diplomacy_frames += 1;
             }
             (Phase::Starting, _)
                 if self.defeat_route() && state.frontend.screen == GameScreen::InGame =>
@@ -1364,7 +1506,7 @@ impl SkirmishCapture {
                         .skirmish_shell_state
                         .choose_map_modal
                         .as_ref()
-                        .is_some_and(|modal| modal.eject_prompt.is_some()));
+                        .is_some_and(|modal| modal.message_box.is_some()));
             }
             Some(ChooserTarget::Entry(target)) => {
                 return Ok(self.phase == Phase::Chooser
@@ -1423,14 +1565,16 @@ impl SkirmishCapture {
                             && Self::chooser_settled(state)
                     }
                     RandomMapTarget::Eject(
-                        crate::ui::skirmish_shell::EjectPromptButton::Cancel,
+                        crate::ui::skirmish_shell::ChooseMapPromptButton::Cancel,
                     ) => {
                         self.phase == Phase::RandomMapEject
                             && self.answer_rested
                             && Self::chooser_settled(state)
                     }
                     RandomMapTarget::EjectBox => self.phase == Phase::RandomMap && self.eject_seen,
-                    RandomMapTarget::Eject(crate::ui::skirmish_shell::EjectPromptButton::Ok) => {
+                    RandomMapTarget::Eject(
+                        crate::ui::skirmish_shell::ChooseMapPromptButton::Ok,
+                    ) => {
                         self.phase == Phase::RandomMapEject
                             && self.answer_rested
                             && state
@@ -1467,6 +1611,9 @@ impl SkirmishCapture {
                 && self.last_presented == Some(PresentedShell::Skirmish)
                 && self.settled(state)?);
         }
+        if self.loading == Some(LoadingTarget::Diplomacy) {
+            return Ok(self.phase == Phase::Diplomacy && self.diplomacy_frames >= 2);
+        }
         if self.loading == Some(LoadingTarget::AfterQuit) {
             return Ok(self.phase == Phase::Quitting
                 && state.frontend.screen == GameScreen::MainMenu
@@ -1483,9 +1630,8 @@ impl SkirmishCapture {
                 LoadingTarget::FirstFrame
                 | LoadingTarget::AfterQuit
                 | LoadingTarget::DefeatScore
-                | LoadingTarget::DefeatContinue => {
-                    crate::app::loading::pump::NextLoadingFrame::First
-                }
+                | LoadingTarget::DefeatContinue
+                | LoadingTarget::Diplomacy => crate::app::loading::pump::NextLoadingFrame::First,
             };
             return Ok(self.phase == Phase::Starting
                 && state.frontend.screen == GameScreen::Loading
@@ -1505,6 +1651,7 @@ impl SkirmishCapture {
             || self.last_presented != Some(PresentedShell::Skirmish)
             || self.selected_scene.is_none()
             || self.hover.is_some() != self.hovered
+            || self.game_options != self.game_options_opened
         {
             return Ok(false);
         }
@@ -1542,7 +1689,7 @@ impl SkirmishCapture {
                             RandomMapTarget::CancelEntry(_)
                             | RandomMapTarget::CancelSteady
                             | RandomMapTarget::Eject(
-                                crate::ui::skirmish_shell::EjectPromptButton::Cancel,
+                                crate::ui::skirmish_shell::ChooseMapPromptButton::Cancel,
                             )
                             | RandomMapTarget::EjectBox,
                         ),
@@ -1552,7 +1699,7 @@ impl SkirmishCapture {
                 (
                     Some(ChooserTarget::RandomMap(
                         RandomMapTarget::UseMap
-                        | RandomMapTarget::Eject(crate::ui::skirmish_shell::EjectPromptButton::Ok),
+                        | RandomMapTarget::Eject(crate::ui::skirmish_shell::ChooseMapPromptButton::Ok),
                     )),
                     _,
                 ) => Some(0x102),
@@ -1576,7 +1723,7 @@ impl SkirmishCapture {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
 
@@ -1630,4 +1777,35 @@ mod tests {
             assert!(invalid.validate().is_err());
         }
     }
+}
+
+/// Tab through the ordinary key edge: the binding lookup falls back to
+/// Request_Diplomacy_Menu (0x0055E08A), which must open 0x73.
+pub(super) fn press_diplomacy_tab(state: &mut AppState) -> Result<()> {
+    let tab = winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab);
+    for edge in [
+        winit::event::ElementState::Pressed,
+        winit::event::ElementState::Released,
+    ] {
+        let paused_at_event = state.match_state.paused();
+        crate::app::input::keyboard::in_game_key_edge(
+            state,
+            crate::app::input::keyboard::InGameKeyEdge {
+                physical: winit::keyboard::KeyCode::Tab,
+                logical: &tab,
+                unmodified: &tab,
+                location: winit::keyboard::KeyLocation::Standard,
+                state: edge,
+                repeat: false,
+                text: None,
+            },
+            paused_at_event,
+        );
+    }
+    ensure!(
+        state.match_state.match_presentation.in_game_menu
+            == crate::ui::pause_menu::InGameMenuState::Diplomacy,
+        "Tab did not open the Diplomacy dialog"
+    );
+    Ok(())
 }

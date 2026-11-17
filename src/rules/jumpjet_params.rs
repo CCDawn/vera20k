@@ -88,8 +88,8 @@ pub struct JumpjetParams {
     pub crash: f32,
     /// Target hover altitude in leptons (`JumpjetHeight=`, `+0xD80`).
     ///
-    /// RESIDUAL — DRIFT, not implemented in VERA. gamemd never hovers at this
-    /// value raw: the `JumpjetLocomotionClass` parameter copy at `0x0054AD30`
+    /// The stored type value is raw. gamemd never hovers at a value below the
+    /// `JumpjetLocomotionClass` floor: the parameter copy at `0x0054AD30`
     /// clamps it **up** on the way into the locomotor (`0x0054AD9B`:
     /// `ECX = 2 * [0x00ABC5E8]`, `CMP EAX,ECX`, `JG` keeps the type's value,
     /// else `EAX = ECX`), giving an effective floor of **208 leptons**.
@@ -102,14 +102,11 @@ pub struct JumpjetParams {
     /// `ftol(tan_table(pi/2 - pi/3) * 362.0387 * 0.5)`, the 0.5 being
     /// `[0x007E1738]`. The table entry the index lands on, `0x0085D5F8`, holds
     /// `0x3F13A08F = 0.5766687`, so `104.3878 -> 104` and the floor is
-    /// `2 * 104`. Every constant in that chain was read out of the binary.
+    /// `2 * 104`.
     ///
-    /// Trigger: a section authoring `JumpjetHeight` below 208. Player effect:
-    /// that unit hovers lower in VERA than in gamemd, permanently. Frequency:
-    /// **zero on stock data** — the lowest authored height in retail
-    /// `rulesmd.ini` is 500, and `[ZEP]`/`[DISK]` author 750, so every stock
-    /// jumpjet clears the floor. Only a mod or map INI can reach it.
-    /// Downstream risk: none — nothing else reads the clamped value.
+    /// [`JumpjetFlightParams::link`](crate::sim::movement::jumpjet_flight::JumpjetFlightParams::link)
+    /// applies the same floor (`height.max(2 * GROUND_LEVEL_HEIGHT_LEPTONS)`),
+    /// including for a Phobos warhead override.
     pub height: i32,
     /// Acceleration rate (`JumpjetAccel=`, `+0xD84`). Deceleration = accel *
     /// 1.5.
@@ -159,7 +156,8 @@ impl JumpjetParams {
             turn_rate: section.read_int("JumpjetTurnRate", ctor.turn_rate),
             // `0x007150D0 PUSH 0x8436C0` -> `0x007150E4 MOV [EBP+0xD74],EAX`:
             // ReadInt, so a fractional `JumpjetSpeed=16.5` reads as 16.
-            speed: SimFixed::from_num(section.read_int("JumpjetSpeed", CTOR_SPEED)),
+            // Saturating: SimFixed holds +-32767, ReadInt the full i32.
+            speed: SimFixed::saturating_from_num(section.read_int("JumpjetSpeed", CTOR_SPEED)),
             // `0x007150F8 PUSH 0x8436B0` -> `0x0071510A FSTP [EBP+0xD78]`.
             climb: section.read_float("JumpjetClimb", ctor.climb),
             // `0x0071511E PUSH 0x8436A0` -> `0x00715130 FSTP [EBP+0xD7C]`.
@@ -179,7 +177,101 @@ impl JumpjetParams {
     }
 }
 
-#[cfg(test)]
+/// Phobos per-warhead Jumpjet overrides (`WarheadTypeExt::Jumpjet*`,
+/// `src/Ext/WarheadType/Body.{h,cpp}`). Every field is `Nullable*`: `None`
+/// inherits the target TechnoType's [`JumpjetParams`] value. Read for every
+/// warhead; only an `IsLocomotor=` shot whose installed locomotor is Jumpjet
+/// applies them.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct JumpjetOverride {
+    pub turn_rate: Option<i32>,
+    pub speed: Option<i32>,
+    pub climb: Option<f32>,
+    pub crash: Option<f32>,
+    pub height: Option<i32>,
+    pub accel: Option<f32>,
+    pub wobbles: Option<f32>,
+    pub no_wobbles: Option<bool>,
+    pub deviation: Option<i32>,
+}
+
+impl JumpjetOverride {
+    /// Phobos `WarheadTypeExt::LoadFromINIFile` (`Body.cpp:327..335`), in
+    /// native read order. `Nullable<int>` uses `ReadInteger`, `Nullable<float>`
+    /// uses `read<float>` over `Parser<double>` (binary32 result), and
+    /// `Nullable<bool>` uses `ReadBool`.
+    #[cfg(feature = "phobos")]
+    pub fn from_section(section: &IniSection) -> Self {
+        let read_f32 = |key: &str, current: Option<f32>| {
+            section
+                .read_phobos_nullable_double(key, current.map(f64::from))
+                .map(|value| value as f32)
+        };
+        Self {
+            turn_rate: section.read_phobos_nullable_int("JumpjetTurnRate", None),
+            speed: section.read_phobos_nullable_int("JumpjetSpeed", None),
+            climb: read_f32("JumpjetClimb", None),
+            crash: read_f32("JumpjetCrash", None),
+            height: section.read_phobos_nullable_int("JumpjetHeight", None),
+            accel: read_f32("JumpjetAccel", None),
+            wobbles: read_f32("JumpjetWobbles", None),
+            no_wobbles: section.read_phobos_nullable_bool("JumpjetNoWobbles", None),
+            deviation: section.read_phobos_nullable_int("JumpjetDeviation", None),
+        }
+    }
+
+    /// Copy each present key over the target type's block. `JumpjetHeight`
+    /// stays raw here; the locomotor link floors it at 208 leptons exactly as
+    /// it does for a type-authored height.
+    pub fn apply_to(&self, params: &mut JumpjetParams) {
+        if let Some(value) = self.turn_rate {
+            params.turn_rate = value;
+        }
+        if let Some(value) = self.speed {
+            params.speed = SimFixed::saturating_from_num(value);
+        }
+        if let Some(value) = self.climb {
+            params.climb = value;
+        }
+        if let Some(value) = self.crash {
+            params.crash = value;
+        }
+        if let Some(value) = self.height {
+            params.height = value;
+        }
+        if let Some(value) = self.accel {
+            params.accel = value;
+        }
+        if let Some(value) = self.wobbles {
+            params.wobbles = value;
+        }
+        if let Some(value) = self.no_wobbles {
+            params.no_wobbles = value;
+        }
+        if let Some(value) = self.deviation {
+            params.deviation = value;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn hash_state(&self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        self.turn_rate.hash(hasher);
+        self.speed.hash(hasher);
+        self.climb.map(f32::to_bits).hash(hasher);
+        self.crash.map(f32::to_bits).hash(hasher);
+        self.height.hash(hasher);
+        self.accel.map(f32::to_bits).hash(hasher);
+        self.wobbles.map(f32::to_bits).hash(hasher);
+        self.no_wobbles.hash(hasher);
+        self.deviation.hash(hasher);
+    }
+}
+
+#[cfg(all(test, tests_rules_a_n))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -199,29 +291,6 @@ mod tests {
         assert!((params.wobbles - 0.15).abs() < 0.01);
         assert_eq!(params.deviation, 40);
         assert!(!params.no_wobbles);
-    }
-
-    #[test]
-    fn test_parse_jumpjet_custom_values() {
-        let ini = IniFile::from_str(
-            "[JUMPJET]\nJumpjetTurnRate=8\nJumpjetSpeed=20.5\n\
-             JumpjetClimb=3.0\nJumpjetCrash=10.0\nJumpjetHeight=750\n\
-             JumpjetAccel=4.0\nJumpjetWobbles=0.0\nJumpjetDeviation=0\n\
-             JumpjetNoWobbles=yes\n",
-        );
-        let section = ini.section("JUMPJET").unwrap();
-        let params = JumpjetParams::from_ini_section(section);
-
-        assert_eq!(params.turn_rate, 8);
-        // ReadInt: the fraction is dropped.
-        assert_eq!(params.speed, SimFixed::from_num(20));
-        assert_eq!(params.climb, 3.0);
-        assert_eq!(params.crash, 10.0);
-        assert_eq!(params.height, 750);
-        assert_eq!(params.accel, 4.0);
-        assert!((params.wobbles).abs() < 0.01);
-        assert_eq!(params.deviation, 0);
-        assert!(params.no_wobbles);
     }
 
     /// gamemd looks up `JumpjetTurnRate` and `JumpjetAccel` (`0x008436D0` and
@@ -248,23 +317,34 @@ mod tests {
         assert_eq!(params.height, 750);
     }
 
-    /// The constructor seeds are the defaults, so an empty section and a
-    /// `Default::default()` must agree field for field.
+    #[cfg(feature = "phobos")]
     #[test]
-    fn empty_section_yields_the_constructor_seeds() {
-        let ini = IniFile::from_str("[E1]\nStrength=100\n");
-        let section = ini.section("E1").unwrap();
-        let params = JumpjetParams::from_ini_section(section);
-        let ctor = JumpjetParams::default();
+    fn warhead_jumpjet_overrides_read() {
+        let ini = IniFile::from_str(
+            "[WH]\nJumpjetTurnRate=9\nJumpjetSpeed=33\nJumpjetClimb=7.5\n\
+             JumpjetCrash=11\nJumpjetHeight=900\nJumpjetAccel=3.5\n\
+             JumpjetWobbles=.5\nJumpjetNoWobbles=yes\nJumpjetDeviation=77\n\
+             [EMPTY]\nKeep=1\n\
+             [RESET]\nKeep=1\nJumpjetSpeed=<default>\n",
+        );
+        let overrides = JumpjetOverride::from_section(ini.section("WH").unwrap());
+        assert_eq!(overrides.turn_rate, Some(9));
+        assert_eq!(overrides.speed, Some(33));
+        assert_eq!(overrides.climb, Some(7.5));
+        assert_eq!(overrides.crash, Some(11.0));
+        assert_eq!(overrides.height, Some(900));
+        assert_eq!(overrides.accel, Some(3.5));
+        assert_eq!(overrides.wobbles, Some(0.5));
+        assert_eq!(overrides.no_wobbles, Some(true));
+        assert_eq!(overrides.deviation, Some(77));
 
-        assert_eq!(params.turn_rate, ctor.turn_rate);
-        assert_eq!(params.speed, ctor.speed);
-        assert_eq!(params.climb, ctor.climb);
-        assert_eq!(params.crash, ctor.crash);
-        assert_eq!(params.height, ctor.height);
-        assert_eq!(params.accel, ctor.accel);
-        assert_eq!(params.wobbles, ctor.wobbles);
-        assert_eq!(params.deviation, ctor.deviation);
-        assert_eq!(params.no_wobbles, ctor.no_wobbles);
+        assert_eq!(
+            JumpjetOverride::from_section(ini.section("EMPTY").unwrap()),
+            JumpjetOverride::default()
+        );
+        assert_eq!(
+            JumpjetOverride::from_section(ini.section("RESET").unwrap()).speed,
+            None
+        );
     }
 }

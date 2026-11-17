@@ -31,12 +31,27 @@ fn chrono_warp_selection(rules: &RuleSet) -> Option<&str> {
         .map(String::as_str)
 }
 
-/// Whether the local selection is the Chrono Warp (`0x008809A0 == 4`).
+/// Whether the local selection is the Chrono Warp (`0x008809A0 == 4`). The
+/// Ares hook 6CBCDE (10035870), when the Rules were read the Ares way
+/// (`RuleSet::ares_form`), asks instead whether the selected type's `Type=`
+/// is ChronoWarp.
 pub(crate) fn chrono_warp_selected(targeting: Option<&TargetingMode>, rules: &RuleSet) -> bool {
     let selected = targeting.and_then(TargetingMode::as_super_weapon);
-    selected.is_some_and(|name| {
-        chrono_warp_selection(rules).is_some_and(|warp| warp.eq_ignore_ascii_case(name))
-    })
+    if rules.ares_form() {
+        selected.is_some_and(|name| {
+            rules
+                .super_weapon(name)
+                .is_some_and(|sw| sw.kind == SuperWeaponKind::ChronoWarp)
+        })
+    } else {
+        selected.is_some_and(|name| {
+            chrono_warp_selection(rules).is_some_and(|warp| warp.eq_ignore_ascii_case(name))
+                || rules.super_weapon(name).is_some_and(|warp| {
+                    warp.kind == SuperWeaponKind::ChronoWarp
+                        && crate::sim::superweapon::paid_pair_source(rules, warp).is_some()
+                })
+        })
+    }
 }
 
 /// The selection writes of the local player's Supers: Launch case 3 selects
@@ -55,6 +70,7 @@ pub(super) fn follow_selection_writes(
     rules: &RuleSet,
     local_owner_name: Option<&str>,
 ) {
+    let ares = rules.ares_form();
     for event in events {
         let (SimSoundEvent::SuperWeaponLaunched { owner, sw_type, .. }
         | SimSoundEvent::SuperWeaponStatusChanged { owner, sw_type }) = event
@@ -62,35 +78,104 @@ pub(super) fn follow_selection_writes(
             continue;
         };
         if !local_owner_name
-            .is_some_and(|local| local.eq_ignore_ascii_case(sim.interner.resolve(*owner)))
+            .is_some_and(|local| local.eq_ignore_ascii_case(sim.interner().resolve(*owner)))
         {
             continue;
         }
         let selected = targeting.as_ref().and_then(TargetingMode::as_super_weapon);
         if let SimSoundEvent::SuperWeaponStatusChanged { .. } = event {
+            // An old cancel/hold can precede a new Begin in one slow-frame
+            // batch. The saved current ticket wins over that transient event;
+            // do not clear the newly selected destination of the same type.
+            if sim
+                .paid_super_weapon_selection(*owner)
+                .is_some_and(|selection| selection.destination == *sw_type)
+            {
+                continue;
+            }
             if selected
-                .is_some_and(|name| name.eq_ignore_ascii_case(sim.interner.resolve(*sw_type)))
+                .is_some_and(|name| name.eq_ignore_ascii_case(sim.interner().resolve(*sw_type)))
+            {
+                *targeting = None;
+            }
+            continue;
+        }
+        if sim
+            .next_paid_super_weapon_selection(rules, *owner, *sw_type)
+            .is_some()
+        {
+            // Extension source selection is saved and may have been cancelled
+            // later in this same command batch. Never revive that old event.
+            if let Some(selection) = sim
+                .paid_super_weapon_selection(*owner)
+                .filter(|selection| selection.source == *sw_type)
+                && selected
+                    .is_some_and(|name| name.eq_ignore_ascii_case(sim.interner().resolve(*sw_type)))
+            {
+                *targeting = Some(TargetingMode::SuperWeapon(
+                    sim.interner().resolve(selection.destination).to_owned(),
+                ));
+            }
+            continue;
+        }
+        // When the Rules were read the Ares way (`RuleSet::ares_form`),
+        // Ares (SWTypeExt::Launch 10033201) clears a redirected Nuke's,
+        // Dominator's or Genetic Mutator's selection only when it is the
+        // fired type.
+        if ares
+            && rules
+                .super_weapon(sim.interner().resolve(*sw_type))
+                .is_some_and(|sw| {
+                    matches!(
+                        sw.kind,
+                        SuperWeaponKind::MultiMissile
+                            | SuperWeaponKind::PsychicDominator
+                            | SuperWeaponKind::GeneticConverter
+                    )
+                })
+        {
+            if selected
+                .is_some_and(|name| name.eq_ignore_ascii_case(sim.interner().resolve(*sw_type)))
             {
                 *targeting = None;
             }
             continue;
         }
         match rules
-            .super_weapon(sim.interner.resolve(*sw_type))
+            .super_weapon(sim.interner().resolve(*sw_type))
             .map(|sw| sw.kind)
         {
-            Some(SuperWeaponKind::GenericWarhead | SuperWeaponKind::UnitDelivery) => {
+            Some(
+                SuperWeaponKind::GenericWarhead
+                | SuperWeaponKind::UnitDelivery
+                | SuperWeaponKind::HunterSeeker
+                | SuperWeaponKind::Protect
+                | SuperWeaponKind::Battery
+                | SuperWeaponKind::SonarPulse
+                | SuperWeaponKind::EMPulse
+                | SuperWeaponKind::Firestorm
+                | SuperWeaponKind::DropPod,
+            ) if ares => {
                 // Ares new-type cleanup only clears the fired selection:
                 // an automatic launch must not disarm a different SW.
                 if selected
-                    .is_some_and(|name| name.eq_ignore_ascii_case(sim.interner.resolve(*sw_type)))
+                    .is_some_and(|name| name.eq_ignore_ascii_case(sim.interner().resolve(*sw_type)))
                 {
                     *targeting = None;
                 }
             }
             Some(SuperWeaponKind::ChronoSphere) => {
-                *targeting = chrono_warp_selection(rules)
-                    .map(|name| TargetingMode::SuperWeapon(name.to_string()));
+                // SW_ChronoSphere::Activate (1006ED30) selects its own warp.
+                let warp = if ares {
+                    rules
+                        .super_weapon(sim.interner().resolve(*sw_type))
+                        .and_then(|sphere| {
+                            crate::sim::superweapon::ares_chrono_warp_for(rules, sphere)
+                        })
+                } else {
+                    chrono_warp_selection(rules)
+                };
+                *targeting = warp.map(|name| TargetingMode::SuperWeapon(name.to_string()));
             }
             Some(
                 SuperWeaponKind::MultiMissile
@@ -113,9 +198,13 @@ pub(super) fn follow_selection_writes(
 }
 
 /// The client's hiding of a Super's ChronoPlacement anim: case 3 hides
-/// another house's at once and stops its sound (`0x006CC485..0x006CC4A0`),
-/// and every SuperClass::AI hides a held anim while the selection is not
-/// the Chrono Warp and stops its sound (`0x006CBCD4..0x006CBCF9`). The byte
+/// another house's at once and hard-stops its sound (`0x006CC485..
+/// 0x006CC4A0`, `VocHandle::StopAndClear @ 0x00405D40`), and every
+/// SuperClass::AI hides a held anim while the selection is not the Chrono
+/// Warp and ends its sound (`0x006CBCD4..0x006CBCF9`, `VocHandle::End @
+/// 0x00405FD0`: the loop stops repeating and plays its decay sample). Case 3
+/// returns before its stop when the launcher is the player (`0x006CC46C`),
+/// so the player's own loop only ever ends the second way. The byte
 /// (AnimClass `+0x19D`) has no other writer for this anim, so a hidden one
 /// stays hidden after its Super lets it go. `hidden` keeps the client's
 /// bytes; anims that are gone leave it.
@@ -129,19 +218,23 @@ pub(super) fn hide_placement_anims(
     hidden.retain(|anim| sim.anim(*anim).is_some());
     for (owner, anim) in sim.super_placement_anims() {
         let local = local_owner_name
-            .is_some_and(|local| local.eq_ignore_ascii_case(sim.interner.resolve(owner)));
+            .is_some_and(|local| local.eq_ignore_ascii_case(sim.interner().resolve(owner)));
         if (local && chrono_warp_selected) || !hidden.insert(anim) {
             continue;
         }
-        output.push(GameSoundEvent::AnimationStopped {
-            anim_id: anim,
-            stop_sound_id: None,
-            source: None,
+        output.push(if local {
+            GameSoundEvent::AnimationDetached { anim_id: anim }
+        } else {
+            GameSoundEvent::AnimationStopped {
+                anim_id: anim,
+                stop_sound_id: None,
+                source: None,
+            }
         });
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_match))]
 mod tests {
     use super::*;
     use crate::sim::superweapon::chronosphere_tests::{
@@ -153,20 +246,118 @@ mod tests {
     }
 
     #[test]
+    fn paid_superweapon_selection_tracks_the_ticket_and_never_revives_cancelled_source() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        use crate::sim::command::Command;
+        let Some((mut rules, mut sim, owner)) = retail_world() else {
+            return;
+        };
+        let source_type = rules
+            .super_weapons
+            .values_mut()
+            .find(|sw| sw.kind == SuperWeaponKind::ChronoSphere)
+            .unwrap();
+        source_type.money_amount = 500;
+        source_type.is_powered = false;
+        sim.spawn_object("GACSPH", "Americans", 5, 5, 0, &rules)
+            .unwrap();
+        let source = charge_chronosphere(&mut sim, owner);
+        let ticket = sim
+            .next_paid_super_weapon_selection(&rules, owner, source)
+            .unwrap();
+        assert!(sim.apply_command(
+            "Americans",
+            &Command::BeginPaidSuperWeapon {
+                selection: ticket,
+                target_rx: SOURCE.0,
+                target_ry: SOURCE.1,
+            },
+            Some(&rules),
+        ));
+        let source_events = sim.sound_events().to_vec();
+        let mut targeting = Some(TargetingMode::SuperWeapon("ChronoSphereSpecial".into()));
+        follow_selection_writes(
+            &mut targeting,
+            &source_events,
+            &sim,
+            &rules,
+            Some("Americans"),
+        );
+        assert_eq!(targeting, warp_selected());
+        sim.take_sound_events_for_test();
+        assert!(sim.apply_command(
+            "Americans",
+            &Command::CancelPaidSuperWeapon { selection: ticket },
+            Some(&rules),
+        ));
+        follow_selection_writes(
+            &mut targeting,
+            sim.sound_events(),
+            &sim,
+            &rules,
+            Some("Americans"),
+        );
+        assert!(targeting.is_none());
+        follow_selection_writes(
+            &mut targeting,
+            &source_events,
+            &sim,
+            &rules,
+            Some("Americans"),
+        );
+        assert!(targeting.is_none());
+        assert!(sim.paid_super_weapon_selection(owner).is_none());
+        assert_eq!(sim.houses()[&owner].economy().credits(), 0);
+        // Source -> cancel -> same source again before presentation catches
+        // up: the older cancel event must not erase the new destination.
+        sim.take_sound_events_for_test();
+        let first = sim
+            .next_paid_super_weapon_selection(&rules, owner, source)
+            .unwrap();
+        for command in [
+            Command::BeginPaidSuperWeapon {
+                selection: first,
+                target_rx: SOURCE.0,
+                target_ry: SOURCE.1,
+            },
+            Command::CancelPaidSuperWeapon { selection: first },
+            Command::BeginPaidSuperWeapon {
+                selection: crate::sim::superweapon::PaidSuperWeaponSelection {
+                    sequence: first.sequence + 1,
+                    ..first
+                },
+                target_rx: SOURCE.0,
+                target_ry: SOURCE.1,
+            },
+        ] {
+            assert!(sim.apply_command("Americans", &command, Some(&rules),));
+        }
+        targeting = Some(TargetingMode::SuperWeapon("ChronoSphereSpecial".into()));
+        follow_selection_writes(
+            &mut targeting,
+            sim.sound_events(),
+            &sim,
+            &rules,
+            Some("Americans"),
+        );
+        assert_eq!(targeting, warp_selected());
+    }
+
+    #[test]
     fn extensions_only_clear_the_matching_local_selection() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
         for kind in ["GenericWarhead", "UnitDelivery"] {
             let rules = RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(&format!(
             "[SuperWeaponTypes]\n0=Strike\n1=Other\n[Strike]\nType={kind}\n[Other]\nType=GenericWarhead\n",
         ))).unwrap();
             let mut sim = Simulation::with_seed(0);
-            let local = sim.interner.intern("Local");
-            let remote = sim.interner.intern("Remote");
-            let sw_type = sim.interner.intern("Strike");
+            let local = sim.intern("Local");
+            let remote = sim.intern("Remote");
+            let sw_type = sim.intern("Strike");
             let launched = |owner| SimSoundEvent::SuperWeaponLaunched {
                 owner,
                 sw_type,
-                rx: 10,
-                ry: 10,
+                world: crate::sim::components::DriveCoord::cell(10, 10, 0).into(),
             };
             let mut selected = Some(TargetingMode::SuperWeapon("Other".to_owned()));
             follow_selection_writes(
@@ -208,14 +399,13 @@ mod tests {
         let Some((rules, mut sim, local)) = retail_world() else {
             return;
         };
-        let remote = sim.interner.intern("Russians");
-        let sphere = sim.interner.intern("ChronoSphereSpecial");
-        let warp = sim.interner.intern("ChronoWarpSpecial");
+        let remote = sim.intern("Russians");
+        let sphere = sim.intern("ChronoSphereSpecial");
+        let warp = sim.intern("ChronoWarpSpecial");
         let launched = |owner, sw_type| SimSoundEvent::SuperWeaponLaunched {
             owner,
             sw_type,
-            rx: 21,
-            ry: 21,
+            world: crate::sim::components::DriveCoord::cell(21, 21, 0).into(),
         };
         let mut targeting = None;
         follow_selection_writes(
@@ -277,13 +467,12 @@ mod tests {
         let Some((rules, mut sim, local)) = retail_world() else {
             return;
         };
-        let remote = sim.interner.intern("Russians");
-        let dominator = sim.interner.intern("PsychicDominatorSpecial");
+        let remote = sim.intern("Russians");
+        let dominator = sim.intern("PsychicDominatorSpecial");
         let launched = |owner| SimSoundEvent::SuperWeaponLaunched {
             owner,
             sw_type: dominator,
-            rx: 21,
-            ry: 21,
+            world: crate::sim::components::DriveCoord::cell(21, 21, 0).into(),
         };
         let selected = || {
             Some(TargetingMode::SuperWeapon(
@@ -324,18 +513,25 @@ mod tests {
         let Some((rules, mut sim, local)) = retail_world() else {
             return;
         };
-        let remote = sim.interner.intern("Russians");
+        let remote = sim.intern("Russians");
         let selected = || Some(TargetingMode::SuperWeapon("NukeSpecial".to_string()));
         let oracle: serde_json::Value =
             serde_json::from_str(crate::test_fixture::text("tools/superweapon_oracle.json"))
                 .unwrap();
-        for (section, name) in [
-            ("nuke_launch", "NukeSpecial"),
-            ("iron_curtain_launch", "IronCurtainSpecial"),
-            ("genetic_launch", "GeneticConverterSpecial"),
-            ("psychic_launch", "PsychicRevealSpecial"),
+        let ares = rules.ares_form();
+        for (section, name, redirected) in [
+            // When the Rules were read the Ares way (`RuleSet::ares_form`),
+            // Ares clears only the fired type's selection for its redirected
+            // Nuke and Genetic Mutator (SWTypeExt::Launch 10033201).
+            ("nuke_launch", "NukeSpecial", true),
+            ("iron_curtain_launch", "IronCurtainSpecial", false),
+            ("genetic_launch", "GeneticConverterSpecial", true),
+            ("psychic_launch", "PsychicRevealSpecial", false),
         ] {
-            let sw_type = sim.interner.intern(name);
+            if ares && redirected {
+                continue;
+            }
+            let sw_type = sim.intern(name);
             let rows = oracle[section].as_array().unwrap();
             assert!(rows.len() > 10);
             for row in rows {
@@ -352,8 +548,7 @@ mod tests {
                     vec![SimSoundEvent::SuperWeaponLaunched {
                         owner,
                         sw_type,
-                        rx: 40,
-                        ry: 40,
+                        world: crate::sim::components::DriveCoord::cell(40, 40, 0).into(),
                     }]
                 } else {
                     Vec::new()
@@ -388,12 +583,11 @@ mod tests {
         let Some((rules, mut sim, local)) = retail_world() else {
             return;
         };
-        let remote = sim.interner.intern("Russians");
+        let remote = sim.intern("Russians");
         let launched = |owner, sw_type| SimSoundEvent::SuperWeaponLaunched {
             owner,
             sw_type,
-            rx: 21,
-            ry: 21,
+            world: crate::sim::components::DriveCoord::cell(21, 21, 0).into(),
         };
         let selected = || Some(TargetingMode::SuperWeapon("NukeSpecial".to_string()));
         let oracle: serde_json::Value =
@@ -401,7 +595,7 @@ mod tests {
                 .unwrap();
         let rows = oracle["spy_plane_launch"].as_array().unwrap();
         assert!(rows.len() > 10);
-        let spy_plane = sim.interner.intern("SpyPlaneSpecial");
+        let spy_plane = sim.intern("SpyPlaneSpecial");
         for row in rows {
             let owner = if row["player"] == true { local } else { remote };
             // ClickFire admits only a charged Super: no launch, no report.
@@ -421,7 +615,7 @@ mod tests {
             assert_eq!(targeting, expected, "{row}");
         }
         for name in ["ParaDropSpecial", "AmericanParaDropSpecial"] {
-            let sw_type = sim.interner.intern(name);
+            let sw_type = sim.intern(name);
             let mut targeting = selected();
             follow_selection_writes(
                 &mut targeting,
@@ -450,9 +644,9 @@ mod tests {
         let Some((rules, mut sim, local)) = retail_world() else {
             return;
         };
-        let remote = sim.interner.intern("Russians");
-        let sphere = sim.interner.intern("ChronoSphereSpecial");
-        let warp = sim.interner.intern("ChronoWarpSpecial");
+        let remote = sim.intern("Russians");
+        let sphere = sim.intern("ChronoSphereSpecial");
+        let warp = sim.intern("ChronoWarpSpecial");
         let changed = |owner, sw_type| SimSoundEvent::SuperWeaponStatusChanged { owner, sw_type };
         let mut targeting = warp_selected();
         follow_selection_writes(
@@ -497,6 +691,22 @@ mod tests {
         hide_placement_anims(&mut hidden, &sim, false, Some("Americans"), &mut output);
         hide_placement_anims(&mut hidden, &sim, false, Some("Americans"), &mut output);
         assert_eq!(hidden, BTreeSet::from([own]));
+        // SuperClass::AI ends the player's own loop (`0x006CBCF9`, End
+        // `0x00405FD0`): ChronosphereSelect plays out its decay sample.
+        let ends = output.drain();
+        assert!(
+            matches!(
+                ends.as_slice(),
+                [GameSoundEvent::AnimationDetached { anim_id }] if *anim_id == own
+            ),
+            "{ends:?}"
+        );
+
+        // Seen from the Russians' client the anim is another house's, and
+        // Launch case 3 hard-stops its loop (`0x006CC4A0`, `0x00405D40`).
+        let mut theirs = BTreeSet::new();
+        hide_placement_anims(&mut theirs, &sim, true, Some("Russians"), &mut output);
+        assert_eq!(theirs, BTreeSet::from([own]));
         let stops = output.drain();
         assert!(
             matches!(
@@ -505,12 +715,6 @@ mod tests {
             ),
             "{stops:?}"
         );
-
-        // Seen from the Russians' client the anim is another house's.
-        let mut theirs = BTreeSet::new();
-        hide_placement_anims(&mut theirs, &sim, true, Some("Russians"), &mut output);
-        assert_eq!(theirs, BTreeSet::from([own]));
-        assert_eq!(output.drain().len(), 1);
 
         // Released by the warp, the anim plays out and leaves.
         click(&mut sim, &rules, americans, "ChronoWarpSpecial", (40, 40));
@@ -539,10 +743,10 @@ mod tests {
         let selected = |name: &str| Some(TargetingMode::SuperWeapon(name.to_string()));
         // A click whose event executes three frames on, as input delay does.
         let click = |sim: &mut Simulation, name: &str, (rx, ry): (u16, u16)| {
-            let sw_type_id = sim.interner.intern(name);
+            let sw_type_id = sim.intern(name);
             sim.queue_command(CommandEnvelope::new(
                 americans,
-                sim.session.tick + 3,
+                sim.session().tick() + 3,
                 Command::LaunchSuperWeapon {
                     sw_type_id,
                     target_rx: rx,
@@ -557,7 +761,7 @@ mod tests {
         // selection, then the client hides its anims.
         let mut frame = |sim: &mut Simulation, targeting: &mut Option<TargetingMode>| {
             step(sim, &rules);
-            let events = std::mem::take(&mut sim.sound_events);
+            let events = sim.take_sound_events_for_test();
             follow_selection_writes(targeting, &events, sim, &rules, Some("Americans"));
             let warp = chrono_warp_selected(targeting.as_ref(), &rules);
             hide_placement_anims(&mut hidden, sim, warp, Some("Americans"), &mut output);

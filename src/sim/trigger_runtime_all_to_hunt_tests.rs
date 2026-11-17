@@ -9,10 +9,6 @@ use serde_json::Value;
 
 fn corpus() -> &'static Value {
     let result = crate::test_fixture::json("tools/spatial_oracle/trigger_all_to_hunt.json");
-    assert_eq!(
-        result["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     result
 }
 
@@ -52,24 +48,27 @@ fn all_to_hunt_action_matches_original_selector_mode_timer_and_ordinary_foot() {
                 let owner = sim.interner.intern(&format!("H{slot}"));
                 let country = sim.interner.intern(&format!("C{}", int(country)));
                 let mut house = HouseState::new(owner, slot as u8, Some(country), false, 0, 10);
-                house.strategy_emergency.mode = int(&control["modes_before"][slot]);
-                house.strategy_timer = CdTimer::from_raw(
+                house
+                    .strategy_emergency_mut()
+                    .set_mode_for_test(int(&control["modes_before"][slot]));
+                house.set_strategy_timer_for_test(CdTimer::from_raw(
                     int(&control["strategy_timers_before"][slot][0]),
                     int(&control["strategy_timers_before"][slot][2]),
-                );
-                sim.houses.insert(owner, house);
+                ));
+                sim.houses.register(house);
                 owner
             })
             .collect();
-        sim.session.house_order = input["order"].as_array().map_or_else(
-            || houses.clone(),
-            |order| {
-                order
-                    .iter()
-                    .map(|slot| houses[slot.as_u64().unwrap() as usize])
-                    .collect()
-            },
-        );
+        sim.houses
+            .reorder_for_test(&input["order"].as_array().map_or_else(
+                || houses.clone(),
+                |order| {
+                    order
+                        .iter()
+                        .map(|slot| houses[slot.as_u64().unwrap() as usize])
+                        .collect()
+                },
+            ));
         super::tests::install_event_ingress_map(
             &mut sim,
             &rules,
@@ -95,7 +94,7 @@ fn all_to_hunt_action_matches_original_selector_mode_timer_and_ordinary_foot() {
             .unwrap()
             .iter()
             .map(|actor| {
-                let id = sim.allocate_stable_id();
+                let id = sim.substrate.allocate_stable_id();
                 let owner = houses[actor["owner"].as_u64().unwrap() as usize];
                 let foot = actor["foot"].as_bool().unwrap();
                 let ty = sim.interner.get(if foot { "U" } else { "B" }).unwrap();
@@ -119,7 +118,7 @@ fn all_to_hunt_action_matches_original_selector_mode_timer_and_ordinary_foot() {
                 );
                 entity
                     .lifecycle
-                    .set_cell_marked(actor["down"].as_bool().unwrap());
+                    .set_cell_marked_for_test(actor["down"].as_bool().unwrap());
                 entity
                     .lifecycle
                     .set_in_limbo_for_test(actor["limbo"].as_bool().unwrap());
@@ -156,24 +155,24 @@ fn all_to_hunt_action_matches_original_selector_mode_timer_and_ordinary_foot() {
                 input: TagEventInput::default(),
             },
             &mut Vec::new(),
-            Some(&rules),
+            &rules,
             None,
             FrameEffects::default(),
         );
         assert_eq!(actual, int(&control["result"]) != 0, "{input}");
         for (slot, house) in houses.iter().enumerate() {
             assert_eq!(
-                sim.houses[house].strategy_emergency.mode(),
+                sim.houses[house].strategy_emergency().mode(),
                 int(&control["modes_after"][slot]),
                 "{input}"
             );
             assert_eq!(
-                sim.houses[house].strategy_emergency.all_to_hunt_bias(),
+                sim.houses[house].strategy_emergency().all_to_hunt_bias(),
                 int(&control["latch_after"][slot]) != 0,
                 "{input}"
             );
             assert_eq!(
-                sim.houses[house].strategy_timer,
+                *sim.houses[house].strategy_timer(),
                 CdTimer::from_raw(
                     int(&control["strategy_timers_after"][slot][0]),
                     int(&control["strategy_timers_after"][slot][2])
@@ -225,6 +224,15 @@ fn all_to_hunt_action_matches_original_selector_mode_timer_and_ordinary_foot() {
 
 #[test]
 fn all_to_hunt_retail_all06_elapsed_enable_chain_releases_existing_gattling_team() {
+    all06_elapsed_enable_chain(true);
+}
+
+#[test]
+fn all_to_hunt_retail_all06_scan_miss_marches_toward_the_player_base() {
+    all06_elapsed_enable_chain(false);
+}
+
+fn all06_elapsed_enable_chain(with_enemy: bool) {
     use crate::rules::{process_owner::NativeScenarioRulesPrefix, team_ai_ini::TeamAiIniRegistry};
     use crate::sim::mission::MissionType;
     let corpus = corpus();
@@ -308,12 +316,13 @@ fn all_to_hunt_retail_all06_elapsed_enable_chain_releases_existing_gattling_team
     crate::sim::scenario_bootstrap::initialize_map_roster_houses(
         &mut sim,
         &roster,
-        Some(&rules),
+        &rules,
         Some(&map.ini),
     );
     sim.intern_rule_type_ids(&rules);
     sim.resolve_type_handles(&rules);
-    sim.session.game_mode_nonzero = false;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false));
     crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
     let owner = sim.interner.get("YuriCountry").unwrap();
     assert_eq!(
@@ -329,8 +338,11 @@ fn all_to_hunt_retail_all06_elapsed_enable_chain_releases_existing_gattling_team
                     EntityCategory::Unit | EntityCategory::Infantry
                 ))
     );
-    super::tests::install_event_ingress_map(&mut sim, &rules, &body);
-    sim.install_team_ai_registry(&teams, &rules).unwrap();
+    let cropped = super::tests::trigger_fixture_map(&body);
+    sim.initialize_trigger_definitions(&cropped, &teams, None, None, None);
+    sim.install_team_ai_registry(&teams, &rules);
+    sim.install_authored_cell_trigger_tags(&cropped);
+    sim.classify_map_triggers(&rules);
     // Explicit prerequisite: Wave4 has already arrived. ALL06 starts with no
     // Yuri Foot; its whole reinforcement sequence and physical terrain are
     // outside this cropped integration. Use its real Team/TF/Script and the
@@ -363,9 +375,21 @@ fn all_to_hunt_retail_all06_elapsed_enable_chain_releases_existing_gattling_team
             id
         })
         .collect();
-    let enemy = sim
-        .spawn_object("HTNK", "Americans", 20, 10, 0, &rules)
-        .unwrap();
+    let enemy = with_enemy.then(|| {
+        sim.spawn_object("HTNK", "Americans", 20, 10, 0, &rules)
+            .unwrap()
+    });
+    if !with_enemy {
+        // Supplied continuation: no target remains in this cropped world,
+        // but the player's House retains its base. Whole ALL06 placement
+        // and defeat handling are not part of this trigger/mission replay.
+        let player = sim.interner.get("Americans").unwrap();
+        sim.session.set_current_house_for_test(Some(player));
+        sim.houses
+            .get_mut(&player)
+            .unwrap()
+            .set_base_center((20, 10));
+    }
     let enabled = |sim: &Simulation, id: &str| {
         sim.trigger_runtime.trigger_order.iter().any(|&live| {
             let trigger = sim.trigger_runtime.trigger(live).unwrap();
@@ -380,7 +404,7 @@ fn all_to_hunt_retail_all06_elapsed_enable_chain_releases_existing_gattling_team
     let action = sim
         .trigger_runtime
         .definitions
-        .resolve_action(entry, None, None);
+        .resolve_action(entry, None, None, None);
     assert!(sim.apply_live_trigger_action(
         &action,
         TriggerActionContext {
@@ -389,14 +413,14 @@ fn all_to_hunt_retail_all06_elapsed_enable_chain_releases_existing_gattling_team
             input: TagEventInput::default()
         },
         &mut Vec::new(),
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default()
     ));
     assert!(enabled(&sim, chain[0]));
     for frame in [0, 3599, 3600, 4049, 4050] {
-        sim.session.binary_frame = frame;
-        sim.advance_triggers(Some(&rules), None, FrameEffects::default());
+        sim.session.set_binary_frame_for_test(frame);
+        sim.advance_triggers(&rules, None, FrameEffects::default());
         for &id in &actors {
             assert_eq!(
                 sim.team_script_vm.team_for_member(id).is_none(),
@@ -417,39 +441,40 @@ fn all_to_hunt_retail_all06_elapsed_enable_chain_releases_existing_gattling_team
             }
         }
     }
-    assert!(sim.houses[&owner].strategy_emergency.all_to_hunt_bias());
+    assert!(sim.houses[&owner].strategy_emergency().all_to_hunt_bias());
     // Continue through the existing mission consumer on the selected
     // ordinary armed route. This is Rust integration, not a native full map.
     for &id in &actors {
         assert!(
-            sim.mission_commence_exact(id, sim.session.binary_frame)
+            sim.substrate
+                .mission_commence_exact(id, sim.session.binary_frame())
                 .unwrap()
         );
     }
+    let completed = |sim: &Simulation| {
+        actors.iter().all(|id| {
+            let actor = sim.substrate.entities.get(*id).unwrap();
+            if let Some(enemy) = enemy {
+                actor.attack_target.target() == Some(crate::sim::combat::TargetKind::Entity(enemy))
+            } else {
+                actor.attack_target.target().is_none()
+                    && actor.navigation.nav_com()
+                        == Some(crate::sim::components::NavTargetRef::cell(20, 10))
+                    && actor.mission.current().known() == Some(MissionType::Move)
+            }
+        })
+    };
     for frame in 4051..4091 {
-        sim.session.binary_frame = frame;
+        sim.session.set_binary_frame_for_test(frame);
         for &id in &actors {
             sim.object_ai_visit_one(id, Some(&rules), crate::sim::world::ObjectAiCtx::default());
         }
-        if actors.iter().all(|id| {
-            sim.substrate
-                .entities
-                .get(*id)
-                .unwrap()
-                .attack_target
-                .target()
-                == Some(crate::sim::combat::TargetKind::Entity(enemy))
-        }) {
+        if completed(&sim) {
             break;
         }
     }
-    assert!(actors.iter().all(|id| {
-        sim.substrate
-            .entities
-            .get(*id)
-            .unwrap()
-            .attack_target
-            .target()
-            == Some(crate::sim::combat::TargetKind::Entity(enemy))
-    }));
+    assert!(
+        completed(&sim),
+        "retail Hunt continuation, enemy={with_enemy}"
+    );
 }

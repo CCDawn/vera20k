@@ -15,6 +15,9 @@ Usage:
     python tools/render_depth_fixture.py target/ordinary-ifv-welding.map --ifv-welding
     python tools/render_depth_fixture.py target/ordinary-ifv-full-health.map --ifv-welding full-health
     python tools/render_depth_fixture.py target/ordinary-disk-laser.map --disk-laser
+    python tools/render_depth_fixture.py target/ordinary-dolphin-sonic.map --sonic-wave /absolute/XMP03T4.MAP
+    python tools/render_depth_fixture.py target/drone-fire.map --drone-fire
+    python tools/render_depth_fixture.py target/ordinary-tele-magnetic.map --magnetic-wave
 
 This writes only the requested map. It neither edits game configuration nor
 launches either engine. The cliff fixture deliberately focuses on one cliff
@@ -149,7 +152,10 @@ def build_fixture(*, walls_only: bool = False, cliff_back: bool = False,
                   bomb_clock: bool = False,
                   ifv_welding: str | None = None,
                   disk_laser: bool = False,
-                  temporal_gunner: bool = False) -> str:
+                  magnetic_wave: bool = False,
+                  temporal_gunner: bool = False,
+                  drone_fire: bool = False,
+                  sonic_wave: Path | None = None) -> str:
     """Keep comparison geometry stable within each selectable scene."""
     if house_self_heal not in (None, 'recovery', 'removal'):
         raise ValueError('Unknown House self-heal scene')
@@ -171,10 +177,10 @@ def build_fixture(*, walls_only: bool = False, cliff_back: bool = False,
     if sum((walls_only, cliff_back, building_brackets, building_repair,
             attack_order_voice is not None, house_self_heal is not None,
             damage_feedback is not None, move_order_voice is not None, bomb_clock,
-            ifv_welding is not None, disk_laser, temporal_gunner)) > 1:
+            ifv_welding is not None, disk_laser, magnetic_wave, temporal_gunner, drone_fire, sonic_wave is not None)) > 1:
         raise ValueError('Choose one comparison mode')
     building_brackets = building_brackets or building_repair
-    command_scene = bomb_clock or disk_laser or temporal_gunner or any(mode is not None for mode in
+    command_scene = sonic_wave is not None or magnetic_wave or bomb_clock or disk_laser or temporal_gunner or drone_fire or any(mode is not None for mode in
                         (attack_order_voice, house_self_heal, damage_feedback,
                          move_order_voice, ifv_welding))
     walls_only = walls_only or building_brackets or command_scene
@@ -232,14 +238,18 @@ def build_fixture(*, walls_only: bool = False, cliff_back: bool = False,
                         bits |= 1 << bit
                 overlay_data[y * 512 + x] = bits
 
+    # Object rows name the Houses a skirmish creates (FromName50C170):
+    # <human player> and Computer, not the launch's Americans/Computer1 keys.
+    # ReadBuildings44F8CB never creates the local House's authored Structures,
+    # so every scene's buildings are the computer's (launch one AI opponent).
     structures = [
-        f'1=Americans,GACNST,256,{C},{C},0,None,0,0,1,0,0,None,None,None,0,0',
-        f'2=Americans,GAPOWR,256,{C+8},{C-6},0,None,0,0,1,0,0,None,None,None,0,0',
-        f'3=Americans,GAWEAP,256,{C-3},{C+5},0,None,0,0,1,0,0,None,None,None,0,0',
-        f'4=Americans,GAPILL,256,{px},{py},0,None,0,0,1,0,0,None,None,None,0,0',
+        f'1=Computer,GACNST,256,{C},{C},0,None,0,0,1,0,0,None,None,None,0,0',
+        f'2=Computer,GAPOWR,256,{C+8},{C-6},0,None,0,0,1,0,0,None,None,None,0,0',
+        f'3=Computer,GAWEAP,256,{C-3},{C+5},0,None,0,0,1,0,0,None,None,None,0,0',
+        f'4=Computer,GAPILL,256,{px},{py},0,None,0,0,1,0,0,None,None,None,0,0',
     ]
     if not walls_only and not cliff_back:
-        structures.append(f'5=Americans,NAPOWR,256,{C-8},{C+1},0,None,0,0,1,0,0,None,None,None,0,0')
+        structures.append(f'5=Computer,NAPOWR,256,{C-8},{C+1},0,None,0,0,1,0,0,None,None,None,0,0')
 
     tanks = [
         (C - 1, C - 1, 64), (C, C - 2, 64), (C - 2, C, 64), (C + 1, C - 2, 64),
@@ -254,7 +264,7 @@ def build_fixture(*, walls_only: bool = False, cliff_back: bool = False,
         ax, ay = BACK_CLIFF_ANCHORS[0]
         tanks.append((ax - 1, ay - 1, 64))
     units = [
-        f'{i}=Americans,MTNK,256,{x},{y},{f},Guard,None,0,-1,0,-1,1,1'
+        f'{i}=<human player>,MTNK,256,{x},{y},{f},Guard,None,0,-1,0,-1,1,1'
         for i, (x, y, f) in enumerate(tanks)
     ]
     gis = [
@@ -265,21 +275,22 @@ def build_fixture(*, walls_only: bool = False, cliff_back: bool = False,
         ax, ay = BACK_CLIFF_ANCHORS[1]
         gis.append((ax - 1, ay - 1, 2, 64))
     infantry = [
-        f'{i}=Americans,E1,256,{x},{y},{s},Guard,{f},None,0,-1,0,1,1'
+        f'{i}=<human player>,E1,256,{x},{y},{s},Guard,{f},None,0,-1,0,1,1'
         for i, (x, y, s, f) in enumerate(gis)
     ]
     if building_brackets:
         # Stock2x2 foundations do not intersect; their art/brackets can overlap
         # across Display parents. The distant voxel retains the capture atlas.
         structures = [
-            f'{i}=Americans,GAPOWR,256,{x},{y},0,None,0,0,1,0,0,None,None,None,0,0'
+            f'{i}=Computer,GAPOWR,256,{x},{y},0,None,0,0,1,0,0,None,None,None,0,0'
             for i, (x, y) in enumerate(((C, C), (C - 2, C + 1), (C + 2, C - 1)))
         ]
-        units = [f'0=Computer1,MTNK,256,{C+12},{C+12},64,Guard,None,0,-1,0,-1,1,1']
+        units = [f'0=Computer,MTNK,256,{C+12},{C+12},64,Guard,None,0,-1,0,-1,1,1']
         if building_repair:
-            # A normal local attacker can damage the stock plant before Stop
-            # and a retained Repair-button click. No HP, weapon or rate patch.
-            units.append(f'1=Americans,MTNK,256,{C},{C-4},64,Guard,None,0,-1,0,-1,1,1')
+            # A normal local attacker can damage the computer's stock plant
+            # before Stop. Paid repair needs a plant the local House owns, built
+            # or captured in play. No HP, weapon or rate patch.
+            units.append(f'1=<human player>,MTNK,256,{C},{C-4},64,Guard,None,0,-1,0,-1,1,1')
         infantry = []
         overlay[:] = b'\xff' * len(overlay)
         overlay_data[:] = bytes(len(overlay_data))
@@ -289,9 +300,7 @@ def build_fixture(*, walls_only: bool = False, cliff_back: bool = False,
         # Stock types and weapons remain unchanged; individual scenes below
         # author map health fractions or the tested VoiceMove reader input.
         # Keep a building's foundation-centre target comfortably in range.
-        # Object rows use the native scenario names FromName50C170 reads,
-        # independently of the launch's internal Americans/Computer1 keys.
-        unit_target = (bomb_clock or disk_laser or temporal_gunner or move_order_voice is not None
+        unit_target = (bomb_clock or disk_laser or magnetic_wave or temporal_gunner or drone_fire or move_order_voice is not None
                        or damage_feedback is not None or house_self_heal is not None
                        or ifv_welding is not None or attack_order_voice == 'unit')
         near, far = (C + (4 if unit_target else 3), C), (C + 12, C + 12)
@@ -323,6 +332,15 @@ def build_fixture(*, walls_only: bool = False, cliff_back: bool = False,
             # retaliation. No bomb, visibility, weapon or fuse override.
             units = [f'0=<human player>,MTNK,256,{C+1},{C},64,Guard,None,0,-1,0,-1,1,1']
             infantry = [f'0=<human player>,IVAN,256,{C},{C},0,Guard,64,None,0,-1,0,1,1']
+        if drone_fire:
+            # DRON and DroneJump retain all retail fields. A later ordinary
+            # SonicZap shot drives Foot's real parasite-release receiver.
+            # Both MTNKs use the map weapon; the sleeping host never fires.
+            units = [
+                f'0=<human player>,DRON,256,{C},{C},64,Sleep,None,0,-1,0,-1,1,1',
+                f'1=Computer,MTNK,256,{C+1},{C},192,Sleep,None,0,-1,0,-1,1,1',
+                f'2=<human player>,MTNK,256,{C-4},{C},64,Sleep,None,0,-1,0,-1,1,1',
+            ]
         if ifv_welding:
             # Stock actors admit normal boarding and friendly repair orders.
             # Only map health fractions differ in the full-health control;
@@ -348,6 +366,13 @@ def build_fixture(*, walls_only: bool = False, cliff_back: bool = False,
             # Structures44F8CB excludes the current House before construction.
             # Keep only the enemy survivor; the profile uses ShortGame=false.
             structures = [f'0=Computer,GAPOWR,256,{plant_cell[0]},{plant_cell[1]},0,None,0,0,1,0,0,None,None,None,0,0']
+        if magnetic_wave:
+            # Both actors sleep until the profile's ordinary Attack command.
+            # Stock TELE/MagneticBeam and MTNK fields remain untouched.
+            units = [
+                f'0=Computer,MTNK,256,{C+2},{C},192,Sleep,None,0,-1,0,-1,1,1',
+                f'1=<human player>,TELE,256,{C-4},{C},64,Sleep,None,0,-1,0,-1,1,1',
+            ]
         if temporal_gunner:
             # Ordinary boarding, approach, firing and unloading must reach
             # their callbacks at runtime; author no weapon, timer or cargo.
@@ -369,6 +394,16 @@ def build_fixture(*, walls_only: bool = False, cliff_back: bool = False,
                 for i, (x, y) in enumerate(positions)
             ]
             infantry = [f'0=<human player>,E1,256,{near[0]},{near[1]},0,Guard,192,None,0,-1,0,1,1']
+        if sonic_wave is not None:
+            # The physical XMP03T4 scene admits these stock naval actors in a
+            # contiguous Water-set pool. Loading must confirm actual terrain;
+            # no water flags, unit, weapon or wave state is overridden here.
+            units = [
+                '0=<human player>,DLPH,256,106,118,64,Sleep,None,0,-1,0,-1,1,1',
+                '1=Computer,CARRIER,256,108,118,192,Sleep,None,0,-1,0,-1,1,1',
+            ]
+            structures = ['0=Computer,GAPOWR,256,76,76,0,None,0,0,1,0,0,None,None,None,0,0']
+            infantry = []
         overlay[:] = b'\xff' * len(overlay)
         overlay_data[:] = bytes(len(overlay_data))
     # Stock cliff-back blocking rejects Track/Foot placement in the exact
@@ -377,6 +412,7 @@ def build_fixture(*, walls_only: bool = False, cliff_back: bool = False,
     cliff_rules = '\n[General]\nCliffBackImpassability=0\n' if cliff_back else ''
     move_voice = move_voices.get(move_order_voice)
     voice_rules = f'\n[MTNK]\nVoiceMove={move_voice}\n' if move_voice is not None else ''
+    drone_rules = '\n[MTNK]\nPrimary=SonicZap\n[SonicZap]\nDamage=4\n' if drone_fire else ''
     # Match normal Battle's AI slot, so the distant voxel also prevents an
     # empty-house victory from ending sustained selection captures.
     bracket_house_slot = '\n2=Computer1' if building_brackets or command_scene else ''
@@ -392,7 +428,10 @@ Color=DarkRed
 ''' if building_brackets or command_scene else ''
 
     name = 'C24 Ordinary Engineer IFV Welding' if ifv_welding else 'Depth Continuation - ' + (
+        'Dolphin Sonic' if sonic_wave is not None else
+        'Magnetic Wave' if magnetic_wave else
         'Temporal Gunner' if temporal_gunner else
+        'Terror Drone Firing' if drone_fire else
         'Disk Laser' if disk_laser else
         'Ivan Bomb Clock' if bomb_clock else
         'Move Voice ' + move_order_voice if move_order_voice else
@@ -403,7 +442,7 @@ Color=DarkRed
         'Building Brackets' if building_brackets else
         'Cliff Back Edge' if cliff_back else 'Walls and Cliff'
     )
-    return f'''[Basic]
+    mission = f'''[Basic]
 Name={name}
 NewINIFormat=4
 Player=Americans
@@ -419,7 +458,7 @@ Lose=<none>
 Action=<none>
 FreeRadar=yes
 EndOfGame=yes
-{cliff_rules}{voice_rules}
+{cliff_rules}{voice_rules}{drone_rules}
 [Map]
 Theater=TEMPERATE
 Size=0,0,48,48
@@ -483,6 +522,48 @@ Color=Grey{bracket_house}
 [IsoMapPack5]
 {pack_lzo(bytes(cells))}
 '''
+    return (retain_terrain_template(mission, Path(sonic_wave).read_text(encoding='latin-1'))
+            if sonic_wave is not None else mission)
+
+
+def retain_terrain_template(mission: str, template: str) -> str:
+    """Copy physical map terrain blocks without interpreting or rebuilding them.
+
+    Actors, scripting and House definitions stay with the selected fixture.
+    Callers must choose a template admitting its fixed scene coordinates.
+    """
+    retained = {'Map', 'Lighting', 'IsoMapPack5', 'OverlayPack', 'OverlayDataPack',
+                'Terrain', 'Smudge', 'Preview', 'PreviewPack', 'Waypoints'}
+
+    def blocks(text):
+        result = []; name = None; lines = []
+        for line in text.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped.startswith('[') and ']' in stripped:
+                if lines:
+                    result.append((name, ''.join(lines)))
+                name = stripped[1:stripped.index(']')]
+                lines = []
+            lines.append(line)
+        if lines:
+            result.append((name, ''.join(lines)))
+        return result
+
+    physical = {}
+    for name, block in blocks(template):
+        if name in retained:
+            if name in physical:
+                raise ValueError(f'Duplicate physical terrain section {name}')
+            physical[name] = block
+    for name in ('Map', 'IsoMapPack5'):
+        if name not in physical:
+            raise ValueError(f'Missing physical terrain section {name}')
+    emitted = set(); output = []
+    for name, block in blocks(mission):
+        output.append(physical.get(name, block))
+        emitted.add(name)
+    output.extend(block for name, block in physical.items() if name not in emitted)
+    return '\n'.join(output)
 
 
 def main() -> None:
@@ -490,6 +571,8 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('output', type=Path, help='Map path to write')
+    parser.add_argument('--terrain-template', type=Path,
+                        help='For --drone-fire, preserve an extracted retail map\'s terrain/scenery blocks; it must admit scene cell48,48 and nearby actors')
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument(
         '--walls-only', action='store_true',
@@ -505,7 +588,7 @@ def main() -> None:
     )
     modes.add_argument(
         '--building-repair', action='store_true',
-        help='Add a stock local tank to the building scene for damage, Stop and paid repair',
+        help='Add a stock local tank that can damage the computer\'s plants and Stop',
     )
     modes.add_argument(
         '--attack-order-voice', choices=('unit', 'building'),
@@ -536,10 +619,22 @@ def main() -> None:
         help='Use a stock local DISK, full-health enemy MTNK and distant power plants for ordinary Attack',
     )
     modes.add_argument(
+        '--magnetic-wave', action='store_true',
+        help='Use stock sleeping TELE/MTNK and a distant enemy survivor for ordinary Attack/Stop',
+    )
+    modes.add_argument(
         '--temporal-gunner', action='store_true',
         help='Use full-health stock CLEG/FV, an enemy HTNK and distant power plant for ordinary boarding and unloading',
     )
+    modes.add_argument(
+        '--sonic-wave', type=Path, metavar='RETAIL_MAP',
+        help='Use stock DLPH/CARRIER and preserve supplied XMP03T4 terrain; fixed naval cells must be admitted',
+    )
+    modes.add_argument('--drone-fire', action='store_true',
+                       help='Use retail DRON/DroneJump and a low-damage map-authored SonicZap tank for ordinary launch and live release')
     args = parser.parse_args()
+    if args.terrain_template and not args.drone_fire:
+        parser.error('--terrain-template belongs to --drone-fire')
     mission = build_fixture(walls_only=args.walls_only, cliff_back=args.cliff_back,
                             building_brackets=args.building_brackets,
                             building_repair=args.building_repair,
@@ -550,9 +645,13 @@ def main() -> None:
                             bomb_clock=args.bomb_clock,
                             ifv_welding=args.ifv_welding,
                             disk_laser=args.disk_laser,
-                            temporal_gunner=args.temporal_gunner)
+                            magnetic_wave=args.magnetic_wave,
+                            temporal_gunner=args.temporal_gunner,
+                            drone_fire=args.drone_fire, sonic_wave=args.sonic_wave)
+    if args.terrain_template:
+        mission = retain_terrain_template(mission, args.terrain_template.read_bytes().decode('latin1'))
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(mission, encoding='ascii')
+    args.output.write_text(mission, encoding='latin1' if args.terrain_template or args.sonic_wave is not None else 'ascii')
     print(f'Wrote {args.output} ({len(mission)} characters)')
 
 

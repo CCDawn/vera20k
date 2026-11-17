@@ -1,24 +1,42 @@
 <img src="docs/images/new-conscirpt-hero-image.png" alt="VERA20K huvudbild" width="100%">
 
 <p align="center" dir="ltr">
-  <strong>Svenska</strong> · <a href="README.zh-CN.md" lang="zh-CN">简体中文</a> · <a href="README.de.md" lang="de">Deutsch</a> · <a href="README.ar.md" lang="ar" dir="rtl">العربية</a> · <a href="README.ru.md" lang="ru">Русский</a> · <a href="README.th.md" lang="th">ไทย</a> · <a href="README.tr.md" lang="tr">Türkçe</a> · <a href="README.md" lang="en">English</a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/macos.yml?query=branch%3Amain" title="Senaste körningen av bibliotekstesterna för macOS (startas manuellt)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/macos.yml/badge.svg?branch=main" alt="Bibliotekstester för macOS" height="20" align="middle"></a>
-  <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/linux.yml?query=branch%3Amain" title="Senaste körningen av bibliotekstesterna för Linux (startas manuellt)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/linux.yml/badge.svg?branch=main" alt="Bibliotekstester för Linux" height="20" align="middle"></a>
-  <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/windows.yml?query=branch%3Amain" title="Senaste körningen av bibliotekstesterna för Windows (startas manuellt)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/windows.yml/badge.svg?branch=main" alt="Bibliotekstester för Windows" height="20" align="middle"></a>
-  <a href="https://discord.gg/kmjRUn5m5F"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&amp;logo=discord&amp;logoColor=white" alt="Gå med i Discord-servern" height="20" align="middle"></a>
-  <img src="https://img.shields.io/badge/QQ_grupp-1097193563-1EBAFC?style=flat&amp;logo=qq&amp;logoColor=white" alt="QQ-grupp" height="20" align="middle">
+  <a href="README.vi.md" lang="vi">Tiếng Việt</a> · <strong>Svenska</strong> · <a href="README.zh-CN.md" lang="zh-CN">简体中文</a> · <a href="README.de.md" lang="de">Deutsch</a> · <a href="README.ar.md" lang="ar" dir="rtl">العربية</a> · <a href="README.es.md" lang="es">Español</a> · <a href="README.ja.md" lang="ja">日本語</a> · <a href="README.ru.md" lang="ru">Русский</a> · <a href="README.th.md" lang="th">ไทย</a> · <a href="README.tr.md" lang="tr">Türkçe</a> · <a href="README.md" lang="en">English</a>
+</p>
+<p align="center" dir="ltr">
+  <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/linux.yml?query=branch%3Amain" title="Senaste körningen av bibliotekstesterna för Linux (startas manuellt)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/linux.yml/badge.svg?branch=main" alt="Bibliotekstester för Linux" height="23" align="middle"></a>
+  <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/windows.yml?query=branch%3Amain" title="Senaste körningen av bibliotekstesterna för Windows (startas manuellt)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/windows.yml/badge.svg?branch=main" alt="Bibliotekstester för Windows" height="23" align="middle"></a>
+  <a href="https://discord.gg/kmjRUn5m5F"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fdiscord.com%2Fapi%2Fv10%2Finvites%2FkmjRUn5m5F%3Fwith_counts%3Dtrue&amp;query=%24.approximate_presence_count&amp;suffix=%20online&amp;label=VERA20K%20Discord&amp;color=5865F2&amp;style=flat&amp;logo=discord&amp;logoColor=white" alt="Gå med i Discord-servern" height="23" align="middle"></a>
+  <img src="https://img.shields.io/badge/VERA20K_QQ-1097193563-1EBAFC?style=flat&amp;logo=qq&amp;logoColor=white" alt="QQ-grupp (VERA20K)" height="23" align="middle">
+  <img src="https://img.shields.io/badge/ra20k.com_QQ-319832195-1EBAFC?style=flat&amp;logo=qq&amp;logoColor=white" alt="QQ-grupp (ra20k.com)" height="23" align="middle">
 </p>
 
 # VERA20K
 
-VERA20K är en communitydriven nyimplementation av originalmotorn, `gamemd.exe`. Den använder
-de ursprungliga spelfilerna, så du behöver en egen kopia av Red Alert 2: Yuri's Revenge.
+VERA20K är en ny motor för Red Alert 2: Yuri's Revenge. Den spelar som originalet, med samma
+enheter, kartor och utseende, och körs på Windows, macOS och Linux. Den är byggd för större
+strider, med upp till 30 spelare och 20 000 enheter på en karta.
 
 VERA20K görs av spelare, för spelare, och det är spelarna som har sista ordet om vart projektet
 ska gå.
 
 <img src="docs/images/vera20k-screenshots.png" alt="VERA20K: inställningar för skirmish och bild från spelet" width="100%">
+
+## Ladda ner och spela
+
+1. Installera Red Alert 2: Yuri's Revenge från Steam eller EA-appen.
+2. Ladda ner VERA20K för ditt system från [releasesidan](https://github.com/YuriPlanet/vera20k/releases).
+3. Öppna filen du laddade ner. Den hittar ditt spel och installerar VERA20K i en egen mapp.
+
+Fastnat? Läs [hjälpsidan](https://vera20k.org/sv/help).
+
+Projektet är under aktiv utveckling: skirmish går att spela på Windows, macOS och Linux, kampanjer
+fungerar delvis och flerspelarläget online (experimentellt) är nu tillgängligt. Tidigare versioner
+och vad som ändrades i varje finns på
+[releasesidan](https://github.com/YuriPlanet/vera20k/releases).
+
+För att starta skirmish-matcher eller kampanjer i YR för en spelare från en CnCNet-klient, se
+[installationen av offlineklienten](integrations/cncnet/README.md).
 
 ## Projektets mål
 
@@ -27,17 +45,17 @@ ska gå.
 3. Integrera kända RTS-funktioner och några som aldrig setts förut.
 4. Integrerad flerspelarklient
 
-## Aktuellt läge
+Se [färdplanen](https://github.com/orgs/YuriPlanet/projects/1) för aktuella prioriteringar och framtida planer.
 
-**Under aktiv utveckling.**
+## Bidra
 
-- **Skirmish:** Går att spela på Windows, Linux och macOS, med kartor från originalspelet
-  och slumpgenererade kartor, basbygge, resursinsamling, strider samt möjlighet att spara och ladda spel.
-- **Kampanjer:** Uppdrag går att starta; stödet är fortfarande ofullständigt.
-- **AI:** Delar av originalets AI sköter basbygge och skriptstyrda anfall.
-- **Pågående arbete:** Spelbeteende, grafik och prestanda.
-- **Flerspelarläge:** Nätverksspel är ännu inte tillgängligt.
-- **Skala:** Slag med 30 spelare och 20 000 enheter har ännu inte demonstrerats.
+Medverkande kan ta ansvar för delar av motorn, med stor frihet att göra ändringar som driver
+VERA20K framåt.
+
+Underhållarna hjälper till med granskning, integrering och sammanslagning. Du får fullt
+erkännande för ditt bidrag.
+
+Diskussionen sker på [Discord](https://discord.gg/kmjRUn5m5F) och i QQ-gruppen (1097193563).
 
 ## Arkitektur
 
@@ -58,15 +76,11 @@ Pilarna visar dataflödet:
 
 Du behöver:
 
-- **Spelet:** Red Alert 2: Yuri's Revenge.
-- **Rust och Git:** den senaste stabila versionen av [Rust](https://rustup.rs/), installerad med
-  rustup, och [Git](https://git-scm.com/).
+- **Rust och Git:** [Rust](https://rustup.rs/) 1.97 eller senare, installerad med rustup, och
+  [Git](https://git-scm.com/).
 - **Byggverktyg:** på Windows Visual Studios C++-byggverktyg, som Rusts installationsprogram
   erbjuder sig att installera; på macOS `xcode-select --install`; på Debian och Ubuntu
-  `sudo apt install build-essential libasound2-dev pkg-config`.
-- **Grafik:** ett grafikkort med Vulkan, DirectX 12 eller Metal.
-
-VERA20K har spelats på Windows, Linux och macOS.
+  `sudo apt install build-essential libasound2-dev libxkbcommon-x11-0 pkg-config`.
 
 ```sh
 git clone https://github.com/YuriPlanet/vera20k.git
@@ -85,25 +99,28 @@ portar sedan dess beteende till Rust och kontrollerar det med
 
 ## Anpassning
 
-Valfria funktioner (t.ex. från Ares) ska kunna konfigureras via INI-filer, med möjlighet
-att slå på och av dem i klienten där det är lämpligt.
+VERA20K fungerar som standard precis som originalspelet. Varje ny funktion, även tillägg från
+moddar som Ares, måste vara avstängd tills den slås på med något av följande:
 
-## Bidra
+- **En spelarinställning i VERA**, under **Options**, som sparas i avsnittet `[VERA]` i `VERA.INI`.
+- **Ett byggalternativ**, till exempel `--features phobos` för de [Phobos-tillägg](docs/phobos.md) som stöds.
+- **En INI-nyckel**, som sätts av en mod eller en karta.
 
-All hjälp är välkommen. Du kan skriva kod, refaktorera motorn, testa spelet, dela idéer eller
-spela det sida vid sida med originalet och berätta vad som känns fel. Öppna en PR så tar vi det
-därifrån. Diskussionen sker på [Discord](https://discord.gg/kmjRUn5m5F) och i QQ-gruppen (1097193563).
+Inställningar för ljud, grafik och kontroller sparas i `VERA.INI`. Spelreglerna kommer från
+lobbyinställningar, moddar eller kartor.
+
+[Moddningsguiden](docs/modding.md) förklarar hur man gör egna moddar.
 
 ## Stöd projektet
 
-<a href="https://paypal.me/vera20k"><img src="docs/images/paypal-support.svg" alt="Stöd VERA20K via PayPal" height="40"></a>
+<a href="https://paypal.me/vera20k"><img src="https://img.shields.io/badge/Donate_via_PayPal-FFC439?style=flat&amp;logo=paypal&amp;logoColor=003087" alt="Stöd VERA20K via PayPal" height="23"></a>
 
 Alla mottagna donationer fördelas till
 medverkande enligt [TIBTRE:s bidragsregister](https://github.com/YuriPlanet/tibtre-ledger).
 
 Utbetalningar till medverkande:
 
-<p><img src="https://img.shields.io/badge/PayPal-003087?style=flat&amp;logo=paypal&amp;logoColor=white" alt="PayPal" height="20"> <img src="https://img.shields.io/badge/China_UnionPay-E21836?style=flat" alt="China UnionPay" height="20"> <img src="https://img.shields.io/badge/Alipay-1677FF?style=flat&amp;logo=alipay&amp;logoColor=white" alt="Alipay" height="20"> <img src="https://img.shields.io/badge/Vipps-FF5B24?style=flat" alt="Vipps" height="20"> <img src="https://img.shields.io/badge/SEPA-2D4B9A?style=flat&amp;logo=sepa&amp;logoColor=white" alt="SEPA" height="20"> <img src="https://img.shields.io/badge/Bitcoin-F7931A?style=flat&amp;logo=bitcoin&amp;logoColor=white" alt="Bitcoin" height="20"></p>
+<p><img src="https://img.shields.io/badge/PayPal-003087?style=flat&amp;logo=paypal&amp;logoColor=white" alt="PayPal" height="23"> <img src="https://img.shields.io/badge/China_UnionPay-E21836?style=flat&amp;logo=data:image/svg%2Bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii02IC02IDI2OCAxNzIiPjxwYXRoIGQ9Ik01MC4wNDE2MzEsMC4wMDA2Njc1NjMzMDUgTDExMy44MjAyMTEsMC4wMDA2Njc1NjMzMDUgQzEyMi43MjMxMjcsMC4wMDA2Njc1NjMzMDUgMTI4LjI2MDQzOCw3LjI1NzMxMzQ1IDEyNi4xODM1NTgsMTYuMTg5NzY1NyBMOTYuNDkwMDcxNSwxNDMuNjc1NDE2IEM5NC4zOTQ1MzY1LDE1Mi41NzY3NzcgODUuNDgwNzM5LDE1OS44Mzk2NDEgNzYuNTcxNjA1LDE1OS44Mzk2NDEgTDEyLjc5OTI0MzMsMTU5LjgzOTY0MSBDMy45MDg3NjQsMTU5LjgzOTY0MSAtMS42NDA5ODQ0NCwxNTIuNTc2Nzc3IDAuNDM1ODk2MjA4LDE0My42NzU0MTYgTDMwLjE0MTgxODYsMTYuMTg5NzY1NyBDMzIuMjE4Njk5Myw3LjI1NzMxMzQ1IDQxLjEyNzgzMzMsMC4wMDA2Njc1NjMzMDUgNTAuMDQxNjMxLDAuMDAwNjY3NTYzMzA1IiBmaWxsPSIjRTIxODM2IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iOCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxwYXRoIGQ9Ik0xMDguNTEzMjgzLDAuMDAwNjY3NTYzMzA1IEwxODEuODU3MDE4LDAuMDAwNjY3NTYzMzA1IEMxOTAuNzU4Mzc4LDAuMDAwNjY3NTYzMzA1IDE4Ni43NDQ1MjcsNy4yNTczMTM0NSAxODQuNjUwNTQ2LDE2LjE4OTc2NTcgTDE1NC45NjE3MjQsMTQzLjY3NTQxNiBDMTUyLjg3ODYyNSwxNTIuNTc2Nzc3IDE1My41Mjg0MjcsMTU5LjgzOTY0MSAxNDQuNjA4NDExLDE1OS44Mzk2NDEgTDcxLjI2NDY3NzUsMTU5LjgzOTY0MSBDNjIuMzQ0NjYxNSwxNTkuODM5NjQxIDU2LjgyNDQ0OTUsMTUyLjU3Njc3NyA1OC45MTk5ODUsMTQzLjY3NTQxNiBMODguNjA3MjUyNSwxNi4xODk3NjU3IEM5MC43MTUyMjQsNy4yNTczMTM0NSA5OS42MDU3MDM1LDAuMDAwNjY3NTYzMzA1IDEwOC41MTMyODMsMC4wMDA2Njc1NjMzMDUiIGZpbGw9IiMwMDQ0N0MiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSI4IiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8%2BPHBhdGggZD0iTTE3OC45NDc4MywwLjAwMDY2NzU2MzMwNSBMMjQyLjcyNjQwOSwwLjAwMDY2NzU2MzMwNSBDMjUxLjY0MTc2MiwwLjAwMDY2NzU2MzMwNSAyNTcuMTc5MDc0LDcuMjU3MzEzNDUgMjU1LjA4NTA5MywxNi4xODk3NjU3IEwyMjUuMzk2MjcxLDE0My42NzU0MTYgQzIyMy4zMDA3MzYsMTUyLjU3Njc3NyAyMTQuMzgwNzE5LDE1OS44Mzk2NDEgMjA1LjQ2NjkyMiwxNTkuODM5NjQxIEwxNDEuNzE3ODc5LDE1OS44Mzk2NDEgQzEzMi43OTc4NjMsMTU5LjgzOTY0MSAxMjcuMjY1MjE1LDE1Mi41NzY3NzcgMTI5LjM1NDUzMiwxNDMuNjc1NDE2IEwxNTkuMDQ4MDE3LDE2LjE4OTc2NTcgQzE2MS4xMjQ4OTksNy4yNTczMTM0NSAxNzAuMDI3ODE0LDAuMDAwNjY3NTYzMzA1IDE3OC45NDc4MywwLjAwMDY2NzU2MzMwNSIgZmlsbD0iIzAwN0I4NCIgc3Ryb2tlPSIjZmZmIiBzdHJva2Utd2lkdGg9IjgiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48L3N2Zz4%3D" alt="China UnionPay" height="23"> <img src="https://img.shields.io/badge/Alipay-1677FF?style=flat&amp;logo=alipay&amp;logoColor=white" alt="Alipay" height="23"> <img src="https://img.shields.io/badge/Vipps-FF5B24?style=flat&amp;logo=data:image/svg%2Bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjQzLjUgMjEuNSAyNyAyNyI%2BPHBhdGggZD0iTTU3LjMsNDAuNmMzLjcsMCw1LjgtMS44LDcuOC00LjRjMS4xLTEuNCwyLjUtMS43LDMuNS0wLjlzMS4xLDIuMywwLDMuN2MtMi45LDMuOC02LjYsNi4xLTExLjMsNi4xIGMtNS4xLDAtOS42LTIuOC0xMi43LTcuN2MtMC45LTEuMy0wLjctMi43LDAuMy0zLjRzMi41LTAuNCwzLjQsMUM1MC41LDM4LjMsNTMuNSw0MC42LDU3LjMsNDAuNnogTTY0LjIsMjguM2MwLDEuOC0xLjQsMy0zLDMgcy0zLTEuMi0zLTNzMS40LTMsMy0zQzYyLjgsMjUuMyw2NC4yLDI2LjYsNjQuMiwyOC4zeiIgZmlsbD0iI2ZmZiIvPjwvc3ZnPg%3D%3D" alt="Vipps" height="23"> <img src="https://img.shields.io/badge/SEPA-2D4B9A?style=flat&amp;logo=sepa&amp;logoColor=white" alt="SEPA" height="23"> <img src="https://img.shields.io/badge/Bitcoin-F7931A?style=flat&amp;logo=bitcoin&amp;logoColor=white" alt="Bitcoin" height="23"></p>
 
 ## Tack och juridisk information
 
@@ -111,8 +128,28 @@ Tack till OpenRA, XCC Mixer, ModEnc-wikin, Project Perfect Mod, EA:s GPL-utgåva
 Command & Conquer och Red Alert, World-Altering Editor, Final Alert, YRpp, Ares, Phobos och
 många andra.
 
-Licensierat under [GPLv3](LICENSE-GPL). Det här repot innehåller inga spelfiler. Command &
-Conquer och Red Alert är varumärken som tillhör Electronic Arts Inc., och skärmbilderna visar
-spelgrafik som ägs av Electronic Arts. VERA20K har ingen koppling till och stöds inte av Electronic Arts.
+Copyright © 2026 Halvor Nikolai Rusten och VERA20K:s bidragsgivare.
+Licensierat under [GPLv3](LICENSE-GPL) med [ytterligare villkor](LEGAL.md#additional-terms).
+Det här repot innehåller inga spelfiler. Command &
+Conquer och Red Alert är varumärken som tillhör Electronic Arts Inc., och skärmbilderna och
+appikonen, Red Alert 2:s röda stjärna, visar spelgrafik som ägs av Electronic Arts. VERA20K har
+ingen koppling till och stöds inte av Electronic Arts.
+
+This product includes software developed by the [Ares Contributors](LICENSES/Ares.txt).
+This product includes software developed by the [Phobos Developers](docs/phobos.md#original-project-and-authors).
+
+**Läs [den juridiska informationen](LEGAL.md) innan du delar, säljer eller forkar VERA20K.**
+
+## Dokumentation
+
+- [WebAssembly-förhandsversion](docs/wasm.md): ett valfritt enspelarbygge som körs i webbläsaren.
+- [Moddningsguide](docs/modding.md): vad moddar kan och inte kan göra och hur VERA20K skiljer sig från originalspelet.
+- [INI-profiler](docs/ini-roots.md): välja regel-, grafik- och AI-filer.
+- [Ares](docs/ares.md), [Phobos](docs/phobos.md) och [NPatch](docs/npatch.md): stöd för tilläggen och deras begränsningar.
+- [Motoröversikt](docs/index.md): kodens upplägg och hur motorns delar hänger ihop.
+- [Utvecklarverktyg](tools/README.md): byggen, tester och granskning av spelresurser.
+- [Karttester](tools/map_observation.md): skriptade scenarier, skärmbilder och observationer av matcher.
+- [Jämförelser med originalet](tools/native_oracle.md): jämföra beteendet med originalspelet.
+- [Arbetsflöde i Ghidra](docs/ghidra-workflow.md): undersöka originalmotorn.
 
 Översättning av [README.md](README.md); håll den uppdaterad i takt med den engelska versionen.

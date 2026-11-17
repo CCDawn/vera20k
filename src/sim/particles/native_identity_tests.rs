@@ -1,5 +1,7 @@
 //! Original constructor/Logic continuation, bounded to the flat Spark controls
 //! in `procedural_drawing_oracle/electric_bolt` and the retained save envelope.
+// Ares simulates this Spark system itself (hooks 0x62DF05, 0x62FD60), so the
+// stock control holds in a stock game only.
 
 use super::{Particle, ParticleSystem};
 use crate::map::resolved_terrain::{ResolvedTerrainGrid, test_flat_cell};
@@ -126,21 +128,20 @@ fn assert_state(sim: &Simulation, id: u64, expected: &Value) {
             particle.marked_for_deletion,
             native["time_to_die"].as_bool().unwrap()
         );
-        let spark = particle.spark.as_ref().unwrap();
         assert_eq!(
             serde_json::json!([
-                spark.velocity_x.bits(),
-                spark.velocity_y.bits(),
-                spark.velocity_z.bits()
+                particle.direction[0].bits(),
+                particle.direction[1].bits(),
+                particle.direction[2].bits()
             ]),
             native["velocity_bits"]
         );
-        assert_eq!(serde_json::json!(spark.start_rgb), native["color"]);
+        assert_eq!(serde_json::json!(particle.start_rgb), native["color"]);
         assert_eq!(
-            spark.color_index,
+            particle.color_index,
             native["color_index"].as_i64().unwrap() as i32
         );
-        let color_hex: String = spark
+        let color_hex: String = particle
             .color_accumulator
             .bits()
             .to_le_bytes()
@@ -244,7 +245,8 @@ fn original_spark_birth_and_first_live_visit_preserve_ids_rng_and_particle_state
 
         // Persistence retains identities and the one allocation cursor; load
         // deliberately reseeds Scenario RNG through the established owner.
-        sim.session.map_name = "spark-native-identities".into();
+        sim.session
+            .set_map_name_for_test("spark-native-identities".into());
         let cursor = sim.native_unique_ids.as_ref().unwrap().current_raw();
         let bytes = GameSnapshot::save_validated(&sim, 17, 23, "Spark native identities", 0);
         let mut restored = GameSnapshot::load_validated(&bytes, 17, 23, "spark-native-identities")
@@ -262,23 +264,30 @@ fn original_spark_birth_and_first_live_visit_preserve_ids_rng_and_particle_state
 #[test]
 fn stored_system_and_child_native_ids_each_affect_authoritative_hash() {
     let mut sim = Simulation::new();
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     let mut system = ParticleSystem::test_fixture(id, ParticleSystemTypeId(0), IVec3::ZERO);
     system
         .particles
         .push(Particle::test_fixture(ParticleTypeId(0), IVec3::ZERO));
-    sim.particle_systems_mut().insert(system);
+    sim.substrate.particle_systems.insert(system);
     let original = sim.state_hash();
-    sim.particle_systems_mut()
+    sim.substrate
+        .particle_systems
         .get_mut(id)
         .unwrap()
         .native_unique_id = 17;
     assert_ne!(sim.state_hash(), original);
-    sim.particle_systems_mut()
+    sim.substrate
+        .particle_systems
         .get_mut(id)
         .unwrap()
         .native_unique_id = 0;
     assert_eq!(sim.state_hash(), original);
-    sim.particle_systems_mut().get_mut(id).unwrap().particles[0].native_unique_id = 17;
+    sim.substrate
+        .particle_systems
+        .get_mut(id)
+        .unwrap()
+        .particles[0]
+        .native_unique_id = 17;
     assert_ne!(sim.state_hash(), original);
 }

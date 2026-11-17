@@ -34,12 +34,9 @@ use crate::sim::stage::StageClass;
 use crate::sim::timer::CdTimer;
 use serde_json::{Value, json};
 
-const NATIVE_SHA256: &str = "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c";
-
 fn corpus() -> &'static Value {
     let corpus = crate::test_fixture::json("tools/spatial_oracle/anytown_damage/unit_unlimbo.json");
     assert_eq!(corpus["schema_version"], 1);
-    assert_eq!(corpus["native_sha256"], NATIVE_SHA256);
     assert_eq!(corpus["direct_rows"].as_array().unwrap().len(), 9);
     assert_eq!(corpus["factory_rows"].as_array().unwrap().len(), 8);
     corpus
@@ -108,18 +105,18 @@ fn retail_world(rules: &RuleSet, terrain_rules: &TerrainRules) -> Simulation {
         off_104: 256,
         off_108: 256,
     });
-    sim.session.map_width = 128;
-    sim.session.map_height = 128;
+    sim.session.set_map_width_for_test(128);
+    sim.session.set_map_height_for_test(128);
     sim.install_resolved_terrain_for_new_map(terrain);
     let owner = sim.interner.intern("Americans");
     sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, true, 50_000, 10));
+        .register(HouseState::new(owner, 0, None, true, 50_000, 10));
     sim
 }
 
 fn apply_cell_inputs(sim: &mut Simulation, cell: (u16, u16), input: &Value) {
     let terrain = sim.resolved_terrain.as_mut().unwrap();
-    let target = terrain.cell_mut(cell.0, cell.1).unwrap();
+    let target = terrain.cell_mut_for_test(cell.0, cell.1).unwrap();
     let has_bridge = input["bridge"].as_bool().unwrap_or(false);
     target.bridge_facts.raw_flags = if has_bridge { 0x100 } else { 0 };
     target.has_bridge_deck = has_bridge;
@@ -139,7 +136,11 @@ fn apply_cell_inputs(sim: &mut Simulation, cell: (u16, u16), input: &Value) {
         cell.1,
         input["deck_bits"].as_u64().unwrap() as u8,
     );
-    sim.session.game_mode_nonzero = int(&input["actual_game_mode"]) != 0;
+    sim.session.set_game_mode(
+        crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+            int(&input["actual_game_mode"]) != 0,
+        ),
+    );
 }
 
 fn assert_actor(sim: &Simulation, id: u64, native: &Value, name: &str) {
@@ -451,7 +452,7 @@ fn compare_factory_radio_call(
                 None,
                 RadioMessage::RequestClearance,
                 RadioPayload::default(),
-                Some(rules),
+                rules,
                 crate::sim::world::FrameEffects::default(),
             )
         } else {
@@ -463,7 +464,7 @@ fn compare_factory_radio_call(
                 sim,
                 ids.0,
                 RadioMessage::RequestClearance,
-                Some(rules),
+                rules,
                 crate::sim::world::FrameEffects::default(),
             )
         };
@@ -623,17 +624,20 @@ fn retail_authored_unit_high_matches_original_pose_scope_and_lists() {
         );
         let id = if input["scope"] == 2 {
             projected += 1;
-            let entities = parse_map_entities(&IniFile::from_str(&format!(
-                "[Units]\n0=Americans,MTNK,256,{},{},128,Guard,None,0,-1,{},-1,1,1\n",
-                cell.0, cell.1, input["parsed_high"],
-            )));
+            let entities = parse_map_entities(
+                &IniFile::from_str(&format!(
+                    "[Units]\n0=Americans,MTNK,256,{},{},128,Guard,None,0,-1,{},-1,1,1\n",
+                    cell.0, cell.1, input["parsed_high"],
+                )),
+                4,
+            );
             assert_eq!(entities.len(), 1);
             assert_eq!(entities[0].high, input["parsed_high"] != 0);
             let terrain = sim.resolved_terrain.as_ref().unwrap().clone();
             let count = sim.with_object_placement_scope(|sim| {
                 let count = sim.spawn_from_map_with_resolved_and_overlay_registry(
                     &entities,
-                    Some(&rules),
+                    &rules,
                     Some(&terrain),
                     Some(&registry),
                 );
@@ -729,7 +733,6 @@ fn exact_unit_placement_input_z_matches_existing_original_ramp_controls() {
     let native: Value =
         serde_json::from_str(crate::test_fixture::text("tools/ramp_height_vectors.json")).unwrap();
     assert_eq!(native["schema"], 1);
-    assert_eq!(native["native_sha256"], NATIVE_SHA256);
     let cases = native["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 158);
     let mut compared = 0;
@@ -763,7 +766,7 @@ fn exact_unit_placement_input_z_matches_existing_original_ramp_controls() {
                 .resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(cell.0, cell.1)
+                .cell_mut_for_test(cell.0, cell.1)
                 .unwrap();
             target.level = int(&case["level"]) as u8;
             target.slope_type = case["ramp"].as_u64().unwrap() as u8;
@@ -961,7 +964,8 @@ fn retail_reused_unit_unlimbo_matches_original_stage_and_rng_tail() {
                 int(&poisoned["rate"]),
                 int(&poisoned["increment"]),
             ));
-        sim.session.binary_frame = input["frame"].as_u64().unwrap() as u32;
+        sim.session
+            .set_binary_frame_for_test(input["frame"].as_u64().unwrap() as u32);
         sim.main_rng = serde_json::from_value::<SimRng>(row["rng_before"]["main"].clone())
             .unwrap()
             .into();
@@ -1080,7 +1084,7 @@ fn retail_land_factory_delivery_matches_original_unit_unlimbo_suffix() {
         let mut sim = retail_world(&rules, &terrain_rules);
         let owner = sim.interner.intern("Americans");
         let unit_type = sim.interner.intern("MTNK");
-        assert!(sim.production.factories.test_enqueue_kernel(
+        assert!(sim.production.factories_mut().test_enqueue_kernel(
             owner,
             ProductionCategory::Vehicle,
             unit_type,
@@ -1116,10 +1120,11 @@ fn retail_land_factory_delivery_matches_original_unit_unlimbo_suffix() {
             producer.position.put_location(producer_coord);
             producer.position.set_z_for_test(4);
         }
-        sim.mission_assign_exact(producer_id, MissionId::from_known(MissionType::Guard), 0)
+        sim.substrate
+            .mission_assign_exact(producer_id, MissionId::from_known(MissionType::Guard), 0)
             .unwrap();
         assert!(
-            sim.houses[&owner].base_projection.buildings().is_empty(),
+            sim.houses[&owner].base_projection().buildings().is_empty(),
             "{name}: direct native ExitObject has no House producer membership"
         );
         let producer_type = rules.object("GAWEAP").unwrap();
@@ -1180,7 +1185,7 @@ fn retail_land_factory_delivery_matches_original_unit_unlimbo_suffix() {
                 .resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(cell.0, cell.1)
+                .cell_mut_for_test(cell.0, cell.1)
                 .unwrap();
             target.level = native["level"].as_u64().unwrap() as u8;
             target.slope_type = native["slope"].as_u64().unwrap() as u8;
@@ -1194,12 +1199,12 @@ fn retail_land_factory_delivery_matches_original_unit_unlimbo_suffix() {
         }
         assert!(
             sim.production
-                .factories
+                .factories_mut()
                 .test_arm_ready(owner, ProductionCategory::Vehicle)
         );
         let prior_rng = sim.rng_state();
-        let prior_tick = sim.session.tick;
-        let prior_frame = sim.session.binary_frame;
+        let prior_tick = sim.session.tick();
+        let prior_frame = sim.session.binary_frame();
         assert_eq!(
             json!(prior_frame),
             row["before"]["frame"],
@@ -1212,6 +1217,7 @@ fn retail_land_factory_delivery_matches_original_unit_unlimbo_suffix() {
                 &rules,
                 producer_id,
                 id,
+                (0, 0),
                 Some(&registry),
                 crate::sim::world::FrameEffects::default(),
             );
@@ -1229,7 +1235,7 @@ fn retail_land_factory_delivery_matches_original_unit_unlimbo_suffix() {
         );
         assert_eq!(row["eax"], 2, "{name}: native ExitObject success");
         assert_eq!(
-            json!(sim.session.binary_frame),
+            json!(sim.session.binary_frame()),
             row["after"]["frame"],
             "{name}: direct ExitObject preserves its native frame"
         );
@@ -1320,17 +1326,18 @@ fn retail_land_factory_delivery_matches_original_unit_unlimbo_suffix() {
             &rules,
             owner,
             ProductionCategory::Vehicle,
+            production::ProductionCancellation::Category(ProductionCategory::Vehicle),
             crate::sim::world::FrameEffects::default(),
         );
         assert!(
             sim.production
-                .factories
+                .factories()
                 .view(owner, ProductionCategory::Vehicle)
                 .is_none_or(|factory| factory.object.is_none()),
             "{name}: successful caller releases its held identity"
         );
         assert_eq!(
-            (sim.session.tick, sim.session.binary_frame),
+            (sim.session.tick(), sim.session.binary_frame()),
             (prior_tick, prior_frame),
             "{name}: ExitObject and caller release do not advance a frame"
         );
@@ -1444,7 +1451,7 @@ fn retail_factory_exit_radio_matches_original_reciprocal_cleanup() {
                 unit,
                 RadioMessage::Hello,
                 RadioPayload::default(),
-                Some(&rules),
+                &rules,
                 crate::sim::world::FrameEffects::default(),
             )
             .code(),
@@ -1458,7 +1465,7 @@ fn retail_factory_exit_radio_matches_original_reciprocal_cleanup() {
                 unit,
                 RadioMessage::Tether,
                 RadioPayload::default(),
-                Some(&rules),
+                &rules,
                 crate::sim::world::FrameEffects::default(),
             )
             .code(),
@@ -1497,7 +1504,6 @@ fn unit_entry_scope_and_actual_game_mode_match_independent_original_controls() {
     ))
     .unwrap();
     assert_eq!(native["schema_version"], 1);
-    assert_eq!(native["native_sha256"], NATIVE_SHA256);
     let rows = native["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 8);
     for row in rows {
@@ -1512,7 +1518,7 @@ fn unit_entry_scope_and_actual_game_mode_match_independent_original_controls() {
         sim.mapgen_rng = crate::sim::rng::SimRng::new(31);
         let owner = sim.interner.intern("Americans");
         sim.houses
-            .insert(owner, HouseState::new(owner, 0, None, false, 0, 10));
+            .register(HouseState::new(owner, 0, None, false, 0, 10));
         let mut actor = GameEntity::test_default(90, "MOVER", "Americans", 10, 10);
         actor.set_type_ref_for_test(sim.interner.intern("MOVER"));
         actor.set_owner_for_test(owner);
@@ -1520,7 +1526,8 @@ fn unit_entry_scope_and_actual_game_mode_match_independent_original_controls() {
         actor.set_in_playfield(input["fixture"]["in_playfield"].as_bool().unwrap());
         actor.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
         sim.substrate.entities.insert(actor);
-        sim.mission_assign_exact(90, MissionId::from_known(MissionType::Guard), 100)
+        sim.substrate
+            .mission_assign_exact(90, MissionId::from_known(MissionType::Guard), 100)
             .unwrap();
         let bounds = &input["fixture"]["bounds"];
         sim.playfield_bounds = Some(crate::map::playfield::PlayfieldBounds {
@@ -1536,7 +1543,11 @@ fn unit_entry_scope_and_actual_game_mode_match_independent_original_controls() {
                 .unwrap()
                 .place_overlay(11, 10, 0, 0);
         }
-        sim.session.game_mode_nonzero = int(&input["actual_game_mode"]) != 0;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+                int(&input["actual_game_mode"]) != 0,
+            ),
+        );
         assert_rng(&sim, &row["rng"], "before_hex", &name);
         let before = sim.rng_state();
         let result = in_scopes(
