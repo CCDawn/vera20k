@@ -1120,3 +1120,50 @@ fn a_resume_names_the_agreed_timing_of_every_player() {
     let short = text.replacen("[Relay]\n", "[Relay]\nResumePings=12\nResumeCursor=2\n", 1);
     assert!(relay(&short).is_err());
 }
+
+/// *(VERA)* `[SuperTiers]` names the Super AI plugin's tier per active AI
+/// slot. Upstream CnCNet clients never write the section, so its absence is
+/// exactly the stock launch: `super_tier: None`.
+#[test]
+fn super_tiers_set_the_super_ai_policy_of_active_ai_slots() {
+    let SpawnGame::Skirmish(session) = SpawnRequest::parse(SKIRMISH).unwrap() else {
+        panic!("expected skirmish")
+    };
+    assert_eq!(session.opponents[0].super_tier, None);
+    assert_eq!(session.opponents[1].super_tier, None);
+
+    let tiers = SKIRMISH.replacen(
+        "[HouseHandicaps]",
+        "[SuperTiers]\nMulti2=Unlimited\nMulti3=Brutal\n[HouseHandicaps]",
+        1,
+    );
+    let SpawnGame::Skirmish(session) = SpawnRequest::parse(&tiers).unwrap() else {
+        panic!("expected skirmish")
+    };
+    assert_eq!(
+        session.opponents[0].super_tier,
+        Some(crate::super_ai::SuperAiDifficulty::Unlimited.into())
+    );
+    assert_eq!(
+        session.opponents[1].super_tier,
+        Some(crate::super_ai::SuperAiDifficulty::Brutal.into())
+    );
+}
+
+/// A tier row is only valid for an active AI house: humans, empty slots and
+/// slots past the network roster refuse the launch, as does an unknown tier
+/// name.
+#[test]
+fn super_tiers_reject_non_ai_slots_and_unknown_tier_names() {
+    for append in [
+        "[SuperTiers]\nMulti1=Fair",
+        "[SuperTiers]\nMulti4=Fair",
+        "[SuperTiers]\nMulti31=Fair",
+        "[SuperTiers]\nMulti2=Brutalish",
+    ] {
+        assert!(
+            SpawnRequest::parse(&format!("{SKIRMISH}\n{append}")).is_err(),
+            "{append}"
+        );
+    }
+}

@@ -31,6 +31,7 @@ use crate::skirmish_launch::{
     SkirmishLocalSlot,
 };
 use crate::skirmish_modes::{ModeStartEffect, SkirmishGameMode, mode_by_id};
+use crate::super_ai::SuperAiDifficulty;
 
 #[derive(Debug)]
 pub(crate) struct SpawnRequest {
@@ -577,6 +578,21 @@ fn skirmish(
         (NETWORK_PLAYER_SLOT_COUNT - player_count) as i32,
     )? as usize;
     let handicaps = ini.section_or_empty("HouseHandicaps");
+    // *(VERA)* `[SuperTiers] MultiN=<tier>` is this fork's per-AI Super AI
+    // tier; upstream CnCNet clients never write the section. Every key must
+    // name a house slot, so a typo or an out-of-range row is refused instead
+    // of silently ignored.
+    let super_tiers = ini.section_or_empty("SuperTiers");
+    for key in super_tiers.keys() {
+        let slot = key
+            .strip_prefix("Multi")
+            .and_then(|index| index.parse::<usize>().ok())
+            .filter(|&slot| (1..=NETWORK_PLAYER_SLOT_COUNT).contains(&slot));
+        ensure!(
+            slot.is_some(),
+            "[SuperTiers] {key} must name a Multi1..Multi{NETWORK_PLAYER_SLOT_COUNT} slot"
+        );
+    }
     let mut active = Vec::new();
     let mut rows = Vec::new();
     let mut colors = Vec::new();
@@ -637,6 +653,10 @@ fn skirmish(
             integer(handicaps, &key, -1)? == -1,
             "[HouseHandicaps] {key} conflicts with a human player"
         );
+        ensure!(
+            !super_tiers.is_present(&key),
+            "[SuperTiers] {key} conflicts with a human player"
+        );
         if house == 0 {
             local_player_index = source;
         }
@@ -676,7 +696,8 @@ fn skirmish(
         if difficulty < 0 {
             ensure!(
                 !ini.section_or_empty("HouseCountries").is_present(&key)
-                    && !ini.section_or_empty("HouseColors").is_present(&key),
+                    && !ini.section_or_empty("HouseColors").is_present(&key)
+                    && !super_tiers.is_present(&key),
                 "{key} has AI options but no active HouseHandicaps entry"
             );
             continue;
@@ -684,6 +705,10 @@ fn skirmish(
         ensure!(!spectator(ini, raw_slot)?, "{key} is a spectator");
         validate_house_extensions(ini, raw_slot)?;
         let color_index = color(ini.section_or_empty("HouseColors"), &key)?;
+        let tier = super_tiers
+            .is_present(&key)
+            .then(|| super_tier(super_tiers, &key))
+            .transpose()?;
         active.push(raw_slot);
         rows.push(raw_slot as u8);
         colors.push(color_index);
@@ -701,7 +726,7 @@ fn skirmish(
                 2 => AiDifficulty::Easy,
                 _ => unreachable!("active AI difficulty was validated"),
             },
-            super_tier: None,
+            super_tier: tier.map(Into::into),
         });
     }
     ensure!(
@@ -932,6 +957,24 @@ fn spectator(ini: &IniFile, raw_slot: usize) -> Result<bool> {
         &format!("Multi{}", raw_slot + 1),
         false,
     )
+}
+
+/// *(VERA)* The `[SuperTiers] MultiN` value: a name from the Super AI
+/// plugin's difficulty ladder (`crate::super_ai::SuperAiDifficulty`), read
+/// in its serde spelling. An unknown name refuses the launch.
+fn super_tier(section: &IniSection, key: &str) -> Result<SuperAiDifficulty> {
+    let name = section.read_string(key, "", 64);
+    let tier = match name.as_str() {
+        "Fair" => SuperAiDifficulty::Fair,
+        "Brutal" => SuperAiDifficulty::Brutal,
+        "Super" => SuperAiDifficulty::Super,
+        "Unlimited" => SuperAiDifficulty::Unlimited,
+        _ => bail!(
+            "[SuperTiers] {key}={name:?} is not a Super AI tier \
+             (Fair, Brutal, Super, Unlimited)"
+        ),
+    };
+    Ok(tier)
 }
 
 fn validate_house_extensions(ini: &IniFile, raw_slot: usize) -> Result<()> {
