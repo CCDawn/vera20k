@@ -547,8 +547,8 @@ fn rebuild_super_players_for(
             wave_host.is_some()
         );
     }
-    // Each house carries its launch tier mark; saves from before the mark
-    // fall back to the build-scale heuristic (a scale marks Super, a
+    // Each house carries its launch driver policy; saves from before the
+    // mark fall back to the build-scale heuristic (a scale marks Super, a
     // scale-less command-driven house is Brutal).
     let command_driven: Vec<(
         crate::sim::intern::InternedId,
@@ -573,7 +573,8 @@ fn rebuild_super_players_for(
             (
                 *house,
                 state
-                    .super_tier()
+                    .super_tier_policy()
+                    .map(crate::super_ai::infer_tier)
                     .unwrap_or(if state.native_build_time_scale().is_some() {
                         crate::super_ai::SuperAiDifficulty::Super
                     } else {

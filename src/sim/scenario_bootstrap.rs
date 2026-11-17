@@ -1944,9 +1944,7 @@ pub fn normalized_launch_slots(session: &SkirmishLaunchSession) -> Vec<Normalize
             handle: None,
             difficulty: HouseDifficulty::from_native(opponent.difficulty.as_i32())
                 .expect("native AI difficulty"),
-            super_tier: opponent
-                .super_tier
-                .map(crate::sim::driver::DriverPolicy::from),
+            super_tier: opponent.super_tier,
             commander: None,
         });
     }
@@ -5689,8 +5687,9 @@ mod tests {
             "[Countries]\n0=Americans\n1=Russians\n2=Neutral\n[Americans]\n[Russians]\n[Neutral]\n",
         ))
         .expect("country fixture rules");
-        let map =
-            IniFile::from_str("[Houses]\n0=Neutral\n[Neutral]\nCountry=Russians\nMultiplayPassive=no\n");
+        let map = IniFile::from_str(
+            "[Houses]\n0=Neutral\n[Neutral]\nCountry=Russians\nMultiplayPassive=no\n",
+        );
         let roster = crate::map::houses::parse_house_roster(&map, &[], Some(&rules));
 
         let mut sim = Simulation::new();

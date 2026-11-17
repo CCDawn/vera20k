@@ -39,14 +39,97 @@
 
 use vera20k_core::sim::command::Command;
 use vera20k_core::sim::command::CommandEnvelope;
+use vera20k_core::sim::driver::{CreditDrip, DriverPolicy};
 use vera20k_core::sim::intern::InternedId;
 use vera20k_core::sim::runtime::SimRuntime;
+use vera20k_core::util::native_x87::NativeF32Bits;
 
-// The difficulty ladder and its Unlimited wallet floor live in
-// `sim::driver` beside the policy they map onto, so the engine never
-// imports this module (the Phase 1a cycle break). Re-exported unchanged
-// for every existing caller of `super_ai::SuperAiDifficulty`.
-pub use vera20k_core::sim::driver::{SuperAiDifficulty, UNLIMITED_WALLET_FLOOR};
+// The difficulty ladder is the plugin's own: the engine core carries no
+// Super AI knowledge, so the tiers and their wallet floor moved here out of
+// `sim::driver` (the Phase 1c pluginization). The serde spelling is
+// unchanged — launch slots and saved setups serialize the same variant
+// names as before.
+/// The ladder the Super AI plays at.
+///
+/// The tiers describe the target behaviour, not what the current milestone
+/// does; see the module docs for the milestone split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum SuperAiDifficulty {
+    /// Zero bonuses, pure decisions: the benchmark baseline. Whatever the
+    /// decision layer achieves at this tier is skill, not subsidy.
+    #[default]
+    Fair,
+    /// Fair play plus credit and harvesting bonuses, in the economy the
+    /// simulation already owns. Lands in a later milestone.
+    Brutal,
+    /// Fast building, parallel factories and continuous unit production on
+    /// top of Brutal's economy. The build-speed knob is a later milestone's
+    /// minimal simulation-side change; nothing simulation-side changes yet.
+    Super,
+    /// Super's treatment plus a wallet floor topped up every tick: the
+    /// spectacle tier for watching the strategy spend without an economy
+    /// behind it. Fork-only showcase row — strength claims never cite it,
+    /// and the income-recovery cancel rule stays asleep under it (a
+    /// wallet above every buildable's cost can finish anything queued).
+    Unlimited,
+}
+
+/// The wallet floor the Unlimited tier tops up to every ordinary tick
+/// (`sim_tick` and the benches apply the same rule). Comfortably above the
+/// priciest retail buildable so every queue the house owns rolls at once.
+pub const UNLIMITED_WALLET_FLOOR: i32 = 1_000_000;
+
+/// The launch tier a stored [`DriverPolicy`] reads back as (the engine's
+/// former `DriverPolicy::infer_tier`, moved here with the ladder): the
+/// strongest knob decides (floor → Unlimited, scale → Super, drip → Brutal,
+/// nothing → Fair). Every tier-launched house infers its launch tier
+/// exactly, so the driver rebuild keeps its semantics.
+pub fn infer_tier(policy: &DriverPolicy) -> SuperAiDifficulty {
+    if policy.wallet_floor.is_some() {
+        SuperAiDifficulty::Unlimited
+    } else if policy.build_time_scale.is_some() {
+        SuperAiDifficulty::Super
+    } else if policy.credit_drip.is_some() {
+        SuperAiDifficulty::Brutal
+    } else {
+        SuperAiDifficulty::Fair
+    }
+}
+
+impl From<SuperAiDifficulty> for DriverPolicy {
+    fn from(tier: SuperAiDifficulty) -> Self {
+        // 0.5f32: build twice as fast as the native chain (the fork's one
+        // documented simulation-side exception, applied by the tier kernel).
+        const HALVED_BUILD_TIME: NativeF32Bits = NativeF32Bits::from_bits(0x3F00_0000);
+        match tier {
+            SuperAiDifficulty::Fair => Self::neutral(),
+            SuperAiDifficulty::Brutal => Self {
+                native_hard_grant: true,
+                credit_drip: Some(CreditDrip {
+                    amount: 1000,
+                    interval_ticks: 600,
+                }),
+                build_time_scale: None,
+                wallet_floor: None,
+            },
+            SuperAiDifficulty::Super => Self {
+                native_hard_grant: true,
+                credit_drip: Some(CreditDrip {
+                    amount: 1000,
+                    interval_ticks: 600,
+                }),
+                build_time_scale: Some(HALVED_BUILD_TIME),
+                wallet_floor: None,
+            },
+            SuperAiDifficulty::Unlimited => Self {
+                native_hard_grant: true,
+                credit_drip: None,
+                build_time_scale: Some(HALVED_BUILD_TIME),
+                wallet_floor: Some(UNLIMITED_WALLET_FLOOR),
+            },
+        }
+    }
+}
 
 /// Ticks between two deploy retries: enough for the MCV's deploy animation to
 /// finish, few enough to recover within a minute of game time.
@@ -20985,11 +21068,12 @@ mod tests {
         ENEMY_BARRACKS_TYPES, ENEMY_REFINERY_TYPES, ENTRANCE_POST_MAX, ENTRANCE_POST_MIN,
         EXPANSION_MIN_DISTANCE, FACTORY_BUILDOUT, FLOATER_COUNTER_THREATS, FLOATER_TYPES, OPENINGS,
         ORE_ENEMY_DIRECTION_BIAS, PlacementRoute, ROLE_SHARE_BASE, ROLE_SHARE_BOOST, Role,
-        RosterEntry, SuperAi, SuperAiDifficulty, TECH_BUILDING_TYPES, aa_per_yard_quota,
-        aa_unit_target, aa_vehicle_target, anti_air_demand, barracks_quota, capture_priority_rank,
-        enemy_direction_bias, entrance_choke_cell, factory_quota, find_defense_site_around,
-        foundation_keeps_gap, ground_per_yard_quota, nearest_connected_target, rally_anchor,
-        spy_infiltration_rank, tech_bank_short, wall_ring_cells,
+        RosterEntry, SuperAi, SuperAiDifficulty, TECH_BUILDING_TYPES, UNLIMITED_WALLET_FLOOR,
+        aa_per_yard_quota, aa_unit_target, aa_vehicle_target, anti_air_demand, barracks_quota,
+        capture_priority_rank, enemy_direction_bias, entrance_choke_cell, factory_quota,
+        find_defense_site_around, foundation_keeps_gap, ground_per_yard_quota, infer_tier,
+        nearest_connected_target, rally_anchor, spy_infiltration_rank, tech_bank_short,
+        wall_ring_cells,
     };
     use vera20k_core::sim::intern::InternedId;
     use vera20k_core::sim::runtime::SimRuntime;
@@ -22146,7 +22230,7 @@ mod tests {
                     (LaunchCountry::America, AiDifficulty::Normal),
                 ],
             );
-            session.opponents[0].super_tier = Some(tier);
+            session.opponents[0].super_tier = Some(tier.into());
             // No roaming starting units: the tier grant multiplies the launch
             // balance with nothing deducted or credited back in between.
             session.options.unit_count = 0;
@@ -22172,7 +22256,7 @@ mod tests {
 
             assert!(tier_house.command_driven(), "the tier slot command-drives");
             assert_eq!(
-                tier_house.super_tier(),
+                tier_house.super_tier_policy().map(infer_tier),
                 Some(tier),
                 "the tier mark rides the house for the driver rebuild"
             );
@@ -22206,7 +22290,7 @@ mod tests {
                 !plain_house.command_driven(),
                 "an ordinary computer slot stays native-AI driven"
             );
-            assert_eq!(plain_house.super_tier(), None);
+            assert_eq!(plain_house.super_tier_policy().map(infer_tier), None);
             assert_eq!(plain_house.difficulty(), HouseDifficulty::Normal);
             assert_eq!(plain_house.native_build_time_scale(), None);
             // Retail MultiplayerAICM's Normal row is 0, so the native loop
@@ -22243,7 +22327,7 @@ mod tests {
             ],
         );
         for opponent in &mut session.opponents {
-            opponent.super_tier = Some(SuperAiDifficulty::Unlimited);
+            opponent.super_tier = Some(SuperAiDifficulty::Unlimited.into());
             opponent.team = LaunchTeam::Team(1);
         }
         session.options.unit_count = 0;
@@ -22260,7 +22344,10 @@ mod tests {
             .map(|(&house, state)| {
                 SuperAi::new(
                     house,
-                    state.super_tier().unwrap_or(SuperAiDifficulty::Brutal),
+                    state
+                        .super_tier_policy()
+                        .map(infer_tier)
+                        .unwrap_or(SuperAiDifficulty::Brutal),
                 )
             })
             .collect();
@@ -22454,7 +22541,7 @@ mod tests {
         // The live lobby's shape: three MAX houses on team A, the rest on
         // team D, the human alone — AI-vs-AI warfare, not one allied bloc.
         for (index, opponent) in session.opponents.iter_mut().enumerate() {
-            opponent.super_tier = Some(SuperAiDifficulty::Unlimited);
+            opponent.super_tier = Some(SuperAiDifficulty::Unlimited.into());
             opponent.team = if index < 3 {
                 LaunchTeam::Team(1)
             } else {
@@ -22475,7 +22562,10 @@ mod tests {
             .map(|(&house, state)| {
                 SuperAi::new(
                     house,
-                    state.super_tier().unwrap_or(SuperAiDifficulty::Brutal),
+                    state
+                        .super_tier_policy()
+                        .map(infer_tier)
+                        .unwrap_or(SuperAiDifficulty::Brutal),
                 )
             })
             .collect();
@@ -28754,5 +28844,57 @@ mod tests {
             None,
             "the met kennel asks for nothing"
         );
+    }
+
+    // The engine's former `sim::driver` tier tests, moved here with the
+    // ladder: the tier→policy mapping and its inference are the plugin's;
+    // the policy mechanics tests stay beside `DriverPolicy` in the engine.
+    const ALL_TIERS: [SuperAiDifficulty; 4] = [
+        SuperAiDifficulty::Fair,
+        SuperAiDifficulty::Brutal,
+        SuperAiDifficulty::Super,
+        SuperAiDifficulty::Unlimited,
+    ];
+
+    #[test]
+    fn tiers_map_to_distinct_policies_and_infer_back() {
+        use vera20k_core::sim::driver::{CreditDrip, DriverPolicy};
+        use vera20k_core::util::native_x87::NativeF32Bits;
+
+        assert_eq!(
+            DriverPolicy::from(SuperAiDifficulty::Fair),
+            DriverPolicy::neutral()
+        );
+
+        let brutal = DriverPolicy::from(SuperAiDifficulty::Brutal);
+        assert!(brutal.native_hard_grant);
+        assert_eq!(
+            brutal.credit_drip,
+            Some(CreditDrip {
+                amount: 1000,
+                interval_ticks: 600,
+            })
+        );
+        assert_eq!(brutal.build_time_scale, None);
+        assert_eq!(brutal.wallet_floor, None);
+
+        let super_tier = DriverPolicy::from(SuperAiDifficulty::Super);
+        assert_eq!(
+            super_tier.build_time_scale,
+            Some(NativeF32Bits::from_bits(0x3F00_0000))
+        );
+        assert_eq!(super_tier.wallet_floor, None);
+
+        let unlimited = DriverPolicy::from(SuperAiDifficulty::Unlimited);
+        assert_eq!(unlimited.wallet_floor, Some(UNLIMITED_WALLET_FLOOR));
+        assert_eq!(unlimited.credit_drip, None);
+
+        for tier in ALL_TIERS {
+            assert_eq!(
+                infer_tier(&DriverPolicy::from(tier)),
+                tier,
+                "{tier:?} round-trips through its policy"
+            );
+        }
     }
 }

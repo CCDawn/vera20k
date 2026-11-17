@@ -682,12 +682,14 @@ pub struct SkirmishAiSlot {
     pub start_position: LaunchStartPosition,
     pub team: LaunchTeam,
     pub difficulty: AiDifficulty,
-    /// Fork-only Super-AI tier (`docs/superai.md`): when set, the slot's
+    /// Fork-only driver policy (`docs/superai.md`): when set, the slot's
     /// house is command-driven — the native AI stands down for it
     /// (`HouseState::command_driven`) and the app's match loop drives it
-    /// through the command layer instead. `None` is a native computer.
+    /// through the command layer instead; the driver plugin's difficulty
+    /// ladder converts its tiers into this policy. `None` is a native
+    /// computer.
     #[serde(default)]
-    pub super_tier: Option<crate::sim::driver::SuperAiDifficulty>,
+    pub super_tier: Option<crate::sim::driver::DriverPolicy>,
 }
 
 fn legacy_raw_ai_slot() -> u8 {

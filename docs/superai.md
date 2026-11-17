@@ -35,10 +35,11 @@ Super re-use `native_ai_opening_grant` — the same kernel behind retail
 native calculation, and the recurring drip and the Unlimited floor both go
 through `Economy::add_credits`, the entry native credit actions already use.
 The launch's `sim_tick` applies the same rules as the bench every ordinary
-tick, so the tier behaves identically in-game and headless. The tier a house
-launched with rides the house itself (`HouseState::super_tier`), so the driver
-rebuild — fresh launch and saved-game restore alike — recovers it exactly;
-saves written before the mark fall back to the build-scale heuristic.
+tick, so the tier behaves identically in-game and headless. The policy a
+house launched with rides the house itself (`HouseState::super_tier_policy`),
+so the driver rebuild — fresh launch and saved-game restore alike — recovers
+its tier exactly (the plugin's `super_ai::infer_tier`); saves written before
+the mark fall back to the build-scale heuristic.
 
 The Unlimited floor deliberately cannot wedge the strategy: the
 income-recovery cancel rule (below) fires only when the wallet genuinely
@@ -99,7 +100,7 @@ locomotor lifts) stand down for that house — the native AI and the
 command layer must not both drive one house. The app's match loop then
 rebuilds one `SuperAi` per command-driven non-passive non-human house on
 every runtime install (fresh match and saved game, tier read back from
-`HouseState::super_tier`) and merges its orders
+`HouseState::super_tier_policy`) and merges its orders
 into the tick's command stream on the Ordinary lane, including the
 Brutal/Super credit drip and the Unlimited floor the bench harness
 applies. An ordinary computer

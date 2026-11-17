@@ -151,7 +151,10 @@ pub fn pack_launch_session_without_start_validation(
             start_position: launch_start_position(slot, opponent.start_position)?,
             team: LaunchTeam::from_shell_value(opponent.team),
             difficulty,
-            super_tier: opponent.row_type.super_tier(),
+            super_tier: opponent
+                .row_type
+                .super_tier()
+                .map(crate::sim::driver::DriverPolicy::from),
         });
     }
 
