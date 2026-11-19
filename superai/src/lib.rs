@@ -21058,6 +21058,716 @@ fn find_site_beyond(
     None
 }
 
+// ---- The Lieutenant: the commander-mode brain ----
+
+// The delegation registry is the engine's, at `vera20k_core::sim::delegation`
+// (the engine spells the module `crate::sim::delegation` in its own layout):
+// `Simulation::delegation` hands the registry out and
+// `DelegationRegistry::groups_of` yields `(group id, live member ids,
+// intent)` per house. The parallel simulation-side task lands these names
+// alongside this commit, so this crate does not compile until that engine
+// commit is in — the import below is the contract point.
+use vera20k_core::sim::delegation::DelegationIntent;
+
+/// Ticks a delegated member that just took a Lieutenant order waits before
+/// taking another: the [`IDLE_REORDER_TICKS`] convention at micro cadence —
+/// the delegated set is small and hand-picked, so its re-order window is
+/// tighter than the standing army's. A command the engine drops leaves the
+/// member idle behind its gate, and the next open window re-orders it.
+const LIEUTENANT_REORDER_TICKS: u32 = 45;
+
+/// The AutoReact ring around the group's centroid, in cells: the
+/// stance's intercept reads run inside it and nothing chases past it —
+/// light local pressure, not a map-wide pursuit.
+const LIEUTENANT_AUTOREACT_RADIUS: i16 = 10;
+
+/// How far a DefendLocation's post reaches from its cell, in cells:
+/// hostiles inside draw an intercept, members outside walk back in.
+const LIEUTENANT_DEFEND_RADIUS: i16 = 8;
+
+/// The hold ring around an intent's anchor, in cells: an
+/// `AttackLocation`'s members closer than this hold their spread posts,
+/// and a `DefendLocation`'s strays past it are walked back in.
+const LIEUTENANT_HOLD_RADIUS: i16 = 6;
+
+/// The ring an `AttackLocation` latches its focus in, around the intent
+/// cell: priority targets on the way there and at it, not the whole map.
+const LIEUTENANT_FOCUS_RADIUS: i16 = 12;
+
+/// The seek ring an Attack-stance `AutoReact` group presses through,
+/// around the group centroid: wide enough to hunt a running fight,
+/// bounded enough that the group never crosses the map alone.
+const LIEUTENANT_SEEK_RADIUS: i16 = 24;
+
+/// The engagement-ring notch the Attack stance adds to the location
+/// intents (`AutoReact`'s behavior is wholly stance-driven, not notched):
+/// one widen step, so an aggressive commander reaches a little further
+/// without the intents' shapes changing.
+const LIEUTENANT_STANCE_RADIUS_NOTCH: i16 = 4;
+
+/// A Defend-stance member whose health fell below this fraction
+/// (thousandths) of its strength breaks off and walks back to the hold
+/// area: the intercept detachment's withdraw ladder
+/// ([`DEFENSE_INTERCEPT_WITHDRAW_FRACTION`]) applied to a single hull.
+const LIEUTENANT_PULLBACK_FRACTION: i32 = 350;
+
+/// A delegated structure whose health fraction fell under this
+/// (thousandths) of its strength earns a repair activation: the base
+/// repair limb's three-fifths reading, and the engine's repair byte owns
+/// the latch from there.
+const LIEUTENANT_REPAIR_FRACTION: i32 = 600;
+
+/// The commander's global posture for a Lieutenant: local player
+/// preference, so it lives only on the Lieutenant instance — never
+/// serialized into a saved setup and never mirrored in the engine; the
+/// commands it produces flow through the owner-house envelope stream as
+/// any other. Extensible: later postures slot in beside these two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LieutenantStance {
+    /// 防守模式: the defensive posture. `AutoReact` groups hold their
+    /// ground — intercept the threats inside the ring, hold a spread of
+    /// guard posts otherwise, pull a badly wounded member back.
+    #[default]
+    Defend,
+    /// 进攻模式: the offensive posture. `AutoReact` groups seek and press
+    /// the armor-ranked best hostile in a wide ring through a latched
+    /// group focus, sustaining the engagement; location intents keep
+    /// their behavior with the engagement ring one notch wider.
+    Attack,
+}
+
+/// The Lieutenant's target ranking: hulls and flyers first, standing
+/// structures next, foot soldiers last — nearest wins inside one rank,
+/// the substrate's stable order breaking the last ties (the boarding
+/// quota's anti-armor-first order, applied to hostile targets).
+fn lieutenant_target_rank(category: vera20k_core::map::entities::EntityCategory) -> u8 {
+    match category {
+        vera20k_core::map::entities::EntityCategory::Unit
+        | vera20k_core::map::entities::EntityCategory::Aircraft => 0,
+        vera20k_core::map::entities::EntityCategory::Structure => 1,
+        vera20k_core::map::entities::EntityCategory::Infantry => 2,
+    }
+}
+
+/// The engagement ring a location intent runs at under `stance`: the
+/// Defense posture keeps the base ring, the Attack posture widens it one
+/// notch ([`LIEUTENANT_STANCE_RADIUS_NOTCH`]).
+fn lieutenant_engage_radius(base: i16, stance: LieutenantStance) -> i16 {
+    match stance {
+        LieutenantStance::Defend => base,
+        LieutenantStance::Attack => base + LIEUTENANT_STANCE_RADIUS_NOTCH,
+    }
+}
+
+/// One human house's delegated task force: the commander-mode brain that
+/// micro-manages exactly the units and armed structures the player handed
+/// over. Every tick it reads the engine's delegation registry fresh for
+/// its house and commands only the tick's `groups_of` snapshot — a dead
+/// or revoked id is never commanded, whatever the pinned books still
+/// hold — and every envelope is owned by that human house. The
+/// commander's global posture ([`LieutenantStance`]) drives the
+/// `AutoReact` groups whole and only widens the location intents'
+/// engagement ring a notch ([`lieutenant_engage_radius`]): `Defend`
+/// (防守模式) holds the group's ground — intercept the armor-ranked best
+/// hostile inside the centroid ring, guard a spread of posts otherwise,
+/// pull a badly wounded member back toward the hold area — while
+/// `Attack` (进攻模式) seeks and presses, one latched per-group focus
+/// (re-latched only when it falls, so the group sustains an engagement
+/// instead of yo-yoing between re-reads) collecting the armor-ranked
+/// best hostile of a wide seek ring. `AttackLocation` advance-marches on
+/// its cell and piles onto the focus latched near it; `DefendLocation`
+/// holds a ring around its cell, intercepts intruders entering and walks
+/// strays back to their spread posts when the ring clears. Delegated
+/// armed structures never move: they force-fire the armor-ranked best
+/// hostile inside the primary weapon's reach and toggle repair when
+/// wounded (health under three fifths of strength, the base repair
+/// limb's reading, one activation bridged until the engine's repair byte
+/// turns on).
+///
+/// **Determinism contract.** For an identical simulation view and an
+/// identical `tick`, [`Lieutenant::orders`] produces the identical
+/// command sequence on every platform and run: a pure function of its
+/// arguments plus this instance's pinned state (the stance, the order
+/// gate, the focus latch, the repair bridges), drawing no randomness and
+/// reading no ambient source — same reads, same commands.
+///
+/// **Command set.** A Lieutenant never issues economy, production,
+/// building, placement, sale, superweapon or any other house-level
+/// command: its envelope set is exactly `Attack`, `AttackMove`, `Guard`,
+/// `Move` and `ToggleRepair` — combat and repair against delegated
+/// members only.
+pub struct Lieutenant {
+    /// The human house whose delegated groups this Lieutenant runs; the
+    /// same identity every envelope's `owner` carries.
+    house: InternedId,
+    /// The commander's global posture; local player preference, so it is
+    /// per-instance state and nothing else. Pinned state, never read from
+    /// the runtime.
+    stance: LieutenantStance,
+    /// Earliest tick each delegated member may take another order; see
+    /// [`LIEUTENANT_REORDER_TICKS`]. Pinned state, never read from the
+    /// runtime.
+    order_gate: std::collections::HashMap<u64, u32>,
+    /// Each group's latched focus `(target, target cell)`, kept until the
+    /// target falls and pruned to the tick's live groups; see
+    /// [`Self::latch_focus`]. Pinned state, never read from the runtime.
+    focus: std::collections::HashMap<u32, (u64, (i16, i16))>,
+    /// Repair activations in flight `(structure, issue tick)`: a
+    /// `ToggleRepair` lands a tick after its issue, so the entry bridges
+    /// the gap and re-arms once past the grace window if the engine
+    /// dropped it; the engine's repair byte owns the latch once it reads
+    /// on. Pinned state, never read from the runtime.
+    repairs: std::collections::HashMap<u64, u32>,
+}
+
+impl Lieutenant {
+    /// Bind the Lieutenant to `house` at the default posture
+    /// ([`LieutenantStance::Defend`]).
+    pub fn new(house: InternedId) -> Self {
+        Self {
+            house,
+            stance: LieutenantStance::default(),
+            order_gate: std::collections::HashMap::new(),
+            focus: std::collections::HashMap::new(),
+            repairs: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Set the commander's global posture; takes effect on the next
+    /// [`Self::orders`] pass.
+    pub fn set_stance(&mut self, stance: LieutenantStance) {
+        self.stance = stance;
+    }
+
+    /// The posture the Lieutenant currently fights at.
+    pub fn stance(&self) -> LieutenantStance {
+        self.stance
+    }
+
+    /// The pass over the house's delegated groups for this tick. Reads
+    /// the delegation registry once per group and returns at most one
+    /// order per member: the structure limbs (repair, then force-fire)
+    /// and the intent's unit limb, each paced by the member gate.
+    pub fn orders(&mut self, runtime: &SimRuntime, tick: u32) -> Vec<CommandEnvelope> {
+        let sim = &runtime.simulation;
+        let rules = &runtime.resources.rules;
+        let at = sim.session().tick() + 1;
+        // The pass collects plain commands and wraps them once at the
+        // end: every envelope is the human house's, at the same stamp.
+        let mut commands: Vec<Command> = Vec::new();
+        let mut live_groups: Vec<u32> = Vec::new();
+
+        for (group, members, intent) in sim.delegation().groups_of(self.house) {
+            live_groups.push(group);
+            // The tick's snapshot is authoritative: a member id absent
+            // from it (the registry prunes engine-side) draws no command,
+            // and every member is re-checked alive and owned here the way
+            // the standing limbs re-check their own rosters.
+            let mut units: Vec<u64> = Vec::new();
+            let mut structures: Vec<u64> = Vec::new();
+            let mut cell_sum = (0i64, 0i64);
+            for &member in members {
+                let Some(entity) = sim.entities().get(member) else {
+                    continue;
+                };
+                if entity.owner() != self.house
+                    || entity.lifecycle.in_limbo()
+                    || !entity.lifecycle.object_alive()
+                {
+                    continue;
+                }
+                match entity.category() {
+                    vera20k_core::map::entities::EntityCategory::Structure => {
+                        structures.push(member);
+                    }
+                    _ => {
+                        cell_sum.0 += i64::from(entity.position.rx());
+                        cell_sum.1 += i64::from(entity.position.ry());
+                        units.push(member);
+                    }
+                }
+            }
+            // The group's anchor: the members' centroid. A group with no
+            // live members keeps its structures' limbs but runs no unit
+            // flow (the intent match below iterates an empty set).
+            let centroid = (!units.is_empty()).then(|| {
+                let count = units.len() as i64;
+                ((cell_sum.0 / count) as i16, (cell_sum.1 / count) as i16)
+            });
+
+            // Delegated structures never move. Repair first: the base
+            // repair limb's health read gates the toggle, and the pinned
+            // entry bridges issue-to-byte so a toggle is never doubled.
+            for &structure in &structures {
+                let Some(entity) = sim.entities().get(structure) else {
+                    continue;
+                };
+                if entity.building.repairing.is_on() {
+                    // A running repair — whoever started it — is the
+                    // latch now; touch nothing.
+                    self.repairs.remove(&structure);
+                } else {
+                    let wounded = SuperAi::health_fraction(
+                        rules,
+                        sim.interner().resolve(entity.type_ref()),
+                        entity,
+                    ) < LIEUTENANT_REPAIR_FRACTION;
+                    let latched = self.repairs.contains_key(&structure);
+                    let stale = self
+                        .repairs
+                        .get(&structure)
+                        .is_none_or(|&issued| tick >= issued + LIEUTENANT_REORDER_TICKS);
+                    if wounded && (!latched || stale) {
+                        self.repairs.insert(structure, tick);
+                        commands.push(Command::ToggleRepair { entity_id: structure });
+                    } else if !wounded && latched {
+                        // Healed by something else (the engine's own
+                        // steps, an engineer): drop the stale bridge.
+                        self.repairs.remove(&structure);
+                    }
+                }
+                // Force-fire: the armor-ranked best hostile inside the
+                // primary weapon's reach, re-aimed on the member gate —
+                // the engine keeps a fired target until it falls.
+                if !self.due(structure, tick) {
+                    continue;
+                }
+                let Some(range) = armed_range(sim, rules, entity) else {
+                    continue;
+                };
+                if let Some(target) = self.best_hostile_in_weapon_range(sim, structure, range) {
+                    self.gate_order(structure, tick);
+                    commands.push(Command::Attack {
+                        attacker_id: structure,
+                        target_id: target,
+                    });
+                }
+            }
+
+            match intent {
+                DelegationIntent::AutoReact => {
+                    let Some(anchor) = centroid else {
+                        continue;
+                    };
+                    match self.stance {
+                        LieutenantStance::Defend => {
+                            // Pull the badly wounded back first — a
+                            // deliberate interrupt, so it rides the gate
+                            // alone (an idle check would keep a fighting
+                            // hull in the fire).
+                            for &member in &units {
+                                if !self.due(member, tick) {
+                                    continue;
+                                }
+                                let Some(entity) = sim.entities().get(member) else {
+                                    continue;
+                                };
+                                if SuperAi::health_fraction(
+                                    rules,
+                                    sim.interner().resolve(entity.type_ref()),
+                                    entity,
+                                ) >= LIEUTENANT_PULLBACK_FRACTION
+                                {
+                                    continue;
+                                }
+                                let post = spread_post(sim, anchor, member);
+                                self.gate_order(member, tick);
+                                commands.push(Command::Move {
+                                    entity_id: member,
+                                    target_rx: post.0,
+                                    target_ry: post.1,
+                                });
+                            }
+                            // Light local pressure: the armor-ranked best
+                            // hostile inside the centroid ring draws
+                            // every due member onto it (focus fire); the
+                            // ring bounds the fight, nothing chases past
+                            // it.
+                            if let Some(target) = self
+                                .best_hostile_near(sim, anchor, LIEUTENANT_AUTOREACT_RADIUS, true)
+                            {
+                                self.order_members_onto(&mut commands, sim, &units, target, tick);
+                            }
+                            // Hold area otherwise: a member past the hold
+                            // ring takes a spread guard post at the
+                            // anchor, and a member inside it is left to
+                            // the engine's own area behavior.
+                            for &member in &units {
+                                if !self.due_idle(sim, member, tick) {
+                                    continue;
+                                }
+                                let Some(entity) = sim.entities().get(member) else {
+                                    continue;
+                                };
+                                if within_ring(anchor, entity_cell(entity), LIEUTENANT_HOLD_RADIUS)
+                                {
+                                    continue;
+                                }
+                                let post = spread_post(sim, anchor, member);
+                                self.gate_order(member, tick);
+                                commands.push(Command::Guard {
+                                    entity_id: member,
+                                    target: Some(vera20k_core::sim::combat::TargetKind::Cell(
+                                        post.0, post.1,
+                                    )),
+                                });
+                            }
+                        }
+                        LieutenantStance::Attack => {
+                            // Seek and press: the latched group focus
+                            // collects the armor-ranked best hostile of
+                            // the wide seek ring and every due member
+                            // sustain-engages it — mutual focus fire, no
+                            // re-read churn while the target stands.
+                            if let Some((target, _)) =
+                                self.latch_focus(sim, group, anchor, LIEUTENANT_SEEK_RADIUS)
+                            {
+                                self.order_members_onto(&mut commands, sim, &units, target, tick);
+                            }
+                        }
+                    }
+                }
+                DelegationIntent::AttackLocation(cell) => {
+                    let cell = *cell;
+                    // Advance and engage: the focus latches near the
+                    // intent cell (one notch wider under the Attack
+                    // stance), members pile onto it, the rest
+                    // attack-march on the cell fighting whatever the walk
+                    // meets, and arrivals hold their spread posts.
+                    let ring = lieutenant_engage_radius(LIEUTENANT_FOCUS_RADIUS, self.stance);
+                    let aim = on_map_cell(sim, cell, cell);
+                    let focus = self.latch_focus(sim, group, cell, ring);
+                    for &member in &units {
+                        if !self.due_idle(sim, member, tick) {
+                            continue;
+                        }
+                        let Some(entity) = sim.entities().get(member) else {
+                            continue;
+                        };
+                        if let Some((target, _)) = focus {
+                            self.order_members_onto(&mut commands, sim, &[member], target, tick);
+                            continue;
+                        }
+                        if within_ring(cell, entity_cell(entity), LIEUTENANT_HOLD_RADIUS) {
+                            let post = spread_post(sim, cell, member);
+                            self.gate_order(member, tick);
+                            commands.push(Command::Guard {
+                                entity_id: member,
+                                target: Some(vera20k_core::sim::combat::TargetKind::Cell(
+                                    post.0, post.1,
+                                )),
+                            });
+                        } else {
+                            self.gate_order(member, tick);
+                            commands.push(Command::AttackMove {
+                                entity_id: member,
+                                target: None,
+                                destination: Some(vera20k_core::sim::combat::TargetKind::Cell(
+                                    aim.0, aim.1,
+                                )),
+                            });
+                        }
+                    }
+                }
+                DelegationIntent::DefendLocation(cell) => {
+                    let cell = *cell;
+                    // Hold the ring: the nearest intruder inside it draws
+                    // every due member (one notch wider under the Attack
+                    // stance); with the ring clear, members past it walk
+                    // back to their spread posts and members inside it
+                    // stand.
+                    let ring = lieutenant_engage_radius(LIEUTENANT_DEFEND_RADIUS, self.stance);
+                    match self.nearest_hostile_near(sim, cell, ring) {
+                        Some(intruder) => {
+                            self.order_members_onto(&mut commands, sim, &units, intruder, tick);
+                        }
+                        None => {
+                            for &member in &units {
+                                if !self.due_idle(sim, member, tick) {
+                                    continue;
+                                }
+                                let Some(entity) = sim.entities().get(member) else {
+                                    continue;
+                                };
+                                if within_ring(cell, entity_cell(entity), ring) {
+                                    continue;
+                                }
+                                let post = spread_post(sim, cell, member);
+                                self.gate_order(member, tick);
+                                commands.push(Command::Move {
+                                    entity_id: member,
+                                    target_rx: post.0,
+                                    target_ry: post.1,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // A revoked group leaves no pinned books behind.
+        self.focus.retain(|group, _| live_groups.contains(group));
+        commands
+            .into_iter()
+            .map(|payload| CommandEnvelope::new(self.house, at, payload))
+            .collect()
+    }
+
+    /// Point every due-and-idle member of `members` at `target` with an
+    /// `Attack` (the four focus-fire sites share the loop): each ordered
+    /// member is gated as it goes.
+    fn order_members_onto(
+        &mut self,
+        commands: &mut Vec<Command>,
+        sim: &vera20k_core::sim::world::Simulation,
+        members: &[u64],
+        target: u64,
+        tick: u32,
+    ) {
+        for &member in members {
+            if !self.due_idle(sim, member, tick) {
+                continue;
+            }
+            self.gate_order(member, tick);
+            commands.push(Command::Attack {
+                attacker_id: member,
+                target_id: target,
+            });
+        }
+    }
+
+    /// Whether `member` may take an order this tick (the standing
+    /// limbs' gate read).
+    fn due(&self, member: u64, tick: u32) -> bool {
+        self.order_gate.get(&member).is_none_or(|&at| tick >= at)
+    }
+
+    /// Whether `member` may take an order and the engine reports it back
+    /// in the idle mission family — an order the command layer dropped
+    /// leaves the mission `None`, so the gate plus the family read keep a
+    /// walking or fighting member from being re-pointed every pass.
+    fn due_idle(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+        member: u64,
+        tick: u32,
+    ) -> bool {
+        self.due(member, tick)
+            && sim.entities().get(member).is_some_and(|entity| {
+                matches!(
+                    entity.passive_acquire_mission(),
+                    vera20k_core::sim::mission::MissionType::None
+                        | vera20k_core::sim::mission::MissionType::Sleep
+                        | vera20k_core::sim::mission::MissionType::Guard
+                        | vera20k_core::sim::mission::MissionType::AreaGuard
+                )
+            })
+    }
+
+    /// Mark `member` as just ordered and forget gates that have expired
+    /// (the [`SuperAi::gate_idle_order`] shape at the Lieutenant's own
+    /// window).
+    fn gate_order(&mut self, member: u64, tick: u32) {
+        self.order_gate.insert(member, tick + LIEUTENANT_REORDER_TICKS);
+        self.order_gate.retain(|_, &mut at| at > tick);
+    }
+
+    /// Whether `owner` is a hostile of the Lieutenant's house: not the
+    /// house itself, not a passive observer and not an ally (the
+    /// [`SuperAi::is_enemy`] reading against this instance's house).
+    fn is_enemy(&self, sim: &vera20k_core::sim::world::Simulation, owner: InternedId) -> bool {
+        if owner == self.house {
+            return false;
+        }
+        let Some(house) = sim.houses().get(&owner) else {
+            return false;
+        };
+        if house.multiplay_passive() {
+            return false;
+        }
+        let alliances = sim.house_alliances();
+        !alliances.is_allied(sim.interner(), self.house, owner)
+            && !alliances.is_allied(sim.interner(), owner, self.house)
+    }
+
+    /// The best hostile within Euclidean `radius` of `anchor`: hulls
+    /// before structures before foot when `armor_first`, nearest inside a
+    /// rank, the substrate's stable order breaking the last ties (the
+    /// [`SuperAi::nearest_intruder`] scan with a rank in the key — a
+    /// flat rank when only nearest is wanted).
+    fn best_hostile_near(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+        anchor: (i16, i16),
+        radius: i16,
+        armor_first: bool,
+    ) -> Option<u64> {
+        let limit = i32::from(radius) * i32::from(radius);
+        let mut best: Option<(u8, i32, u64)> = None;
+        for (id, entity) in sim.entities().iter_sorted() {
+            if entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+                || !self.is_enemy(sim, entity.owner())
+            {
+                continue;
+            }
+            let dx = i32::from(entity.position.rx() as i16 - anchor.0);
+            let dy = i32::from(entity.position.ry() as i16 - anchor.1);
+            let distance = dx * dx + dy * dy;
+            if distance > limit {
+                continue;
+            }
+            let rank = if armor_first {
+                lieutenant_target_rank(entity.category())
+            } else {
+                0
+            };
+            if best.is_none_or(|(kept_rank, kept_distance, _)| {
+                (rank, distance) < (kept_rank, kept_distance)
+            }) {
+                best = Some((rank, distance, id));
+            }
+        }
+        best.map(|(_, _, id)| id)
+    }
+
+    /// The nearest hostile within `radius` of `anchor` (the intruder
+    /// read a `DefendLocation` intercepts on).
+    fn nearest_hostile_near(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+        anchor: (i16, i16),
+        radius: i16,
+    ) -> Option<u64> {
+        self.best_hostile_near(sim, anchor, radius, false)
+    }
+
+    /// The armor-ranked best hostile inside `shooter`'s weapon reach,
+    /// leptons this time (a standing structure's force-fire read): same
+    /// ranking, the planar distance the combat layer resolves.
+    fn best_hostile_in_weapon_range(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+        shooter: u64,
+        range_leptons: i32,
+    ) -> Option<u64> {
+        let mut best: Option<(u8, i32, u64)> = None;
+        for (id, entity) in sim.entities().iter_sorted() {
+            if entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+                || !self.is_enemy(sim, entity.owner())
+            {
+                continue;
+            }
+            let Some(distance) = vera20k_core::sim::combat::object_distance_to(
+                shooter,
+                &vera20k_core::sim::combat::TargetKind::Entity(id),
+                sim,
+            ) else {
+                continue;
+            };
+            if distance >= range_leptons {
+                continue;
+            }
+            let rank = lieutenant_target_rank(entity.category());
+            if best.is_none_or(|(kept_rank, kept_distance, _)| {
+                (rank, distance) < (kept_rank, kept_distance)
+            }) {
+                best = Some((rank, distance, id));
+            }
+        }
+        best.map(|(_, _, id)| id)
+    }
+
+    /// The group's latched focus `(target, target cell)`: the latched
+    /// head stands until it falls (the wave-sequence latch), then the
+    /// armor-ranked best hostile of `radius` re-latches it — sustain
+    /// engagement, never a per-pass re-read that yo-yos the group
+    /// between targets.
+    fn latch_focus(
+        &mut self,
+        sim: &vera20k_core::sim::world::Simulation,
+        group: u32,
+        anchor: (i16, i16),
+        radius: i16,
+    ) -> Option<(u64, (i16, i16))> {
+        if let Some(&(target, cell)) = self.focus.get(&group)
+            && sim.entities().get(target).is_some_and(|entity| {
+                entity.lifecycle.object_alive() && !entity.lifecycle.in_limbo()
+            })
+        {
+            return Some((target, cell));
+        }
+        let latched = self
+            .best_hostile_near(sim, anchor, radius, true)
+            .map(|target| {
+                let cell = sim
+                    .entities()
+                    .get(target)
+                    .map(entity_cell)
+                    .unwrap_or(anchor);
+                (target, cell)
+            });
+        match latched {
+            Some(found) => {
+                self.focus.insert(group, found);
+                Some(found)
+            }
+            None => {
+                self.focus.remove(&group);
+                None
+            }
+        }
+    }
+}
+
+/// The delegated structure's primary weapon reach, in leptons; `None` —
+/// the structure arms no weapon (repair-only then).
+fn armed_range(
+    sim: &vera20k_core::sim::world::Simulation,
+    rules: &vera20k_core::rules::ruleset::RuleSet,
+    entity: &vera20k_core::sim::game_entity::GameEntity,
+) -> Option<i32> {
+    rules
+        .object(sim.interner().resolve(entity.type_ref()))?
+        .weapon_at(0)
+        .and_then(|weapon| rules.weapon(weapon))
+        .map(|weapon| weapon.range_leptons)
+}
+
+/// The entity's map cell, the signed pair the delegation intent cells
+/// carry.
+fn entity_cell(entity: &vera20k_core::sim::game_entity::GameEntity) -> (i16, i16) {
+    (entity.position.rx() as i16, entity.position.ry() as i16)
+}
+
+/// Whether `cell` stands within Euclidean `radius` of `anchor` — the
+/// squared-cell ring test the Lieutenant's holds and intercepts share.
+fn within_ring(anchor: (i16, i16), cell: (i16, i16), radius: i16) -> bool {
+    let dx = i32::from(cell.0 - anchor.0);
+    let dy = i32::from(cell.1 - anchor.1);
+    dx * dx + dy * dy <= i32::from(radius) * i32::from(radius)
+}
+
+/// The spread post `member` holds around `anchor`: the shared fan-out
+/// offsets picked by entity id (the standing limbs' spread read), clamped
+/// onto the map with `anchor` as the fallback.
+fn spread_post(
+    sim: &vera20k_core::sim::world::Simulation,
+    anchor: (i16, i16),
+    member: u64,
+) -> (u16, u16) {
+    let spread = SPREAD_OFFSETS[member as usize % SPREAD_OFFSETS.len()];
+    on_map_cell(
+        sim,
+        (
+            anchor.0 + i16::from(spread.0),
+            anchor.1 + i16::from(spread.1),
+        ),
+        anchor,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -21066,14 +21776,17 @@ mod tests {
         DEFENSE_PER_YARD_AA_BASE, DEFENSE_PER_YARD_AA_HEAVY, DEFENSE_PER_YARD_AA_WARTIME,
         DEFENSE_PER_YARD_ASSAULT, DEFENSE_PER_YARD_BASIC, DEFENSE_PER_YARD_WARTIME,
         ENEMY_BARRACKS_TYPES, ENEMY_REFINERY_TYPES, ENTRANCE_POST_MAX, ENTRANCE_POST_MIN,
-        EXPANSION_MIN_DISTANCE, FACTORY_BUILDOUT, FLOATER_COUNTER_THREATS, FLOATER_TYPES, OPENINGS,
+        EXPANSION_MIN_DISTANCE, FACTORY_BUILDOUT, FLOATER_COUNTER_THREATS, FLOATER_TYPES,
+        LIEUTENANT_AUTOREACT_RADIUS, LIEUTENANT_DEFEND_RADIUS, LIEUTENANT_FOCUS_RADIUS,
+        LIEUTENANT_REORDER_TICKS, LIEUTENANT_STANCE_RADIUS_NOTCH, Lieutenant, LieutenantStance,
+        OPENINGS,
         ORE_ENEMY_DIRECTION_BIAS, PlacementRoute, ROLE_SHARE_BASE, ROLE_SHARE_BOOST, Role,
         RosterEntry, SuperAi, SuperAiDifficulty, TECH_BUILDING_TYPES, UNLIMITED_WALLET_FLOOR,
         aa_per_yard_quota, aa_unit_target, aa_vehicle_target, anti_air_demand, barracks_quota,
         capture_priority_rank, enemy_direction_bias, entrance_choke_cell, factory_quota,
         find_defense_site_around, foundation_keeps_gap, ground_per_yard_quota, infer_tier,
-        nearest_connected_target, rally_anchor, spy_infiltration_rank, tech_bank_short,
-        wall_ring_cells,
+        lieutenant_engage_radius, lieutenant_target_rank, nearest_connected_target, rally_anchor,
+        spy_infiltration_rank, tech_bank_short, wall_ring_cells,
     };
     use vera20k_core::sim::intern::InternedId;
     use vera20k_core::sim::runtime::SimRuntime;
@@ -28896,5 +29609,81 @@ mod tests {
                 "{tier:?} round-trips through its policy"
             );
         }
+    }
+
+    // ---- The Lieutenant's pure decision pieces ----
+    //
+    // The Lieutenant's sim-facing pass needs the engine's delegation
+    // registry, which its own tests cannot build here; what is testable
+    // without a harness is the decision surface around it: the stance
+    // bookkeeping, the stance's ring table, the member gate and the
+    // armor ranking.
+
+    #[test]
+    fn lieutenant_stance_defaults_to_defend_and_switches() {
+        let mut lieutenant = Lieutenant::new(InternedId::from_index(0));
+        assert_eq!(lieutenant.stance(), LieutenantStance::Defend);
+        lieutenant.set_stance(LieutenantStance::Attack);
+        assert_eq!(lieutenant.stance(), LieutenantStance::Attack);
+        lieutenant.set_stance(LieutenantStance::Defend);
+        assert_eq!(lieutenant.stance(), LieutenantStance::Defend);
+    }
+
+    #[test]
+    fn lieutenant_stance_keeps_defend_rings_and_widens_attack_rings_a_notch() {
+        for base in [
+            LIEUTENANT_AUTOREACT_RADIUS,
+            LIEUTENANT_DEFEND_RADIUS,
+            LIEUTENANT_FOCUS_RADIUS,
+        ] {
+            assert_eq!(
+                lieutenant_engage_radius(base, LieutenantStance::Defend),
+                base,
+                "the Defense posture keeps the ring"
+            );
+            assert_eq!(
+                lieutenant_engage_radius(base, LieutenantStance::Attack),
+                base + LIEUTENANT_STANCE_RADIUS_NOTCH,
+                "the Attack posture widens the ring one notch"
+            );
+        }
+    }
+
+    #[test]
+    fn lieutenant_order_gate_paces_and_prunes_expired_entries() {
+        let mut lieutenant = Lieutenant::new(InternedId::from_index(0));
+        assert!(lieutenant.due(1, 100));
+        lieutenant.gate_order(1, 100);
+        assert!(!lieutenant.due(1, 101));
+        assert!(!lieutenant.due(1, 100 + LIEUTENANT_REORDER_TICKS - 1));
+        assert!(lieutenant.due(1, 100 + LIEUTENANT_REORDER_TICKS));
+        // Gating another member keeps the first member's live window.
+        lieutenant.gate_order(2, 110);
+        assert!(!lieutenant.due(1, 120));
+        assert!(!lieutenant.due(2, 130));
+        assert!(lieutenant.due(2, 110 + LIEUTENANT_REORDER_TICKS));
+        // Pruning drops entries whose window has passed, and a dropped
+        // entry reads due again.
+        lieutenant.gate_order(3, 150);
+        assert!(!lieutenant.order_gate.contains_key(&1));
+        assert!(lieutenant.order_gate.contains_key(&2));
+        assert!(lieutenant.due(1, 150));
+    }
+
+    #[test]
+    fn lieutenant_target_rank_orders_hulls_over_foot() {
+        use vera20k_core::map::entities::EntityCategory;
+        assert_eq!(
+            lieutenant_target_rank(EntityCategory::Unit),
+            lieutenant_target_rank(EntityCategory::Aircraft)
+        );
+        assert!(
+            lieutenant_target_rank(EntityCategory::Unit)
+                < lieutenant_target_rank(EntityCategory::Structure)
+        );
+        assert!(
+            lieutenant_target_rank(EntityCategory::Structure)
+                < lieutenant_target_rank(EntityCategory::Infantry)
+        );
     }
 }
