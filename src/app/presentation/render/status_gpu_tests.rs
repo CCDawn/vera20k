@@ -2311,6 +2311,7 @@ fn native_status_controls(fixture: &'static str, type_name: &str, category: Enti
                             digital_shapes: Vec::new(),
                             talk_bubble: None,
                             self_heal: None,
+                            delegated: 0..0,
                         });
                         fenced.extras_runs.push(ObjectExtrasRun::Lines {
                             parent: parent + 1000,

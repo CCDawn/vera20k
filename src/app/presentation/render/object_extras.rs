@@ -307,6 +307,7 @@ fn status_instances<'a>(
         digital_text,
         digital_shapes,
         talk_bubble,
+        delegated,
         ..
     } = run
     else {
@@ -338,7 +339,7 @@ fn status_instances<'a>(
         first = first.min(rectangles.start);
         last = last.max(text.end);
     }
-    for range in [fills, scale, group_rectangles, group_text] {
+    for range in [fills, scale, group_rectangles, group_text, delegated] {
         if !range.is_empty() {
             first = first.min(range.start);
             last = last.max(range.end);
@@ -449,6 +450,7 @@ fn draw_status_group<'a>(
         digital_text,
         digital_shapes,
         talk_bubble,
+        delegated,
         ..
     } = run
     else {
@@ -490,6 +492,18 @@ fn draw_status_group<'a>(
         //6F5EDE flags600: ordinary centered, opaque plain53-row Convert,
         //no A/Z access. The existing passthrough material owns this path.
         batch.draw_with_buffer_passthrough_range(pass, shape.texture(), buffer, *index, 1);
+    }
+    // VERA's Command Mode delegation mark (no native owner): the same opaque
+    // white-texture stores as the group label above, at the object's top-left.
+    if !delegated.is_empty() {
+        batch.draw_passthrough_range_bound(
+            pass,
+            overlay.white_texture(),
+            buffer,
+            batch.surface_camera_bind_group(),
+            delegated.start,
+            delegated.end - delegated.start,
+        );
     }
 }
 
@@ -582,6 +596,7 @@ fn rank_run_end(runs: &[ObjectExtrasRun], start: usize) -> usize {
         talk_bubble: None,
         group_rectangles,
         group_text,
+        delegated,
         ..
     } = &runs[start]
     else {
@@ -591,6 +606,7 @@ fn rank_run_end(runs: &[ObjectExtrasRun], start: usize) -> usize {
         || !scale.is_empty()
         || !group_rectangles.is_empty()
         || !group_text.is_empty()
+        || !delegated.is_empty()
     {
         return start + 1;
     }
@@ -608,6 +624,7 @@ fn rank_run_end(runs: &[ObjectExtrasRun], start: usize) -> usize {
         talk_bubble: None,
         group_rectangles,
         group_text,
+        delegated,
         ..
     }) = runs.get(end)
     {
@@ -615,6 +632,7 @@ fn rank_run_end(runs: &[ObjectExtrasRun], start: usize) -> usize {
             || !scale.is_empty()
             || !group_rectangles.is_empty()
             || !group_text.is_empty()
+            || !delegated.is_empty()
             || *index != *first + (end - start) as u32
         {
             break;

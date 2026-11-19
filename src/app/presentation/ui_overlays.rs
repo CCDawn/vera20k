@@ -1239,6 +1239,10 @@ pub(crate) struct TechnoExtras {
     pub group: StatusTextOverlayInstances,
     ///6F5E8D..5EDE: after health/pips/group, plain600 at the caller point.
     pub talk_bubble: Option<SpriteInstance>,
+    /// VERA's Command Mode delegation mark (no native owner): the fixed corner
+    /// bracket's world-pixel commands, drawn after this parent's other status
+    /// with the status text's own white-texture material.
+    pub delegated: Vec<SpriteInstance>,
 }
 
 impl TechnoExtras {
@@ -1625,6 +1629,58 @@ fn ares_status_marker_frame(
     (frames as i32).wrapping_mul(frame % cycle) / cycle
 }
 
+/// The Command Mode mark's fixed cyan, quantized through the same retail
+/// presentation format the status text uses. VERA-specific: no native owner.
+pub(crate) fn delegated_mark_tint() -> [f32; 3] {
+    let [red, green, blue, _] =
+        crate::render::native_surface_format::ACTIVE_RETAIL_RGB565_PRESENTATION
+            .quantize_rgba8([0, 255, 255, 255]);
+    [red, green, blue].map(|channel| f32::from(channel) / 255.0)
+}
+
+/// VERA's Command Mode delegation mark (no native owner): the delegated
+/// object's fixed corner bracket in world pixels. Two one-pixel strokes join
+/// at the object's top-left, mirroring the distances the veteran pip keeps to
+/// its bottom-right corner, so mark and pip never read as the same command.
+/// It draws with the status text's opaque white-texture material and needs no
+/// art asset. Like the rank pip, it is withheld from an object the local
+/// player cannot see or only sees disguised.
+pub(crate) fn delegated_mark_commands(
+    entity: &ObjectRecord,
+    point: (f32, f32),
+    viewport: StatusViewport,
+) -> Vec<SpriteInstance> {
+    if entity.seen.disguised_to_observer || entity.seen.visual_character == 5 {
+        return Vec::new();
+    }
+    if !crate::render::snapshot::SnapshotObject::delegated(entity) {
+        return Vec::new();
+    }
+    let (dx, dy) = if entity.category() == EntityCategory::Infantry {
+        (-7.0, -4.0)
+    } else {
+        (-12.0, -8.0)
+    };
+    let (x, y) = (point.0 + dx, point.1 + dy);
+    let tint = delegated_mark_tint();
+    let command = |size: [f32; 2]| {
+        let instance = SpriteInstance {
+            position: [x, y],
+            size,
+            uv_origin: [0.0, 0.0],
+            uv_size: [1.0, 1.0],
+            tint,
+            alpha: 1.0,
+            ..Default::default()
+        };
+        viewport.contains(&instance).then_some(instance)
+    };
+    [command([4.0, 1.0]), command([1.0, 4.0])]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 /// One Techno DrawExtras6F5190 parent: clock, wrench, rank, then health6F64A0.
 /// Rank70A990 precedes the selected/hovered health gate at6F5388. It uses
 /// the shared cloak/disguise and raw Veterancy owners, with opaque status art.
@@ -1867,6 +1923,9 @@ pub(crate) fn techno_extras_for_parent(
                 rank
             });
     }
+    // VERA's Command Mode mark (no native owner), with the rank pip's own
+    // visibility gate: only an object the local player truly sees carries it.
+    strip.delegated = delegated_mark_commands(entity, (sx, sy), viewport);
     let widened = health_strip_widened(
         sim,
         entity,

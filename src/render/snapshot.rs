@@ -37,6 +37,12 @@ pub(crate) trait SnapshotObject {
     fn world_z_leptons_off_map(&self) -> i32;
     /// What the radar reads of it beyond its record.
     fn radar(&self) -> &crate::render::radar::RadarFacts;
+    /// Whether Command Mode delegated the object to the AI
+    /// (`Simulation::delegation`'s registry). VERA-specific: retail has no
+    /// such mark, so this answers false without a captured flag.
+    fn delegated(&self) -> bool {
+        false
+    }
 }
 
 /// The presentation frame's objects, by stable id.

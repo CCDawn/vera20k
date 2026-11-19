@@ -59,6 +59,14 @@ impl Capture<'_> {
             .interner()
             .object_type(entity.type_ref(), self.rules())
     }
+
+    /// Whether Command Mode delegated the object to the AI: the delegation
+    /// registry's `(owner, id)` membership (`Simulation::delegation`'s
+    /// `DelegationRegistry::is_delegated`). Any house's delegated assets are
+    /// marked, whatever the viewer's own house is.
+    fn sim_delegated(&self, owner: InternedId, id: u64) -> bool {
+        self.sim.delegation().is_delegated(owner, id)
+    }
 }
 
 /// One object's draw record: its state under [`GameEntity`]'s names.
@@ -115,6 +123,10 @@ pub(crate) struct ObjectRecord {
     /// The cargo a Carryall draws inside its own draw
     /// (`Simulation::carryall_drawn_cargo`).
     pub(crate) drawn_cargo: Option<u64>,
+    /// Whether Command Mode delegated it to the AI (`Simulation::delegation`'s
+    /// registry). VERA-specific: retail has no such mark, so no line here may
+    /// cite a native address.
+    pub(crate) delegated: bool,
     /// The answers of `GameEntity`'s own queries.
     answers: Answers,
     /// [`RenderPose::read`] at the committed binary frame.
@@ -666,6 +678,7 @@ impl ObjectRecord {
             drawn_cargo: (entity.category() == EntityCategory::Aircraft)
                 .then(|| at.sim.carryall_drawn_cargo(entity.stable_id(), at.rules()))
                 .flatten(),
+            delegated: at.sim_delegated(entity.owner(), entity.stable_id()),
             answers,
             place,
             seen,
@@ -894,6 +907,9 @@ impl crate::render::snapshot::SnapshotObject for ObjectRecord {
     }
     fn radar(&self) -> &crate::render::radar::RadarFacts {
         &self.scene.radar
+    }
+    fn delegated(&self) -> bool {
+        self.delegated
     }
 }
 

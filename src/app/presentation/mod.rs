@@ -65,6 +65,9 @@ mod spawn_pip_tests;
 #[cfg(all(test, tests_app_presentation))]
 mod absorber_pip_tests;
 
+#[cfg(all(test, tests_app_presentation))]
+mod delegated_mark_tests;
+
 pub(crate) mod lighting;
 
 #[cfg(all(test, tests_app_presentation))]

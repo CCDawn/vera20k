@@ -160,6 +160,9 @@ pub(crate) enum ObjectExtrasRun {
         /// uploaded instance index, in emission order.
         digital_shapes: Vec<(u32, u32)>,
         talk_bubble: Option<u32>,
+        /// The Command Mode delegation mark's uploaded range
+        /// (`ui_overlays::TechnoExtras::delegated`).
+        delegated: std::ops::Range<u32>,
     },
 }
 
@@ -455,6 +458,9 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                     lowered.extras_instances.push(instance);
                     index
                 });
+                let delegated_start = lowered.extras_instances.len() as u32;
+                lowered.extras_instances.extend(strip.delegated);
+                let delegated_end = lowered.extras_instances.len() as u32;
                 ObjectExtrasRun::Status {
                     #[cfg(test)]
                     parent: owner,
@@ -472,6 +478,7 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                     digital_text,
                     digital_shapes,
                     talk_bubble,
+                    delegated: delegated_start..delegated_end,
                 }
             });
             // Clock6F524E, wrench6F5340 and rank6F5382 precede Building lines
@@ -510,6 +517,7 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                         digital_text: Vec::new(),
                         digital_shapes: Vec::new(),
                         talk_bubble: None,
+                        delegated: fills.start..fills.start,
                     });
                 }
             }
@@ -568,6 +576,7 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                 digital_text,
                 digital_shapes,
                 talk_bubble,
+                delegated,
                 ..
             }) = strip
             {
@@ -590,6 +599,7 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                     || !digital_text.is_empty()
                     || !digital_shapes.is_empty()
                     || talk_bubble.is_some()
+                    || !delegated.is_empty()
                 {
                     if is_building {
                         // Tactical6D9153 calls Building Extras before its body;
@@ -614,6 +624,7 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                         digital_text,
                         digital_shapes,
                         talk_bubble,
+                        delegated,
                     });
                 }
             }
