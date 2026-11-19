@@ -1,0 +1,29 @@
+name: superai-check
+
+# The Super AI crate is a workspace member, but nothing else compiles it on
+# every push: upstream merges land on this branch between releases, and a
+# plugin that broke against the merged engine should go red here the same
+# day, not at the next dn build.
+
+on:
+  push:
+    branches: [superai/defense-next]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the plugin against the engine in this tree
+        run: cargo check -p vera20k-superai --lib
