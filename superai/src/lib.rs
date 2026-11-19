@@ -6222,7 +6222,7 @@ impl SuperAi {
                     entity.owner() == self.house
                         && entity.lifecycle.object_alive()
                         && entity
-                            .passenger_role
+                            .passenger_role()
                             .cargo()
                             .is_some_and(|cargo| cargo.count() > 0)
                 })
@@ -6241,7 +6241,7 @@ impl SuperAi {
                             && sim.interner().resolve(entity.type_ref()) == fortress_name
                             && !entity.lifecycle.in_limbo()
                             && entity
-                                .passenger_role
+                                .passenger_role()
                                 .cargo()
                                 .is_some_and(|cargo| cargo.count() > 0)
                     })
@@ -6293,7 +6293,7 @@ impl SuperAi {
                                 == vera20k_core::map::entities::EntityCategory::Unit
                             && sim.interner().resolve(entity.type_ref()) == fortress_name
                             && entity
-                                .passenger_role
+                                .passenger_role()
                                 .cargo()
                                 .is_some_and(|cargo| cargo.count() < cargo.capacity())
                     })
@@ -6308,7 +6308,7 @@ impl SuperAi {
                 // the first anti-armor type filling the hold (the basic
                 // soldier never once boarded before).
                 let aboard: Vec<&str> = fortress_entity
-                    .passenger_role
+                    .passenger_role()
                     .cargo()
                     .map(|cargo| {
                         cargo
@@ -9465,7 +9465,7 @@ impl SuperAi {
         let ride = self.find_raid_ride(sim, ride_name, tick);
         let seats = ride
             .and_then(|id| sim.entities().get(id))
-            .and_then(|entity| entity.passenger_role.cargo().map(|cargo| cargo.capacity()))
+            .and_then(|entity| entity.passenger_role().cargo().map(|cargo| cargo.capacity()))
             .unwrap_or(1)
             .max(1);
         let engineers = self.find_raid_engineers(sim, opening, tick, seats.min(3) as usize);
@@ -9653,7 +9653,7 @@ impl SuperAi {
                     && entity.lifecycle.object_alive()
                     && !entity.lifecycle.in_limbo()
                     && entity
-                        .passenger_role
+                        .passenger_role()
                         .cargo()
                         .is_none_or(|cargo| cargo.count() == 0)
                     && self.order_gate.get(id).is_none_or(|&due| tick >= due)
@@ -9723,7 +9723,7 @@ impl SuperAi {
                 let aboard = |actor: u64| {
                     sim.entities().get(ride).is_some_and(|entity| {
                         entity
-                            .passenger_role
+                            .passenger_role()
                             .cargo()
                             .is_some_and(|cargo| cargo.passengers().contains(&actor))
                     })
@@ -10004,11 +10004,11 @@ impl SuperAi {
         })?;
         let transport_name = sim.interner().resolve(entity.type_ref());
         let has_cargo = entity
-            .passenger_role
+            .passenger_role()
             .cargo()
             .is_some_and(|cargo| cargo.count() > 0);
         let has_seats = entity
-            .passenger_role
+            .passenger_role()
             .cargo()
             .is_some_and(|cargo| cargo.count() < cargo.capacity());
         let at = (entity.position.rx() as i16, entity.position.ry() as i16);
@@ -13092,7 +13092,7 @@ impl SuperAi {
                 // retention takes.
                 let standing = entity.lifecycle.object_alive() && !entity.lifecycle.in_limbo();
                 let manned = if standing {
-                    (entity.passenger_role.occupants().count().max(0) as usize)
+                    (entity.passenger_role().occupants().count().max(0) as usize)
                         + self
                             .garrison_inbound
                             .iter()
@@ -15164,7 +15164,7 @@ impl SuperAi {
     ) -> bool {
         Some(sim.interner().resolve(entity.type_ref())) == opening.fortress
             && entity
-                .passenger_role
+                .passenger_role()
                 .cargo()
                 .is_some_and(|cargo| cargo.count() < cargo.capacity())
     }
@@ -16028,7 +16028,7 @@ impl SuperAi {
     /// tank, and the churn never ends.
     fn garrisoned(entity: &vera20k_core::sim::game_entity::GameEntity) -> bool {
         entity.lifecycle.in_limbo()
-            || entity.passenger_role.is_inside_transport()
+            || entity.passenger_role().is_inside_transport()
             || entity.bunker.link().installed_in().is_some()
     }
 
@@ -17345,7 +17345,7 @@ impl SuperAi {
             if !ty.can_be_occupied {
                 continue;
             }
-            let occupants = entity.passenger_role.occupants().count().max(0) as usize;
+            let occupants = entity.passenger_role().occupants().count().max(0) as usize;
             let inbound = self
                 .garrison_inbound
                 .iter()
@@ -17500,7 +17500,7 @@ impl SuperAi {
                 let Some(ty) = rules.object(sim.interner().resolve(entity.type_ref())) else {
                     return 0;
                 };
-                let occupants = entity.passenger_role.occupants().count().max(0) as usize;
+                let occupants = entity.passenger_role().occupants().count().max(0) as usize;
                 let inbound = self
                     .garrison_inbound
                     .iter()
@@ -19637,7 +19637,7 @@ impl SuperAi {
                     let aboard = |actor: u64| {
                         sim.entities().get(ride).is_some_and(|entity| {
                             entity
-                                .passenger_role
+                                .passenger_role()
                                 .cargo()
                                 .is_some_and(|cargo| cargo.passengers().contains(&actor))
                         })
@@ -19862,7 +19862,7 @@ impl SuperAi {
         let seats = sim
             .entities()
             .get(ride)
-            .and_then(|entity| entity.passenger_role.cargo().map(|cargo| cargo.capacity()))
+            .and_then(|entity| entity.passenger_role().cargo().map(|cargo| cargo.capacity()))
             .unwrap_or(1)
             .max(1);
         let engineers = self.find_raid_engineers(sim, opening, tick, seats.min(3) as usize);
@@ -23646,7 +23646,7 @@ mod tests {
                         && scenario.sim().interner().resolve(entity.type_ref()) == "BFRT"
                     {
                         seen.fortress = seen.fortress.max(1);
-                        if let Some(cargo) = entity.passenger_role.cargo() {
+                        if let Some(cargo) = entity.passenger_role().cargo() {
                             seen.fortress_seats = seen.fortress_seats.max(cargo.count() as usize);
                         }
                     }
@@ -24926,7 +24926,7 @@ mod tests {
             .sim()
             .entities()
             .get(bunker)
-            .map(|entity| entity.passenger_role.occupants().count().max(0) as usize)
+            .map(|entity| entity.passenger_role().occupants().count().max(0) as usize)
             .expect("the bunker stands");
         assert_eq!(
             occupants + ai.garrison_inbound.len(),
