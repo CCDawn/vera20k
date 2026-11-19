@@ -111,7 +111,7 @@ fn ares_emp_on_a_construction_yard_holds_its_production_until_expiry() {
     let plant = sim.interner.intern("NAPOWR");
     // The fixture arms the queue kernel's held object; Begin's own
     // admission is not the question here.
-    assert!(sim.production.factories_mut().test_enqueue_kernel(
+    assert!(sim.production.factories_mut_for_test().test_enqueue_kernel(
         russians,
         ProductionCategory::Building,
         plant,

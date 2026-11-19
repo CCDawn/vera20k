@@ -389,7 +389,7 @@ pub fn place_crate_at_for_tooling(
     powerup: Option<u8>,
 ) -> Option<(i16, i16)> {
     let before: std::collections::BTreeSet<usize> = sim
-        .crate_authority
+        .crate_authority()
         .slots()
         .iter()
         .enumerate()
@@ -411,7 +411,7 @@ pub fn place_crate_at_for_tooling(
     if !placed {
         return None;
     }
-    sim.crate_authority
+    sim.crate_authority()
         .slots()
         .iter()
         .enumerate()

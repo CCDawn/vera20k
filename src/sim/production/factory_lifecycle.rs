@@ -1036,7 +1036,7 @@ pub fn complete_held_building_for_test(
     .expect("the fixture constructs its object at StartProduction");
     assert!(
         sim.production
-            .factories_mut()
+            .factories_mut_for_test()
             .test_arm_ready(owner, category)
     );
     super::production_queue::publish_production_changes_for_tests(sim, rules, owner);

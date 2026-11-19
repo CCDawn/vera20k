@@ -216,7 +216,7 @@ fn the_need_waits_for_the_refinery_the_yard_is_building() {
     yard_builds(&mut sim, &rules, owner, yard, "REFN");
     for (owed, need) in [(1000, false), (1500, false), (1501, true)] {
         sim.production
-            .factories_mut()
+            .factories_mut_for_test()
             .test_building_factory_mut(yard)
             .unwrap()
             .set_balance_for_test(owed);
@@ -244,7 +244,7 @@ fn the_need_waits_for_the_harvester_the_war_factory_is_building() {
     crate::sim::production::factory_ai(&mut sim, &rules, factory, None, FrameEffects::default());
     for (owed, need) in [(1000, false), (1001, true)] {
         sim.production
-            .factories_mut()
+            .factories_mut_for_test()
             .test_building_factory_mut(factory)
             .expect("the war factory builds the harvester")
             .set_balance_for_test(owed);

@@ -195,7 +195,7 @@ pub fn publish_command_driven_production(sim: &mut Simulation, rules: &RuleSet) 
     for owner in driven {
         let mut completed = sim
             .production
-            .factories_mut()
+            .edit_factories()
             .take_changed_completed_for_owner(owner);
         completed.sort_by_key(|category| match category {
             super::ProductionCategory::Building => 0,

@@ -1613,6 +1613,7 @@ impl FactoryEdit<'_> {
         owner: InternedId,
     ) -> Vec<ProductionCategory> {
         let order: Vec<FactoryHolder> = self
+            .registry
             .holders_insertion_ordered()
             .into_iter()
             .filter_map(|(holder, _)| {
@@ -1621,7 +1622,11 @@ impl FactoryEdit<'_> {
             .collect();
         let mut completed = Vec::new();
         for holder in order {
-            let factory = self.factories.get_mut(&holder).expect("retained Factory");
+            let factory = self
+                .registry
+                .factories
+                .get_mut(&holder)
+                .expect("retained Factory");
             if std::mem::take(&mut factory.changed)
                 && factory.progress >= PRODUCTION_STEPS
                 && factory.object.is_some()
