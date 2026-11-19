@@ -476,6 +476,12 @@ pub struct AnimObject {
     /// presentation anim is local, so it is never saved, compared or hashed.
     #[serde(skip)]
     presentation: Option<Option<crate::sim::world::display_layers::DisplayLayer>>,
+    /// VERA-only: a presentation anim's place in Display submission order,
+    /// taken when it was last placed in its layer
+    /// (`DisplayLayers::unshared_order`), where an ordinary anim's slot
+    /// would hold it.
+    #[serde(skip)]
+    presentation_order: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -494,6 +500,12 @@ impl AnimObject {
     /// ordinary anim, which Display places, or a concealed one.
     pub fn presentation_layer(&self) -> Option<crate::sim::world::display_layers::DisplayLayer> {
         self.presentation.flatten()
+    }
+
+    /// A presentation anim's place in Display submission order
+    /// (`Simulation::picture_draw_order`).
+    pub fn presentation_order(&self) -> u64 {
+        self.presentation_order
     }
 
     /// Read the same hidden byte for a particular client without making
@@ -804,6 +816,7 @@ impl AnimObject {
             attached_bullet: None,
             owner_terrain: None,
             presentation: None,
+            presentation_order: 0,
         }
     }
 
@@ -1011,14 +1024,12 @@ pub(crate) fn is_local_anim_id(id: u64) -> bool {
 /// Each reads its own log, so one reader's take leaves the others' intact.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AnimTouchReader {
-    /// The kept Ground display sort keys.
-    GroundKeys = 0,
     /// The pointer-expiry broadcast's listener index.
-    ExpiryListeners = 1,
+    ExpiryListeners = 0,
 }
 
 impl AnimTouchReader {
-    const COUNT: usize = 2;
+    const COUNT: usize = 1;
 }
 
 impl AnimStore {
@@ -1644,6 +1655,33 @@ impl Simulation {
         self.spawn_anim_at_world(rules, descriptor, world_coord)
     }
 
+    /// [`Self::spawn_anim_object`] for a muzzle flash, impact or trailer: it
+    /// takes [`Self::effect_anim_constructor`], so after
+    /// [`Self::present_effect_anims`] a picture-only type is a presentation
+    /// anim, as in a match.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn spawn_effect_anim_object(
+        &mut self,
+        rules: &RuleSet,
+        descriptor: AnimClassSpawnDescriptor,
+    ) -> Result<AnimId, AnimSpawnError> {
+        let world_coord = AnimWorldCoord::from_cell_sub_z(
+            descriptor.rx,
+            descriptor.ry,
+            descriptor.sub_x,
+            descriptor.sub_y,
+            descriptor.z,
+        );
+        let constructor = self.effect_anim_constructor(rules, descriptor.type_name);
+        self.spawn_anim_at_world_with_constructor(
+            rules,
+            descriptor,
+            world_coord,
+            constructor,
+            FrameEffects::default(),
+        )
+    }
+
     /// Construct one combat explosion as a real `AnimClass` instance.
     ///
     /// gamemd-derived: the warhead's `AnimList=` pick reaches
@@ -1902,10 +1940,11 @@ impl Simulation {
     ///
     /// RESIDUAL: a local anim runs the whole AnimClass::AI, as gamemd's does.
     /// A MoveFlash type that damages, leaves a scorch or crater, spawns
-    /// particles, a `TrailerAnim=` or a `Next=` anim, marks `MakeInfantry=`
-    /// cells or sits in `Layer=Ground` (whose sorted order is shared state)
-    /// would change the clicking game alone, as in gamemd. Retail RING does
-    /// none of these.
+    /// particles, a `TrailerAnim=` or a `Next=` anim or marks `MakeInfantry=`
+    /// cells would change the clicking game alone, as in gamemd. A
+    /// `Layer=Ground` one keeps its own list (`DisplayLayers::local_ground`),
+    /// so it moves no shared member, but draws after every Ground member
+    /// rather than at its sort key. Retail RING does none of these.
     pub(crate) fn spawn_move_flash(&mut self, rules: &RuleSet, cell: (u16, u16)) -> bool {
         if rules.general.move_flash.name.is_empty() {
             return false;
@@ -2241,6 +2280,7 @@ impl Simulation {
             attached_bullet: None,
             owner_terrain: None,
             presentation: presentation.then_some(None),
+            presentation_order: 0,
         };
         // The insert must run in every build profile: wrapped in
         // `debug_assert!` it was compiled out of release binaries and no
@@ -2414,7 +2454,7 @@ impl Simulation {
     /// attached entries. Non-resource cells keep the prior Convert. This is not
     /// the live AI's virtual coordinate minus384, and does not alter timers,
     /// intensity, depth, attachment or RNG.
-    pub fn refresh_animated_tiberium_after_load(
+    pub(crate) fn refresh_animated_tiberium_after_load(
         &mut self,
         rules: &RuleSet,
         overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
@@ -3353,20 +3393,15 @@ impl Simulation {
         // A presentation anim keeps the layer it draws in instead of a slot.
         if self.anim(id).is_some_and(AnimObject::is_presentation) {
             let layer = self.anim_display_layer(id, rules);
+            let order = self.substrate.display.unshared_order();
             if let Some(anim) = self.substrate.anims.get_mut(id) {
                 anim.presentation = Some(layer);
+                anim.presentation_order = order;
             }
             return;
         }
         if let Some(layer) = self.anim_display_layer(id, rules) {
-            Self::submit_object_display(
-                &self.interner,
-                &self.terrain_objects,
-                &mut self.substrate,
-                id,
-                layer,
-                rules,
-            );
+            Self::submit_object_display(&mut self.substrate, id, layer);
         } else {
             self.substrate.display.remove(id);
         }
@@ -3471,8 +3506,8 @@ impl Simulation {
 
     /// The presentation anims ([`AnimConstructorInput::Presentation`]) that
     /// draw this frame, each with its layer, in the order they were made. The
-    /// presentation draws each at the end of its layer, after the Display
-    /// members: depth, not the vector's order, hides what stands in front.
+    /// picture draws each where Display would hold it as an ordinary anim
+    /// (`Simulation::picture_draw_order`).
     pub fn presentation_anims(
         &self,
     ) -> impl Iterator<Item = (AnimId, crate::sim::world::display_layers::DisplayLayer)> + '_ {
@@ -4891,8 +4926,8 @@ pub(crate) enum AnimConstructorInput {
     /// its own picture ([`crate::rules::art_data::ArtRegistry::anim_presentation_only`]),
     /// which every game makes alike. It takes no Display slot, no Logic slot,
     /// no unique id and no Scenario draw, and nothing in the simulation holds
-    /// it; the presentation draws it at the end of its layer
-    /// ([`Simulation::presentation_anims`]).
+    /// it; the picture draws it where Display would hold it
+    /// (`Simulation::picture_draw_order`).
     ///
     /// VERA-only sim-scale deviation, on in real matches
     /// ([`Simulation::present_effect_anims`]): gamemd keeps every muzzle flash and
@@ -5305,7 +5340,7 @@ mod tests {
             sim.session.set_map_height_for_test(16);
             let mut grid = OverlayGrid::new(16, 16);
             grid.place_overlay(8, 8, overlays.id_for_name("TIB01").unwrap(), density);
-            sim.install_overlay_grid_for_load(grid);
+            *sim.overlay_grid_mut_for_test() = Some(grid);
             let type_id = sim.interner.intern("TWNK1");
             let id = sim
                 .spawn_anim_at_world(
@@ -6074,9 +6109,7 @@ mod tests {
         assert!(!sim.substrate.entities.get(100).unwrap().is_parachuted());
         sim.substrate
             .entities
-            .write_held_anim(101, |owner, authority| {
-                owner.hold_parachute_animation(first, authority)
-            })
+            .hold_parachute_animation(101, first)
             .unwrap();
         assert!(sim.anim_pointer_expired(first, 101, &rules));
         assert_eq!(sim.anim(first).unwrap().owner_entity, None);
@@ -6522,6 +6555,38 @@ mod tests {
         assert_eq!(starts(&sim), 1, "Start runs once per delay");
     }
 
+    /// A presentation anim draws where gamemd's Display would hold it as an
+    /// ordinary anim: on Ground by its GetYSort key (Anim422BC0, inserted
+    /// by Ground551A90) among the members, not after all of them.
+    #[test]
+    fn a_ground_presentation_anim_sorts_among_the_ground_members() {
+        use crate::sim::world::display_layers::DisplayLayer;
+        let rules = runtime_rules("[PUFF]\nEnd=8\nLayer=Ground\n", &[("PUFF", 8)]);
+        let zero = crate::util::fixed_math::SIM_ZERO;
+        let mut sim = Simulation::new();
+        sim.present_effect_anims();
+        let type_id = sim.interner.intern("PUFF");
+        let near = sim
+            .spawn_combat_explosion_anim(&rules, type_id, 1, 1, zero, zero, 0, 0)
+            .unwrap();
+        let far = sim
+            .spawn_combat_explosion_anim(&rules, type_id, 10, 10, zero, zero, 0, 0)
+            .unwrap();
+        // X+Y 2000 lies between the kept anims' cells 1,1 and 10,10.
+        let point = crate::sim::projectile::ProjectileCoord::new(1000, 1000, 0);
+        let packet = crate::sim::combat::detonation_anim::placed_effect(type_id, point);
+        crate::sim::world::damage_consequences::admit_explosion_effect(&mut sim, &rules, packet);
+        let (puff, layer) = sim.presentation_anims().next().unwrap();
+        assert_eq!(layer, DisplayLayer::GROUND);
+        let ground: Vec<u64> = sim
+            .picture_draw_order(Some(&rules))
+            .into_iter()
+            .filter(|&(layer, _)| layer == DisplayLayer::GROUND)
+            .map(|(_, id)| id)
+            .collect();
+        assert_eq!(ground, [near, puff, far]);
+    }
+
     /// The impact packet keeps nothing, so a picture-only impact is a
     /// presentation anim; `spawn_combat_explosion_anim`'s callers may keep
     /// theirs (the nuke awaits its NUKEBALL), so it makes an ordinary one.
@@ -6725,7 +6790,7 @@ mod tests {
 
     /// The store saves as the former derived newtype `AnimStore(map)` (the
     /// touch log is never saved), and every mutable hand-out is noted for the
-    /// kept Ground sort keys.
+    /// pointer-expiry listener index.
     #[test]
     fn anim_store_saves_as_before_and_notes_every_hand_out() {
         #[derive(Serialize)]
@@ -6753,7 +6818,7 @@ mod tests {
         );
 
         // Nothing has been derived from a fresh store yet.
-        let keys = AnimTouchReader::GroundKeys;
+        let keys = AnimTouchReader::ExpiryListeners;
         assert_eq!(store.take_touched(keys), Touched::All);
         assert!(store.get(id).is_some());
         assert_eq!(store.take_touched(keys), Touched::Ids(Vec::new()));
@@ -6761,11 +6826,6 @@ mod tests {
         let removed = store.remove(id).unwrap();
         store.insert(removed);
         assert_eq!(store.take_touched(keys), Touched::Ids(vec![id]));
-        // Each reader takes its own log.
-        assert_eq!(
-            store.take_touched(AnimTouchReader::ExpiryListeners),
-            Touched::All
-        );
         assert_eq!(store.clone().take_touched(keys), Touched::All);
         let _ = store.values_mut().count();
         assert_eq!(store.take_touched(keys), Touched::All);
@@ -7749,7 +7809,7 @@ mod tests {
                 .unwrap();
             sim.substrate
                 .anims
-                .take_touched(AnimTouchReader::GroundKeys)
+                .take_touched(AnimTouchReader::ExpiryListeners)
         };
         visit(&mut sim, 0); // constructor first-AI guard
         visit(&mut sim, 1); // delay 1 -> 0

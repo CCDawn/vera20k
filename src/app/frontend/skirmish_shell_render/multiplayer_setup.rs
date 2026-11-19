@@ -4,7 +4,7 @@
 use super::chrome::*;
 use super::controls::{
     ControlPaint, dropdown_scroll_part, house_color_tint, list_controls, paint_control,
-    push_new_edit, push_popup_instances,
+    push_new_edit, push_popup_instances, team_caption_tint,
 };
 use super::in_game_shell::{
     self, InGameShellFrame, ShellFrameArt, ShellFrameCursor, ShellFrameOverlay,
@@ -37,53 +37,6 @@ pub(crate) fn render_multiplayer_setup(
     encoder: &mut wgpu::CommandEncoder,
     destination: &wgpu::Texture,
 ) -> anyhow::Result<()> {
-    if let Some((completed, total)) = state
-        .frontend
-        .network_setup_protocol
-        .as_ref()
-        .filter(|protocol| protocol.blocking_map_transfer())
-        .and_then(|protocol| protocol.transfer_progress())
-    {
-        crate::app::frontend::preview_zoom::close(state);
-        let (progress_meter, texts) =
-            crate::app::loading::pump::transfer_progress_draws(state, completed, total)?;
-        let smooth_art = state.smooth_online_menus();
-        let layout = crate::app::input::multiplayer_setup::layout(state);
-        let atlas = state
-            .frontend
-            .skirmish_shell_chrome
-            .as_ref()
-            .expect("setup art");
-        let mut art = Vec::new();
-        super::modals::push_message_box_backdrop_instances(
-            &mut art,
-            atlas,
-            &crate::ui::skirmish_shell::compute_layout_on(
-                layout.page.scale,
-                state.render_width(),
-                state.render_height(),
-            ),
-        );
-        return in_game_shell::render_shell_frame(
-            state,
-            encoder,
-            destination,
-            InGameShellFrame {
-                art,
-                controls: Vec::new(),
-                texts: Vec::new(),
-                label: "LAN map transfer",
-            },
-            ShellFrameArt::Launcher,
-            ShellFrameOverlay {
-                progress_meter,
-                texts,
-                smooth_art,
-                ..Default::default()
-            },
-            ShellFrameCursor::Hidden,
-        );
-    }
     let Some(view) = crate::app::shell_network_setup::view(state) else {
         crate::app::frontend::preview_zoom::close(state);
         return Ok(());
@@ -108,7 +61,7 @@ pub(crate) fn render_multiplayer_setup(
     } else {
         state.frontend.skirmish_preview_texture = None;
     }
-    let zoom_layout = ensure_zoom_texture(state, scale, !sliding && !view.preview_hidden);
+    let zoom_layout = ensure_zoom_texture(state, scale, !sliding);
     let heading = localized_label(state, view.page().title_key, view.page().title_key);
     let accept_highlight = state
         .frontend
@@ -336,7 +289,7 @@ pub(crate) fn render_multiplayer_setup(
                     crate::ui::skirmish_shell::combo_text_rect(layout.combos[row][0], scale)
                 },
                 ShellAlign::V_CENTER,
-                label_rgb,
+                team_caption_tint(state.rules(), &header.member_colors).unwrap_or(label_rgb),
                 SHELL_CONTROL_TEXT_DEPTH,
                 roster_size,
             ));
@@ -480,7 +433,7 @@ pub(crate) fn render_multiplayer_setup(
                         &crate::i18n::tr(caption),
                         rect,
                         ShellAlign::V_CENTER,
-                        ROOM_TEXT_RGB,
+                        SHELL_LABEL_TEXT_RGB,
                         SHELL_CONTROL_TEXT_DEPTH,
                         ROSTER_TEXT_SCALE,
                     ));
@@ -634,30 +587,6 @@ pub(crate) fn render_multiplayer_setup(
                 );
             }
         }
-        // C2/C9 ping statics 0x754+row, kind-2 images like the acceptance ones.
-        if let Some(rects) = &layout.ping_icons {
-            for (row, icon) in view.ping_icons.iter().enumerate() {
-                if let Some(entry) = icon.and_then(|icon| atlas.wol_ping_icon(icon)) {
-                    if layout.roster {
-                        push_entry_fitted(
-                            &mut controls,
-                            entry,
-                            rects[row],
-                            scale,
-                            SHELL_CONTROL_DEPTH,
-                        );
-                    } else {
-                        push_flag_entry_clipped_centered(
-                            &mut controls,
-                            entry,
-                            rects[row],
-                            scale,
-                            SHELL_CONTROL_DEPTH,
-                        );
-                    }
-                }
-            }
-        }
         // VERA's room keeps its options in Game Options; Difficulty stays.
         if layout.game_options.is_none() {
             push_option_controls(
@@ -749,27 +678,8 @@ pub(crate) fn render_multiplayer_setup(
                 layout.chat_text_scale(),
             ));
         }
-        // C9's 0x71F "Preview unavailable" after the host's Z3 (0x5E3D10),
-        // a left-aligned static at its template place.
-        if !sliding
-            && view.no_preview
-            && let Some(rect) = layout.no_preview
-        {
-            texts.push(text(
-                &localized_label(state, "TXT_NAT_NO_PREVIEW", "Preview unavailable"),
-                rect,
-                ShellAlign::NONE,
-                SHELL_LABEL_TEXT_RGB,
-                SHELL_CONTROL_TEXT_DEPTH,
-            ));
-        }
         if !sliding {
-            if let Some(preview) = state
-                .frontend
-                .skirmish_preview_texture
-                .as_ref()
-                .filter(|_| !view.preview_hidden)
-            {
+            if let Some(preview) = state.frontend.skirmish_preview_texture.as_ref() {
                 overlay.preview = build_preview_surface_instance(
                     layout.map_preview,
                     preview.width,
@@ -1247,7 +1157,7 @@ const ROSTER_LINE_H: f32 = 20.0;
 
 /// VERA's room's own text: green, where the shell's is yellow, and a dim
 /// green, where the shell's is dark red, on what is closed.
-const ROOM_TEXT_RGB: [f32; 3] = [0.0, 1.0, 0.0];
+const ROOM_TEXT_RGB: [f32; 3] = [0.0, 0.75, 0.0];
 const ROOM_CLOSED_TEXT_RGB: [f32; 3] = [0.0, 0.5, 0.0];
 
 /// The local player's row in VERA's roster: a dark red band behind it.
@@ -1443,21 +1353,11 @@ fn push_trackbar(
         return;
     };
     let scale = layout.control_scale(bar.id);
-    // The team bar's count keeps its value at the roster's text size and
-    // in the room's colours.
-    let (text_factor, [rgb, closed]) = if scale == layout.page.scale {
-        (
-            scale.factor(),
-            [
-                SHELL_LABEL_TEXT_RGB,
-                SHELL_DISABLED_TEXT_RGB_FROM_PACKED_0000009F,
-            ],
-        )
+    // The team bar's trackbars keep their values at the roster's text size.
+    let text_factor = if scale == layout.page.scale {
+        scale.factor()
     } else {
-        (
-            layout.page.scale.factor() * ROSTER_TEXT_SCALE,
-            [ROOM_TEXT_RGB, ROOM_CLOSED_TEXT_RGB],
-        )
+        layout.page.scale.factor() * ROSTER_TEXT_SCALE
     };
     paint_control(
         controls,
@@ -1494,7 +1394,11 @@ fn push_trackbar(
             &state.renderer.bit_font,
             &value,
             rect_to_text_rect(crate::ui::shell::trackbar::value_text_rect(rect, scale)),
-            if view.enabled(bar.id) { rgb } else { closed },
+            if view.enabled(bar.id) {
+                SHELL_LABEL_TEXT_RGB
+            } else {
+                SHELL_DISABLED_TEXT_RGB_FROM_PACKED_0000009F
+            },
             ShellAlign::H_CENTER | ShellAlign::V_CENTER,
             [0.0; 2],
             text_depth,

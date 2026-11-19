@@ -136,7 +136,7 @@ fn a_maps_ares_key_turns_ares_on() {
             .spawn_object("GAPOWR", "Americans", 12, 12, 0, rules)
             .unwrap();
         sim.object_ai_visit_one(id, Some(rules), crate::sim::world::ObjectAiCtx::default());
-        sim.substrate.entities.get(id).unwrap().cloak.is_some()
+        sim.entities().get(id).unwrap().cloak.is_some()
     };
     let stock = skirmish(
         &mut owner,
@@ -167,7 +167,7 @@ fn the_ares_setting_off_keeps_a_maps_ares_key_off() {
 }
 
 /// `ares.mix` mounted at startup (Load_Bootstrap_AresMIX, hook 0x0053029E)
-/// turns Ares on for retail rules in every test build, and the switch is
+/// turns Ares on for retail rules, and the switch is
 /// part of the game's configuration, so a replay or a peer with the other
 /// answer is refused.
 #[test]

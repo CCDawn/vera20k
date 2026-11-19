@@ -140,7 +140,7 @@ impl Patriot {
             house_colors: &colors,
             building_zshape: false,
         };
-        let order = NativeDisplayOrder::from_display(self.runtime.simulation.display_layers());
+        let order = NativeDisplayOrder::from_world(&self.runtime.simulation, None);
         let mut planned = Vec::new();
         build_shp_instances_from_inputs(&input, &mut planned, &order);
         planned
@@ -187,16 +187,14 @@ fn retail_patriot_turret_appears_on_the_last_buildup_frame() {
     scene
         .runtime
         .simulation
-        .entities_mut_for_test()
-        .get_mut(scene.id)
+        .entity_mut_for_test(scene.id)
         .unwrap()
         .set_native_stage_value(last - 1);
     assert!(!scene.turret_drawn(), "penultimate buildup frame");
     scene
         .runtime
         .simulation
-        .entities_mut_for_test()
-        .get_mut(scene.id)
+        .entity_mut_for_test(scene.id)
         .unwrap()
         .set_native_stage_value(last);
     assert!(scene.turret_drawn(), "last buildup frame");

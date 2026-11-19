@@ -133,7 +133,7 @@ impl DisplayMembers {
         // (`Simulation::allocate_stable_id`), so an id has one store and the
         // order of these tests picks no winner: records, Anims and Terrain
         // objects, the many, are asked first.
-        for (layer, id) in sim.display_layers().members_in_order() {
+        for &(layer, id) in frame.display_order(sim).ordered() {
             let object = |kind| ObjectMember { layer, id, kind };
             let kind = if let Some((slot, span)) = frame.slot_and_span(id) {
                 objects.push(object(ObjectKind::Record { slot, span }));
@@ -171,7 +171,7 @@ impl DisplayMembers {
             effects.push(EffectMember { id, kind });
         }
         // The presentation anims hold no Display slot; they follow every
-        // member, as their places in the draw order do
+        // member here, and the draw order places each in its own layer
         // (`NativeDisplayOrder::from_world`).
         for (id, _) in sim.presentation_anims() {
             if let Some(anim) = sim.anim(id) {

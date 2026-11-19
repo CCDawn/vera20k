@@ -163,7 +163,6 @@ struct Answers {
     building_online: bool,
     has_airstrike_marker: bool,
     building_cloak_stage: u8,
-    native_cloak_offset_words: i32,
     driver_killed: bool,
     #[cfg(feature = "phobos")]
     is_power_plant_enhancer_active: bool,
@@ -193,7 +192,6 @@ impl Answers {
             building_online: entity.building_online(),
             has_airstrike_marker: entity.has_airstrike_marker(),
             building_cloak_stage: entity.building_cloak_stage(),
-            native_cloak_offset_words: entity.native_cloak_offset_words(),
             driver_killed: entity.driver_killed(),
             #[cfg(feature = "phobos")]
             is_power_plant_enhancer_active: entity.is_power_plant_enhancer_active(),
@@ -662,7 +660,7 @@ impl ObjectRecord {
             sinking: Sinking {
                 active: entity.sinking.is_active(),
             },
-            passenger_role: PassengerRole::of(&entity.passenger_role),
+            passenger_role: PassengerRole::of(entity.passenger_role()),
             rocking: entity.rocking.as_ref().map(|_| ()),
             mission: Mission::of(&entity.mission),
             tether: Tether {
@@ -797,10 +795,6 @@ impl ObjectRecord {
         self.answers.building_cloak_stage
     }
 
-    pub(crate) fn native_cloak_offset_words(&self) -> i32 {
-        self.answers.native_cloak_offset_words
-    }
-
     pub(crate) fn driver_killed(&self) -> bool {
         self.answers.driver_killed
     }
@@ -882,9 +876,6 @@ impl crate::render::snapshot::SnapshotObject for ObjectRecord {
     }
     fn building_cloak_stage(&self) -> u8 {
         self.answers.building_cloak_stage
-    }
-    fn native_cloak_offset_words(&self) -> i32 {
-        self.answers.native_cloak_offset_words
     }
     fn is_warped_out(&self) -> bool {
         self.answers.is_warped_out
@@ -1168,7 +1159,7 @@ impl Flashing {
 }
 
 /// Every stored object's record, for one world state and local player.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct PresentationFrame {
     /// In ascending stable-id order.
     objects: Vec<ObjectRecord>,
@@ -1196,6 +1187,9 @@ pub(crate) struct PresentationFrame {
     display_order: crate::util::sync::OnceLock<
         crate::app::presentation::render::draw_plan_lowering::NativeDisplayOrder,
     >,
+    /// The rules the world was captured under, which the Ground draw order
+    /// reads (`Simulation::ground_draw_order`).
+    resources: CapturedRules,
     /// Every anim's absolute coordinate (`Simulation::anim_absolute_coord`),
     /// which an attached anim takes from its owner object.
     anim_coords: crate::util::lookup_hash::LookupMap<u64, crate::sim::anim_class::AnimWorldCoord>,
@@ -1209,7 +1203,24 @@ pub(crate) struct PresentationFrame {
     pub(crate) psychic_detection: bool,
 }
 
+/// The resources a frame was captured under; none for a default frame.
+#[derive(Default)]
+struct CapturedRules(Option<std::sync::Arc<crate::sim::runtime::SimResources>>);
+
+impl std::fmt::Debug for CapturedRules {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CapturedRules")
+    }
+}
+
 impl PresentationFrame {
+    /// Release the live match's resources before the host accepts its next Rules write.
+    /// Freeing the frame's 20,000 object records can still run on the pool.
+    pub(crate) fn retire(mut self: Box<Self>) {
+        self.resources.0 = None;
+        crate::sim::parallel::drop_on_pool(self);
+    }
+
     /// The records of `runtime`'s objects, as its local player (the
     /// scenario's current house) sees them, with the sidebar's answers for
     /// `sidebar_types`.
@@ -1288,6 +1299,7 @@ impl PresentationFrame {
             line_sources,
             display_members: Default::default(),
             display_order: Default::default(),
+            resources: CapturedRules(Some(runtime.resources.clone())),
             anim_coords,
             parachute_animations,
             scene,
@@ -1336,6 +1348,7 @@ impl PresentationFrame {
         self.display_order.get_or_init(|| {
             crate::app::presentation::render::draw_plan_lowering::NativeDisplayOrder::from_world(
                 sim,
+                self.resources.0.as_ref().map(|resources| &resources.rules),
             )
         })
     }

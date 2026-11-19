@@ -47,9 +47,9 @@ mod placement_gpu_tests;
 mod status_gpu_tests;
 #[cfg(all(test, tests_app_presentation_render))]
 mod target_laser_gpu_tests;
-pub(crate) use draw_passes::draw_software_cursor;
 #[cfg(test)]
 pub(crate) use draw_passes::{draw_bridge_shadows, draw_pooled_cell_bodies};
+pub(crate) use draw_passes::{draw_software_cursor, draw_world_window_copy};
 pub(crate) mod draw_plan_lowering;
 mod merge_passes;
 pub(crate) mod minimap_transaction;
@@ -180,9 +180,29 @@ pub(crate) struct GameRenderTimes {
     pub message_ms: Option<u64>,
 }
 
-/// Whether this render measures its phases: for an attached dashboard, or
-/// while the performance panel shows its Most CPU row.
+/// Names of the render phases, in the same order as [`RenderPhases::spans`].
+/// The perf recorder uses these as CSV column names.
+#[cfg(feature = "perf")]
+pub(crate) const RENDER_PHASE_KEYS: [&str; RenderPhases::COUNT] = [
+    "world",
+    "debug",
+    "shroud",
+    "ui",
+    "sidebar",
+    "upload",
+    "lights",
+    "effects",
+    "draw_calls",
+    "handoff",
+    "other",
+];
+
+/// Whether this render measures its phases: for an attached dashboard, while
+/// the performance panel shows its Most CPU row, or always in a perf build.
 fn render_phases_wanted(state: &AppState) -> bool {
+    if cfg!(feature = "perf") {
+        return true;
+    }
     #[cfg(feature = "telemetry-dashboard")]
     if state.diag.telemetry_observer.active() {
         return true;
@@ -244,24 +264,26 @@ pub(crate) fn render_game(
     if z == 1.0 {
         state.renderer.world_zoom_pass = None;
     } else {
+        // When the Options zoom scales the frame, the world also goes
+        // straight into the window (`draw_world_window_copy`). At 100% (the
+        // Original shape's bars) the frame's world is already the window's.
+        let window_copy = state.tactical_zoom().is_some_and(|zoom| zoom.percent > 100);
         let renderer = &mut state.renderer;
         let gpu = &renderer.gpu;
         let target = [sw as u32, sh as u32];
-        if let Some(pass) = renderer.world_zoom_pass.as_mut() {
-            pass.set_view(&gpu.device, &gpu.queue, target, z);
-        } else {
-            renderer.world_zoom_pass = Some(crate::render::upscale_pass::WorldZoomPass::new(
+        let pass = renderer.world_zoom_pass.get_or_insert_with(|| {
+            crate::render::upscale_pass::WorldZoomPass::new(
                 &gpu.device,
                 &gpu.queue,
                 gpu.surface_format,
                 target,
                 z,
-            ));
-        }
-        renderer.batch_renderer.set_native_world_resolution(
-            &gpu.queue,
-            renderer.world_zoom_pass.as_ref().unwrap().source_size(),
-        );
+            )
+        });
+        pass.set_view(&gpu.device, &gpu.queue, target, z, window_copy);
+        renderer
+            .batch_renderer
+            .set_native_world_resolution(&gpu.queue, pass.source_size());
     }
     let world_camera = state.renderer.batch_renderer.camera_uniform();
 
@@ -796,6 +818,7 @@ pub(crate) fn render_game(
             cell_body_draws: &world.cell_body_draws,
             terrain: &world.terrain.normal,
             smudge: &world.smudge,
+            smudge_cuts: &world.smudge_cuts,
             bridge_shadows: &world.bridge_body_shadow,
             object_layers: &world.object_layers,
             fogged_objects: &world.fogged_objects,

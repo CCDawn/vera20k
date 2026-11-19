@@ -1196,10 +1196,7 @@ impl Simulation {
             };
         }
         if self.substrate.particle_systems.contains_key(stable_id) {
-            let registered = self.reveal_particle_system(
-                stable_id,
-                crate::rules::ruleset::RuleSet::empty_for_test(),
-            );
+            let registered = self.reveal_particle_system(stable_id);
             return RevealOutcome::Revealed {
                 logic_registered: registered,
             };
@@ -1218,7 +1215,7 @@ impl Simulation {
     }
 
     /// [`Self::reveal`] for an entity, with the rules context the type-reading
-    /// Unlimbo writers need (Aircraft Techno+3D4 retention, Ground sort keys).
+    /// Unlimbo writers need (Aircraft Techno+3D4 retention).
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reveal_entity_with_rules(
         &mut self,
@@ -1828,7 +1825,6 @@ impl Simulation {
         if still_placed {
             Self::submit_entity_display(
                 &self.interner,
-                &self.terrain_objects,
                 &mut self.substrate,
                 &self.resolved_terrain,
                 stable_id,
@@ -1983,7 +1979,8 @@ impl Simulation {
     /// match its game watches. It stands in the followed player's seat for
     /// that player's view, sidebar and sounds, or shows the observer's
     /// sidebar there, but sends nothing, so every command record is another
-    /// game's. The app installs it with the world, before its first frame.
+    /// game's. The app installs it once the match's live session says this
+    /// game watches, before the world's first frame.
     pub fn install_watcher(&mut self) {
         self.session.install_watcher();
     }
@@ -3009,7 +3006,6 @@ impl Simulation {
         entity.position.put_z(world_z);
         Self::submit_entity_display(
             &self.interner,
-            &self.terrain_objects,
             &mut self.substrate,
             &self.resolved_terrain,
             stable_id,
@@ -3129,7 +3125,6 @@ impl Simulation {
         if let Some(before) = jumpjet_layer_before {
             Self::complete_jumpjet_display_process(
                 &self.interner,
-                &self.terrain_objects,
                 &mut self.substrate,
                 &self.resolved_terrain,
                 stable_id,
@@ -3268,7 +3263,6 @@ impl Simulation {
         // cell lists never regain it.
         Self::submit_entity_display(
             &self.interner,
-            &self.terrain_objects,
             &mut self.substrate,
             &self.resolved_terrain,
             id,
@@ -3645,27 +3639,19 @@ impl Simulation {
         piece.lifecycle_mut().in_limbo = false;
         piece.lifecycle_mut().admit_mark_down();
         // VoxelAnim VT7F6318+78 ->74A960: always Air.
-        Self::submit_overhead_display(&mut self.substrate, stable_id, DisplayLayer::AIR);
+        Self::submit_object_display(&mut self.substrate, stable_id, DisplayLayer::AIR);
         self.register_logic_object(stable_id)
     }
 
-    pub(crate) fn reveal_particle_system(&mut self, stable_id: u64, rules: &RuleSet) -> bool {
+    pub(crate) fn reveal_particle_system(&mut self, stable_id: u64) -> bool {
         if !self.substrate.particle_systems.contains_key(stable_id) {
             return false;
         }
-        // ParticleSystem VT7EFB9C+78 ->62FE80: always Ground. Rules resolve
-        // the existing Building peers' GetYSort adjustments during insertion.
+        // ParticleSystem VT7EFB9C+78 ->62FE80: always Ground.
         // RESIDUAL: ObjectUnlimbo refuses the empty coordinate
         // (`0x005F4ECD..0x005F4EEF`), so gamemd leaves a system built at
         // 0,0,0 in Limbo; VERA reveals it. No producer builds one there.
-        Self::submit_object_display(
-            &self.interner,
-            &self.terrain_objects,
-            &mut self.substrate,
-            stable_id,
-            DisplayLayer::GROUND,
-            rules,
-        );
+        Self::submit_object_display(&mut self.substrate, stable_id, DisplayLayer::GROUND);
         self.register_logic_object(stable_id)
     }
 
@@ -3678,7 +3664,7 @@ impl Simulation {
     /// AIR (3), so Display4A9720 reaches the existing append owner5519B0.
     /// A particle is owned by its system and never joins global Logic.
     pub(crate) fn reveal_particle(substrate: &mut ObjectSubstrate, stable_id: u64) {
-        Self::submit_overhead_display(substrate, stable_id, DisplayLayer::AIR);
+        Self::submit_object_display(substrate, stable_id, DisplayLayer::AIR);
     }
 
     /// Spark62ED2C (and the other System AI cleanup callers) invokes the
@@ -3717,14 +3703,7 @@ impl Simulation {
             });
         // Terrain ctor71BC76 reveals at the retained type-adjusted coordinate;
         // Object5F4260 selects Ground even on elevated cells.
-        Self::submit_object_display(
-            &self.interner,
-            &self.terrain_objects,
-            &mut self.substrate,
-            stable_id,
-            DisplayLayer::GROUND,
-            rules,
-        );
+        Self::submit_object_display(&mut self.substrate, stable_id, DisplayLayer::GROUND);
         // ObjectUnlimbo5F4FE2 submits Display before the independent Logic
         // admission5F4FEF..5F5040; ordinary trees still complete Unlimbo.
         if joins_logic {
@@ -3763,7 +3742,7 @@ impl Simulation {
         } else {
             DisplayLayer::AIR
         };
-        Self::submit_overhead_display(&mut self.substrate, stable_id, layer);
+        Self::submit_object_display(&mut self.substrate, stable_id, layer);
         self.register_logic_object(stable_id)
     }
 
@@ -3772,7 +3751,7 @@ impl Simulation {
             return false;
         }
         // Wave VT7F6BF4+78 ->75F890: always Air; Submit at75F952.
-        Self::submit_overhead_display(&mut self.substrate, stable_id, DisplayLayer::AIR);
+        Self::submit_object_display(&mut self.substrate, stable_id, DisplayLayer::AIR);
         self.register_logic_object(stable_id)
     }
 
@@ -5104,11 +5083,11 @@ impl Simulation {
             .iter()
             .copied()
             .for_each(&mut name);
-        if let Some(cargo) = listener.passenger_role.cargo() {
+        if let Some(cargo) = listener.passenger_role().cargo() {
             cargo.passengers().iter().copied().for_each(&mut name);
         }
         listener
-            .passenger_role
+            .passenger_role()
             .occupants()
             .ids()
             .iter()
@@ -5125,8 +5104,8 @@ impl Simulation {
             .for_each(&mut name);
         [
             listener.unit_follower(),
-            listener.passenger_role.inside_transport_id(),
-            listener.passenger_role.transporter(),
+            listener.passenger_role().inside_transport_id(),
+            listener.passenger_role().transporter(),
             listener.pending_entry(),
             listener.spawn_owner_id.owner(),
             listener.fire_particle_system.system(),
@@ -5539,7 +5518,7 @@ impl Simulation {
         // `removed` argument is set, so a cloaking rider stays aboard.
         let drops_passenger = control == PointerExpiryControl::Uninit
             && listener
-                .passenger_role
+                .passenger_role()
                 .cargo()
                 .is_some_and(|cargo| cargo.passengers().contains(&expired_id));
         // `0x007077EE..0x007077FD`, after the radio and cargo, whatever the
@@ -5607,7 +5586,7 @@ impl Simulation {
 
             // TechnoClass removes an expiring passenger from its CargoClass before
             // clearing its target/archive/manager reference family.
-            if drops_passenger && let Some(cargo) = listener.passenger_role.cargo_mut() {
+            if drops_passenger && let Some(cargo) = listener.cargo_mut() {
                 let _ = cargo.disembark(expired_id);
             }
             if drops_spawn_owner {
@@ -5725,9 +5704,9 @@ impl Simulation {
         let hull_gone =
             !expired_object_alive || expired_health == 0 || self.object_placement_scope_active();
         let clear_transporter =
-            hull_gone && listener.passenger_role.transporter() == Some(expired_id);
+            hull_gone && listener.passenger_role().transporter() == Some(expired_id);
         let clear_passenger_role =
-            hull_gone && listener.passenger_role.inside_transport_id() == Some(expired_id);
+            hull_gone && listener.passenger_role().inside_transport_id() == Some(expired_id);
         let clear_c4_source = listener
             .building
             .pending_c4_detonation
@@ -5751,7 +5730,7 @@ impl Simulation {
         let clear_occupant = listener.category() == EntityCategory::Structure
             && self.object_placement_scope_active()
             && listener
-                .passenger_role
+                .passenger_role()
                 .occupants()
                 .ids()
                 .contains(&expired_id);
@@ -5837,10 +5816,10 @@ impl Simulation {
             ammo.set_dock(None);
         }
         if clear_transporter {
-            listener.passenger_role.clear_transporter();
+            listener.clear_transporter();
         }
         if clear_passenger_role {
-            listener.passenger_role.clear_carrier_relation();
+            listener.clear_carrier_relation();
         }
         if clear_c4_source {
             listener.building.pending_c4_detonation.forget_source();
@@ -5857,10 +5836,7 @@ impl Simulation {
             listener.building.building_light.take();
         }
         if clear_occupant {
-            listener
-                .passenger_role
-                .occupants_mut()
-                .remove_expired(expired_id);
+            listener.remove_garrison_reference(expired_id);
         }
     }
 
@@ -6185,7 +6161,7 @@ impl Simulation {
             // FactoryClass::PointerExpired4CA580 is a control-insensitive
             // listener in Dispatch7258D0. Its only mutation clears a matching
             // held product; no entity listener consumes that factory pointer.
-            let mut named = self.production.factories_mut().pointer_expired(expired_id);
+            let mut named = self.production.factory_product_expired(expired_id);
             // `HouseClass::PointerExpired @ 0x004FB9B0`, each house a listener
             // (`0x004F5FFB`), forgets House+54E0 whatever the control. Phobos'
             // `AnnounceInvalidPointer` hook at this dispatcher's entry
@@ -7056,7 +7032,7 @@ impl Simulation {
                 .substrate
                 .entities
                 .get_mut(building_id)
-                .and_then(|entity| entity.passenger_role.cargo_mut())
+                .and_then(|entity| entity.cargo_mut())
                 .and_then(|cargo| cargo.unload_first())
                 .map(|(id, _)| id);
             let Some(passenger) = passenger else {
@@ -7257,13 +7233,13 @@ impl Simulation {
                     .entities
                     .get(stable_id)
                     .filter(|entity| {
-                        crate::sim::superweapon::provided_supers(self, rules, entity)
+                        crate::sim::superweapon::provided_supers(self, rules, entity, false)
                             .next()
                             .is_some()
                     })
                     .map(|entity| entity.owner())
             {
-                crate::sim::superweapon::update_owned_supers(self, rules, owner);
+                crate::sim::superweapon::update_owned_supers(self, rules, owner, context.effects());
             }
             // Active-frame Building43BEF5..43BF11 compares Health+6C with
             // the retained AI sample+544 after its slot/fire destructors.
@@ -7345,7 +7321,7 @@ impl Simulation {
                     .substrate
                     .entities
                     .get_mut(stable_id)
-                    .and_then(|entity| entity.passenger_role.cargo_mut())
+                    .and_then(|entity| entity.cargo_mut())
                     .and_then(|cargo| cargo.unload_first())
                     .map(|(id, _)| id);
                 let Some(passenger) = passenger else {

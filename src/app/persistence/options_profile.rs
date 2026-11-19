@@ -237,10 +237,6 @@ pub(crate) struct RetailOptionsProfile {
     /// 0, off, by default; read as
     /// [`crate::rules::personal_rules::admitted_superweapon_limit`] admits it.
     pub(crate) superweapon_limit: u8,
-    /// `[VERA] WolTestService=`: Internet answers from VERA's stand-in WOL
-    /// service instead of showing `TXT_APIMISSING`. No Options page offers it.
-    /// Off by default; no real service exists yet.
-    pub(crate) wol_test_service: bool,
     /// `[VERA] SoloSkirmish=`: Start accepts a skirmish that has fewer than two
     /// sides for an undisturbed test match — either no AI row enabled, or every
     /// enabled AI on the local player's own explicit team. Off by default, so
@@ -330,6 +326,13 @@ pub(crate) struct RetailOptionsProfile {
     /// list stacks every line as gamemd does (`TacticalClass::Draw`
     /// `0x006D4941..0x006D4B25`). Client presentation only.
     pub(crate) compact_super_timers: bool,
+    /// `[VERA] SuperweaponBuildingTimers=`: every building that provides one
+    /// of the player's super weapons draws its countdown above itself
+    /// (`app::presentation::ui_overlays`). A scenario starts from this value
+    /// and the match's hotkey command flips it, writing the choice back here;
+    /// the Options page keeps no box for it. Off by default, so the
+    /// battlefield shows only gamemd's labels. Client presentation only.
+    pub(crate) superweapon_building_timers: bool,
 }
 
 /// The two process-start products obtained from one physical `VERA.INI`
@@ -404,7 +407,6 @@ impl Default for RetailOptionsProfile {
             shift_queue_count: DEFAULT_SHIFT_QUEUE_COUNT,
             terrain_deformation: false,
             superweapon_limit: 0,
-            wol_test_service: false,
             solo_skirmish: false,
             commander_feedback: true,
             custom_end_game_banner: false,
@@ -421,6 +423,7 @@ impl Default for RetailOptionsProfile {
             display: crate::ui::main_menu_dialogs::options::DisplayTarget::Auto,
             detailed_eva_text: false,
             compact_super_timers: false,
+            superweapon_building_timers: false,
         }
     }
 }
@@ -670,7 +673,6 @@ impl RetailOptionsProfile {
             );
             self.auto_repair = vera.read_bool("AutoRepair", self.auto_repair);
             self.minimap_beacons = vera.read_bool("MinimapBeacons", self.minimap_beacons);
-            self.wol_test_service = vera.read_bool("WolTestService", self.wol_test_service);
             self.solo_skirmish = vera.read_bool("SoloSkirmish", self.solo_skirmish);
             self.commander_feedback = vera.read_bool("CommanderFeedback", self.commander_feedback);
             self.custom_end_game_banner =
@@ -682,6 +684,10 @@ impl RetailOptionsProfile {
             self.detailed_eva_text = vera.read_bool("DetailedEvaText", self.detailed_eva_text);
             self.compact_super_timers =
                 vera.read_bool("CompactSuperTimers", self.compact_super_timers);
+            self.superweapon_building_timers = vera.read_bool(
+                "SuperweaponBuildingTimers",
+                self.superweapon_building_timers,
+            );
             // Absent keeps the current value; a value this build does not know
             // reads as the native rule instead of hiding the original strip.
             self.health_bars = crate::ui::main_menu_dialogs::options::HealthBarMode::from_ini_value(
@@ -819,10 +825,6 @@ impl RetailOptionsProfile {
                 ("SkipIntro", format_bool(self.skip_intro).to_string()),
                 ("ShiftQueue", format_bool(self.shift_queue).to_string()),
                 ("ShiftQueueCount", self.shift_queue_count.to_string()),
-                (
-                    "WolTestService",
-                    format_bool(self.wol_test_service).to_string(),
-                ),
                 ("SoloSkirmish", format_bool(self.solo_skirmish).to_string()),
                 (
                     "CommanderFeedback",
@@ -878,6 +880,10 @@ impl RetailOptionsProfile {
                     format_bool(self.compact_super_timers).to_string(),
                 ),
                 (
+                    "SuperweaponBuildingTimers",
+                    format_bool(self.superweapon_building_timers).to_string(),
+                ),
+                (
                     "TerrainDeformation",
                     format_bool(self.terrain_deformation).to_string(),
                 ),
@@ -924,8 +930,9 @@ impl RetailOptionsProfile {
         let output =
             crate::util::ini_writer::set_ini_byte_values(&output, NETWORK_SECTION, &network);
         let output = apply_formatted_section(&output, VERA_SECTION, &formatted.vera);
-        // The window keys are from earlier builds: a windowed launch now
-        // always opens centred, at gamemd's startup size.
+        // Keys earlier builds wrote: a windowed launch now always opens
+        // centred, at gamemd's startup size, and only shell captures select
+        // the offline WOL test service.
         crate::util::ini_writer::remove_ini_keys(
             &output,
             VERA_SECTION,
@@ -939,6 +946,7 @@ impl RetailOptionsProfile {
                 "WindowWidth",
                 "WindowHeight",
                 "WindowMaximized",
+                "WolTestService",
             ],
         )
     }
@@ -1678,8 +1686,6 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
         assert!(!defaults.retained_profile.yr_original_style);
         // Shift + left click queues one copy, as in gamemd, until it is ticked.
         assert!(!defaults.retained_profile.shift_queue);
-        // Internet shows TXT_APIMISSING, as on retail, until it is ticked.
-        assert!(!defaults.retained_profile.wol_test_service);
         // The retail minimum-player gate stays until SoloSkirmish= is enabled.
         assert!(!defaults.retained_profile.solo_skirmish);
         assert_eq!(
@@ -1689,7 +1695,7 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
 
         let load = load_snapshot(
             &RetailStartupOptions::default(),
-            b"[VERA]\nFullScreen=yes\nZoom=2\nOriginalShape=yes\nSidebar=150\nShiftQueue=yes\nShiftQueueCount=8\nWolTestService=yes\nSoloSkirmish=yes\n",
+            b"[VERA]\nFullScreen=yes\nZoom=2\nOriginalShape=yes\nSidebar=150\nShiftQueue=yes\nShiftQueueCount=8\nSoloSkirmish=yes\n",
         );
         assert!(load.retained_profile.full_screen);
         // The first release saved the whole factor.
@@ -1699,7 +1705,6 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
         assert!(!load.retained_profile.yr_original_style);
         assert!(!load.retained_profile.skip_intro);
         assert!(load.retained_profile.shift_queue);
-        assert!(load.retained_profile.wol_test_service);
         assert!(load.retained_profile.solo_skirmish);
         assert_eq!(load.retained_profile.shift_queue_count, 8);
         // A value this build doesn't know reads as Auto.
@@ -1726,7 +1731,6 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
             show_string_keys: true,
             shift_queue: true,
             shift_queue_count: 7,
-            wol_test_service: true,
             solo_skirmish: true,
             ..RetailOptionsProfile::default()
         };
@@ -1735,7 +1739,7 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
                 .unwrap();
         assert!(
             output.contains(
-                "[VERA]\r\nFullScreen=yes\r\nZoom=150\r\nOriginalShape=yes\r\nSidebar=200\r\nSidebarColumns=4\r\nYROriginalStyle=yes\r\nSkipIntro=yes\r\nShiftQueue=yes\r\nShiftQueueCount=7\r\nWolTestService=yes\r\nSoloSkirmish=yes\r\n"
+                "[VERA]\r\nFullScreen=yes\r\nZoom=150\r\nOriginalShape=yes\r\nSidebar=200\r\nSidebarColumns=4\r\nYROriginalStyle=yes\r\nSkipIntro=yes\r\nShiftQueue=yes\r\nShiftQueueCount=7\r\nSoloSkirmish=yes\r\n"
             ),
             "{output}"
         );
@@ -1752,7 +1756,6 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
         assert!(reread.retained_profile.skip_intro);
         assert!(reread.retained_profile.show_string_keys);
         assert!(reread.retained_profile.shift_queue);
-        assert!(reread.retained_profile.wol_test_service);
         assert!(reread.retained_profile.solo_skirmish);
         assert_eq!(reread.retained_profile.shift_queue_count, 7);
 
@@ -2196,7 +2199,7 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
         let startup = RetailStartupOptions::default();
         for style in [false, true] {
             let input = format!(
-                "[VERA]\nYROriginalStyle={}\nRenderInterpolation=yes\nRA2Look=yes\nUnowned=keep\n",
+                "[VERA]\nYROriginalStyle={}\nRenderInterpolation=yes\nRA2Look=yes\nWolTestService=yes\nUnowned=keep\n",
                 format_bool(style),
             );
             let profile = load_snapshot(&startup, input.as_bytes()).retained_profile;
@@ -2205,6 +2208,7 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
             let text = String::from_utf8_lossy(&written);
             assert!(!text.contains("RA2Look="));
             assert!(!text.contains("RenderInterpolation="));
+            assert!(!text.contains("WolTestService="), "{text}");
             assert!(text.contains("Unowned=keep"));
             let reloaded = load_snapshot(&startup, &written).retained_profile;
             assert_eq!(reloaded.yr_original_style, style);
@@ -2586,6 +2590,18 @@ IsScoreRepeat=no\r\nIsScoreShuffle=no\r\nSoundLatency=9\r\nInGameMusic=yes\r\n\
         profile.compact_super_timers = false;
         let written = profile.transform_settings(b"[VERA]\nCompactSuperTimers=yes\n");
         assert!(!read(&written).compact_super_timers);
+    }
+
+    #[test]
+    fn superweapon_building_timers_defaults_off_and_round_trips_through_the_vera_section() {
+        let startup = RetailStartupOptions::default();
+        let read = |bytes: &[u8]| load_snapshot(&startup, bytes).retained_profile;
+        assert!(!read(b"").superweapon_building_timers);
+        let mut profile = read(b"[VERA]\nSuperweaponBuildingTimers=yes\n");
+        assert!(profile.superweapon_building_timers);
+        profile.superweapon_building_timers = false;
+        let written = profile.transform_settings(b"[VERA]\nSuperweaponBuildingTimers=yes\n");
+        assert!(!read(&written).superweapon_building_timers);
     }
 
     #[test]

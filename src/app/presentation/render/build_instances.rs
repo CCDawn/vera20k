@@ -46,8 +46,11 @@ pub(super) struct WorldInstances {
     pub fogged_objects: super::draw_plan_lowering::ObjectLayerPass,
     /// One BuildingClass::Array-ordered text sweep after Ground2 bodies.
     pub building_status_text: crate::app::presentation::ui_overlays::BuildingStatusTextInstances,
-    /// Static smudge decals (craters, scorches) — drawn between terrain and entities.
+    /// Static smudge decals (craters, scorches) in the tile walk's order.
     pub smudge: Vec<SpriteInstance>,
+    /// For each smudge, how many walk-ordered terrain tiles draw before it
+    /// (`render::smudge::VisibleSmudges::cuts`).
+    pub smudge_cuts: Vec<u32>,
     pub bridge_body_shadow: Vec<SpriteInstance>,
     /// Actual particle pieces observed by the existing map diagnostic policy.
     pub particle_draws: Option<Vec<instances::ParticleDrawObservation>>,
@@ -220,6 +223,7 @@ pub(super) fn build_world_instances(
     } else {
         crate::render::terrain_instances::TerrainInstances {
             normal: terrain_buffer,
+            walk: Vec::new(),
         }
     };
 
@@ -235,7 +239,10 @@ pub(super) fn build_world_instances(
             match state.match_state.sim_runtime.frame() {
                 Some(frame) => frame.display_order(world),
                 None => {
-                    own_order = super::draw_plan_lowering::NativeDisplayOrder::from_world(world);
+                    own_order = super::draw_plan_lowering::NativeDisplayOrder::from_world(
+                        world,
+                        Some(&rt.resources.rules),
+                    );
                     &own_order
                 }
             }
@@ -274,7 +281,9 @@ pub(super) fn build_world_instances(
     // Smudges: static crater/scorch decals on top of terrain, under entities.
     // Registered SmudgeType SHPs share the live OverlayAtlas and Cell light
     // grid with the ordinary ground drawing consumers.
-    let smudge: Vec<SpriteInstance> = build_smudge_instances(state, sw, sh);
+    let smudges = build_smudge_instances(state, sw, sh);
+    let smudge_cuts = smudges.cuts(&terrain.walk);
+    let smudge = smudges.instances;
 
     state
         .renderer
@@ -646,6 +655,7 @@ pub(super) fn build_world_instances(
         fogged_objects,
         building_status_text,
         smudge,
+        smudge_cuts,
         bridge_body_shadow,
         particle_draws,
         cell_sparkles,
@@ -748,7 +758,11 @@ fn build_pixel_fx_sparkle_instances(state: &AppState, sw: f32, sh: f32) -> Vec<S
 /// uses the resolved terrain level at the footprint origin and emits that
 /// frame once on the coherent flat uniform-material route. Native recenters
 /// a separate draw from every occupied cell; unequal material remains open.
-fn build_smudge_instances(state: &AppState, sw: f32, sh: f32) -> Vec<SpriteInstance> {
+fn build_smudge_instances(
+    state: &AppState,
+    sw: f32,
+    sh: f32,
+) -> crate::render::smudge::VisibleSmudges {
     let (sim, rules) = match (
         state
             .match_state
@@ -758,16 +772,16 @@ fn build_smudge_instances(state: &AppState, sw: f32, sh: f32) -> Vec<SpriteInsta
         state.rules(),
     ) {
         (Some(s), Some(r)) => (s, r),
-        _ => return Vec::new(),
+        _ => return Default::default(),
     };
     let Some(grid) = sim.smudge_grid() else {
-        return Vec::new();
+        return Default::default();
     };
     let Some(resolved_terrain) = sim.resolved_terrain() else {
-        return Vec::new();
+        return Default::default();
     };
     let Some(atlas) = state.match_state.match_presentation.overlay_atlas.as_ref() else {
-        return Vec::new();
+        return Default::default();
     };
     // Resolve (smudge_type_id, frame_offset) → atlas placement.
     // Smudge SHPs are registered into the OverlayAtlas under
@@ -893,8 +907,13 @@ pub(super) fn update_minimap(state: &mut AppState, local_owner: &Option<String>)
         }
     }
 
-    // VERA's HD radar draws at the sidebar's whole scale while it is on.
-    let hd_scale = state.hd_radar().then(|| state.sidebar_frame().draw_scale());
+    // VERA's HD radar draws at the sidebar's whole scale while it is on; a
+    // fractional surface has none (a 1.5x radar has no whole pixel grid).
+    let hd_scale = state
+        .hd_radar()
+        .then(|| state.sidebar_frame().draw_scale())
+        .filter(|scale| scale.fract() == 0.0)
+        .map(|scale| scale as u32);
     if let Some(minimap) = state.match_state.match_presentation.minimap.as_mut() {
         minimap.set_hd_scale(
             &state.renderer.gpu.device,
@@ -940,7 +959,6 @@ pub(super) fn update_minimap(state: &mut AppState, local_owner: &Option<String>)
                     Some(&runtime.resources.rules),
                     Some(view.interner()),
                     view.overlay_grid(),
-                    Some(&runtime.resources.overlay_registry),
                     &presentation.overlay_radar_colors,
                     view.resolved_terrain(),
                     presentation

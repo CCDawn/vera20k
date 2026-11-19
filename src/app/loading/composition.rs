@@ -30,10 +30,6 @@ const WIDE_ART_SIZE: [i32; 2] = [800, 600];
 
 /// Skirmish mode whose briefing block sits lower on the loading screen.
 
-/// Bitmap the random-map setup dialog writes and the preview source the
-/// random-map loading branch consumes.
-pub(crate) const RANDOM_MAP_PREVIEW_FILE: &str = "RandMap.img";
-
 /// Loading-art viewport size for the current screen width.
 pub(crate) const fn loading_art_viewport_size(render_width: u32) -> [i32; 2] {
     if render_width == NARROW_LOADING_SCREEN_WIDTH {
@@ -1053,10 +1049,10 @@ mod tests {
         use crate::skirmish_launch::{
             LaunchStartPosition, LaunchTeam, SkirmishLaunchOptions, SkirmishLocalSlot,
         };
-        SkirmishLaunchSession {
-            mode: mode("MPBattleMD.ini"),
-            selected_map_file: Some(RANDMAP_SED_FIXTURE.to_owned()),
-            humans: vec![crate::skirmish_launch::SkirmishHumanSlot {
+        SkirmishLaunchSession::from_rows(
+            mode("MPBattleMD.ini"),
+            Some(RANDMAP_SED_FIXTURE.to_owned()),
+            vec![crate::skirmish_launch::SkirmishHumanSlot {
                 raw_slot_index: Some(0),
                 name: "Player".to_owned(),
                 slot: SkirmishLocalSlot {
@@ -1069,13 +1065,10 @@ mod tests {
                 },
                 role: crate::skirmish_launch::LaunchHumanRole::from_observer(false),
             }],
-            local_player_index: 0,
-            ai_player_count: 0,
-            opponents: Vec::new(),
-            pre_fill_house_roster:
-                crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(0),
-            options: SkirmishLaunchOptions::default(),
-        }
+            0,
+            Vec::new(),
+            SkirmishLaunchOptions::default(),
+        )
     }
 
     const RANDMAP_SED_FIXTURE: &str = "RandMap.Sed";

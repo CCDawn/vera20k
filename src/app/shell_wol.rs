@@ -20,8 +20,7 @@
 pub(crate) mod buddies;
 pub(crate) mod buddy;
 mod live_service;
-#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) use live_service::lobby_base_url;
+pub(crate) use live_service::lobby_get;
 pub(crate) mod lobby;
 mod lobby_phrases;
 mod login;
@@ -37,7 +36,6 @@ mod test_service;
 pub(crate) mod translation;
 
 pub(crate) use live_service::OnlineCleanup;
-pub(crate) use live_service::RELEASES_URL;
 #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
 pub(crate) use live_service::discard_spawned_visit;
 pub(crate) use live_service::keep_network_report;
@@ -46,14 +44,12 @@ pub(crate) use live_service::retire_visit_for_exit;
 pub(crate) use live_service::{
     DecodedRelayGrant, begin_spawned_match, decode_external_relay_grant, end_spawned_match,
 };
-pub(crate) use live_service::{
-    local_choices_agreed, online_cleanup_pending, online_exit_ready, online_match_id,
-};
+pub(crate) use live_service::{local_choices_agreed, online_cleanup_pending, online_match_id};
 pub(crate) use login::{account_form_layout, combo_popup, login_layout, open_login_art};
 pub(crate) use service::{
-    NET_STATUS_LOST, WolApiStatus, WolHighScoreRecord, WolLadderRecord, WolLoginAccepted, WolMatch,
-    WolProvider, WolServer, WolServerList, WolServiceEvent, WolServiceRequest, request,
-    service_event,
+    NET_STATUS_LOST, SERVER_STATUS_READY, WolApiStatus, WolHighScoreRecord, WolLadderRecord,
+    WolLoginAccepted, WolMatch, WolProvider, WolServer, WolServerList, WolServiceEvent,
+    WolServiceRequest, service_event,
 };
 pub(crate) use test_service::{
     WolTestGuest, default_buddies as test_service_buddies,
@@ -245,6 +241,9 @@ pub(crate) struct WolVisit {
     /// list of them last answered (docs/lobby-protocol.md "Watching"); `None`
     /// before the first answer.
     lobby_watches: Option<bool>,
+    /// VERA: the lobby lets a room's players visit the public lobby, as
+    /// its sign-in answered (docs/lobby-protocol.md "Visiting the lobby").
+    lobby_visits: bool,
     /// VERA: BC6's Continue after a co-op mission: the stage the kept
     /// room's host takes when the room comes back. The runner's post-match
     /// entry drops it unless it waits for that room.
@@ -316,6 +315,7 @@ impl WolVisit {
             back_to_room: false,
             problem_line: None,
             lobby_watches: None,
+            lobby_visits: false,
             cooperative_resume: None,
             connected: false,
             disconnected: false,
@@ -332,11 +332,6 @@ impl WolVisit {
             quick_match: Default::default(),
             spawned: None,
         }
-    }
-
-    /// Diagnostics and tests can select a backend without changing presentation.
-    pub(crate) fn set_provider(&mut self, provider: WolProvider) {
-        self.provider = provider;
     }
 
     pub(crate) fn modern_ui(&self) -> bool {
@@ -463,6 +458,16 @@ pub(crate) fn lobby_watches(state: &AppState) -> Option<bool> {
         .and_then(|visit| visit.lobby_watches)
 }
 
+/// VERA: whether the online lobby lets a room's players visit the public
+/// lobby, as its sign-in answered; a lobby from before it does not.
+pub(crate) fn lobby_visits(state: &AppState) -> bool {
+    state
+        .frontend
+        .wol
+        .as_ref()
+        .is_some_and(|visit| visit.lobby_visits)
+}
+
 /// A WOL box (`0x005E2CD0` style 0) with a CSF body.
 pub(crate) fn message_box(state: &AppState, key: &str) -> crate::ui::wol_shell::WolMessageBox {
     service::message_box(state, key, false)
@@ -504,6 +509,19 @@ pub(crate) fn hold_problem_line(state: &mut AppState, text: String) {
     }
 }
 
+/// VERA: add `text` to the line waiting for the chat this online visit next
+/// lands in, or let it wait alone.
+pub(crate) fn add_problem_line(state: &mut AppState, text: String) {
+    if let Some(visit) = state.frontend.wol.as_mut()
+        && visit.provider == WolProvider::Online
+    {
+        visit.problem_line = Some(match visit.problem_line.take() {
+            Some(held) => format!("{held} {text}"),
+            None => text,
+        });
+    }
+}
+
 /// The runner handed over to a WOL match (`[0xB77DC1]` set).
 pub(crate) fn match_started(state: &mut AppState) {
     quick_match::match_starts(state);
@@ -536,7 +554,7 @@ pub(crate) fn open_lobby(state: &mut AppState, postmatch: bool) {
         .is_some_and(|lobby| lobby.runner == lobby::Runner::Buddy);
     match (buddy_mode, postmatch, buddy_runner) {
         (true, false, true) => buddy::stopped(state),
-        (true, _, _) => buddy::open(state),
+        (true, _, _) => lobby::open_runner(state, lobby::Runner::Buddy),
         (false, _, _) => lobby::open(state, postmatch),
     }
 }
@@ -569,6 +587,12 @@ pub(crate) fn reenter_after_match(state: &mut AppState) {
         visit.back_to_room = false;
     }
     live_service::match_returned(state);
+    if !App::prepare_multiplayer_settings(
+        state,
+        crate::app::match_runtime::session::SessionMode::Wol,
+    ) {
+        return;
+    }
     persona::enter_wol_main(state);
     read_wol_settings(state);
     let now_ms = crate::app::match_runtime::frame_pacer::wall_clock_ms();
@@ -580,19 +604,6 @@ pub(crate) fn reenter_after_match(state: &mut AppState) {
     send_wol_preferences(state);
     apply_wol_preferences(state);
     open_lobby(state, true);
-}
-
-fn provider_for_visit(
-    test_service: bool,
-    capture_size: Option<winit::dpi::PhysicalSize<u32>>,
-) -> WolProvider {
-    // Stand-in games and players are diagnostic fixtures. A saved test
-    // preference must never replace the real service in ordinary play.
-    if capture_size.is_some() && test_service {
-        WolProvider::TestService
-    } else {
-        WolProvider::Online
-    }
 }
 
 impl App {
@@ -610,10 +621,10 @@ impl App {
         let lobby_music = state.frontend.wol_preferences.lobby_music != 0;
         let saved_shuffle = state.audio.enter_wol_lobby_music(lobby_music, now_ms);
         let mut visit = WolVisit::open(saved_shuffle);
-        visit.provider = provider_for_visit(
-            state.persistence.options_profile.wol_test_service,
-            state.platform.capture_client_size,
-        );
+        visit.provider = state
+            .frontend
+            .wol_capture_provider
+            .unwrap_or(WolProvider::Online);
         visit.set_legacy_ui(state.frontend.native_shell_ui);
         state.frontend.wol = Some(visit);
         // Persona I/O is selected by the new visit's provider, never a
@@ -1037,7 +1048,7 @@ impl App {
     /// The login flow returned 0 (Back, or a failed connect after its box):
     /// mode 0 (`0x0077B3F6`), and the loop runs a fresh `0x10E` with its
     /// entry slide, or the online sign-in again.
-    pub(crate) fn reopen_wol_welcome(state: &mut AppState) {
+    pub(super) fn reopen_wol_welcome(state: &mut AppState) {
         let Some(visit) = state.frontend.wol.as_mut() else {
             return;
         };

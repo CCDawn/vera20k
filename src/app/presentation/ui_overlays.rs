@@ -3,7 +3,6 @@
 //! Split from the presentation render path. Part of the app layer — may depend on everything.
 
 use crate::app::AppState;
-use crate::app::input::commands::preferred_local_owner_name;
 use crate::app::input::cursor::{
     CursorTargets, current_cursor_feedback_kind, cursor_id_for_feedback,
     software_cursor_frame_index,
@@ -66,6 +65,11 @@ struct HudMore {
     /// `sim::digital_display::values_for_display` for the local player, one
     /// per `RuleSet::digital_display_indices` entry of its type.
     digital_values: Vec<Option<(i32, i32)>>,
+    /// VERA's Super Weapon Building Timers: the countdown lines this building
+    /// draws, one per Super its type provides that its House charges. Captured
+    /// with the frame so the label never reads the live simulation while a
+    /// frame is being drawn; empty for anything but such a Structure.
+    super_charges: Vec<crate::sim::superweapon::SuperChargeLine>,
 }
 
 impl HudMore {
@@ -75,6 +79,7 @@ impl HudMore {
             && self.capture_links.is_empty()
             && self.bomb.is_none()
             && self.digital_values.is_empty()
+            && self.super_charges.is_empty()
     }
 }
 
@@ -177,6 +182,14 @@ impl HudFacts {
                 }),
             #[cfg(not(feature = "phobos"))]
             digital_values: Vec::new(),
+            // A tick's worth of countdowns, read here rather than at draw time:
+            // the label is per-frame text like DrawExtraInfo's, and the
+            // simulation may move on before the frame reaches the screen.
+            super_charges: if entity.category() == EntityCategory::Structure {
+                crate::sim::superweapon::building_super_charges(sim, rules, id)
+            } else {
+                Vec::new()
+            },
         };
         Self {
             get_coords: crate::sim::movement::ground_pose::object_get_coords(entity, terrain),
@@ -223,6 +236,12 @@ impl HudFacts {
     /// Its digital displays' values, in `digital_display_indices` order.
     pub(crate) fn digital_values(&self) -> &[Option<(i32, i32)>] {
         self.more().map_or(&[], |more| &more.digital_values)
+    }
+
+    /// VERA's Super Weapon Building Timers: the Super countdowns this
+    /// Structure draws, in its type's order.
+    pub(crate) fn super_charges(&self) -> &[crate::sim::superweapon::SuperChargeLine] {
+        self.more().map_or(&[], |more| &more.super_charges)
     }
 
     fn toggled_off(&self) -> bool {
@@ -907,71 +926,62 @@ pub(crate) fn build_building_status_render_instances(
     zoom: f32,
     tactical_clip: [i32; 4],
     rules: &RuleSet,
+    superweapon_building_timers: bool,
 ) -> BuildingStatusTextInstances {
     let mut labels = BuildingStatusTextInstances::default();
     let current_house = sim.interner().resolve(current_house_id);
     let ares_form = rules.ares_form();
     // `current_house_id` is the frame's local player, whom its records answer
-    // for. Only the buildings drawn this frame can pass the body-opportunity
-    // test, so they are walked instead of every record; both ascend by id.
-    let structures = body_opportunities
-        .iter()
-        .filter_map(|&id| frame.object(id))
-        .filter(|entity| entity.category() == EntityCategory::Structure);
-    for entity in structures {
+    // for, and whose view decides the allies' labels' colour. The sweep is
+    // BuildingClass::Array (every retained building, in stable-id order), not
+    // the frame's body plan: VERA's countdown is permanent text and must not
+    // blink out on frames where a building's pieces were not planned. The
+    // selected label keeps the native body-opportunity test through
+    // `body_opportunities`.
+    for entity in frame.structures() {
         //6D944D/9458 tests Mark+74 and body-opportunity+99.43E7C7
-        //requires selected, including when the object is also hovered.
-        if !entity.selection.is_selected() || !entity.lifecycle.cell_marked() {
+        if !entity.lifecycle.cell_marked() {
             continue;
         }
+        let owner_name = sim.interner().resolve(entity.owner());
         let allied = crate::map::houses::is_allied_with(
             sim.house_alliances().as_map(),
-            sim.interner().resolve(entity.owner()),
+            owner_name,
             current_house,
         );
         let Some(object) = sim.interner().object_type(entity.type_ref(), rules) else {
             continue;
         };
         let primary = sim.production().is_primary_factory(entity.stable_id());
-        //Without Ares, 43E7EF's separate non-allied Techno+210 display-bit
-        //arm is dormant: no writer found sets the bit nonzero (see
-        //entity_status_pips_drawable).
-        //70AA88..70AAA4 admits the positive type Power arm only when the
-        //primary latch is clear.70ABEA then tests that latch for PRIMARY.
-        // Ares 3.0 10015AB0 (hook 0x0043E7B0) also admits a building whose
-        // `SpyEffect.RevealProduction` spy bit the current house holds
-        // (`sim::spy_infiltration::DisplayProductionTo`); its DrawExtraInfo
-        // 10015F10 (hook 0x0070AA60) puts the Power arm first, shows a
-        // `Storage=` building's money to a house not allied to its owner,
-        // and PRIMARY only to an allied one. A `Fake=` type's TXT_FAKE
-        // (10015F10's first test, `TypeExt+0x5F`) replaces all three.
-        // These follow `ares_form`, as the spy bit and `Fake=` do.
-        // RESIDUAL: Ares' observer arms are not ported; an observer sees
-        // what the house it watches sees.
-        let text = if ares_form {
-            let revealed =
-                object.spy_reveals_production() && entity.hud.shows_production_to_observer();
-            if !(allied || revealed) {
-                continue;
-            }
-            if object.ares_fake() {
-                BuildingStatusText::Fake
-            } else if object.power > 0 {
-                BuildingStatusText::Power
-            } else if object.storage > 0 && !allied {
-                BuildingStatusText::Money
-            } else if primary && allied {
-                BuildingStatusText::Primary
+        // VERA's Super Weapon Building Timers (the hotkey switch): one line
+        // per Super this building provides, on every House's buildings whether
+        // or not they are selected — an enemy's silo counting down is what
+        // says an attack is coming, and the tint already says whose it is. A
+        // building the player cannot see draws none: a timer over the shroud
+        // would give away a silo scouting has not found. The lines were
+        // captured with the frame, so this pass reads no simulation state.
+        let visible = crate::app::presentation::instances::cell_shows_objects(
+            current_house_id,
+            sim.fog(),
+            entity.position.rx(),
+            entity.position.ry(),
+            sim.session().game_options().fog_of_war,
+        );
+        let lines: &[crate::sim::superweapon::SuperChargeLine] =
+            if superweapon_building_timers && visible {
+                entity.hud.super_charges()
             } else {
-                continue;
-            }
-        } else {
-            match (allied, primary, object.power > 0) {
-                (false, _, _) | (true, false, false) => continue,
-                (true, true, _) => BuildingStatusText::Primary,
-                (true, false, true) => BuildingStatusText::Power,
-            }
-        };
+                &[]
+            };
+        // DrawExtraInfo needs the building selected, including when it is
+        // also hovered.
+        let label = (entity.selection.is_selected()
+            && body_opportunities.contains(&entity.stable_id()))
+        .then(|| building_status_text(entity, object, allied, primary, ares_form))
+        .flatten();
+        if label.is_none() && lines.is_empty() {
+            continue;
+        }
         let location = entity.hud.location;
         //6D9472 calls virtual+AC=459EF0, not GetCoords447AC0. Neither
         //foundation half-dimensions nor the group tail's offsets apply.
@@ -990,7 +1000,47 @@ pub(crate) fn build_building_status_render_instances(
         {
             continue;
         }
-        let text = match text {
+        let tint = status_text_tint(sim, entity, house_color_map, house_color_ramps);
+        // The lines sit under DrawExtraInfo's place, so a selected building
+        // shows both, and a building providing several Supers stacks one line
+        // per Super, in its type's own order.
+        let line_height = (font.cell_height() as f32 * zoom).round() as i32;
+        for (row, line) in lines.iter().enumerate() {
+            let name = super_line_name(sim, rules, csf, line.super_id);
+            let seconds =
+                line.left.max(0) / crate::app::presentation::super_timers::FRAMES_PER_SECOND;
+            // `*` marks a Super this building charges itself (the Superweapon
+            // Limit's per-building shots) rather than the House's one shared
+            // charge that a radar or a battle lab provides.
+            let text = format!(
+                "{}{name} {}",
+                if line.own { "*" } else { "" },
+                crate::app::presentation::super_timers::time_text(seconds),
+            );
+            let anchor = [
+                anchor[0],
+                anchor[1].wrapping_add(line_height.wrapping_mul(row as i32 + 1)),
+            ];
+            let measure = font.compute_text_rect(&text, anchor, 0x149, [4, 2]);
+            // The backing keeps its whole measured rect: the pass's scissor
+            // already bounds it, so nothing is drawn outside the view, and a
+            // clip that shrank to nothing is exactly what would drop a label
+            // the player can still read.
+            if !rect_overlaps(measure, tactical_clip) {
+                continue;
+            }
+            let origin = [
+                measure[0].wrapping_add(4) as f32 + camera[0],
+                measure[1].wrapping_add(2) as f32 + camera[1],
+            ];
+            labels.push(status_text_instances(
+                font, &text, origin, measure, camera, tint,
+            ));
+        }
+        let Some(label) = label else {
+            continue;
+        };
+        let text = match label {
             BuildingStatusText::Primary => {
                 //70AC24's45EC90 uses foundation CELL width, not Dimension2 leptons.
                 let key = if object.foundation.dimensions().0 == 1 {
@@ -1038,15 +1088,86 @@ pub(crate) fn build_building_status_render_instances(
             measure[1].wrapping_add(2) as f32 + camera[1],
         ];
         labels.push(status_text_instances(
-            font,
-            &text,
-            origin,
-            clipped,
-            camera,
-            status_text_tint(sim, entity, house_color_map, house_color_ramps),
+            font, &text, origin, clipped, camera, tint,
         ));
     }
     labels
+}
+
+/// The name a countdown line leads with: the Super's `UIName=` text from the
+/// string table, or its rule name when the rules give it none (or the table
+/// has no entry, which [`type_ui_name`] answers with the key itself).
+fn super_line_name(
+    sim: &crate::sim::world::Simulation,
+    rules: &RuleSet,
+    csf: &crate::assets::csf_file::CsfFile,
+    super_id: crate::sim::intern::InternedId,
+) -> String {
+    let rule_name = sim.interner().resolve(super_id);
+    let ui_name = rules
+        .super_weapon(rule_name)
+        .and_then(|sw| sw.ui_name.as_deref());
+    let text = crate::assets::csf_file::type_ui_name(ui_name, Some(csf));
+    if text.is_empty() {
+        rule_name.to_owned()
+    } else {
+        text
+    }
+}
+
+/// Whether two `[x, y, width, height]` rects share a pixel.
+fn rect_overlaps(a: [i32; 4], b: [i32; 4]) -> bool {
+    a[0] < b[0].saturating_add(b[2])
+        && b[0] < a[0].saturating_add(a[2])
+        && a[1] < b[1].saturating_add(b[3])
+        && b[1] < a[1].saturating_add(a[3])
+}
+
+/// Which of DrawExtraInfo's texts a selected building shows, `None` for none.
+/// Without Ares, 43E7EF's separate non-allied Techno+210 display-bit arm is
+/// dormant: no writer found sets the bit nonzero (see
+/// `entity_status_pips_drawable`). 70AA88..70AAA4 admits the positive type
+/// Power arm only when the primary latch is clear; 70ABEA then tests that
+/// latch for PRIMARY.
+/// Ares 3.0 10015AB0 (hook 0x0043E7B0) also admits a building whose
+/// `SpyEffect.RevealProduction` spy bit the current house holds
+/// (`sim::spy_infiltration::DisplayProductionTo`); its DrawExtraInfo
+/// 10015F10 (hook 0x0070AA60) puts the Power arm first, shows a
+/// `Storage=` building's money to a house not allied to its owner,
+/// and PRIMARY only to an allied one. A `Fake=` type's TXT_FAKE
+/// (10015F10's first test, `TypeExt+0x5F`) replaces all three.
+/// These follow `ares_form`, as the spy bit and `Fake=` do.
+/// RESIDUAL: Ares' observer arms are not ported; an observer sees
+/// what the house it watches sees.
+fn building_status_text(
+    entity: &ObjectRecord,
+    object: &crate::rules::object_type::ObjectType,
+    allied: bool,
+    primary: bool,
+    ares_form: bool,
+) -> Option<BuildingStatusText> {
+    if !ares_form {
+        return match (allied, primary, object.power > 0) {
+            (false, _, _) | (true, false, false) => None,
+            (true, true, _) => Some(BuildingStatusText::Primary),
+            (true, false, true) => Some(BuildingStatusText::Power),
+        };
+    }
+    let revealed = object.spy_reveals_production() && entity.hud.shows_production_to_observer();
+    if !(allied || revealed) {
+        return None;
+    }
+    if object.ares_fake() {
+        Some(BuildingStatusText::Fake)
+    } else if object.power > 0 {
+        Some(BuildingStatusText::Power)
+    } else if object.storage > 0 && !allied {
+        Some(BuildingStatusText::Money)
+    } else if primary && allied {
+        Some(BuildingStatusText::Primary)
+    } else {
+        None
+    }
 }
 
 /// Which of DrawExtraInfo's texts a selected building shows.
@@ -1078,10 +1199,11 @@ pub(crate) fn build_building_status_instances(
     let Some(frame) = state.match_state.sim_runtime.frame() else {
         return BuildingStatusTextInstances::default();
     };
-    let Some(current_house) = preferred_local_owner_name(state)
-        .as_deref()
-        .and_then(|name| sim.interner().get(name))
-    else {
+    // The local player comes from the world this frame draws, not from
+    // `local_player_owner`: that accessor reads the home runtime, which is
+    // empty whenever a tick has it lent to the simulation thread, and asking
+    // it here blanked every label for exactly those frames.
+    let Some(current_house) = sim.session().current_house() else {
         return BuildingStatusTextInstances::default();
     };
     let (left, top, width, height) = crate::app::input::camera::tactical_viewport_px(state);
@@ -1102,6 +1224,10 @@ pub(crate) fn build_building_status_instances(
         zoom,
         [left as i32, top as i32, width as i32, height as i32],
         rules,
+        state
+            .match_state
+            .match_presentation
+            .superweapon_building_timers,
     )
 }
 
@@ -1221,6 +1347,9 @@ pub(crate) struct TechnoExtras {
     /// were read the Ares way.
     pub power_off: Option<SpriteInstance>,
     pub rank: Option<SpriteInstance>,
+    /// The custom insignia SHP (normalized file name) `rank` was cut from;
+    /// `None` is the stock PIPS strip. The replay binds that shape's texture.
+    pub rank_insignia: Option<String>,
     pub background: Option<SpriteInstance>,
     /// Phobos mobile shield PIPBRD/E00, before the shield and health fills.
     pub shield_background: Option<SpriteInstance>,
@@ -1420,8 +1549,9 @@ fn shield_bar_instances(
     }
 }
 
-/// Phobos `TechnoExt::DrawInsignia`: the custom/stock rank shape, frame and
-/// screen position for one Techno, or `None` when the draw is refused. The
+/// Phobos `TechnoExt::DrawInsignia`: the custom/stock rank shape, frame,
+/// screen position and custom SHP name for one Techno, or `None` when the
+/// draw is refused. The
 /// hook replaces the native rank block whenever the Phobos capability is
 /// compiled in, so the stock negative-rank frame19 arm is not reached.
 #[cfg(feature = "phobos")]
@@ -1441,6 +1571,7 @@ fn phobos_insignia_draw<'a>(
     &'a crate::render::selection_overlay::CenteredShapeStrip,
     usize,
     (f32, f32),
+    Option<String>,
 )> {
     let globals = rules.phobos_draw_globals();
     if globals.only_on_selected
@@ -1533,16 +1664,16 @@ fn phobos_insignia_draw<'a>(
         if let Some(found) = layer[rank]
             .iter()
             .rev()
-            .find_map(|name| overlay.insignia_shape(name))
+            .find_map(|name| Some((overlay.insignia_shape(name)?, name)))
         {
             shape = Some(found);
         }
     }
     let (shape, custom) = match shape {
-        Some(shape) => (shape, true),
-        None => (overlay.pips()?, false),
+        Some((shape, name)) => (shape, Some(name.clone())),
+        None => (overlay.pips()?, None),
     };
-    let frame = usize::try_from(insignia.frame(rank, custom)?).ok()?;
+    let frame = usize::try_from(insignia.frame(rank, custom.is_some())?).ok()?;
     let (mut x, mut y) = (sx, sy);
     match entity.category() {
         EntityCategory::Infantry => {
@@ -1566,7 +1697,84 @@ fn phobos_insignia_draw<'a>(
     if globals.use_pixel_selection_bracket_delta {
         y += object.pixel_selection_bracket_delta as f32;
     }
-    Some((shape, frame, (x, y)))
+    Some((shape, frame, (x, y), custom))
+}
+
+/// Ares.dll 0x1004E0F1..0x1004E149 checks the owner's ally mask for the
+/// viewer and compares the viewer to the observer house (0xAC1198).
+#[cfg(not(feature = "phobos"))]
+fn ares_insignia_visible(
+    sim: &crate::sim::world::Simulation,
+    owner: crate::sim::intern::InternedId,
+    viewer: Option<crate::sim::intern::InternedId>,
+    show_enemy: bool,
+) -> bool {
+    show_enemy
+        || viewer.is_some_and(|viewer| {
+            sim.house_alliances()
+                .is_allied(sim.interner(), owner, viewer)
+                || sim.session().is_observer_house(viewer)
+        })
+}
+
+/// Ares `TechnoClass_DrawVeterancy` (Ares.dll 1004E0C0, hook 0x70A990),
+/// which replaces the stock rank leaf; Phobos's `DrawInsignia` replaces it
+/// in turn. The rank shape, frame and custom SHP name, or `None`:
+/// - 1004E0F1..1004E149: the player, an ally of the owner or the observer
+///   sees it; anyone else only with `Insignia.ShowEnemy`, else `[General]
+///   EnemyInsignia`;
+/// - 1004E14F..1004E1A7: Veterancy at 2.0 is elite (PIPS 15), at 1.0
+///   veteran (14), else rookie (none, no negative frame 19); the rank's
+///   custom SHP replaces PIPS with frame 0;
+/// - 1004E1AB..1004E1D5: a nonnegative `InsigniaFrame` replaces that frame.
+///
+/// The caller keeps the stock offsets, PALETTE.PAL, E00 and Z -2 it draws
+/// with (1004E1D7..1004E228). Its TechnoTypeExt and RulesExt keys are read
+/// only the Ares way, so the caller asks [`RuleSet::ares_form`].
+#[cfg(not(feature = "phobos"))]
+fn ares_insignia_draw<'a>(
+    sim: &crate::sim::world::Simulation,
+    entity: &ObjectRecord,
+    object: &crate::rules::object_type::ObjectType,
+    rules: &RuleSet,
+    overlay: &'a crate::render::selection_overlay::SelectionOverlay,
+    observer_id: Option<crate::sim::intern::InternedId>,
+) -> Option<(
+    &'a crate::render::selection_overlay::CenteredShapeStrip,
+    usize,
+    Option<String>,
+)> {
+    use crate::sim::combat::veterancy::{raw_is_elite, raw_is_veteran};
+    let insignia = &object.ares_insignia;
+    let show_enemy = insignia
+        .show_enemy
+        .unwrap_or_else(|| rules.ares_enemy_insignia());
+    if !ares_insignia_visible(sim, entity.owner(), observer_id, show_enemy) {
+        return None;
+    }
+    let raw = entity.veterancy.raw();
+    let (rank, stock_frame) = if raw_is_elite(raw) {
+        (2, 15)
+    } else if raw_is_veteran(raw) {
+        (1, 14)
+    } else {
+        (0, -1)
+    };
+    let custom = insignia.images[rank]
+        .iter()
+        .rev()
+        .find_map(|name| Some((overlay.insignia_shape(name)?, name)));
+    let (shape, default_frame, name) = match custom {
+        Some((shape, name)) => (shape, 0, Some(name.clone())),
+        None => (overlay.pips()?, stock_frame, None),
+    };
+    let frame = match insignia.frames[rank] {
+        frame if frame < 0 => default_frame,
+        frame => frame,
+    };
+    usize::try_from(frame)
+        .ok()
+        .map(|frame| (shape, frame, name))
 }
 
 /// DrawExtras' wrench test (`0x006F5253`): a repairing building. Ares
@@ -1868,8 +2076,10 @@ pub(crate) fn techno_extras_for_parent(
     let observer_id = local_owner_id;
     let disguised = observer_id.is_some() && entity.seen.disguised_to_observer;
     let character = entity.seen.visual_character;
+    // Ares replaces this leaf (hook 0x70A990) when the Rules were read the
+    // Ares way ([`ares_insignia_draw`]).
     #[cfg(not(feature = "phobos"))]
-    if !disguised && character != 5 {
+    if !ares_form && !disguised && character != 5 {
         use crate::sim::combat::veterancy::{raw_is_elite, raw_is_negative, raw_is_veteran};
         //70A999's +88 getter is discarded (Unit741490, Building459EE0);
         // there is no Trainable gate.70A9B2/C2/D2 tests the raw accumulator,
@@ -1903,7 +2113,7 @@ pub(crate) fn techno_extras_for_parent(
     #[cfg(feature = "phobos")]
     if character != 5
         && let Some(rules) = rules
-        && let Some((shape, frame, point)) = phobos_insignia_draw(
+        && let Some((shape, frame, point, insignia)) = phobos_insignia_draw(
             sim,
             entity,
             rules,
@@ -1922,6 +2132,28 @@ pub(crate) fn techno_extras_for_parent(
                 rank.z_adjust = -2.0;
                 rank
             });
+        strip.rank_insignia = strip.rank.is_some().then_some(insignia).flatten();
+    }
+    #[cfg(not(feature = "phobos"))]
+    if ares_form
+        && !disguised
+        && character != 5
+        && let (Some(rules), Some(object)) = (rules, object)
+        && let Some((shape, frame, insignia)) =
+            ares_insignia_draw(sim, entity, object, rules, overlay, observer_id)
+    {
+        let (dx, dy) = if entity.category() == EntityCategory::Infantry {
+            (5.0, 2.0)
+        } else {
+            (10.0, 6.0)
+        };
+        strip.rank = instance(shape, frame, (sx + dx, sy + dy), 0.0006)
+            .filter(|rank| viewport.contains(rank))
+            .map(|mut rank| {
+                rank.z_adjust = -2.0;
+                rank
+            });
+        strip.rank_insignia = strip.rank.is_some().then_some(insignia).flatten();
     }
     // VERA's Command Mode mark (no native owner), with the rank pip's own
     // visibility gate: only an object the local player truly sees carries it.
@@ -2243,7 +2475,7 @@ fn ares_passenger_pip_frames(
     let mut frames = vec![0; max];
     let mut next = 0;
     let passengers = entity
-        .passenger_role
+        .passenger_role()
         .cargo()
         .map_or(&[][..], |cargo| cargo.passengers());
     for &id in passengers.iter().rev() {
@@ -2336,7 +2568,7 @@ fn scale_pip_rows(
     //709C27..D17 precedes passengers and uses raw OccupyPip, including
     //reader-produced1..5 as well as person frames6..12. Keep its own origin.
     if building && object.show_occupant_pips && object.max_number_occupants > 0 {
-        let occupants = entity.passenger_role.occupants().ids();
+        let occupants = entity.passenger_role().occupants().ids();
         pips.extend((0..object.max_number_occupants as usize).map(|slot| {
             let frame = occupants
                 .get(slot)
@@ -2375,7 +2607,7 @@ fn scale_pip_rows(
             let gunner_step = if object.gunner && slot > 0 { 2 } else { 0 };
             pip(slot + gunner_step, 0, row_y)
         }));
-        let Some(cargo) = entity.passenger_role.cargo() else {
+        let Some(cargo) = entity.passenger_role().cargo() else {
             return pips;
         };
         //4598A0/709DD4..9E43: absorbers walk the head forward, consuming
@@ -2694,6 +2926,28 @@ mod mind_control_pip_tests;
 
 #[cfg(all(test, tests_app_presentation))]
 mod tests {
+    #[cfg(not(feature = "phobos"))]
+    #[test]
+    fn ares_enemy_insignia_checks_the_owners_allies_and_the_observer_house() {
+        use super::ares_insignia_visible as visible;
+        let mut sim = crate::sim::world::Simulation::new();
+        let blue = sim.intern("Blue");
+        let red = sim.intern("Red");
+        sim.house_alliances_mut_for_test()
+            .entry("BLUE".into())
+            .or_default()
+            .insert("RED".into());
+
+        assert!(visible(&sim, blue, Some(red), false));
+        assert!(!visible(&sim, red, Some(blue), false));
+        assert!(visible(&sim, red, Some(blue), true));
+        assert!(!visible(&sim, red, None, false));
+
+        sim.session_mut_for_test()
+            .install_observer_houses_for_test(vec![blue]);
+        assert!(visible(&sim, red, Some(blue), false));
+    }
+
     /// Ares TechnoClass_DrawExtras_PowerOff (10049FE0, hook 0x6F526C): the
     /// owner sees its repairing building's wrench, an enemy only with
     /// `EnemyWrench=yes` (the default).
@@ -2711,7 +2965,7 @@ mod tests {
                 .spawn_object("POWR", "Americans", 8, 8, 0, &rules)
                 .unwrap();
             crate::sim::arena_fixture::install_status_repair(
-                sim.entities_mut_for_test().get_mut(id).unwrap(),
+                sim.entity_mut_for_test(id).unwrap(),
                 true,
             );
             let record =
@@ -2917,8 +3171,7 @@ mod tests {
             admitted(&sim, None),
             "owner's one-way alliance admits shared pip tail"
         );
-        sim.entities_mut_for_test()
-            .get_mut(1)
+        sim.entity_mut_for_test(1)
             .unwrap()
             .selection
             .set_selected_for_test(false);
@@ -2927,8 +3180,7 @@ mod tests {
             admitted(&sim, Some(1)),
             "ordinary hover also admits count/self-heal/group tail"
         );
-        sim.entities_mut_for_test()
-            .get_mut(1)
+        sim.entity_mut_for_test(1)
             .unwrap()
             .lifecycle
             .set_in_limbo_for_test(true);
@@ -3022,8 +3274,7 @@ mod tests {
                 if expected {
                     // Being hovered cannot resurrect a limbo member, even
                     // while a retained Display registration still exists.
-                    sim.entities_mut_for_test()
-                        .get_mut(1)
+                    sim.entity_mut_for_test(1)
                         .unwrap()
                         .lifecycle
                         .set_in_limbo_for_test(true);

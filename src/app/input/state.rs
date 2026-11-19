@@ -198,6 +198,7 @@ pub(crate) struct MatchInputState {
     /// (`sim_host::home_answer`): both walk the live objects, which a draw
     /// beside a lent tick may not read.
     pub(crate) cursor_targets_seen: std::cell::RefCell<crate::app::input::cursor::CursorTargets>,
+    pub(crate) tactical_tip_seen: super::tooltips::TacticalTipAnswer,
     pub(crate) cursor_feedback_seen:
         std::cell::RefCell<Option<crate::app::types::CursorFeedbackKind>>,
     pub(crate) camera_x: f32,
@@ -551,6 +552,7 @@ impl MatchInputState {
             cursor_visibility: Default::default(),
             shown_cursor: Default::default(),
             cursor_targets_seen: Default::default(),
+            tactical_tip_seen: Default::default(),
             cursor_feedback_seen: Default::default(),
             minimap_press_button: None,
             touch_mapper: crate::app::input::touch::TouchMouseMapper::new(),
@@ -827,6 +829,10 @@ impl MatchInputState {
         self.auto_repair = Default::default();
         // Its factory ids and counts belong to the world that ended.
         self.primary_rotation = Default::default();
+        // These VERA orders belong to this match, even when the next world
+        // reuses the same object ids or has the same buildable types.
+        self.ferry = Default::default();
+        self.build_repeat = Default::default();
         self.targeting_mode = None;
         self.building_placement_preview = None;
         self.saved_building_placement = None;

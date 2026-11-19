@@ -75,7 +75,7 @@ fn boarded_transport(sim: &mut Simulation, rules: &RuleSet, kind: &str) -> (u64,
             .entities
             .get(passenger)
             .unwrap()
-            .passenger_role
+            .passenger_role()
             .is_inside_transport()
         {
             break;
@@ -86,7 +86,7 @@ fn boarded_transport(sim: &mut Simulation, rules: &RuleSet, kind: &str) -> (u64,
             .entities
             .get(passenger)
             .unwrap()
-            .passenger_role
+            .passenger_role()
             .inside_transport_id(),
         Some(carrier)
     );
@@ -95,7 +95,7 @@ fn boarded_transport(sim: &mut Simulation, rules: &RuleSet, kind: &str) -> (u64,
             .entities
             .get(carrier)
             .unwrap()
-            .passenger_role
+            .passenger_role()
             .cargo()
             .unwrap()
             .passengers(),
@@ -218,7 +218,7 @@ fn a_tank_killed_by_its_bridge_fall_still_scans_on_that_visit() {
         .unwrap();
     put_on_deck(&mut sim, &rules, tank, false);
     sim.object_custom_sounds
-        .insert(tank, "TestAmbient".to_owned());
+        .insert(tank, "TestAmbient".to_owned().into());
     remove_deck(&mut sim);
     blow_up_bridge_cell_fallout(
         &mut sim,
@@ -535,7 +535,7 @@ fn a_transport_shot_mid_fall_kills_its_passenger_without_the_landing_force_flags
             .entities
             .get(carrier)
             .unwrap()
-            .passenger_role
+            .passenger_role()
             .cargo()
             .unwrap()
             .passengers()

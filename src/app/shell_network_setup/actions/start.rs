@@ -9,7 +9,8 @@ use crate::skirmish_modes::ModeStartEffect;
 use super::super::chat_notice as message;
 
 pub(super) fn request_start(state: &mut AppState) -> anyhow::Result<()> {
-    let wol = super::super::dialog(state).wol();
+    let dialog = super::super::dialog(state);
+    let wol = dialog.wol();
     anyhow::ensure!(
         state.match_state.session.host(),
         "only the host starts a network game"
@@ -23,12 +24,7 @@ pub(super) fn request_start(state: &mut AppState) -> anyhow::Result<()> {
         "setup is locked"
     );
     // C2 ignores Start while its StartGame request is pending (00B77DEC).
-    if state
-        .frontend
-        .network_setup_protocol
-        .as_ref()
-        .is_some_and(|protocol| protocol.start_in_progress())
-    {
+    if super::super::start_phase(state).in_progress() {
         return Ok(());
     }
     super::super::remember_setup(state);
@@ -93,17 +89,8 @@ pub(super) fn request_start(state: &mut AppState) -> anyhow::Result<()> {
         .session
         .network_setup_capacity()
         .unwrap_or(0);
-    // A room sharing bases seats a team's players on one start where the
-    // map runs out (`teams::team_starts`), so its map needs one for each
-    // team with players; otherwise one for each person and AI.
     let shares = state.match_state.session.network_shares_bases();
-    let needed = |ai: i32| {
-        if shares {
-            super::super::teams::bases_needed(&launch)
-        } else {
-            humans + ai
-        }
-    };
+    let needed = super::super::teams::starts_needed(&launch, shares, dialog.flavor);
     if wol {
         // C2 0x79071E..0x7908D5: allies, readiness, then capacity. VERA's
         // explicit AI rows share the map with human players, even though
@@ -115,7 +102,7 @@ pub(super) fn request_start(state: &mut AppState) -> anyhow::Result<()> {
         if !all_ready(state) {
             return Ok(());
         }
-        if capacity < needed(launch.opponents.len() as i32) {
+        if capacity < needed {
             message(
                 state,
                 "TXT_SCENARIO_TOO_SMALL",
@@ -152,7 +139,7 @@ pub(super) fn request_start(state: &mut AppState) -> anyhow::Result<()> {
             }
         }
     } else {
-        let capacity_ok = capacity >= needed(launch.ai_player_count);
+        let capacity_ok = capacity >= needed;
         if !capacity_ok {
             message(
                 state,
@@ -248,6 +235,8 @@ pub(super) fn request_start(state: &mut AppState) -> anyhow::Result<()> {
     }
     // Native mode+64 follows the resolved options/name publication, before
     // preview disposal and GO. Only Cooperative consumes Scenario RNG here.
+    // RESIDUAL: its C1 (0x005C2710) is not sent; nothing reads the later
+    // rounds, so guests keep their own.
     // C2 then calls mode+0x24 (0x790B62), a no-op except MPCooperative's
     // 5C1CB0 flag for its later 5C2680 save step: not ported.
     let launch = state
@@ -264,23 +253,9 @@ pub(super) fn request_start(state: &mut AppState) -> anyhow::Result<()> {
         .iter()
         .map(|human| human.name.clone())
         .collect();
-    if launch.mode.class.uses_cooperative_setup() {
-        let rounds = state
-            .frontend
-            .multiplayer_shell_runtime
-            .cooperative_round_assignments()
-            .to_vec();
-        queue(
-            state,
-            NetworkSetupRequest::PublishCooperativeAssignments(rounds),
-        );
-    }
     let Some(max_ahead_frames) = max_ahead_frames else {
-        // C2 0x790BB9: API+0x48 StartGame with every channel user, then
-        // 00B77E28/00B77DEC until OnGameStart answers.
-        queue(state, NetworkSetupRequest::StartGame { users });
         if let Some(protocol) = state.frontend.network_setup_protocol.as_mut() {
-            protocol.wol_start_pending = true;
+            protocol.submit_start(users);
         }
         return Ok(());
     };
@@ -289,35 +264,35 @@ pub(super) fn request_start(state: &mut AppState) -> anyhow::Result<()> {
         .session
         .network_start_seed()
         .ok_or_else(|| anyhow::anyhow!("host setup has no proposed seed"))?;
-    queue(
-        state,
-        NetworkSetupRequest::Go {
-            agreed_seed,
-            max_ahead_frames,
-        },
-    );
-    let go_pending = state
+    let launch = state
         .match_state
         .session
         .network_setup()
-        .map_or_else(Vec::new, |launch| {
-            (0..launch.humans.len())
-                .filter(|source| *source != launch.local_player_index)
-                .collect()
-        });
+        .ok_or_else(|| anyhow::anyhow!("no setup"))?;
     if let Some(protocol) = state.frontend.network_setup_protocol.as_mut() {
-        protocol.locked = true;
-        // The transport starts the native drain only after all GO packets
-        // have entered its existing global send queue.
-        protocol.lan_go = Some(super::super::LanGoWait::HostSending {
-            pending: go_pending,
-        });
-        // Native's offer blocks the dialog until it ends, so Start cannot
-        // follow a pending one; GO drops it.
-        protocol.drop_preview_offer();
+        queue_lan_go(protocol, launch, agreed_seed, max_ahead_frames);
     }
     state.frontend.skirmish_preview_texture = None;
     Ok(())
+}
+
+fn queue_lan_go(
+    protocol: &mut NetworkSetupProtocol,
+    launch: &SkirmishLaunchSession,
+    agreed_seed: u32,
+    max_ahead_frames: i32,
+) {
+    let pending = (0..launch.humans.len())
+        .filter(|source| *source != launch.local_player_index)
+        .collect();
+    protocol.requests.push(NetworkSetupRequest::Go {
+        agreed_seed,
+        max_ahead_frames,
+    });
+    protocol.locked = true;
+    // The transport starts the native drain only after all GO packets
+    // have entered its existing global send queue.
+    protocol.lan_go = Some(super::super::LanGoWait::HostSending { pending });
 }
 
 /// A direct spawn host's start (docs/spawn.md): the launcher already
@@ -357,28 +332,15 @@ pub(crate) fn begin_external_lan_go(state: &mut AppState) -> anyhow::Result<()> 
         .session
         .network_setup()
         .ok_or_else(|| anyhow::anyhow!("no setup"))?;
-    let go_pending = (0..launch.humans.len())
-        .filter(|source| *source != launch.local_player_index)
-        .collect();
     log::info!(
         "Direct spawn: every guest answered; GO with MaxAhead {max_ahead_frames}, seed {agreed_seed}"
-    );
-    queue(
-        state,
-        NetworkSetupRequest::Go {
-            agreed_seed,
-            max_ahead_frames,
-        },
     );
     let protocol = state
         .frontend
         .network_setup_protocol
         .as_mut()
         .expect("checked setup");
-    protocol.locked = true;
-    protocol.lan_go = Some(super::super::LanGoWait::HostSending {
-        pending: go_pending,
-    });
+    queue_lan_go(protocol, launch, agreed_seed, max_ahead_frames);
     Ok(())
 }
 
@@ -388,8 +350,9 @@ pub(crate) fn begin_external_lan_go(state: &mut AppState) -> anyhow::Result<()> 
 /// and players sharing a House count once. VERA's own room (`watch_ai`)
 /// also starts with everyone watching while two or more AI play.
 fn has_minimum_players(launch: &SkirmishLaunchSession, watch_ai: bool) -> bool {
-    let houses = (0..launch.humans.len())
-        .filter(|&index| !launch.humans[index].is_observer() && launch.house_leader(index) == index)
+    let houses = launch
+        .humans_with_house_leaders()
+        .filter(|(index, human, leader)| index == leader && !human.is_observer())
         .count();
     (houses >= 1 || watch_ai) && houses + launch.opponents.len() >= 2
 }

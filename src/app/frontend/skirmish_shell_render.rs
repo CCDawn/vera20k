@@ -35,31 +35,6 @@ pub(crate) use preview::{
     SkirmishPreviewTexture, is_random_map_sentinel_entry, start_marker_picture,
 };
 
-/// The preview the setup dialog shows for `file`, decoded the way BC's own
-/// preview is: the LAN host's `[0xAC1154]` for its preview upload.
-pub(crate) fn decode_network_map_preview(
-    state: &AppState,
-    file: &str,
-) -> Option<crate::map::preview::DecodedPreview> {
-    let entry = state
-        .frontend
-        .scenario_catalog
-        .shell_maps()
-        .iter()
-        .find(|entry| entry.file_name.eq_ignore_ascii_case(file))?;
-    let ra2_dir = state
-        .platform
-        .game_config
-        .as_ref()
-        .map(|config| config.paths.ra2_dir.as_path())
-        .or_else(|| {
-            state
-                .process_assets
-                .manager()
-                .map(|assets| assets.ra2_dir())
-        });
-    preview::decode_preview_for_map_entry(entry, ra2_dir, state.process_assets.manager())
-}
 pub(crate) use text::{
     combo_item_label, skirmish_right_panel_label_strings, skirmish_selected_map_name,
 };
@@ -140,9 +115,6 @@ const SHELL_CURSOR_DEPTH: f32 = 0.00001;
 const SHELL_BUTTON_TEXT_RGB_00000C05: [f32; 3] = [5.0 / 255.0, 12.0 / 255.0, 0.0];
 const SHELL_LABEL_TEXT_RGB: [f32; 3] = [1.0, 1.0, 0.0];
 const SHELL_DISABLED_TEXT_RGB_FROM_PACKED_0000009F: [f32; 3] = [0x9F as f32 / 255.0, 0.0, 0.0];
-const RANDMAP_SENTINEL_FILE_NAME: &str = "RandMap.Sed";
-
-const RANDMAP_PREVIEW_FILE_NAME: &str = "RandMap.img";
 const COMBODROPWIN_TEXT_INSET_X: i32 = 3;
 const COMBODROPWIN_TEXT_TRUNCATION_SCROLLBAR_RESERVE_PX: i32 = 20;
 // Owner-draw packed colors are 0x00BBGGRR. Runtime DirectDraw conversion is

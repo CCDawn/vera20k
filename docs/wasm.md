@@ -108,6 +108,8 @@ offers one-click Continue on the next visit; other browsers ask for the folder a
 parallel work on a Rayon pool of Web Workers. It combines with `--network` and
 `--lan`, and needs a pinned nightly, because the standard library has to be
 rebuilt with Wasm atomics. Desktop and default browser builds stay on stable.
+The option stays out of the [build check](Networking.md#build-check): a threaded
+package plays with the same package built without it.
 
 ```sh
 rustup toolchain install nightly-2026-10-15 --profile minimal --component rust-src --target wasm32-unknown-unknown
@@ -173,8 +175,13 @@ deferred network-loading waits. Desktop builds, including those enabling
 single-player package still returns an explicit unsupported error at network
 entry points. Browser LAN discovery and direct UDP connections are not supported.
 
-Random map generation and synchronous GPU screenshot/capture are also unavailable
-in this single-threaded preview. Existing installed maps remain the target.
+The Generate Map dialog, which generates on a thread of its own, and synchronous
+GPU screenshot/capture are also unavailable in the browser. So are Choose Map's
+Online Maps row and the online login page's player counts, which the game reads
+from the lobby on threads of their own (`src/app/worker.rs`). A page makes a random
+map's file with `generate_map(input)` instead ([random maps](spawn.md#random-maps)):
+on the threaded package with its pool started it runs on a pool worker, otherwise
+on the page's thread.
 Shifted punctuation shortcuts on non-US keyboard layouts
 are not fully mapped. Chat edits take input-method text through a hidden textarea
 that the engine adds to the page while one is active (`src/web/ime.rs`), so a host
@@ -235,15 +242,10 @@ set_lifecycle_callback(event => {
   `kills`, `losses`, `built`, `raw_score` and `score`; they read the simulation's
   finalized snapshot without new RNG draws. `scores: null` means no terminal
   score snapshot was produced, including abort and cooperative paths.
-  `network_quality` is present for an online relay match only:
-  `played_seconds` (the time the record watched the match in play), `catch_up`
-  (`episodes`, `seconds`, `max_backlog_frames`, `skipped_draws`), `network`
-  (`gaps`, `repair_pulls`, nullable `command_round_trip_ms` with `mean`, `max`
-  and `samples`, `max_jitter_reserve_ms`, `underruns`), `performance`
-  (nullable `tick_ms_p50`, `tick_ms_p99`, `fps_p50`, `fps_p5`, and
-  `unfocused_seconds`), `pacing` (`slowdowns`, `slowed_by` Houses,
-  `slowed_seconds`) and `outcome` (nullable `desync_frame`, `reconnects`,
-  `started`, nullable `failure` and `start_hash`, as in `docs/lobby-protocol.md`).
+  `network_quality` is present for an online relay match only: the report a
+  lobby match's `finish` carries (`network_quality` in `docs/lobby-protocol.md`).
+  A watcher's report can also name the `failure` `watch_desync` or
+  `watch_lost`; a watcher sends no `finish`, so that list leaves them out.
   These are wall-clock observations of this client; desktop `-SPAWN` writes
   the same object into `spawn_result.json`, and every client logs it once as
   `Network quality:` when the match returns its transport.
@@ -267,8 +269,8 @@ retained once for existing result consumers.
 Once `engine-exited` has returned, the same page may call `start_spawn` again:
 import the next launch's files with `import_spawn_file`, call `prepare_audio` and
 pass a new canvas. The imported retail files stay, so `import_file` is refused
-and changing the game folder needs a new page; `restore_user_file` and `probe`
-work between launches, and each launch rereads the settings. The output
+and changing the game folder needs a new page; `restore_user_file`, `probe` and
+`generate_map` work between launches, and each launch rereads the settings. The output
 `AudioContext` also stays, so a later launch needs no new user gesture. A launch's
 files under `/spawn` are removed when it exits. `can_start_spawn()` says whether
 another launch can start. It stays false while a game runs, after `start_game`

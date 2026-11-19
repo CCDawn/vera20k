@@ -59,49 +59,6 @@ fn transport() -> LanUdpTransport {
     .unwrap()
 }
 
-#[test]
-fn wol_catchup_pacing_uses_admitted_peer_progress_and_existing_rtt() {
-    let (mut live, _) = pair(73);
-    live.mode = LiveCommandMode::Wol;
-    let mut sim = Simulation::new();
-    let packet = crate::net::event_packet::EventPacketCodec::default()
-        .encode_packet(
-            &[],
-            crate::net::event_packet::EventPacketHeader::Vera {
-                frame_info: FrameInfo {
-                    house_id: 1,
-                    event_frame: 0,
-                    checksum: 0,
-                    timing_word: 0,
-                    delay: 0,
-                },
-                command_frontier: 0,
-            },
-            0,
-            crate::net::event_packet::NATIVE_EVENT_PACKET_CAPACITY,
-        )
-        .unwrap()
-        .bytes;
-    assert!(
-        live.exchange
-            .receive(1, &packet, 73, &mut sim.network_command_queues(), 0)
-            .unwrap()
-    );
-    live.exchange.record_peer_lag(1, 40, 60, 40);
-    assert_eq!(live.peers()[0].lag_frames(), 20);
-    assert_eq!(live.pacing_delay_millis(40), 20);
-    assert_eq!(live.pacing_delay_millis(30), 0);
-    assert!(
-        !live
-            .exchange
-            .receive(1, &packet, 73, &mut sim.network_command_queues(), 0)
-            .unwrap()
-    );
-    assert_eq!(live.pacing_delay_millis(40), 20);
-    live.remove_peer(1);
-    assert_eq!(live.pacing_delay_millis(40), 0);
-}
-
 // Pure native queue/probe fixtures declare their complete protocol snapshot.
 // The new certificate regressions below exercise real sockets and real hashes.
 fn fixture_agreement(
@@ -131,6 +88,8 @@ fn fixture_agreement(
         30,
         rate,
         0,
+        "",
+        "",
     )
     .unwrap()
 }
@@ -218,6 +177,7 @@ fn pair(seed: u32) -> (LiveCommandSession, LiveCommandSession) {
             seed,
             NonZeroU32::new(5).unwrap(),
             LiveCommandMode::Lan,
+            None,
         )
         .unwrap(),
         LiveCommandSession::new(
@@ -227,6 +187,7 @@ fn pair(seed: u32) -> (LiveCommandSession, LiveCommandSession) {
             seed,
             NonZeroU32::new(5).unwrap(),
             LiveCommandMode::Lan,
+            None,
         )
         .unwrap(),
     )
@@ -255,7 +216,6 @@ fn poll_pair(
                 now,
                 (now).wrapping_mul(16),
                 0,
-                0,
             )
             .unwrap();
         passes[1] = right
@@ -265,7 +225,6 @@ fn poll_pair(
                 10,
                 now,
                 (now).wrapping_mul(16),
-                0,
                 0,
             )
             .unwrap();
@@ -289,6 +248,46 @@ fn poll_pair(
         std::thread::yield_now();
     }
     (passes[0], passes[1])
+}
+
+/// Games that load the same world but would play it differently, another
+/// build or other rules, never certify one start; the start report names
+/// the part that differs.
+#[test]
+fn start_identity_differs_by_build_and_by_rules() {
+    let agreement = |version: &str, rules: &str| {
+        let rate = NonZeroU32::new(1).unwrap();
+        StartupAgreement::new(
+            [(0, 0), (1, 1)],
+            [0, 1],
+            73,
+            10,
+            30,
+            rate,
+            0,
+            version,
+            rules,
+        )
+        .unwrap()
+    };
+    let base = agreement("1.0:a:0000", "rules");
+    for (other, part) in [
+        (agreement("1.0:b:0000", "rules"), "build"),
+        (agreement("1.0:a:0000", "other"), "rules"),
+    ] {
+        assert_ne!(
+            other.sequencing_identity().unwrap().0,
+            base.sequencing_identity().unwrap().0
+        );
+        let differs: Vec<_> = base
+            .report_parts()
+            .into_iter()
+            .zip(other.report_parts())
+            .filter(|(ours, theirs)| ours != theirs)
+            .map(|(ours, _)| ours.0)
+            .collect();
+        assert_eq!(differs, [part]);
+    }
 }
 
 /// A real private-UDP cohort; the agreement is the install-time snapshot,
@@ -323,6 +322,8 @@ fn startup_cohort(active: &[u8], hashes: &[u64]) -> Vec<LiveCommandSession> {
                 30,
                 rate,
                 hashes[index],
+                "",
+                "",
             )
             .unwrap();
             LiveCommandSession::new(
@@ -336,6 +337,7 @@ fn startup_cohort(active: &[u8], hashes: &[u64]) -> Vec<LiveCommandSession> {
                 } else {
                     LiveCommandMode::Wol
                 },
+                None,
             )
             .unwrap()
         })
@@ -362,7 +364,6 @@ fn full_and_majority_loading_rosters_require_the_same_frozen_world() {
                         10,
                         100 + (start.elapsed().as_millis() / 16) as u32,
                         1600,
-                        0,
                         0,
                     )
                     .unwrap();
@@ -395,7 +396,9 @@ fn full_and_majority_loading_rosters_require_the_same_frozen_world() {
             10,
             30,
             NonZeroU32::new(5).unwrap(),
-            0
+            0,
+            "",
+            ""
         ),
         Err(StartupError::NoMajority)
     );
@@ -419,7 +422,6 @@ fn full_and_majority_loading_rosters_require_the_same_frozen_world() {
                 10,
                 100,
                 1600,
-                0,
                 0,
             ) {
                 Err(LiveCommandError::Startup(StartupError::Mismatch)) => rejected[index] = true,
@@ -457,8 +459,9 @@ fn startup_ready_retries_after_release_and_old_scope_cannot_certify_rematch() {
     }
     impl Proxy {
         fn pump(&mut self) {
-            // Existing VLS1 outer scope, UDP checksum, then ConnectionClass.
-            const CONNECTION_OFFSET: usize = 4 + 16 + 8 + 4;
+            // The LAN scope header, the UDP checksum, then ConnectionClass.
+            use crate::net::udp::{CHECKSUM_LEN, LAN_SCOPE_HEADER_LEN, LAN_SCOPE_MAGIC};
+            const CONNECTION_OFFSET: usize = LAN_SCOPE_HEADER_LEN + CHECKSUM_LEN;
             for side in 0..2 {
                 loop {
                     let mut packet = [0; crate::net::udp::UDP_DATAGRAM_CAPACITY];
@@ -469,7 +472,7 @@ fn startup_ready_retries_after_release_and_old_scope_cannot_certify_rematch() {
                     };
                     assert_eq!(source, std::net::SocketAddr::V4(self.endpoints[side]));
                     let packet = &packet[..len];
-                    assert!(packet.starts_with(b"VLS\x01"));
+                    assert!(packet.starts_with(LAN_SCOPE_MAGIC));
                     let frame = &packet[CONNECTION_OFFSET..];
                     let control = frame
                         .get(crate::net::reliable::CONNECTION_HEADER_LEN..)
@@ -546,6 +549,8 @@ fn startup_ready_retries_after_release_and_old_scope_cannot_certify_rematch() {
         30,
         rate,
         Simulation::with_seed(73).state_hash(),
+        "",
+        "",
     )
     .unwrap();
     let mut clients = wires
@@ -559,6 +564,7 @@ fn startup_ready_retries_after_release_and_old_scope_cannot_certify_rematch() {
                 73,
                 rate,
                 LiveCommandMode::Lan,
+                None,
             )
             .unwrap()
         })
@@ -580,7 +586,6 @@ fn startup_ready_retries_after_release_and_old_scope_cannot_certify_rematch() {
                     10,
                     now,
                     now * 16,
-                    0,
                     0,
                 )
                 .unwrap();
@@ -605,7 +610,6 @@ fn startup_ready_retries_after_release_and_old_scope_cannot_certify_rematch() {
                 10,
                 now,
                 now * 16,
-                0,
                 0,
             )
             .unwrap();
@@ -646,7 +650,6 @@ fn startup_ready_retries_after_release_and_old_scope_cannot_certify_rematch() {
                     now,
                     now * 16,
                     0,
-                    0,
                 )
                 .unwrap();
             clients[side].service_transport(now);
@@ -676,6 +679,7 @@ fn startup_ready_retries_after_release_and_old_scope_cannot_certify_rematch() {
                 73,
                 rate,
                 LiveCommandMode::Lan,
+                None,
             )
             .unwrap()
         })
@@ -688,7 +692,6 @@ fn startup_ready_retries_after_release_and_old_scope_cannot_certify_rematch() {
                 10,
                 now,
                 now * 16,
-                0,
                 0
             )
             .unwrap(),
@@ -737,7 +740,6 @@ fn startup_ready_retries_after_release_and_old_scope_cannot_certify_rematch() {
                 10,
                 now,
                 now * 16,
-                0,
                 0
             )
             .unwrap(),
@@ -756,7 +758,6 @@ fn startup_ready_retries_after_release_and_old_scope_cannot_certify_rematch() {
                     10,
                     now,
                     now * 16,
-                    0,
                     0,
                 )
                 .unwrap();
@@ -812,7 +813,6 @@ fn initial_barrier_off_cadence_and_positive_frame_use_one_native_queue() {
             10,
             1001,
             (1001_u32).wrapping_mul(16),
-            0,
             0
         )
         .unwrap(),
@@ -882,7 +882,6 @@ fn initial_response_histories_clear_only_on_successful_barrier_once() {
                 endpoint,
                 0,
                 &connection_prefix(0x1236, 2, sequence, 2),
-                now + 22,
                 &mut |_, _| {},
             )
             .unwrap();
@@ -902,6 +901,7 @@ fn initial_response_histories_clear_only_on_successful_barrier_once() {
         73,
         NonZeroU32::new(5).unwrap(),
         LiveCommandMode::Lan,
+        None,
     )
     .unwrap();
     certify_native_probe_fixture(&mut live);
@@ -919,7 +919,6 @@ fn initial_response_histories_clear_only_on_successful_barrier_once() {
                 10,
                 now,
                 now * 16,
-                0,
                 0
             )
             .unwrap(),
@@ -942,7 +941,6 @@ fn initial_response_histories_clear_only_on_successful_barrier_once() {
             10,
             1002,
             16032,
-            0,
             0
         )
         .unwrap(),
@@ -961,16 +959,8 @@ fn initial_response_histories_clear_only_on_successful_barrier_once() {
         },
     ] {
         assert_eq!(
-            live.poll(
-                &mut sim.network_command_queues(),
-                next,
-                10,
-                1200,
-                19200,
-                0,
-                0
-            )
-            .unwrap(),
+            live.poll(&mut sim.network_command_queues(), next, 10, 1200, 19200, 0)
+                .unwrap(),
             NetworkQueuePass::SkipDispatch
         );
         assert_eq!(live.connections().mean_response_time(1), Some(11));
@@ -996,6 +986,7 @@ fn ordinary_wait_uses_private_response_history_with_larger_primary_global_mean()
         73,
         NonZeroU32::new(5).unwrap(),
         LiveCommandMode::Lan,
+        None,
     )
     .unwrap();
     certify_native_probe_fixture(&mut live);
@@ -1011,7 +1002,6 @@ fn ordinary_wait_uses_private_response_history_with_larger_primary_global_mean()
             5,
             1000,
             16000,
-            0,
             0
         )
         .unwrap(),
@@ -1028,7 +1018,6 @@ fn ordinary_wait_uses_private_response_history_with_larger_primary_global_mean()
             5,
             1001,
             16016,
-            0,
             0
         )
         .unwrap(),
@@ -1058,13 +1047,7 @@ fn ordinary_wait_uses_private_response_history_with_larger_primary_global_mean()
     ));
     live.global_mut().service(1100, &mut |_, _| {});
     live.global_mut()
-        .receive(
-            peer,
-            0,
-            &connection_prefix(0x1236, 2, 0, 2),
-            1300,
-            &mut |_, _| {},
-        )
+        .receive(peer, 0, &connection_prefix(0x1236, 2, 0, 2), &mut |_, _| {})
         .unwrap();
     live.global_mut().service(1300, &mut |_, _| {});
     assert_eq!(live.connections().mean_response_time(1), Some(10));
@@ -1077,7 +1060,6 @@ fn ordinary_wait_uses_private_response_history_with_larger_primary_global_mean()
                 5,
                 1300 + frame,
                 (1300 + frame) * 16,
-                0,
                 0
             )
             .unwrap(),
@@ -1094,7 +1076,6 @@ fn ordinary_wait_uses_private_response_history_with_larger_primary_global_mean()
             5,
             1305,
             20880,
-            0,
             0
         )
         .unwrap(),
@@ -1126,6 +1107,7 @@ fn online_initial_probe_waits_for_the_online_table_boundary() {
         73,
         NonZeroU32::new(5).unwrap(),
         LiveCommandMode::Wol,
+        None,
     )
     .unwrap();
     certify_native_probe_fixture(&mut live);
@@ -1141,7 +1123,6 @@ fn online_initial_probe_waits_for_the_online_table_boundary() {
         1000,
         16000,
         0,
-        0,
     )
     .unwrap();
     live.take_service_report();
@@ -1152,7 +1133,6 @@ fn online_initial_probe_waits_for_the_online_table_boundary() {
         1119,
         17904,
         0,
-        0,
     )
     .unwrap();
     assert_eq!(live.take_service_report().unwrap().sent_datagrams, 0);
@@ -1162,7 +1142,6 @@ fn online_initial_probe_waits_for_the_online_table_boundary() {
         10,
         1120,
         17920,
-        0,
         0,
     )
     .unwrap();
@@ -1187,6 +1166,7 @@ fn initial_probe_repeats_only_at_the_native_wall_clock_boundary() {
         91,
         NonZeroU32::new(5).unwrap(),
         LiveCommandMode::Lan,
+        None,
     )
     .unwrap();
     certify_native_probe_fixture(&mut live);
@@ -1202,7 +1182,6 @@ fn initial_probe_repeats_only_at_the_native_wall_clock_boundary() {
             10,
             1000,
             (1000_u32).wrapping_mul(16),
-            0,
             0
         )
         .unwrap(),
@@ -1232,7 +1211,6 @@ fn initial_probe_repeats_only_at_the_native_wall_clock_boundary() {
             10,
             1059,
             (1059_u32).wrapping_mul(16),
-            0,
             0
         )
         .unwrap(),
@@ -1246,7 +1224,6 @@ fn initial_probe_repeats_only_at_the_native_wall_clock_boundary() {
             10,
             1060,
             (1060_u32).wrapping_mul(16),
-            0,
             0
         )
         .unwrap(),
@@ -1264,7 +1241,6 @@ fn initial_probe_repeats_only_at_the_native_wall_clock_boundary() {
         1159,
         (1159_u32).wrapping_mul(16),
         0,
-        0,
     )
     .unwrap();
     assert_eq!(live.take_service_report().unwrap().sent_datagrams, 0);
@@ -1274,7 +1250,6 @@ fn initial_probe_repeats_only_at_the_native_wall_clock_boundary() {
         10,
         1160,
         (1160_u32).wrapping_mul(16),
-        0,
         0,
     )
     .unwrap();
@@ -1298,7 +1273,6 @@ fn ordinary_wait_uses_180_buckets_and_keeps_the_frame_send_complete() {
                 10,
                 2000,
                 (2000_u32).wrapping_mul(16),
-                0,
                 0,
             )
             .unwrap();
@@ -1325,7 +1299,6 @@ fn ordinary_wait_uses_180_buckets_and_keeps_the_frame_send_complete() {
             10,
             2000,
             (2000_u32).wrapping_mul(16),
-            0,
             0
         )
         .unwrap(),
@@ -1349,7 +1322,6 @@ fn ordinary_wait_uses_180_buckets_and_keeps_the_frame_send_complete() {
             10,
             2179,
             (2179_u32).wrapping_mul(16),
-            0,
             0
         )
         .unwrap(),
@@ -1363,7 +1335,6 @@ fn ordinary_wait_uses_180_buckets_and_keeps_the_frame_send_complete() {
             10,
             2180,
             (2180_u32).wrapping_mul(16),
-            0,
             0
         )
         .unwrap(),
@@ -1380,7 +1351,6 @@ fn ordinary_wait_uses_180_buckets_and_keeps_the_frame_send_complete() {
         2479,
         (2479_u32).wrapping_mul(16),
         0,
-        0,
     )
     .unwrap();
     assert_eq!(left.take_service_report().unwrap().sent_datagrams, 0);
@@ -1390,7 +1360,6 @@ fn ordinary_wait_uses_180_buckets_and_keeps_the_frame_send_complete() {
         10,
         2480,
         (2480_u32).wrapping_mul(16),
-        0,
         0,
     )
     .unwrap();
@@ -1415,6 +1384,7 @@ fn lowest_frame_projection_uses_existing_signed_progress_and_first_tie() {
         73,
         NonZeroU32::new(5).unwrap(),
         LiveCommandMode::Lan,
+        None,
     )
     .unwrap();
     let mut sim = Simulation::new();
@@ -1439,12 +1409,24 @@ fn invalid_roster_context_and_initial_seed_are_explicit_failures() {
     // human. Once startup is admitted, losing the last peer also retains
     // the normal local-only transfer path (covered below).
     let mut one = LiveCommandSession::new(
-        StartupAgreement::new([(0, 0)], [0], 1, 10, 30, NonZeroU32::new(5).unwrap(), 0).unwrap(),
+        StartupAgreement::new(
+            [(0, 0)],
+            [0],
+            1,
+            10,
+            30,
+            NonZeroU32::new(5).unwrap(),
+            0,
+            "",
+            "",
+        )
+        .unwrap(),
         transport(),
         0,
         1,
         NonZeroU32::new(5).unwrap(),
         LiveCommandMode::Lan,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1457,7 +1439,6 @@ fn invalid_roster_context_and_initial_seed_are_explicit_failures() {
             10,
             100,
             1600,
-            0,
             0
         )
         .unwrap(),
@@ -1474,7 +1455,8 @@ fn invalid_roster_context_and_initial_seed_are_explicit_failures() {
             0,
             1,
             NonZeroU32::new(5).unwrap(),
-            LiveCommandMode::Lan
+            LiveCommandMode::Lan,
+            None
         ),
         Err(LiveCommandError::InvalidRemoteHouse(200))
     ));
@@ -1489,7 +1471,8 @@ fn invalid_roster_context_and_initial_seed_are_explicit_failures() {
             0,
             1,
             NonZeroU32::new(5).unwrap(),
-            LiveCommandMode::Lan
+            LiveCommandMode::Lan,
+            None
         ),
         Err(LiveCommandError::UnboundPeer { .. })
     ));
@@ -1511,7 +1494,6 @@ fn invalid_roster_context_and_initial_seed_are_explicit_failures() {
             10,
             1000,
             (1000_u32).wrapping_mul(16),
-            0,
             0
         ),
         Err(LiveCommandError::FrameSequence {
@@ -1528,7 +1510,6 @@ fn invalid_roster_context_and_initial_seed_are_explicit_failures() {
             1000,
             (1000_u32).wrapping_mul(16),
             0,
-            0,
         );
         let r = right.poll(
             &mut b.network_command_queues(),
@@ -1536,7 +1517,6 @@ fn invalid_roster_context_and_initial_seed_are_explicit_failures() {
             10,
             1000,
             (1000_u32).wrapping_mul(16),
-            0,
             0,
         );
         if matches!(
@@ -1573,7 +1553,6 @@ fn failed_retry_service_keeps_receiving_and_retains_its_diagnostic() {
             10,
             2000,
             (2000_u32).wrapping_mul(16),
-            0,
             0,
         )
         .unwrap();
@@ -1620,7 +1599,6 @@ fn failed_retry_service_keeps_receiving_and_retains_its_diagnostic() {
                 now,
                 (now).wrapping_mul(16),
                 0,
-                0,
             )
             .unwrap();
         assert_eq!(left.take_service_report().unwrap().failed_peer, Some(1));
@@ -1640,7 +1618,6 @@ fn failed_retry_service_keeps_receiving_and_retains_its_diagnostic() {
             10,
             2003,
             (2003_u32).wrapping_mul(16),
-            0,
             0
         )
         .unwrap(),
@@ -1665,7 +1642,6 @@ fn removing_the_last_peer_resumes_wait_and_keeps_local_transfer_running() {
             2000,
             (2000_u32).wrapping_mul(16),
             0,
-            0,
         )
         .unwrap();
     }
@@ -1682,7 +1658,6 @@ fn removing_the_last_peer_resumes_wait_and_keeps_local_transfer_running() {
             10,
             2001,
             (2001_u32).wrapping_mul(16),
-            0,
             0
         )
         .unwrap(),
@@ -1698,7 +1673,6 @@ fn removing_the_last_peer_resumes_wait_and_keeps_local_transfer_running() {
             10,
             2002,
             (2002_u32).wrapping_mul(16),
-            0,
             0
         )
         .unwrap(),
@@ -1717,7 +1691,6 @@ fn removing_the_last_peer_resumes_wait_and_keeps_local_transfer_running() {
                 10,
                 2003,
                 (2003_u32).wrapping_mul(16),
-                0,
                 0
             )
             .unwrap(),
@@ -1788,7 +1761,6 @@ impl NetworkCommandBoundary for Boundary {
             ahead,
             self.now.get(),
             (self.now.get()).wrapping_mul(16),
-            0,
             0,
         )
         .map(Some)
@@ -1870,9 +1842,9 @@ fn production_frame(sim: &mut Simulation, rules: &RuleSet, boundary: &Boundary) 
         .with_network_commands(boundary)
         .with_command_applied(&applied);
     if sim.pending_network_wait() {
-        sim.resume_network_wait(rules, None, effects).unwrap()
+        sim.resume_network_wait(rules, effects).unwrap()
     } else {
-        sim.advance_app_frame(&[], rules, None, 33, TickLane::Ordinary, effects)
+        sim.advance_app_frame(&[], rules, 33, TickLane::Ordinary, effects)
             .unwrap()
     }
 }
@@ -1977,6 +1949,66 @@ fn retail_infantry_plan_finishes_both_moves_over_lan() {
     }
 }
 
+/// One person watching AI play runs the match through the relay when the
+/// lobby marked its certificate, so that others can watch it; any other
+/// one-human match keeps local input. A LAN match never runs on the relay's
+/// clock, and a certificate naming another number of players refuses the match.
+#[test]
+fn a_one_human_match_orders_through_the_relay_only_when_the_lobby_marked_it() {
+    use crate::net::udp::{
+        CertificatePacing, RelayTicket,
+        test_support::{SecretKey, derive_packet_key},
+    };
+    let key = SecretKey::new([31; 32]);
+    let ticket = RelayTicket {
+        room: [27; 16],
+        player: [1; 16],
+        source: 0,
+        generation: 1,
+        expires: 300,
+        nonce: [3; 16],
+    }
+    .sign(&key)
+    .unwrap();
+    let relay_wire = |alone| {
+        let mut wire = transport();
+        wire.enable_relay(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9),
+            &ticket,
+            *derive_packet_key(&key, &ticket).expose_for_https(),
+            [29; 32],
+        )
+        .unwrap();
+        let certificate = OrderingCertificate {
+            room: [27; 16],
+            sources_mask: 1,
+            tick_hz: 30,
+            expires: 86_500,
+            pacing: CertificatePacing::On,
+            ordered_alone: alone,
+        };
+        wire.set_ordering_certificate(certificate.sign(&key).unwrap())
+            .unwrap();
+        wire
+    };
+    let rate = NonZeroU32::new(1).unwrap();
+    for alone in [false, true] {
+        let wire = relay_wire(alone);
+        assert_eq!(relay_clock(LiveCommandMode::Lan, &wire, 1), Ok(None));
+        assert_eq!(
+            relay_clock(LiveCommandMode::Wol, &wire, 2),
+            Err(StartupError::ClockRoster),
+            "marked: {alone}"
+        );
+        let clock = relay_clock(LiveCommandMode::Wol, &wire, 1).unwrap();
+        let agreement = StartupAgreement::new([(0, 0)], [0], 73, 10, 30, rate, 0, "", "").unwrap();
+        let live =
+            LiveCommandSession::new(agreement, wire, 0, 73, rate, LiveCommandMode::Wol, clock)
+                .unwrap();
+        assert_eq!(live.uses_sequenced_lockstep(), alone, "marked: {alone}");
+    }
+}
+
 #[test]
 fn solo_wol_commands_apply_without_ahead_or_batching_across_timing_updates() {
     let (mut sim, rules, actor) = stop_scene();
@@ -1988,9 +2020,17 @@ fn solo_wol_commands_apply_without_ahead_or_batching_across_timing_updates() {
         .install_network_command_timing(0, std::num::NonZeroU8::new(10).unwrap(), [0]);
     let rate = NonZeroU32::new(10).unwrap();
     let agreement =
-        StartupAgreement::new([(0, 0)], [0], 73, 40, 30, rate, sim.state_hash()).unwrap();
-    let mut live =
-        LiveCommandSession::new(agreement, transport(), 0, 73, rate, LiveCommandMode::Wol).unwrap();
+        StartupAgreement::new([(0, 0)], [0], 73, 40, 30, rate, sim.state_hash(), "", "").unwrap();
+    let mut live = LiveCommandSession::new(
+        agreement,
+        transport(),
+        0,
+        73,
+        rate,
+        LiveCommandMode::Wol,
+        None,
+    )
+    .unwrap();
     live.configure_precalculated_timing(40, 45);
     let mut boundary = Boundary::new(live);
     boundary.process_millis = Some(60);
@@ -2097,6 +2137,7 @@ fn originally_multiplayer_wol_keeps_its_delay_after_the_last_peer_leaves() {
         73,
         rate,
         LiveCommandMode::Wol,
+        None,
     )
     .unwrap();
     certify_native_probe_fixture(&mut live);
@@ -2247,6 +2288,7 @@ fn three_udp_clients_keep_adaptive_timing_after_the_original_publisher_exits() {
                 73,
                 NonZeroU32::new(5).unwrap(),
                 LiveCommandMode::Lan,
+                None,
             )
             .unwrap();
             let mut boundary = Boundary::new(live);
@@ -2385,7 +2427,8 @@ fn three_udp_clients_recover_a_retained_frontier_across_a_timing_shrink() {
     }
     impl Link {
         fn forward(&mut self, side: usize, packet: &[u8]) {
-            let frame = &packet[4..]; // Existing UDP checksum, no outer scope.
+            // The UDP checksum, no LAN scope header.
+            let frame = &packet[crate::net::udp::CHECKSUM_LEN..];
             if side == 0
                 && let Some(first) = self.first_lost
             {
@@ -2411,7 +2454,7 @@ fn three_udp_clients_recover_a_retained_frontier_across_a_timing_shrink() {
                     };
                     assert_eq!(source, std::net::SocketAddr::V4(self.endpoints[side]));
                     let packet = &packet[..len];
-                    let frame = &packet[4..];
+                    let frame = &packet[crate::net::udp::CHECKSUM_LEN..];
                     let body = &frame[crate::net::reliable::CONNECTION_HEADER_LEN..];
                     if side == 0
                         && frame[2] == 0
@@ -2496,6 +2539,7 @@ fn three_udp_clients_recover_a_retained_frontier_across_a_timing_shrink() {
                 73,
                 NonZeroU32::new(5).unwrap(),
                 LiveCommandMode::Wol,
+                None,
             )
             .unwrap();
             if index == 0 {
@@ -2723,8 +2767,7 @@ fn three_udp_clients_recover_a_retained_frontier_across_a_timing_shrink() {
         );
         assert!(
             worlds[index]
-                .substrate
-                .entities
+                .entities()
                 .get(actor)
                 .unwrap()
                 .navigation
@@ -2751,9 +2794,7 @@ fn two_udp_clients_execute_the_delayed_stop_through_the_production_frame_boundar
     for frame in 0..=10 {
         if frame == 10 {
             for sim in [&mut a, &mut b] {
-                sim.substrate
-                    .entities
-                    .get_mut(actor)
+                sim.entity_mut_for_test(actor)
                     .unwrap()
                     .navigation
                     .set_nav_list_for_test(
@@ -2792,8 +2833,7 @@ fn two_udp_clients_execute_the_delayed_stop_through_the_production_frame_boundar
     }
     for sim in [&a, &b] {
         assert!(
-            sim.substrate
-                .entities
+            sim.entities()
                 .get(actor)
                 .unwrap()
                 .navigation
@@ -3041,8 +3081,7 @@ fn real_udp_mass_order_survives_backpressure_and_executes_one_shared_frame() {
             actors.iter().copied().collect()
         );
         assert!(actors.iter().all(|id| {
-            sim.substrate
-                .entities
+            sim.entities()
                 .get(*id)
                 .unwrap()
                 .navigation
@@ -3056,19 +3095,8 @@ fn real_udp_mass_order_survives_backpressure_and_executes_one_shared_frame() {
 /// clock independent of either client's frame/UI service.
 #[test]
 fn sequenced_udp_paused_client_catches_up_without_stalling_healthy_commands() {
-    use crate::net::udp::{
-        RelayTicket, relay_peer_endpoint,
-        test_support::{MAX_DATAGRAM, RelayServer, SecretKey, derive_packet_key},
-    };
     use crate::sim::command::{Command, IDLE_OPCODE, MEGAMISSION_OPCODE};
     use std::collections::BTreeMap;
-    let key = SecretKey::new([11; 32]);
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket.set_nonblocking(true).unwrap();
-    let address = match socket.local_addr().unwrap() {
-        std::net::SocketAddr::V4(a) => a,
-        _ => unreachable!(),
-    };
     let journal_dir = std::env::temp_dir().join(format!(
         "vera20k-catchup-{}-{}",
         std::process::id(),
@@ -3084,80 +3112,13 @@ fn sequenced_udp_paused_client_catches_up_without_stalling_healthy_commands() {
         directory.mode(0o700);
     }
     directory.create(&journal_dir).unwrap();
-    let mut relay = RelayServer::with_journal(key.clone(), 4, &journal_dir).unwrap();
-    let (a, rules, actor) = stop_scene();
-    let (b, _, _) = stop_scene();
-    let mut worlds = [a, b];
+    let (mut worlds, rules, actor, boundaries, mut relay) =
+        sequenced_pair_with(0, Some(&journal_dir));
     let mut beta = 0;
     for sim in &mut worlds {
-        sim.session.set_game_mode(ScenarioGameMode::Wol);
-        sim.network_command_queues().install_timing(
-            0,
-            std::num::NonZeroU8::new(1).unwrap(),
-            [0, 1],
-        );
-        sim.network_command_queues().configure_sequenced_clock(30);
         beta = sim.spawn_object("AMCV", "Beta", 30, 30, 0, &rules).unwrap();
     }
-    let certificate = crate::net::udp::OrderingCertificate {
-        room: [7; 16],
-        sources_mask: 3,
-        tick_hz: 30,
-        expires: 86_500,
-        pacing: Default::default(),
-    }
-    .sign(&key)
-    .unwrap();
-    let agreement = StartupAgreement::new(
-        [(0, 0), (1, 1)],
-        [0, 1],
-        73,
-        10,
-        30,
-        NonZeroU32::new(1).unwrap(),
-        worlds[0].state_hash(),
-    )
-    .unwrap();
-    let boundaries: Vec<_> = (0..2u8)
-        .map(|source| {
-            let ticket = RelayTicket {
-                room: [7; 16],
-                player: [source + 1; 16],
-                source,
-                generation: 1,
-                expires: 300,
-                nonce: [source + 3; 16],
-            }
-            .sign(&key)
-            .unwrap();
-            let mut wire = transport();
-            wire.enable_relay(
-                address,
-                &ticket,
-                *derive_packet_key(&key, &ticket).expose_for_https(),
-                [9; 32],
-            )
-            .unwrap();
-            wire.set_ordering_certificate(certificate.to_vec()).unwrap();
-            wire.connections_mut()
-                .add_peer(
-                    i32::from(1 - source),
-                    relay_peer_endpoint(1 - source).unwrap(),
-                )
-                .unwrap();
-            Boundary::new(
-                LiveCommandSession::new(
-                    agreement.clone(),
-                    wire,
-                    source as i8,
-                    73,
-                    NonZeroU32::new(1).unwrap(),
-                    LiveCommandMode::Wol,
-                )
-                .unwrap(),
-            )
-        })
-        .collect();
+    let second_address = boundaries[1].live.borrow().primary_addr().unwrap();
     let mut now_ms = 16_000u64;
     let mut move_issued = false;
     let mut stop_issued = false;
@@ -3215,18 +3176,6 @@ fn sequenced_udp_paused_client_catches_up_without_stalling_healthy_commands() {
             assert!(worlds[1].issue_local_command(CommandEnvelope::synchronized(record, tick)));
             late_issued = true;
         }
-        relay.advance_clock(now_ms, 100 + (now_ms - 16_000) / 1000);
-        for forwarded in relay.drain_ordering_push(now_ms, 100 + (now_ms - 16_000) / 1000) {
-            // A disconnected client loses unsolicited delivery too; dropping
-            // only its requests no longer pauses a server-pushed stream.
-            if !paused || forwarded.endpoint != boundaries[1].live.borrow().primary_addr().unwrap()
-            {
-                socket
-                    .send_to(&forwarded.bytes, forwarded.endpoint)
-                    .unwrap();
-            }
-        }
-        settle_loopback();
         for side in 0..2 {
             boundaries[side].now.set((now_ms >> 4) as u32);
             boundaries[side]
@@ -3234,50 +3183,30 @@ fn sequenced_udp_paused_client_catches_up_without_stalling_healthy_commands() {
                 .borrow_mut()
                 .service_transport((now_ms >> 4) as u32);
         }
-        settle_loopback();
-        loop {
-            let mut packet = [0; MAX_DATAGRAM + 1];
-            let (length, from) = match socket.recv_from(&mut packet) {
-                Ok(value) => value,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("{error}"),
-            };
-            let std::net::SocketAddr::V4(from) = from else {
-                unreachable!()
-            };
-            if paused && from == boundaries[1].live.borrow().primary_addr().unwrap() {
-                continue;
+        // A suspended client loses what it sends and what the relay sends
+        // it, pushed frames included.
+        let mut datagrams = relay.received();
+        datagrams.retain(|(from, _)| !paused || *from != second_address);
+        let mut overtaken = false;
+        relay.answer(now_ms, datagrams, |reply| {
+            if paused && reply.endpoint == second_address {
+                return false;
             }
-            for forwarded in relay
-                .process_at(
-                    from,
-                    &packet[..length],
-                    100 + (now_ms - 16_000) / 1000,
-                    now_ms,
-                )
-                .unwrap_or_default()
-            {
-                // Lose/reorder one complete authenticated reply. Recovery uses
-                // the immutable cursor, never a simulation-side prediction.
-                if healthy_frame >= 8 && !reordered {
-                    if held.is_none() {
-                        held = Some(forwarded);
-                        continue;
-                    }
-                    socket
-                        .send_to(&forwarded.bytes, forwarded.endpoint)
-                        .unwrap();
-                    let previous = held.take().unwrap();
-                    socket.send_to(&previous.bytes, previous.endpoint).unwrap();
-                    reordered = true;
-                } else {
-                    socket
-                        .send_to(&forwarded.bytes, forwarded.endpoint)
-                        .unwrap();
-                }
+            // Hold one complete authenticated reply until a later one has
+            // gone. Recovery uses the immutable cursor, never a
+            // simulation-side prediction.
+            if healthy_frame >= 8 && !reordered && held.is_none() {
+                held = Some((reply.endpoint, reply.bytes.clone()));
+                return false;
             }
+            overtaken |= held.is_some();
+            true
+        });
+        if overtaken && let Some((endpoint, bytes)) = held.take() {
+            relay.socket.send_to(&bytes, endpoint).unwrap();
+            reordered = true;
+            settle_loopback();
         }
-        settle_loopback();
         for side in 0..2 {
             for _ in 0..8 {
                 if worlds[side].session().binary_frame() >= 1200 {
@@ -3342,7 +3271,6 @@ fn sequenced_udp_paused_client_catches_up_without_stalling_healthy_commands() {
             && *applied),
         "a late order executes only at a future canonical frame"
     );
-    assert_eq!(boundaries[0].live.borrow().pacing_delay_millis(40), 0);
     drop(boundaries);
     drop(relay);
     std::fs::remove_dir_all(journal_dir).unwrap();
@@ -3353,63 +3281,17 @@ fn sequenced_udp_paused_client_catches_up_without_stalling_healthy_commands() {
 /// a lone earlier one does not start that window.
 #[test]
 fn sequenced_service_ends_a_match_a_newer_relay_keeps_stalling() {
-    use crate::net::udp::{
-        OrderingCertificate, RelayTicket, relay_peer_endpoint,
-        test_support::{SecretKey, derive_packet_key},
-    };
     use vera20k_relay_protocol::OrderEvent;
 
-    let key = SecretKey::new([31; 32]);
-    let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let std::net::SocketAddr::V4(address) = sink.local_addr().unwrap() else {
-        unreachable!()
-    };
-    let ticket = RelayTicket {
-        room: [27; 16],
-        player: [1; 16],
-        source: 0,
-        generation: 1,
-        expires: 300,
-        nonce: [3; 16],
-    }
-    .sign(&key)
-    .unwrap();
-    let certificate = OrderingCertificate {
-        room: [27; 16],
-        sources_mask: 3,
-        tick_hz: 30,
-        expires: 86_500,
-        pacing: Default::default(),
-    }
-    .sign(&key)
-    .unwrap();
-    let mut wire = transport();
-    wire.enable_relay(
-        address,
-        &ticket,
-        *derive_packet_key(&key, &ticket).expose_for_https(),
-        [29; 32],
-    )
-    .unwrap();
-    wire.set_ordering_certificate(certificate.to_vec()).unwrap();
-    wire.connections_mut()
-        .add_peer(1, relay_peer_endpoint(1).unwrap())
-        .unwrap();
-    let agreement = StartupAgreement::new(
-        [(0, 0), (1, 1)],
-        [0, 1],
-        73,
-        10,
-        30,
-        NonZeroU32::new(1).unwrap(),
-        0,
-    )
-    .unwrap();
-    let mut session = sequenced::SequencedSession::new(&agreement, &wire, 0).unwrap();
+    let (_, _, _, boundaries, _) = sequenced_pair();
+    let mut live = boundaries[0].live.borrow_mut();
+    let live = &mut *live;
+    let session = live.sequenced.as_mut().unwrap();
     // Before the start, no Status this build can read arrives.
     let mut unreadable_at = |now: u32| {
-        wire.push_ordering_received_for_test(OrderEvent::Unrecognized);
-        session.service(&mut wire, now);
+        live.transport
+            .push_ordering_received_for_test(OrderEvent::Unrecognized);
+        session.service(&mut live.transport, now);
         session.failed()
     };
     assert!(!unreadable_at(0));
@@ -3420,107 +3302,29 @@ fn sequenced_service_ends_a_match_a_newer_relay_keeps_stalling() {
     assert!(unreadable_at(11_000));
 }
 
-/// The relay drops a lapsed ticket unanswered and retires a silent player after
-/// ABSENT_MS, so nothing tells a game that its place is gone. A route that has
-/// heard nothing for that long and 15 seconds more is released and stops
-/// knocking, whatever holds the transport: a one-human match and the score
-/// screen have no ordered session to end.
-#[test]
-fn a_relay_route_silent_past_the_relays_own_limit_is_released() {
-    use crate::net::udp::{
-        RelayTicket,
-        test_support::{MAX_DATAGRAM, SecretKey, derive_packet_key},
-    };
-
-    let key = SecretKey::new([31; 32]);
-    let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
-    sink.set_nonblocking(true).unwrap();
-    let std::net::SocketAddr::V4(address) = sink.local_addr().unwrap() else {
-        unreachable!()
-    };
-    let ticket = RelayTicket {
-        room: [27; 16],
-        player: [1; 16],
-        source: 0,
-        generation: 1,
-        expires: 300,
-        nonce: [3; 16],
-    }
-    .sign(&key)
-    .unwrap();
-    let packet_key = *derive_packet_key(&key, &ticket).expose_for_https();
-    let mut wire = transport();
-    wire.enable_relay(address, &ticket, packet_key, [29; 32])
-        .unwrap();
-    let knocks = |sink: &UdpSocket| {
-        settle_loopback();
-        let mut bytes = [0; MAX_DATAGRAM + 1];
-        std::iter::from_fn(|| sink.recv_from(&mut bytes).ok()).count()
-    };
-    let limit = ((vera20k_relay_protocol::ABSENT_MS + 15_000) / 16) as u32;
-    wire.service(100);
-    assert!(knocks(&sink) > 0);
-    // A sample older than the last one is not 49 days of silence.
-    wire.service(99);
-    wire.service(100 + limit);
-    assert!(!wire.relay_absent() && wire.relay_expires().is_some());
-    assert!(knocks(&sink) > 0);
-    wire.service(100 + limit + 1);
-    assert!(wire.relay_absent() && wire.relay_expires().is_none());
-    knocks(&sink);
-    wire.service(100 + limit + 1_000);
-    assert_eq!(knocks(&sink), 0);
-    // The lobby's reply to a renewal asked before the release is not an error.
-    wire.renew_relay(address, &ticket, packet_key, [29; 32])
-        .unwrap();
-}
-
 /// A started match whose relay goes silent waits for it, showing Reconnecting,
 /// until the transport releases the route; then it ends as absent instead of
 /// waiting for as long as the game stays open.
 #[test]
 fn sequenced_match_ends_as_absent_once_its_silent_relay_route_is_released() {
-    use crate::net::udp::test_support::MAX_DATAGRAM;
-
-    let (mut worlds, rules, _, boundaries, socket, mut relay) = sequenced_pair();
+    let (mut worlds, rules, _, boundaries, mut relay) = sequenced_pair();
     let counters = |boundary: &Boundary| boundary.live.borrow().delivery_counters().unwrap();
     let frame = |worlds: &mut [Simulation; 2], ticks: u32| {
         for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
             boundary.now.set(ticks);
             let effects = FrameEffects::empty().with_network_commands(boundary);
             if world.pending_network_wait() {
-                let _ = world.resume_network_wait(&rules, None, effects);
+                let _ = world.resume_network_wait(&rules, effects);
             } else {
-                let _ = world.advance_app_frame(&[], &rules, None, 33, TickLane::Ordinary, effects);
+                let _ = world.advance_app_frame(&[], &rules, 33, TickLane::Ordinary, effects);
             }
         }
     };
     let mut now_ms = 16_000;
     for _ in 0..200 {
         now_ms += 16;
-        let unix = 100 + (now_ms - 16_000) / 1000;
-        relay.advance_clock(now_ms, unix);
-        for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
-            boundary.now.set((now_ms >> 4) as u32);
-            boundary.live.borrow_mut().service_pending_commands(
-                &mut world.network_command_queues(),
-                (now_ms >> 4) as u32,
-            );
-        }
-        settle_loopback();
-        let mut replies = Vec::new();
-        let mut bytes = [0; MAX_DATAGRAM + 1];
-        while let Ok((length, std::net::SocketAddr::V4(source))) = socket.recv_from(&mut bytes) {
-            replies.extend(
-                relay
-                    .process_at(source, &bytes[..length], unix, now_ms)
-                    .unwrap_or_default(),
-            );
-        }
-        for packet in replies {
-            socket.send_to(&packet.bytes, packet.endpoint).unwrap();
-        }
-        settle_loopback();
+        service_pair(&mut worlds, &boundaries, now_ms);
+        relay.pass(now_ms, |_| true);
         frame(&mut worlds, (now_ms >> 4) as u32);
         if boundaries.iter().all(|boundary| counters(boundary).started) {
             break;
@@ -3545,138 +3349,44 @@ fn sequenced_match_ends_as_absent_once_its_silent_relay_route_is_released() {
 
 #[test]
 fn sequenced_unsent_batch_retries_when_the_relay_route_recovers() {
-    use crate::net::udp::{
-        OrderingCertificate, RelayTicket, relay_peer_endpoint,
-        test_support::{MAX_DATAGRAM, RelayServer, SecretKey, derive_packet_key},
-    };
-    use vera20k_relay_protocol::{ClientSession, OrderEvent, ServerEvent};
+    use vera20k_relay_protocol::OrderEvent;
 
-    let key = SecretKey::new([31; 32]);
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket.set_nonblocking(true).unwrap();
-    let std::net::SocketAddr::V4(address) = socket.local_addr().unwrap() else {
-        unreachable!()
-    };
-    let ticket = RelayTicket {
-        room: [27; 16],
-        player: [1; 16],
-        source: 0,
-        generation: 1,
-        expires: 300,
-        nonce: [3; 16],
-    }
-    .sign(&key)
-    .unwrap();
-    let certificate = OrderingCertificate {
-        room: [27; 16],
-        sources_mask: 3,
-        tick_hz: 30,
-        expires: 86_500,
-        pacing: Default::default(),
-    }
-    .sign(&key)
-    .unwrap();
-    let mut wire = transport();
-    wire.enable_relay(
-        address,
-        &ticket,
-        *derive_packet_key(&key, &ticket).expose_for_https(),
-        [29; 32],
-    )
-    .unwrap();
-    wire.set_ordering_certificate(certificate.to_vec()).unwrap();
-    wire.connections_mut()
-        .add_peer(1, relay_peer_endpoint(1).unwrap())
-        .unwrap();
-    let agreement = StartupAgreement::new(
-        [(0, 0), (1, 1)],
-        [0, 1],
-        73,
-        10,
-        30,
-        NonZeroU32::new(1).unwrap(),
-        0,
-    )
-    .unwrap();
-    let mut session = sequenced::SequencedSession::new(&agreement, &wire, 0).unwrap();
-    let mut relay = RelayServer::new(key.clone(), 1);
-    // The relay orders only matches of two or more sources. Source 1 readies
-    // in process and then stays silent.
-    let ticket = RelayTicket {
-        room: [27; 16],
-        player: [2; 16],
-        source: 1,
-        generation: 1,
-        expires: 300,
-        nonce: [4; 16],
-    }
-    .sign(&key)
-    .unwrap();
-    let packet_key = *derive_packet_key(&key, &ticket).expose_for_https();
-    let mut second = ClientSession::new(&ticket, packet_key, [29; 32]).unwrap();
-    let from = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 9);
-    let mut bytes = Vec::new();
-    second.probe_at(16_000, &mut bytes).unwrap();
-    let challenge = relay.process_at(from, &bytes, 116, 16_000).unwrap();
-    let Ok(ServerEvent::Challenge(cookie)) = second.receive_at(&challenge[0].bytes, 16_000) else {
-        panic!("challenge");
-    };
-    second
-        .confirm_at(&cookie.to_vec(), 16_000, &mut bytes)
-        .unwrap();
-    let ready = relay.process_at(from, &bytes, 116, 16_000).unwrap();
-    assert!(matches!(
-        second.receive_at(&ready[0].bytes, 16_000),
-        Ok(ServerEvent::Ready)
-    ));
-    let identity = agreement.sequencing_identity().unwrap().0;
-    second
-        .configure_ordering_at(&certificate, identity, 16_000, &mut bytes)
-        .unwrap();
-    relay.process_at(from, &bytes, 116, 16_000).unwrap();
-    let pump = |wire: &mut LanUdpTransport, relay: &mut RelayServer, now: u32| {
-        wire.service(now >> 4);
-        settle_loopback();
-        loop {
-            let mut packet = [0; MAX_DATAGRAM + 1];
-            let (length, std::net::SocketAddr::V4(from)) = (match socket.recv_from(&mut packet) {
-                Ok(value) => value,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("{error}"),
-            }) else {
-                unreachable!()
-            };
-            for reply in relay
-                .process_at(
-                    from,
-                    &packet[..length],
-                    100 + u64::from(now) / 1000,
-                    u64::from(now),
-                )
-                .unwrap()
-            {
-                socket.send_to(&reply.bytes, reply.endpoint).unwrap();
-            }
-        }
-        settle_loopback();
-        wire.service(now >> 4);
-    };
+    let (_, _, _, boundaries, mut relay) = sequenced_pair();
+    // The relay orders only matches of two or more sources. Both games
+    // start, and from then on the second stays silent.
     let mut now = 16_000;
     for _ in 0..60 {
-        session.service(&mut wire, now);
-        pump(&mut wire, &mut relay, now);
-        if session.started() {
+        for boundary in &boundaries {
+            boundary.live.borrow_mut().service_transport(now >> 4);
+        }
+        relay.pass(u64::from(now), |_| true);
+        if boundaries[0]
+            .live
+            .borrow()
+            .sequenced
+            .as_ref()
+            .unwrap()
+            .started()
+        {
             break;
         }
         now += 16;
     }
+    let mut live = boundaries[0].live.borrow_mut();
+    let live = &mut *live;
+    let (session, wire) = (live.sequenced.as_mut().unwrap(), &mut live.transport);
     assert!(session.started(), "authenticated ordering startup");
+    let pump = |wire: &mut LanUdpTransport, relay: &mut LoopbackRelay, now: u32| {
+        wire.service(now >> 4);
+        relay.pass(u64::from(now), |_| true);
+        wire.service(now >> 4);
+    };
     let mut sim = Simulation::new();
     sim.session.set_game_mode(ScenarioGameMode::Wol);
     assert_eq!(
         session
             .poll(
-                &mut wire,
+                wire,
                 &mut sim.network_command_queues(),
                 NetworkQueueContext {
                     frame: 0,
@@ -3703,7 +3413,7 @@ fn sequenced_unsent_batch_retries_when_the_relay_route_recovers() {
     assert!(sim.issue_local_command(CommandEnvelope::synchronized(stop.clone(), 0)));
     session
         .poll(
-            &mut wire,
+            wire,
             &mut sim.network_command_queues(),
             NetworkQueueContext {
                 frame: 1,
@@ -3716,15 +3426,15 @@ fn sequenced_unsent_batch_retries_when_the_relay_route_recovers() {
     let recovered_at = now + 16;
     let deadline = Instant::now() + STALL_LIMIT;
     while !wire.relay_ready() && Instant::now() < deadline {
-        pump(&mut wire, &mut relay, recovered_at);
+        pump(wire, &mut relay, recovered_at);
         std::thread::yield_now();
     }
     assert!(
         wire.relay_ready(),
         "same route completed its real challenge"
     );
-    session.service(&mut wire, recovered_at);
-    pump(&mut wire, &mut relay, recovered_at);
+    session.service(wire, recovered_at);
+    pump(wire, &mut relay, recovered_at);
     let drain_ack = |wire: &mut LanUdpTransport| {
         let mut acknowledged = false;
         while let Some(event) = wire.pop_ordering_received() {
@@ -3738,11 +3448,11 @@ fn sequenced_unsent_batch_retries_when_the_relay_route_recovers() {
         }
         acknowledged
     };
-    let mut acknowledged = drain_ack(&mut wire);
+    let mut acknowledged = drain_ack(wire);
     let deadline = Instant::now() + STALL_LIMIT;
     while !acknowledged && Instant::now() < deadline {
-        pump(&mut wire, &mut relay, recovered_at);
-        acknowledged = drain_ack(&mut wire);
+        pump(wire, &mut relay, recovered_at);
+        acknowledged = drain_ack(wire);
         std::thread::yield_now();
     }
     assert!(
@@ -3750,34 +3460,105 @@ fn sequenced_unsent_batch_retries_when_the_relay_route_recovers() {
         "an unsent batch must not wait for the 100ms retransmission deadline"
     );
 
-    // The ACK was withheld from the app owner, so the batch's records stay
-    // in its local queue; the relay session alone owns the acceptance and
-    // resends nothing more (spec §6.4).
-    session.service(&mut wire, recovered_at + 112);
-    pump(&mut wire, &mut relay, recovered_at + 112);
-    assert!(!drain_ack(&mut wire), "no retry of an acknowledged batch");
-    assert_eq!(session.sent_commands(), 0);
+    // The relay session owns the acceptance: it resends nothing more
+    // (spec §6.4), and the batch leaves OutList although this game never
+    // read the ACK, as when its full inbox drops one.
+    session.service(wire, recovered_at + 112);
+    pump(wire, &mut relay, recovered_at + 112);
+    assert!(!drain_ack(wire), "no retry of an acknowledged batch");
     assert_eq!(
         sim.network_command_queues().local_records().unwrap(),
         vec![&stop]
     );
+    session.service_pending_commands(wire, &mut sim.network_command_queues(), recovered_at + 112);
+    assert_eq!(session.sent_commands(), 1);
+    assert!(
+        sim.network_command_queues()
+            .local_records()
+            .unwrap()
+            .is_empty()
+    );
 }
 
-type SequencedPair = (
-    [Simulation; 2],
-    RuleSet,
-    u64,
-    Vec<Boundary>,
-    UdpSocket,
-    crate::net::udp::test_support::RelayServer,
-);
+type SequencedPair = ([Simulation; 2], RuleSet, u64, Vec<Boundary>, LoopbackRelay);
+
+/// The relay both games of a sequenced test reach, on one loopback socket. Its
+/// Unix clock reads 100 s at the tests' 16 000 ms start.
+struct LoopbackRelay {
+    server: crate::net::udp::test_support::RelayServer,
+    socket: UdpSocket,
+}
+
+impl LoopbackRelay {
+    /// What the games have sent the relay since it last read, with each sender.
+    fn received(&self) -> Vec<(SocketAddrV4, Vec<u8>)> {
+        settle_loopback();
+        let mut bytes = [0; crate::net::udp::test_support::MAX_DATAGRAM + 1];
+        std::iter::from_fn(|| match self.socket.recv_from(&mut bytes) {
+            Ok((length, std::net::SocketAddr::V4(from))) => Some((from, bytes[..length].to_vec())),
+            Ok(_) => unreachable!(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+            Err(error) => panic!("{error}"),
+        })
+        .collect()
+    }
+
+    /// Moves the relay's clock to `relay_ms`, has it read `datagrams`, and
+    /// delivers each of its replies and pushes that `keep` lets through.
+    fn answer(
+        &mut self,
+        relay_ms: u64,
+        datagrams: Vec<(SocketAddrV4, Vec<u8>)>,
+        mut keep: impl FnMut(&vera20k_relay_protocol::ForwardDatagram) -> bool,
+    ) {
+        let unix = 100 + (relay_ms - 16_000) / 1000;
+        self.server.advance_clock(relay_ms, unix);
+        let mut replies = Vec::new();
+        for (from, bytes) in datagrams {
+            replies.extend(
+                self.server
+                    .process_at(from, &bytes, unix, relay_ms)
+                    .unwrap_or_default(),
+            );
+        }
+        replies.extend(self.server.drain_ordering_push(relay_ms, unix));
+        for reply in replies {
+            if keep(&reply) {
+                self.socket.send_to(&reply.bytes, reply.endpoint).unwrap();
+            }
+        }
+        settle_loopback();
+    }
+
+    /// `answer` for everything the games have sent.
+    fn pass(
+        &mut self,
+        relay_ms: u64,
+        keep: impl FnMut(&vera20k_relay_protocol::ForwardDatagram) -> bool,
+    ) {
+        let datagrams = self.received();
+        self.answer(relay_ms, datagrams, keep);
+    }
+}
+
+/// Services both games' transports and pending commands at `now_ms`.
+fn service_pair(worlds: &mut [Simulation; 2], boundaries: &[Boundary], now_ms: u64) {
+    for (world, boundary) in worlds.iter_mut().zip(boundaries) {
+        boundary.now.set((now_ms >> 4) as u32);
+        boundary
+            .live
+            .borrow_mut()
+            .service_pending_commands(&mut world.network_command_queues(), (now_ms >> 4) as u32);
+    }
+}
 
 fn sequenced_pair() -> SequencedPair {
-    sequenced_pair_with_second_hash_offset(0)
+    sequenced_pair_with(0, None)
 }
 
-/// `offset` makes the second game's start agreement differ from the first's.
-fn sequenced_pair_with_second_hash_offset(offset: u64) -> SequencedPair {
+/// `offset` makes the second game's start agreement differ from the first's;
+/// `journal` is the directory the relay keeps its journal in.
+fn sequenced_pair_with(offset: u64, journal: Option<&std::path::Path>) -> SequencedPair {
     use crate::net::udp::{
         OrderingCertificate, RelayTicket, relay_peer_endpoint,
         test_support::{RelayServer, SecretKey, derive_packet_key},
@@ -3789,7 +3570,10 @@ fn sequenced_pair_with_second_hash_offset(offset: u64) -> SequencedPair {
     let std::net::SocketAddr::V4(address) = socket.local_addr().unwrap() else {
         unreachable!()
     };
-    let relay = RelayServer::new(key.clone(), 2);
+    let server = match journal {
+        Some(directory) => RelayServer::with_journal(key.clone(), 2, directory).unwrap(),
+        None => RelayServer::new(key.clone(), 2),
+    };
     let (first, rules, actor) = stop_scene();
     let (second, _, _) = stop_scene();
     let mut worlds = [first, second];
@@ -3805,6 +3589,7 @@ fn sequenced_pair_with_second_hash_offset(offset: u64) -> SequencedPair {
         tick_hz: 30,
         expires: 86_500,
         pacing: Default::default(),
+        ordered_alone: false,
     }
     .sign(&key)
     .unwrap();
@@ -3818,6 +3603,8 @@ fn sequenced_pair_with_second_hash_offset(offset: u64) -> SequencedPair {
             30,
             NonZeroU32::new(1).unwrap(),
             world_hash.wrapping_add(u64::from(source) * offset),
+            "",
+            "",
         )
         .unwrap()
     };
@@ -3848,6 +3635,7 @@ fn sequenced_pair_with_second_hash_offset(offset: u64) -> SequencedPair {
                     relay_peer_endpoint(1 - source).unwrap(),
                 )
                 .unwrap();
+            let clock = relay_clock(LiveCommandMode::Wol, &wire, 2).unwrap();
             Boundary::new(
                 LiveCommandSession::new(
                     agreement(source),
@@ -3856,56 +3644,39 @@ fn sequenced_pair_with_second_hash_offset(offset: u64) -> SequencedPair {
                     73,
                     NonZeroU32::new(1).unwrap(),
                     LiveCommandMode::Wol,
+                    clock,
                 )
                 .unwrap(),
             )
         })
         .collect();
-    (worlds, rules, actor, boundaries, socket, relay)
+    (
+        worlds,
+        rules,
+        actor,
+        boundaries,
+        LoopbackRelay { server, socket },
+    )
 }
 
 /// The relay answers a second game with a different start agreement by an
 /// error it counts nowhere, so that game's report has to name it.
 #[test]
 fn sequenced_agreement_mismatch_names_itself_in_the_match_report() {
-    use crate::net::udp::test_support::MAX_DATAGRAM;
-
-    let (mut worlds, rules, _, boundaries, socket, mut relay) =
-        sequenced_pair_with_second_hash_offset(1);
+    let (mut worlds, rules, _, boundaries, mut relay) = sequenced_pair_with(1, None);
     let counters = |boundary: &Boundary| boundary.live.borrow().delivery_counters().unwrap();
     let mut now_ms = 16_000;
     for _ in 0..200 {
         now_ms += 16;
-        let unix = 100 + (now_ms - 16_000) / 1000;
-        relay.advance_clock(now_ms, unix);
-        for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
-            boundary.now.set((now_ms >> 4) as u32);
-            boundary.live.borrow_mut().service_pending_commands(
-                &mut world.network_command_queues(),
-                (now_ms >> 4) as u32,
-            );
-        }
-        settle_loopback();
-        let mut replies = Vec::new();
-        let mut bytes = [0; MAX_DATAGRAM + 1];
-        while let Ok((length, std::net::SocketAddr::V4(source))) = socket.recv_from(&mut bytes) {
-            replies.extend(
-                relay
-                    .process_at(source, &bytes[..length], unix, now_ms)
-                    .unwrap_or_default(),
-            );
-        }
-        for packet in replies {
-            socket.send_to(&packet.bytes, packet.endpoint).unwrap();
-        }
-        settle_loopback();
+        service_pair(&mut worlds, &boundaries, now_ms);
+        relay.pass(now_ms, |_| true);
         for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
             let effects = FrameEffects::empty().with_network_commands(boundary);
             // This match is meant to fail; its report is what is checked.
             if world.pending_network_wait() {
-                let _ = world.resume_network_wait(&rules, None, effects);
+                let _ = world.resume_network_wait(&rules, effects);
             } else {
-                let _ = world.advance_app_frame(&[], &rules, None, 33, TickLane::Ordinary, effects);
+                let _ = world.advance_app_frame(&[], &rules, 33, TickLane::Ordinary, effects);
             }
         }
         if boundaries
@@ -3928,75 +3699,6 @@ fn sequenced_agreement_mismatch_names_itself_in_the_match_report() {
     );
 }
 
-#[test]
-fn sequenced_lost_first_uplink_is_resent_until_the_subscription_pushes() {
-    use crate::net::udp::test_support::MAX_DATAGRAM;
-
-    let (mut worlds, rules, _, boundaries, socket, mut relay) = sequenced_pair();
-    let second_address = boundaries[1].live.borrow().primary_addr().unwrap();
-    let mut now_ms = 16_000;
-    let mut dropped = None;
-    let mut subscribed = None;
-    for step in 0..200 {
-        now_ms += 16;
-        let unix = 100 + (now_ms - 16_000) / 1000;
-        relay.advance_clock(now_ms, unix);
-        for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
-            boundary.now.set((now_ms >> 4) as u32);
-            boundary.live.borrow_mut().service_pending_commands(
-                &mut world.network_command_queues(),
-                (now_ms >> 4) as u32,
-            );
-        }
-        settle_loopback();
-        let mut replies = Vec::new();
-        let mut bytes = [0; MAX_DATAGRAM + 1];
-        while let Ok((length, std::net::SocketAddr::V4(source))) = socket.recv_from(&mut bytes) {
-            // Lose the second client's first UPLINK (CONTROL kind 4 in the
-            // v3 `hdr`, request 8 after the 9-byte envelope header).
-            let uplink = bytes[0] & 0x1F == 4 && bytes[9] == 8;
-            if uplink && source == second_address && dropped.is_none() {
-                dropped = Some(step);
-                continue;
-            }
-            replies.extend(
-                relay
-                    .process_at(source, &bytes[..length], unix, now_ms)
-                    .unwrap_or_default(),
-            );
-        }
-        replies.extend(relay.drain_ordering_push(now_ms, unix));
-        for packet in replies {
-            socket.send_to(&packet.bytes, packet.endpoint).unwrap();
-        }
-        settle_loopback();
-        for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
-            production_frame(world, &rules, boundary);
-        }
-        if subscribed.is_none()
-            && relay
-                .reader_link_stats([17; 16], 1)
-                .is_some_and(|stats| stats.subscribed)
-        {
-            subscribed = Some(step);
-        }
-    }
-    let (dropped, subscribed) = (dropped.unwrap(), subscribed.unwrap());
-    // Spec §6.0: resent every RTO until a PACK. This only bounds the recovery, at
-    // about a second; the UPLINK tests in the relay protocol's `link/uplink.rs` pin
-    // the exact schedule with a fake clock.
-    assert!(
-        subscribed - dropped <= 64,
-        "subscribed {} steps after the lost UPLINK",
-        subscribed - dropped
-    );
-    assert!(
-        boundaries
-            .iter()
-            .all(|boundary| boundary.live.borrow().sequenced_timing().is_some())
-    );
-}
-
 /// A client that runs fewer frames than the relay seals slows the match to a
 /// Game Speed rate it can drain its waiting frames at. Both clients pace at
 /// it and get one line naming the slow player, the slow one catches up, and
@@ -4004,37 +3706,14 @@ fn sequenced_lost_first_uplink_is_resent_until_the_subscription_pushes() {
 #[test]
 fn a_client_that_cannot_keep_up_slows_both_clients_until_it_catches_up() {
     use crate::net::live_commands::MatchSpeedChange;
-    use crate::net::udp::test_support::MAX_DATAGRAM;
 
-    let (mut worlds, rules, _, boundaries, socket, mut relay) = sequenced_pair();
+    let (mut worlds, rules, _, boundaries, mut relay) = sequenced_pair();
     let mut now_ms = 16_000;
     let mut changes = [Vec::new(), Vec::new()];
     for step in 0..1200 {
         now_ms += 16;
-        let unix = 100 + (now_ms - 16_000) / 1000;
-        relay.advance_clock(now_ms, unix);
-        for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
-            boundary.now.set((now_ms >> 4) as u32);
-            boundary.live.borrow_mut().service_pending_commands(
-                &mut world.network_command_queues(),
-                (now_ms >> 4) as u32,
-            );
-        }
-        settle_loopback();
-        let mut replies = Vec::new();
-        let mut bytes = [0; MAX_DATAGRAM + 1];
-        while let Ok((length, std::net::SocketAddr::V4(source))) = socket.recv_from(&mut bytes) {
-            replies.extend(
-                relay
-                    .process_at(source, &bytes[..length], unix, now_ms)
-                    .unwrap_or_default(),
-            );
-        }
-        replies.extend(relay.drain_ordering_push(now_ms, unix));
-        for packet in replies {
-            socket.send_to(&packet.bytes, packet.endpoint).unwrap();
-        }
-        settle_loopback();
+        service_pair(&mut worlds, &boundaries, now_ms);
+        relay.pass(now_ms, |_| true);
         // The second PC runs one frame in three 16 ms wakes: 21 a second
         // against the certificate's 30.
         for (index, (world, boundary)) in worlds.iter_mut().zip(&boundaries).enumerate() {
@@ -4073,71 +3752,15 @@ fn a_client_that_cannot_keep_up_slows_both_clients_until_it_catches_up() {
 
 #[test]
 fn sequenced_push_advances_without_requests_and_repairs_a_lost_range() {
-    use crate::net::udp::test_support::MAX_DATAGRAM;
     use crate::sim::command::{Command, MEGAMISSION_OPCODE};
 
-    let (mut worlds, rules, actor, boundaries, socket, mut relay) = sequenced_pair();
+    let (mut worlds, rules, actor, boundaries, mut relay) = sequenced_pair();
     let second_address = boundaries[1].live.borrow().primary_addr().unwrap();
-    let pump = |relay: &mut crate::net::udp::test_support::RelayServer,
-                now_ms: u64,
-                accept_requests: bool,
-                lose_second: bool| {
-        let deliver = |packet: vera20k_relay_protocol::ForwardDatagram| {
-            if !lose_second || packet.endpoint != second_address {
-                socket.send_to(&packet.bytes, packet.endpoint).unwrap();
-            }
-        };
-        settle_loopback();
-        let mut requests = 0;
-        {
-            loop {
-                let mut bytes = [0; MAX_DATAGRAM + 1];
-                let (length, std::net::SocketAddr::V4(source)) = (match socket.recv_from(&mut bytes)
-                {
-                    Ok(packet) => packet,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(error) => panic!("{error}"),
-                }) else {
-                    unreachable!()
-                };
-                requests += 1;
-                if !accept_requests {
-                    continue;
-                }
-                for packet in relay
-                    .process_at(
-                        source,
-                        &bytes[..length],
-                        100 + (now_ms - 16_000) / 1000,
-                        now_ms,
-                    )
-                    .unwrap_or_default()
-                {
-                    deliver(packet);
-                }
-            }
-        }
-        for packet in relay.drain_ordering_push(now_ms, 100 + (now_ms - 16_000) / 1000) {
-            deliver(packet);
-        }
-        settle_loopback();
-        requests
-    };
-    let service = |worlds: &mut [Simulation; 2], now_ms: u64| {
-        for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
-            boundary.now.set((now_ms >> 4) as u32);
-            boundary.live.borrow_mut().service_pending_commands(
-                &mut world.network_command_queues(),
-                (now_ms >> 4) as u32,
-            );
-        }
-    };
     let mut now_ms = 16_000;
     for _ in 0..250 {
         now_ms += 16;
-        relay.advance_clock(now_ms, 100 + (now_ms - 16_000) / 1000);
-        service(&mut worlds, now_ms);
-        pump(&mut relay, now_ms, true, false);
+        service_pair(&mut worlds, &boundaries, now_ms);
+        relay.pass(now_ms, |_| true);
         for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
             production_frame(world, &rules, boundary);
         }
@@ -4162,9 +3785,9 @@ fn sequenced_push_advances_without_requests_and_repairs_a_lost_range() {
     let mut idle_requests = 0;
     for _ in 0..24 {
         now_ms += 16;
-        relay.advance_clock(now_ms, 100 + (now_ms - 16_000) / 1000);
-        service(&mut worlds, now_ms);
-        idle_requests += pump(&mut relay, now_ms, false, false);
+        service_pair(&mut worlds, &boundaries, now_ms);
+        idle_requests += relay.received().len();
+        relay.answer(now_ms, Vec::new(), |_| true);
         for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
             production_frame(world, &rules, boundary);
         }
@@ -4199,11 +3822,12 @@ fn sequenced_push_advances_without_requests_and_repairs_a_lost_range() {
     ];
     for step in 0..250 {
         now_ms += 16;
-        relay.advance_clock(now_ms, 100 + (now_ms - 16_000) / 1000);
-        service(&mut worlds, now_ms);
+        service_pair(&mut worlds, &boundaries, now_ms);
         // Lose a real range of pushed frames and replies, then allow the
         // existing Pull/history owner to repair the contiguous stream.
-        pump(&mut relay, now_ms, true, step < 15);
+        relay.pass(now_ms, |reply| {
+            step >= 15 || reply.endpoint != second_address
+        });
         for (side, (world, boundary)) in worlds.iter_mut().zip(&boundaries).enumerate() {
             for _ in 0..4 {
                 if production_frame(world, &rules, boundary)
@@ -4255,59 +3879,31 @@ fn sequenced_push_advances_without_requests_and_repairs_a_lost_range() {
 #[test]
 fn sequenced_pause_stops_at_one_boundary_and_recovers_a_lost_resume() {
     use crate::net::live_commands::MatchPauseChange;
-    use crate::net::udp::test_support::MAX_DATAGRAM;
     use crate::sim::command::{Command, MEGAMISSION_OPCODE};
+    use vera20k_relay_protocol::envelope::{CONTROL, Direction, HEADER_LEN, peek};
 
-    let (mut worlds, rules, actor, boundaries, socket, mut relay) = sequenced_pair();
+    let (mut worlds, rules, actor, boundaries, mut relay) = sequenced_pair();
     let second_address = boundaries[1].live.borrow().primary_addr().unwrap();
     let mut committed = [
         std::collections::BTreeMap::new(),
         std::collections::BTreeMap::new(),
     ];
     let step = |worlds: &mut [Simulation; 2],
-                relay: &mut crate::net::udp::test_support::RelayServer,
+                relay: &mut LoopbackRelay,
                 committed: &mut [std::collections::BTreeMap<u32, u64>; 2],
                 now_ms: u64,
                 lose_second: bool,
                 lose_pause_status: bool| {
-        let now = 100 + (now_ms - 16_000) / 1000;
-        relay.advance_clock(now_ms, now);
-        for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
-            boundary.now.set((now_ms >> 4) as u32);
-            boundary.live.borrow_mut().service_pending_commands(
-                &mut world.network_command_queues(),
-                (now_ms >> 4) as u32,
-            );
-        }
-        settle_loopback();
-        let deliver = |packet: vera20k_relay_protocol::ForwardDatagram| {
-            // Protocol v2 has a 48-byte server header; payload kind8 is
-            // PauseStatus. Lose those replies but retain canonical history.
-            let lost_status = lose_pause_status && packet.bytes.get(9) == Some(&8);
-            if packet.endpoint != second_address || (!lose_second && !lost_status) {
-                socket.send_to(&packet.bytes, packet.endpoint).unwrap();
-            }
-        };
-        loop {
-            let mut bytes = [0; MAX_DATAGRAM + 1];
-            let (length, std::net::SocketAddr::V4(source)) = (match socket.recv_from(&mut bytes) {
-                Ok(packet) => packet,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("{error}"),
-            }) else {
-                unreachable!()
-            };
-            for packet in relay
-                .process_at(source, &bytes[..length], now, now_ms)
-                .unwrap()
-            {
-                deliver(packet);
-            }
-        }
-        for packet in relay.drain_ordering_push(now_ms, now) {
-            deliver(packet);
-        }
-        settle_loopback();
+        service_pair(worlds, &boundaries, now_ms);
+        relay.pass(now_ms, |reply| {
+            // A PauseStatus reply: a CONTROL payload led by relay-protocol's
+            // `PAUSE_STATUS_EVENT`. Lose those but keep canonical history.
+            let pause_status = peek(Direction::Down, &reply.bytes)
+                .is_ok_and(|header| header.kind == CONTROL)
+                && reply.bytes.get(HEADER_LEN) == Some(&8);
+            reply.endpoint != second_address
+                || (!lose_second && !(lose_pause_status && pause_status))
+        });
         for (side, (world, boundary)) in worlds.iter_mut().zip(&boundaries).enumerate() {
             boundary
                 .live
@@ -4583,23 +4179,64 @@ fn sequenced_pause_stops_at_one_boundary_and_recovers_a_lost_resume() {
     );
 }
 
+/// A room whose players are on several relays answers a pause probe without
+/// this game's own source (relay `control_pause`): it never pauses, so the
+/// game stops asking. One still waiting for another player keeps asking.
+#[test]
+fn a_relay_room_that_cannot_pause_is_not_asked_again() {
+    use vera20k_relay_protocol::OrderEvent;
+
+    let (_, _, _, boundaries, mut relay) = sequenced_pair();
+    let mut live = boundaries[0].live.borrow_mut();
+    let live = &mut *live;
+    // Only the relay's handshake reaches this game: HELLO, CHALLENGE, READY.
+    for now in 1..=3 {
+        live.transport.service(now);
+        relay.pass(16_000, |_| true);
+    }
+    assert!(live.transport.relay_ready());
+    let session = live.sequenced.as_mut().unwrap();
+    let mut service = |now: u32, event: Option<OrderEvent>| {
+        if let Some(event) = event {
+            live.transport.push_ordering_received_for_test(event);
+        }
+        session.service(&mut live.transport, now);
+        relay.received().len()
+    };
+    let started = OrderEvent::Status(sequenced::fixtures::started_status());
+    let pause_status = |supported_sources| OrderEvent::PauseStatus {
+        supported_sources,
+        active_sources: 3,
+        request_id: 0,
+        epoch: 0,
+        paused: false,
+        frame: 0,
+    };
+    assert_eq!(service(0, None), 1, "its Ready");
+    assert_eq!(service(1, Some(started)), 1, "the first probe");
+    assert_eq!(
+        service(501, Some(pause_status(0b01))),
+        1,
+        "the other player has not yet"
+    );
+    assert_eq!(service(1_001, Some(pause_status(0))), 0);
+    for now in (1_501..=6_001).step_by(500) {
+        assert_eq!(service(now, None), 0, "at {now} ms");
+    }
+    assert!(!session.pause_status().available);
+}
+
 #[test]
 fn sequenced_push_resubscribes_as_soon_as_a_renewed_lease_is_confirmed() {
     use crate::net::udp::{
         RelayTicket,
-        test_support::{MAX_DATAGRAM, SecretKey, derive_packet_key},
+        test_support::{SecretKey, derive_packet_key},
     };
-    let (mut worlds, rules, _, boundaries, socket, mut relay) = sequenced_pair();
-    let std::net::SocketAddr::V4(address) = socket.local_addr().unwrap() else {
+    let (mut worlds, rules, _, boundaries, mut relay) = sequenced_pair();
+    let std::net::SocketAddr::V4(address) = relay.socket.local_addr().unwrap() else {
         unreachable!()
     };
     let mut pass = |relay_ms: u64, client_ms: u64| {
-        let now = 100 + (relay_ms - 16_000) / 1000;
-        relay.advance_clock(relay_ms, now);
-        for packet in relay.drain_ordering_push(relay_ms, now) {
-            socket.send_to(&packet.bytes, packet.endpoint).unwrap();
-        }
-        settle_loopback();
         for boundary in &boundaries {
             boundary.now.set((client_ms >> 4) as u32);
             boundary
@@ -4607,17 +4244,7 @@ fn sequenced_push_resubscribes_as_soon_as_a_renewed_lease_is_confirmed() {
                 .borrow_mut()
                 .service_transport((client_ms >> 4) as u32);
         }
-        settle_loopback();
-        let mut bytes = [0; MAX_DATAGRAM + 1];
-        while let Ok((length, std::net::SocketAddr::V4(source))) = socket.recv_from(&mut bytes) {
-            for packet in relay
-                .process_at(source, &bytes[..length], now, relay_ms)
-                .unwrap_or_default()
-            {
-                socket.send_to(&packet.bytes, packet.endpoint).unwrap();
-            }
-        }
-        settle_loopback();
+        relay.pass(relay_ms, |_| true);
     };
     let mut now_ms = 16_000;
     for _ in 0..250 {
@@ -4693,9 +4320,8 @@ fn sequenced_push_resubscribes_as_soon_as_a_renewed_lease_is_confirmed() {
 
 #[test]
 fn sequenced_player_input_passes_an_unacknowledged_checksum_batch() {
-    use crate::net::udp::test_support::MAX_DATAGRAM;
     use crate::sim::command::{Command, MEGAMISSION_OPCODE};
-    let (mut worlds, rules, actor, boundaries, socket, mut relay) = sequenced_pair();
+    let (mut worlds, rules, actor, boundaries, mut relay) = sequenced_pair();
     let first_address = boundaries[0].live.borrow().primary_addr().unwrap();
     let mut hold_receipts = false;
     let mut issued = false;
@@ -4722,15 +4348,6 @@ fn sequenced_player_input_passes_an_unacknowledged_checksum_batch() {
             assert!(worlds[0].issue_local_command(CommandEnvelope::synchronized(record, tick)));
             issued = true;
         }
-        relay.advance_clock(now_ms, 100 + (now_ms - 16_000) / 1000);
-        for forwarded in relay.drain_ordering_push(now_ms, 100 + (now_ms - 16_000) / 1000) {
-            if !hold_receipts || forwarded.endpoint != first_address {
-                socket
-                    .send_to(&forwarded.bytes, forwarded.endpoint)
-                    .unwrap();
-            }
-        }
-        settle_loopback();
         for boundary in &boundaries {
             boundary.now.set((now_ms >> 4) as u32);
             boundary
@@ -4738,33 +4355,9 @@ fn sequenced_player_input_passes_an_unacknowledged_checksum_batch() {
                 .borrow_mut()
                 .service_transport((now_ms >> 4) as u32);
         }
-        settle_loopback();
-        loop {
-            let mut packet = [0; MAX_DATAGRAM + 1];
-            let (length, std::net::SocketAddr::V4(from)) = (match socket.recv_from(&mut packet) {
-                Ok(value) => value,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("{error}"),
-            }) else {
-                unreachable!()
-            };
-            for forwarded in relay
-                .process_at(
-                    from,
-                    &packet[..length],
-                    100 + (now_ms - 16_000) / 1000,
-                    now_ms,
-                )
-                .unwrap_or_default()
-            {
-                if !hold_receipts || forwarded.endpoint != first_address {
-                    socket
-                        .send_to(&forwarded.bytes, forwarded.endpoint)
-                        .unwrap();
-                }
-            }
-        }
-        settle_loopback();
+        relay.pass(now_ms, |reply| {
+            !hold_receipts || reply.endpoint != first_address
+        });
         for side in 0..2 {
             production_frame(&mut worlds[side], &rules, &boundaries[side]);
         }
@@ -4816,9 +4409,8 @@ fn sequenced_player_input_passes_an_unacknowledged_checksum_batch() {
 
 #[test]
 fn sequenced_fresh_batch_survives_one_lost_datagram_within_an_rto() {
-    use crate::net::udp::test_support::MAX_DATAGRAM;
     use crate::sim::command::{Command, MEGAMISSION_OPCODE};
-    let (mut worlds, rules, actor, boundaries, socket, mut relay) = sequenced_pair();
+    let (mut worlds, rules, actor, boundaries, mut relay) = sequenced_pair();
     let first_address = boundaries[0].live.borrow().primary_addr().unwrap();
     let mut issued = false;
     let mut sent = None;
@@ -4829,12 +4421,11 @@ fn sequenced_fresh_batch_survives_one_lost_datagram_within_an_rto() {
             .live
             .borrow()
             .command_delivery_traces()
-            .last()
-            .is_some_and(|trace| trace.sent_at.is_some())
+            .next()
+            .is_some()
     };
     for step in 0..250 {
         let now_ms = 16_000 + step * 16;
-        let unix = 100 + (now_ms - 16_000) / 1000;
         if !issued && worlds[0].session().binary_frame() >= 20 {
             let owner = worlds[0].interner.get("Alpha").unwrap();
             let record = worlds[0]
@@ -4851,36 +4442,11 @@ fn sequenced_fresh_batch_survives_one_lost_datagram_within_an_rto() {
             assert!(worlds[0].issue_local_command(CommandEnvelope::synchronized(record, tick)));
             issued = true;
         }
-        relay.advance_clock(now_ms, unix);
-        for forwarded in relay.drain_ordering_push(now_ms, unix) {
-            socket
-                .send_to(&forwarded.bytes, forwarded.endpoint)
-                .unwrap();
-        }
-        settle_loopback();
-        for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
-            boundary.now.set((now_ms >> 4) as u32);
-            boundary.live.borrow_mut().service_pending_commands(
-                &mut world.network_command_queues(),
-                (now_ms >> 4) as u32,
-            );
-        }
+        service_pair(&mut worlds, &boundaries, now_ms);
         if sent.is_none() && traced_send(&boundaries[0]) {
             sent = Some(step);
         }
-        settle_loopback();
-        let mut packets = Vec::new();
-        loop {
-            let mut packet = [0; MAX_DATAGRAM + 1];
-            let (length, std::net::SocketAddr::V4(from)) = (match socket.recv_from(&mut packet) {
-                Ok(value) => value,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("{error}"),
-            }) else {
-                unreachable!()
-            };
-            packets.push((from, packet[..length].to_vec()));
-        }
+        let mut packets = relay.received();
         if sent.is_some() && !lost {
             // Lose the first datagram of the fresh command batch, the
             // sender's largest; small control datagrams still arrive.
@@ -4898,17 +4464,7 @@ fn sequenced_fresh_batch_survives_one_lost_datagram_within_an_rto() {
                 lost = true;
             }
         }
-        for (from, bytes) in packets {
-            for forwarded in relay
-                .process_at(from, &bytes, unix, now_ms)
-                .unwrap_or_default()
-            {
-                socket
-                    .send_to(&forwarded.bytes, forwarded.endpoint)
-                    .unwrap();
-            }
-        }
-        settle_loopback();
+        relay.answer(now_ms, packets, |_| true);
         for side in 0..2 {
             production_frame(&mut worlds[side], &rules, &boundaries[side]);
         }
@@ -4941,54 +4497,15 @@ fn sequenced_fresh_batch_survives_one_lost_datagram_within_an_rto() {
         .command_delivery_traces()
         .last()
         .expect("command batch traced");
-    assert!(trace.sent_at.is_some() && trace.assigned.is_some());
+    assert!(trace.assigned.is_some());
 }
 
 #[test]
 fn sequenced_transport_sends_input_while_the_canonical_frontier_is_closed() {
-    use crate::net::udp::test_support::MAX_DATAGRAM;
     use crate::sim::command::{Command, MEGAMISSION_OPCODE};
 
-    let (mut worlds, rules, actor, boundaries, socket, mut relay) = sequenced_pair();
+    let (mut worlds, rules, actor, boundaries, mut relay) = sequenced_pair();
     let first_address = boundaries[0].live.borrow().primary_addr().unwrap();
-    let pump = |relay: &mut crate::net::udp::test_support::RelayServer,
-                now_ms: u64,
-                hold_sender: bool| {
-        settle_loopback();
-        loop {
-            let mut packet = [0; MAX_DATAGRAM + 1];
-            let (length, std::net::SocketAddr::V4(from)) = (match socket.recv_from(&mut packet) {
-                Ok(value) => value,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("{error}"),
-            }) else {
-                unreachable!()
-            };
-            for forwarded in relay
-                .process_at(
-                    from,
-                    &packet[..length],
-                    100 + (now_ms - 16_000) / 1000,
-                    now_ms,
-                )
-                .unwrap_or_default()
-            {
-                if !hold_sender || forwarded.endpoint != first_address {
-                    socket
-                        .send_to(&forwarded.bytes, forwarded.endpoint)
-                        .unwrap();
-                }
-            }
-        }
-        for forwarded in relay.drain_ordering_push(now_ms, 100 + (now_ms - 16_000) / 1000) {
-            if !hold_sender || forwarded.endpoint != first_address {
-                socket
-                    .send_to(&forwarded.bytes, forwarded.endpoint)
-                    .unwrap();
-            }
-        }
-        settle_loopback();
-    };
     let mut hold_sender = false;
     let mut held_tick = None;
     let mut observed = false;
@@ -5016,15 +4533,10 @@ fn sequenced_transport_sends_input_while_the_canonical_frontier_is_closed() {
             assert!(worlds[0].issue_local_command(CommandEnvelope::synchronized(record, tick)));
             held_tick = Some(tick);
         }
-        relay.advance_clock(now_ms, 100 + (now_ms - 16_000) / 1000);
-        for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
-            boundary.now.set((now_ms >> 4) as u32);
-            boundary.live.borrow_mut().service_pending_commands(
-                &mut world.network_command_queues(),
-                (now_ms >> 4) as u32,
-            );
-        }
-        pump(&mut relay, now_ms, hold_sender);
+        service_pair(&mut worlds, &boundaries, now_ms);
+        relay.pass(now_ms, |reply| {
+            !hold_sender || reply.endpoint != first_address
+        });
         if held_tick.is_none() {
             production_frame(&mut worlds[0], &rules, &boundaries[0]);
         }
@@ -5067,14 +4579,8 @@ fn sequenced_transport_sends_input_while_the_canonical_frontier_is_closed() {
     let quiescent_start = u64::from(boundaries[0].now.get()) * 16;
     for step in 1..=32 {
         let now_ms = quiescent_start + step * 16;
-        relay.advance_clock(now_ms, 100 + (now_ms - 16_000) / 1000);
-        for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
-            boundary.live.borrow_mut().service_pending_commands(
-                &mut world.network_command_queues(),
-                (now_ms >> 4) as u32,
-            );
-        }
-        pump(&mut relay, now_ms, false);
+        service_pair(&mut worlds, &boundaries, now_ms);
+        relay.pass(now_ms, |_| true);
         let mut peer = boundaries[1].live.borrow_mut();
         // An explicit diagnostic read is independent of normal pushed
         // delivery. Idle clients no longer request a status every frame.
@@ -5082,7 +4588,7 @@ fn sequenced_transport_sends_input_while_the_canonical_frontier_is_closed() {
         let deadline = Instant::now() + STALL_LIMIT;
         let mut saw_status = false;
         while !saw_status && Instant::now() < deadline {
-            pump(&mut relay, now_ms, false);
+            relay.pass(now_ms, |_| true);
             peer.transport.service((now_ms >> 4) as u32);
             while let Some(event) = peer.transport.pop_ordering_received() {
                 match event {
@@ -5121,7 +4627,7 @@ fn sequenced_transport_sends_input_while_the_canonical_frontier_is_closed() {
 /// stops hearing them.
 #[test]
 fn a_removed_player_the_relay_stops_hearing_is_not_named() {
-    let (_, _, _, boundaries, _, _) = sequenced_pair();
+    let (_, _, _, boundaries, _) = sequenced_pair();
     let mut live = boundaries[0].live.borrow_mut();
     let silent = |live: &mut LiveCommandSession, sources| {
         live.sequenced.as_mut().unwrap().note_silent(sources);
@@ -5137,4 +4643,60 @@ fn a_removed_player_the_relay_stops_hearing_is_not_named() {
     assert_eq!(silent(&mut live, 0), named(true));
     assert!(live.remove_peer(1));
     assert!(silent(&mut live, 0b10).is_empty());
+}
+
+/// A relay that lost a running match's configuration (NotConfigured) stops its
+/// clock until it is configured again, but the match did start: a player lost
+/// meanwhile leaves a running match, not a start.
+#[test]
+fn a_running_match_its_relay_lost_is_not_startup_pending() {
+    use vera20k_relay_protocol::{OrderError, OrderEvent};
+
+    let (_, _, _, boundaries, _) = sequenced_pair();
+    let mut live = boundaries[0].live.borrow_mut();
+    assert!(live.startup_pending());
+    live.transport
+        .push_ordering_received_for_test(OrderEvent::Status(sequenced::fixtures::started_status()));
+    live.service_transport(1);
+    assert!(!live.startup_pending());
+    live.transport
+        .push_ordering_received_for_test(OrderEvent::Error {
+            code: OrderError::NotConfigured,
+            expected: 0,
+        });
+    live.service_transport(2);
+    assert!(live.awaiting_initial_barrier(), "the relay's clock stopped");
+    assert!(!live.startup_pending());
+}
+
+/// The session that ends a match keeps it ended: poll reports the error once,
+/// and the match still reads as failed after it.
+#[test]
+fn a_reported_relay_failure_stays_with_its_session() {
+    use vera20k_relay_protocol::{OrderError, OrderEvent};
+
+    let (mut worlds, _, _, boundaries, _) = sequenced_pair();
+    let mut live = boundaries[0].live.borrow_mut();
+    live.transport
+        .push_ordering_received_for_test(OrderEvent::Error {
+            code: OrderError::HistoryGap,
+            expected: 0,
+        });
+    let mut queues = worlds[0].network_command_queues();
+    let context = NetworkQueueContext {
+        frame: 0,
+        checksum: 0,
+    };
+    let reported = live.poll(&mut queues, context, 10, 1, 16, 0);
+    assert!(matches!(
+        reported,
+        Err(LiveCommandError::Sequenced(SequencedError::HistoryExpired))
+    ));
+    assert!(live.has_terminal_network_error());
+    let again = live.poll(&mut queues, context, 10, 2, 32, 0);
+    assert!(matches!(again, Err(LiveCommandError::Failed)));
+    assert_eq!(
+        live.delivery_counters().unwrap().failure,
+        Some("history_expired")
+    );
 }

@@ -12,7 +12,6 @@ use crate::render::bit_font::BitFont;
 use crate::render::shell_paint::{self, PaintLabel};
 use crate::render::shell_text::{self, ShellAlign, ShellTextDraw, TextRect};
 use crate::skirmish_launch::{LaunchCountry, LaunchStartPosition};
-use crate::skirmish_modes::mode_by_id;
 use crate::ui::shell::geom::ShellScale;
 use crate::ui::shell::list::ListMetrics;
 use crate::ui::shell::modal::BodyOkLayout;
@@ -467,11 +466,9 @@ fn push_combo_face_label_draw_with_color(
 pub(crate) fn skirmish_right_panel_label_strings(state: &AppState) -> (String, String, String) {
     let shell = &state.frontend.skirmish_shell_state;
     let title = localized_label(state, "GUI:SkirmishGame", "Skirmish Game");
-    let game_type = state
-        .frontend
-        .skirmish_modes
-        .iter()
-        .find(|mode| mode.id == shell.selected_mode_id)
+    let game_type = shell
+        .selected_mode
+        .resolve(&state.frontend.skirmish_modes)
         .map(|mode| localized_label(state, &mode.ui_name_key, &mode.ui_name_key))
         .unwrap_or_else(|| localized_label(state, "GUI:Battle", "Battle"));
     // VERA: with no map files the list is empty and no map is selected. The
@@ -949,6 +946,9 @@ pub(super) fn push_random_map_setup_modal_text_draws(
     }
     if modal.advanced && modal.extras_page.is_none() {
         for field in crate::ui::skirmish_shell::AdvancedField::ALL {
+            if field.page() != modal.advanced_page {
+                continue;
+            }
             let (key, fallback) = field.label();
             let color = if modal.is_enabled(RandomMapSetupControl::Advanced(field)) {
                 SHELL_LABEL_TEXT_RGB
@@ -959,13 +959,14 @@ pub(super) fn push_random_map_setup_modal_text_draws(
                 out,
                 state,
                 &localized_label(state, key, fallback),
-                rect_to_text_rect(layout.advanced_label_rects[field.row()]),
+                rect_to_text_rect(layout.advanced_label_rects[field.page_row()]),
                 color,
                 ShellAlign::V_CENTER,
                 SHELL_DROPDOWN_TEXT_DEPTH - 0.00008,
                 scale.factor(),
             );
-            let value_rect = value_text_rect(layout.advanced_control_rects[field.row()], scale);
+            let value_rect =
+                value_text_rect(layout.advanced_control_rects[field.page_row()], scale);
             push_text_draw(
                 out,
                 state,
@@ -1418,19 +1419,19 @@ pub(super) fn push_choose_map_modal_text_draws(
         }
     }
     let geometry = modal.mode_geometry(layout);
-    for (visible, mode_id) in modal
+    for (visible, chosen) in modal
         .mode_rows()
         .iter()
         .skip(modal.mode_top_index)
         .take(geometry.visible_rows)
         .enumerate()
     {
-        let label = if *mode_id == crate::ui::skirmish_shell::ONLINE_MAPS_ROW {
+        let label = if chosen.id == crate::ui::skirmish_shell::ONLINE_MAPS_ROW {
             tr("VERA:OnlineMaps")
-        } else if *mode_id == crate::ui::skirmish_shell::FAVORITES_ROW {
+        } else if chosen.id == crate::ui::skirmish_shell::FAVORITES_ROW {
             tr("VERA:Favorites")
         } else {
-            let Some(mode) = mode_by_id(&state.frontend.skirmish_modes, *mode_id) else {
+            let Some(mode) = chosen.resolve(&state.frontend.skirmish_modes) else {
                 continue;
             };
             localized_label(state, &mode.ui_name_key, &mode.ui_name_key)

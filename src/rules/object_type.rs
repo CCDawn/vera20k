@@ -374,6 +374,18 @@ pub const WEAPON_COUNT_LIMIT: i32 = 1024;
 /// which for a value near `i32::MAX` exhausts memory; no dock layout needs more.
 pub const DOCK_CONTACT_LIMIT: i32 = 256;
 
+/// VERA's bound on `MaxDebris=` and `MinDebris=` (TechnoType and Warhead).
+/// The debris throw (`0x00702291..0x0070256C`, `0x00469D0C..0x00469EB4`)
+/// draws and builds one piece at a time, so a value near `i32::MAX` freezes
+/// the match on the first death; retail throws at most 15.
+pub const DEBRIS_LIMIT: i32 = 256;
+
+/// VERA's bound on `SpawnsNumber=`, read by `TechnoTypeClass::ReadINI`'s
+/// ReadInt (`0x00714EF0`, `+0xD5C`). The spawn manager constructor
+/// (`0x006B6C90`) builds one node per spawn and each node its aircraft, so a
+/// value near `i32::MAX` exhausts memory; no carrier needs more.
+pub const SPAWNS_NUMBER_LIMIT: i32 = 128;
+
 /// Weapon-array slot the `Primary=` / `ElitePrimary=` keys name
 /// (`TechnoTypeClass+0x898` / `+0xA94`).
 pub const WEAPON_SLOT_PRIMARY: usize = 0;
@@ -903,6 +915,9 @@ pub struct ObjectType {
     /// the ordered TechnoType reader.
     #[cfg(feature = "phobos")]
     pub phobos_insignia: crate::rules::insignia_type::PhobosInsignia,
+    /// Ares `TechnoTypeExt` insignia keys (`Insignia*`, `InsigniaFrame*`,
+    /// `Insignia.ShowEnemy`), accumulated like the Phobos block above.
+    pub ares_insignia: crate::rules::insignia_type::AresInsignia,
     /// Phobos `Passengers.BySize` (`Valueable<bool>`, default yes): the
     /// passenger-count key `DrawInsignia` indexes `Insignia.PassengersN`
     /// with. Its other consumer, the NoQueueUpToEnter admission rewrite, is
@@ -1542,7 +1557,8 @@ pub struct ObjectType {
     /// resolvable value is the sole gate on creating a spawn manager, matching
     /// `TechnoClass::Init_Managers`.
     pub spawns: Option<String>,
-    /// Spawn pool capacity (`SpawnsNumber=`). Default 0.
+    /// Spawn pool capacity (`SpawnsNumber=`). Default 0, at most
+    /// [`SPAWNS_NUMBER_LIMIT`].
     pub spawns_number: i32,
     /// Frames before a destroyed spawn child is rebuilt (`SpawnRegenRate=`).
     pub spawn_regen_rate: u32,
@@ -1745,7 +1761,7 @@ pub struct ObjectType {
     /// pointer vector (`RulesClass__ReadAI @ 0x00672AE0`, binding
     /// `0x00672B14..0x00672C01`). `RuleSet` stamps this after all type
     /// registries exist.
-    pub build_const_eligible: bool,
+    pub(super) build_const_eligible: bool,
     /// Native BuildingType registry index used by ordered House BasePlan nodes.
     /// Non-building types retain `-1`.
     pub base_plan_type_index: i32,
@@ -3745,24 +3761,38 @@ impl ObjectType {
         self.vehicle_thief = flags.vehicle_thief.unwrap_or(self.vehicle_thief);
     }
 
-    /// TechnoType GetPipMax716290, virtual+74. Signed configuration capacity;
-    /// callers own allocation/fill bounds. Uses the live bound base weapon0,
-    /// not a capture manager's retained admission capacity or elite weapon.
+    /// GetPipMax, virtual+74: BuildingType's override (0x0045ECE0) for a
+    /// Building, else TechnoType's (0x00716290). Signed configuration
+    /// capacity; callers own allocation/fill bounds. Uses the live bound base
+    /// weapon0, not a capture manager's retained admission capacity or elite
+    /// weapon.
     pub fn pip_max(&self, rules: &crate::rules::ruleset::RuleSet) -> i32 {
-        // Ares 3.0 BuildingTypeClass_GetMaxPips 10010150 (hook 0x45ECE0): a
-        // building on a custom foundation answers its `Foundation.X` width
-        // for every PipScale. (VERA lacks the stock BuildingType override
-        // 0x0045ECE0 itself, which sizes Tiberium and Power pips by the
-        // foundation width; buildings take the TechnoType answer below.)
-        // Only a Rules read the Ares way installs a custom foundation.
-        if self.category == ObjectCategory::Building
-            && matches!(
-                self.foundation,
-                crate::rules::foundation::Foundation::Custom(_)
-            )
-        {
-            return i32::from(self.foundation.dimensions().0);
+        // BuildingTypeClass::GetPipMax 0x0045ECE0: the foundation width
+        // (table 0x008192B8) times 60, divided by 8 toward zero
+        // (0x0045ECED..0x0045ED02), caps Tiberium pips at `Storage=`, or a
+        // Weeder's at `[General] WeedCapacity=`, a negative one answering 0;
+        // Power answers the cap, every other scale TechnoType's. Ares
+        // BuildingTypeClass_GetMaxPips (Ares.dll 10010150, hook 0x45ECE0)
+        // only loads a custom foundation's `Foundation.X` as that width and
+        // resumes at 0x0045ECED. Stock buildings draw no Tiberium pips
+        // (DrawPipScalePips 0x00709B61), so the Tiberium arm shows only with
+        // Ares' storage pips (docs/ares-tiberium.md).
+        if self.category == ObjectCategory::Building {
+            let cap = i32::from(self.foundation.dimensions().0) * 60 / 8;
+            match self.pip_scale {
+                PipScale::Tiberium => {
+                    let held = if self.weeder {
+                        rules.general.weed_capacity
+                    } else {
+                        self.storage
+                    };
+                    return if held < 0 { 0 } else { held.min(cap) };
+                }
+                PipScale::Power => return cap,
+                _ => {}
+            }
         }
+        // TechnoTypeClass::GetPipMax 0x00716290.
         match self.pip_scale {
             PipScale::None => 0,
             PipScale::Ammo => self.ammo,
@@ -4245,6 +4275,11 @@ impl ObjectType {
         }
     }
 
+    /// Membership in the ruleset's ordered `[AI] BuildConst=` list.
+    pub fn build_const_eligible(&self) -> bool {
+        self.build_const_eligible
+    }
+
     /// BuildingType gate used by the native base-reservation setter. With
     /// Ares, `BuildingExt::ExtData::IsBaseNormal @ 10011810` (hooks
     /// `0x00440C08` Unlimbo, `0x00445A72` Limbo, `0x00456370` the neighbour
@@ -4384,8 +4419,8 @@ impl ObjectType {
         // no folding step, so the 17 `[VehicleTypes]` that spell it
         // `Maxdebris=3` are invisible to gamemd and keep the constructor
         // default of 0 (`TechnoTypeClass::Constructor 0x00710FB7`).
-        let max_debris = section.read_int("MaxDebris", 0);
-        let min_debris = section.read_int("MinDebris", 0).max(0);
+        let max_debris = section.read_int("MaxDebris", 0).min(DEBRIS_LIMIT);
+        let min_debris = section.read_int("MinDebris", 0).clamp(0, DEBRIS_LIMIT);
         let max_debris = max_debris.max(min_debris);
 
         Self {
@@ -4692,6 +4727,7 @@ impl ObjectType {
             // accumulates these keys over every reached pass.
             #[cfg(feature = "phobos")]
             phobos_insignia: crate::rules::insignia_type::PhobosInsignia::default(),
+            ares_insignia: crate::rules::insignia_type::AresInsignia::default(),
             #[cfg(feature = "phobos")]
             phobos_passengers_by_size: crate::rules::ares_switch::not_ares_read(|| {
                 section.read_ares_bool("Passengers.BySize", true)
@@ -4958,7 +4994,7 @@ impl ObjectType {
             // Spawn manager pool. Constructor null; only the ordered Process
             // owner reads `Spawns=`.
             spawns: None,
-            spawns_number: section.read_int("SpawnsNumber", 0),
+            spawns_number: section.read_int("SpawnsNumber", 0).min(SPAWNS_NUMBER_LIMIT),
             spawn_regen_rate: section.read_int("SpawnRegenRate", 0).max(0) as u32,
             spawn_reload_rate: section.read_int("SpawnReloadRate", 0).max(0) as u32,
             missile_spawn: section.read_bool("MissileSpawn", false),
@@ -5657,6 +5693,10 @@ mod ammo_pip_tests;
 #[cfg(all(test, tests_rules_o_z))]
 #[path = "absorber_pip_tests.rs"]
 mod absorber_pip_tests;
+
+#[cfg(all(test, tests_rules_o_z))]
+#[path = "building_pip_tests.rs"]
+mod building_pip_tests;
 
 #[cfg(all(test, tests_rules_o_z))]
 mod tests {

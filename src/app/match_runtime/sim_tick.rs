@@ -818,23 +818,6 @@ fn audio_pump_follows_main_tick(mode: SessionMode, match_admitted: bool, own_loo
     mode.is_single_player() && match_admitted && !own_loop
 }
 
-/// Pure modal-pump decision: should the simulation advance one frame while a
-/// modal dialog is open? Mirrors the pump body: advance only on the network
-/// branch (LAN/WOL), only when neither service-only blocker is set, and only
-/// when no fixed tick is already in progress. Offline campaign/skirmish freeze
-/// the world; message, input, and repaint still run in the surrounding loop.
-/// Pure and total, so it is unit-tested without an `AppState`. The live
-/// app-layer consumer is `decide_runtime_pass`, which composes it with the
-/// pacer timing answer and the remaining freeze predicates to gate the
-/// one-frame admission inside `advance_in_game_runtime`.
-pub fn modal_pump_should_advance_sim(
-    mode: SessionMode,
-    service_only_blocked: bool,
-    reentrancy_in_progress: bool,
-) -> bool {
-    mode.is_network() && !service_only_blocked && !reentrancy_in_progress
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WallClockServiceAdmission {
     simulation: bool,
@@ -847,16 +830,18 @@ struct WallClockServiceAdmission {
 /// it stops simulation only and leaves ordinary per-render camera/placement
 /// updates admitted.
 ///
-/// gamemd-derived: modal service pump, verified `FUN_00623120 @ 0x00623120`.
+/// `ProcessModalServicePump @ 0x00623120` runs Main_Tick behind a modal only
+/// outside `g_GameMode` 0 and 5; offline, it services messages and repaints
+/// with the world frozen. Its other blockers, the lobby byte `0x00A8D60E`,
+/// the counter `0x00A8DAB4` and Main_Tick's reentrancy byte `0x00ABCD58`
+/// (read by `0x0055CBF0`), stay clear here: VERA's in-game modal pass never
+/// runs inside Main_Tick, event execution or the lobby.
 fn wall_clock_service_admission(
     paused: bool,
     modal_open: bool,
     mode: SessionMode,
-    service_only_blocked: bool,
-    reentrancy_in_progress: bool,
 ) -> WallClockServiceAdmission {
-    let tactical_mutation = !modal_open
-        || modal_pump_should_advance_sim(mode, service_only_blocked, reentrancy_in_progress);
+    let tactical_mutation = !modal_open || mode.is_network();
     WallClockServiceAdmission {
         simulation: if modal_open {
             tactical_mutation
@@ -941,16 +926,8 @@ pub(crate) fn decide_runtime_pass(inputs: RuntimePassInputs) -> RuntimePassDecis
             sidebar_action: true,
         };
     }
-    // The session owner (`MatchSession`) carries no network service-only
-    // blocker yet; the in-game network service of a later networking stage
-    // supplies their combined state.
-    let service = wall_clock_service_admission(
-        inputs.paused,
-        inputs.menu_open,
-        inputs.session_mode,
-        false,
-        false,
-    );
+    let service =
+        wall_clock_service_admission(inputs.paused, inputs.menu_open, inputs.session_mode);
     let pacer_admitted = service.simulation && inputs.pacer_timing_admits;
     let scenario_blocks =
         super::scenario_pause::blocks_main_tick(inputs.session_mode, inputs.scenario_paused);
@@ -1146,30 +1123,14 @@ fn advance_in_game_runtime_mode(
                     true
                 } else if let Some(runtime) = state.match_state.sim_runtime.runtime() {
                     let frame = runtime.simulation.session().binary_frame();
-                    let frontier = live.committed_frontier();
-                    if let Some(timing) = live.sequenced_timing().filter(|_| {
-                        !replaying
-                            && !frame_stepping
-                            && !state.match_state.paused()
-                            && !state.focus_freeze_active()
-                            && !runtime.simulation.session().scenario_paused()
-                    }) {
-                        let recovering = live.recovery_status(now_ms as u32, frame).is_some();
-                        state
-                            .platform
-                            .frame_pacer
-                            .online_frame_decision(
-                                crate::util::time::Instant::now(),
-                                frame,
-                                frontier,
-                                timing,
-                                resume_wait,
-                                recovering,
-                            )
-                            .admits()
-                    } else {
-                        super::frame_pacer::LocalFramePacer::admits_canonical_frame(frame, frontier)
-                    }
+                    let inputs = online_pacing_inputs(state, frame, now_ms);
+                    state.platform.frame_pacer.admits_online_frame(
+                        crate::util::time::Instant::now(),
+                        frame,
+                        live.committed_frontier(),
+                        inputs,
+                        resume_wait,
+                    )
                 } else {
                     false
                 }
@@ -1321,27 +1282,15 @@ fn advance_in_game_runtime_mode(
             .as_ref()
             .filter(|live| live.uses_sequenced_lockstep() && !live.has_terminal_network_error())
         {
+            // A frame step has cleared its request above; it ticks inline
+            // whatever this answers.
             Some(live) => state.match_state.sim_runtime.runtime().is_some_and(|rt| {
-                let session = rt.simulation.session();
-                let next_frame = session.binary_frame().wrapping_add(1);
-                let receipt = live
-                    .sequenced_timing()
-                    .filter(|_| {
-                        !replaying
-                            && !frame_stepping
-                            && !state.match_state.paused()
-                            && !state.focus_freeze_active()
-                            && !session.scenario_paused()
-                    })
-                    .map(|timing| {
-                        let recovering = live.recovery_status(wall_ms as u32, next_frame).is_some();
-                        (timing, recovering)
-                    });
+                let next_frame = rt.simulation.session().binary_frame().wrapping_add(1);
                 pacer.another_online_pass_follows(
                     now,
                     next_frame,
                     live.committed_frontier(),
-                    receipt,
+                    online_pacing_inputs(state, next_frame, wall_ms),
                 )
             }),
             None => pacer.another_pass_follows(
@@ -1672,9 +1621,9 @@ fn play_hash_interval(network: bool) -> std::num::NonZeroU64 {
     }
 }
 
-/// The GameSpeed and network FPS (with lag delay) the local pacer times
-/// Main_Tick by; sequenced online play paces with its own clock instead.
-pub(crate) fn local_pacing_inputs(state: &AppState) -> (u8, Option<(u16, u32)>) {
+/// Game speed and network FPS for the local frame timer.
+/// Relay-sequenced play uses the online pacer.
+pub(crate) fn local_pacing_inputs(state: &AppState) -> (u8, Option<u16>) {
     let game_speed = state
         .match_state
         .sim_runtime
@@ -1695,6 +1644,37 @@ pub(crate) fn local_pacing_inputs(state: &AppState) -> (u8, Option<(u16, u32)>) 
             },
         );
     (game_speed, super::network_match::frame_budget(state))
+}
+
+/// The online pacer's inputs for canonical `frame`: the relay's timing and
+/// whether `frame` is being recovered. `None` while the match is held
+/// (paused, focus-frozen, scenario-paused, replaying or frame-stepping) or
+/// before the relay's timing arrives; the committed frontier alone then
+/// admits frames (`LocalFramePacer::admits_canonical_frame`). The pass, the
+/// lend decision, the catch-up service and the render continuation all ask
+/// this; each keeps its own policy for a terminal network error.
+pub(crate) fn online_pacing_inputs(
+    state: &AppState,
+    frame: u32,
+    now_ms: u64,
+) -> Option<(crate::net::live_commands::SequencedTiming, bool)> {
+    let live = state.match_state.live_network.as_ref()?;
+    let session = state
+        .match_state
+        .sim_runtime
+        .runtime()?
+        .simulation
+        .session();
+    if state.match_state.paused()
+        || state.focus_freeze_active()
+        || session.scenario_paused()
+        || state.match_state.match_diagnostics.is_replay_playback()
+        || state.diag.debug_frame_step_requested
+    {
+        return None;
+    }
+    let timing = live.sequenced_timing()?;
+    Some((timing, live.recovery_status(now_ms as u32, frame).is_some()))
 }
 
 /// Debug speed is limited to an offline Skirmish; online, LAN and campaign
@@ -1749,6 +1729,25 @@ enum FrameResume {
     /// (`DeferredClientEffects::hands_off_queue`). It resumes as a network
     /// wait does; the thread's part already counted the frame's cost.
     QueueHandoff,
+}
+
+impl FrameResume {
+    /// Run the frame this resume names with the caller's effects.
+    fn run(
+        self,
+        rt: &mut crate::sim::runtime::SimRuntime,
+        due_commands: &[crate::sim::command::CommandEnvelope],
+        tick_lane: TickLane,
+        effects: FrameEffects<'_>,
+    ) -> Result<SimFrameOutput, crate::sim::world::FrameAdvanceError> {
+        match self {
+            Self::ChecksumModal => rt.resume_after_network_failure(effects),
+            Self::NetworkWait | Self::QueueHandoff => rt.resume_network_wait(effects),
+            Self::NetworkLeave => rt.leave_network_wait(effects),
+            Self::OutcomeWait => rt.resume_outcome_wait(effects),
+            Self::None => rt.advance_frame(due_commands, SIM_TICK_MS, tick_lane, effects),
+        }
+    }
 }
 
 /// House+56F9, the House colour an Ares `Beam.IsHouseColor` birth keeps
@@ -1888,12 +1887,6 @@ fn advance_one_simulation_frame(
     let local_owner_name = crate::app::input::commands::preferred_local_owner_name(state);
     let sound_listener = crate::app::presentation::building_anim::sound_listener(state);
     let session_mode = state.match_state.session_mode();
-    let logic_frame_rate = state
-        .match_state
-        .match_presentation
-        .detail
-        .borrow()
-        .frame_rate();
     let other_local_pause = state.match_state.local_paused();
     let rules_owner = state.process_assets.native_rules();
     let initial_save = if !resuming && tick_lane == TickLane::Ordinary {
@@ -1976,7 +1969,9 @@ fn advance_one_simulation_frame(
     // Report points need the ledger whether or not a dashboard is
     // attached; `publish_if_due` only runs with a client. Elsewhere
     // the performance panel's Most CPU row reads it while the panel shows.
-    sim.set_frame_profiling(cfg!(feature = "telemetry-dashboard") || fps_panel_shown);
+    sim.set_frame_profiling(
+        cfg!(feature = "telemetry-dashboard") || cfg!(feature = "perf") || fps_panel_shown,
+    );
     // Delay-zero AnimClass construction can emit StartSound during the
     // final map-load sweep. Keep it until this first tactical drain;
     // `drain(..)` below still consumes every event exactly once.
@@ -2202,10 +2197,9 @@ fn advance_one_simulation_frame(
             &mut state.match_state.input.planning,
             &mut state.match_state.input.selection_state,
         )
-        .with_network_session(&mut state.match_state.session)
+        .with_latency_fudge(state.match_state.session.latency_fudge())
         .with_frame_checksums(frame_checksums)
         .with_live_network(state.match_state.live_network.as_mut())
-        .with_logic_frame_rate(logic_frame_rate)
         .with_scenario_pause(
             &mut state.match_state.match_presentation.scenario_pause,
             &elapsed_clock,
@@ -2248,18 +2242,7 @@ fn advance_one_simulation_frame(
             }
         } else {
             let network = rt.simulation.session().game_mode().is_network();
-            let advanced = match resume {
-                FrameResume::ChecksumModal => rt.resume_after_network_failure(effects),
-                FrameResume::NetworkWait | FrameResume::QueueHandoff => {
-                    rt.resume_network_wait(effects)
-                }
-                FrameResume::NetworkLeave => rt.leave_network_wait(effects),
-                FrameResume::OutcomeWait => rt.resume_outcome_wait(effects),
-                FrameResume::None => {
-                    rt.advance_frame(&due_commands, SIM_TICK_MS, tick_lane, effects)
-                }
-            };
-            match advanced {
+            match resume.run(rt, &due_commands, tick_lane, effects) {
                 Ok(advanced) => advanced,
                 Err(error) => {
                     stop_failed_frame(state, network, &error);
@@ -2415,13 +2398,7 @@ fn run_deferred_tick(
     } else {
         effects
     };
-    match resume {
-        FrameResume::ChecksumModal => rt.resume_after_network_failure(effects),
-        FrameResume::NetworkWait | FrameResume::QueueHandoff => rt.resume_network_wait(effects),
-        FrameResume::NetworkLeave => rt.leave_network_wait(effects),
-        FrameResume::OutcomeWait => rt.resume_outcome_wait(effects),
-        FrameResume::None => rt.advance_frame(due_commands, SIM_TICK_MS, tick_lane, effects),
-    }
+    resume.run(rt, due_commands, tick_lane, effects)
 }
 
 /// The frame tail on the main thread: the client takes the tick's output.
@@ -2451,6 +2428,9 @@ fn finish_simulation_frame(
     let mut hud_messages = Vec::new();
     // Carried out of the sim borrow so the census can read `state` freely below.
     let mut census_tick: Option<u64> = None;
+    // Read before the world is borrowed for writing below.
+    #[cfg(feature = "telemetry-dashboard")]
+    let telemetry_budget_ms = super::network_match::game_frame_ms(state);
     {
         if let Some((rt, _)) = state.match_state.sim_runtime.tick_parts() {
             state
@@ -2506,6 +2486,24 @@ fn finish_simulation_frame(
             // its cost from that thread's part; the exchange adds no sample.
             if let Some(tick_cost) = tick_cost {
                 let tick_ms = tick_cost.as_secs_f32() * 1000.0;
+                // Capture the committed tick's SIM snapshot while the runtime
+                // is home (this is the tick tail). The perf recorder reads this
+                // at present time, when the runtime may be lent to the SIM
+                // thread and `home_runtime()` is None.
+                #[cfg(feature = "perf")]
+                {
+                    use crate::app::diagnostics::perf_recorder::PerfTickSnapshot;
+                    let sim = rt.simulation.frame_profile().last_frame();
+                    let path = rt.simulation.path_batch_stats();
+                    state.diag.perf_last_tick = Some(PerfTickSnapshot {
+                        tick: rt.simulation.session().tick(),
+                        binary_frame: rt.simulation.session().binary_frame(),
+                        objects: rt.simulation.entities().len(),
+                        houses: rt.simulation.houses().len(),
+                        sim,
+                        path,
+                    });
+                }
                 state.match_state.network_quality.record_tick(tick_ms);
                 // The relay's pace reports carry the simulation's own cost.
                 if let Some(live) = state.match_state.live_network.as_mut() {
@@ -2526,33 +2524,10 @@ fn finish_simulation_frame(
                     // five seconds since the previous point rather than the whole
                     // match.
                     if crate::app::match_runtime::telemetry::ReportHistory::due(tick) {
-                        let speed = crate::sim::game_options::clamp_game_speed(
-                            rt.simulation.session().game_options().game_speed,
-                        );
-                        let mut timing = state.match_state.telemetry_timing.summarize(
-                            state.platform.frame_pacer.budget_ms(
-                                speed,
-                                rt.simulation
-                                    .session()
-                                    .network_command_timing()
-                                    .map(|timing| {
-                                        (
-                                            timing.frames_per_second(),
-                                            state.match_state.live_network.as_ref().map_or(
-                                                0,
-                                                |live| {
-                                                    live.pacing_delay_millis(
-                                                        rt.simulation
-                                                            .session()
-                                                            .network_max_ahead_frames()
-                                                            .unwrap_or(0),
-                                                    )
-                                                },
-                                            ),
-                                        )
-                                    }),
-                            ),
-                        );
+                        let mut timing = state
+                            .match_state
+                            .telemetry_timing
+                            .summarize(telemetry_budget_ms);
                         timing.fps = state.diag.frame_timer.fps();
                         timing.tick_hz = state
                             .match_state
@@ -3902,9 +3877,8 @@ mod camera_cadence_tests;
 #[cfg(all(test, tests_app_match))]
 mod modal_pump_tests {
     use super::{
-        SessionMode, audio_pump_follows_main_tick, modal_pump_should_advance_sim,
-        resolve_score_rows, score_title_key, should_record_replay_tick,
-        wall_clock_service_admission,
+        SessionMode, audio_pump_follows_main_tick, resolve_score_rows, score_title_key,
+        should_record_replay_tick, wall_clock_service_admission,
     };
 
     /// 0x005C9BE7: only GameMode 5 retitles 0x108.
@@ -3946,34 +3920,29 @@ mod modal_pump_tests {
 
     #[test]
     fn gsi_01_03_debug_pause_does_not_impersonate_an_offline_modal() {
-        let debug_pause =
-            wall_clock_service_admission(true, false, SessionMode::Skirmish, false, false);
+        let debug_pause = wall_clock_service_admission(true, false, SessionMode::Skirmish);
         assert!(!debug_pause.simulation);
         assert!(debug_pause.tactical_mutation);
 
-        let actual_modal =
-            wall_clock_service_admission(true, true, SessionMode::Skirmish, false, false);
+        let actual_modal = wall_clock_service_admission(true, true, SessionMode::Skirmish);
         assert!(!actual_modal.simulation);
         assert!(!actual_modal.tactical_mutation);
     }
 
     #[test]
     fn gsi_01_03_tactical_view_mutators_follow_modal_service_admission() {
-        // No modal means the ordinary app loop owns camera/placement updates;
-        // modal-pump blockers have no authority on that path.
+        let admitted = super::WallClockServiceAdmission {
+            simulation: true,
+            tactical_mutation: true,
+        };
+        // No modal means the ordinary app loop owns camera/placement updates.
         for mode in [
             SessionMode::Campaign,
             SessionMode::Skirmish,
             SessionMode::Lan,
             SessionMode::Wol,
         ] {
-            assert_eq!(
-                wall_clock_service_admission(false, false, mode, true, true),
-                super::WallClockServiceAdmission {
-                    simulation: true,
-                    tactical_mutation: true,
-                }
-            );
+            assert_eq!(wall_clock_service_admission(false, false, mode), admitted);
         }
 
         // The active offline Menu, Abort and Options callers all enter the
@@ -3981,7 +3950,7 @@ mod modal_pump_tests {
         // placement preview underneath the dialog.
         for mode in [SessionMode::Campaign, SessionMode::Skirmish] {
             assert_eq!(
-                wall_clock_service_admission(true, true, mode, false, false),
+                wall_clock_service_admission(true, true, mode),
                 super::WallClockServiceAdmission {
                     simulation: false,
                     tactical_mutation: false,
@@ -3989,29 +3958,9 @@ mod modal_pump_tests {
             );
         }
 
-        // Preserve the existing network-modal branch, including both native
-        // reasons it falls back to service-only work.
+        // A network match keeps running behind the modal.
         for mode in [SessionMode::Lan, SessionMode::Wol] {
-            let admitted = super::WallClockServiceAdmission {
-                simulation: true,
-                tactical_mutation: true,
-            };
-            let denied = super::WallClockServiceAdmission {
-                simulation: false,
-                tactical_mutation: false,
-            };
-            assert_eq!(
-                wall_clock_service_admission(true, true, mode, false, false),
-                admitted
-            );
-            assert_eq!(
-                wall_clock_service_admission(true, true, mode, true, false),
-                denied
-            );
-            assert_eq!(
-                wall_clock_service_admission(true, true, mode, false, true),
-                denied
-            );
+            assert_eq!(wall_clock_service_admission(true, true, mode), admitted);
         }
     }
 
@@ -4040,120 +3989,6 @@ mod modal_pump_tests {
             true,
             true
         ));
-    }
-
-    #[test]
-    fn only_network_modes_advance_behind_a_modal() {
-        // {3 LAN, 4 WOL} advance; {0 campaign, 5 skirmish} + Other freeze.
-        assert!(modal_pump_should_advance_sim(
-            SessionMode::Lan,
-            false,
-            false
-        ));
-        assert!(modal_pump_should_advance_sim(
-            SessionMode::Wol,
-            false,
-            false
-        ));
-        assert!(!modal_pump_should_advance_sim(
-            SessionMode::Campaign,
-            false,
-            false
-        ));
-        assert!(!modal_pump_should_advance_sim(
-            SessionMode::Skirmish,
-            false,
-            false
-        ));
-        assert!(!modal_pump_should_advance_sim(
-            SessionMode::Other,
-            false,
-            false
-        ));
-    }
-
-    #[test]
-    fn reentrancy_guard_blocks_advance_even_on_network() {
-        // The native reentrancy guard: a fixed tick already in progress means the
-        // pump skips advancing, even on the network branch.
-        assert!(!modal_pump_should_advance_sim(
-            SessionMode::Lan,
-            false,
-            true
-        ));
-        assert!(!modal_pump_should_advance_sim(
-            SessionMode::Wol,
-            false,
-            true
-        ));
-    }
-
-    #[test]
-    fn service_only_blockers_prevent_network_modal_advance() {
-        assert!(!modal_pump_should_advance_sim(
-            SessionMode::Lan,
-            true,
-            false
-        ));
-        assert!(!modal_pump_should_advance_sim(
-            SessionMode::Wol,
-            true,
-            false
-        ));
-    }
-
-    #[test]
-    fn pumped_tick_delta_is_zero_offline_and_n_on_network() {
-        // C2 acceptance at the decision level: the pump decision drives whether the
-        // world's fixed tick advances per pumped frame. `tick` stands in for
-        // `sim.session.tick`; the full headless-World assertion (incl. "no
-        // battlefield recomposite offline") lands with the live `service_tick` swap.
-        const FRAMES: u64 = 7;
-        let pumped = |mode: SessionMode| -> u64 {
-            let mut tick = 0u64;
-            for _ in 0..FRAMES {
-                if modal_pump_should_advance_sim(mode, false, false) {
-                    tick += 1; // one fixed step advanced this pumped frame
-                }
-            }
-            tick
-        };
-        // Offline freezes: zero advance over N pumped frames.
-        assert_eq!(pumped(SessionMode::Skirmish), 0);
-        assert_eq!(pumped(SessionMode::Campaign), 0);
-        // Network advances once per pumped frame.
-        assert_eq!(pumped(SessionMode::Lan), FRAMES);
-        assert_eq!(pumped(SessionMode::Wol), FRAMES);
-    }
-
-    #[test]
-    fn pumped_world_tick_freezes_offline_and_advances_on_network() {
-        use crate::sim::world::Simulation;
-
-        // C2 acceptance with a real headless World: drive `advance_tick` exactly
-        // when the pump decision is true, and assert `session.tick` motion.
-        // `advance_tick` commits one tick per call (no entities/rules needed).
-        const FRAMES: u64 = 7;
-        let pumped_world_delta = |mode: SessionMode| -> u64 {
-            let mut sim = Simulation::new();
-            let start = sim.session().tick();
-            for _ in 0..FRAMES {
-                if modal_pump_should_advance_sim(mode, false, false) {
-                    // `tick_ms` does not affect the asserted tick delta; a literal
-                    // matches the sim-test style and avoids the const dependency.
-                    sim.advance_tick(&[], None, None, None, 33);
-                }
-            }
-            sim.session().tick() - start
-        };
-
-        // Offline modes freeze the world behind the modal: zero tick advance.
-        assert_eq!(pumped_world_delta(SessionMode::Skirmish), 0);
-        assert_eq!(pumped_world_delta(SessionMode::Campaign), 0);
-        // Network modes advance one fixed tick per pumped frame (dead code this
-        // build; proves the contract for when multiplayer lands).
-        assert_eq!(pumped_world_delta(SessionMode::Lan), FRAMES);
-        assert_eq!(pumped_world_delta(SessionMode::Wol), FRAMES);
     }
 
     #[test]

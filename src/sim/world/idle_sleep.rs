@@ -73,7 +73,7 @@ pub(super) enum SleepVisit {
 pub(super) struct SleepCheck {
     expected: serde_json::Value,
     /// The state hash's parts with the visit counted.
-    hash: [(&'static str, u64); 30],
+    hash: super::world_hash::StateHashOwners,
     scenario_rng: u64,
     main_rng: u64,
     logic_len: usize,
@@ -377,7 +377,7 @@ impl Simulation {
             && entity.slave_manager.is_none()
             && entity.cloak.is_none()
             && entity.rocking.is_none()
-            && entity.passenger_role.occupants().is_empty()
+            && entity.passenger_role().occupants().is_empty()
             && !entity.berserk.is_active()
             && !entity.deactivated.is_offline()
             && entity.building.tesla_charge.chargers().is_empty()

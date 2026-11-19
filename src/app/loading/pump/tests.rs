@@ -18,8 +18,8 @@ fn browser_peer_wait_starts_after_the_terminal_ack_drain() {
 }
 
 pub(super) fn test_launch_session(country: LaunchCountry) -> SkirmishLaunchSession {
-    SkirmishLaunchSession {
-        mode: SkirmishLaunchMode {
+    SkirmishLaunchSession::from_rows(
+        SkirmishLaunchMode {
             class: crate::skirmish_modes::MpModeClass::Battle,
             id: 1,
             ui_name_key: "GUI:Battle".to_string(),
@@ -30,8 +30,8 @@ pub(super) fn test_launch_session(country: LaunchCountry) -> SkirmishLaunchSessi
             allies_allowed: true,
             must_ally: false,
         },
-        selected_map_file: Some("mp01t4.map".to_string()),
-        humans: vec![crate::skirmish_launch::SkirmishHumanSlot {
+        Some("mp01t4.map".to_string()),
+        vec![crate::skirmish_launch::SkirmishHumanSlot {
             raw_slot_index: Some(0),
             name: "Player".to_string(),
             slot: SkirmishLocalSlot {
@@ -44,9 +44,8 @@ pub(super) fn test_launch_session(country: LaunchCountry) -> SkirmishLaunchSessi
             },
             role: crate::skirmish_launch::LaunchHumanRole::from_observer(false),
         }],
-        local_player_index: 0,
-        ai_player_count: 1,
-        opponents: vec![SkirmishAiSlot {
+        0,
+        vec![SkirmishAiSlot {
             raw_slot_index: 1,
             country: LaunchCountry::Russia,
             country_random: false,
@@ -57,9 +56,8 @@ pub(super) fn test_launch_session(country: LaunchCountry) -> SkirmishLaunchSessi
             difficulty: AiDifficulty::Easy,
             super_tier: None,
         }],
-        pre_fill_house_roster: crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(1),
-        options: SkirmishLaunchOptions::default(),
-    }
+        SkirmishLaunchOptions::default(),
+    )
 }
 
 #[test]
@@ -154,7 +152,6 @@ fn cold_and_warm_rules_share_world_and_agreement_identity(
     remote.slot.color_index = 1;
     remote.slot.start_position = LaunchStartPosition::Position(1);
     launch.humans.push(remote);
-    launch.rebuild_house_roster();
     let mut session = MatchSession::default();
     session.enter_network(context);
     session
@@ -252,6 +249,8 @@ fn cold_and_warm_rules_share_world_and_agreement_identity(
                 45,
                 std::num::NonZeroU32::new(u32::from(send_rate)).unwrap(),
                 sim.state_hash(),
+                "",
+                "",
             )
             .unwrap(),
         );
@@ -263,7 +262,8 @@ fn cold_and_warm_rules_share_world_and_agreement_identity(
         warm.sim().native_identity_cursor(),
         cold.sim().native_identity_cursor()
     );
-    // The full value object includes every private sequencing-identity input.
+    // The full value object includes every world-derived sequencing-identity
+    // input; the build and rules are process-level and left out here.
     assert_eq!(agreements[0], agreements[1]);
 }
 
@@ -489,31 +489,20 @@ fn prefix_test_map(starts: &[(u8, u16, u16)]) -> crate::map::map_file::MapFile {
     map
 }
 
-fn generated_preview_with_starts(
-    seed: u16,
-    starts: &[(u8, u16, u16)],
-) -> crate::map::rmg::GeneratedMap {
-    crate::map::rmg::GeneratedMap {
-        map_file: prefix_test_map(starts),
-        mapgen_continuation: Some(crate::map::rmg::RmgRng::new(seed).into_continuation()),
-        construction_trace: crate::map::rmg::RmgConstructionTrace::default(),
-        start_waypoints: starts.to_vec(),
-        stages_run: Vec::new(),
-        unfilled_start_slots: 0,
-        fairness: None,
-    }
-}
-
 fn accepted_random_map_with_starts(
     selected_map_file: &str,
-    seed: u16,
     preview_waypoints: &[(u8, u16, u16)],
     staged_starts: &[(u8, u16, u16)],
 ) -> crate::app::shell_random_map::AcceptedRandomMapLaunch {
     let mut retention = crate::app::shell_random_map::RandomMapGenerationRetention::default();
-    let mut generated = generated_preview_with_starts(seed, staged_starts);
-    generated.map_file = prefix_test_map(preview_waypoints);
-    retention.finish_generation(generated);
+    retention.finish_generation(crate::map::rmg::GeneratedMap {
+        map_file: prefix_test_map(preview_waypoints),
+        construction_trace: crate::map::rmg::RmgConstructionTrace::default(),
+        start_waypoints: staged_starts.to_vec(),
+        stages_run: Vec::new(),
+        unfilled_start_slots: 0,
+        fairness: None,
+    });
     retention.accept_setup(selected_map_file);
     retention
         .take_acceptance_for_loading(Some(selected_map_file))
@@ -1056,7 +1045,7 @@ fn gsi_04_12_generated_prefix_uses_accepted_staging_once() {
     let regenerated = [(0, 70, 90), (1, 90, 90)];
     let mut launch = test_launch_session(LaunchCountry::America);
     launch.selected_map_file = Some(selected.to_string());
-    let accepted = accepted_random_map_with_starts(selected, 0x1212, &preview_waypoints, &staged);
+    let accepted = accepted_random_map_with_starts(selected, &preview_waypoints, &staged);
     let mut regenerated_map =
         crate::map::rmg::emit::empty_map_file(&crate::map::rmg::RmgOptions::default(), 100, 100);
     regenerated_map
@@ -1304,7 +1293,7 @@ fn load_descriptor_source_family_format_matrix() {
                 must_ally: false,
             };
         }
-        let accepted = accepted_random_map_with_starts(&selected, 0x2345, &starts, &starts);
+        let accepted = accepted_random_map_with_starts(&selected, &starts, &starts);
         let mut map = prefix_test_map(&starts);
         map.basic.new_ini_format = Some(4);
         let source = crate::map::source::LoadedMapSource::Generated {
@@ -1419,14 +1408,14 @@ fn generic_manual_and_unresolved_legacy_reject_before_receipt_or_staging() {
         prefix_test_map(&starts),
         source,
     );
-    let accepted = accepted_random_map_with_starts(selected, 0x4567, &starts, &starts);
+    let accepted = accepted_random_map_with_starts(selected, &starts, &starts);
     let mut generic =
         LoadingRequest::generic_map_load(selected).with_accepted_random_map(Some(accepted));
     let generic_err = generic.admit_context(&initial).unwrap_err();
     assert!(format!("{generic_err:#}").contains("Generic startup"));
     assert!(generic.accepted_rmg_start_staging.is_some());
 
-    let accepted = accepted_random_map_with_starts(selected, 0x4567, &starts, &starts);
+    let accepted = accepted_random_map_with_starts(selected, &starts, &starts);
     let mut unresolved_session = test_launch_session(LaunchCountry::America);
     unresolved_session.selected_map_file = Some(selected.to_string());
     unresolved_session.local_slot_mut().country_random = true;
@@ -1468,7 +1457,6 @@ fn loading_assignments_keep_gather_table_slots_separate_from_sparse_waypoint_ind
     second_opponent.start_position = LaunchStartPosition::Position(2);
     launch.opponents.push(second_opponent);
     launch.ai_player_count = 2;
-    launch.rebuild_house_roster();
 
     // Gather target 3 retains raw slots 0 and 2, then appends a fallback
     // at vector position 2. The retained slot and fallback consequently
@@ -1550,7 +1538,7 @@ fn generated_prefix_rejects_cooperative_mode() {
         .find(|mode| mode.id == 3)
         .expect("retail Cooperative row");
     launch.mode = SkirmishLaunchMode::from_game_mode(&cooperative);
-    let accepted = accepted_random_map_with_starts(selected, 0x1515, &starts, &starts);
+    let accepted = accepted_random_map_with_starts(selected, &starts, &starts);
     let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
         prefix_test_map(&starts),
         crate::map::source::LoadedMapSource::Generated {
@@ -1594,7 +1582,7 @@ fn authored_prefix_rejects_random_map_staging_for_loose_and_mix_sources() {
     for source in sources {
         let mut launch = test_launch_session(LaunchCountry::America);
         launch.selected_map_file = Some(selected.to_string());
-        let accepted = accepted_random_map_with_starts(selected, 0x1616, &starts, &starts);
+        let accepted = accepted_random_map_with_starts(selected, &starts, &starts);
         let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
             prefix_test_map(&starts),
             source,
@@ -1716,7 +1704,6 @@ fn gsi_04_12_stock_ffa_preview_can_only_supply_loading_fallback_pixels() {
     let active_scenario_waypoints = map.waypoints.clone();
     let generated = crate::map::rmg::GeneratedMap {
         map_file: map,
-        mapgen_continuation: Some(crate::map::rmg::RmgRng::new(0x4567).into_continuation()),
         construction_trace: crate::map::rmg::RmgConstructionTrace::default(),
         start_waypoints: vec![(0, 70, 70), (1, 90, 70), (2, 70, 90)],
         stages_run: Vec::new(),
@@ -1999,9 +1986,10 @@ fn selected_native_gate_preserves_metadata_and_raw_progress_cadence() {
         );
         native.runtime_color_scheme_count = 16;
         {
-            let mut phase = LoadingPhaseProgress::select(Some(&mut native), true, None, |_, _| {
-                panic!("no atlas must select the real gated sink")
-            });
+            let mut phase =
+                LoadingPhaseProgress::select(Some(&mut native), true, true, None, |_, _| {
+                    panic!("no atlas must select the real gated sink")
+                });
             assert!(matches!(&phase.sink, SelectedProgressSink::Gated(_)));
             assert!(phase.native_theater_cache_mismatch);
             assert_eq!(phase.runtime_color_scheme_count, 16);
@@ -2011,9 +1999,10 @@ fn selected_native_gate_preserves_metadata_and_raw_progress_cadence() {
         }
         assert_eq!(native.progress.current_percent(), expected);
         {
-            let mut phase = LoadingPhaseProgress::select(Some(&mut native), false, None, |_, _| {
-                panic!("no atlas must select the real gated sink")
-            });
+            let mut phase =
+                LoadingPhaseProgress::select(Some(&mut native), false, true, None, |_, _| {
+                    panic!("no atlas must select the real gated sink")
+                });
             assert!(!phase.native_theater_cache_mismatch);
             phase
                 .sink
@@ -2256,7 +2245,6 @@ fn network_load_with_remote_peer(
     remote.slot.color_index = 1;
     remote.slot.start_position = LaunchStartPosition::Position(1);
     launch.humans.push(remote);
-    launch.rebuild_house_roster();
     let rules = crate::rules::ruleset::RuleSet::from_ini(
         &crate::rules::ini_parser::IniFile::from_str("[Countries]\n0=Americans\n"),
     )
@@ -2398,7 +2386,6 @@ fn held_network_sink_sends_rmg_display_progress_and_services_the_same_source_row
             .progress_row
             .total_fraction(&host_native.progress),
     );
-    host_session.request_kick_proposal(1);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         for (service, session, native, raw) in [
@@ -2411,9 +2398,10 @@ fn held_network_sink_sends_rmg_display_progress_and_services_the_same_source_row
                 false,
             )
             .unwrap();
-            let mut phase = LoadingPhaseProgress::select(Some(native), false, network, |_, _| {
-                panic!("fixture deliberately uses the real gated network sink without GPU art")
-            });
+            let mut phase =
+                LoadingPhaseProgress::select(Some(native), false, true, network, |_, _| {
+                    panic!("fixture deliberately uses the real gated network sink without GPU art")
+                });
             phase.sink.milestone(raw).unwrap();
         }
         if host_native.progress_row.participants[1]
@@ -2447,15 +2435,6 @@ fn held_network_sink_sends_rmg_display_progress_and_services_the_same_source_row
         host_native.progress_row.participants[0]
             .remote_progress
             .is_none()
-    );
-    assert_eq!(
-        host_session.take_network_loading_requests(),
-        vec![
-            crate::app::match_runtime::session::NetworkLoadingRequest::ProposeKick {
-                target_source: 1
-            },
-        ],
-        "the synchronous report drain cannot steal another owner's request"
     );
     let fraction = host_native
         .progress_row

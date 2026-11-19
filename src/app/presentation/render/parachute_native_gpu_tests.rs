@@ -100,8 +100,7 @@ impl Scene {
         // than measuring Infantry Unlimbo's subcell choice. Match that input
         // boundary through the Location owner; the complete ordinary producer
         // and its subcell admission remain covered by the lifecycle test.
-        sim.entities_mut_for_test()
-            .get_mut(body)
+        sim.entity_mut_for_test(body)
             .unwrap()
             .position
             .put_location(DriveCoord {
@@ -220,7 +219,7 @@ impl Scene {
             &self.runtime,
             &Default::default(),
         );
-        let order = NativeDisplayOrder::from_display(sim.display_layers());
+        let order = NativeDisplayOrder::from_world(&sim, None);
         let voxel_images = RefCell::new(VoxelImageCache::default());
         let mut parents = Vec::new();
         build_shp_instances_from_inputs(

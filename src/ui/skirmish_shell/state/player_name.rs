@@ -3,7 +3,7 @@
 use crate::map::scenario_menu::MapMenuEntry;
 use crate::sim::game_options::GameOptions;
 use crate::skirmish_launch::{
-    LaunchCountry, LaunchStartPosition, NETWORK_PLAYER_SLOT_COUNT, SKIRMISH_PLAYER_SLOT_COUNT,
+    LaunchCountry, LaunchStartPosition, SKIRMISH_MAX_SLOT_COUNT, SKIRMISH_PLAYER_SLOT_COUNT,
     SkirmishLaunchOptions,
 };
 use crate::skirmish_modes::{SkirmishGameMode, mode_by_id};
@@ -15,8 +15,8 @@ use super::super::layout::{SkirmishShellLayout, SkirmishTrackbarId, shown_player
 use super::trackbars::SkirmishTrackbarBounds;
 use super::{
     ChooseMapModalState, DropdownScrollDragState, DropdownScrollbarPressState, OpenComboDropdown,
-    OwnerDrawButton, RandomMapSetupModalState, SkirmishShellOpponent, SkirmishShellUiSound,
-    SkirmishValidationModalState, default_opponents,
+    OwnerDrawButton, RandomMapSetupModalState, SkirmishModeSelection, SkirmishShellOpponent,
+    SkirmishShellUiSound, SkirmishValidationModalState, default_opponents,
 };
 
 pub const PLAYER_NAME_DEFAULT: &str = "Player";
@@ -342,7 +342,7 @@ pub struct SkirmishShellState {
     /// claim and random draw of the shell reads this copy.
     pub(crate) lobby_colors: crate::rules::skirmish_colors::SkirmishColorMode,
     pub selected_map_idx: usize,
-    pub selected_mode_id: i32,
+    pub selected_mode: SkirmishModeSelection,
     pub player_name_edit: PlayerNameEditState,
     pub player_country: LaunchCountry,
     pub player_country_random: bool,
@@ -450,7 +450,7 @@ impl Default for SkirmishShellState {
             country_catalog: CountryMenuCatalog::default(),
             lobby_colors: Default::default(),
             selected_map_idx: 0,
-            selected_mode_id: 1,
+            selected_mode: 1.into(),
             player_name_edit: PlayerNameEditState::default(),
             player_country: LaunchCountry::default(),
             player_country_random: false,
@@ -606,10 +606,10 @@ pub fn selected_player_rows(state: &SkirmishShellState, maps: &[MapMenuEntry]) -
         })
 }
 
-/// A map's player capacity as rows: VERA seats up to thirty players, as its
-/// rooms do; a retail map declares eight or fewer.
+/// A map's player capacity as rows: offline Skirmish seats up to
+/// [`SKIRMISH_MAX_SLOT_COUNT`] players; a retail map declares eight or fewer.
 fn admitted_player_rows(capacity: i32) -> usize {
-    capacity.clamp(0, NETWORK_PLAYER_SLOT_COUNT as i32) as usize
+    capacity.clamp(0, SKIRMISH_MAX_SLOT_COUNT as i32) as usize
 }
 
 /// The last [`SkirmishShellState::first_opponent`] for `rows` admitted player
@@ -644,9 +644,8 @@ fn reset_rows_hidden_by_capacity(state: &mut SkirmishShellState, capacity: i32) 
     }
 }
 
-/// Apply the accepted Choose Map selection as one row-lifecycle transaction.
-/// A shrink resets every now-hidden opponent row before the selected map becomes
-/// observable; growth only reveals rows, whose prior hide reset remains intact.
+/// Apply the accepted map's capacity to the opponent rows. SkirmishDialog
+/// (`0x006ADDF0`) refreshes the rows even when both maps are `RandMap.Sed`.
 pub fn accept_selected_map(
     state: &mut SkirmishShellState,
     maps: &[MapMenuEntry],
@@ -655,13 +654,9 @@ pub fn accept_selected_map(
     let Some(new_map) = maps.get(map_idx) else {
         return false;
     };
-    let old_capacity = maps
-        .get(state.selected_map_idx)
-        .map(|map| map.player_capacity)
-        .unwrap_or(SKIRMISH_PLAYER_SLOT_COUNT as i32);
-    if new_map.player_capacity < old_capacity {
-        reset_rows_hidden_by_capacity(state, new_map.player_capacity);
-    }
+    // Generating another random map replaces the selected entry in place, so
+    // reading its old index here would already give the new capacity.
+    reset_rows_hidden_by_capacity(state, new_map.player_capacity);
     state.selected_map_idx = map_idx;
     true
 }
@@ -729,7 +724,9 @@ mod multiplayer_dialog_value_tests {
 }
 
 pub fn repair_teams_for_selected_mode(state: &mut SkirmishShellState, modes: &[SkirmishGameMode]) {
-    let mode = mode_by_id(modes, state.selected_mode_id)
+    let mode = state
+        .selected_mode
+        .resolve(modes)
         .or_else(|| mode_by_id(modes, 1))
         .or_else(|| modes.first());
     if let Some(mode) = mode {

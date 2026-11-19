@@ -332,8 +332,8 @@ fn render_original_body_pixels(
         .set_infantry_doing_verified(int(&actor["doing"]))
         .unwrap();
     sim.entities_mut_for_test().insert(gi);
-    sim.submit_object_display_for_test(1, DisplayLayer::GROUND, Some(&rules));
-    let order = NativeDisplayOrder::from_display(sim.display_layers());
+    sim.submit_object_display_for_test(1, DisplayLayer::GROUND);
+    let order = NativeDisplayOrder::from_world(&sim, None);
     let resources = SimResources::new(rules);
     if production {
         let mut terrain = crate::map::resolved_terrain::test_grid(32, 32, |x, y| {
@@ -345,7 +345,7 @@ fn render_original_body_pixels(
                 &theater,
                 &assets,
                 &crate::rules::terrain_rules::TerrainRules::from_ini(&raw_rules),
-                &resources.overlay_registry,
+                resources.rules.overlay_registry(),
                 false,
                 0,
                 Default::default(),
@@ -485,11 +485,7 @@ fn render_original_body_pixels(
                 ];
                 batch.write_camera(&gpu.queue, view);
             }
-            let gi = runtime
-                .simulation
-                .entities_mut_for_test()
-                .get_mut(1)
-                .unwrap();
+            let gi = runtime.simulation.entity_mut_for_test(1).unwrap();
             gi.berserk
                 .set_active_for_test(input["berserk"].as_bool().unwrap());
             gi.body_facing = FacingClass::new(int(&input["facing"]) as u16, 0);

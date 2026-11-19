@@ -93,11 +93,11 @@ pub(crate) mod persistence;
 pub(crate) mod os_clipboard;
 pub(crate) mod phobos_version;
 pub(crate) mod presentation;
-pub(crate) mod process_affinity;
 pub(crate) mod process_assets;
-#[cfg(feature = "telemetry-dashboard")]
+#[cfg(any(feature = "telemetry-dashboard", feature = "perf"))]
 pub(crate) mod process_stats;
 pub(crate) mod radar_movie;
+pub(crate) mod random_map_file;
 #[cfg(all(test, tests_app))]
 mod random_map_lifecycle_tests;
 pub(crate) mod renderer_state;
@@ -135,6 +135,7 @@ pub(crate) mod types;
 pub(crate) mod updater;
 pub(crate) mod web_link;
 mod window_icon;
+pub(crate) mod worker;
 
 /// Main window title. The single-instance gate finds a running copy's window by
 /// this exact title, so `main` hands the same constant to

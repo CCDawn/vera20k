@@ -2,6 +2,8 @@
 //! NewEdit614B30 ->5EDD00 ->5DE360. Discovery and displayed rows are views;
 //! admitted participants, setup, timers and service requests belong to the app.
 
+use std::collections::VecDeque;
+
 use crate::util::time::Instant;
 
 use crate::ui::shell::button::ShellButtonInteraction;
@@ -200,12 +202,23 @@ pub(crate) enum LanLobbyAction {
     NameChanged(String),
     SendChat(Vec<u16>),
     ObserverChanged(bool),
-    /// Every selection notification refreshes displayed users; only a change
-    /// broadcasts selection in5DDCFD..5DDD28.
+    /// Every selection notification refreshes displayed users; `change`
+    /// decides what the service broadcasts.
     SelectGame {
         game_id: Option<u64>,
-        changed: bool,
+        change: LanSelectionChange,
     },
+}
+
+/// How a game selection came about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LanSelectionChange {
+    /// A click on the row already selected.
+    Unchanged,
+    /// A click on another row.
+    Changed,
+    /// Discovery dropped rows and clamped the selection to the last one.
+    Clamped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +241,11 @@ pub(crate) struct LanChatState {
     pub(crate) edit: SavedSeedDescriptionEdit,
     pub(crate) lines: Vec<LanChatLine>,
     pub(crate) list: LanListState,
+    /// The messages `lines` were wrapped from, newest last, and the width
+    /// they were wrapped to: VERA's room re-wraps them when its chat column
+    /// changes width with the window ([`Self::rewrap`]).
+    messages: VecDeque<LanChatLine>,
+    width: i32,
 }
 
 impl LanChatState {
@@ -275,6 +293,12 @@ impl LanChatState {
         visible_rows: usize,
         measure: impl Fn(&[u16]) -> i32,
     ) {
+        self.rewrap(width, visible_rows, &measure);
+        // Each message adds a row at least, so these cover the rows kept.
+        if self.messages.len() >= CHAT_ROWS {
+            self.messages.pop_front();
+        }
+        self.messages.push_back(message.clone());
         append_list_message(
             &mut self.lines,
             &mut self.list,
@@ -284,7 +308,50 @@ impl LanChatState {
             measure,
         );
     }
+
+    /// Wrap the messages again when the log is now `width` wide (VERA's own:
+    /// gamemd's logs never change width). A view at the bottom stays there;
+    /// a scrolled one keeps its top row's index.
+    pub(crate) fn rewrap(
+        &mut self,
+        width: i32,
+        visible_rows: usize,
+        measure: impl Fn(&[u16]) -> i32,
+    ) {
+        if width == self.width {
+            return;
+        }
+        self.width = width;
+        let follow = self.lines.len().saturating_sub(self.list.top_index) <= visible_rows;
+        self.lines = self
+            .messages
+            .iter()
+            .flat_map(|message| {
+                split_chat_lines(&message.text, width, &measure)
+                    .into_iter()
+                    .map(|text| LanChatLine {
+                        text,
+                        color: message.color,
+                    })
+            })
+            .collect();
+        let dropped = self.lines.len().saturating_sub(CHAT_ROWS);
+        self.lines.drain(..dropped);
+        if follow {
+            self.list.top_index = self.lines.len().saturating_sub(visible_rows);
+        }
+    }
 }
+
+/// The width a chat log's rows wrap to ([`LanChatState::append_message`]):
+/// the log's width in the shell's 800x600 pixels, counted in its text's own
+/// pixels, so smaller text fits more of it.
+pub(crate) fn chat_wrap_width(rect: RectPx, scale: ShellScale, text: f32) -> i32 {
+    (scale.base_rect(rect).w as f32 / text) as i32
+}
+
+/// `0x005E29A0` keeps at most 501 rows.
+const CHAT_ROWS: usize = 501;
 
 /// The shell list line adder `0x005E2820` -> `0x005E29A0`: wrap the text to
 /// the list's width and append each row. An empty text adds nothing.
@@ -318,7 +385,7 @@ fn append_row(
     visible_rows: usize,
 ) {
     let follow = lines.len().saturating_sub(list.top_index) <= visible_rows;
-    if lines.len() > 500 {
+    if lines.len() >= CHAT_ROWS {
         lines.remove(0);
         list.top_index = list.top_index.saturating_sub(1);
     }
@@ -467,7 +534,7 @@ impl LanLobbyState {
         self.game_list.selected = Some(selected);
         (selected != before).then(|| LanLobbyAction::SelectGame {
             game_id: self.selected_game().map(|row| row.id),
-            changed: true,
+            change: LanSelectionChange::Clamped,
         })
     }
 
@@ -548,13 +615,17 @@ impl LanLobbyState {
         {
             return None;
         }
-        let changed = self.game_list.selected != Some(index);
+        let change = if self.game_list.selected == Some(index) {
+            LanSelectionChange::Unchanged
+        } else {
+            LanSelectionChange::Changed
+        };
         self.game_list.selected = Some(index);
         // The roster follows through `replace_players` (the 0x549 LBN_SELCHANGE
         // handler's `0x005DAFE0`), which keeps the selected player by name.
         Some(LanLobbyAction::SelectGame {
             game_id: self.selected_game().map(|row| row.id),
-            changed,
+            change,
         })
     }
 
@@ -854,6 +925,41 @@ mod tests {
         assert_eq!(lobby.chat.list.top_index, 9);
     }
 
+    /// VERA's room re-wraps its chat when the column changes width: a
+    /// message wrapped wide splits to fit a narrow log, the view stays at
+    /// the bottom, and a later message at the old width joins it again.
+    #[test]
+    fn chat_rewraps_its_messages_to_a_new_width() {
+        let measure = |units: &[u16]| units.len() as i32 * 8;
+        let message = |text: &str| LanChatLine {
+            text: text.encode_utf16().collect(),
+            color: u32::MAX,
+        };
+        let rows = |chat: &LanChatState| -> Vec<String> {
+            chat.lines
+                .iter()
+                .map(|line| String::from_utf16_lossy(&line.text))
+                .collect()
+        };
+        let hint = "Players join ready. Press Start Game when everyone is here.";
+        let mut chat = LanChatState::default();
+        chat.append_message(message(hint), 600, 2, measure);
+        assert_eq!(rows(&chat), [hint]);
+        chat.rewrap(200, 2, measure);
+        assert_eq!(
+            rows(&chat),
+            [
+                "Players join ready.",
+                "Press Start Game when",
+                "everyone is here."
+            ]
+        );
+        assert_eq!(chat.list.top_index, 1);
+        chat.append_message(message("ok"), 600, 2, measure);
+        assert_eq!(rows(&chat), [hint, "ok"]);
+        assert_eq!(chat.list.top_index, 0);
+    }
+
     #[test]
     fn chat_enter_matches_original_newedit_parent_getter_and_clear_chain() {
         for row in native()["chat"].as_array().unwrap() {
@@ -971,14 +1077,14 @@ mod tests {
             lobby.select_game(3),
             Some(LanLobbyAction::SelectGame {
                 game_id: Some(2),
-                changed: true
+                change: LanSelectionChange::Changed
             })
         );
         assert_eq!(
             lobby.replace_games(Vec::new()),
             Some(LanLobbyAction::SelectGame {
                 game_id: None,
-                changed: true
+                change: LanSelectionChange::Clamped
             })
         );
         assert_eq!(

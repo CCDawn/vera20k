@@ -706,12 +706,15 @@ fn tactical_left_up(state: &mut AppState) {
         };
         match action {
             SelectAction::Click(sx, sy) => {
-                // Native TacticalPick6DA380 reads the retained
-                // Display registrations after the projected click
+                // Native TacticalPick6DA380 reads the Display
+                // registrations in draw order after the projected click
                 // gate. The ScreenSelection list belongs to band/type
                 // scope, not this pointer pick.
                 let click_order =
-                    crate::app::presentation::instances::tactical_entity_encounter_order(sim);
+                    crate::app::presentation::instances::tactical_entity_encounter_order(
+                        sim,
+                        state.rules(),
+                    );
                 let world_x: f32 =
                     sx / state.match_state.input.zoom_level + state.match_state.input.camera_x;
                 let world_y: f32 =
@@ -2289,6 +2292,26 @@ fn dispatch_retail_hotkey(state: &mut AppState, command: HotkeyCommand) {
         // VERA: the mouse drags the interface's parts until Save, or until
         // the key comes again and puts them back.
         HotkeyCommand::LayoutEdit => crate::app::input::layout_edit::toggle(state),
+        // VERA: show or hide the countdown above every provider building.
+        // Presentation only, and saved under the same `[VERA]` key the old
+        // Options box wrote, so a match's choice seeds the next scenario.
+        HotkeyCommand::SuperweaponTimers => {
+            let timers = &mut state
+                .match_state
+                .match_presentation
+                .superweapon_building_timers;
+            *timers = !*timers;
+            let on = *timers;
+            state
+                .persistence
+                .options_profile
+                .superweapon_building_timers = on;
+            crate::app::persistence::options::persist_options_profile(state);
+            log::info!(
+                "Super weapon building timers: {}",
+                if on { "shown" } else { "hidden" }
+            );
+        }
         // A held key: `input::keyboard::in_game_key_edge` tracks it.
         HotkeyCommand::FormationLine => {}
         HotkeyCommand::FormationLock => {
@@ -3591,7 +3614,6 @@ mod item83_selection_order_tests {
         sim.advance_app_frame(
             &[],
             RuleSet::empty_for_test(),
-            None,
             67,
             crate::sim::world::TickLane::Ordinary,
             crate::sim::world::FrameEffects::empty(),
@@ -4086,12 +4108,12 @@ mod item83_selection_order_tests {
                 {
                     let entities = sim.entities_mut_for_test();
                     entities
-                        .get_mut(pill)
+                        .get_mut_for_test(pill)
                         .unwrap()
                         .bunker
                         .set_bunker_occupant_for_test(None);
                     entities
-                        .get_mut(tank)
+                        .get_mut_for_test(tank)
                         .unwrap()
                         .bunker
                         .set_bunker_link_for_test(
@@ -4634,7 +4656,7 @@ fn deploy_key_commands(
     let first = selection.first().and_then(|&id| sim.entities().get(id));
     if let Some(building) = first.filter(|entity| {
         entity.category() == EntityCategory::Structure
-            && entity.passenger_role.occupants().count() > 0
+            && entity.passenger_role().occupants().count() > 0
     }) {
         return deploy_key_command(sim, rules, building.stable_id(), local_owner)
             .into_iter()
@@ -4713,7 +4735,7 @@ fn deploy_key_command(
         // Selection730B28..730B5E sends Event9 for an occupied Building.
         // Its native receiver owns NULL setters and Unload; self-click keeps
         // the separate MEGAMISSION/absorber admission in transport_orders.
-        EntityCategory::Structure => (!entity.passenger_role.occupants().is_empty()
+        EntityCategory::Structure => (!entity.passenger_role().occupants().is_empty()
             && local_owner.is_none_or(|owner| entity.owner() == owner))
         .then_some(Command::DeployMcv { entity_id }),
         EntityCategory::Infantry => Some(Command::ToggleInfantryDeploy { entity_id }),
@@ -5183,10 +5205,9 @@ mod deploy_key_tests {
         let infantry = spawn("GI");
         let mut cargo = PassengerCargo::new(5, 0.0);
         cargo.board_forced_chain(&[(999, 1.0)]);
-        sim.entities_mut_for_test()
-            .get_mut(transport)
+        sim.entity_mut_for_test(transport)
             .unwrap()
-            .passenger_role = PassengerRole::transport(cargo);
+            .set_passenger_role_for_test(PassengerRole::transport(cargo));
 
         assert_eq!(
             deploy_key_command(&sim, Some(&rules), heli, sim.session().current_house()),
@@ -5218,10 +5239,7 @@ mod deploy_key_tests {
             deploy_key_command(&sim, Some(&rules), firer, sim.session().current_house()),
             Some(Command::DeployMcv { entity_id: firer })
         );
-        sim.entities_mut_for_test()
-            .get_mut(heli)
-            .unwrap()
-            .low_bridge_tube_state = Some(
+        sim.entity_mut_for_test(heli).unwrap().low_bridge_tube_state = Some(
             crate::sim::movement::tube_movement::LowBridgeTubeMovementState::for_test(
                 crate::map::tube_facts::TubeId(0),
                 0,
@@ -5260,10 +5278,9 @@ mod deploy_key_tests {
             let mut cargo = PassengerCargo::new(capacity, 0.0);
             let head: Vec<_> = (0..count).map(|index| (999 + index as u64, 1.0)).collect();
             cargo.board_forced_chain(&head);
-            sim.entities_mut_for_test()
-                .get_mut(transport)
+            sim.entity_mut_for_test(transport)
                 .unwrap()
-                .passenger_role = PassengerRole::transport(cargo);
+                .set_passenger_role_for_test(PassengerRole::transport(cargo));
             let owner = sim
                 .session()
                 .current_house()
@@ -5335,10 +5352,9 @@ mod deploy_key_tests {
         let transport = spawn("TRANSPORT");
         let mut cargo = PassengerCargo::new(2, 0.0);
         cargo.board_forced_chain(&[(999, 1.0)]);
-        sim.entities_mut_for_test()
-            .get_mut(transport)
+        sim.entity_mut_for_test(transport)
             .unwrap()
-            .passenger_role = PassengerRole::transport(cargo);
+            .set_passenger_role_for_test(PassengerRole::transport(cargo));
         let owner = sim.session().current_house();
         assert!(deploy_key_commands(&sim, Some(&rules), &[tank], owner).is_empty());
         assert_eq!(
@@ -5348,8 +5364,7 @@ mod deploy_key_tests {
             })
         );
         for id in [tank, transport] {
-            sim.entities_mut_for_test()
-                .get_mut(id)
+            sim.entity_mut_for_test(id)
                 .unwrap()
                 .bunker
                 .set_bunker_link_for_test(BunkerLink::Installed(99));
@@ -5400,10 +5415,9 @@ mod deploy_key_tests {
             .expect("Bio Reactor builds");
         let mut cargo = PassengerCargo::new(5, 0.0);
         cargo.board_forced_chain(&[(99, 1.0)]);
-        sim.entities_mut_for_test()
-            .get_mut(reactor)
+        sim.entity_mut_for_test(reactor)
             .unwrap()
-            .passenger_role = PassengerRole::transport(cargo);
+            .set_passenger_role_for_test(PassengerRole::transport(cargo));
 
         assert!(
             deploy_key_commands(
@@ -5432,8 +5446,7 @@ mod deploy_key_tests {
             deploy_key_commands(&sim, Some(&rules), &[heli], sim.session().current_house()),
             [Command::DeployMcv { entity_id: heli }]
         );
-        sim.entities_mut_for_test()
-            .get_mut(heli)
+        sim.entity_mut_for_test(heli)
             .unwrap()
             .berserk
             .set_active_for_test(true);
@@ -5467,8 +5480,7 @@ mod deploy_key_tests {
             ),
             [Command::DeployMcv { entity_id: heli }]
         );
-        sim.entities_mut_for_test()
-            .get_mut(heli)
+        sim.entity_mut_for_test(heli)
             .unwrap()
             .deactivated
             .set_for_test(true);
@@ -5493,14 +5505,12 @@ mod deploy_key_tests {
                 .expect("the deploy key fixture builds")
         };
         let (standing, deployed, gassed) = (spawn(3), spawn(4), spawn(5));
-        sim.entities_mut_for_test()
-            .get_mut(deployed)
+        sim.entity_mut_for_test(deployed)
             .unwrap()
             .mission_leaf
             .set_infantry_doing_verified(28)
             .unwrap();
-        sim.entities_mut_for_test()
-            .get_mut(gassed)
+        sim.entity_mut_for_test(gassed)
             .unwrap()
             .berserk
             .set_active_for_test(true);
@@ -5530,8 +5540,7 @@ mod deploy_key_tests {
             (true, false, false),
             (true, false, true),
         ] {
-            sim.entities_mut_for_test()
-                .get_mut(id)
+            sim.entity_mut_for_test(id)
                 .unwrap()
                 .set_unit_simple_deploy_for_test(deployed, begin, reverse);
             assert_eq!(
@@ -5841,7 +5850,7 @@ mod control_group_tests {
         // Member 12 stays in limbo (inside a transport).
         group_entity(&mut sim, 12, local);
         for id in [10, 11] {
-            let entity = sim.entities_mut_for_test().get_mut(id).unwrap();
+            let entity = sim.entity_mut_for_test(id).unwrap();
             entity.lifecycle.set_in_limbo_for_test(false);
         }
         let raw_selected = [10, 11];
@@ -5914,8 +5923,7 @@ mod control_group_tests {
             .set_current_house_for_test(Some(local));
         for id in 1..=4 {
             group_entity(&mut sim, id, local);
-            sim.entities_mut_for_test()
-                .get_mut(id)
+            sim.entity_mut_for_test(id)
                 .unwrap()
                 .set_object_group_for_test(if id == 4 { 0 } else { 9 });
         }
@@ -6001,8 +6009,7 @@ mod control_group_tests {
         );
 
         for (id, group) in [(1, 0), (2, 0), (5, 2), (7, 1)] {
-            sim.entities_mut_for_test()
-                .get_mut(id)
+            sim.entity_mut_for_test(id)
                 .unwrap()
                 .set_object_group_for_test(group);
         }
@@ -6025,8 +6032,7 @@ mod control_group_tests {
             "recall filters the latent member while its owner is an AI house"
         );
 
-        sim.entities_mut_for_test()
-            .get_mut(1)
+        sim.entity_mut_for_test(1)
             .unwrap()
             .set_object_group_for_test(1);
         apply_group_assignment(&mut sim, 2, &[]);
@@ -6066,8 +6072,7 @@ mod control_group_tests {
             sim.session_mut_for_test()
                 .set_current_house_for_test(Some(local));
             for id in 1..=4 {
-                sim.entities_mut_for_test()
-                    .get_mut(id)
+                sim.entity_mut_for_test(id)
                     .unwrap()
                     .set_object_group_for_test(if id == 4 { 1 } else { 0 });
             }
@@ -6129,16 +6134,14 @@ mod control_group_tests {
                     .set_player_control_for_test(actor["player_control"].as_bool().unwrap());
                 group_entity(&mut sim, id, owner);
                 let is_selected = actor["selected"].as_bool().unwrap();
-                sim.entities_mut_for_test()
-                    .get_mut(id)
+                sim.entity_mut_for_test(id)
                     .unwrap()
                     .selection
                     .set_selected_for_test(is_selected);
                 if is_selected {
                     selected.push(id);
                 }
-                sim.entities_mut_for_test()
-                    .get_mut(id)
+                sim.entity_mut_for_test(id)
                     .unwrap()
                     .set_object_group_for_test(actor["group_slot"].as_i64().unwrap() as i32);
             }
@@ -6189,7 +6192,7 @@ mod control_group_tests {
         group_entity(&mut sim, 10, local);
         group_entity(&mut sim, 11, enemy);
         for id in [10, 11] {
-            let entity = sim.entities_mut_for_test().get_mut(id).unwrap();
+            let entity = sim.entity_mut_for_test(id).unwrap();
             entity.lifecycle.set_in_limbo_for_test(false);
         }
 
@@ -6236,7 +6239,7 @@ mod control_group_tests {
         typed_group_entity(&mut sim, 11, local, "MTNK");
         typed_group_entity(&mut sim, 9, local, "HIDE");
         for id in [9, 10, 11] {
-            let entity = sim.entities_mut_for_test().get_mut(id).unwrap();
+            let entity = sim.entity_mut_for_test(id).unwrap();
             entity.lifecycle.set_in_limbo_for_test(false);
         }
         let recall = |group: &[u64]| {
@@ -6302,7 +6305,7 @@ mod control_group_tests {
             ),
         );
         for id in [5, 10, 11, 77] {
-            let entity = sim.entities_mut_for_test().get_mut(id).unwrap();
+            let entity = sim.entity_mut_for_test(id).unwrap();
             entity.lifecycle.set_in_limbo_for_test(false);
         }
         let group = [10, 5, 11];
@@ -6373,7 +6376,7 @@ mod control_group_tests {
             crate::sim::world::RevealOutcome::Revealed { .. }
         ));
         assert!(
-            crate::app::presentation::instances::tactical_entity_encounter_order(&sim)
+            crate::app::presentation::instances::tactical_entity_encounter_order(&sim, None)
                 .contains(&27)
         );
 
@@ -6435,7 +6438,7 @@ mod control_group_tests {
             crate::sim::world::RevealOutcome::Revealed { .. }
         ));
         assert!(
-            crate::app::presentation::instances::tactical_entity_encounter_order(&sim)
+            crate::app::presentation::instances::tactical_entity_encounter_order(&sim, None)
                 .contains(&27)
         );
 
@@ -6490,10 +6493,7 @@ mod control_group_tests {
         let ground_text_position = selected_ground.text[0].position;
 
         {
-            let aircraft = sim
-                .entities_mut_for_test()
-                .get_mut(27)
-                .expect("retained ORCA");
+            let aircraft = sim.entity_mut_for_test(27).expect("retained ORCA");
             aircraft.selection.set_selected_for_test(false);
             aircraft.position.set_exact_z_leptons_for_test(Some(1500));
         }
@@ -6531,15 +6531,13 @@ mod control_group_tests {
         );
         assert_eq!(render(&sim, &groups, Some(27))[&27].text.len(), 1);
 
-        sim.entities_mut_for_test()
-            .get_mut(27)
+        sim.entity_mut_for_test(27)
             .expect("retained ORCA")
             .selection
             .set_selected_for_test(false);
         assert!(render(&sim, &groups, None).is_empty());
         groups[registered_slot("TeamCreate_10")].clear();
-        sim.entities_mut_for_test()
-            .get_mut(27)
+        sim.entity_mut_for_test(27)
             .expect("retained ORCA")
             .selection
             .set_selected_for_test(true);
@@ -6636,8 +6634,7 @@ mod control_group_tests {
             vec![(27, '1')]
         );
 
-        sim.entities_mut_for_test()
-            .get_mut(27)
+        sim.entity_mut_for_test(27)
             .expect("retained building")
             .selection
             .set_selected_for_test(false);
@@ -6661,8 +6658,7 @@ mod control_group_tests {
             vec![(27, '1')]
         );
 
-        sim.entities_mut_for_test()
-            .get_mut(27)
+        sim.entity_mut_for_test(27)
             .expect("retained building")
             .selection
             .set_selected_for_test(true);
@@ -6755,7 +6751,7 @@ mod control_group_tests {
         // the common CurrentPlayer-allied path implemented here.
         sim.fog_mut_for_test().mark_visible_for_owner(owner, 12, 10);
         let display_order =
-            crate::app::presentation::instances::tactical_entity_encounter_order(&sim);
+            crate::app::presentation::instances::tactical_entity_encounter_order(&sim, None);
         for id in [17, 18, 19] {
             assert!(
                 display_order.contains(&id),
@@ -7002,7 +6998,7 @@ mod control_group_tests {
         let mut groups = vec![Vec::new(); 10];
         groups[1] = vec![80];
         assert!(
-            crate::app::presentation::instances::tactical_entity_encounter_order(&sim)
+            crate::app::presentation::instances::tactical_entity_encounter_order(&sim, None)
                 .contains(&80),
             "the allied unit remains in the retained Display projection"
         );
@@ -7397,8 +7393,7 @@ mod control_group_tests {
             .set_current_house_for_test(Some(local));
         for id in [1, 2] {
             group_entity(&mut sim, id, local);
-            sim.entities_mut_for_test()
-                .get_mut(id)
+            sim.entity_mut_for_test(id)
                 .unwrap()
                 .set_object_group_for_test(9);
         }

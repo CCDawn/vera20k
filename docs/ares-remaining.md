@@ -49,11 +49,9 @@ first; the Ares part is then small. None of them is reachable with retail YR dat
 | Gate placement selling walls (0x440709, 100156F0) | The hook's wall test in BuildingClass::Unlimbo's Gate arm; the stock arm is ported with the stock wall ids | A mod `Wall=` overlay stays under a gate |
 | Tunnel entry by an absorber click (0x44351A, 100172F0) | The absorber click that sends radio 0x10 | Ares tunnels are mod-only |
 
-Stock gaps found in passing, with no Ares dependency:
-- BuildingType GetPipMax (0x45ECE0): retail refineries show 5 ore pips where native shows
-  30 (GAREFN, NAREFN) or 15 (YAREFN).
-- Generate_Starting_Units (0x5D6D80) stops for every later house when one house has no
-  starting-unit candidates; VERA skips only that house.
+Stock gap found in passing, with no Ares dependency: Generate_Starting_Units (0x5D6D80)
+stops for every later house when one house has no starting-unit candidates; VERA skips
+only that house.
 
 ## Ares mechanisms ported in part
 
@@ -155,8 +153,7 @@ atlas. The ordinary ROBO/MTNK path has zero TurretCount on both types.
 - Sidebar and screens: the observer strip art (`0x6AA0CA`, `0x6AA164`;
   [ares-country-presentation.md](ares-country-presentation.md)), the Money superweapon
   tooltip (`0x6A932B`).
-- Palettes and draw order: an anim's `CustomPalette` (`0x4232CE`), a ParticleType's
-  `Palette` (`0x62D015`) and the Ground layer's per-frame sort (`0x551A30`). See
+- Palettes: a ParticleType's `Palette` (`0x62D015`). See
   [ares-anim-particles.md](ares-anim-particles.md) and [ares-bugfixes.md](ares-bugfixes.md).
 - Audio: the move sound under a Magnetron (`0x4DAA68`, `0x7101CF`), the amphibious
   water sound (`0x51D799`), and loose WAV samples and extra audio bags (`0x4016F0`).
