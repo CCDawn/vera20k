@@ -21127,12 +21127,14 @@ pub enum LieutenantStance {
     /// 防守模式: the defensive posture. `AutoReact` groups hold their
     /// ground — intercept the threats inside the ring, hold a spread of
     /// guard posts otherwise, pull a badly wounded member back.
-    #[default]
     Defend,
     /// 进攻模式: the offensive posture. `AutoReact` groups seek and press
     /// the armor-ranked best hostile in a wide ring through a latched
     /// group focus, sustaining the engagement; location intents keep
-    /// their behavior with the engagement ring one notch wider.
+    /// their behavior with the engagement ring one notch wider. The
+    /// player-specified default: takeover hands over troops to fight, not
+    /// to stand around.
+    #[default]
     Attack,
 }
 
@@ -29620,13 +29622,13 @@ mod tests {
     // armor ranking.
 
     #[test]
-    fn lieutenant_stance_defaults_to_defend_and_switches() {
+    fn lieutenant_stance_defaults_to_attack_and_switches() {
         let mut lieutenant = Lieutenant::new(InternedId::from_index(0));
-        assert_eq!(lieutenant.stance(), LieutenantStance::Defend);
-        lieutenant.set_stance(LieutenantStance::Attack);
         assert_eq!(lieutenant.stance(), LieutenantStance::Attack);
         lieutenant.set_stance(LieutenantStance::Defend);
         assert_eq!(lieutenant.stance(), LieutenantStance::Defend);
+        lieutenant.set_stance(LieutenantStance::Attack);
+        assert_eq!(lieutenant.stance(), LieutenantStance::Attack);
     }
 
     #[test]
