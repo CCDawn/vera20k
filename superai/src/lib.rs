@@ -4315,7 +4315,7 @@ impl SuperAi {
             let clear = vera20k_core::sim::build_site::can_place_building_at(
                 sim,
                 rules,
-                Some(&runtime.resources.overlay_registry),
+                Some(runtime.resources.rules.overlay_registry()),
                 yard_ty,
                 (mx - 1, my - 1),
                 None,
@@ -4399,7 +4399,7 @@ impl SuperAi {
                 if let Some((ox, oy)) = find_site_around(
                     sim,
                     rules,
-                    &runtime.resources.overlay_registry,
+                    runtime.resources.rules.overlay_registry(),
                     yard_ty,
                     (mx, my),
                     self.house,
@@ -4443,7 +4443,7 @@ impl SuperAi {
                     let resite = find_site_around(
                         sim,
                         rules,
-                        &runtime.resources.overlay_registry,
+                        runtime.resources.rules.overlay_registry(),
                         yard_ty,
                         (mx, my),
                         self.house,
@@ -4664,7 +4664,7 @@ impl SuperAi {
             self.expansion_site = self.best_ore_field(
                 sim,
                 rules,
-                &runtime.resources.overlay_registry,
+                runtime.resources.rules.overlay_registry(),
                 home,
                 None,
                 Some(opening.refinery),
@@ -4790,7 +4790,7 @@ impl SuperAi {
                         sim,
                         rules,
                         opening,
-                        &runtime.resources.overlay_registry,
+                        runtime.resources.rules.overlay_registry(),
                         true,
                     ) {
                         Some(cell) => {
@@ -4859,7 +4859,7 @@ impl SuperAi {
                                 find_site_beyond(
                                     sim,
                                     rules,
-                                    &runtime.resources.overlay_registry,
+                                    runtime.resources.rules.overlay_registry(),
                                     ty,
                                     (sx as i16, sy as i16),
                                     self.house,
@@ -4927,7 +4927,7 @@ impl SuperAi {
                             let site = find_site_around_capped(
                                 sim,
                                 rules,
-                                &runtime.resources.overlay_registry,
+                                runtime.resources.rules.overlay_registry(),
                                 ty,
                                 center,
                                 self.house,
@@ -4938,7 +4938,7 @@ impl SuperAi {
                                 find_site_around_capped(
                                     sim,
                                     rules,
-                                    &runtime.resources.overlay_registry,
+                                    runtime.resources.rules.overlay_registry(),
                                     ty,
                                     center,
                                     self.house,
@@ -4982,7 +4982,7 @@ impl SuperAi {
                                     find_defense_site_around_in_area(
                                         sim,
                                         rules,
-                                        &runtime.resources.overlay_registry,
+                                        runtime.resources.rules.overlay_registry(),
                                         ty,
                                         anchor,
                                         self.house,
@@ -5004,7 +5004,7 @@ impl SuperAi {
                                             find_site_around_capped(
                                                 sim,
                                                 rules,
-                                                &runtime.resources.overlay_registry,
+                                                runtime.resources.rules.overlay_registry(),
                                                 ty,
                                                 home,
                                                 self.house,
@@ -5029,7 +5029,7 @@ impl SuperAi {
                                         find_defense_site_around(
                                             sim,
                                             rules,
-                                            &runtime.resources.overlay_registry,
+                                            runtime.resources.rules.overlay_registry(),
                                             ty,
                                             home,
                                             self.house,
@@ -5047,7 +5047,7 @@ impl SuperAi {
                                             find_site_around_capped(
                                                 sim,
                                                 rules,
-                                                &runtime.resources.overlay_registry,
+                                                runtime.resources.rules.overlay_registry(),
                                                 ty,
                                                 home,
                                                 self.house,
@@ -5059,7 +5059,7 @@ impl SuperAi {
                                         find_site_around_capped(
                                             sim,
                                             rules,
-                                            &runtime.resources.overlay_registry,
+                                            runtime.resources.rules.overlay_registry(),
                                             ty,
                                             home,
                                             self.house,
@@ -6450,7 +6450,7 @@ impl SuperAi {
                 self.expansion2_site = self.best_ore_field(
                     sim,
                     rules,
-                    &runtime.resources.overlay_registry,
+                    runtime.resources.rules.overlay_registry(),
                     home,
                     self.expansion_site,
                     Some(opening.construction_yard),
@@ -6498,7 +6498,7 @@ impl SuperAi {
                             find_site_beyond(
                                 sim,
                                 rules,
-                                &runtime.resources.overlay_registry,
+                                runtime.resources.rules.overlay_registry(),
                                 yard,
                                 (sx as i16, sy as i16),
                                 self.house,
@@ -7189,7 +7189,7 @@ impl SuperAi {
                         sim,
                         rules,
                         opening,
-                        &runtime.resources.overlay_registry,
+                        runtime.resources.rules.overlay_registry(),
                         false,
                     )
                     .is_some()
@@ -7795,7 +7795,7 @@ impl SuperAi {
                                     find_site_around_capped(
                                         sim,
                                         rules,
-                                        &runtime.resources.overlay_registry,
+                                        runtime.resources.rules.overlay_registry(),
                                         yard_ty,
                                         yard,
                                         self.house,
@@ -23174,7 +23174,7 @@ mod tests {
                         vera20k_core::sim::build_site::can_place_building_at(
                             sim,
                             rules,
-                            Some(&scenario.runtime.resources.overlay_registry),
+                            Some(scenario.runtime.resources.rules.overlay_registry()),
                             yard_ty,
                             (mcv_cell.0 as i16 - 1, mcv_cell.1 as i16 - 1),
                             None,
@@ -24174,7 +24174,7 @@ mod tests {
                         y as u16,
                         0,
                         &runtime.resources.rules,
-                        &runtime.resources.overlay_registry,
+                        runtime.resources.rules.overlay_registry(),
                     ) {
                         return id;
                     }
@@ -24206,7 +24206,7 @@ mod tests {
                 &mut runtime.simulation,
                 &runtime.resources.rules,
                 &[event],
-                Some(&runtime.resources.overlay_registry),
+                Some(runtime.resources.rules.overlay_registry()),
                 vera20k_core::sim::world::FrameEffects::default(),
             );
             if !runtime
@@ -25310,7 +25310,7 @@ mod tests {
                 continue;
             };
             let rules = scenario.runtime.resources.rules.clone();
-            let registry = scenario.runtime.resources.overlay_registry.clone();
+            let registry = scenario.runtime.resources.rules.overlay_registry().clone();
             let records: Vec<_> = scenario
                 .sim()
                 .zone_grid()
@@ -25759,7 +25759,7 @@ mod tests {
             ai.best_ore_field(
                 scenario.sim(),
                 &scenario.runtime.resources.rules,
-                &scenario.runtime.resources.overlay_registry,
+                scenario.runtime.resources.rules.overlay_registry(),
                 from,
                 None,
                 Some("GAREFN"),
@@ -25830,7 +25830,7 @@ mod tests {
             ai.best_ore_field(
                 scenario.sim(),
                 &scenario.runtime.resources.rules,
-                &scenario.runtime.resources.overlay_registry,
+                scenario.runtime.resources.rules.overlay_registry(),
                 from,
                 None,
                 Some("GAREFN"),
@@ -26603,7 +26603,7 @@ mod tests {
                 .find(|opening| opening.construction_yard == "GACNST")
                 .expect("the Allied opening");
             let rules = &scenario.runtime.resources.rules;
-            let overlays = &scenario.runtime.resources.overlay_registry;
+            let overlays = scenario.runtime.resources.rules.overlay_registry();
 
             // Fill the tried-cell book the way the placement branch does —
             // one mark per answered cell — until the walk finds nothing.
@@ -28295,7 +28295,7 @@ mod tests {
                         &mut runtime.simulation,
                         &runtime.resources.rules,
                         &[event],
-                        Some(&runtime.resources.overlay_registry),
+                        Some(runtime.resources.rules.overlay_registry()),
                         vera20k_core::sim::world::FrameEffects::default(),
                     );
                 }
@@ -28632,7 +28632,7 @@ mod tests {
             .find(|opening| opening.construction_yard == "GACNST")
             .expect("the Allied opening");
         let rules = &scenario.runtime.resources.rules;
-        let overlays = &scenario.runtime.resources.overlay_registry;
+        let overlays = scenario.runtime.resources.rules.overlay_registry();
         let standing = |sim: &vera20k_core::sim::world::Simulation, name: &str| -> Vec<u64> {
             sim.entities()
                 .iter_sorted()
@@ -28832,7 +28832,7 @@ mod tests {
             .find(|opening| opening.construction_yard == "GACNST")
             .expect("the Allied opening");
         let rules = &scenario.runtime.resources.rules;
-        let overlays = &scenario.runtime.resources.overlay_registry;
+        let overlays = scenario.runtime.resources.rules.overlay_registry();
         let wall_id = (0..=u8::MAX)
             .find(|&id| overlays.flags(id).is_some_and(|flags| flags.wall))
             .expect("the retail overlay table carries a wall");
