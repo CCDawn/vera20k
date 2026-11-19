@@ -1993,7 +1993,7 @@ fn advance_one_simulation_frame(
     // take instead of touching main-thread state on the worker.
     let mut super_orders = Vec::new();
     if tick_lane == TickLane::Ordinary && !state.match_state.super_players.is_empty() {
-        let tick = u32::try_from(sim.session().tick()).unwrap_or(u32::MAX);
+        let tick = u32::try_from(rt.simulation.session().tick()).unwrap_or(u32::MAX);
         let mut super_players = std::mem::take(&mut state.match_state.super_players);
         for ai in super_players.iter_mut() {
             super_orders.extend(ai.orders(rt, tick));
@@ -2018,7 +2018,7 @@ fn advance_one_simulation_frame(
     if tick_lane == TickLane::Ordinary
         && let Some(lieutenant) = state.match_state.lieutenant.as_mut()
     {
-        let tick = u32::try_from(sim.session().tick()).unwrap_or(u32::MAX);
+        let tick = u32::try_from(rt.simulation.session().tick()).unwrap_or(u32::MAX);
         super_orders.extend(lieutenant.orders(rt, tick));
     }
     if !threaded {
