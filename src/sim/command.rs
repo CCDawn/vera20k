@@ -1666,6 +1666,24 @@ pub enum Command {
     /// player's regrouping no longer changes what that player's own teams
     /// recruit or which group an action 84 wakes.
     AssignControlGroup { group: i32, entity_ids: Vec<u64> },
+    /// VERA "Commander Mode": hand the named own assets to the external AI
+    /// plugin. The envelope owner is the delegating (human) house. The
+    /// receiver (`world_commands`) validates every id against the envelope
+    /// owner (a foreign id drops the whole command silently), skips unarmed
+    /// structures (base buildings never delegate) and records the survivors
+    /// as a new delegated group in `Simulation::delegation` — state that
+    /// lives in sim, changes only through this command stream and persists
+    /// in snapshots. Re-delegating an id moves it from its older group.
+    /// Appended to preserve existing serialized variant indices.
+    DelegateAssets {
+        entity_ids: Vec<u64>,
+        intent: crate::sim::delegation::DelegationIntent,
+    },
+    /// VERA "Commander Mode": take the named own assets back from the
+    /// external AI plugin. Same per-id owner gate as `DelegateAssets`; the
+    /// ids leave every group of the envelope owner's registry. Appended to
+    /// preserve existing serialized variant indices.
+    RevokeAssets { entity_ids: Vec<u64> },
 }
 
 impl Command {
@@ -1686,7 +1704,13 @@ impl Command {
             | Self::AssignControlGroup { .. }
             | Self::SetGameSpeed { .. }
             | Self::MoveFlash { .. }
-            | Self::CancelPaidSuperWeapon { .. } => false,
+            | Self::CancelPaidSuperWeapon { .. }
+            // VERA delegation extensions: no native EventClass record exists
+            // for them; like the local extensions above they ride the
+            // synchronized FIFO in issue order without native OutList
+            // capacity.
+            | Self::DelegateAssets { .. }
+            | Self::RevokeAssets { .. } => false,
             Self::PlanningRecord { .. }
             | Self::Move { .. }
             | Self::MoveToObject { .. }

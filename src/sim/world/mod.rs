@@ -1894,6 +1894,17 @@ pub struct Simulation {
     /// the defeat gate (`world::house_defeat`) is the sole reader.
     #[serde(skip)]
     defense_map_form: bool,
+    /// Delegated assets ("Commander Mode"): per-house groups a player handed
+    /// to the external AI plugin. Single authoritative sim state, written
+    /// only by the `DelegateAssets`/`RevokeAssets` command receivers
+    /// (`world_commands`) and the lifecycle death prune
+    /// (`finalize_and_remove_common`); the plugin reads it through
+    /// [`Self::delegation`]. Saved whole with the snapshot (`GameSnapshot`
+    /// embeds this struct); `#[serde(default)]` admits saves made before the
+    /// field existed — the traced snapshot layout digest changes with it,
+    /// accepted by design.
+    #[serde(default)]
+    pub(crate) delegation: crate::sim::delegation::DelegationRegistry,
 }
 
 impl Simulation {
@@ -4855,6 +4866,7 @@ impl Simulation {
             replaying_recorded_commands: false,
             trigger_runtime: TriggerRuntime::default(),
             defense_map_form: false,
+            delegation: crate::sim::delegation::DelegationRegistry::default(),
         };
         debug_assert_eq!(out.scenario_rng.state(), out.main_rng.state());
         // Authoritative map bounds are session state, known at construction —
@@ -4917,6 +4929,14 @@ impl Simulation {
     /// The entity store. Read access for systems above sim/.
     pub fn entities(&self) -> &EntityStore {
         &self.substrate.entities
+    }
+
+    /// The delegated-asset registry (Commander Mode state). Read access for
+    /// the external AI plugin and presentation, along the same visibility
+    /// path as [`Self::entities`]; the groups change only through the
+    /// synchronized command stream and lifecycle's death prune.
+    pub fn delegation(&self) -> &crate::sim::delegation::DelegationRegistry {
+        &self.delegation
     }
 
     /// The objects that may draw differently since the last take, leaving

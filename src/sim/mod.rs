@@ -64,6 +64,7 @@ pub(crate) mod conversion_health;
 pub mod crates; // scenario-start crate placement (Post_Map_Init step 3)
 pub mod credit_income; // oil-derrick ProduceCash + Floating Disc money drain (object-loop money)
 pub(crate) mod crew_survival; // building SpawnSurvivors and vehicle crew escape
+pub mod delegation; // delegated-asset groups ("Commander Mode") owned through the command stream
 #[cfg(feature = "debug-tools")]
 pub mod debug_event_log;
 pub mod dirty_cells;

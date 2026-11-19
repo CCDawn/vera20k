@@ -2117,6 +2117,15 @@ impl Simulation {
                     frame_effects,
                 )
                 .accepted(),
+            // VERA "Commander Mode" extensions: the envelope owner is the
+            // delegating house; the receivers validate every member id
+            // against it and record only survivors in the registry.
+            Command::DelegateAssets { entity_ids, intent } => {
+                self.apply_delegate_assets(command_owner, entity_ids, *intent, rules)
+            }
+            Command::RevokeAssets { entity_ids } => {
+                self.apply_revoke_assets(command_owner, entity_ids)
+            }
             Command::ForceAttackCell {
                 attacker_id,
                 target_rx,
@@ -3323,6 +3332,98 @@ impl Simulation {
             .entities
             .get(stable_id)
             .is_some_and(|e| command_owner.eq_ignore_ascii_case(self.interner.resolve(e.owner())))
+    }
+
+    /// VERA "Commander Mode" admission: hand the named own assets to the
+    /// external AI plugin (`Simulation::delegation`). Every id must belong
+    /// to the delegating house — one foreign or despawned id silently drops
+    /// the whole command (deterministic rejection, never logged). The member
+    /// list is then filtered: every foot techno (unit, infantry, aircraft)
+    /// stays, while a structure is delegatable only when its type keeps a
+    /// weapon, read through `combat_weapon::is_armed` — the
+    /// `TechnoClass::Is_Armed 0x00701120` / `BuildingClass::Is_Armed 0x00458DB0`
+    /// predicate the defense-building targeting path (`Greatest_Threat`
+    /// 0x006F85AB's building gate) also consumes. Unarmed base buildings
+    /// (conyard, power plant, refinery, ...) are silently skipped. An empty
+    /// remainder is a no-op; otherwise the survivors join one fresh group of
+    /// the house's registry (re-delegating an id moves it from its older
+    /// group).
+    fn apply_delegate_assets(
+        &mut self,
+        command_owner: &str,
+        entity_ids: &[u64],
+        intent: crate::sim::delegation::DelegationIntent,
+        rules: &RuleSet,
+    ) -> bool {
+        let Some(owner) = self.interner.get(command_owner) else {
+            return false;
+        };
+        if entity_ids.is_empty() {
+            return false;
+        }
+        if !entity_ids
+            .iter()
+            .all(|id| self.entity_owned_by_id(command_owner, *id))
+        {
+            return false;
+        }
+        let members: Vec<u64> = entity_ids
+            .iter()
+            .copied()
+            .filter(|id| self.delegation_member_admissible(*id, rules))
+            .collect();
+        if members.is_empty() {
+            return false;
+        }
+        self.delegation.delegate(owner, &members, intent);
+        true
+    }
+
+    /// VERA "Commander Mode" admission: take the named own assets back. The
+    /// same per-id owner gate as [`Self::apply_delegate_assets`] applies —
+    /// an id the envelope owner no longer owns (a same-tick despawn
+    /// included) drops the whole command silently; the lifecycle death prune
+    /// has usually already removed a despawned id, so the ordinary revoke of
+    /// live groups is unaffected.
+    fn apply_revoke_assets(&mut self, command_owner: &str, entity_ids: &[u64]) -> bool {
+        let Some(owner) = self.interner.get(command_owner) else {
+            return false;
+        };
+        if entity_ids.is_empty() {
+            return false;
+        }
+        if !entity_ids
+            .iter()
+            .all(|id| self.entity_owned_by_id(command_owner, *id))
+        {
+            return false;
+        }
+        self.delegation.revoke(owner, entity_ids);
+        true
+    }
+
+    /// The delegatable-member filter: every foot techno passes; a structure
+    /// passes only while its type arms it (see
+    /// [`Self::apply_delegate_assets`]); any other category is skipped.
+    fn delegation_member_admissible(&self, stable_id: u64, rules: &RuleSet) -> bool {
+        let Some(entity) = self.substrate.entities.get(stable_id) else {
+            return false;
+        };
+        match entity.category() {
+            EntityCategory::Unit | EntityCategory::Infantry | EntityCategory::Aircraft => true,
+            EntityCategory::Structure => {
+                let Some(obj) = self.object_type(entity.type_ref(), rules) else {
+                    return false;
+                };
+                combat::combat_weapon::is_armed(
+                    entity,
+                    obj,
+                    &self.substrate.entities,
+                    rules,
+                    &self.interner,
+                )
+            }
+        }
     }
 
     /// VERA-only network admission, not a native receiver test: refuse an

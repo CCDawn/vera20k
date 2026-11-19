@@ -7507,6 +7507,15 @@ impl Simulation {
                     // replacement or altering the House's Factory queue slots.
                     self.production.clear_primary_factory(stable_id);
                 }
+                // Delegated assets ("Commander Mode") never keep a dead id:
+                // this is the shared physical destructor owner every death
+                // path reaches, so one liveness prune here drops the removed
+                // identity from its house's groups and empties those groups.
+                if entity.is_some() {
+                    let entities = &self.substrate.entities;
+                    self.delegation
+                        .prune_dead(|member| entities.get(member).is_some());
+                }
                 entity.is_some()
             }
             Some(ObjectKind::Anim) => self.substrate.anims.remove(stable_id).is_some(),
