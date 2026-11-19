@@ -1983,11 +1983,12 @@ fn advance_one_simulation_frame(
     // A lent frame takes its due commands on the simulation thread, after
     // its frame is published: taken here, the published world would have a
     // selection or control group neither queued nor applied.
-    let mut due_commands = if !threaded && !replaying && !resuming && tick_lane == TickLane::Ordinary {
-        sim.take_due_commands()
-    } else {
-        Vec::new()
-    };
+    let mut due_commands =
+        if !threaded && !replaying && !resuming && tick_lane == TickLane::Ordinary {
+            sim.take_due_commands()
+        } else {
+            Vec::new()
+        };
     // Fork-only Super-AI opponents (`docs/superai.md`): the command layer
     // drives each command-driven house — its orders merge into this frame's
     // commands — and the house's driver policy applies its credit support (a
@@ -2014,6 +2015,16 @@ fn advance_one_simulation_frame(
             policy.apply_credit_support(rt, ai.house(), tick);
         }
         state.match_state.super_players = super_players;
+    }
+    // VERA commander mode: the local human house's lieutenant merges its
+    // orders the same way — drawn while the world is still home, Ordinary
+    // lane only, threaded job merges after its own take. The human house is
+    // not command-driven; this never touches super_players.
+    if tick_lane == TickLane::Ordinary
+        && let Some(lieutenant) = state.match_state.lieutenant.as_mut()
+    {
+        let tick = u32::try_from(sim.session().tick()).unwrap_or(u32::MAX);
+        super_orders.extend(lieutenant.orders(rt, tick));
     }
     if !threaded {
         due_commands.append(&mut super_orders);

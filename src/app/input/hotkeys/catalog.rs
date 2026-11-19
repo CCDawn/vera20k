@@ -103,7 +103,7 @@ const CAMERA_COMMANDS: [CommandMetadata; 4] = [
 /// (`hotkeys::VERA_DEFAULT_KEYS`). Each name is the Options page's label for
 /// the same setting, but Thread Stats', Ferry's, Relation Colours' and the two
 /// Formation commands', which have none; each category literal is [`VERA_CATEGORY_KEY`].
-const SHORTCUT_COMMANDS: [CommandMetadata; 11] = [
+const SHORTCUT_COMMANDS: [CommandMetadata; 14] = [
     command!(
         HotkeyCommand::PerformanceStats,
         "PerformanceStats",
@@ -190,6 +190,30 @@ const SHORTCUT_COMMANDS: [CommandMetadata; 11] = [
         "VERA:RelationColors",
         "VERA:HotkeyCategory",
         "VERA:RelationColorsDesc",
+        None
+    ),
+    command!(
+        HotkeyCommand::DelegateToAi,
+        "DelegateToAi",
+        "VERA:DelegateToAi",
+        "VERA:HotkeyCategory",
+        "VERA:DelegateToAiDesc",
+        None
+    ),
+    command!(
+        HotkeyCommand::DelegateIntent,
+        "DelegateIntent",
+        "VERA:DelegateIntent",
+        "VERA:HotkeyCategory",
+        "VERA:DelegateIntentDesc",
+        None
+    ),
+    command!(
+        HotkeyCommand::CycleLieutenantStance,
+        "CycleLieutenantStance",
+        "VERA:CycleLieutenantStance",
+        "VERA:HotkeyCategory",
+        "VERA:CycleLieutenantStanceDesc",
         None
     ),
 ];

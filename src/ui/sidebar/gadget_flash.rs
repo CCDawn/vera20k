@@ -181,6 +181,13 @@ pub struct SidebarGadgetState {
     pub command_bar_open_at_defeat: bool,
     pub command_pressed: [bool; 11],
     pub command_thumb_pressed: bool,
+    /// VERA commander mode (`[gameplay] commander_mode` gates the pair): the
+    /// takeover button's on-state and the stance button's indicator (true =
+    /// attack), mirrored from the match input state and the lieutenant every
+    /// gadget pass. The bar draw reads them like the PlanningMode button's
+    /// `command_pressed` on-state.
+    pub commander_takeover_on: bool,
+    pub commander_stance_attack: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

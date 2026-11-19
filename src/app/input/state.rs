@@ -298,6 +298,16 @@ pub(crate) struct MatchInputState {
     /// The object the camera is following, i.e. `DisplayClass +0x11A0` behind
     /// its valid byte `+0x119C`. `None` is the cleared pair.
     pub(crate) follow_target: Option<u64>,
+    /// Commander mode's takeover toggle (`[gameplay] commander_mode` gates
+    /// the whole feature): while on, every completed selection of the local
+    /// player's own delegatable assets hands them to the match's lieutenant.
+    /// Local HUD toggle like the planning mode; never enters the command
+    /// stream, and toggling off leaves existing delegations in place.
+    pub(crate) takeover_mode: bool,
+    /// Commander mode's armed intent-targeting click (`input::dispatch`
+    /// arms it): the selection ids the next tactical click re-delegates.
+    /// A command latch like the ferry's armed drop click.
+    pub(crate) delegate_intent_target: Option<Vec<u64>>,
     /// Mutually-exclusive cursor-on-tactical-map targeting mode (building
     /// placement OR superweapon). Right-click clears; Options preserves it. Arming one
     /// kind clears the other.
@@ -554,6 +564,8 @@ impl MatchInputState {
             last_control_group_press: None,
             build_repeat: Default::default(),
             follow_target: None,
+            takeover_mode: false,
+            delegate_intent_target: None,
             targeting_mode: None,
             building_placement_preview: None,
             foundation_latch: FoundationLatch::default(),
@@ -941,6 +953,10 @@ impl MatchInputState {
     pub(crate) fn clear_command_latches(&mut self) {
         self.formation_line.clear_key();
         self.ferry.disarm();
+        // Commander mode's armed intent click is one more command latch an
+        // input lock must not strand. The takeover toggle itself is a mode
+        // like the planning mode below, not a latch: it stays.
+        self.delegate_intent_target = None;
         // A command-latch clear does not end the local planning mode. Keep
         // its physical release owner so an input lock cannot strand paths.
         self.queued_order_mode = crate::app::types::OrderMode::Move;

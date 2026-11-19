@@ -96,7 +96,11 @@ impl PathsConfig {
         // The browser build keeps mods apart from the saved profile: its page
         // imports the one a launch plays (web.rs `import_mod_file`) and
         // never stores it back.
-        if cfg!(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")) {
+        if cfg!(all(
+            feature = "wasm",
+            target_arch = "wasm32",
+            target_os = "unknown"
+        )) {
             return PathBuf::from(WEB_MODS_DIR);
         }
         self.settings_dir.join("Mods")
@@ -239,6 +243,13 @@ pub struct GameplayConfig {
     /// pressure then comes from map waves instead of an AI opponent. Testing
     /// switch for defense maps; the lobby picker is a later pillar.
     pub defense_ai: bool,
+    /// VERA fork-only switch (no gamemd key): when set, the interactive match
+    /// enables commander mode — the local player may hand assets to the
+    /// match's lieutenant driver ([`crate::super_ai::Lieutenant`]) with the
+    /// takeover toggle (Ctrl+G, or the bottom command bar's button) and the
+    /// Alt+G intent re-delegation, and manual orders reclaim delegated assets.
+    /// App-layer policy only; never read by the simulation.
+    pub commander_mode: bool,
 }
 
 impl Default for GameplayConfig {
@@ -247,6 +258,7 @@ impl Default for GameplayConfig {
             input_delay_ticks: default_input_delay_ticks(),
             pause_on_focus_loss: false,
             defense_ai: false,
+            commander_mode: false,
         }
     }
 }
@@ -431,6 +443,9 @@ impl GameConfig {
                     parse_bool(value).map(|on| gameplay.pause_on_focus_loss = on)
                 }
                 ("gameplay", "defense_ai") => parse_bool(value).map(|on| gameplay.defense_ai = on),
+                ("gameplay", "commander_mode") => {
+                    parse_bool(value).map(|on| gameplay.commander_mode = on)
+                }
                 ("profile", "name") => parse_string(value).map(|name| profile.name = Some(name)),
                 ("ini", "profile") => parse_string(value).and_then(|name| {
                     ini.profile = name.parse().map_err(anyhow::Error::msg)?;

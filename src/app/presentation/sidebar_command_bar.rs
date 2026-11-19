@@ -19,7 +19,19 @@ pub(crate) fn layout_and_slots(state: &AppState) -> Option<(CommandBarLayout, Ve
             .command_bar_closed,
     )?;
     let multiplayer = !state.match_state.session_mode().is_single_player();
-    Some((layout, art.slots[usize::from(multiplayer)].clone()))
+    let mut slots = art.slots[usize::from(multiplayer)].clone();
+    // VERA commander mode: the takeover and stance buttons take the next
+    // free tiles after the retail commands; a frame too narrow for them
+    // leaves them unplaced, like a retail command past the right cap.
+    if state.match_state.commander_mode_enabled {
+        slots.push(Some(
+            crate::ui::sidebar::command_bar::COMMANDER_TAKEOVER_COMMAND,
+        ));
+        slots.push(Some(
+            crate::ui::sidebar::command_bar::COMMANDER_STANCE_COMMAND,
+        ));
+    }
+    Some((layout, slots))
 }
 
 /// The bar a match shows on `frame`, in its layout space: along the strip the
@@ -120,11 +132,7 @@ pub(crate) fn append_prepared(
     draw(art.right_cap, layout.right_cap.x, layout.right_cap.y);
     for (slot, command) in slots.iter().copied().enumerate() {
         if let (Some(rect), Some(command)) = (layout.slot(slot), command) {
-            draw(
-                art.buttons[command][usize::from(gadgets.command_pressed[command])],
-                rect.x,
-                rect.y,
-            );
+            draw(bar_button_entry(art, gadgets, command), rect.x, rect.y);
         }
     }
     draw(
@@ -132,6 +140,39 @@ pub(crate) fn append_prepared(
         layout.left_cap.x,
         layout.left_cap.y,
     );
+}
+
+/// The shape one bar slot draws. The retail commands read their pressed bits
+/// as published; VERA commander mode's two appended buttons reuse existing
+/// shape slots — the takeover toggle draws the PlanningMode shape in its
+/// synced on/off frames, and the stance indicator draws the Guard shape
+/// while defending and the AttackMove shape (pressed frame) while attacking.
+/// Their on-states come from the gadget pass like the PlanningMode button's.
+fn bar_button_entry(
+    art: &crate::render::sidebar_chrome::CommandBarArt<SidebarChromeEntry>,
+    gadgets: &crate::ui::sidebar::gadget_flash::SidebarGadgetState,
+    command: usize,
+) -> Option<SidebarChromeEntry> {
+    use crate::ui::sidebar::command_bar::{
+        COMMANDER_STANCE_ART_COMMANDS, COMMANDER_STANCE_COMMAND, COMMANDER_TAKEOVER_ART_COMMAND,
+        COMMANDER_TAKEOVER_COMMAND,
+    };
+    match command {
+        COMMANDER_TAKEOVER_COMMAND => {
+            art.buttons[COMMANDER_TAKEOVER_ART_COMMAND][usize::from(gadgets.commander_takeover_on)]
+        }
+        COMMANDER_STANCE_COMMAND => {
+            let (art_command, on) = if gadgets.commander_stance_attack {
+                (COMMANDER_STANCE_ART_COMMANDS[1], true)
+            } else {
+                (COMMANDER_STANCE_ART_COMMANDS[0], false)
+            };
+            art.buttons[art_command][usize::from(on)]
+        }
+        // The ButtonList reader can only name the retail commands, so any
+        // other slot index is one of theirs.
+        _ => art.buttons[command][usize::from(gadgets.command_pressed[command])],
+    }
 }
 
 fn append_clipped(

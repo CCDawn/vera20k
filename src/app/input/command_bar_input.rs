@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// VERA commander mode's gadget ids, beside the retail command block
+/// (0xD6..0xE0) and ahead of the thumb pair (0xF0/0xF1). Their commands sit
+/// past the retail eleven (`crate::ui::sidebar::command_bar::
+/// COMMANDER_TAKEOVER_COMMAND` / `COMMANDER_STANCE_COMMAND`); both reuse
+/// existing shape slots — no new art assets.
+const ID_COMMANDER_TAKEOVER: u16 = 0xE2;
+const ID_COMMANDER_STANCE: u16 = 0xE3;
+
 pub(super) fn sync(state: &mut AppState) {
     let layout = crate::app::presentation::sidebar_build::command_bar::layout_and_slots(state);
     let closed = state
@@ -10,9 +18,30 @@ pub(super) fn sync(state: &mut AppState) {
         .sidebar_gadget_state
         .command_bar_closed;
     let frame = state.sidebar_frame();
+    // VERA commander mode: mirror the takeover toggle and the lieutenant's
+    // stance onto their buttons' on-states and the draw bits, like the
+    // planning owner above. Without the config the slots carry no marker, so
+    // the gadgets stay unplaced (disabled) and only these bits are written.
+    let enabled = state.match_state.commander_mode_enabled;
+    let takeover_on = enabled && state.match_state.input.takeover_mode;
+    let stance_attack = enabled
+        && state
+            .match_state
+            .lieutenant
+            .as_ref()
+            .is_some_and(|lieutenant| {
+                matches!(
+                    lieutenant.stance(),
+                    crate::super_ai::LieutenantStance::Attack
+                )
+            });
     let gadgets = &mut state.match_state.match_presentation.in_game_gadgets;
     sync_prepared(gadgets, layout.as_ref(), closed, frame);
     sync_planning_button(gadgets, state.match_state.input.planning.active());
+    sync_commander_button_on_states(gadgets, takeover_on, stance_attack);
+    let out = &mut state.match_state.match_presentation.sidebar_gadget_state;
+    out.commander_takeover_on = takeover_on;
+    out.commander_stance_attack = stance_attack;
 }
 
 /// TabClass::ReceiveNotice @ 0x006D1770 (the planning notice sink) turns the
@@ -29,6 +58,27 @@ fn sync_planning_button(gadgets: &mut InGameGadgets, active: bool) {
     }
 }
 
+/// The two appended commander buttons' on-states, written onto the gadget
+/// list the same pass the planning owner writes its own.
+fn sync_commander_button_on_states(
+    gadgets: &mut InGameGadgets,
+    takeover_on: bool,
+    stance_attack: bool,
+) {
+    let Some(handles) = gadgets.command_bar else {
+        return;
+    };
+    let on = [takeover_on, stance_attack];
+    for (offset, handle) in handles[11..13].iter().enumerate() {
+        if let Some(gadget) = gadgets.list.get_mut(*handle)
+            && let GadgetBehavior::Button(mut button) = gadget.behavior
+        {
+            button.is_on = on[offset];
+            gadget.behavior = GadgetBehavior::Button(button);
+        }
+    }
+}
+
 /// TabClass::Init @ 0x006D03A0 -> InitCommandBarButtons @ 0x006D0FD0 gives
 /// command `i` ID 0xD6 + i, flags 5 (Team01..03 0x55, PlanningMode a toggle)
 /// and places it at its ButtonList slot only when it ends before the right
@@ -39,6 +89,9 @@ fn sync_planning_button(gadgets: &mut InGameGadgets, active: bool) {
 /// the show button) when the sidebar is shown; only SidebarClass::Init_Clear
 /// (0x006A507C) and Init's hide-then-show (0x006A5560) pass 0, so in a
 /// scenario the sidebar stays shown and its hidden branch has no effect.
+/// VERA appends two commander-mode buttons past the retail commands
+/// (takeover 0xE2, stance 0xE3 — both toggle/on-state mirrors, no native
+/// counterpart) and keeps the thumb at index 13.
 fn sync_prepared(
     gadgets: &mut InGameGadgets,
     layout: Option<&(
@@ -51,8 +104,13 @@ fn sync_prepared(
     let handles =
         *gadgets.command_bar.get_or_insert_with(|| {
             std::array::from_fn(|i| {
-                let id = if i == 11 { 0xF0 } else { 0xD6 + i as u16 };
-                let kind = if i == 9 {
+                let id = match i {
+                    11 => ID_COMMANDER_TAKEOVER,
+                    12 => ID_COMMANDER_STANCE,
+                    13 => 0xF0,
+                    _ => 0xD6 + i as u16,
+                };
+                let kind = if i == 9 || i == 11 {
                     ToggleKind::Flip
                 } else {
                     ToggleKind::Plain
@@ -65,7 +123,7 @@ fn sync_prepared(
         });
     for (command, handle) in handles.into_iter().enumerate() {
         let rect = layout.and_then(|(layout, slots)| {
-            if command == 11 {
+            if command == 13 {
                 Some(layout.left_cap)
             } else {
                 slots
@@ -79,7 +137,7 @@ fn sync_prepared(
             gadget.rect = rect
                 .map(|rect| frame_rect_px(frame.bar_rect_to_frame(rect)))
                 .unwrap_or(GadgetRect::new(0, 0, 0, 0));
-            if command == 11 {
+            if command == 13 {
                 gadget.id = if closed { 0xF1 } else { 0xF0 };
             }
         }
@@ -123,14 +181,33 @@ pub(crate) fn tooltips(gadgets: &InGameGadgets) -> Vec<(u16, GadgetRect, &'stati
             .filter(|gadget| !gadget.is_disabled)
             .map(|gadget| (gadget.id, gadget.rect))
     };
-    let thumb = placed(handles[11]);
     let mut tips: Vec<_> = COMMAND_TIPS
         .iter()
         .filter_map(|&(command, label)| {
             placed(handles[command]).map(|(id, rect)| (id, rect, label))
         })
         .collect();
-    if let Some((id, rect)) = thumb {
+    // VERA commander mode: the two appended buttons' tips follow the retail
+    // commands'. The stance tip names the current posture, read off the
+    // button's synced on-state (`sync_commander_button_on_states`).
+    if let Some((id, rect)) = placed(handles[11]) {
+        tips.push((id, rect, "VERA:TakeoverMode"));
+    }
+    if let Some((id, rect)) = placed(handles[12]) {
+        let stance_attack = gadgets.list.get(handles[12]).is_some_and(
+            |gadget| matches!(gadget.behavior, GadgetBehavior::Button(button) if button.is_on),
+        );
+        tips.push((
+            id,
+            rect,
+            if stance_attack {
+                "VERA:StanceAttack"
+            } else {
+                "VERA:StanceDefend"
+            },
+        ));
+    }
+    if let Some((id, rect)) = placed(handles[13]) {
         tips.push((
             id,
             rect,
@@ -180,6 +257,16 @@ pub(super) fn apply(state: &mut AppState, result: u16) -> bool {
             .command_bar_closed = !opening;
         return true;
     }
+    // VERA commander mode: the two appended buttons share the hotkeys'
+    // owners (`input::dispatch`); a right click cycles/toggles alike.
+    if id == ID_COMMANDER_TAKEOVER {
+        crate::app::input::dispatch::toggle_takeover_mode(state);
+        return true;
+    }
+    if id == ID_COMMANDER_STANCE {
+        crate::app::input::dispatch::cycle_lieutenant_stance(state);
+        return true;
+    }
     if !(0xD6..0xE1).contains(&id) {
         return false;
     }
@@ -198,14 +285,16 @@ pub(super) fn publish(state: &mut AppState) {
     let Some(handles) = gadgets.command_bar else {
         return;
     };
-    let pressed = std::array::from_fn::<_, 12, _>(|i| {
+    let pressed = std::array::from_fn::<_, 14, _>(|i| {
         gadgets.list.get(handles[i]).is_some_and(|g| {
-        matches!(g.behavior,GadgetBehavior::Button(b) if if i == 9 { b.is_on } else { b.is_pressed })
+        matches!(g.behavior,GadgetBehavior::Button(b) if if i == 9 || i == 11 || i == 12 { b.is_on } else { b.is_pressed })
     })
     });
     let out = &mut state.match_state.match_presentation.sidebar_gadget_state;
     out.command_pressed.copy_from_slice(&pressed[..11]);
-    out.command_thumb_pressed = pressed[11];
+    out.commander_takeover_on = pressed[11];
+    out.commander_stance_attack = pressed[12];
+    out.command_thumb_pressed = pressed[13];
 }
 
 #[cfg(all(test, tests_app_input_a_c))]
@@ -390,12 +479,12 @@ mod tests {
         );
         sync_prepared(&mut gadgets, Some(&(layout(false), slots)), true, native);
         assert!(
-            handles[..11]
+            handles[..13]
                 .iter()
                 .all(|h| gadgets.list.get(*h).unwrap().is_disabled)
         );
         assert_eq!(
-            gadgets.list.get(handles[11]).unwrap().rect,
+            gadgets.list.get(handles[13]).unwrap().rect,
             GadgetRect::new(576, 568, 28, 32)
         );
         tick(
@@ -408,7 +497,7 @@ mod tests {
             .out
             .dispatches
             .iter()
-            .find(|record| record.handle == handles[11])
+            .find(|record| record.handle == handles[13])
             .unwrap();
         assert_eq!((press.key_after, press.action_result), (0, 1));
         assert_eq!(
@@ -424,7 +513,7 @@ mod tests {
             .out
             .dispatches
             .iter()
-            .find(|record| record.handle == handles[11])
+            .find(|record| record.handle == handles[13])
             .unwrap();
         assert_eq!((release.key_after, release.action_result), (0x80F1, 1));
         assert!(gadgets.focus.sticky.is_none());

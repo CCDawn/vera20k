@@ -1206,3 +1206,96 @@ fn a_loaded_carryall_offers_unload() {
         })
     );
 }
+
+// ---- VERA commander mode: takeover auto-delegation and manual-order reclaim ----
+
+/// Takeover auto-delegation reads one decision: with the toggle on, a
+/// completed selection of the local player's own assets becomes one
+/// `DelegateAssets` payload whose ids drop unarmed structures (a structure
+/// is delegatable only armed; units pass); with the toggle off, nothing is
+/// delegated.
+#[test]
+fn takeover_delegates_owned_armed_assets_and_nothing_when_off() {
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = &retail.rules;
+    let (mut sim, grinder, tank, gi) = scene(rules, "Americans");
+    let tesla = sim
+        .spawn_object("ATESLA", "Americans", 16, 16, 0, rules)
+        .expect("tesla coil");
+    let owner = sim.interner().get("Americans").unwrap();
+    let selected = [grinder, tesla, tank, gi];
+    // The Grinder is an unarmed structure: out. The units and the armed
+    // coil pass, in selection order.
+    assert_eq!(
+        crate::app::input::dispatch::delegatable_owned_ids(&sim, rules, owner, &selected),
+        [tesla, tank, gi]
+    );
+    assert_eq!(
+        crate::app::input::dispatch::takeover_delegate_payload(&sim, rules, owner, &selected, true,),
+        Some(Command::DelegateAssets {
+            entity_ids: vec![tesla, tank, gi],
+            intent: crate::sim::delegation::DelegationIntent::AutoReact,
+        })
+    );
+    assert_eq!(
+        crate::app::input::dispatch::takeover_delegate_payload(
+            &sim, rules, owner, &selected, false,
+        ),
+        None,
+        "takeover off delegates nothing"
+    );
+    // Another house's unit never rides a local delegation.
+    let russian_tank = sim
+        .spawn_object("MTNK", "Russians", 19, 19, 0, rules)
+        .expect("russian tank");
+    assert_eq!(
+        crate::app::input::dispatch::delegatable_owned_ids(&sim, rules, owner, &[russian_tank]),
+        []
+    );
+}
+
+/// The manual-order reclaim reads the live delegation state: actors the
+/// lieutenant holds (seeded here through the production `DelegateAssets`
+/// application) come back as the revoke subset, one the engine's own
+/// `RevokeAssets` application releases; never-delegated ids stay out.
+#[test]
+fn manual_order_reclaim_reads_delegated_actors_only() {
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = &retail.rules;
+    let (mut sim, grinder, tank, gi) = scene(rules, "Americans");
+    assert_eq!(
+        super::reclaim_delegated_actors(&sim, &[tank, gi]),
+        [],
+        "nothing delegated yet"
+    );
+    assert!(sim.apply_command(
+        "Americans",
+        &Command::DelegateAssets {
+            entity_ids: vec![tank, gi],
+            intent: crate::sim::delegation::DelegationIntent::AutoReact,
+        },
+        Some(rules),
+    ));
+    // The revoke subset is the delegated actors of the manual order, in
+    // stable id order; the never-delegated Grinder stays out.
+    assert_eq!(
+        super::reclaim_delegated_actors(&sim, &[gi, grinder, tank]),
+        [tank, gi]
+    );
+    assert!(sim.apply_command(
+        "Americans",
+        &Command::RevokeAssets {
+            entity_ids: vec![tank],
+        },
+        Some(rules),
+    ));
+    assert_eq!(
+        super::reclaim_delegated_actors(&sim, &[tank, gi]),
+        [gi],
+        "the revoke released the tank only"
+    );
+}

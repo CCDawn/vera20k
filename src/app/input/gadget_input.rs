@@ -94,7 +94,7 @@ pub(crate) struct InGameGadgets {
     /// Minimap/radar click region (A3): invisible sticky region over the radar
     /// minimap; disabled when the radar is offline / minimap absent.
     pub minimap: Option<GadgetHandle>,
-    pub command_bar: Option<[GadgetHandle; 12]>,
+    pub command_bar: Option<[GadgetHandle; 14]>,
     timer_dock: Option<GadgetHandle>,
     /// The layout's added parts, a gadget for each: grown to fit and never
     /// shrunk, with every part that is no button disabled.

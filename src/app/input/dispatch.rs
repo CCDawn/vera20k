@@ -37,6 +37,7 @@ use crate::app::presentation::sidebar_render::current_sidebar_view;
 use crate::app::types::OrderMode;
 use crate::map::entities::EntityCategory;
 use crate::sim::command::Command;
+use crate::sim::intern::InternedId;
 use crate::sim::selection::SelectAction;
 use crate::ui::sidebar::{SidebarAction, SidebarTab};
 
@@ -463,6 +464,10 @@ pub(crate) enum LeftUp {
 pub(crate) fn band_box_left_up(state: &mut AppState, click: LeftUp) {
     left_up_branches(state, click);
     state.match_state.input.queued_order_mode = OrderMode::Move;
+    // VERA commander mode: the armed intent-targeting click ends with the
+    // release, like the stock attack-move mode above — consumed by this
+    // click or not.
+    state.match_state.input.delegate_intent_target = None;
 }
 
 fn left_up_branches(state: &mut AppState, click: LeftUp) {
@@ -872,7 +877,13 @@ fn cancel_armed_pointer_mode(state: &mut AppState) -> bool {
         return true;
     }
     // VERA ferry: the armed drop click is one more mode a right click ends.
-    state.match_state.input.ferry.disarm()
+    if state.match_state.input.ferry.disarm() {
+        return true;
+    }
+    // VERA commander mode: the armed intent-targeting click is one more
+    // mode a right click ends.
+    state.match_state.input.delegate_intent_target = None;
+    false
 }
 
 fn handle_tactical_right_click(state: &mut AppState) {
@@ -2300,7 +2311,178 @@ fn dispatch_retail_hotkey(state: &mut AppState, command: HotkeyCommand) {
             presentation.relation_colors = !presentation.relation_colors;
             state.match_state.refresh_relation_colors();
         }
+        // VERA commander mode: the takeover toggle (Ctrl+G). The bottom
+        // command bar's takeover button calls the same owner.
+        HotkeyCommand::DelegateToAi => toggle_takeover_mode(state),
+        // VERA commander mode: arm the intent-targeting click over the
+        // current selection; the next tactical click re-delegates it
+        // (`input::context_order` consumes the click).
+        HotkeyCommand::DelegateIntent => arm_delegate_intent(state),
+        // VERA commander mode: cycle the lieutenant's global posture between
+        // defend and attack. The bottom command bar's stance button calls the
+        // same owner.
+        HotkeyCommand::CycleLieutenantStance => cycle_lieutenant_stance(state),
     }
+}
+
+/// VERA commander mode: the takeover toggle (`DelegateToAi`, Ctrl+G, and the
+/// bottom command bar's takeover button). Local HUD state like the planning
+/// mode: it never enters the command stream, and turning it off leaves the
+/// existing delegations in place. No-op without
+/// `[gameplay] commander_mode`.
+pub(crate) fn toggle_takeover_mode(state: &mut AppState) {
+    if !state.match_state.commander_mode_enabled {
+        return;
+    }
+    state.match_state.input.takeover_mode = !state.match_state.input.takeover_mode;
+}
+
+/// VERA commander mode: cycle the lieutenant's global posture (defend ->
+/// attack -> defend). Only a seated lieutenant answers; without
+/// `[gameplay] commander_mode` none exists, so this is a no-op.
+pub(crate) fn cycle_lieutenant_stance(state: &mut AppState) {
+    use crate::super_ai::LieutenantStance;
+    let Some(lieutenant) = state.match_state.lieutenant.as_mut() else {
+        return;
+    };
+    let next = match lieutenant.stance() {
+        LieutenantStance::Defend => LieutenantStance::Attack,
+        LieutenantStance::Attack => LieutenantStance::Defend,
+    };
+    lieutenant.set_stance(next);
+}
+
+/// VERA commander mode: arm the intent-targeting click (`DelegateIntent`,
+/// Alt+G). The current selection becomes the target set; the next tactical
+/// click re-delegates it to attack (plain click) or defend (Shift click) the
+/// clicked cell (`input::context_order`). A selection with no owned
+/// delegatable member leaves the mode unarmed.
+fn arm_delegate_intent(state: &mut AppState) {
+    if !state.match_state.commander_mode_enabled {
+        return;
+    }
+    let Some(owner_name) = preferred_local_owner(state) else {
+        return;
+    };
+    let selected = selected_stable_ids_in_order(
+        state
+            .match_state
+            .sim_runtime
+            .runtime()
+            .map(|rt| &rt.simulation),
+        state.rules(),
+        &state.match_state.input.selection_order,
+        state.match_state.input.selection_order_pending,
+    );
+    let Some(runtime) = state.match_state.sim_runtime.runtime() else {
+        return;
+    };
+    let Some(owner) = runtime.simulation.interner().get(&owner_name) else {
+        return;
+    };
+    let ids = delegatable_owned_ids(
+        &runtime.simulation,
+        &runtime.resources.rules,
+        owner,
+        &selected,
+    );
+    if ids.is_empty() {
+        return;
+    }
+    state.match_state.input.delegate_intent_target = Some(ids);
+}
+
+/// The selection ids the local player may hand to the lieutenant: the ones
+/// the local house owns, minus unarmed structures — a structure is
+/// delegatable only when it is armed ([`crate::sim::combat::combat_weapon::
+/// is_armed`], the same presence check the attack orders read); units pass.
+pub(crate) fn delegatable_owned_ids(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    owner: InternedId,
+    ids: &[u64],
+) -> Vec<u64> {
+    ids.iter()
+        .copied()
+        .filter(|&id| {
+            let Some(entity) = sim.entities().get(id) else {
+                return false;
+            };
+            if entity.owner() != owner {
+                return false;
+            }
+            if entity.category() != EntityCategory::Structure {
+                return true;
+            }
+            let Some(object) = sim.interner().object_type(entity.type_ref(), rules) else {
+                return false;
+            };
+            crate::sim::combat::combat_weapon::is_armed(
+                entity,
+                object,
+                sim.entities(),
+                rules,
+                sim.interner(),
+            )
+        })
+        .collect()
+}
+
+/// VERA commander mode: delegate `selected` — this frame's logic Selects —
+/// to the lieutenant while the takeover toggle is on. One `DelegateAssets`
+/// command with the owned, armed subset; nothing is enqueued when none
+/// qualify or the toggle is off. Runs from the post-sim selection
+/// reconciliation, so box, click and type selects all land here.
+fn auto_delegate_selected(state: &mut AppState, selected: &[u64]) {
+    let Some(owner_name) = preferred_local_owner(state) else {
+        return;
+    };
+    let takeover_mode = state.match_state.input.takeover_mode;
+    let payload = state.match_state.sim_runtime.runtime().and_then(|runtime| {
+        let owner = runtime.simulation.interner().get(&owner_name)?;
+        takeover_delegate_payload(
+            &runtime.simulation,
+            &runtime.resources.rules,
+            owner,
+            selected,
+            takeover_mode,
+        )
+    });
+    let Some(payload) = payload else {
+        return;
+    };
+    if !super::commands::selection_input_has_capacity(state, 1) {
+        return;
+    }
+    let Some(runtime) = state.match_state.sim_runtime.write_sim(SimWrite::Command) else {
+        return;
+    };
+    let _ = crate::app::input::commands::schedule_command_in_sim(
+        &mut runtime.simulation,
+        &owner_name,
+        payload,
+    );
+}
+
+/// The one `DelegateAssets` payload the takeover auto-delegation enqueues
+/// for a completing selection — `None` with the toggle off or when no owned
+/// delegatable member qualifies. Split from the scheduler so a test reads
+/// the same decision the enqueue makes.
+pub(crate) fn takeover_delegate_payload(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    owner: InternedId,
+    selected: &[u64],
+    takeover_mode: bool,
+) -> Option<Command> {
+    if !takeover_mode {
+        return None;
+    }
+    let ids = delegatable_owned_ids(sim, rules, owner, selected);
+    (!ids.is_empty()).then(|| Command::DelegateAssets {
+        entity_ids: ids,
+        intent: crate::sim::delegation::DelegationIntent::AutoReact,
+    })
 }
 
 /// The Performance Stats boxes follow the panel the keys showed or hid.
@@ -2945,6 +3127,13 @@ pub(crate) fn reconcile_selection_order_after_sim(
         runtime
             .simulation
             .flash_selected_for_current_player(&selected, &runtime.resources.rules);
+    }
+    // VERA commander mode: a completed selection of the local player's own
+    // delegatable assets hands itself to the lieutenant while the takeover
+    // toggle is on — one AutoReact delegation per completing frame, whatever
+    // produced the selection (box, click or type select).
+    if state.match_state.input.takeover_mode && !selected.is_empty() {
+        auto_delegate_selected(state, &selected);
     }
 }
 

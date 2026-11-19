@@ -106,6 +106,17 @@ pub(crate) struct MatchState {
     /// other command-driven AI in the defense persona (`docs/defense-ai.md`).
     /// Copied at startup like configured_input_delay_ticks.
     pub(crate) defense_ai_enabled: bool,
+    /// Config-sourced fork-only switch (`[gameplay] commander_mode`, default
+    /// off): gates the local player's takeover toggle, the Alt+G intent
+    /// re-delegation, the manual-order reclaim and the bottom command bar's
+    /// commander buttons. Copied at startup like defense_ai_enabled.
+    pub(crate) commander_mode_enabled: bool,
+    /// Commander mode's driver for the LOCAL human house: the lieutenant the
+    /// takeover toggle delegates to, whose stance the command bar cycles.
+    /// Seated beside the Super-AI drivers on every runtime install when
+    /// `commander_mode_enabled`; the human house is not command-driven, so it
+    /// never joins `super_players`.
+    pub(crate) lieutenant: Option<crate::super_ai::Lieutenant>,
 }
 
 impl MatchState {
@@ -117,16 +128,30 @@ impl MatchState {
     /// and the houses of an explicitly classified defense map, adopt the
     /// defense persona (`docs/defense-ai.md`). Every install also lands the
     /// sim's defense-map form verdict for the defeat gate, switch off
-    /// included.
+    /// included. With `commander_mode_enabled` the install also seats the
+    /// local house's [`crate::super_ai::Lieutenant`].
     pub(crate) fn rebuild_super_players(&mut self) {
         let defense_ai = self.defense_ai_enabled;
-        self.super_players = self
+        let commander_mode = self.commander_mode_enabled;
+        let (super_players, lieutenant) = self
             .sim_runtime
             .home_runtime_mut()
             .map(|rt| {
-                rebuild_super_players_for(&mut rt.simulation, &rt.resources.rules, defense_ai)
+                let super_players =
+                    rebuild_super_players_for(&mut rt.simulation, &rt.resources.rules, defense_ai);
+                let lieutenant = if commander_mode {
+                    let simulation = &rt.simulation;
+                    scenario_local_owner(simulation)
+                        .and_then(|owner| simulation.interner().get(owner))
+                        .map(crate::super_ai::Lieutenant::new)
+                } else {
+                    None
+                };
+                (super_players, lieutenant)
             })
             .unwrap_or_default();
+        self.super_players = super_players;
+        self.lieutenant = lieutenant;
     }
     /// Shared ScenarioPause684060 audio hold, independent of menu/debug pause.
     /// Main_Tick55D82C also gates offline world admission on its counter.

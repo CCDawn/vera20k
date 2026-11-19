@@ -22,11 +22,12 @@ const VK_DELETE: u16 = 0x2e;
 /// VERA's own commands that come with a key: Performance Stats Ctrl+Alt+F,
 /// Thread Stats Ctrl+Alt+G, Lock
 /// Cursor to Window Ctrl+Alt+L, Full Screen Alt+Enter, String Keys Ctrl+Alt+K,
-/// Edit Layout Ctrl+Alt+E, Formation Line F, Formation Lock O, Ferry J and
-/// Rotate Primary I.
+/// Edit Layout Ctrl+Alt+E, Formation Line F, Formation Lock O, Ferry J,
+/// Rotate Primary I, Takeover (DelegateToAi) Ctrl+G, the intent-targeting
+/// click (DelegateIntent) Alt+G and the lieutenant stance cycle Ctrl+H.
 /// Retail `KEYBOARDMD.INI` binds none of these keys but F, which is its
 /// Follow; [`HotkeyBindings::move_follow_off_formation_key`] moves that.
-const VERA_DEFAULT_KEYS: [(HotkeyCommand, u16); 11] = [
+const VERA_DEFAULT_KEYS: [(HotkeyCommand, u16); 14] = [
     (HotkeyCommand::PerformanceStats, CTRL_BIT | ALT_BIT | 0x46),
     (HotkeyCommand::ThreadStats, CTRL_BIT | ALT_BIT | 0x47),
     (HotkeyCommand::LockCursor, CTRL_BIT | ALT_BIT | 0x4c),
@@ -38,6 +39,9 @@ const VERA_DEFAULT_KEYS: [(HotkeyCommand, u16); 11] = [
     (HotkeyCommand::Ferry, 0x4a),
     (HotkeyCommand::RotatePrimary, 0x49),
     (HotkeyCommand::RelationColors, ALT_BIT | 0x41),
+    (HotkeyCommand::DelegateToAi, CTRL_BIT | 0x47),
+    (HotkeyCommand::DelegateIntent, ALT_BIT | 0x47),
+    (HotkeyCommand::CycleLieutenantStance, CTRL_BIT | 0x48),
 ];
 /// F: Formation Line's default key and retail Follow's.
 const FORMATION_LINE_KEY: u16 = 0x46;
@@ -137,6 +141,21 @@ pub(crate) enum HotkeyCommand {
     /// neutral unchanged) to tell players apart in large melee matches. Pure
     /// presentation; works in a match only.
     RelationColors,
+    /// VERA commander mode: toggle takeover — while it is on, every completed
+    /// selection of the local player's own delegatable assets hands them to
+    /// the match's lieutenant (`input::dispatch`). In the `vera20k` keyboard
+    /// category with the Ctrl+G default; the bottom command bar's takeover
+    /// button drives the same toggle.
+    DelegateToAi,
+    /// VERA commander mode: arm an intent-targeting click over the current
+    /// selection; the click re-delegates it to attack (plain) or defend
+    /// (Shift) the clicked cell. In the `vera20k` keyboard category with the
+    /// Alt+G default.
+    DelegateIntent,
+    /// VERA commander mode: cycle the lieutenant's global posture between
+    /// defend and attack. In the `vera20k` keyboard category with the Ctrl+H
+    /// default; the bottom command bar's stance button drives the same cycle.
+    CycleLieutenantStance,
     /// VeraX: load the selection into nearby transports. Registered in the
     /// `vera20k` keyboard category with the Ctrl+D default.
     AutoLoad,

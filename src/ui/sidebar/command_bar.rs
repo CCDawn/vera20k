@@ -22,6 +22,21 @@ pub const COMMAND_NAMES: [&str; 11] = [
     "Cheer",
 ];
 
+/// VERA commander mode appends two buttons of its own after the UIMD slots
+/// when `[gameplay] commander_mode` is on: the takeover toggle and the
+/// lieutenant stance indicator. Their command indexes sit past the retail
+/// eleven (the ButtonList reader can only name the retail ones); the
+/// gadgets, tooltips and draw read the same indexes. Both reuse existing
+/// shape slots — no new art assets (`app::input::command_bar_input`).
+pub const COMMANDER_TAKEOVER_COMMAND: usize = 11;
+pub const COMMANDER_STANCE_COMMAND: usize = 12;
+/// The shape slots the two reuse (see `app::input::command_bar_input`): the
+/// takeover toggle draws the PlanningMode shape, the bar's existing
+/// mode-toggle idiom; the stance indicator draws the Guard shape while
+/// defending and the AttackMove shape (pressed frame) while attacking.
+pub const COMMANDER_TAKEOVER_ART_COMMAND: usize = 9;
+pub const COMMANDER_STANCE_ART_COMMANDS: [usize; 2] = [6, 5];
+
 /// UIMD.INI maps command identities to slots, rather than numbering artwork
 /// by slot. `674650` reads `ButtonList` into 0x200 bytes and gives each
 /// `strtok(",")` token the next slot; the name search `6CFCC0` is an exact

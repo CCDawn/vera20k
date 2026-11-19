@@ -1476,6 +1476,57 @@ fn emit_entity_order_voice(
     state.match_state.match_audio.sound_events.push(event);
 }
 
+/// VERA commander mode: the armed intent-targeting click's producer
+/// (`DelegateIntent`, Alt+G). The captured selection re-delegates to
+/// `AttackLocation` (plain click) or `DefendLocation` (Shift click) at the
+/// clicked cell — one command, one lieutenant group engine-side. The click
+/// counts as consumed either way, so an internal refusal cannot leak it into
+/// an ordinary order.
+fn queue_delegate_intent_order(
+    state: &mut AppState,
+    entity_ids: Vec<u64>,
+    cell: (u16, u16),
+) -> bool {
+    let Some(owner) = preferred_local_owner(state) else {
+        return true;
+    };
+    let intent = if is_shift_held(state) {
+        crate::sim::delegation::DelegationIntent::DefendLocation((cell.0 as i16, cell.1 as i16))
+    } else {
+        crate::sim::delegation::DelegationIntent::AttackLocation((cell.0 as i16, cell.1 as i16))
+    };
+    if !crate::app::input::commands::selection_input_has_capacity(state, 1) {
+        return true;
+    }
+    let Some(runtime) = state.match_state.sim_runtime.write_sim(SimWrite::Command) else {
+        return true;
+    };
+    let _ = crate::app::input::commands::schedule_command_in_sim(
+        &mut runtime.simulation,
+        &owner,
+        Command::DelegateAssets { entity_ids, intent },
+    );
+    true
+}
+
+/// VERA commander mode: which of `actors` the local player's lieutenant
+/// currently holds. The manual-order reclaim revokes exactly these before
+/// the order lands.
+fn reclaim_delegated_actors(sim: &crate::sim::world::Simulation, actors: &[u64]) -> Vec<u64> {
+    let Some(house) = sim.session().current_house() else {
+        return Vec::new();
+    };
+    let delegation = sim.delegation();
+    let mut delegated: Vec<u64> = actors
+        .iter()
+        .copied()
+        .filter(|&id| delegation.is_delegated(house, id))
+        .collect();
+    delegated.sort_unstable();
+    delegated.dedup();
+    delegated
+}
+
 /// Commit a resolved context dispatch: one voice line, the queue, then its timer.
 ///
 /// Every exit from order resolution goes through here so the single-speaker rule
@@ -1526,6 +1577,33 @@ fn finish_order(
         );
         // The local acknowledgement reads the resolved input order before
         // encoding. Only the native record enters the gameplay queue.
+        // VERA commander mode: a manual order retakes its delegated actors
+        // first — one RevokeAssets for the delegated subset, issued on this
+        // same tick ahead of the order batch, so the manual order then
+        // applies. (Planning-mode nodes defer their orders to the plan
+        // commit and reclaim there is a recorded residual.)
+        let queued_actors: Vec<u64> = queued
+            .iter()
+            .filter_map(|envelope| command_actor_id(&envelope.payload))
+            .collect();
+        if let Some(sim) = state
+            .match_state
+            .sim_runtime
+            .runtime()
+            .map(|rt| &rt.simulation)
+        {
+            let revoke = reclaim_delegated_actors(sim, &queued_actors);
+            if !revoke.is_empty()
+                && let Some(owner) = preferred_local_owner(state)
+                && let Some(rt) = state.match_state.sim_runtime.write_sim(SimWrite::Command)
+            {
+                let _ = crate::app::input::commands::schedule_command_in_sim(
+                    &mut rt.simulation,
+                    &owner,
+                    Command::RevokeAssets { entity_ids: revoke },
+                );
+            }
+        }
         let (encoded, feedback): (Vec<_>, Vec<_>) = if let Some(sim) = state
             .match_state
             .sim_runtime
@@ -2186,6 +2264,12 @@ pub(crate) fn try_queue_context_order(
         }
         ContextOrderTarget::Radar(target) => target.cell,
     };
+    // VERA commander mode: the armed intent-targeting click (Alt+G) consumes
+    // this click — the captured selection re-delegates to attack (plain
+    // click) or defend (Shift click) the clicked cell instead of ordering.
+    if let Some(entity_ids) = state.match_state.input.delegate_intent_target.take() {
+        return queue_delegate_intent_order(state, entity_ids, (target_rx, target_ry));
+    }
     let world_point = match target {
         ContextOrderTarget::ScreenPoint(x, y) => Some(
             crate::app::match_runtime::sim_tick::screen_point_to_world(state, x, y),
